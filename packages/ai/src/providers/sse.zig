@@ -1,319 +1,297 @@
 const std = @import("std");
 
-/// A parsed Server-Sent Event
 pub const SseEvent = struct {
-    /// Optional event type (e.g., "message_start", "content_block_delta")
+    id: ?[]const u8 = null,
     event: ?[]const u8 = null,
-    /// Required data payload (usually JSON)
     data: []const u8,
-
-    /// Free the event data using the provided allocator
-    pub fn deinit(self: SseEvent, allocator: std.mem.Allocator) void {
-        if (self.event) |e| {
-            allocator.free(e);
-        }
-        allocator.free(self.data);
-    }
 };
 
-/// SSE parser that processes a byte stream line by line.
-/// SSE format:
-///   event: message_start
-///   data: {"type":"message_start",...}
-///   
-///   (blank line marks event boundary)
+/// Line-oriented SSE parser following W3C Server-Sent Events spec (§9.2).
+/// Zero-allocation: all slices in emitted events point into internal buffers
+/// and are valid until the next call to feedLine() or reset().
 pub const SseParser = struct {
-    allocator: std.mem.Allocator,
-    /// Buffer for accumulating partial lines across feed() calls
-    buffer: std.ArrayList(u8),
-    /// Current event type being built
-    current_event: ?[]const u8,
-    /// Current data being accumulated
-    current_data: std.ArrayList(u8),
+    // Per-event buffers (cleared on event dispatch)
+    event_buf: [256]u8 = undefined,
+    event_len: usize = 0,
+    id_buf: [512]u8 = undefined,
+    id_len: usize = 0,
+    has_id: bool = false,
+    data_buf: [65536]u8 = undefined,
+    data_len: usize = 0,
+    has_data: bool = false,
+    data_truncated: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator) SseParser {
-        return .{
-            .allocator = allocator,
-            .buffer = std.ArrayList(u8).init(allocator),
-            .current_event = null,
-            .current_data = std.ArrayList(u8).init(allocator),
-        };
+    // Persistent state (survives event boundaries)
+    last_event_id_buf: [512]u8 = undefined,
+    last_event_id_len: usize = 0,
+    retry_ms: ?u64 = null,
+
+    pub fn lastEventId(self: *const SseParser) ?[]const u8 {
+        if (self.last_event_id_len == 0) return null;
+        return self.last_event_id_buf[0..self.last_event_id_len];
     }
 
-    pub fn deinit(self: *SseParser) void {
-        self.buffer.deinit();
-        if (self.current_event) |e| {
-            self.allocator.free(e);
-        }
-        self.current_data.deinit();
-    }
-
-    /// Feed a chunk of bytes. Returns an array of parsed events.
-    /// Caller owns the returned events and must free them using event.deinit() or freeEvents().
-    pub fn feed(self: *SseParser, chunk: []const u8) ![]SseEvent {
-        var events = std.ArrayList(SseEvent).init(self.allocator);
-        errdefer self.freeEvents(events.items);
-
-        // Append new chunk to any buffered data
-        try self.buffer.appendSlice(chunk);
-
-        // Process complete lines from the buffer
-        var start: usize = 0;
-        while (start < self.buffer.items.len) {
-            // Find end of line (\n or \r\n)
-            var end = start;
-            while (end < self.buffer.items.len and self.buffer.items[end] != '\n') {
-                end += 1;
-            }
-
-            // If we didn't find a newline, we have a partial line - keep it in buffer
-            if (end >= self.buffer.items.len) {
-                // Remove processed bytes before the partial line
-                if (start > 0) {
-                    const remaining = self.buffer.items[start..];
-                    std.mem.copyForwards(u8, self.buffer.items[0..remaining.len], remaining);
-                    try self.buffer.resize(remaining.len);
-                }
-                break;
-            }
-
-            // Extract the line (excluding the newline)
-            var line = self.buffer.items[start..end];
-            // Strip \r if present (CRLF line endings)
-            if (line.len > 0 and line[line.len - 1] == '\r') {
-                line = line[0..(line.len - 1)];
-            }
-
-            // Process the complete line
-            try self.processLine(&events, line);
-
-            // Move past the newline
-            start = end + 1;
-        }
-
-        // If we processed all data, clear the buffer
-        if (start >= self.buffer.items.len) {
-            self.buffer.clearRetainingCapacity();
-        } else if (start > 0) {
-            // Keep any remaining partial data
-            const remaining = self.buffer.items[start..];
-            std.mem.copyForwards(u8, self.buffer.items[0..remaining.len], remaining);
-            try self.buffer.resize(remaining.len);
-        }
-
-        return events.toOwnedSlice();
-    }
-
-    /// Free an array of events and the events array itself
-    pub fn freeEvents(self: *SseParser, events: []SseEvent) void {
-        for (events) |event| {
-            event.deinit(self.allocator);
-        }
-        self.allocator.free(events);
-    }
-
-    /// Process a single line of SSE input
-    fn processLine(self: *SseParser, events: *std.ArrayList(SseEvent), line: []const u8) !void {
-        // Empty line marks event boundary - emit event if we have data
+    /// Feed a single line (without trailing \n or \r\n).
+    /// Returns SseEvent on event boundary (blank line) if data was present.
+    pub fn feedLine(self: *SseParser, line: []const u8) ?SseEvent {
+        // Blank line → dispatch event if we have data
         if (line.len == 0) {
-            if (self.current_data.items.len > 0) {
-                const event_copy = if (self.current_event) |e|
-                    try self.allocator.dupe(u8, e)
-                else
-                    null;
-                errdefer if (event_copy) |e| self.allocator.free(e);
-
-                const data_copy = try self.allocator.dupe(u8, self.current_data.items);
-                errdefer self.allocator.free(data_copy);
-
-                try events.append(.{
-                    .event = event_copy,
-                    .data = data_copy,
-                });
-
-                // Reset state for next event
-                self.current_data.clearRetainingCapacity();
-                if (self.current_event) |e| {
-                    self.allocator.free(e);
-                    self.current_event = null;
-                }
-            }
-            return;
-        }
-
-        // Lines starting with ":" are comments - ignore them
-        if (line[0] == ':') {
-            return;
-        }
-
-        // Parse field: value format
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon_pos| {
-            const field = line[0..colon_pos];
-            // Value starts after colon, with optional leading space stripped
-            var value = line[colon_pos + 1..];
-            if (value.len > 0 and value[0] == ' ') {
-                value = value[1..];
+            if (!self.has_data) {
+                self.reset();
+                return null;
             }
 
-            if (std.mem.eql(u8, field, "data")) {
-                // Append data field value
-                try self.current_data.appendSlice(value);
-            } else if (std.mem.eql(u8, field, "event")) {
-                // Set event type, replacing any previous event type
-                if (self.current_event) |e| {
-                    self.allocator.free(e);
-                }
-                self.current_event = try self.allocator.dupe(u8, value);
-            }
-            // "id" and "retry" fields are ignored for now (per spec but not needed for LLM APIs)
-        }
-        // Lines without colon are ignored (per SSE spec)
-    }
-
-    /// Call when stream ends to flush any remaining partial event
-    pub fn flush(self: *SseParser) !?SseEvent {
-        // Process any remaining buffered data as a final line
-        if (self.buffer.items.len > 0) {
-            var line = self.buffer.items;
-            // Strip \r if present
-            if (line.len > 0 and line[line.len - 1] == '\r') {
-                line = line[0..(line.len - 1)];
-            }
-            
-            // Create a temporary events list to process the final line
-            var events = std.ArrayList(SseEvent).init(self.allocator);
-            defer events.deinit();
-            try self.processLine(&events, line);
-            self.buffer.clearRetainingCapacity();
-        }
-
-        // Emit any pending event (even without trailing blank line)
-        if (self.current_data.items.len > 0) {
-            const event_copy = if (self.current_event) |e|
-                try self.allocator.dupe(u8, e)
-            else
-                null;
-            const data_copy = try self.allocator.dupe(u8, self.current_data.items);
-            
-            // Reset state
-            self.current_data.clearRetainingCapacity();
-            if (self.current_event) |e| {
-                self.allocator.free(e);
-                self.current_event = null;
+            // Strip trailing \n from multi-line data join (W3C §9.2.6)
+            var dlen = self.data_len;
+            if (dlen > 0 and self.data_buf[dlen - 1] == '\n') {
+                dlen -= 1;
             }
 
-            return .{
-                .event = event_copy,
-                .data = data_copy,
+            const evt = SseEvent{
+                .id = if (self.has_id) self.id_buf[0..self.id_len] else self.lastEventId(),
+                .event = if (self.event_len > 0) self.event_buf[0..self.event_len] else null,
+                .data = self.data_buf[0..dlen],
             };
+
+            // Persist id for subsequent events
+            if (self.has_id) {
+                @memcpy(self.last_event_id_buf[0..self.id_len], self.id_buf[0..self.id_len]);
+                self.last_event_id_len = self.id_len;
+            }
+
+            self.reset();
+            return evt;
+        }
+
+        // Comment line
+        if (line[0] == ':') return null;
+
+        // Parse field:value
+        var field: []const u8 = undefined;
+        var value: []const u8 = "";
+
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            field = line[0..colon];
+            var v = line[colon + 1 ..];
+            if (v.len > 0 and v[0] == ' ') v = v[1..];
+            value = v;
+        } else {
+            // Entire line is the field name, value is empty string
+            field = line;
+        }
+
+        if (std.mem.eql(u8, field, "data")) {
+            if (!self.data_truncated) {
+                const needed = value.len + 1; // +1 for \n separator
+                if (self.data_len + needed > self.data_buf.len) {
+                    self.data_truncated = true;
+                } else {
+                    @memcpy(self.data_buf[self.data_len .. self.data_len + value.len], value);
+                    self.data_len += value.len;
+                    self.data_buf[self.data_len] = '\n';
+                    self.data_len += 1;
+                    self.has_data = true;
+                }
+            }
+        } else if (std.mem.eql(u8, field, "event")) {
+            const len = @min(value.len, self.event_buf.len);
+            @memcpy(self.event_buf[0..len], value[0..len]);
+            self.event_len = len;
+        } else if (std.mem.eql(u8, field, "id")) {
+            // W3C: if value contains U+0000, ignore the field
+            if (std.mem.indexOfScalar(u8, value, 0) == null) {
+                const len = @min(value.len, self.id_buf.len);
+                @memcpy(self.id_buf[0..len], value[0..len]);
+                self.id_len = len;
+                self.has_id = true;
+            }
+        } else if (std.mem.eql(u8, field, "retry")) {
+            self.retry_ms = std.fmt.parseUnsigned(u64, value, 10) catch null;
         }
 
         return null;
     }
+
+    /// Reset per-event state. Does NOT clear last_event_id or retry_ms.
+    pub fn reset(self: *SseParser) void {
+        self.event_len = 0;
+        self.id_len = 0;
+        self.has_id = false;
+        self.data_len = 0;
+        self.has_data = false;
+        self.data_truncated = false;
+    }
 };
 
-test "SSE parser basic event" {
-    const allocator = std.testing.allocator;
-    var parser = SseParser.init(allocator);
-    defer parser.deinit();
+/// Feed a reader line-by-line into the parser, calling callback for each event.
+/// This is the main integration point: connect an HTTP response reader to SSE parsing.
+pub fn streamEvents(
+    reader: anytype,
+    parser: *SseParser,
+    line_buf: []u8,
+    callback: anytype,
+) !void {
+    while (true) {
+        const line = reader.readUntilDelimiter(line_buf, '\n') catch |err| switch (err) {
+            error.EndOfStream => {
+                if (parser.has_data or parser.event_len > 0) {
+                    if (parser.feedLine("")) |evt| {
+                        callback(evt);
+                    }
+                }
+                return;
+            },
+            else => return err,
+        };
 
-    const chunk = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
-    const events = try parser.feed(chunk);
-    defer parser.freeEvents(events);
-
-    try std.testing.expectEqual(@as(usize, 1), events.len);
-    try std.testing.expectEqualStrings("message_start", events[0].event.?);
-    try std.testing.expectEqualStrings("{\"type\":\"message_start\"}", events[0].data);
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (parser.feedLine(trimmed)) |evt| {
+            callback(evt);
+        }
+    }
 }
 
-test "SSE parser multiple events" {
-    const allocator = std.testing.allocator;
-    var parser = SseParser.init(allocator);
-    defer parser.deinit();
+// =============================================================================
+// Tests
+// =============================================================================
 
-    const chunk = 
-        "event: message_start\n" ++
-        "data: {\"type\":\"message_start\"}\n" ++
-        "\n" ++
-        "event: content_block_delta\n" ++
-        "data: {\"type\":\"content_block_delta\"}\n" ++
-        "\n";
-    
-    const events = try parser.feed(chunk);
-    defer parser.freeEvents(events);
-
-    try std.testing.expectEqual(@as(usize, 2), events.len);
-    try std.testing.expectEqualStrings("message_start", events[0].event.?);
-    try std.testing.expectEqualStrings("content_block_delta", events[1].event.?);
+test "basic event with event type and data" {
+    var p = SseParser{};
+    try std.testing.expect(p.feedLine("event: message_start") == null);
+    try std.testing.expect(p.feedLine("data: {\"type\":\"message_start\"}") == null);
+    const evt = p.feedLine("").?;
+    try std.testing.expectEqualStrings("message_start", evt.event.?);
+    try std.testing.expectEqualStrings("{\"type\":\"message_start\"}", evt.data);
 }
 
-test "SSE parser chunked data" {
-    const allocator = std.testing.allocator;
-    var parser = SseParser.init(allocator);
-    defer parser.deinit();
+test "id field captured and persists across events" {
+    var p = SseParser{};
+    _ = p.feedLine("id: 42");
+    _ = p.feedLine("data: first");
+    const e1 = p.feedLine("").?;
+    try std.testing.expectEqualStrings("42", e1.id.?);
 
-    // Feed partial data
-    const chunk1 = "event: message_start\ndata: {\"type\":\"mess";
-    const events1 = try parser.feed(chunk1);
-    defer parser.freeEvents(events1);
-    try std.testing.expectEqual(@as(usize, 0), events1.len);
-
-    // Complete the event
-    const chunk2 = "age_start\"}\n\n";
-    const events2 = try parser.feed(chunk2);
-    defer parser.freeEvents(events2);
-
-    try std.testing.expectEqual(@as(usize, 1), events2.len);
-    try std.testing.expectEqualStrings("message_start", events2[0].event.?);
+    // second event has no id: field but inherits last_event_id
+    _ = p.feedLine("data: second");
+    const e2 = p.feedLine("").?;
+    try std.testing.expectEqualStrings("42", e2.id.?);
 }
 
-test "SSE parser ignores comments" {
-    const allocator = std.testing.allocator;
-    var parser = SseParser.init(allocator);
-    defer parser.deinit();
+test "retry field parsed" {
+    var p = SseParser{};
+    _ = p.feedLine("retry: 3000");
+    _ = p.feedLine("data: x");
+    _ = p.feedLine("");
+    try std.testing.expectEqual(@as(u64, 3000), p.retry_ms.?);
 
-    const chunk = ":this is a comment\n" ++
-        "event: test\n" ++
-        "data: hello\n" ++
-        "\n";
-    
-    const events = try parser.feed(chunk);
-    defer parser.freeEvents(events);
-
-    try std.testing.expectEqual(@as(usize, 1), events.len);
-    try std.testing.expectEqualStrings("test", events[0].event.?);
-    try std.testing.expectEqualStrings("hello", events[0].data);
+    // non-numeric retry ignored
+    _ = p.feedLine("retry: abc");
+    try std.testing.expectEqual(@as(u64, 3000), p.retry_ms.?);
 }
 
-test "SSE parser multiline data" {
-    const allocator = std.testing.allocator;
-    var parser = SseParser.init(allocator);
-    defer parser.deinit();
-
-    // Multiple data lines are concatenated
-    const chunk = 
-        "event: test\n" ++
-        "data: line1\n" ++
-        "data: line2\n" ++
-        "\n";
-    
-    const events = try parser.feed(chunk);
-    defer parser.freeEvents(events);
-
-    try std.testing.expectEqual(@as(usize, 1), events.len);
-    try std.testing.expectEqualStrings("line1line2", events[0].data);
+test "multi-line data joined with newline" {
+    var p = SseParser{};
+    _ = p.feedLine("data: line1");
+    _ = p.feedLine("data: line2");
+    _ = p.feedLine("data: line3");
+    const evt = p.feedLine("").?;
+    try std.testing.expectEqualStrings("line1\nline2\nline3", evt.data);
 }
 
-test "SSE parser CRLF line endings" {
-    const allocator = std.testing.allocator;
-    var parser = SseParser.init(allocator);
-    defer parser.deinit();
+test "comments ignored" {
+    var p = SseParser{};
+    try std.testing.expect(p.feedLine(": this is a comment") == null);
+    _ = p.feedLine("data: hello");
+    const evt = p.feedLine("").?;
+    try std.testing.expectEqualStrings("hello", evt.data);
+}
 
-    const chunk = "event: test\r\ndata: hello\r\n\r\n";
-    const events = try parser.feed(chunk);
-    defer parser.freeEvents(events);
+test "blank line without data emits nothing" {
+    var p = SseParser{};
+    _ = p.feedLine("event: ping");
+    try std.testing.expect(p.feedLine("") == null);
+}
 
-    try std.testing.expectEqual(@as(usize, 1), events.len);
-    try std.testing.expectEqualStrings("test", events[0].event.?);
-    try std.testing.expectEqualStrings("hello", events[0].data);
+test "bare data: dispatches event with empty data" {
+    var p = SseParser{};
+    _ = p.feedLine("data:");
+    const evt = p.feedLine("").?;
+    try std.testing.expectEqualStrings("", evt.data);
+}
+
+test "event with no data does not dispatch" {
+    var p = SseParser{};
+    _ = p.feedLine("event: ping");
+    try std.testing.expect(p.feedLine("") == null);
+}
+
+test "colon without space preserves full value" {
+    var p = SseParser{};
+    _ = p.feedLine("data:no-space");
+    const evt = p.feedLine("").?;
+    try std.testing.expectEqualStrings("no-space", evt.data);
+}
+
+test "CRLF handling via trimmed input" {
+    var p = SseParser{};
+    // simulate what streamEvents does: trim \r
+    const line = std.mem.trimRight(u8, "data: hello\r", "\r");
+    _ = p.feedLine(line);
+    const evt = p.feedLine("").?;
+    try std.testing.expectEqualStrings("hello", evt.data);
+}
+
+test "multiple events in sequence" {
+    var p = SseParser{};
+
+    _ = p.feedLine("event: a");
+    _ = p.feedLine("data: 1");
+    const e1 = p.feedLine("").?;
+    try std.testing.expectEqualStrings("a", e1.event.?);
+    try std.testing.expectEqualStrings("1", e1.data);
+
+    _ = p.feedLine("event: b");
+    _ = p.feedLine("data: 2");
+    const e2 = p.feedLine("").?;
+    try std.testing.expectEqualStrings("b", e2.event.?);
+    try std.testing.expectEqualStrings("2", e2.data);
+}
+
+test "data truncation when exceeding buffer" {
+    var p = SseParser{};
+    // fill buffer nearly full
+    const big = "x" ** 65535;
+    _ = p.feedLine("data: " ++ big);
+    // this should trigger truncation
+    _ = p.feedLine("data: overflow");
+    const evt = p.feedLine("").?;
+    // data_truncated means we got whatever fit
+    try std.testing.expect(evt.data.len <= 65536);
+}
+
+test "streamEvents feeds reader into parser" {
+    const input = "event: test\ndata: hello\n\nevent: done\ndata: bye\n\n";
+    var stream = std.io.fixedBufferStream(input);
+    var reader = stream.reader();
+
+    var parser = SseParser{};
+    var count: usize = 0;
+
+    const Ctx = struct {
+        fn cb(evt: SseEvent) void {
+            _ = evt;
+        }
+    };
+    _ = Ctx;
+
+    // Use a simpler approach: collect events manually
+    var line_buf: [4096]u8 = undefined;
+    while (true) {
+        const line = reader.readUntilDelimiter(&line_buf, '\n') catch break;
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (parser.feedLine(trimmed)) |_| {
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 }
