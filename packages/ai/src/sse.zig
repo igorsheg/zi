@@ -67,7 +67,7 @@ pub const SseParser = struct {
         if (line[0] == ':') return null;
 
         // Parse field:value
-        var field: []const u8 = undefined;
+        var field: []const u8 = "";
         var value: []const u8 = "";
 
         if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
@@ -106,7 +106,9 @@ pub const SseParser = struct {
                 self.has_id = true;
             }
         } else if (std.mem.eql(u8, field, "retry")) {
-            self.retry_ms = std.fmt.parseUnsigned(u64, value, 10) catch null;
+            if (std.fmt.parseUnsigned(u64, value, 10)) |ms| {
+                self.retry_ms = ms;
+            } else |_| {} // W3C: ignore malformed retry values
         }
 
         return null;
