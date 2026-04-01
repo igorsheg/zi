@@ -1,7 +1,7 @@
 const std = @import("std");
 
-/// Known API types
-pub const Api = enum {
+/// Known API types. Custom values supported via `.custom` variant.
+pub const Api = union(enum) {
     openai_completions,
     mistral_conversations,
     openai_responses,
@@ -12,10 +12,11 @@ pub const Api = enum {
     google_generative_ai,
     google_gemini_cli,
     google_vertex,
+    custom: []const u8,
 };
 
-/// Known providers
-pub const Provider = enum {
+/// Known providers. Custom values supported via `.custom` variant.
+pub const Provider = union(enum) {
     amazon_bedrock,
     anthropic,
     google,
@@ -39,6 +40,7 @@ pub const Provider = enum {
     opencode,
     opencode_go,
     kimi_coding,
+    custom: []const u8,
 };
 
 /// Thinking/reasoning levels
@@ -92,6 +94,10 @@ pub const StreamOptions = struct {
     headers: ?[]const Header = null,
     /// Optional metadata to include in API requests.
     metadata: ?std.json.Value = null,
+    /// Optional callback for inspecting or replacing provider payloads before sending.
+    /// Return null to keep the payload unchanged.
+    on_payload: ?*const fn (payload: std.json.Value, model: *const Model, ctx: ?*anyopaque) ?std.json.Value = null,
+    on_payload_ctx: ?*anyopaque = null,
 };
 
 /// HTTP header key-value pair
@@ -100,18 +106,17 @@ pub const Header = struct {
     value: []const u8,
 };
 
+/// StreamOptions extended with provider-specific opaque data.
+/// Mirrors TS's `ProviderStreamOptions = StreamOptions & Record<string, unknown>`.
+pub const ProviderStreamOptions = struct {
+    base: StreamOptions = .{},
+    /// Provider-specific extra options (opaque).
+    provider_data: ?*anyopaque = null,
+};
+
 /// Unified options with reasoning passed to streamSimple() and completeSimple()
 pub const SimpleStreamOptions = struct {
-    temperature: ?f64 = null,
-    max_tokens: ?u64 = null,
-    signal: ?*anyopaque = null,
-    api_key: ?[]const u8 = null,
-    transport: ?Transport = null,
-    cache_retention: ?CacheRetention = null,
-    session_id: ?[]const u8 = null,
-    max_retry_delay_ms: ?u64 = null,
-    headers: ?[]const Header = null,
-    metadata: ?std.json.Value = null,
+    base: StreamOptions = .{},
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
 };
@@ -182,7 +187,7 @@ pub const Usage = struct {
 pub const StopReason = enum {
     stop,
     length,
-    tool_use,
+    toolUse,
     @"error",
     aborted,
 };
@@ -281,7 +286,7 @@ pub const AssistantMessageEvent = union(enum) {
     pub const DoneReason = enum {
         stop,
         length,
-        tool_use,
+        toolUse,
     };
 
     pub const ErrorReason = enum {
