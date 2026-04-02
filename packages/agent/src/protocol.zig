@@ -59,11 +59,29 @@ pub const AgentMessage = union(enum) {
     user: ai.protocol.UserMessage,
     assistant: ai.protocol.AssistantMessage,
     tool_result: ai.protocol.ToolResultMessage,
+    /// pi-mono: CompactionSummaryMessage (messages.ts:62-67)
+    compaction_summary: CompactionSummaryMessage,
+    /// pi-mono: BranchSummaryMessage (messages.ts:55-60)
+    branch_summary: BranchSummaryMessage,
+    /// pi-mono: CustomMessage (messages.ts:46-53)
     custom: CustomMessage,
+
+    pub const CompactionSummaryMessage = struct {
+        summary: []const u8,
+        tokens_before: u64,
+        timestamp: i64,
+    };
+
+    pub const BranchSummaryMessage = struct {
+        summary: []const u8,
+        from_id: []const u8,
+        timestamp: i64,
+    };
 
     pub const CustomMessage = struct {
         custom_type: []const u8,
         content: []const u8,
+        display: bool = false,
         details: ?std.json.Value = null,
         timestamp: i64,
     };

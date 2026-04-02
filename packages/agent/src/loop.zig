@@ -25,11 +25,19 @@ pub fn runAgentLoop(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    // Mutable message list — grows as we add assistant responses and tool results
+    // Arena for per-turn allocations: tool result content blocks, error results,
+    // LLM message lists. All freed together when the loop exits.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Mutable message list — grows as we add assistant responses and tool results.
+    // Uses arena_alloc so tool result content slices (which point into arena memory)
+    // stay valid for the loop's lifetime.
     var messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .{};
-    defer messages.deinit(allocator);
+    defer messages.deinit(arena_alloc);
     for (initial_messages) |msg| {
-        messages.append(allocator, msg) catch return;
+        messages.append(arena_alloc, msg) catch return;
     }
 
     // 1. agent_start
@@ -49,7 +57,7 @@ pub fn runAgentLoop(
     const prov = provider_registry.get(api_str) orelse {
         const err_msg = makeErrorAssistantMessage(model, "No provider registered for API");
         const agent_err = protocol.AgentMessage{ .assistant = err_msg };
-        messages.append(allocator, agent_err) catch {};
+        messages.append(arena_alloc, agent_err) catch {};
         event_sink(.{ .message_start = .{ .message = agent_err } }, event_ctx);
         event_sink(.{ .message_end = .{ .message = agent_err } }, event_ctx);
         event_sink(.{ .turn_end = .{ .message = agent_err, .tool_results = &.{} } }, event_ctx);
@@ -59,9 +67,9 @@ pub fn runAgentLoop(
 
     // Convert AgentTools to LLM Tools for the provider
     var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .{};
-    defer llm_tools.deinit(allocator);
+    defer llm_tools.deinit(arena_alloc);
     for (tools) |t| {
-        llm_tools.append(allocator, .{
+        llm_tools.append(arena_alloc, .{
             .name = t.name,
             .description = t.description,
             .parameters = t.parameters,
@@ -78,13 +86,13 @@ pub fn runAgentLoop(
 
         // Build LLM context from current messages
         var llm_messages: std.ArrayListUnmanaged(ai.protocol.Message) = .{};
-        defer llm_messages.deinit(allocator);
+        defer llm_messages.deinit(arena_alloc);
         for (messages.items) |agent_msg| {
             switch (agent_msg) {
-                .user => |u| llm_messages.append(allocator, .{ .user = u }) catch continue,
-                .assistant => |a| llm_messages.append(allocator, .{ .assistant = a }) catch continue,
-                .tool_result => |t| llm_messages.append(allocator, .{ .tool_result = t }) catch continue,
-                .custom => continue,
+                .user => |u| llm_messages.append(arena_alloc, .{ .user = u }) catch continue,
+                .assistant => |a| llm_messages.append(arena_alloc, .{ .assistant = a }) catch continue,
+                .tool_result => |t| llm_messages.append(arena_alloc, .{ .tool_result = t }) catch continue,
+                .compaction_summary, .branch_summary, .custom => continue,
             }
         }
 
@@ -99,7 +107,7 @@ pub fn runAgentLoop(
             .sink = event_sink,
             .sink_ctx = event_ctx,
         };
-        prov.stream(allocator, model, llm_context, options, &StreamBridge.callback, @ptrCast(&bridge));
+        prov.stream(arena_alloc, model, llm_context, options, &StreamBridge.callback, @ptrCast(&bridge));
 
         const assistant_msg = bridge.final_message orelse {
             // No response at all — emit agent_end and bail
@@ -108,7 +116,7 @@ pub fn runAgentLoop(
         };
 
         // Add assistant message to context
-        messages.append(allocator, .{ .assistant = assistant_msg }) catch {};
+        messages.append(arena_alloc, .{ .assistant = assistant_msg }) catch {};
 
         // Check for error/aborted
         if (assistant_msg.stop_reason == .@"error" or assistant_msg.stop_reason == .aborted) {
@@ -140,7 +148,7 @@ pub fn runAgentLoop(
 
         // Execute tool calls sequentially
         var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .{};
-        defer tool_results.deinit(allocator);
+        defer tool_results.deinit(arena_alloc);
 
         for (assistant_msg.content) |block| {
             switch (block) {
@@ -155,10 +163,10 @@ pub fn runAgentLoop(
                     // Find tool — pi-mono: prepareToolCall (agent-loop.ts:472-522)
                     const tool = findTool(tools, tc.name);
                     if (tool == null) {
-                        const err_result = makeErrorToolResult(allocator, tc.id, tc.name, "tool not found");
+                        const err_result = makeErrorToolResult(arena_alloc, tc.id, tc.name, "tool not found");
                         emitToolResult(event_sink, event_ctx, tc, err_result, true, null);
-                        messages.append(allocator, .{ .tool_result = err_result }) catch {};
-                        tool_results.append(allocator, err_result) catch {};
+                        messages.append(arena_alloc, .{ .tool_result = err_result }) catch {};
+                        tool_results.append(arena_alloc, err_result) catch {};
                         continue;
                     }
 
@@ -166,7 +174,7 @@ pub fn runAgentLoop(
                     const t = tool.?;
                     const result = t.execute(
                         t.ctx,
-                        allocator,
+                        arena_alloc,
                         tc.id,
                         tc.arguments,
                         null, // signal
@@ -179,8 +187,8 @@ pub fn runAgentLoop(
                     var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .{};
                     for (result.content) |cb| {
                         switch (cb) {
-                            .text => |txt| trm_content.append(allocator, .{ .text = txt }) catch continue,
-                            .image => |img| trm_content.append(allocator, .{ .image = img }) catch continue,
+                            .text => |txt| trm_content.append(arena_alloc, .{ .text = txt }) catch continue,
+                            .image => |img| trm_content.append(arena_alloc, .{ .image = img }) catch continue,
                         }
                     }
 
@@ -194,8 +202,8 @@ pub fn runAgentLoop(
                     };
 
                     emitToolResult(event_sink, event_ctx, tc, tool_result_msg, result.is_error, result.details);
-                    messages.append(allocator, .{ .tool_result = tool_result_msg }) catch {};
-                    tool_results.append(allocator, tool_result_msg) catch {};
+                    messages.append(arena_alloc, .{ .tool_result = tool_result_msg }) catch {};
+                    tool_results.append(arena_alloc, tool_result_msg) catch {};
                 },
                 else => {},
             }

@@ -13,6 +13,15 @@ when a zi surface drifts from pi-mono, default assumption is to close the drift,
 - no compatibility theater if a bad api blocks the right architecture
 - no "quick fix" shim that papers over drift instead of removing it
 
+## JSON Serialization
+
+**do NOT hand-roll JSON.** use `std.json.Stringify` for writing and `std.json.parseFromSlice` for reading.
+
+- **writing**: create a `std.io.Writer.Allocating`, wrap in `std.json.Stringify`, use `jw.beginObject()` / `jw.objectField("camelCase")` / `jw.write(value)` / `jw.endObject()`. this handles escaping, commas, and nesting correctly. get output via `out.toOwnedSlice()`.
+- **reading**: parse into `std.json.Value` with `std.json.parseFromSlice`, extract fields by camelCase name. for struct-based parsing, use `std.json.parseFromSlice(MyStruct, ...)` when field names match.
+- **shared utils**: `packages/ai/src/json_util.zig` — `cloneJsonValue`, `jsonToFloat`, enum↔string converters (`providerToString`/`parseProvider`, `parseApi`, `stopReasonToString`/`parseStopReason`). use these instead of writing local copies.
+- **camelCase wire format**: zig structs use snake_case but pi-mono's JSON uses camelCase. we handle this with explicit `jw.objectField("camelCase")` calls — NOT by renaming struct fields.
+
 ## Implementation Process
 
 two failure modes, opposite directions:

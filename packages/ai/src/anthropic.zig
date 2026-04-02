@@ -450,320 +450,200 @@ fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockS
 }
 
 // =================================================================
-// JSON request building
+// JSON request building — uses std.json.Stringify
 // =================================================================
 
 fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool) !void {
-    try buf.append(allocator, '{');
+    var out = std.io.Writer.Allocating.fromArrayList(allocator, buf);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
 
-    // model
-    try jsonKey(allocator, buf, "model");
-    try jsonString(allocator, buf, model.id);
-    try buf.append(allocator, ',');
+    try jw.beginObject();
+    try jw.objectField("model");
+    try jw.write(model.id);
+    try jw.objectField("max_tokens");
+    try jw.write(options.max_tokens orelse model.max_tokens);
+    try jw.objectField("stream");
+    try jw.write(true);
 
-    // max_tokens
-    try jsonKey(allocator, buf, "max_tokens");
-    const max_tokens = options.max_tokens orelse model.max_tokens;
-    try jsonInt(allocator, buf, max_tokens);
-    try buf.append(allocator, ',');
-
-    // stream
-    try jsonKey(allocator, buf, "stream");
-    try jsonBool(allocator, buf, true);
-    try buf.append(allocator, ',');
-
-    // system prompt — OAuth tokens MUST include Claude Code identity prefix
     if (is_oauth) {
-        try jsonKey(allocator, buf, "system");
-        try buf.appendSlice(allocator, "[{\"type\":\"text\",\"text\":");
-        try jsonString(allocator, buf, "You are Claude Code, Anthropic's official CLI for Claude.");
-        try buf.appendSlice(allocator, "}");
+        try jw.objectField("system");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write("text");
+        try jw.objectField("text");
+        try jw.write("You are Claude Code, Anthropic's official CLI for Claude.");
+        try jw.endObject();
         if (context.system_prompt) |system| {
-            try buf.appendSlice(allocator, ",{\"type\":\"text\",\"text\":");
-            try jsonString(allocator, buf, system);
-            try buf.appendSlice(allocator, "}");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("text");
+            try jw.objectField("text");
+            try jw.write(system);
+            try jw.endObject();
         }
-        try buf.appendSlice(allocator, "],");
+        try jw.endArray();
     } else if (context.system_prompt) |system| {
-        try jsonKey(allocator, buf, "system");
-        try jsonString(allocator, buf, system);
-        try buf.append(allocator, ',');
+        try jw.objectField("system");
+        try jw.write(system);
     }
 
-    // messages
-    try jsonKey(allocator, buf, "messages");
-    try buf.append(allocator, '[');
-    for (context.messages, 0..) |msg, i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try buildMessageJson(allocator, buf, msg);
+    try jw.objectField("messages");
+    try jw.beginArray();
+    for (context.messages) |msg| {
+        try writeMessageJson(&jw, msg);
     }
-    try buf.append(allocator, ']');
+    try jw.endArray();
 
-    // tools (if provided)
     if (context.tools) |tools| {
         if (tools.len > 0) {
-            try buf.append(allocator, ',');
-            try jsonKey(allocator, buf, "tools");
-            try buildToolsJson(allocator, buf, tools);
+            try jw.objectField("tools");
+            try jw.beginArray();
+            for (tools) |tool| {
+                try jw.beginObject();
+                try jw.objectField("name");
+                try jw.write(tool.name);
+                try jw.objectField("description");
+                try jw.write(tool.description);
+                try jw.objectField("input_schema");
+                try jw.write(tool.parameters);
+                try jw.endObject();
+            }
+            try jw.endArray();
         }
     }
 
-    // temperature (if provided)
     if (options.temperature) |temp| {
-        try buf.append(allocator, ',');
-        try jsonKey(allocator, buf, "temperature");
-        try std.fmt.format(buf.writer(allocator), "{d}", .{temp});
+        try jw.objectField("temperature");
+        try jw.print("{d}", .{temp});
     }
 
-    try buf.append(allocator, '}');
+    try jw.endObject();
+    buf.* = out.toArrayList();
 }
 
-fn buildMessageJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), msg: protocol.Message) !void {
-    try buf.append(allocator, '{');
-
+fn writeMessageJson(jw: *std.json.Stringify, msg: protocol.Message) !void {
+    try jw.beginObject();
     switch (msg) {
         .user => |user| {
-            try jsonKey(allocator, buf, "role");
-            try jsonString(allocator, buf, "user");
-            try buf.append(allocator, ',');
-            try jsonKey(allocator, buf, "content");
+            try jw.objectField("role");
+            try jw.write("user");
+            try jw.objectField("content");
             switch (user.content) {
-                .text => |text_val| {
-                    try jsonString(allocator, buf, text_val);
-                },
+                .text => |text_val| try jw.write(text_val),
                 .blocks => |blocks| {
-                    try buf.append(allocator, '[');
-                    for (blocks, 0..) |block, i| {
-                        if (i > 0) try buf.append(allocator, ',');
+                    try jw.beginArray();
+                    for (blocks) |block| {
                         switch (block) {
                             .text => |t| {
-                                try buf.append(allocator, '{');
-                                try jsonKey(allocator, buf, "type");
-                                try jsonString(allocator, buf, "text");
-                                try buf.append(allocator, ',');
-                                try jsonKey(allocator, buf, "text");
-                                try jsonString(allocator, buf, t.text);
-                                try buf.append(allocator, '}');
+                                try jw.beginObject();
+                                try jw.objectField("type");
+                                try jw.write("text");
+                                try jw.objectField("text");
+                                try jw.write(t.text);
+                                try jw.endObject();
                             },
-                            .image => |img| {
-                                try buf.append(allocator, '{');
-                                try jsonKey(allocator, buf, "type");
-                                try jsonString(allocator, buf, "image");
-                                try buf.append(allocator, ',');
-                                try jsonKey(allocator, buf, "source");
-                                try buf.append(allocator, '{');
-                                try jsonKey(allocator, buf, "type");
-                                try jsonString(allocator, buf, "base64");
-                                try buf.append(allocator, ',');
-                                try jsonKey(allocator, buf, "media_type");
-                                try jsonString(allocator, buf, img.mime_type);
-                                try buf.append(allocator, ',');
-                                try jsonKey(allocator, buf, "data");
-                                try jsonString(allocator, buf, img.data);
-                                try buf.append(allocator, '}');
-                                try buf.append(allocator, '}');
-                            },
+                            .image => |img| try writeAnthropicImageBlock(jw, img),
                         }
                     }
-                    try buf.append(allocator, ']');
+                    try jw.endArray();
                 },
             }
         },
         .assistant => |assistant| {
-            try jsonKey(allocator, buf, "role");
-            try jsonString(allocator, buf, "assistant");
-            try buf.append(allocator, ',');
-            try jsonKey(allocator, buf, "content");
-            try buf.append(allocator, '[');
-            for (assistant.content, 0..) |block, i| {
-                if (i > 0) try buf.append(allocator, ',');
+            try jw.objectField("role");
+            try jw.write("assistant");
+            try jw.objectField("content");
+            try jw.beginArray();
+            for (assistant.content) |block| {
                 switch (block) {
                     .text => |t| {
-                        try buf.append(allocator, '{');
-                        try jsonKey(allocator, buf, "type");
-                        try jsonString(allocator, buf, "text");
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "text");
-                        try jsonString(allocator, buf, t.text);
-                        try buf.append(allocator, '}');
+                        try jw.beginObject();
+                        try jw.objectField("type");
+                        try jw.write("text");
+                        try jw.objectField("text");
+                        try jw.write(t.text);
+                        try jw.endObject();
                     },
                     .thinking => |th| {
-                        try buf.append(allocator, '{');
-                        try jsonKey(allocator, buf, "type");
-                        try jsonString(allocator, buf, "thinking");
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "thinking");
-                        try jsonString(allocator, buf, th.thinking);
+                        try jw.beginObject();
+                        try jw.objectField("type");
+                        try jw.write("thinking");
+                        try jw.objectField("thinking");
+                        try jw.write(th.thinking);
                         if (th.thinking_signature) |sig| {
-                            try buf.append(allocator, ',');
-                            try jsonKey(allocator, buf, "signature");
-                            try jsonString(allocator, buf, sig);
+                            try jw.objectField("signature");
+                            try jw.write(sig);
                         }
-                        try buf.append(allocator, '}');
+                        try jw.endObject();
                     },
                     .tool_call => |tc| {
-                        try buf.append(allocator, '{');
-                        try jsonKey(allocator, buf, "type");
-                        try jsonString(allocator, buf, "tool_use");
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "id");
-                        try jsonString(allocator, buf, tc.id);
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "name");
-                        try jsonString(allocator, buf, tc.name);
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "input");
-                        try jsonValue(allocator, buf, tc.arguments);
-                        try buf.append(allocator, '}');
+                        try jw.beginObject();
+                        try jw.objectField("type");
+                        try jw.write("tool_use");
+                        try jw.objectField("id");
+                        try jw.write(tc.id);
+                        try jw.objectField("name");
+                        try jw.write(tc.name);
+                        try jw.objectField("input");
+                        try jw.write(tc.arguments);
+                        try jw.endObject();
                     },
                 }
             }
-            try buf.append(allocator, ']');
+            try jw.endArray();
         },
         .tool_result => |tr| {
-            try jsonKey(allocator, buf, "role");
-            try jsonString(allocator, buf, "user");
-            try buf.append(allocator, ',');
-            try jsonKey(allocator, buf, "content");
-            try buf.append(allocator, '[');
-            try buf.append(allocator, '{');
-            try jsonKey(allocator, buf, "type");
-            try jsonString(allocator, buf, "tool_result");
-            try buf.append(allocator, ',');
-            try jsonKey(allocator, buf, "tool_use_id");
-            try jsonString(allocator, buf, tr.tool_call_id);
-            try buf.append(allocator, ',');
-            try jsonKey(allocator, buf, "content");
-            try buf.append(allocator, '[');
-            for (tr.content, 0..) |content_block, i| {
-                if (i > 0) try buf.append(allocator, ',');
+            try jw.objectField("role");
+            try jw.write("user");
+            try jw.objectField("content");
+            try jw.beginArray();
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("tool_result");
+            try jw.objectField("tool_use_id");
+            try jw.write(tr.tool_call_id);
+            try jw.objectField("content");
+            try jw.beginArray();
+            for (tr.content) |content_block| {
                 switch (content_block) {
                     .text => |t| {
-                        try buf.append(allocator, '{');
-                        try jsonKey(allocator, buf, "type");
-                        try jsonString(allocator, buf, "text");
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "text");
-                        try jsonString(allocator, buf, t.text);
-                        try buf.append(allocator, '}');
+                        try jw.beginObject();
+                        try jw.objectField("type");
+                        try jw.write("text");
+                        try jw.objectField("text");
+                        try jw.write(t.text);
+                        try jw.endObject();
                     },
-                    .image => |img| {
-                        try buf.append(allocator, '{');
-                        try jsonKey(allocator, buf, "type");
-                        try jsonString(allocator, buf, "image");
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "source");
-                        try buf.append(allocator, '{');
-                        try jsonKey(allocator, buf, "type");
-                        try jsonString(allocator, buf, "base64");
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "media_type");
-                        try jsonString(allocator, buf, img.mime_type);
-                        try buf.append(allocator, ',');
-                        try jsonKey(allocator, buf, "data");
-                        try jsonString(allocator, buf, img.data);
-                        try buf.append(allocator, '}');
-                        try buf.append(allocator, '}');
-                    },
+                    .image => |img| try writeAnthropicImageBlock(jw, img),
                 }
             }
-            try buf.append(allocator, ']');
+            try jw.endArray();
             if (tr.is_error) {
-                try buf.append(allocator, ',');
-                try jsonKey(allocator, buf, "is_error");
-                try jsonBool(allocator, buf, true);
+                try jw.objectField("is_error");
+                try jw.write(true);
             }
-            try buf.append(allocator, '}');
-            try buf.append(allocator, ']');
+            try jw.endObject();
+            try jw.endArray();
         },
     }
-
-    try buf.append(allocator, '}');
+    try jw.endObject();
 }
 
-fn buildToolsJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), tools: []const protocol.Tool) !void {
-    try buf.append(allocator, '[');
-    for (tools, 0..) |tool, i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try buf.append(allocator, '{');
-        try jsonKey(allocator, buf, "name");
-        try jsonString(allocator, buf, tool.name);
-        try buf.append(allocator, ',');
-        try jsonKey(allocator, buf, "description");
-        try jsonString(allocator, buf, tool.description);
-        try buf.append(allocator, ',');
-        try jsonKey(allocator, buf, "input_schema");
-        try jsonValue(allocator, buf, tool.parameters);
-        try buf.append(allocator, '}');
-    }
-    try buf.append(allocator, ']');
-}
-
-// =================================================================
-// JSON helpers
-// =================================================================
-
-fn jsonString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            0x08 => try buf.appendSlice(allocator, "\\b"),
-            0x0C => try buf.appendSlice(allocator, "\\f"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            0x00...0x07, 0x0B, 0x0E...0x1f => try std.fmt.format(buf.writer(allocator), "\\u{x:0>4}", .{c}),
-            else => try buf.append(allocator, c),
-        }
-    }
-    try buf.append(allocator, '"');
-}
-
-fn jsonKey(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), key: []const u8) !void {
-    try jsonString(allocator, buf, key);
-    try buf.append(allocator, ':');
-}
-
-fn jsonInt(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), n: anytype) !void {
-    try std.fmt.format(buf.writer(allocator), "{d}", .{n});
-}
-
-fn jsonBool(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), b: bool) !void {
-    try buf.appendSlice(allocator, if (b) "true" else "false");
-}
-
-fn jsonValue(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
-    switch (value) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |n| try std.fmt.format(buf.writer(allocator), "{d}", .{n}),
-        .float => |f| try std.fmt.format(buf.writer(allocator), "{d}", .{f}),
-        .number_string => |s| try buf.appendSlice(allocator, s),
-        .string => |s| try jsonString(allocator, buf, s),
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, i| {
-                if (i > 0) try buf.append(allocator, ',');
-                try jsonValue(allocator, buf, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var first = true;
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                try jsonString(allocator, buf, entry.key_ptr.*);
-                try buf.append(allocator, ':');
-                try jsonValue(allocator, buf, entry.value_ptr.*);
-            }
-            try buf.append(allocator, '}');
-        },
-    }
+fn writeAnthropicImageBlock(jw: *std.json.Stringify, img: protocol.ImageContent) !void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("image");
+    try jw.objectField("source");
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("base64");
+    try jw.objectField("media_type");
+    try jw.write(img.mime_type);
+    try jw.objectField("data");
+    try jw.write(img.data);
+    try jw.endObject();
+    try jw.endObject();
 }
 
 // =================================================================

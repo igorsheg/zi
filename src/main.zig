@@ -1,6 +1,8 @@
 const std = @import("std");
 const ai = @import("ai");
+const auth = @import("auth");
 const agent = @import("agent");
+const session = @import("session");
 const bash_tool = @import("tools/bash.zig");
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
@@ -133,6 +135,13 @@ pub fn main() !void {
             .max_tokens = 4096,
         };
 
+        // Session writer — persists messages incrementally on message_end,
+        // gated on first assistant message (matches pi-mono behavior).
+        const cwd_buf = std.fs.cwd().realpathAlloc(allocator, ".") catch "/unknown";
+        var sw = session.writer.SessionWriter.init(allocator, cwd_buf);
+
+        var handler = PrintSessionHandler{ .session_writer = &sw };
+
         agent.loop.runAgentLoop(
             allocator,
             &registry,
@@ -141,43 +150,55 @@ pub fn main() !void {
             &.{user_msg},
             &tools,
             options,
-            &printHandler,
-            null,
+            &PrintSessionHandler.callback,
+            @ptrCast(&handler),
         );
 
         try stdout.writeAll("\n");
+
+        if (sw.flushed) {
+            stderr.writeAll("session: ") catch {};
+            stderr.writeAll(sw.session_file) catch {};
+            stderr.writeAll("\n") catch {};
+        }
     } else {
         try stderr.writeAll("error: interactive mode not yet implemented. use -p flag.\n");
         std.process.exit(1);
     }
 }
 
-fn printHandler(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {
-    switch (event) {
-        .message_update => |mu| {
-            switch (mu.assistant_message_event) {
-                .text_delta => |d| stdout.writeAll(d.delta) catch {},
-                .@"error" => |e| {
-                    if (e.@"error".error_message) |msg| {
-                        stderr.writeAll("\nerror: ") catch {};
-                        stderr.writeAll(msg) catch {};
-                        stderr.writeAll("\n") catch {};
-                    }
-                },
-                else => {},
-            }
-        },
-        .tool_execution_start => |te| {
-            stderr.writeAll("⚡ ") catch {};
-            stderr.writeAll(te.tool_name) catch {};
-            stderr.writeAll("\n") catch {};
-        },
-        .tool_execution_end => {
-            // tool done — next streaming response will follow
-        },
-        else => {},
+/// Event handler: prints to stdout/stderr AND persists messages on message_end.
+const PrintSessionHandler = struct {
+    session_writer: *session.writer.SessionWriter,
+
+    fn callback(event: agent.protocol.AgentEvent, ctx: ?*anyopaque) void {
+        const self: *PrintSessionHandler = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .message_update => |mu| {
+                switch (mu.assistant_message_event) {
+                    .text_delta => |d| stdout.writeAll(d.delta) catch {},
+                    .@"error" => |e| {
+                        if (e.@"error".error_message) |msg| {
+                            stderr.writeAll("\nerror: ") catch {};
+                            stderr.writeAll(msg) catch {};
+                            stderr.writeAll("\n") catch {};
+                        }
+                    },
+                    else => {},
+                }
+            },
+            .tool_execution_start => |te| {
+                stderr.writeAll("⚡ ") catch {};
+                stderr.writeAll(te.tool_name) catch {};
+                stderr.writeAll("\n") catch {};
+            },
+            .message_end => |me| {
+                self.session_writer.appendMessage(me.message);
+            },
+            else => {},
+        }
     }
-}
+};
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);

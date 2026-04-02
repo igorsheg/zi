@@ -68,9 +68,6 @@ pub fn modelsAreEqual(a: ?protocol.Model, b: ?protocol.Model) bool {
 /// Total number of models in the catalog.
 pub const model_count = generated.models.len;
 
-test "catalog has models" {
-    try std.testing.expect(model_count > 0);
-}
 
 test "find anthropic sonnet by id" {
     const m = getModelById("claude-sonnet-4-20250514") orelse

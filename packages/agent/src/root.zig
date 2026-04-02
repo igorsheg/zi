@@ -3,4 +3,5 @@ pub const loop = @import("loop.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("loop_test.zig");
 }
