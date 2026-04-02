@@ -14,7 +14,8 @@ pub fn main() !void {
     var show_help = false;
     var show_version = false;
     var api_key_arg: ?[]const u8 = null;
-    var model_id: []const u8 = "claude-sonnet-4-20250514";
+    var model_id: ?[]const u8 = null;
+    var list_models = false;
     var prompt_text: ?[]const u8 = null;
 
     var args = std.process.args();
@@ -30,6 +31,8 @@ pub fn main() !void {
             api_key_arg = args.next();
         } else if (eql(arg, "--model")) {
             if (args.next()) |m| model_id = m;
+        } else if (eql(arg, "--list-models")) {
+            list_models = true;
         } else if (arg.len > 0 and arg[0] != '-') {
             prompt_text = arg;
         }
@@ -46,13 +49,27 @@ pub fn main() !void {
             \\Usage: zi [options] [message]
             \\
             \\Options:
-            \\  -p, --print         Non-interactive mode
-            \\  --model <id>        Model ID (default: claude-sonnet-4-20250514)
-            \\  --api-key <key>     API key (or set ANTHROPIC_API_KEY)
-            \\  -h, --help          Show help
-            \\  -v, --version       Show version
+            \\  -p, --print           Non-interactive mode
+            \\  --model <id>          Model ID or pattern (default: claude-sonnet-4-20250514)
+            \\  --api-key <key>       API key (or set ANTHROPIC_API_KEY)
+            \\  --list-models         List available models
+            \\  -h, --help            Show help
+            \\  -v, --version         Show version
             \\
         );
+        return;
+    }
+
+    if (list_models) {
+        const all = ai.models.getAllModels();
+        for (all) |m| {
+            stdout.writeAll(ai.provider.apiToString(m.api)) catch {};
+            stdout.writeAll("\t") catch {};
+            stdout.writeAll(m.id) catch {};
+            stdout.writeAll("\t") catch {};
+            stdout.writeAll(m.name) catch {};
+            stdout.writeAll("\n") catch {};
+        }
         return;
     }
 
@@ -61,6 +78,26 @@ pub fn main() !void {
             try stderr.writeAll("error: no prompt provided\n");
             std.process.exit(1);
         };
+
+        // Resolve model from catalog
+        const resolved_id = model_id orelse "claude-sonnet-4-20250514";
+        const model = ai.models.getModelById(resolved_id) orelse
+            ai.models.findModel(resolved_id) orelse {
+            try stderr.writeAll("error: model not found: ");
+            try stderr.writeAll(resolved_id);
+            try stderr.writeAll("\nuse --list-models to see available models\n");
+            std.process.exit(1);
+        };
+
+        // Only anthropic provider implemented for now
+        if (!std.meta.eql(model.api, .anthropic_messages)) {
+            try stderr.writeAll("error: only anthropic models supported currently. model '");
+            try stderr.writeAll(model.id);
+            try stderr.writeAll("' uses api '");
+            try stderr.writeAll(ai.provider.apiToString(model.api));
+            try stderr.writeAll("'\n");
+            std.process.exit(1);
+        }
 
         const key = api_key_arg orelse std.posix.getenv("ANTHROPIC_API_KEY") orelse {
             try stderr.writeAll("error: no API key. set ANTHROPIC_API_KEY or use --api-key\n");
@@ -73,19 +110,6 @@ pub fn main() !void {
         var registry = ai.provider.Registry.init(allocator);
         defer registry.deinit();
         try registry.register("anthropic-messages", prov, null);
-
-        const model = ai.protocol.Model{
-            .id = model_id,
-            .name = model_id,
-            .api = .anthropic_messages,
-            .provider = .anthropic,
-            .base_url = "https://api.anthropic.com",
-            .reasoning = false,
-            .input = &.{.text},
-            .cost = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 },
-            .context_window = 200000,
-            .max_tokens = 8192,
-        };
 
         const user_msg = agent.protocol.AgentMessage{
             .user = .{
