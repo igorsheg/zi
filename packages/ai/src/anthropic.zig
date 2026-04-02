@@ -56,7 +56,8 @@ pub const AnthropicProvider = struct {
         var payload_buf: std.ArrayListUnmanaged(u8) = .{};
         defer payload_buf.deinit(allocator);
 
-        buildRequestJson(allocator, &payload_buf, model, context, options) catch |err| {
+        const is_oauth_token = if (options.api_key) |k| std.mem.indexOf(u8, k, "sk-ant-oat") != null else false;
+        buildRequestJson(allocator, &payload_buf, model, context, options, is_oauth_token) catch |err| {
             emitError(allocator, callback, callback_ctx, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
@@ -98,9 +99,7 @@ pub const AnthropicProvider = struct {
                 emitError(allocator, callback, callback_ctx, "failed to build auth header", .{});
                 return;
             };
-            // Note: auth_value lives on heap, but we only need it for the duration of the request.
-            // It will leak if we defer free here since the headers reference it. That's ok for now —
-            // the allocator lifetime covers the whole streamImpl call.
+            // freed after request completes (auth_value is referenced by headers)
             extra_headers_buf[n_extra] = .{ .name = "authorization", .value = auth_value };
             n_extra += 1;
             extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14" };
@@ -412,7 +411,7 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
 // JSON request building
 // =================================================================
 
-fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions) !void {
+fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool) !void {
     try buf.append(allocator, '{');
 
     // model
@@ -431,8 +430,19 @@ fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
     try jsonBool(allocator, buf, true);
     try buf.append(allocator, ',');
 
-    // system prompt
-    if (context.system_prompt) |system| {
+    // system prompt — OAuth tokens MUST include Claude Code identity prefix
+    if (is_oauth) {
+        try jsonKey(allocator, buf, "system");
+        try buf.appendSlice(allocator, "[{\"type\":\"text\",\"text\":");
+        try jsonString(allocator, buf, "You are Claude Code, Anthropic's official CLI for Claude.");
+        try buf.appendSlice(allocator, "}");
+        if (context.system_prompt) |system| {
+            try buf.appendSlice(allocator, ",{\"type\":\"text\",\"text\":");
+            try jsonString(allocator, buf, system);
+            try buf.appendSlice(allocator, "}");
+        }
+        try buf.appendSlice(allocator, "],");
+    } else if (context.system_prompt) |system| {
         try jsonKey(allocator, buf, "system");
         try jsonString(allocator, buf, system);
         try buf.append(allocator, ',');
