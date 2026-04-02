@@ -236,9 +236,20 @@ pub const AnthropicProvider = struct {
             }
         }
 
+        // Build final content blocks from accumulated streaming state.
+        // Allocations go through the caller's allocator (arena) so they survive
+        // after this function returns.
+        state.partial.content = buildFinalContent(allocator, state.content_blocks.items) catch &.{};
+
         // Emit final done event
         if (state.stop_reason) |sr| {
             const done_reason: protocol.AssistantMessageEvent.DoneReason = switch (sr) {
+                .end_turn => .stop,
+                .max_tokens => .length,
+                .tool_use => .toolUse,
+                else => .stop,
+            };
+            state.partial.stop_reason = switch (sr) {
                 .end_turn => .stop,
                 .max_tokens => .length,
                 .tool_use => .toolUse,
@@ -323,12 +334,13 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
                 callback(.{ .thinking_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
             } else if (std.mem.eql(u8, block_type, "tool_use")) {
                 var block = ContentBlockState.init(.tool_call, index);
-                const tool_id = extractJsonField(block_json, "id") orelse "";
-                const tool_name = extractJsonField(block_json, "name") orelse "";
+                // Dupe id/name immediately — SSE buffer gets overwritten on next read
+                const tool_id = state.allocator.dupe(u8, extractJsonField(block_json, "id") orelse "") catch "";
+                const tool_name = state.allocator.dupe(u8, extractJsonField(block_json, "name") orelse "") catch "";
                 block.tool_call = .{
                     .id = tool_id,
                     .name = tool_name,
-                    .arguments = .{ .null = {} },
+                    .arguments = .null,
                     .thought_signature = null,
                 };
                 state.content_blocks.append(state.allocator, block) catch return;
@@ -341,26 +353,29 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             const index = extractJsonInt(data, "index") orelse return;
 
             if (std.mem.eql(u8, delta_type, "text_delta")) {
-                if (extractJsonString(delta_json, "text")) |text_val| {
+                if (extractJsonString(delta_json, "text")) |text_raw| {
+                    const text_val = jsonUnescapeString(state.allocator, text_raw);
                     if (index < state.content_blocks.items.len) {
                         state.content_blocks.items[index].text.appendSlice(state.allocator, text_val) catch return;
                         callback(.{ .text_delta = .{ .content_index = index, .delta = text_val, .partial = state.partial } }, callback_ctx);
                     }
                 }
             } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
-                if (extractJsonString(delta_json, "thinking")) |thinking_val| {
+                if (extractJsonString(delta_json, "thinking")) |thinking_raw| {
+                    const thinking_val = jsonUnescapeString(state.allocator, thinking_raw);
                     if (index < state.content_blocks.items.len) {
                         state.content_blocks.items[index].thinking.appendSlice(state.allocator, thinking_val) catch return;
                         callback(.{ .thinking_delta = .{ .content_index = index, .delta = thinking_val, .partial = state.partial } }, callback_ctx);
                     }
                 }
             } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
-                if (extractJsonString(delta_json, "partial_json")) |json_delta| {
+                if (extractJsonString(delta_json, "partial_json")) |json_delta_raw| {
+                    const json_delta = jsonUnescapeString(state.allocator, json_delta_raw);
                     if (index < state.content_blocks.items.len) {
                         const block = &state.content_blocks.items[index];
                         if (block.tool_call) |*tc| {
                             block.text.appendSlice(state.allocator, json_delta) catch return;
-                            tc.arguments = parsePartialJson(block.text.items);
+                            tc.arguments = parsePartialJson(state.allocator, block.text.items);
                         }
                         callback(.{ .toolcall_delta = .{ .content_index = index, .delta = json_delta, .partial = state.partial } }, callback_ctx);
                     }
@@ -381,9 +396,9 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             },
             .tool_call => {
                 if (block.tool_call) |tc| {
-                    const final_args = parsePartialJson(block.text.items);
                     var final_tc = tc;
-                    final_tc.arguments = final_args;
+                    final_tc.arguments = parsePartialJson(state.allocator, block.text.items);
+                    block.tool_call = final_tc;
                     callback(.{ .toolcall_end = .{ .content_index = index, .tool_call = final_tc, .partial = state.partial } }, callback_ctx);
                 }
             },
@@ -408,6 +423,30 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             emitErrorDirect(callback, callback_ctx, err_msg);
         }
     }
+}
+
+// =================================================================
+// Final content building
+// =================================================================
+
+fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockState) ![]const protocol.AssistantMessage.AssistantContentBlock {
+    const content = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, blocks.len);
+    for (blocks, 0..) |block, i| {
+        content[i] = switch (block.block_type) {
+            .text => .{ .text = .{
+                .text = try allocator.dupe(u8, block.text.items),
+            } },
+            .thinking => .{ .thinking = .{
+                .thinking = try allocator.dupe(u8, block.thinking.items),
+            } },
+            .tool_call => .{ .tool_call = block.tool_call orelse .{
+                .id = "",
+                .name = "",
+                .arguments = .null,
+            } },
+        };
+    }
+    return content;
 }
 
 // =================================================================
@@ -574,9 +613,7 @@ fn buildMessageJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
                         try jsonString(allocator, buf, tc.name);
                         try buf.append(allocator, ',');
                         try jsonKey(allocator, buf, "input");
-                        // TODO: serialize tc.arguments (std.json.Value) — not needed for text-only vertical slice
-                        try buf.appendSlice(allocator, "{}");
-
+                        try jsonValue(allocator, buf, tc.arguments);
                         try buf.append(allocator, '}');
                     },
                 }
@@ -631,6 +668,11 @@ fn buildMessageJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
                 }
             }
             try buf.append(allocator, ']');
+            if (tr.is_error) {
+                try buf.append(allocator, ',');
+                try jsonKey(allocator, buf, "is_error");
+                try jsonBool(allocator, buf, true);
+            }
             try buf.append(allocator, '}');
             try buf.append(allocator, ']');
         },
@@ -651,8 +693,7 @@ fn buildToolsJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8)
         try jsonString(allocator, buf, tool.description);
         try buf.append(allocator, ',');
         try jsonKey(allocator, buf, "input_schema");
-        // TODO: serialize tool.parameters (std.json.Value)
-        try buf.appendSlice(allocator, "{}");
+        try jsonValue(allocator, buf, tool.parameters);
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
@@ -691,6 +732,38 @@ fn jsonInt(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), n: an
 
 fn jsonBool(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), b: bool) !void {
     try buf.appendSlice(allocator, if (b) "true" else "false");
+}
+
+fn jsonValue(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
+    switch (value) {
+        .null => try buf.appendSlice(allocator, "null"),
+        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
+        .integer => |n| try std.fmt.format(buf.writer(allocator), "{d}", .{n}),
+        .float => |f| try std.fmt.format(buf.writer(allocator), "{d}", .{f}),
+        .number_string => |s| try buf.appendSlice(allocator, s),
+        .string => |s| try jsonString(allocator, buf, s),
+        .array => |arr| {
+            try buf.append(allocator, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try buf.append(allocator, ',');
+                try jsonValue(allocator, buf, item);
+            }
+            try buf.append(allocator, ']');
+        },
+        .object => |obj| {
+            try buf.append(allocator, '{');
+            var first = true;
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                try jsonString(allocator, buf, entry.key_ptr.*);
+                try buf.append(allocator, ':');
+                try jsonValue(allocator, buf, entry.value_ptr.*);
+            }
+            try buf.append(allocator, '}');
+        },
+    }
 }
 
 // =================================================================
@@ -748,16 +821,75 @@ fn extractJsonString(json: []const u8, field: []const u8) ?[]const u8 {
     return extractJsonField(json, field);
 }
 
+/// Unescape a JSON string value extracted by extractJsonField.
+/// extractJsonField returns the raw content between quotes, with escape sequences intact.
+/// This function resolves: \" \\ \/ \n \r \t \b \f
+fn jsonUnescapeString(allocator: std.mem.Allocator, s: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, s, "\\") == null) return s;
+
+    var result: std.ArrayListUnmanaged(u8) = .{};
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\\' and i + 1 < s.len) {
+            const next = s[i + 1];
+            switch (next) {
+                '"' => {
+                    result.append(allocator, '"') catch {};
+                    i += 2;
+                },
+                '\\' => {
+                    result.append(allocator, '\\') catch {};
+                    i += 2;
+                },
+                '/' => {
+                    result.append(allocator, '/') catch {};
+                    i += 2;
+                },
+                'n' => {
+                    result.append(allocator, '\n') catch {};
+                    i += 2;
+                },
+                'r' => {
+                    result.append(allocator, '\r') catch {};
+                    i += 2;
+                },
+                't' => {
+                    result.append(allocator, '\t') catch {};
+                    i += 2;
+                },
+                'b' => {
+                    result.append(allocator, 0x08) catch {};
+                    i += 2;
+                },
+                'f' => {
+                    result.append(allocator, 0x0C) catch {};
+                    i += 2;
+                },
+                else => {
+                    result.append(allocator, s[i]) catch {};
+                    i += 1;
+                },
+            }
+        } else {
+            result.append(allocator, s[i]) catch {};
+            i += 1;
+        }
+    }
+    return result.items;
+}
+
 fn extractJsonInt(json: []const u8, field: []const u8) ?u64 {
     const val = extractJsonField(json, field) orelse return null;
     return std.fmt.parseInt(u64, val, 10) catch null;
 }
 
-fn parsePartialJson(json_str: []const u8) std.json.Value {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, json_str, .{ .allocate = .alloc_if_needed }) catch {
-        return .{ .null = {} };
+fn parsePartialJson(allocator: std.mem.Allocator, json_str: []const u8) std.json.Value {
+    if (json_str.len == 0) return .null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{ .allocate = .alloc_if_needed }) catch {
+        return .null;
     };
-    defer parsed.deinit();
+    // Intentionally not calling parsed.deinit() — caller's arena owns the memory.
+    // This avoids dangling pointers in tool_call.arguments json values.
     return parsed.value;
 }
 

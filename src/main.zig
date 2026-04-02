@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
+const bash_tool = @import("tools/bash.zig");
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
@@ -8,7 +9,11 @@ const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+
+    // Arena allocator for the entire run. No explicit frees needed in print mode.
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     var print_mode = false;
     var show_help = false;
@@ -118,9 +123,9 @@ pub fn main() !void {
             },
         };
 
-        const context = agent.protocol.AgentContext{
-            .system_prompt = "You are a helpful assistant. Be concise.",
-            .messages = &.{user_msg},
+        // Build tools
+        const tools = [_]agent.protocol.AgentTool{
+            bash_tool.makeTool(),
         };
 
         const options = ai.protocol.StreamOptions{
@@ -128,11 +133,13 @@ pub fn main() !void {
             .max_tokens = 4096,
         };
 
-        agent.loop.runSingleTurn(
+        agent.loop.runAgentLoop(
             allocator,
             &registry,
             model,
-            context,
+            "You are a helpful assistant. Be concise. You have access to a bash tool to execute commands.",
+            &.{user_msg},
+            &tools,
             options,
             &printHandler,
             null,
@@ -159,6 +166,14 @@ fn printHandler(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {
                 },
                 else => {},
             }
+        },
+        .tool_execution_start => |te| {
+            stderr.writeAll("⚡ ") catch {};
+            stderr.writeAll(te.tool_name) catch {};
+            stderr.writeAll("\n") catch {};
+        },
+        .tool_execution_end => {
+            // tool done — next streaming response will follow
         },
         else => {},
     }

@@ -74,6 +74,7 @@ pub const AgentMessage = union(enum) {
 pub const AgentToolResult = struct {
     content: []const ContentBlock,
     details: std.json.Value = .null,
+    is_error: bool = false,
 
     pub const ContentBlock = union(enum) {
         text: TextContent,
@@ -92,9 +93,13 @@ pub const AgentTool = struct {
     description: []const u8,
     label: []const u8,
     parameters: std.json.Value,
+    /// Opaque context pointer for tool state (cwd, config, etc).
+    ctx: ?*anyopaque = null,
     /// Optional compatibility shim for raw tool-call arguments before schema validation.
     prepare_arguments: ?*const fn (args: std.json.Value) std.json.Value = null,
     execute: *const fn (
+        ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
         tool_call_id: []const u8,
         args: std.json.Value,
         signal: ?*anyopaque,
