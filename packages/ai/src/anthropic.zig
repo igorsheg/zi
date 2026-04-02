@@ -89,17 +89,18 @@ pub const AnthropicProvider = struct {
         extra_headers_buf[n_extra] = .{ .name = "anthropic-version", .value = "2023-06-01" };
         n_extra += 1;
 
+
         // OAuth tokens (sk-ant-oat*) use Bearer auth + claude-code identity headers.
         // API keys use x-api-key header.
         const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
 
+        // Stack buffer for Bearer auth header value
+        var auth_buf: [4096]u8 = undefined;
         if (is_oauth) {
-            // Build "Bearer <token>" — need allocator for concat
-            const auth_value = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
-                emitError(allocator, callback, callback_ctx, "failed to build auth header", .{});
+            const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
+                emitError(allocator, callback, callback_ctx, "API key too long for auth buffer", .{});
                 return;
             };
-            // freed after request completes (auth_value is referenced by headers)
             extra_headers_buf[n_extra] = .{ .name = "authorization", .value = auth_value };
             n_extra += 1;
             extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14" };
@@ -124,11 +125,12 @@ pub const AnthropicProvider = struct {
             }
         }
 
-        // Send request (zig 0.15 API)
+        // Send request (zig 0.15 API) — disable compression so SSE arrives as plaintext
         var req = client.request(.POST, uri, .{
             .extra_headers = extra_headers_buf[0..n_extra],
             .headers = .{
                 .content_type = .{ .override = "application/json" },
+                .accept_encoding = .{ .override = "identity" },
             },
         }) catch |err| {
             emitError(allocator, callback, callback_ctx, "failed to open connection: {s}", .{@errorName(err)});
@@ -208,6 +210,7 @@ pub const AnthropicProvider = struct {
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
         // Process SSE events line by line (zig 0.15: takeDelimiterInclusive)
+
         while (true) {
             const line_with_nl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => {
