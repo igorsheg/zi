@@ -17,6 +17,19 @@ pub const StopReason = ai.protocol.StopReason;
 pub const StreamOptions = ai.protocol.StreamOptions;
 pub const SimpleStreamOptions = ai.protocol.SimpleStreamOptions;
 
+/// Stream function type used by the agent loop.
+/// pi-mono source: packages/agent/src/types.ts:24-26
+/// In zig, streaming is done via Provider.streamSimple — this type captures
+/// the equivalent callback signature for use in AgentLoopConfig.
+pub const StreamFn = *const fn (
+    allocator: std.mem.Allocator,
+    model: Model,
+    context: ai.protocol.Context,
+    options: ai.protocol.SimpleStreamOptions,
+    callback: ai.provider.EventCallback,
+    callback_ctx: ?*anyopaque,
+) void;
+
 /// Thinking/reasoning level — extends ai.ThinkingLevel with "off".
 /// pi-mono source: packages/agent/src/types.ts:220
 pub const ThinkingLevel = enum {
@@ -34,6 +47,10 @@ pub const ToolExecutionMode = enum {
     sequential,
     parallel,
 };
+
+/// Alias for ToolCall when used in agent context.
+/// pi-mono source: packages/agent/src/types.ts:38
+pub const AgentToolCall = ToolCall;
 
 /// Agent message — union of LLM messages + custom app messages.
 /// pi-mono source: packages/agent/src/types.ts:245
@@ -56,7 +73,7 @@ pub const AgentMessage = union(enum) {
 /// pi-mono source: packages/agent/src/types.ts:281-286
 pub const AgentToolResult = struct {
     content: []const ContentBlock,
-    details: ?std.json.Value = null,
+    details: std.json.Value = .null,
 
     pub const ContentBlock = union(enum) {
         text: TextContent,
@@ -75,6 +92,8 @@ pub const AgentTool = struct {
     description: []const u8,
     label: []const u8,
     parameters: std.json.Value,
+    /// Optional compatibility shim for raw tool-call arguments before schema validation.
+    prepare_arguments: ?*const fn (args: std.json.Value) std.json.Value = null,
     execute: *const fn (
         tool_call_id: []const u8,
         args: std.json.Value,
@@ -113,6 +132,7 @@ pub const AgentState = struct {
     messages: []const AgentMessage = &.{},
     is_streaming: bool = false,
     streaming_message: ?AgentMessage = null,
+    pending_tool_calls: []const []const u8 = &.{},
     error_message: ?[]const u8 = null,
 };
 
@@ -149,6 +169,47 @@ pub const AfterToolCallContext = struct {
     result: AgentToolResult,
     is_error: bool,
     context: AgentContext,
+};
+
+/// Configuration for the agent loop — all hooks and options.
+/// pi-mono source: packages/agent/src/types.ts:96-214
+pub const AgentLoopConfig = struct {
+    model: Model,
+    stream_fn: StreamFn,
+
+    /// Converts AgentMessage[] to LLM Message[] before each call.
+    convert_to_llm: *const fn (messages: []const AgentMessage) []const ai.protocol.Message,
+
+    /// Transform applied to context before convertToLlm.
+    transform_context: ?*const fn (messages: []const AgentMessage, signal: ?*anyopaque) []const AgentMessage = null,
+
+    /// Resolve API key dynamically per call (for expiring tokens).
+    get_api_key: ?*const fn (provider_name: []const u8) ?[]const u8 = null,
+
+    /// Mid-run steering message injection.
+    get_steering_messages: ?*const fn () []const AgentMessage = null,
+
+    /// Post-run follow-up messages.
+    get_follow_up_messages: ?*const fn () []const AgentMessage = null,
+
+    /// Tool execution mode.
+    tool_execution: ToolExecutionMode = .parallel,
+
+    /// Called before tool execution, after arg validation. Return block=true to prevent.
+    before_tool_call: ?*const fn (ctx: BeforeToolCallContext, signal: ?*anyopaque) ?BeforeToolCallResult = null,
+
+    /// Called after tool execution. Return overrides for content/details/isError.
+    after_tool_call: ?*const fn (ctx: AfterToolCallContext, signal: ?*anyopaque) ?AfterToolCallResult = null,
+
+    // StreamOptions fields inlined from SimpleStreamOptions
+    temperature: ?f64 = null,
+    max_tokens: ?u64 = null,
+    api_key: ?[]const u8 = null,
+    cache_retention: ?ai.protocol.CacheRetention = null,
+    session_id: ?[]const u8 = null,
+    max_retry_delay_ms: ?u64 = null,
+    thinking_budgets: ?ai.protocol.ThinkingBudgets = null,
+    transport: ?ai.protocol.Transport = null,
 };
 
 /// Agent events — emitted for UI/logging.

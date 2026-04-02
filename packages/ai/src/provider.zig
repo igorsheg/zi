@@ -111,6 +111,20 @@ pub const Registry = struct {
         }
     }
 
+    /// Get all registered providers. Caller owns the returned slice.
+    /// pi-mono equivalent: getApiProviders()
+    pub fn getAll(self: *const Registry, allocator: std.mem.Allocator) ![]Provider {
+        const count = self.providers.count();
+        const result = try allocator.alloc(Provider, count);
+        var it = self.providers.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |entry| {
+            result[i] = entry.provider;
+            i += 1;
+        }
+        return result;
+    }
+
     /// Clear all providers.
     pub fn clear(self: *Registry) void {
         self.providers.clearRetainingCapacity();

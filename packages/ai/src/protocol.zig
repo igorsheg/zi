@@ -107,7 +107,8 @@ pub const Header = struct {
 };
 
 /// StreamOptions extended with provider-specific opaque data.
-/// Mirrors TS's `ProviderStreamOptions = StreamOptions & Record<string, unknown>`.
+/// pi-mono source: types.ts:108
+/// Mirrors TS's ProviderStreamOptions = StreamOptions & Record<string, unknown>.
 pub const ProviderStreamOptions = struct {
     base: StreamOptions = .{},
     /// Provider-specific extra options (opaque).
@@ -123,7 +124,7 @@ pub const SimpleStreamOptions = struct {
 
 /// Text signature metadata (v1)
 pub const TextSignatureV1 = struct {
-    v: u8, // must be 1
+    v: u8 = 1,
     id: []const u8,
     phase: ?enum {
         commentary,
@@ -145,7 +146,7 @@ pub const ThinkingContent = struct {
     thinking_signature: ?[]const u8 = null,
     /// When true, the thinking content was redacted by safety filters.
     /// The opaque encrypted payload is stored in `thinking_signature`.
-    redacted: bool = false,
+    redacted: ?bool = null,
 };
 
 /// Image content block
@@ -160,10 +161,15 @@ pub const ImageContent = struct {
 pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
+    /// Tool arguments. Should be a JSON object (Record<string, any> in pi-mono).
     arguments: std.json.Value,
     /// Google-specific: opaque signature for reusing thought context
     thought_signature: ?[]const u8 = null,
 };
+
+/// Alias matching pi-mono's AgentToolCall — a ToolCall from an AssistantMessage content block.
+/// pi-mono source: packages/agent/src/types.ts:38
+pub const AgentToolCall = ToolCall;
 
 /// Usage and cost information
 pub const Usage = struct {
@@ -405,3 +411,14 @@ pub const Model = struct {
         cache_write: f64,
     };
 };
+
+/// Stream function type — the core provider callable.
+/// pi-mono source: types.ts:125-129
+/// In zig, uses callback-based streaming instead of returning an AsyncIterable.
+pub const StreamFunction = *const fn (
+    model: Model,
+    context: Context,
+    options: StreamOptions,
+    callback: *const fn (event: AssistantMessageEvent, ctx: ?*anyopaque) void,
+    callback_ctx: ?*anyopaque,
+) void;
