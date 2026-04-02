@@ -87,8 +87,34 @@ pub const AnthropicProvider = struct {
 
         extra_headers_buf[n_extra] = .{ .name = "anthropic-version", .value = "2023-06-01" };
         n_extra += 1;
-        extra_headers_buf[n_extra] = .{ .name = "x-api-key", .value = api_key };
-        n_extra += 1;
+
+        // OAuth tokens (sk-ant-oat*) use Bearer auth + claude-code identity headers.
+        // API keys use x-api-key header.
+        const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
+
+        if (is_oauth) {
+            // Build "Bearer <token>" — need allocator for concat
+            const auth_value = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
+                emitError(allocator, callback, callback_ctx, "failed to build auth header", .{});
+                return;
+            };
+            // Note: auth_value lives on heap, but we only need it for the duration of the request.
+            // It will leak if we defer free here since the headers reference it. That's ok for now —
+            // the allocator lifetime covers the whole streamImpl call.
+            extra_headers_buf[n_extra] = .{ .name = "authorization", .value = auth_value };
+            n_extra += 1;
+            extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14" };
+            n_extra += 1;
+            extra_headers_buf[n_extra] = .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" };
+            n_extra += 1;
+            extra_headers_buf[n_extra] = .{ .name = "user-agent", .value = "claude-cli/2.1.75" };
+            n_extra += 1;
+            extra_headers_buf[n_extra] = .{ .name = "x-app", .value = "cli" };
+            n_extra += 1;
+        } else {
+            extra_headers_buf[n_extra] = .{ .name = "x-api-key", .value = api_key };
+            n_extra += 1;
+        }
 
         if (options.headers) |custom_headers| {
             for (custom_headers) |h| {
@@ -99,7 +125,7 @@ pub const AnthropicProvider = struct {
             }
         }
 
-        // Send request
+        // Send request (zig 0.15 API)
         var req = client.request(.POST, uri, .{
             .extra_headers = extra_headers_buf[0..n_extra],
             .headers = .{
@@ -111,25 +137,17 @@ pub const AnthropicProvider = struct {
         };
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = payload_buf.items.len };
-        var body = req.sendBodyUnflushed(&.{}) catch |err| {
+        // sendBodyComplete needs mutable slice
+        const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
+            emitError(allocator, callback, callback_ctx, "failed to allocate body: {s}", .{@errorName(err)});
+            return;
+        };
+        defer allocator.free(body_copy);
+
+        req.sendBodyComplete(body_copy) catch |err| {
             emitError(allocator, callback, callback_ctx, "failed to send body: {s}", .{@errorName(err)});
             return;
         };
-        body.writer.writeAll(payload_buf.items) catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to write body: {s}", .{@errorName(err)});
-            return;
-        };
-        body.end() catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to end body: {s}", .{@errorName(err)});
-            return;
-        };
-        if (req.connection) |conn| {
-            conn.flush() catch |err| {
-                emitError(allocator, callback, callback_ctx, "failed to flush: {s}", .{@errorName(err)});
-                return;
-            };
-        }
 
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |err| {
@@ -138,23 +156,25 @@ pub const AnthropicProvider = struct {
         };
 
         const status = response.head.status;
+        var transfer_buf: [16384]u8 = undefined;
+
         if (status != .ok) {
-            var err_body: [4096]u8 = undefined;
-            const reader = response.reader(&.{});
+            var reader = response.reader(&transfer_buf);
+            var err_body_buf: [4096]u8 = undefined;
             var n_read: usize = 0;
-            while (n_read < err_body.len) {
-                const chunk = reader.read(err_body[n_read..]) catch break;
-                if (chunk == 0) break;
-                n_read += chunk;
+            while (n_read < err_body_buf.len) {
+                const data = reader.take(err_body_buf.len - n_read) catch break;
+                if (data.len == 0) break;
+                @memcpy(err_body_buf[n_read..][0..data.len], data);
+                n_read += data.len;
             }
-            emitError(allocator, callback, callback_ctx, "HTTP {d}: {s}", .{ @intFromEnum(status), err_body[0..n_read] });
+            emitError(allocator, callback, callback_ctx, "HTTP {d}: {s}", .{ @intFromEnum(status), err_body_buf[0..n_read] });
             return;
         }
 
-        // Parse SSE stream
+        // Parse SSE stream line by line
         var parser = sse.SseParser{};
-        var line_buf: [8192]u8 = undefined;
-        const reader = response.reader(&.{});
+        var reader = response.reader(&transfer_buf);
 
         // Streaming state
         var state = StreamState{
@@ -188,9 +208,9 @@ pub const AnthropicProvider = struct {
         // Emit start event
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
-        // Process SSE events
+        // Process SSE events line by line (zig 0.15: takeDelimiterInclusive)
         while (true) {
-            const line = reader.readUntilDelimiter(&line_buf, '\n') catch |err| switch (err) {
+            const line_with_nl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => {
                     if (parser.has_data or parser.event_len > 0) {
                         if (parser.feedLine("")) |evt| {
@@ -205,8 +225,11 @@ pub const AnthropicProvider = struct {
                 },
             };
 
-            const trimmed = std.mem.trimRight(u8, line, "\r");
-            if (parser.feedLine(trimmed)) |evt| {
+            // Strip trailing \n and \r
+            var line = line_with_nl;
+            if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            if (parser.feedLine(line)) |evt| {
                 handleSseEvent(evt, &state, callback, callback_ctx);
             }
         }
