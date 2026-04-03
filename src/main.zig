@@ -4,6 +4,7 @@ const auth = @import("auth/root.zig");
 const settings_mod = @import("settings/root.zig");
 const agent = @import("agent/root.zig");
 const coding_agent = @import("coding_agent.zig");
+const interactive_mod = @import("tui/interactive.zig");
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
@@ -215,8 +216,59 @@ pub fn main() !void {
             stderr.writeAll("\n") catch {};
         }
     } else {
-        try stderr.writeAll("error: interactive mode not yet implemented. use -p flag.\n");
-        std.process.exit(1);
+        // Interactive mode
+        var auth_storage = auth.storage.AuthStorage.create(allocator, null) catch {
+            try stderr.writeAll("warning: could not load auth storage\n");
+            unreachable;
+        };
+        _ = &auth_storage;
+
+        const cwd_buf = std.fs.cwd().realpathAlloc(allocator, ".") catch "/unknown";
+        var settings = settings_mod.manager.SettingsManager.create(allocator, cwd_buf, null) catch {
+            try stderr.writeAll("warning: could not load settings\n");
+            unreachable;
+        };
+        _ = &settings;
+
+        const model = resolveModel(model_id, &settings, &auth_storage) orelse {
+            try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
+            try stderr.writeAll("use --list-models to see available models\n");
+            std.process.exit(1);
+        };
+
+        if (!std.meta.eql(model.api, .anthropic_messages)) {
+            try stderr.writeAll("error: only anthropic models supported currently\n");
+            std.process.exit(1);
+        }
+
+        const provider_str = ai.json_util.providerToString(model.provider);
+        if (api_key_arg) |cli_key| {
+            auth_storage.setRuntimeApiKey(provider_str, cli_key);
+        }
+        const key = auth_storage.getApiKey(provider_str) orelse {
+            try stderr.writeAll("error: no API key. run `pi login` or set ANTHROPIC_API_KEY\n");
+            std.process.exit(1);
+        };
+
+        var anthropic_prov = ai.anthropic.AnthropicProvider.init(allocator);
+        const prov = anthropic_prov.provider();
+
+        var registry = ai.provider.Registry.init(allocator);
+        defer registry.deinit();
+        try registry.register("anthropic-messages", prov, null);
+
+        var ca = coding_agent.CodingAgent.init(allocator, .{
+            .model = model,
+            .api_key = key,
+            .cwd = cwd_buf,
+            .max_tokens = 4096,
+            .registry = &registry,
+        });
+        defer ca.deinit();
+
+        var interactive = try interactive_mod.Interactive.init(allocator, &ca);
+        defer interactive.deinit();
+        try interactive.run();
     }
 }
 
