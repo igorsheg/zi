@@ -612,3 +612,53 @@ test "CodingAgent: response sequence across multiple prompts" {
         else => return error.ExpectedText,
     }
 }
+
+// session persistence: prompt → JSONL written → read back → context matches
+test "CodingAgent: session persistence round-trip" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("persisted response")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &content, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("persist me");
+
+    // Session should have been flushed (assistant message triggers flush)
+    try testing.expect(ca.sessionFlushed());
+    const session_file = ca.getSessionFile();
+
+    // Read back the session file
+    const loaded = try loadSessionContext(allocator, session_file);
+    try testing.expectEqual(@as(usize, 2), loaded.messages.len);
+
+    // First message: user
+    try testing.expect(loaded.messages[0] == .user);
+    switch (loaded.messages[0].user.content) {
+        .text => |t| try testing.expectEqualStrings("persist me", t),
+        .blocks => |b| {
+            try testing.expectEqual(@as(usize, 1), b.len);
+            try testing.expectEqualStrings("persist me", b[0].text.text);
+        },
+    }
+
+    // Second message: assistant with correct text
+    try testing.expect(loaded.messages[1] == .assistant);
+    const a = loaded.messages[1].assistant;
+    try testing.expectEqual(@as(usize, 1), a.content.len);
+    switch (a.content[0]) {
+        .text => |t| try testing.expectEqualStrings("persisted response", t.text),
+        else => return error.ExpectedTextBlock,
+    }
+
+    // Clean up the session file
+    std.fs.deleteFileAbsolute(session_file) catch {};
+}
