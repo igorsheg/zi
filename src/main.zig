@@ -161,27 +161,53 @@ pub fn main() !void {
             bash_tool.makeTool(),
         };
 
-        const options = ai.protocol.StreamOptions{
-            .api_key = key,
-            .max_tokens = 4096,
-        };
-
         // Session writer — persists messages incrementally on message_end,
         // gated on first assistant message (matches pi-mono behavior).
         var sw = session.writer.SessionWriter.init(allocator, cwd_buf);
 
         var handler = PrintSessionHandler{ .session_writer = &sw };
 
+        const prompts = [_]agent.protocol.AgentMessage{user_msg};
+        const context = agent.protocol.AgentContext{
+            .system_prompt = "You are a helpful assistant. Be concise. You have access to a bash tool to execute commands.",
+            .messages = &.{},
+            .tools = &tools,
+        };
+
+        // Wrap registry stream into a StreamHook
+        const RegistryStream = struct {
+            fn streamFn(
+                ctx: ?*anyopaque,
+                stream_alloc: std.mem.Allocator,
+                stream_model: ai.protocol.Model,
+                stream_context: ai.protocol.Context,
+                options: ai.protocol.SimpleStreamOptions,
+                callback: ai.provider.EventCallback,
+                callback_ctx: ?*anyopaque,
+            ) void {
+                const reg: *ai.provider.Registry = @ptrCast(@alignCast(ctx.?));
+                const api_str = ai.provider.apiToString(stream_model.api);
+                const prov2 = reg.get(api_str) orelse return;
+                prov2.streamSimple(stream_alloc, stream_model, stream_context, options, callback, callback_ctx);
+            }
+        };
+
+        const config = agent.protocol.AgentLoopConfig{
+            .model = model,
+            .stream = .{ .func = RegistryStream.streamFn, .ctx = @ptrCast(&registry) },
+            .convert_to_llm = .{ .func = defaultConvertToLlm },
+            .api_key = key,
+            .max_tokens = 4096,
+        };
+
         agent.loop.runAgentLoop(
             allocator,
-            &registry,
-            model,
-            "You are a helpful assistant. Be concise. You have access to a bash tool to execute commands.",
-            &.{user_msg},
-            &tools,
-            options,
+            &prompts,
+            context,
+            config,
             &PrintSessionHandler.callback,
             @ptrCast(&handler),
+            null,
         );
 
         try stdout.writeAll("\n");
@@ -229,6 +255,19 @@ const PrintSessionHandler = struct {
         }
     }
 };
+
+fn defaultConvertToLlm(allocator: std.mem.Allocator, messages: []const agent.protocol.AgentMessage, _: ?*anyopaque) []const ai.protocol.Message {
+    var result: std.ArrayListUnmanaged(ai.protocol.Message) = .empty;
+    for (messages) |msg| {
+        switch (msg) {
+            .user => |u| result.append(allocator, .{ .user = u }) catch continue,
+            .assistant => |a| result.append(allocator, .{ .assistant = a }) catch continue,
+            .tool_result => |t| result.append(allocator, .{ .tool_result = t }) catch continue,
+            .compaction_summary, .branch_summary, .custom => continue,
+        }
+    }
+    return result.items;
+}
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);

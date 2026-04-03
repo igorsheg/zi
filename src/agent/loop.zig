@@ -2,221 +2,322 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
 
-/// Multi-turn agent loop with sequential tool execution.
-/// No steering, no follow-ups — just the inner tool-call loop.
+/// Start an agent loop with new prompt messages.
+/// Prompts are added to the context and events are emitted for them.
 ///
-/// Matches pi-mono's runLoop (agent-loop.ts:155-232) for the subset:
-///   stream → if toolUse → execute tools → add results → stream again → if stop → done
-///
-/// Event ordering:
-///   agent_start → turn_start → [user message_start/end]* →
-///   [stream → message_start → message_update* → message_end →
-///    [tool_execution_start → tool_execution_end → message_start(result) → message_end(result)]* →
-///    turn_end]+ →
-///   agent_end
+/// Matches pi-mono's runAgentLoop (agent-loop.ts:95-118).
 pub fn runAgentLoop(
     allocator: std.mem.Allocator,
-    provider_registry: *const ai.provider.Registry,
-    model: ai.protocol.Model,
-    system_prompt: []const u8,
-    initial_messages: []const protocol.AgentMessage,
-    tools: []const protocol.AgentTool,
-    options: ai.protocol.StreamOptions,
+    prompts: []const protocol.AgentMessage,
+    context: protocol.AgentContext,
+    config: protocol.AgentLoopConfig,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+    signal: ?*anyopaque,
+) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // newMessages tracks only messages created during this run
+    var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
+    for (prompts) |p| {
+        new_messages.append(aa, p) catch return;
+    }
+
+    // Working context = existing messages + prompts
+    var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
+    for (context.messages) |m| {
+        ctx_messages.append(aa, m) catch return;
+    }
+    for (prompts) |p| {
+        ctx_messages.append(aa, p) catch return;
+    }
+
+    event_sink(.agent_start, event_ctx);
+    event_sink(.turn_start, event_ctx);
+
+    // Emit message_start/end for prompt messages
+    for (prompts) |p| {
+        event_sink(.{ .message_start = .{ .message = p } }, event_ctx);
+        event_sink(.{ .message_end = .{ .message = p } }, event_ctx);
+    }
+
+    runLoop(aa, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
+}
+
+/// Continue an agent loop from existing context without adding a new message.
+/// Used for retries — context already has user message or tool results.
+///
+/// Matches pi-mono's runAgentLoopContinue (agent-loop.ts:120-143).
+pub fn runAgentLoopContinue(
+    allocator: std.mem.Allocator,
+    context: protocol.AgentContext,
+    config: protocol.AgentLoopConfig,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+    signal: ?*anyopaque,
+) void {
+    if (context.messages.len == 0) {
+        // pi-mono throws "Cannot continue: no messages in context"
+        return;
+    }
+
+    // Check last message isn't assistant
+    const last = context.messages[context.messages.len - 1];
+    if (last == .assistant) {
+        // pi-mono throws "Cannot continue from message role: assistant"
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
+    var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
+    for (context.messages) |m| {
+        ctx_messages.append(aa, m) catch return;
+    }
+
+    event_sink(.agent_start, event_ctx);
+    event_sink(.turn_start, event_ctx);
+
+    // No message_start/end for existing messages — that's the key difference from runAgentLoop
+
+    runLoop(aa, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
+}
+
+/// Main loop logic shared by runAgentLoop and runAgentLoopContinue.
+/// Implements pi-mono's dual loop (agent-loop.ts:155-232):
+///   outer loop: continues when follow-up messages arrive after agent would stop
+///   inner loop: processes tool calls and steering messages
+fn runLoop(
+    aa: std.mem.Allocator,
+    ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    context: protocol.AgentContext,
+    config: protocol.AgentLoopConfig,
+    signal: ?*anyopaque,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    // Arena for per-turn allocations: tool result content blocks, error results,
-    // LLM message lists. All freed together when the loop exits.
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
+    var first_turn = true;
 
-    // Mutable message list — grows as we add assistant responses and tool results.
-    // Uses arena_alloc so tool result content slices (which point into arena memory)
-    // stay valid for the loop's lifetime.
-    var messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
-    defer messages.deinit(arena_alloc);
-    for (initial_messages) |msg| {
-        messages.append(arena_alloc, msg) catch return;
+    // Convert AgentTools to LLM Tools once
+    var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .empty;
+    if (context.tools) |tools| {
+        for (tools) |t| {
+            llm_tools.append(aa, .{
+                .name = t.name,
+                .description = t.description,
+                .parameters = t.parameters,
+            }) catch continue;
+        }
     }
 
-    // 1. agent_start
-    event_sink(.agent_start, event_ctx);
+    // Initial steering poll (pi-mono agent-loop.ts:165)
+    var pending_messages = if (config.get_steering_messages) |hook|
+        hook.call(aa)
+    else
+        @as([]const protocol.AgentMessage, &.{});
 
-    // 2. turn_start
-    event_sink(.turn_start, event_ctx);
+    // Outer loop: continues when follow-up messages arrive
+    outer: while (true) {
+        var has_more_tool_calls = true;
 
-    // 3. Emit message_start/end for initial user messages
-    for (initial_messages) |msg| {
-        event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
-        event_sink(.{ .message_end = .{ .message = msg } }, event_ctx);
+        // Inner loop: process tool calls and steering messages
+        while (has_more_tool_calls or pending_messages.len > 0) {
+            if (!first_turn) {
+                event_sink(.turn_start, event_ctx);
+            } else {
+                first_turn = false;
+            }
+
+            // Inject pending messages before next assistant response
+            if (pending_messages.len > 0) {
+                for (pending_messages) |msg| {
+                    event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
+                    event_sink(.{ .message_end = .{ .message = msg } }, event_ctx);
+                    ctx_messages.append(aa, msg) catch {};
+                    new_messages.append(aa, msg) catch {};
+                }
+                pending_messages = &.{};
+            }
+
+            // Stream assistant response
+            const assistant_msg = streamAssistantResponse(aa, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
+                event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                return;
+            };
+
+            new_messages.append(aa, .{ .assistant = assistant_msg }) catch {};
+
+            if (assistant_msg.stop_reason == .@"error" or assistant_msg.stop_reason == .aborted) {
+                event_sink(.{ .turn_end = .{
+                    .message = .{ .assistant = assistant_msg },
+                    .tool_results = &.{},
+                } }, event_ctx);
+                event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                return;
+            }
+
+            // Check for tool calls
+            var tool_call_count: usize = 0;
+            for (assistant_msg.content) |block| {
+                switch (block) {
+                    .tool_call => tool_call_count += 1,
+                    else => {},
+                }
+            }
+            has_more_tool_calls = tool_call_count > 0;
+
+            var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
+            if (has_more_tool_calls) {
+                executeToolCalls(aa, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, signal, event_sink, event_ctx);
+            }
+
+            event_sink(.{ .turn_end = .{
+                .message = .{ .assistant = assistant_msg },
+                .tool_results = tool_results.items,
+            } }, event_ctx);
+
+            // Poll steering messages after tool execution
+            pending_messages = if (config.get_steering_messages) |hook|
+                hook.call(aa)
+            else
+                @as([]const protocol.AgentMessage, &.{});
+        }
+
+        // Agent would stop here. Check for follow-up messages.
+        const follow_ups = if (config.get_follow_up_messages) |hook|
+            hook.call(aa)
+        else
+            @as([]const protocol.AgentMessage, &.{});
+
+        if (follow_ups.len > 0) {
+            pending_messages = follow_ups;
+            continue :outer;
+        }
+
+        break;
     }
 
-    // 4. Look up provider
-    const api_str = ai.provider.apiToString(model.api);
-    const prov = provider_registry.get(api_str) orelse {
-        const err_msg = makeErrorAssistantMessage(model, "No provider registered for API");
-        const agent_err = protocol.AgentMessage{ .assistant = err_msg };
-        messages.append(arena_alloc, agent_err) catch {};
-        event_sink(.{ .message_start = .{ .message = agent_err } }, event_ctx);
-        event_sink(.{ .message_end = .{ .message = agent_err } }, event_ctx);
-        event_sink(.{ .turn_end = .{ .message = agent_err, .tool_results = &.{} } }, event_ctx);
-        event_sink(.{ .agent_end = .{ .messages = messages.items } }, event_ctx);
-        return;
+    event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+}
+
+/// Stream an assistant response from the LLM.
+/// Applies transformContext → convertToLlm pipeline before calling the stream function.
+/// Matches pi-mono's streamAssistantResponse (agent-loop.ts:238-331).
+fn streamAssistantResponse(
+    aa: std.mem.Allocator,
+    ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    config: protocol.AgentLoopConfig,
+    signal: ?*anyopaque,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+    llm_tools: []const ai.protocol.Tool,
+    system_prompt: []const u8,
+) ?ai.protocol.AssistantMessage {
+    // Apply context transform if configured (AgentMessage[] → AgentMessage[])
+    var messages: []const protocol.AgentMessage = ctx_messages.items;
+    if (config.transform_context) |hook| {
+        messages = hook.call(aa, messages, signal);
+    }
+
+    // Convert to LLM messages (AgentMessage[] → Message[])
+    const llm_messages = config.convert_to_llm.call(aa, messages);
+
+    const llm_context = ai.protocol.Context{
+        .system_prompt = if (system_prompt.len > 0) system_prompt else null,
+        .messages = llm_messages,
+        .tools = if (llm_tools.len > 0) llm_tools else null,
     };
 
-    // Convert AgentTools to LLM Tools for the provider
-    var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .empty;
-    defer llm_tools.deinit(arena_alloc);
-    for (tools) |t| {
-        llm_tools.append(arena_alloc, .{
-            .name = t.name,
-            .description = t.description,
-            .parameters = t.parameters,
-        }) catch continue;
-    }
+    const stream_options = config.buildStreamOptions();
 
-    // 5. Inner loop: stream → tool calls → repeat
-    var first_turn = true;
-    while (true) {
-        if (!first_turn) {
-            event_sink(.turn_start, event_ctx);
-        }
-        first_turn = false;
+    var bridge = StreamBridge{
+        .sink = event_sink,
+        .sink_ctx = event_ctx,
+    };
+    config.stream.call(aa, config.model, llm_context, stream_options, &StreamBridge.callback, @ptrCast(&bridge));
 
-        // Build LLM context from current messages
-        var llm_messages: std.ArrayListUnmanaged(ai.protocol.Message) = .empty;
-        defer llm_messages.deinit(arena_alloc);
-        for (messages.items) |agent_msg| {
-            switch (agent_msg) {
-                .user => |u| llm_messages.append(arena_alloc, .{ .user = u }) catch continue,
-                .assistant => |a| llm_messages.append(arena_alloc, .{ .assistant = a }) catch continue,
-                .tool_result => |t| llm_messages.append(arena_alloc, .{ .tool_result = t }) catch continue,
-                .compaction_summary, .branch_summary, .custom => continue,
-            }
-        }
+    const assistant_msg = bridge.final_message orelse return null;
 
-        const llm_context = ai.protocol.Context{
-            .system_prompt = if (system_prompt.len > 0) system_prompt else null,
-            .messages = llm_messages.items,
-            .tools = if (llm_tools.items.len > 0) llm_tools.items else null,
-        };
+    // Add to context (pi-mono: context.messages.push or replace last)
+    ctx_messages.append(aa, .{ .assistant = assistant_msg }) catch {};
 
-        // Stream assistant response
-        var bridge = StreamBridge{
-            .sink = event_sink,
-            .sink_ctx = event_ctx,
-        };
-        prov.stream(arena_alloc, model, llm_context, options, &StreamBridge.callback, @ptrCast(&bridge));
+    return assistant_msg;
+}
 
-        const assistant_msg = bridge.final_message orelse {
-            // No response at all — emit agent_end and bail
-            event_sink(.{ .agent_end = .{ .messages = messages.items } }, event_ctx);
-            return;
-        };
+/// Execute tool calls sequentially.
+/// Matches pi-mono's executeToolCallsSequential (agent-loop.ts:350-388).
+fn executeToolCalls(
+    aa: std.mem.Allocator,
+    ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
+    assistant_msg: ai.protocol.AssistantMessage,
+    tools: []const protocol.AgentTool,
+    signal: ?*anyopaque,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+) void {
+    for (assistant_msg.content) |block| {
+        switch (block) {
+            .tool_call => |tc| {
+                event_sink(.{ .tool_execution_start = .{
+                    .tool_call_id = tc.id,
+                    .tool_name = tc.name,
+                    .args = tc.arguments,
+                } }, event_ctx);
 
-        // Add assistant message to context
-        messages.append(arena_alloc, .{ .assistant = assistant_msg }) catch {};
+                const tool = findTool(tools, tc.name);
+                if (tool == null) {
+                    const err_result = makeErrorToolResult(aa, tc.id, tc.name, "tool not found");
+                    emitToolResult(event_sink, event_ctx, tc, err_result, true, null);
+                    ctx_messages.append(aa, .{ .tool_result = err_result }) catch {};
+                    new_messages.append(aa, .{ .tool_result = err_result }) catch {};
+                    tool_results.append(aa, err_result) catch {};
+                    continue;
+                }
 
-        // Check for error/aborted
-        if (assistant_msg.stop_reason == .@"error" or assistant_msg.stop_reason == .aborted) {
-            event_sink(.{ .turn_end = .{
-                .message = .{ .assistant = assistant_msg },
-                .tool_results = &.{},
-            } }, event_ctx);
-            event_sink(.{ .agent_end = .{ .messages = messages.items } }, event_ctx);
-            return;
-        }
+                const t = tool.?;
+                const result = t.execute(
+                    t.ctx,
+                    aa,
+                    tc.id,
+                    tc.arguments,
+                    signal,
+                    null,
+                    null,
+                );
 
-        // Extract tool calls from assistant message content
-        var tool_call_count: usize = 0;
-        for (assistant_msg.content) |block| {
-            switch (block) {
-                .tool_call => tool_call_count += 1,
-                else => {},
-            }
-        }
-
-        if (tool_call_count == 0) {
-            // No tool calls — we're done
-            event_sink(.{ .turn_end = .{
-                .message = .{ .assistant = assistant_msg },
-                .tool_results = &.{},
-            } }, event_ctx);
-            break;
-        }
-
-        // Execute tool calls sequentially
-        var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
-        defer tool_results.deinit(arena_alloc);
-
-        for (assistant_msg.content) |block| {
-            switch (block) {
-                .tool_call => |tc| {
-                    // Emit tool_execution_start
-                    event_sink(.{ .tool_execution_start = .{
-                        .tool_call_id = tc.id,
-                        .tool_name = tc.name,
-                        .args = tc.arguments,
-                    } }, event_ctx);
-
-                    // Find tool — pi-mono: prepareToolCall (agent-loop.ts:472-522)
-                    const tool = findTool(tools, tc.name);
-                    if (tool == null) {
-                        const err_result = makeErrorToolResult(arena_alloc, tc.id, tc.name, "tool not found");
-                        emitToolResult(event_sink, event_ctx, tc, err_result, true, null);
-                        messages.append(arena_alloc, .{ .tool_result = err_result }) catch {};
-                        tool_results.append(arena_alloc, err_result) catch {};
-                        continue;
+                var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .empty;
+                for (result.content) |cb| {
+                    switch (cb) {
+                        .text => |txt| trm_content.append(aa, .{ .text = txt }) catch continue,
+                        .image => |img| trm_content.append(aa, .{ .image = img }) catch continue,
                     }
+                }
 
-                    // Execute tool — pi-mono: executePreparedToolCall (agent-loop.ts:524-559)
-                    const t = tool.?;
-                    const result = t.execute(
-                        t.ctx,
-                        arena_alloc,
-                        tc.id,
-                        tc.arguments,
-                        null, // signal
-                        null, // on_update
-                        null, // update_ctx
-                    );
+                const tool_result_msg = ai.protocol.ToolResultMessage{
+                    .tool_call_id = tc.id,
+                    .tool_name = tc.name,
+                    .content = trm_content.items,
+                    .details = result.details,
+                    .is_error = result.is_error,
+                    .timestamp = std.time.milliTimestamp(),
+                };
 
-                    // Build ToolResultMessage — pi-mono: emitToolCallOutcome (agent-loop.ts:604-631)
-                    // Propagate details and detect error from tool result content
-                    var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .empty;
-                    for (result.content) |cb| {
-                        switch (cb) {
-                            .text => |txt| trm_content.append(arena_alloc, .{ .text = txt }) catch continue,
-                            .image => |img| trm_content.append(arena_alloc, .{ .image = img }) catch continue,
-                        }
-                    }
-
-                    const tool_result_msg = ai.protocol.ToolResultMessage{
-                        .tool_call_id = tc.id,
-                        .tool_name = tc.name,
-                        .content = trm_content.items,
-                        .details = result.details,
-                        .is_error = result.is_error,
-                        .timestamp = std.time.milliTimestamp(),
-                    };
-
-                    emitToolResult(event_sink, event_ctx, tc, tool_result_msg, result.is_error, result.details);
-                    messages.append(arena_alloc, .{ .tool_result = tool_result_msg }) catch {};
-                    tool_results.append(arena_alloc, tool_result_msg) catch {};
-                },
-                else => {},
-            }
+                emitToolResult(event_sink, event_ctx, tc, tool_result_msg, result.is_error, result.details);
+                ctx_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
+                new_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
+                tool_results.append(aa, tool_result_msg) catch {};
+            },
+            else => {},
         }
-
-        event_sink(.{ .turn_end = .{
-            .message = .{ .assistant = assistant_msg },
-            .tool_results = tool_results.items,
-        } }, event_ctx);
     }
-
-    // 6. agent_end
-    event_sink(.{ .agent_end = .{ .messages = messages.items } }, event_ctx);
 }
 
 /// Emit tool_execution_end → message_start → message_end for a tool result.
@@ -229,7 +330,6 @@ fn emitToolResult(
     is_error: bool,
     tool_result_value: ?std.json.Value,
 ) void {
-    // tool_execution_end — pi-mono passes the actual result here
     event_sink(.{ .tool_execution_end = .{
         .tool_call_id = tc.id,
         .tool_name = tc.name,
@@ -237,7 +337,6 @@ fn emitToolResult(
         .is_error = is_error,
     } }, event_ctx);
 
-    // message_start/end for tool result
     const msg = protocol.AgentMessage{ .tool_result = result };
     event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
     event_sink(.{ .message_end = .{ .message = msg } }, event_ctx);
@@ -270,11 +369,6 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
 
 /// Bridge between provider events and agent events.
 /// Translates AssistantMessageEvent → AgentEvent.
-///
-/// Event mapping matches pi-mono's streamAssistantResponse (agent-loop.ts:276-320):
-///   start        → message_start only (no message_update)
-///   content_*    → message_update
-///   done/error   → backfill message_start if needed, then message_end (no message_update)
 const StreamBridge = struct {
     sink: protocol.AgentEventSink,
     sink_ctx: ?*anyopaque,
@@ -306,7 +400,6 @@ const StreamBridge = struct {
                 self.sink(.{ .message_end = .{ .message = .{ .assistant = e.@"error" } } }, self.sink_ctx);
             },
 
-            // Incremental content events → message_update
             else => |_| {
                 const partial = extractPartial(event);
                 if (partial) |p| {
