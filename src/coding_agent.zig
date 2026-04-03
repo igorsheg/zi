@@ -437,3 +437,178 @@ test "convertToLlm handles mixed message types in order" {
     try testing.expect(result[3] == .user); // branch
     try testing.expect(result[4] == .user); // custom
 }
+
+// ── CodingAgent e2e tests (ported from pi-mono test-harness.test.ts) ───
+
+const faux = ai.faux;
+
+/// Test helper: create a CodingAgent wired to a faux provider.
+fn createTestCodingAgent(
+    allocator: std.mem.Allocator,
+    _: *faux.FauxProvider,
+    registry: *ai.provider.Registry,
+    collector: *EventCollector,
+) CodingAgent {
+    return CodingAgent.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = registry,
+        .tools = &.{},
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(collector) },
+    });
+}
+
+const EventCollector = struct {
+    events: std.ArrayListUnmanaged(protocol.AgentEvent),
+    alloc: std.mem.Allocator,
+
+    fn init(alloc: std.mem.Allocator) EventCollector {
+        return .{ .events = .empty, .alloc = alloc };
+    }
+
+    fn deinit(self: *EventCollector) void {
+        self.events.deinit(self.alloc);
+    }
+
+    fn callback(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
+        const self: *EventCollector = @ptrCast(@alignCast(ctx));
+        self.events.append(self.alloc, event) catch {};
+    }
+
+    fn countType(self: *const EventCollector, comptime tag: std.meta.Tag(protocol.AgentEvent)) usize {
+        var n: usize = 0;
+        for (self.events.items) |e| {
+            if (e == tag) n += 1;
+        }
+        return n;
+    }
+};
+
+// pi-mono test-harness.test.ts: "simple text response"
+test "CodingAgent: simple text response" {
+    // Use arena — SessionWriter allocates internally with no deinit
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("hello world")};
+    const msg = faux.fauxAssistantMessage(allocator, &content, .stop);
+    fp.setResponses(&.{msg});
+
+    var registry = ai.provider.Registry.init(allocator);
+    const prov = fp.provider();
+    try registry.register("faux", prov, null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("hi");
+
+    try testing.expectEqual(@as(usize, 1), fp.call_count);
+    try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
+    try testing.expect(ca.agent.state.messages[0] == .user);
+    try testing.expect(ca.agent.state.messages[1] == .assistant);
+
+    const assistant = ca.agent.state.messages[1].assistant;
+    try testing.expectEqual(@as(usize, 1), assistant.content.len);
+    switch (assistant.content[0]) {
+        .text => |t| try testing.expectEqualStrings("hello world", t.text),
+        else => return error.ExpectedTextBlock,
+    }
+}
+
+// pi-mono test-harness.test.ts: "error response"
+test "CodingAgent: error response sets stop_reason" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const err_msg = faux.fauxAssistantMessage(allocator, &.{}, .@"error");
+    fp.setResponses(&.{err_msg});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("hi");
+
+    try testing.expectEqual(@as(usize, 1), fp.call_count);
+    try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
+    const assistant = ca.agent.state.messages[1].assistant;
+    try testing.expectEqual(ai.protocol.StopReason.@"error", assistant.stop_reason);
+}
+
+// pi-mono test-harness.test.ts: "event capture"
+test "CodingAgent: events emitted in correct order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("hi")};
+    const msg = faux.fauxAssistantMessage(allocator, &content, .stop);
+    fp.setResponses(&.{msg});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("hello");
+
+    // Should have: agent_start, turn_start, message_start(user), message_end(user),
+    // message_start(assistant-stream), message_update*, message_end(assistant),
+    // turn_end, agent_end
+    try testing.expect(collector.countType(.agent_start) >= 1);
+    try testing.expect(collector.countType(.agent_end) >= 1);
+    try testing.expect(collector.countType(.message_end) >= 2); // user + assistant
+    try testing.expect(collector.countType(.turn_end) >= 1);
+}
+
+// pi-mono test-harness.test.ts: "response sequence"
+test "CodingAgent: response sequence across multiple prompts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const c1 = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("first")};
+    const c2 = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("second")};
+    fp.setResponses(&.{
+        faux.fauxAssistantMessage(allocator, &c1, .stop),
+        faux.fauxAssistantMessage(allocator, &c2, .stop),
+    });
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("a");
+    ca.run("b");
+
+    try testing.expectEqual(@as(usize, 2), fp.call_count);
+    try testing.expectEqual(@as(usize, 4), ca.agent.state.messages.len);
+    // user, assistant("first"), user, assistant("second")
+    const a1 = ca.agent.state.messages[1].assistant;
+    switch (a1.content[0]) {
+        .text => |t| try testing.expectEqualStrings("first", t.text),
+        else => return error.ExpectedText,
+    }
+    const a2 = ca.agent.state.messages[3].assistant;
+    switch (a2.content[0]) {
+        .text => |t| try testing.expectEqualStrings("second", t.text),
+        else => return error.ExpectedText,
+    }
+}
