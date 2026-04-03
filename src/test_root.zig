@@ -7,4 +7,5 @@ test {
     _ = @import("session/root.zig");
     _ = @import("coding_agent.zig");
     _ = @import("system_prompt.zig");
+    _ = @import("tui/root.zig");
 }
