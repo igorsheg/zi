@@ -509,6 +509,18 @@ const EventCollector = struct {
         }
         return n;
     }
+
+    fn getTextDeltas(self: *const EventCollector) []const []const u8 {
+        var deltas: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (self.events.items) |e| {
+            if (e == .message_update) {
+                if (e.message_update.assistant_message_event == .text_delta) {
+                    deltas.append(self.alloc, e.message_update.assistant_message_event.text_delta.delta) catch {};
+                }
+            }
+        }
+        return deltas.items;
+    }
 };
 
 // pi-mono test-harness.test.ts: "simple text response"
@@ -897,4 +909,109 @@ test "CodingAgent: compaction_summary converted to user message for provider" {
             try testing.expect(std.mem.indexOf(u8, t, "<summary>") != null);
         },
     }
+}
+
+// pi-mono test-harness.test.ts: "context capture"
+test "CodingAgent: context capture — provider receives user message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const c = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("reply")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &c, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("my question");
+
+    try testing.expectEqual(@as(usize, 1), fp.captured_contexts.items.len);
+    const ctx = fp.captured_contexts.items[0];
+    // Should contain user message
+    var found_user = false;
+    for (ctx.messages) |m| {
+        if (m == .user) {
+            found_user = true;
+            break;
+        }
+    }
+    try testing.expect(found_user);
+}
+
+// pi-mono test-harness.test.ts: "streams text deltas"
+test "CodingAgent: text deltas reconstruct full response" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const c = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("hello world")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &c, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("hi");
+
+    const deltas = collector.getTextDeltas();
+    try testing.expect(deltas.len > 0);
+
+    // Reconstruct — faux sends full text as one delta
+    var total_len: usize = 0;
+    for (deltas) |d| total_len += d.len;
+    var buf = try allocator.alloc(u8, total_len);
+    var pos: usize = 0;
+    for (deltas) |d| {
+        @memcpy(buf[pos..][0..d.len], d);
+        pos += d.len;
+    }
+    try testing.expectEqualStrings("hello world", buf);
+}
+
+// pi-mono test-harness.test.ts: "streams thinking deltas"
+test "CodingAgent: thinking events emitted for thinking content" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const c = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        .{ .thinking = .{ .thinking = "let me think" } },
+        faux.fauxText("answer"),
+    };
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &c, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    ca.run("hi");
+
+    // Check for thinking events in message_update
+    var thinking_starts: usize = 0;
+    var thinking_deltas: usize = 0;
+    var thinking_ends: usize = 0;
+    for (collector.events.items) |e| {
+        if (e == .message_update) {
+            const ame = e.message_update.assistant_message_event;
+            if (ame == .thinking_start) thinking_starts += 1;
+            if (ame == .thinking_delta) thinking_deltas += 1;
+            if (ame == .thinking_end) thinking_ends += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), thinking_starts);
+    try testing.expect(thinking_deltas > 0);
+    try testing.expectEqual(@as(usize, 1), thinking_ends);
 }
