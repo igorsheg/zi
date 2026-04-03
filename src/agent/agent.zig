@@ -131,12 +131,16 @@ pub const Agent = struct {
     pub fn init(allocator: std.mem.Allocator, options: Options) Agent {
         const initial = options.initial_state orelse protocol.AgentState{};
         var message_arena = std.heap.ArenaAllocator.init(allocator);
+        const aa = message_arena.allocator();
         var messages: std.ArrayList(protocol.AgentMessage) = .empty;
         for (initial.messages) |m| {
-            messages.append(message_arena.allocator(), m) catch {};
+            messages.append(aa, dupeAgentMessage(aa, m)) catch {};
         }
+        // Sync state.messages to the owned copy so they share one backing store.
+        var state = initial;
+        state.messages = messages.items;
         return .{
-            .state = initial,
+            .state = state,
             .listeners = .empty,
             .steering_queue = PendingMessageQueue.init(allocator, options.steering_mode),
             .follow_up_queue = PendingMessageQueue.init(allocator, options.follow_up_mode),
@@ -383,7 +387,8 @@ pub const Agent = struct {
             },
             .message_end => |payload| {
                 self.state.streaming_message = null;
-                self.messages.append(self.message_arena.allocator(), payload.message) catch {};
+                const owned = dupeAgentMessage(self.message_arena.allocator(), payload.message);
+                self.messages.append(self.message_arena.allocator(), owned) catch {};
                 self.state.messages = self.messages.items;
             },
             .tool_execution_start => |payload| {
@@ -417,6 +422,116 @@ pub const Agent = struct {
         }
     }
 };
+
+// -- Deep copy utility ------------------------------------------------------
+
+/// Deep-copy an AgentMessage into the given allocator.
+/// Copies all nested slices (text content, content block arrays, string fields)
+/// so the result is fully owned by the allocator and independent of the source.
+fn dupeAgentMessage(alloc: std.mem.Allocator, msg: protocol.AgentMessage) protocol.AgentMessage {
+    return switch (msg) {
+        .user => |u| .{ .user = dupeUserMessage(alloc, u) },
+        .assistant => |a| .{ .assistant = dupeAssistantMessage(alloc, a) },
+        .tool_result => |t| .{ .tool_result = dupeToolResultMessage(alloc, t) },
+        .compaction_summary => |c| .{ .compaction_summary = .{
+            .summary = alloc.dupe(u8, c.summary) catch c.summary,
+            .tokens_before = c.tokens_before,
+            .timestamp = c.timestamp,
+        } },
+        .branch_summary => |b| .{ .branch_summary = .{
+            .summary = alloc.dupe(u8, b.summary) catch b.summary,
+            .from_id = alloc.dupe(u8, b.from_id) catch b.from_id,
+            .timestamp = b.timestamp,
+        } },
+        .custom => |c| .{ .custom = .{
+            .custom_type = alloc.dupe(u8, c.custom_type) catch c.custom_type,
+            .content = alloc.dupe(u8, c.content) catch c.content,
+            .display = c.display,
+            .details = c.details,
+            .timestamp = c.timestamp,
+        } },
+    };
+}
+
+fn dupeUserMessage(alloc: std.mem.Allocator, msg: ai.protocol.UserMessage) ai.protocol.UserMessage {
+    return .{
+        .content = switch (msg.content) {
+            .text => |t| .{ .text = alloc.dupe(u8, t) catch t },
+            .blocks => |blocks| .{ .blocks = dupeUserBlocks(alloc, blocks) },
+        },
+        .timestamp = msg.timestamp,
+    };
+}
+
+fn dupeUserBlocks(alloc: std.mem.Allocator, blocks: []const ai.protocol.UserMessage.UserMessageContent.Block) []const ai.protocol.UserMessage.UserMessageContent.Block {
+    const duped = alloc.alloc(ai.protocol.UserMessage.UserMessageContent.Block, blocks.len) catch return blocks;
+    for (blocks, 0..) |block, i| {
+        duped[i] = switch (block) {
+            .text => |t| .{ .text = .{
+                .text = alloc.dupe(u8, t.text) catch t.text,
+                .text_signature = if (t.text_signature) |s| alloc.dupe(u8, s) catch s else null,
+            } },
+            .image => |img| .{ .image = .{
+                .data = alloc.dupe(u8, img.data) catch img.data,
+                .mime_type = alloc.dupe(u8, img.mime_type) catch img.mime_type,
+            } },
+        };
+    }
+    return duped;
+}
+
+fn dupeAssistantMessage(alloc: std.mem.Allocator, msg: ai.protocol.AssistantMessage) ai.protocol.AssistantMessage {
+    const content = alloc.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, msg.content.len) catch return msg;
+    for (msg.content, 0..) |block, i| {
+        content[i] = switch (block) {
+            .text => |t| .{ .text = .{
+                .text = alloc.dupe(u8, t.text) catch t.text,
+                .text_signature = if (t.text_signature) |s| alloc.dupe(u8, s) catch s else null,
+            } },
+            .thinking => |t| .{ .thinking = .{
+                .thinking = alloc.dupe(u8, t.thinking) catch t.thinking,
+                .thinking_signature = if (t.thinking_signature) |s| alloc.dupe(u8, s) catch s else null,
+                .redacted = t.redacted,
+            } },
+            .tool_call => |tc| .{ .tool_call = .{
+                .id = alloc.dupe(u8, tc.id) catch tc.id,
+                .name = alloc.dupe(u8, tc.name) catch tc.name,
+                .arguments = tc.arguments,
+                .thought_signature = if (tc.thought_signature) |s| alloc.dupe(u8, s) catch s else null,
+            } },
+        };
+    }
+    var result = msg;
+    result.content = content;
+    if (msg.error_message) |em| {
+        result.error_message = alloc.dupe(u8, em) catch em;
+    }
+    if (msg.response_id) |rid| {
+        result.response_id = alloc.dupe(u8, rid) catch rid;
+    }
+    return result;
+}
+
+fn dupeToolResultMessage(alloc: std.mem.Allocator, msg: ai.protocol.ToolResultMessage) ai.protocol.ToolResultMessage {
+    const content = alloc.alloc(ai.protocol.ToolResultMessage.ContentBlock, msg.content.len) catch return msg;
+    for (msg.content, 0..) |block, i| {
+        content[i] = switch (block) {
+            .text => |t| .{ .text = .{
+                .text = alloc.dupe(u8, t.text) catch t.text,
+                .text_signature = if (t.text_signature) |s| alloc.dupe(u8, s) catch s else null,
+            } },
+            .image => |img| .{ .image = .{
+                .data = alloc.dupe(u8, img.data) catch img.data,
+                .mime_type = alloc.dupe(u8, img.mime_type) catch img.mime_type,
+            } },
+        };
+    }
+    var result = msg;
+    result.content = content;
+    result.tool_call_id = alloc.dupe(u8, msg.tool_call_id) catch msg.tool_call_id;
+    result.tool_name = alloc.dupe(u8, msg.tool_name) catch msg.tool_name;
+    return result;
+}
 
 // -- Default hooks ----------------------------------------------------------
 
