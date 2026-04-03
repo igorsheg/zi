@@ -53,6 +53,8 @@ test "Agent: creates with default state" {
     try std.testing.expectEqual(@as(?[]const u8, null), agent.state.error_message);
     try std.testing.expectEqual(@as(usize, 0), agent.state.messages.len);
     try std.testing.expectEqual(@as(usize, 0), agent.state.tools.len);
+    try std.testing.expectEqual(protocol.ThinkingLevel.off, agent.state.thinking_level);
+    try std.testing.expectEqualStrings("unknown", agent.state.model.id);
 }
 
 test "Agent: state mutators don't emit events" {
@@ -468,4 +470,161 @@ test "Agent: reset clears state and queues" {
     try std.testing.expectEqual(@as(usize, 0), agent.state.messages.len);
     try std.testing.expectEqual(false, agent.state.is_streaming);
     try std.testing.expectEqual(false, agent.hasQueuedMessages());
+}
+
+// ── test 4: continue returns error when called while running ──
+
+test "Agent: continue returns error when called while running" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const msg = createAssistantMessage(allocator, "ok");
+    defer allocator.free(msg.content);
+    fp.setResponses(&.{msg});
+
+    var agent = Agent.init(allocator, .{
+        .stream_fn = fauxStreamHook(&fp),
+    });
+    defer agent.deinit();
+
+    const GuardState = struct {
+        agent_ptr: *Agent,
+        nested_rejected: bool = false,
+    };
+    var guard_state = GuardState{ .agent_ptr = &agent };
+
+    const GuardListener = struct {
+        fn listener(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
+            const s: *GuardState = @ptrCast(@alignCast(ctx.?));
+            if (event == .agent_start) {
+                const result = s.agent_ptr.@"continue"();
+                if (result) |_| {} else |err| {
+                    if (err == error.AlreadyProcessing) {
+                        s.nested_rejected = true;
+                    }
+                }
+            }
+        }
+    };
+
+    _ = agent.subscribe(GuardListener.listener, @ptrCast(&guard_state));
+
+    const prompts = [_]protocol.AgentMessage{makeUserMessage("hello")};
+    try agent.prompt(&prompts);
+
+    try std.testing.expect(guard_state.nested_rejected);
+}
+
+// ── test 5: custom initial state loads config fields ──
+
+test "Agent: custom initial state loads config fields" {
+    const allocator = std.testing.allocator;
+
+    var state = protocol.AgentState{
+        .system_prompt = "Custom system prompt",
+
+        .thinking_level = .high,
+    };
+    _ = &state;
+
+    var agent = Agent.init(allocator, .{
+        .initial_state = state,
+    });
+    defer agent.deinit();
+
+    try std.testing.expectEqualStrings("Custom system prompt", agent.state.system_prompt);
+    try std.testing.expectEqual(protocol.ThinkingLevel.high, agent.state.thinking_level);
+}
+
+// ── test 6: subscribe and unsubscribe ──
+
+test "Agent: unsubscribe stops listener notifications" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const msg1 = createAssistantMessage(allocator, "first");
+    defer allocator.free(msg1.content);
+    const msg2 = createAssistantMessage(allocator, "second");
+    defer allocator.free(msg2.content);
+    fp.setResponses(&.{ msg1, msg2 });
+
+    var agent = Agent.init(allocator, .{
+        .stream_fn = fauxStreamHook(&fp),
+    });
+    defer agent.deinit();
+
+    var event_count: usize = 0;
+    const Counter = struct {
+        fn listener(_: protocol.AgentEvent, ctx: ?*anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(ctx.?));
+            count.* += 1;
+        }
+    };
+    const token = agent.subscribe(Counter.listener, @ptrCast(&event_count));
+
+    // First prompt — listener should fire
+    const prompts1 = [_]protocol.AgentMessage{makeUserMessage("first")};
+    try agent.prompt(&prompts1);
+    const count_after_first = event_count;
+    try std.testing.expect(count_after_first > 0);
+
+    // Unsubscribe
+    agent.unsubscribe(token);
+
+    // Second prompt — listener should NOT fire
+    const prompts2 = [_]protocol.AgentMessage{makeUserMessage("second")};
+    try agent.prompt(&prompts2);
+    try std.testing.expectEqual(count_after_first, event_count);
+}
+
+// ── test 7: sessionId forwarded to streamFn options ──
+
+test "Agent: sessionId forwarded to streamFn options" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const msg = createAssistantMessage(allocator, "ok");
+    defer allocator.free(msg.content);
+    fp.setResponses(&.{msg});
+
+    const CaptureState = struct {
+        captured_session_id: ?[]const u8 = null,
+        fp_ptr: *faux.FauxProvider,
+    };
+    var capture = CaptureState{ .fp_ptr = &fp };
+
+    const capturingStreamFn = struct {
+        fn func(
+            ctx: ?*anyopaque,
+            alloc: std.mem.Allocator,
+            model: ai.protocol.Model,
+            context: ai.protocol.Context,
+            options: ai.protocol.SimpleStreamOptions,
+            callback: ai.provider.EventCallback,
+            callback_ctx: ?*anyopaque,
+        ) void {
+            const s: *CaptureState = @ptrCast(@alignCast(ctx.?));
+            s.captured_session_id = options.base.session_id;
+            const prov = s.fp_ptr.provider();
+            prov.streamSimple(alloc, model, context, options, callback, callback_ctx);
+        }
+    }.func;
+
+    var agent = Agent.init(allocator, .{
+        .stream_fn = .{ .func = capturingStreamFn, .ctx = @ptrCast(&capture) },
+        .session_id = "session-abc",
+    });
+    defer agent.deinit();
+
+    const prompts = [_]protocol.AgentMessage{makeUserMessage("hello")};
+    try agent.prompt(&prompts);
+
+    try std.testing.expect(capture.captured_session_id != null);
+    try std.testing.expectEqualStrings("session-abc", capture.captured_session_id.?);
 }

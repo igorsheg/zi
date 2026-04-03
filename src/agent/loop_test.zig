@@ -916,3 +916,306 @@ test "follow-up: messages processed after agent would stop" {
     try std.testing.expectEqual(AgentMessageTag.user, snap.message_tags[2]);
     try std.testing.expectEqual(AgentMessageTag.assistant, snap.message_tags[3]);
 }
+
+// ── test 1: strengthen tool call lifecycle — assert args received ──
+
+fn trackingEchoExecute(
+    ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    args: std.json.Value,
+    _: ?*anyopaque,
+    _: ?protocol.AgentToolUpdateCallback,
+    _: ?*anyopaque,
+) protocol.AgentToolResult {
+    const state: *TrackingEchoState = @ptrCast(@alignCast(ctx.?));
+    state.received_tool_call_id = tool_call_id;
+    state.received_args = args;
+    state.execute_count += 1;
+
+    const content = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+        return .{ .content = &.{}, .is_error = true };
+    content[0] = .{ .text = .{ .text = "echoed" } };
+    return .{ .content = content };
+}
+
+const TrackingEchoState = struct {
+    received_tool_call_id: ?[]const u8 = null,
+    received_args: ?std.json.Value = null,
+    execute_count: usize = 0,
+};
+
+test "tool call lifecycle: execute receives correct tool_call_id and args" {
+    const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    // Send a json object as args — matches pi-mono pattern of {value: "hello"}
+    var obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    defer obj.object.deinit();
+    try obj.object.put("value", .{ .string = "hello" });
+
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("echo", "tc-args-1", obj),
+    };
+    const tc_msg = faux.fauxAssistantMessage(allocator, &tc_content, .toolUse);
+    defer allocator.free(tc_msg.content);
+
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done")};
+    const text_msg = faux.fauxAssistantMessage(allocator, &text_content, .stop);
+    defer allocator.free(text_msg.content);
+
+    fp.setResponses(&.{ tc_msg, text_msg });
+
+    var tracking = TrackingEchoState{};
+    const echo_tool = protocol.AgentTool{
+        .name = "echo",
+        .description = "echo tool",
+        .label = "Echo",
+        .parameters = .null,
+        .ctx = @ptrCast(&tracking),
+        .execute = trackingEchoExecute,
+    };
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const user_msg = makeUserMessage("call echo");
+    const prompts = [_]protocol.AgentMessage{user_msg};
+    const tools = [_]protocol.AgentTool{echo_tool};
+    const context = protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &tools,
+    };
+    var config = makeConfig(&fp);
+    _ = &config;
+
+    loop.runAgentLoop(
+        loop_arena.allocator(),
+        &prompts,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    // Tool was executed exactly once
+    try std.testing.expectEqual(@as(usize, 1), tracking.execute_count);
+    // Received correct tool_call_id
+    try std.testing.expectEqualStrings("tc-args-1", tracking.received_tool_call_id.?);
+    // Received correct args — object with "value": "hello"
+    const received = tracking.received_args.?;
+    try std.testing.expect(received == .object);
+    const val = received.object.get("value").?;
+    try std.testing.expect(val == .string);
+    try std.testing.expectEqualStrings("hello", val.string);
+}
+
+// ── test 2: steering with 2 tool calls — both complete before inject ──
+
+test "steering: injected after ALL tool executions complete, visible in LLM context" {
+    const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    // First response: 2 tool calls
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("echo", "tc-a", .null),
+        faux.fauxToolCall("echo", "tc-b", .null),
+    };
+    const tc_msg = faux.fauxAssistantMessage(allocator, &tc_content, .toolUse);
+    defer allocator.free(tc_msg.content);
+
+    // Second response: final text (after steering)
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done")};
+    const text_msg = faux.fauxAssistantMessage(allocator, &text_content, .stop);
+    defer allocator.free(text_msg.content);
+
+    fp.setResponses(&.{ tc_msg, text_msg });
+
+    const echo_tool = protocol.AgentTool{
+        .name = "echo",
+        .description = "echo tool",
+        .label = "Echo",
+        .parameters = .null,
+        .execute = echoExecute,
+    };
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const user_msg = makeUserMessage("start");
+    const prompts = [_]protocol.AgentMessage{user_msg};
+    const tools = [_]protocol.AgentTool{echo_tool};
+    const context = protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &tools,
+    };
+
+    var config = makeConfig(&fp);
+
+    const SteeringPollState2 = struct {
+        poll_count: usize = 0,
+        steering_msg: protocol.AgentMessage,
+    };
+    var poll_state = SteeringPollState2{
+        .steering_msg = makeUserMessage("interrupt"),
+    };
+
+    const steeringPollFn2 = struct {
+        fn func(alloc: std.mem.Allocator, ctx: ?*anyopaque) []const protocol.AgentMessage {
+            const s: *SteeringPollState2 = @ptrCast(@alignCast(ctx.?));
+            s.poll_count += 1;
+            if (s.poll_count == 2) {
+                const result = alloc.alloc(protocol.AgentMessage, 1) catch return &.{};
+                result[0] = s.steering_msg;
+                return result;
+            }
+            return &.{};
+        }
+    }.func;
+
+    config.get_steering_messages = .{ .func = steeringPollFn2, .ctx = @ptrCast(&poll_state) };
+
+    loop.runAgentLoop(
+        loop_arena.allocator(),
+        &prompts,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    // Both tool_execution_end events should be non-error
+    var tool_end_count: usize = 0;
+    var tool_end_errors: usize = 0;
+    var tool_result_count: usize = 0;
+    var saw_all_tool_results = false;
+    var saw_interrupt_after_all_results = false;
+
+    for (collector.events.items) |e| {
+        switch (eventTag(e)) {
+            .tool_execution_end => {
+                tool_end_count += 1;
+                if (e.tool_execution_end.is_error) tool_end_errors += 1;
+            },
+            .message_start => {
+                if (e.message_start.message == .tool_result) {
+                    tool_result_count += 1;
+                    if (tool_result_count == 2) saw_all_tool_results = true;
+                }
+                if (e.message_start.message == .user) {
+                    if (saw_all_tool_results) saw_interrupt_after_all_results = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Both tools executed without error
+    try std.testing.expectEqual(@as(usize, 2), tool_end_count);
+    try std.testing.expectEqual(@as(usize, 0), tool_end_errors);
+
+    // Interrupt appears after BOTH tool results
+    try std.testing.expect(saw_all_tool_results);
+    try std.testing.expect(saw_interrupt_after_all_results);
+
+    // Two LLM calls
+    try std.testing.expectEqual(@as(usize, 2), fp.call_count);
+}
+
+// ── test 3: agentLoopContinue with custom tail message ──
+
+test "agentLoopContinue: allows custom message as last message via convertToLlm" {
+    const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("Response")};
+    const msg = faux.fauxAssistantMessage(allocator, &content, .stop);
+    defer allocator.free(msg.content);
+    fp.setResponses(&.{msg});
+
+    // convertToLlm maps custom → user message
+    const customConvert = struct {
+        fn func(alloc: std.mem.Allocator, messages: []const protocol.AgentMessage, _: ?*anyopaque) []const ai.protocol.Message {
+            var result: std.ArrayListUnmanaged(ai.protocol.Message) = .empty;
+            for (messages) |m| {
+                switch (m) {
+                    .user => |u| result.append(alloc, .{ .user = u }) catch continue,
+                    .assistant => |a| result.append(alloc, .{ .assistant = a }) catch continue,
+                    .tool_result => |t| result.append(alloc, .{ .tool_result = t }) catch continue,
+                    .custom => {
+                        result.append(alloc, .{ .user = .{
+                            .content = .{ .text = "custom-mapped" },
+                            .timestamp = std.time.milliTimestamp(),
+                        } }) catch continue;
+                    },
+                    else => continue,
+                }
+            }
+            return result.items;
+        }
+    }.func;
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    // Context ends with a custom message (not assistant)
+    const custom_msg = protocol.AgentMessage{ .custom = .{
+        .custom_type = "notification",
+        .content = "custom tail",
+        .timestamp = std.time.milliTimestamp(),
+    } };
+    const existing = [_]protocol.AgentMessage{
+        makeUserMessage("Hello"),
+        custom_msg,
+    };
+
+    const context = protocol.AgentContext{
+        .system_prompt = "You are helpful.",
+        .messages = &existing,
+        .tools = null,
+    };
+
+    var config = makeConfig(&fp);
+    config.convert_to_llm = .{ .func = customConvert };
+
+    try loop.runAgentLoopContinue(
+        loop_arena.allocator(),
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    // Result has 1 assistant message, no user message events
+    const snap = collector.agent_end_snapshot orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), snap.count);
+    try std.testing.expectEqual(AgentMessageTag.assistant, snap.message_tags[0]);
+
+    // No user message_end events emitted (continue doesn't emit for existing messages)
+    var user_message_events: usize = 0;
+    for (collector.events.items) |e| {
+        if (eventTag(e) == .message_end) {
+            if (e.message_end.message == .user) {
+                user_message_events += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), user_message_events);
+}
