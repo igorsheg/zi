@@ -171,7 +171,7 @@ fn runLoop(
 
             var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
             if (has_more_tool_calls) {
-                executeToolCalls(allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, signal, event_sink, event_ctx);
+                executeToolCalls(allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
             }
 
             event_sink(.{ .turn_end = .{
@@ -248,8 +248,29 @@ fn streamAssistantResponse(
     return assistant_msg;
 }
 
-/// Execute tool calls sequentially.
-/// Matches pi-mono's executeToolCallsSequential (agent-loop.ts:350-388).
+/// Bridge for streaming tool execution updates to the event sink.
+/// Passed as opaque context to AgentToolUpdateCallback.
+const UpdateBridge = struct {
+    sink: protocol.AgentEventSink,
+    sink_ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args: std.json.Value,
+
+    fn callback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
+        const self: *const UpdateBridge = @ptrCast(@alignCast(ctx));
+        self.sink(.{ .tool_execution_update = .{
+            .tool_call_id = self.tool_call_id,
+            .tool_name = self.tool_name,
+            .args = self.args,
+            .partial_result = partial_result,
+        } }, self.sink_ctx);
+    }
+};
+
+/// Execute tool calls sequentially using the 3-phase pipeline:
+///   prepareToolCall → executePreparedToolCall → finalizeExecutedToolCall
+/// Matches pi-mono's agent-loop.ts:350-388 (sequential) calling 458-595 (phases).
 fn executeToolCalls(
     aa: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
@@ -257,6 +278,8 @@ fn executeToolCalls(
     tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
     assistant_msg: ai.protocol.AssistantMessage,
     tools: []const protocol.AgentTool,
+    config: protocol.AgentLoopConfig,
+    system_prompt: []const u8,
     signal: ?*anyopaque,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
@@ -264,6 +287,8 @@ fn executeToolCalls(
     for (assistant_msg.content) |block| {
         switch (block) {
             .tool_call => |tc| {
+                // --- Phase 1: prepareToolCall (pi-mono agent-loop.ts:472-522) ---
+
                 event_sink(.{ .tool_execution_start = .{
                     .tool_call_id = tc.id,
                     .tool_name = tc.name,
@@ -272,32 +297,95 @@ fn executeToolCalls(
 
                 const tool = findTool(tools, tc.name);
                 if (tool == null) {
-                    const err_content_buf = aa.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
-                    if (err_content_buf.len > 0) {
-                        err_content_buf[0] = .{ .text = .{ .text = "tool not found" } };
-                    }
-                    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true };
-                    const err_result = makeErrorToolResult(aa, tc.id, tc.name, "tool not found");
-                    emitToolResult(event_sink, event_ctx, tc, err_result, true, err_tool_result);
-                    ctx_messages.append(aa, .{ .tool_result = err_result }) catch {};
-                    new_messages.append(aa, .{ .tool_result = err_result }) catch {};
-                    tool_results.append(aa, err_result) catch {};
+                    const err_msg = std.fmt.allocPrint(aa, "Tool {s} not found", .{tc.name}) catch "Tool not found";
+                    emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
                     continue;
                 }
 
                 const t = tool.?;
+
+                // prepare_arguments: optional arg transform before execution
+                const prepared_args = if (t.prepare_arguments) |prep_fn|
+                    prep_fn(tc.arguments)
+                else
+                    tc.arguments;
+
+                // beforeToolCall hook: can block execution
+                if (config.before_tool_call) |hook| {
+                    const hook_ctx = protocol.BeforeToolCallContext{
+                        .assistant_message = assistant_msg,
+                        .tool_call = tc,
+                        .args = prepared_args,
+                        .context = .{
+                            .system_prompt = system_prompt,
+                            .messages = ctx_messages.items,
+                            .tools = if (tools.len > 0) tools else null,
+                        },
+                    };
+                    if (hook.call(hook_ctx, signal)) |before_result| {
+                        if (before_result.block) {
+                            const reason = before_result.reason orelse "Tool execution was blocked";
+                            emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, reason, event_sink, event_ctx);
+                            continue;
+                        }
+                    }
+                }
+
+                // --- Phase 2: executePreparedToolCall (pi-mono agent-loop.ts:524-559) ---
+
+                var update_bridge = UpdateBridge{
+                    .sink = event_sink,
+                    .sink_ctx = event_ctx,
+                    .tool_call_id = tc.id,
+                    .tool_name = tc.name,
+                    .args = tc.arguments,
+                };
+
                 const result = t.execute(
                     t.ctx,
                     aa,
                     tc.id,
-                    tc.arguments,
+                    prepared_args,
                     signal,
-                    null,
-                    null,
+                    &UpdateBridge.callback,
+                    @ptrCast(&update_bridge),
                 );
 
+                // --- Phase 3: finalizeExecutedToolCall (pi-mono agent-loop.ts:561-595) ---
+
+                var final_content = result.content;
+                var final_details = result.details;
+                var final_is_error = result.is_error;
+
+                if (config.after_tool_call) |hook| {
+                    const hook_ctx = protocol.AfterToolCallContext{
+                        .assistant_message = assistant_msg,
+                        .tool_call = tc,
+                        .args = prepared_args,
+                        .result = result,
+                        .is_error = result.is_error,
+                        .context = .{
+                            .system_prompt = system_prompt,
+                            .messages = ctx_messages.items,
+                            .tools = if (tools.len > 0) tools else null,
+                        },
+                    };
+                    if (hook.call(hook_ctx, signal)) |after_result| {
+                        if (after_result.content) |c| final_content = c;
+                        if (after_result.details) |d| final_details = d;
+                        if (after_result.is_error) |e| final_is_error = e;
+                    }
+                }
+
+                // Build final AgentToolResult and ToolResultMessage
+                const final_agent_result = protocol.AgentToolResult{
+                    .content = final_content,
+                    .details = final_details,
+                    .is_error = final_is_error,
+                };
+
                 var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .empty;
-                for (result.content) |cb| {
+                for (final_content) |cb| {
                     switch (cb) {
                         .text => |txt| trm_content.append(aa, .{ .text = txt }) catch continue,
                         .image => |img| trm_content.append(aa, .{ .image = img }) catch continue,
@@ -308,12 +396,12 @@ fn executeToolCalls(
                     .tool_call_id = tc.id,
                     .tool_name = tc.name,
                     .content = trm_content.items,
-                    .details = result.details,
-                    .is_error = result.is_error,
+                    .details = final_details,
+                    .is_error = final_is_error,
                     .timestamp = std.time.milliTimestamp(),
                 };
 
-                emitToolResult(event_sink, event_ctx, tc, tool_result_msg, result.is_error, result);
+                emitToolResult(event_sink, event_ctx, tc, tool_result_msg, final_is_error, final_agent_result);
                 ctx_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
                 new_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
                 tool_results.append(aa, tool_result_msg) catch {};
@@ -323,8 +411,30 @@ fn executeToolCalls(
     }
 }
 
-/// Emit tool_execution_end → message_start → message_end for a tool result.
-/// Matches pi-mono's emitToolCallOutcome (agent-loop.ts:604-631).
+/// Emit an immediate error result for a tool call that failed during preparation.
+/// Covers: tool not found, beforeToolCall blocked, arg preparation failure.
+fn emitImmediateError(
+    aa: std.mem.Allocator,
+    ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
+    tc: ai.protocol.ToolCall,
+    msg: []const u8,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+) void {
+    const err_content_buf = aa.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
+    if (err_content_buf.len > 0) {
+        err_content_buf[0] = .{ .text = .{ .text = msg } };
+    }
+    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true };
+    const err_result = makeErrorToolResult(aa, tc.id, tc.name, msg);
+    emitToolResult(event_sink, event_ctx, tc, err_result, true, err_tool_result);
+    ctx_messages.append(aa, .{ .tool_result = err_result }) catch {};
+    new_messages.append(aa, .{ .tool_result = err_result }) catch {};
+    tool_results.append(aa, err_result) catch {};
+}
+
 fn emitToolResult(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,

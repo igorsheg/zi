@@ -1219,3 +1219,327 @@ test "agentLoopContinue: allows custom message as last message via convertToLlm"
     }
     try std.testing.expectEqual(@as(usize, 0), user_message_events);
 }
+
+// ── contract: tool call pipeline hooks (pi-mono agent-loop.test.ts:310-450) ──
+
+test "prepareArguments: rewrites args before execution receives them" {
+    const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    // LLM sends flat {oldText: "before", newText: "after"}
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"oldText\":\"before\",\"newText\":\"after\"}", .{});
+    defer parsed.deinit();
+
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("edit", "tc-prep-1", parsed.value),
+    };
+    const tc_msg = faux.fauxAssistantMessage(allocator, &tc_content, .toolUse);
+    defer allocator.free(tc_msg.content);
+
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done")};
+    const text_msg = faux.fauxAssistantMessage(allocator, &text_content, .stop);
+    defer allocator.free(text_msg.content);
+
+    fp.setResponses(&.{ tc_msg, text_msg });
+
+    // Track what args execute receives
+    const PrepState = struct {
+        received_args: ?std.json.Value = null,
+        execute_count: usize = 0,
+    };
+    var prep_state = PrepState{};
+
+    const prepFn = struct {
+        fn func(args: std.json.Value) std.json.Value {
+            // Rewrite flat {oldText, newText} → {edits: [{oldText, newText}]}
+            // We just return a sentinel object to prove prepare_arguments ran
+            _ = args;
+            // Build {edits: "rewritten"} as sentinel
+            return .{ .string = "prepared-sentinel" };
+        }
+    }.func;
+
+    const execFn = struct {
+        fn func(
+            ctx: ?*anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            args: std.json.Value,
+            _: ?*anyopaque,
+            _: ?protocol.AgentToolUpdateCallback,
+            _: ?*anyopaque,
+        ) protocol.AgentToolResult {
+            const s: *PrepState = @ptrCast(@alignCast(ctx.?));
+            s.received_args = args;
+            s.execute_count += 1;
+            const content = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+                return .{ .content = &.{}, .is_error = true };
+            content[0] = .{ .text = .{ .text = "ok" } };
+            return .{ .content = content };
+        }
+    }.func;
+
+    const edit_tool = protocol.AgentTool{
+        .name = "edit",
+        .description = "edit tool",
+        .label = "Edit",
+        .parameters = .null,
+        .ctx = @ptrCast(&prep_state),
+        .prepare_arguments = prepFn,
+        .execute = execFn,
+    };
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const user_msg = makeUserMessage("edit something");
+    const prompts = [_]protocol.AgentMessage{user_msg};
+    const tools = [_]protocol.AgentTool{edit_tool};
+    const context = protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &tools,
+    };
+    var config = makeConfig(&fp);
+    _ = &config;
+
+    loop.runAgentLoop(
+        loop_arena.allocator(),
+        &prompts,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    // Execute was called exactly once
+    try std.testing.expectEqual(@as(usize, 1), prep_state.execute_count);
+    // Execute received the prepared sentinel, not the original args
+    const received = prep_state.received_args.?;
+    try std.testing.expect(received == .string);
+    try std.testing.expectEqualStrings("prepared-sentinel", received.string);
+}
+
+test "beforeToolCall: block=true prevents execution and emits error" {
+    const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("echo", "tc-block-1", .null),
+    };
+    const tc_msg = faux.fauxAssistantMessage(allocator, &tc_content, .toolUse);
+    defer allocator.free(tc_msg.content);
+
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done")};
+    const text_msg = faux.fauxAssistantMessage(allocator, &text_content, .stop);
+    defer allocator.free(text_msg.content);
+
+    fp.setResponses(&.{ tc_msg, text_msg });
+
+    // Track whether execute is called
+    const BlockState = struct {
+        execute_count: usize = 0,
+    };
+    var block_state = BlockState{};
+
+    const blockExecFn = struct {
+        fn func(
+            ctx: ?*anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: std.json.Value,
+            _: ?*anyopaque,
+            _: ?protocol.AgentToolUpdateCallback,
+            _: ?*anyopaque,
+        ) protocol.AgentToolResult {
+            const s: *BlockState = @ptrCast(@alignCast(ctx.?));
+            s.execute_count += 1;
+            const content = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+                return .{ .content = &.{}, .is_error = true };
+            content[0] = .{ .text = .{ .text = "should not reach" } };
+            return .{ .content = content };
+        }
+    }.func;
+
+    const echo_tool = protocol.AgentTool{
+        .name = "echo",
+        .description = "echo tool",
+        .label = "Echo",
+        .parameters = .null,
+        .ctx = @ptrCast(&block_state),
+        .execute = blockExecFn,
+    };
+
+    const blockHookFn = struct {
+        fn func(_: protocol.BeforeToolCallContext, _: ?*anyopaque, _: ?*anyopaque) ?protocol.BeforeToolCallResult {
+            return .{ .block = true, .reason = "not allowed" };
+        }
+    }.func;
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const user_msg = makeUserMessage("call echo");
+    const prompts = [_]protocol.AgentMessage{user_msg};
+    const tools = [_]protocol.AgentTool{echo_tool};
+    const context = protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &tools,
+    };
+    var config = makeConfig(&fp);
+    config.before_tool_call = .{ .func = blockHookFn };
+
+    loop.runAgentLoop(
+        loop_arena.allocator(),
+        &prompts,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    // Execute was NOT called
+    try std.testing.expectEqual(@as(usize, 0), block_state.execute_count);
+
+    // tool_execution_end was emitted with is_error=true
+    var found_tool_end = false;
+    var tool_end_is_error = false;
+    var tool_end_has_reason = false;
+    for (collector.events.items) |e| {
+        if (eventTag(e) == .tool_execution_end) {
+            found_tool_end = true;
+            tool_end_is_error = e.tool_execution_end.is_error;
+            // Check the error content contains the reason
+            for (e.tool_execution_end.result.content) |cb| {
+                switch (cb) {
+                    .text => |txt| {
+                        if (std.mem.indexOf(u8, txt.text, "not allowed") != null) {
+                            tool_end_has_reason = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_tool_end);
+    try std.testing.expect(tool_end_is_error);
+    try std.testing.expect(tool_end_has_reason);
+}
+
+test "afterToolCall: overrides content and isError in emitted result" {
+    const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("echo", "tc-after-1", .null),
+    };
+    const tc_msg = faux.fauxAssistantMessage(allocator, &tc_content, .toolUse);
+    defer allocator.free(tc_msg.content);
+
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done")};
+    const text_msg = faux.fauxAssistantMessage(allocator, &text_content, .stop);
+    defer allocator.free(text_msg.content);
+
+    fp.setResponses(&.{ tc_msg, text_msg });
+
+    // Execute returns {content: [{text: "original"}], is_error: false}
+    const origExecFn = struct {
+        fn func(
+            _: ?*anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: std.json.Value,
+            _: ?*anyopaque,
+            _: ?protocol.AgentToolUpdateCallback,
+            _: ?*anyopaque,
+        ) protocol.AgentToolResult {
+            const content = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+                return .{ .content = &.{}, .is_error = true };
+            content[0] = .{ .text = .{ .text = "original" } };
+            return .{ .content = content, .is_error = false };
+        }
+    }.func;
+
+    const echo_tool = protocol.AgentTool{
+        .name = "echo",
+        .description = "echo tool",
+        .label = "Echo",
+        .parameters = .null,
+        .execute = origExecFn,
+    };
+
+    // afterToolCall overrides content and flips is_error to true
+    const afterHookFn = struct {
+        fn func(_: protocol.AfterToolCallContext, _: ?*anyopaque, hook_ctx: ?*anyopaque) ?protocol.AfterToolCallResult {
+            _ = hook_ctx;
+            return .{
+                .content = &.{.{ .text = .{ .text = "overridden" } }},
+                .is_error = true,
+            };
+        }
+    }.func;
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const user_msg = makeUserMessage("call echo");
+    const prompts = [_]protocol.AgentMessage{user_msg};
+    const tools = [_]protocol.AgentTool{echo_tool};
+    const context = protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &tools,
+    };
+    var config = makeConfig(&fp);
+    config.after_tool_call = .{ .func = afterHookFn };
+
+    loop.runAgentLoop(
+        loop_arena.allocator(),
+        &prompts,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    // tool_execution_end should have the overridden values
+    var found_tool_end = false;
+    var end_is_error = false;
+    var end_has_overridden_content = false;
+    for (collector.events.items) |e| {
+        if (eventTag(e) == .tool_execution_end) {
+            found_tool_end = true;
+            end_is_error = e.tool_execution_end.is_error;
+            for (e.tool_execution_end.result.content) |cb| {
+                switch (cb) {
+                    .text => |txt| {
+                        if (std.mem.eql(u8, txt.text, "overridden")) {
+                            end_has_overridden_content = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_tool_end);
+    try std.testing.expect(end_is_error);
+    try std.testing.expect(end_has_overridden_content);
+}
