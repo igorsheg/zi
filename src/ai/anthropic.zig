@@ -53,7 +53,7 @@ pub const AnthropicProvider = struct {
         _ = self;
 
         // Build request payload
-        var payload_buf: std.ArrayListUnmanaged(u8) = .{};
+        var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer payload_buf.deinit(allocator);
 
         const is_oauth_token = if (options.api_key) |k| std.mem.indexOf(u8, k, "sk-ant-oat") != null else false;
@@ -279,8 +279,8 @@ const ContentBlockState = struct {
         return .{
             .block_type = block_type,
             .index = index,
-            .text = .{},
-            .thinking = .{},
+            .text = .empty,
+            .thinking = .empty,
             .tool_call = null,
         };
     }
@@ -707,7 +707,7 @@ fn extractJsonString(json: []const u8, field: []const u8) ?[]const u8 {
 fn jsonUnescapeString(allocator: std.mem.Allocator, s: []const u8) []const u8 {
     if (std.mem.indexOf(u8, s, "\\") == null) return s;
 
-    var result: std.ArrayListUnmanaged(u8) = .{};
+    var result: std.ArrayListUnmanaged(u8) = .empty;
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '\\' and i + 1 < s.len) {

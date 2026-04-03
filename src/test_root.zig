@@ -1,0 +1,8 @@
+test {
+    _ = @import("storage.zig");
+    _ = @import("ai/root.zig");
+    _ = @import("auth/root.zig");
+    _ = @import("settings/root.zig");
+    _ = @import("agent/root.zig");
+    _ = @import("session/root.zig");
+}

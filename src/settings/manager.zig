@@ -68,7 +68,7 @@ pub const SettingsManager = struct {
             .modified_project_fields = std.EnumSet(types.SettingsField).initEmpty(),
             .modified_nested = std.AutoHashMap(types.SettingsField, std.StringHashMap(void)).init(allocator),
             .modified_project_nested = std.AutoHashMap(types.SettingsField, std.StringHashMap(void)).init(allocator),
-            .errors = .{},
+            .errors = .empty,
         };
         mgr.loadScope(.global);
         mgr.loadScope(.project);
@@ -98,8 +98,9 @@ pub const SettingsManager = struct {
     // ── loading ─────────────────────────────────────────────────────────
 
     fn loadScope(self: *SettingsManager, scope: types.SettingsScope) void {
-        var capture: ReadCapture = .{};
+        var capture: ReadCapture = .{ .allocator = self.allocator };
         self.storage.withLock(scope, @ptrCast(&capture), ReadCapture.callback);
+        defer if (capture.content) |c| self.allocator.free(c);
         if (capture.content) |content| {
             const result = json.parseSettingsJson(self.allocator, content) catch {
                 switch (scope) {
@@ -189,14 +190,16 @@ pub const SettingsManager = struct {
     }
 
     fn persistScopedSettings(self: *SettingsManager, scope: types.SettingsScope) void {
-        // Step 1: read current file content
-        var capture: ReadCapture = .{};
+        // Step 1: read current file content (duped by ReadCapture, we must free)
+        var capture: ReadCapture = .{ .allocator = self.allocator };
         self.storage.withLock(scope, @ptrCast(&capture), ReadCapture.callback);
 
         // Step 2: merge modified fields into raw object
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
+        // Free the captured content after arena takes ownership of its parse
+        defer if (capture.content) |c| self.allocator.free(c);
 
         var raw_obj: std.json.ObjectMap = if (capture.content) |c| blk: {
             const parsed = std.json.parseFromSlice(std.json.Value, a, c, .{}) catch
@@ -719,7 +722,7 @@ pub const SettingsManager = struct {
     /// ArrayList's backing buffer and is invalidated on next mutation.
     pub fn drainErrors(self: *SettingsManager) []const types.SettingsError {
         const items = self.errors.items;
-        self.errors = .{};
+        self.errors = .empty;
         return items;
     }
 };
@@ -728,10 +731,12 @@ pub const SettingsManager = struct {
 
 const ReadCapture = struct {
     content: ?[]const u8 = null,
+    allocator: std.mem.Allocator,
 
     fn callback(ctx: *anyopaque, current: ?[]const u8) ?[]const u8 {
         const self: *ReadCapture = @ptrCast(@alignCast(ctx));
-        self.content = current;
+        // Dupe the content — file storage frees `current` after callback returns
+        self.content = if (current) |c| self.allocator.dupe(u8, c) catch null else null;
         return null;
     }
 };

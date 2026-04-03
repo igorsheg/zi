@@ -1,5 +1,5 @@
 const std = @import("std");
-const agent = @import("agent");
+const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const json = @import("json.zig");
 
@@ -47,7 +47,7 @@ pub const SessionWriter = struct {
             .timestamp = timestamp,
             .cwd = cwd,
         };
-        var buffered: std.ArrayListUnmanaged(proto.FileEntry) = .{};
+        var buffered: std.ArrayListUnmanaged(proto.FileEntry) = .empty;
         buffered.append(allocator, .{ .header = header }) catch @panic("OOM");
 
         return .{
@@ -117,6 +117,7 @@ pub const SessionWriter = struct {
             file.writeAll("\n") catch {};
         }
         self.flushed = true;
+        self.buffered_entries.clearRetainingCapacity();
     }
 
     /// Append a single entry to the already-flushed file.

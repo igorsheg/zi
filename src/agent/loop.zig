@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai = @import("ai");
+const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
 
 /// Multi-turn agent loop with sequential tool execution.
@@ -34,7 +34,7 @@ pub fn runAgentLoop(
     // Mutable message list — grows as we add assistant responses and tool results.
     // Uses arena_alloc so tool result content slices (which point into arena memory)
     // stay valid for the loop's lifetime.
-    var messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .{};
+    var messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     defer messages.deinit(arena_alloc);
     for (initial_messages) |msg| {
         messages.append(arena_alloc, msg) catch return;
@@ -66,7 +66,7 @@ pub fn runAgentLoop(
     };
 
     // Convert AgentTools to LLM Tools for the provider
-    var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .{};
+    var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .empty;
     defer llm_tools.deinit(arena_alloc);
     for (tools) |t| {
         llm_tools.append(arena_alloc, .{
@@ -85,7 +85,7 @@ pub fn runAgentLoop(
         first_turn = false;
 
         // Build LLM context from current messages
-        var llm_messages: std.ArrayListUnmanaged(ai.protocol.Message) = .{};
+        var llm_messages: std.ArrayListUnmanaged(ai.protocol.Message) = .empty;
         defer llm_messages.deinit(arena_alloc);
         for (messages.items) |agent_msg| {
             switch (agent_msg) {
@@ -147,7 +147,7 @@ pub fn runAgentLoop(
         }
 
         // Execute tool calls sequentially
-        var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .{};
+        var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
         defer tool_results.deinit(arena_alloc);
 
         for (assistant_msg.content) |block| {
@@ -184,7 +184,7 @@ pub fn runAgentLoop(
 
                     // Build ToolResultMessage — pi-mono: emitToolCallOutcome (agent-loop.ts:604-631)
                     // Propagate details and detect error from tool result content
-                    var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .{};
+                    var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .empty;
                     for (result.content) |cb| {
                         switch (cb) {
                             .text => |txt| trm_content.append(arena_alloc, .{ .text = txt }) catch continue,

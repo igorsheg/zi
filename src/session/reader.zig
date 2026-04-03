@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai = @import("ai");
+const ai = @import("../ai/root.zig");
 const proto = @import("protocol.zig");
 const json = @import("json.zig");
 
@@ -13,7 +13,7 @@ pub const SessionData = struct {
 /// All returned data is owned by the provided allocator.
 pub fn parseSessionContent(allocator: std.mem.Allocator, content: []const u8) !SessionData {
     var header: ?proto.SessionHeader = null;
-    var entries: std.ArrayListUnmanaged(proto.SessionEntry) = .{};
+    var entries: std.ArrayListUnmanaged(proto.SessionEntry) = .empty;
 
     var line_start: usize = 0;
     for (content, 0..) |c, i| {

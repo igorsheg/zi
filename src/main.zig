@@ -1,8 +1,9 @@
 const std = @import("std");
-const ai = @import("ai");
-const auth = @import("auth");
-const agent = @import("agent");
-const session = @import("session");
+const ai = @import("ai/root.zig");
+const auth = @import("auth/root.zig");
+const settings_mod = @import("settings/root.zig");
+const agent = @import("agent/root.zig");
+const session = @import("session/root.zig");
 const bash_tool = @import("tools/bash.zig");
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
@@ -57,8 +58,8 @@ pub fn main() !void {
             \\
             \\Options:
             \\  -p, --print           Non-interactive mode
-            \\  --model <id>          Model ID or pattern (default: claude-sonnet-4-20250514)
-            \\  --api-key <key>       API key (or set ANTHROPIC_API_KEY)
+            \\  --model <id>          Model ID or pattern (default: from settings or claude-sonnet-4)
+            \\  --api-key <key>       API key override (also reads ~/.pi/agent/auth.json)
             \\  --list-models         List available models
             \\  -h, --help            Show help
             \\  -v, --version         Show version
@@ -86,13 +87,25 @@ pub fn main() !void {
             std.process.exit(1);
         };
 
-        // Resolve model from catalog
-        const resolved_id = model_id orelse "claude-sonnet-4-20250514";
-        const model = ai.models.getModelById(resolved_id) orelse
-            ai.models.findModel(resolved_id) orelse {
-            try stderr.writeAll("error: model not found: ");
-            try stderr.writeAll(resolved_id);
-            try stderr.writeAll("\nuse --list-models to see available models\n");
+        // Auth + settings — reads ~/.pi/agent/auth.json and settings.json
+        var auth_storage = auth.storage.AuthStorage.create(allocator, null) catch {
+            try stderr.writeAll("warning: could not load auth storage\n");
+            unreachable;
+        };
+        _ = &auth_storage;
+
+        const cwd_buf = std.fs.cwd().realpathAlloc(allocator, ".") catch "/unknown";
+        var settings = settings_mod.manager.SettingsManager.create(allocator, cwd_buf, null) catch {
+            try stderr.writeAll("warning: could not load settings\n");
+            unreachable;
+        };
+        _ = &settings;
+
+        // Resolve model: --model flag → settings default → first authed provider default
+        // pi-mono: model-resolver.ts:474-554
+        const model = resolveModel(model_id, &settings, &auth_storage) orelse {
+            try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
+            try stderr.writeAll("use --list-models to see available models\n");
             std.process.exit(1);
         };
 
@@ -106,8 +119,26 @@ pub fn main() !void {
             std.process.exit(1);
         }
 
-        const key = api_key_arg orelse std.posix.getenv("ANTHROPIC_API_KEY") orelse {
-            try stderr.writeAll("error: no API key. set ANTHROPIC_API_KEY or use --api-key\n");
+        // Resolve API key: --api-key flag is tier 1 (runtime override),
+        // then auth.json, oauth tokens, env vars via AuthStorage.getApiKey
+        const provider_str = ai.json_util.providerToString(model.provider);
+        if (api_key_arg) |cli_key| {
+            auth_storage.setRuntimeApiKey(provider_str, cli_key);
+        }
+        const key = auth_storage.getApiKey(provider_str) orelse {
+            try stderr.writeAll("error: no API key for provider '");
+            try stderr.writeAll(provider_str);
+            try stderr.writeAll("'. run `pi login` or set ");
+            const env_hint = ai.env_api_keys.getEnvApiKey(provider_str);
+            if (env_hint == null) {
+                // Show the env var name they could set
+                if (std.mem.eql(u8, provider_str, "anthropic")) {
+                    try stderr.writeAll("ANTHROPIC_API_KEY");
+                } else {
+                    try stderr.writeAll("the provider's API key env var");
+                }
+            }
+            try stderr.writeAll("\n");
             std.process.exit(1);
         };
 
@@ -137,7 +168,6 @@ pub fn main() !void {
 
         // Session writer — persists messages incrementally on message_end,
         // gated on first assistant message (matches pi-mono behavior).
-        const cwd_buf = std.fs.cwd().realpathAlloc(allocator, ".") catch "/unknown";
         var sw = session.writer.SessionWriter.init(allocator, cwd_buf);
 
         var handler = PrintSessionHandler{ .session_writer = &sw };
@@ -203,3 +233,71 @@ const PrintSessionHandler = struct {
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
+
+/// Resolve model matching pi-mono's findInitialModel priority:
+/// 1. --model CLI flag (exact or fuzzy match)
+/// 2. settings.json defaultProvider + defaultModel
+/// 3. first authed provider's default model (from defaultModelPerProvider)
+/// 4. first model in catalog where auth is available
+/// pi-mono: model-resolver.ts:474-554
+fn resolveModel(
+    cli_model: ?[]const u8,
+    settings: *settings_mod.manager.SettingsManager,
+    auth_storage: *auth.storage.AuthStorage,
+) ?ai.protocol.Model {
+    // 1. CLI flag
+    if (cli_model) |id| {
+        return ai.models.getModelById(id) orelse ai.models.findModel(id);
+    }
+
+    // 2. Settings default
+    if (settings.getDefaultModel()) |model_id| {
+        if (ai.models.getModelById(model_id) orelse ai.models.findModel(model_id)) |m| {
+            return m;
+        }
+    }
+
+    // 3. Default model per provider, for providers with auth
+    // pi-mono: model-resolver.ts:540-546
+    for (default_models_per_provider) |entry| {
+        if (auth_storage.hasAuth(entry.provider)) {
+            if (ai.models.getModelById(entry.model_id)) |m| return m;
+        }
+    }
+
+    // 4. First model in catalog where auth exists
+    for (ai.models.getAllModels()) |m| {
+        const provider_str = ai.json_util.providerToString(m.provider);
+        if (auth_storage.hasAuth(provider_str)) return m;
+    }
+
+    return null;
+}
+
+/// pi-mono: model-resolver.ts:14-38
+const ProviderDefault = struct { provider: []const u8, model_id: []const u8 };
+const default_models_per_provider = [_]ProviderDefault{
+    .{ .provider = "anthropic", .model_id = "claude-sonnet-4-20250514" },
+    .{ .provider = "openai", .model_id = "gpt-5.4" },
+    .{ .provider = "google", .model_id = "gemini-2.5-pro" },
+    .{ .provider = "amazon-bedrock", .model_id = "us.anthropic.claude-opus-4-6-v1" },
+    .{ .provider = "google-gemini-cli", .model_id = "gemini-2.5-pro" },
+    .{ .provider = "google-antigravity", .model_id = "gemini-3.1-pro-high" },
+    .{ .provider = "google-vertex", .model_id = "gemini-3-pro-preview" },
+    .{ .provider = "openai-codex", .model_id = "gpt-5.4" },
+    .{ .provider = "azure-openai-responses", .model_id = "gpt-5.2" },
+    .{ .provider = "github-copilot", .model_id = "gpt-4o" },
+    .{ .provider = "xai", .model_id = "grok-4-fast-non-reasoning" },
+    .{ .provider = "groq", .model_id = "openai/gpt-oss-120b" },
+    .{ .provider = "cerebras", .model_id = "zai-glm-4.7" },
+    .{ .provider = "openrouter", .model_id = "openai/gpt-5.1-codex" },
+    .{ .provider = "vercel-ai-gateway", .model_id = "anthropic/claude-opus-4-6" },
+    .{ .provider = "zai", .model_id = "glm-5" },
+    .{ .provider = "mistral", .model_id = "devstral-medium-latest" },
+    .{ .provider = "minimax", .model_id = "MiniMax-M2.7" },
+    .{ .provider = "minimax-cn", .model_id = "MiniMax-M2.7" },
+    .{ .provider = "huggingface", .model_id = "moonshotai/Kimi-K2.5" },
+    .{ .provider = "opencode", .model_id = "claude-opus-4-6" },
+    .{ .provider = "opencode-go", .model_id = "kimi-k2.5" },
+    .{ .provider = "kimi-coding", .model_id = "kimi-k2-thinking" },
+};

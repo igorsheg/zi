@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai = @import("ai");
+const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
 const loop = @import("loop.zig");
 const faux = ai.faux;
@@ -59,7 +59,7 @@ const EventCollector = struct {
     agent_end_snapshot: ?AgentEndSnapshot = null,
 
     fn init(allocator: std.mem.Allocator) EventCollector {
-        return .{ .events = .{}, .alloc = allocator };
+        return .{ .events = .empty, .alloc = allocator };
     }
 
     fn deinit(self: *EventCollector) void {

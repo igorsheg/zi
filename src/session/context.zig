@@ -1,6 +1,6 @@
 const std = @import("std");
-const ai = @import("ai");
-const agent = @import("agent");
+const ai = @import("../ai/root.zig");
+const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 
 /// Result of building session context from entries.
@@ -45,7 +45,7 @@ pub fn buildSessionContext(
     }
 
     // Walk from leaf to root, collecting path indices
-    var path_indices: std.ArrayListUnmanaged(usize) = .{};
+    var path_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer path_indices.deinit(allocator);
     var current_idx: ?usize = leaf_idx;
     while (current_idx) |idx| {
@@ -79,7 +79,7 @@ pub fn buildSessionContext(
     }
 
     // Build messages
-    var messages: std.ArrayListUnmanaged(agent.protocol.AgentMessage) = .{};
+    var messages: std.ArrayListUnmanaged(agent.protocol.AgentMessage) = .empty;
 
     if (compaction_data) |cd| {
         // pi-mono: createCompactionSummaryMessage (messages.ts:109-119)

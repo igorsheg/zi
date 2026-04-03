@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_util = @import("../ai/json_util.zig");
 
 /// API key credential — stored as `{"type": "api_key", "key": "..."}` in auth.json.
 /// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:22-25
@@ -81,7 +82,7 @@ pub fn parseAuthJson(allocator: std.mem.Allocator, json_content: []const u8) !Au
                     continue;
                 const duped_key = try allocator.dupe(u8, k);
                 errdefer allocator.free(duped_key);
-                const cloned_val = try cloneJsonValue(allocator, field.value_ptr.*);
+                const cloned_val = try json_util.cloneJsonValue(allocator, field.value_ptr.*);
                 try extras.put(duped_key, cloned_val);
             }
 
@@ -166,7 +167,7 @@ pub fn deinitAuthStorageData(data: *AuthStorageData) void {
                 var eit = extras.iterator();
                 while (eit.next()) |e| {
                     allocator.free(e.key_ptr.*);
-                    freeJsonValue(allocator, e.value_ptr.*);
+                    json_util.freeJsonValue(allocator, e.value_ptr.*);
                 }
                 extras.deinit();
             },
@@ -174,56 +175,6 @@ pub fn deinitAuthStorageData(data: *AuthStorageData) void {
         allocator.free(entry.key_ptr.*);
     }
     data.deinit();
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |b| return .{ .bool = b },
-        .integer => |i| return .{ .integer = i },
-        .float => |f| return .{ .float = f },
-        .number_string => |s| return .{ .number_string = try allocator.dupe(u8, s) },
-        .string => |s| return .{ .string = try allocator.dupe(u8, s) },
-        .array => |arr| {
-            var new_arr = try std.json.Array.initCapacity(allocator, arr.items.len);
-            for (arr.items) |item| {
-                try new_arr.append(try cloneJsonValue(allocator, item));
-            }
-            return .{ .array = new_arr };
-        },
-        .object => |obj| {
-            var new_obj = std.json.ObjectMap.init(allocator);
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                const key = try allocator.dupe(u8, entry.key_ptr.*);
-                const val = try cloneJsonValue(allocator, entry.value_ptr.*);
-                try new_obj.put(key, val);
-            }
-            return .{ .object = new_obj };
-        },
-    }
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |s| allocator.free(s),
-        .number_string => |s| allocator.free(s),
-        .array => |arr| {
-            for (arr.items) |item| freeJsonValue(allocator, item);
-            var mutable = arr;
-            mutable.deinit();
-        },
-        .object => |obj| {
-            var mutable = obj;
-            var oit = mutable.iterator();
-            while (oit.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            mutable.deinit();
-        },
-        else => {},
-    }
 }
 
 // ── tests ───────────────────────────────────────────────────────────────

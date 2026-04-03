@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai = @import("ai");
+const ai = @import("../ai/root.zig");
 
 // ── enums ──────────────────────────────────────────────────────────────
 

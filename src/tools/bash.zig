@@ -1,5 +1,5 @@
 const std = @import("std");
-const agent = @import("agent");
+const agent = @import("../agent/root.zig");
 
 /// Bash tool — executes shell commands via /bin/sh -c.
 /// pi-mono equivalent: packages/coding-agent/src/core/tools/bash/
@@ -53,7 +53,7 @@ fn execute(
         ) catch "failed to execute command");
     };
 
-    var output_parts: std.ArrayListUnmanaged(u8) = .{};
+    var output_parts: std.ArrayListUnmanaged(u8) = .empty;
     if (result.stdout.len > 0) {
         output_parts.appendSlice(allocator, result.stdout) catch {};
     }

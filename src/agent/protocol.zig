@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai = @import("ai");
+const ai = @import("../ai/root.zig");
 
 // Re-export ai protocol for convenience
 pub const Message = ai.protocol.Message;

@@ -1,5 +1,6 @@
 const std = @import("std");
-const ai = @import("ai");
+const ai = @import("../ai/root.zig");
+const shared_storage = @import("../storage.zig");
 const types = @import("types.zig");
 const file_backend = @import("file_backend.zig");
 const resolve_config_value = @import("resolve_config_value.zig");
@@ -20,9 +21,15 @@ pub const AuthStorage = struct {
     /// Create a file-backed AuthStorage, loading from disk.
     /// pi-mono source: auth-storage.ts:195-197
     pub fn create(allocator: std.mem.Allocator, auth_path: ?[]const u8) !AuthStorage {
+        const path = if (auth_path) |p|
+            try allocator.dupe(u8, p)
+        else
+            try file_backend.defaultAuthPath(allocator);
+        defer allocator.free(path);
+
         var self = AuthStorage{
             .data = types.AuthStorageData.init(allocator),
-            .backend = .{ .file = try file_backend.FileState.init(allocator, auth_path) },
+            .backend = .{ .file = try shared_storage.LockedFile.init(allocator, path) },
             .allocator = allocator,
             .runtime_overrides = std.StringHashMap([]const u8).init(allocator),
         };
@@ -34,7 +41,7 @@ pub const AuthStorage = struct {
     /// Optionally pre-populate with initial data by serializing it into the memory backend.
     /// pi-mono source: auth-storage.ts:203-207
     pub fn inMemory(allocator: std.mem.Allocator, initial_data: ?*const types.AuthStorageData) !AuthStorage {
-        var backend: file_backend.Backend = .{ .memory = file_backend.MemoryState.init(allocator) };
+        var backend: file_backend.Backend = .{ .memory = @import("../storage.zig").MemoryFile.init(allocator) };
 
         if (initial_data) |d| {
             const json = try types.serializeAuthJson(allocator, d);
@@ -292,7 +299,7 @@ pub const AuthStorage = struct {
                 var eit = oa.extras.iterator();
                 while (eit.next()) |entry| {
                     const k = try allocator.dupe(u8, entry.key_ptr.*);
-                    const v = try cloneJsonValue(allocator, entry.value_ptr.*);
+                    const v = try ai.json_util.cloneJsonValue(allocator, entry.value_ptr.*);
                     try extras.put(k, v);
                 }
 
@@ -317,60 +324,10 @@ pub const AuthStorage = struct {
                 var eit = extras.iterator();
                 while (eit.next()) |entry| {
                     allocator.free(entry.key_ptr.*);
-                    freeJsonValue(allocator, entry.value_ptr.*);
+                    ai.json_util.freeJsonValue(allocator, entry.value_ptr.*);
                 }
                 extras.deinit();
             },
-        }
-    }
-
-    fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-        switch (value) {
-            .null => return .null,
-            .bool => |b| return .{ .bool = b },
-            .integer => |i| return .{ .integer = i },
-            .float => |f| return .{ .float = f },
-            .number_string => |s| return .{ .number_string = try allocator.dupe(u8, s) },
-            .string => |s| return .{ .string = try allocator.dupe(u8, s) },
-            .array => |arr| {
-                var new_arr = try std.json.Array.initCapacity(allocator, arr.items.len);
-                for (arr.items) |item| {
-                    try new_arr.append(try cloneJsonValue(allocator, item));
-                }
-                return .{ .array = new_arr };
-            },
-            .object => |obj| {
-                var new_obj = std.json.ObjectMap.init(allocator);
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    const key = try allocator.dupe(u8, entry.key_ptr.*);
-                    const val = try cloneJsonValue(allocator, entry.value_ptr.*);
-                    try new_obj.put(key, val);
-                }
-                return .{ .object = new_obj };
-            },
-        }
-    }
-
-    fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-        switch (value) {
-            .string => |s| allocator.free(s),
-            .number_string => |s| allocator.free(s),
-            .array => |arr| {
-                for (arr.items) |item| freeJsonValue(allocator, item);
-                var mutable = arr;
-                mutable.deinit();
-            },
-            .object => |obj| {
-                var mutable = obj;
-                var oit = mutable.iterator();
-                while (oit.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    freeJsonValue(allocator, entry.value_ptr.*);
-                }
-                mutable.deinit();
-            },
-            else => {},
         }
     }
 };

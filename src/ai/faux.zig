@@ -70,7 +70,7 @@ pub const FauxProvider = struct {
 
     pub fn init(allocator: std.mem.Allocator) FauxProvider {
         return .{
-            .responses = .{},
+            .responses = .empty,
             .call_count = 0,
             .allocator = allocator,
         };
@@ -244,7 +244,7 @@ test "faux provider streams text response" {
         }
     };
 
-    var collector: Collector = .{ .events = .{}, .alloc = allocator };
+    var collector: Collector = .{ .events = .empty, .alloc = allocator };
     defer collector.events.deinit(allocator);
 
     const p = faux.provider();

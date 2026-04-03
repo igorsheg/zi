@@ -29,6 +29,29 @@ pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.
     }
 }
 
+/// Recursively free all owned memory in a std.json.Value tree.
+pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .string => |s| allocator.free(s),
+        .number_string => |s| allocator.free(s),
+        .array => |arr| {
+            for (arr.items) |item| freeJsonValue(allocator, item);
+            var mutable = arr;
+            mutable.deinit();
+        },
+        .object => |obj| {
+            var mutable = obj;
+            var it = mutable.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeJsonValue(allocator, entry.value_ptr.*);
+            }
+            mutable.deinit();
+        },
+        else => {},
+    }
+}
+
 pub fn jsonToFloat(v: std.json.Value) f64 {
     return switch (v) {
         .float => |f| f,
