@@ -231,3 +231,35 @@ test "Editor renders prompt and text to buffer" {
     try std.testing.expectEqual(@as(u21, 'x'), buf.get(2, 0).grapheme.codepoint);
 }
 
+
+test "editor render after backspace clears deleted char from buffer" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 1);
+    defer buf.deinit();
+
+    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
+    _ = editor.handleInput(.{ .code = .char, .char = 'b' });
+    _ = editor.handleInput(.{ .code = .char, .char = 'c' });
+
+    // Frame 1: render "> abc"
+    editor.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'c'), buf.get(4, 0).grapheme.codepoint);
+
+    // Backspace removes 'c'
+    _ = editor.handleInput(.{ .code = .backspace });
+
+    // Frame 2: clear buffer (simulates renderer.begin()), re-render
+    buf.clear();
+    editor.render(buf.region());
+
+    // Position 4 must be blank, not ghost 'c'
+    try std.testing.expectEqual(@as(u21, 'b'), buf.get(3, 0).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), buf.get(4, 0).grapheme.codepoint);
+
+    // Cursor should be at prompt_width(2) + cursor_col(2) = 4
+    const cs = editor.cursorState().?;
+    try std.testing.expectEqual(@as(u32, 4), cs.x);
+    try std.testing.expectEqual(@as(u32, 0), cs.y);
+}

@@ -237,3 +237,46 @@ test "Renderer skips unchanged cells" {
         try std.testing.expect(n < 50);
     }
 }
+
+test "multi-frame render emits clearing output for deleted characters" {
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+    defer std.posix.close(pipe[1]);
+
+    var r = try Renderer.init(std.testing.allocator, pipe[1], 10, 1);
+    defer r.deinit();
+
+    // Frame 1: write "abc"
+    {
+        const reg = r.begin();
+        _ = reg.writeStr(0, 0, "abc", Color.default, Color.default, Attributes.none);
+        try r.end();
+        // drain the first frame output
+        var drain: [4096]u8 = undefined;
+        _ = try std.posix.read(pipe[0], &drain);
+    }
+
+    // Frame 2: write "ab" (one char deleted)
+    {
+        const reg = r.begin();
+        _ = reg.writeStr(0, 0, "ab", Color.default, Color.default, Attributes.none);
+        try r.end();
+
+        var read_buf: [4096]u8 = undefined;
+        const n = try std.posix.read(pipe[0], &read_buf);
+        const output = read_buf[0..n];
+
+        // Diff must emit something — position 2 changed from 'c' to ' '
+        // Sync markers + at least a cursor-pos + space character
+        try std.testing.expect(n > 20);
+        // Must contain sync begin/end
+        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026l") != null);
+
+        // After end(), buffers are swapped: current = the "ab" frame.
+        // Position 2 should be blank (space), not 'c'.
+        try std.testing.expectEqual(@as(u21, 'a'), r.current.get(0, 0).grapheme.codepoint);
+        try std.testing.expectEqual(@as(u21, 'b'), r.current.get(1, 0).grapheme.codepoint);
+        try std.testing.expectEqual(@as(u21, ' '), r.current.get(2, 0).grapheme.codepoint);
+    }
+}

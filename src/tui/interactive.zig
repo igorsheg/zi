@@ -294,14 +294,15 @@ pub const Interactive = struct {
         const editor_region = region.sub(0, h - editor_height, w, editor_height);
         self.editor.render(editor_region);
 
+
+        self.renderer.end() catch {};
+
         if (self.editor.cursorState()) |cs| {
             self.terminal.showCursor();
             self.terminal.setCursorPos(cs.x, h - editor_height + cs.y);
         } else {
             self.terminal.hideCursor();
         }
-
-        self.renderer.end() catch {};
     }
 
     // --- Editor submit callback ---
