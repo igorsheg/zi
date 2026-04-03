@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const loop_mod = @import("loop.zig");
 const ai = @import("../ai/root.zig");
+const json_util = @import("../ai/json_util.zig");
 
 /// Queue mode for pending message queues.
 /// pi-mono source: packages/agent/src/agent.ts:55
@@ -407,7 +408,7 @@ pub const Agent = struct {
             .turn_end => |payload| {
                 if (payload.message == .assistant) {
                     if (payload.message.assistant.error_message) |err_msg| {
-                        self.state.error_message = err_msg;
+                        self.state.error_message = self.message_arena.allocator().dupe(u8, err_msg) catch err_msg;
                     }
                 }
             },
@@ -428,6 +429,15 @@ pub const Agent = struct {
 /// Deep-copy an AgentMessage into the given allocator.
 /// Copies all nested slices (text content, content block arrays, string fields)
 /// so the result is fully owned by the allocator and independent of the source.
+fn cloneJson(alloc: std.mem.Allocator, value: std.json.Value) std.json.Value {
+    return json_util.cloneJsonValue(alloc, value) catch value;
+}
+
+fn cloneOptionalJson(alloc: std.mem.Allocator, value: ?std.json.Value) ?std.json.Value {
+    const v = value orelse return null;
+    return json_util.cloneJsonValue(alloc, v) catch v;
+}
+
 fn dupeAgentMessage(alloc: std.mem.Allocator, msg: protocol.AgentMessage) protocol.AgentMessage {
     return switch (msg) {
         .user => |u| .{ .user = dupeUserMessage(alloc, u) },
@@ -447,7 +457,7 @@ fn dupeAgentMessage(alloc: std.mem.Allocator, msg: protocol.AgentMessage) protoc
             .custom_type = alloc.dupe(u8, c.custom_type) catch c.custom_type,
             .content = alloc.dupe(u8, c.content) catch c.content,
             .display = c.display,
-            .details = c.details,
+            .details = cloneOptionalJson(alloc, c.details),
             .timestamp = c.timestamp,
         } },
     };
@@ -496,7 +506,7 @@ fn dupeAssistantMessage(alloc: std.mem.Allocator, msg: ai.protocol.AssistantMess
             .tool_call => |tc| .{ .tool_call = .{
                 .id = alloc.dupe(u8, tc.id) catch tc.id,
                 .name = alloc.dupe(u8, tc.name) catch tc.name,
-                .arguments = tc.arguments,
+                .arguments = cloneJson(alloc, tc.arguments),
                 .thought_signature = if (tc.thought_signature) |s| alloc.dupe(u8, s) catch s else null,
             } },
         };
@@ -530,6 +540,7 @@ fn dupeToolResultMessage(alloc: std.mem.Allocator, msg: ai.protocol.ToolResultMe
     result.content = content;
     result.tool_call_id = alloc.dupe(u8, msg.tool_call_id) catch msg.tool_call_id;
     result.tool_name = alloc.dupe(u8, msg.tool_name) catch msg.tool_name;
+    result.details = cloneOptionalJson(alloc, msg.details);
     return result;
 }
 
