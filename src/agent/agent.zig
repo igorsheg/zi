@@ -98,6 +98,7 @@ pub const Agent = struct {
     transport: ?ai.protocol.Transport,
     max_retry_delay_ms: ?u64,
     tool_execution: protocol.ToolExecutionMode,
+    get_api_key: ?protocol.GetApiKeyHook,
 
     is_running: bool,
     abort_requested: bool,
@@ -127,6 +128,7 @@ pub const Agent = struct {
         transport: ?ai.protocol.Transport = null,
         max_retry_delay_ms: ?u64 = null,
         tool_execution: protocol.ToolExecutionMode = .parallel,
+        get_api_key: ?protocol.GetApiKeyHook = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Agent {
@@ -159,6 +161,7 @@ pub const Agent = struct {
             .transport = options.transport,
             .max_retry_delay_ms = options.max_retry_delay_ms,
             .tool_execution = options.tool_execution,
+            .get_api_key = options.get_api_key,
             .is_running = false,
             .abort_requested = false,
             .messages = messages,
@@ -362,6 +365,21 @@ pub const Agent = struct {
             .max_retry_delay_ms = self.max_retry_delay_ms,
             .thinking_budgets = self.thinking_budgets,
             .transport = self.transport,
+            .reasoning = mapThinkingLevel(self.state.thinking_level),
+            .get_api_key = self.get_api_key,
+        };
+    }
+
+    /// Maps agent ThinkingLevel to ai ThinkingLevel.
+    /// pi-mono: agent.ts:411 — reasoning: thinkingLevel === "off" ? undefined : thinkingLevel
+    fn mapThinkingLevel(level: protocol.ThinkingLevel) ?ai.protocol.ThinkingLevel {
+        return switch (level) {
+            .off => null,
+            .minimal => .minimal,
+            .low => .low,
+            .medium => .medium,
+            .high => .high,
+            .xhigh => .xhigh,
         };
     }
 

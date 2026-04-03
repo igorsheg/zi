@@ -277,6 +277,18 @@ pub const AfterToolCallHook = struct {
     }
 };
 
+
+/// Hook: resolves API key dynamically per LLM request (e.g. expiring OAuth tokens).
+/// pi-mono source: packages/agent/src/types.ts:157
+pub const GetApiKeyHook = struct {
+    func: *const fn (provider: []const u8, ctx: ?*anyopaque) ?[]const u8,
+    ctx: ?*anyopaque = null,
+
+    pub fn call(self: GetApiKeyHook, provider: []const u8) ?[]const u8 {
+        return self.func(provider, self.ctx);
+    }
+};
+
 /// Configuration for the agent loop — all hooks and options.
 /// pi-mono source: packages/agent/src/types.ts:96-214
 pub const AgentLoopConfig = struct {
@@ -300,6 +312,8 @@ pub const AgentLoopConfig = struct {
     max_retry_delay_ms: ?u64 = null,
     thinking_budgets: ?ai.protocol.ThinkingBudgets = null,
     transport: ?ai.protocol.Transport = null,
+    reasoning: ?ai.protocol.ThinkingLevel = null,
+    get_api_key: ?GetApiKeyHook = null,
 
     pub fn buildStreamOptions(self: *const AgentLoopConfig) ai.protocol.SimpleStreamOptions {
         return .{
@@ -313,6 +327,7 @@ pub const AgentLoopConfig = struct {
                 .transport = self.transport,
             },
             .thinking_budgets = self.thinking_budgets,
+            .reasoning = self.reasoning,
         };
     }
 };

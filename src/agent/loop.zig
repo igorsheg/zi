@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
+const json_util = @import("../ai/json_util.zig");
 
 /// Start an agent loop with new prompt messages.
 /// Prompts are added to the context and events are emitted for them.
@@ -233,6 +234,14 @@ fn streamAssistantResponse(
 
     var stream_options = config.buildStreamOptions();
     stream_options.base.signal = signal;
+
+    // Resolve API key dynamically (pi-mono agent-loop.ts:264-265)
+    if (config.get_api_key) |hook| {
+        const provider_str = json_util.providerToString(config.model.provider);
+        if (hook.call(provider_str)) |resolved_key| {
+            stream_options.base.api_key = resolved_key;
+        }
+    }
 
     var bridge = StreamBridge{
         .sink = event_sink,

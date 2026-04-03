@@ -3,6 +3,7 @@ const ai = @import("ai/root.zig");
 const agent_mod = @import("agent/root.zig");
 const session_mod = @import("session/root.zig");
 const bash_tool = @import("tools/bash.zig");
+const system_prompt_mod = @import("system_prompt.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -39,7 +40,8 @@ pub const CodingAgent = struct {
         model: ai.protocol.Model,
         api_key: []const u8,
         cwd: []const u8,
-        system_prompt: []const u8 = "You are a helpful assistant. Be concise. You have access to a bash tool to execute commands.",
+        system_prompt: ?[]const u8 = null,
+        context_files: []const system_prompt_mod.ContextFile = &.{},
         max_tokens: ?u64 = 4096,
         tools: ?[]const protocol.AgentTool = null,
         registry: *ai.provider.Registry,
@@ -74,9 +76,19 @@ pub const CodingAgent = struct {
             .ctx = @ptrCast(closure),
         };
 
+        const sys_prompt = options.system_prompt orelse blk: {
+            const tool_names = allocator.alloc([]const u8, tools.len) catch break :blk @as([]const u8, "You are a helpful coding assistant.");
+            for (tools, 0..) |t, i| tool_names[i] = t.name;
+            break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
+                .cwd = options.cwd,
+                .tool_names = tool_names,
+                .context_files = options.context_files,
+            }) catch "You are a helpful coding assistant.";
+        };
+
         const a = Agent.init(allocator, .{
             .initial_state = .{
-                .system_prompt = options.system_prompt,
+                .system_prompt = sys_prompt,
                 .model = options.model,
                 .tools = tools,
                 .messages = options.initial_messages,

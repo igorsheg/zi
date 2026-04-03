@@ -6,4 +6,5 @@ test {
     _ = @import("agent/root.zig");
     _ = @import("session/root.zig");
     _ = @import("coding_agent.zig");
+    _ = @import("system_prompt.zig");
 }
