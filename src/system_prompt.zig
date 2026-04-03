@@ -27,6 +27,15 @@ fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Normalize cwd: backslash → forward slash (pi-mono system-prompt.ts:40)
+fn normalizeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
+    const result = try allocator.dupe(u8, cwd);
+    for (result) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return result;
+}
+
 /// Build the system prompt matching pi-mono's system-prompt.ts:28-168.
 ///
 /// If `custom_prompt` is set, it replaces the default identity/tools/guidelines
@@ -41,6 +50,9 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
     const date = try isoDate(allocator);
     defer allocator.free(date);
 
+    const cwd = try normalizeCwd(allocator, options.cwd);
+    defer allocator.free(cwd);
+
     if (options.custom_prompt) |custom| {
         try w.writeAll(custom);
         if (options.append_system_prompt) |append| {
@@ -49,7 +61,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
         }
         try writeContextFiles(w, options.context_files);
         try w.print("\nCurrent date: {s}", .{date});
-        try w.print("\nCurrent working directory: {s}", .{options.cwd});
+        try w.print("\nCurrent working directory: {s}", .{cwd});
         return try aw.toOwnedSlice();
     }
 
@@ -122,7 +134,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
     try writeContextFiles(w, options.context_files);
 
     try w.print("\nCurrent date: {s}", .{date});
-    try w.print("\nCurrent working directory: {s}", .{options.cwd});
+    try w.print("\nCurrent working directory: {s}", .{cwd});
 
     return try aw.toOwnedSlice();
 }

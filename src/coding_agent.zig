@@ -76,12 +76,24 @@ pub const CodingAgent = struct {
             .ctx = @ptrCast(closure),
         };
 
-        const sys_prompt = options.system_prompt orelse blk: {
-            const tool_names = allocator.alloc([]const u8, tools.len) catch break :blk @as([]const u8, "You are a helpful coding assistant.");
-            for (tools, 0..) |t, i| tool_names[i] = t.name;
+        const tool_name_slice: []const []const u8 = blk: {
+            const tn = allocator.alloc([]const u8, tools.len) catch break :blk &.{};
+            for (tools, 0..) |t, i| tn[i] = t.name;
+            break :blk tn;
+        };
+
+        const sys_prompt = blk: {
+            if (options.system_prompt) |custom| {
+                break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
+                    .custom_prompt = custom,
+                    .cwd = options.cwd,
+                    .context_files = options.context_files,
+                    .tool_names = tool_name_slice,
+                }) catch custom;
+            }
             break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
                 .cwd = options.cwd,
-                .tool_names = tool_names,
+                .tool_names = tool_name_slice,
                 .context_files = options.context_files,
             }) catch "You are a helpful coding assistant.";
         };
@@ -208,7 +220,9 @@ pub const CodingAgent = struct {
             const api_str = ai.provider.apiToString(model.api);
             const prov = self.registry.get(api_str) orelse return;
             var opts = options;
-            opts.base.api_key = self.api_key;
+            if (opts.base.api_key == null or opts.base.api_key.?.len == 0) {
+                opts.base.api_key = self.api_key;
+            }
             if (self.max_tokens) |mt| opts.base.max_tokens = mt;
             prov.streamSimple(stream_alloc, model, stream_context, opts, callback, callback_ctx);
         }

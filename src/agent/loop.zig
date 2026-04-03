@@ -236,9 +236,11 @@ fn streamAssistantResponse(
     stream_options.base.signal = signal;
 
     // Resolve API key dynamically (pi-mono agent-loop.ts:264-265)
+    // JS `||` treats empty string as falsy, so we must check len > 0.
     if (config.get_api_key) |hook| {
         const provider_str = json_util.providerToString(config.model.provider);
-        if (hook.call(provider_str)) |resolved_key| {
+        const resolved_key = hook.call(provider_str);
+        if (resolved_key != null and resolved_key.?.len > 0) {
             stream_options.base.api_key = resolved_key;
         }
     }
