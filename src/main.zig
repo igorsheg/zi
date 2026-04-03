@@ -3,8 +3,7 @@ const ai = @import("ai/root.zig");
 const auth = @import("auth/root.zig");
 const settings_mod = @import("settings/root.zig");
 const agent = @import("agent/root.zig");
-const session = @import("session/root.zig");
-const bash_tool = @import("tools/bash.zig");
+const coding_agent = @import("coding_agent.zig");
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
@@ -13,7 +12,6 @@ pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
 
-    // Arena allocator for the entire run. No explicit frees needed in print mode.
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -25,6 +23,7 @@ pub fn main() !void {
     var model_id: ?[]const u8 = null;
     var list_models = false;
     var prompt_text: ?[]const u8 = null;
+    var continue_path: ?[]const u8 = null;
 
     var args = std.process.args();
     _ = args.next();
@@ -41,6 +40,8 @@ pub fn main() !void {
             if (args.next()) |m| model_id = m;
         } else if (eql(arg, "--list-models")) {
             list_models = true;
+        } else if (eql(arg, "--continue")) {
+            continue_path = args.next();
         } else if (arg.len > 0 and arg[0] != '-') {
             prompt_text = arg;
         }
@@ -60,6 +61,7 @@ pub fn main() !void {
             \\  -p, --print           Non-interactive mode
             \\  --model <id>          Model ID or pattern (default: from settings or claude-sonnet-4)
             \\  --api-key <key>       API key override (also reads ~/.pi/agent/auth.json)
+            \\  --continue <path>     Continue from a session file
             \\  --list-models         List available models
             \\  -h, --help            Show help
             \\  -v, --version         Show version
@@ -81,13 +83,16 @@ pub fn main() !void {
         return;
     }
 
-    if (print_mode or prompt_text != null) {
-        const prompt = prompt_text orelse {
+    const has_prompt = print_mode or prompt_text != null;
+    const is_continue = continue_path != null;
+
+    if (has_prompt or is_continue) {
+        const prompt = if (is_continue) null else (prompt_text orelse {
             try stderr.writeAll("error: no prompt provided\n");
             std.process.exit(1);
-        };
+        });
 
-        // Auth + settings — reads ~/.pi/agent/auth.json and settings.json
+        // Auth + settings
         var auth_storage = auth.storage.AuthStorage.create(allocator, null) catch {
             try stderr.writeAll("warning: could not load auth storage\n");
             unreachable;
@@ -101,15 +106,12 @@ pub fn main() !void {
         };
         _ = &settings;
 
-        // Resolve model: --model flag → settings default → first authed provider default
-        // pi-mono: model-resolver.ts:474-554
         const model = resolveModel(model_id, &settings, &auth_storage) orelse {
             try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
             try stderr.writeAll("use --list-models to see available models\n");
             std.process.exit(1);
         };
 
-        // Only anthropic provider implemented for now
         if (!std.meta.eql(model.api, .anthropic_messages)) {
             try stderr.writeAll("error: only anthropic models supported currently. model '");
             try stderr.writeAll(model.id);
@@ -119,8 +121,6 @@ pub fn main() !void {
             std.process.exit(1);
         }
 
-        // Resolve API key: --api-key flag is tier 1 (runtime override),
-        // then auth.json, oauth tokens, env vars via AuthStorage.getApiKey
         const provider_str = ai.json_util.providerToString(model.provider);
         if (api_key_arg) |cli_key| {
             auth_storage.setRuntimeApiKey(provider_str, cli_key);
@@ -131,7 +131,6 @@ pub fn main() !void {
             try stderr.writeAll("'. run `pi login` or set ");
             const env_hint = ai.env_api_keys.getEnvApiKey(provider_str);
             if (env_hint == null) {
-                // Show the env var name they could set
                 if (std.mem.eql(u8, provider_str, "anthropic")) {
                     try stderr.writeAll("ANTHROPIC_API_KEY");
                 } else {
@@ -149,72 +148,59 @@ pub fn main() !void {
         defer registry.deinit();
         try registry.register("anthropic-messages", prov, null);
 
-        const user_msg = agent.protocol.AgentMessage{
-            .user = .{
-                .content = .{ .text = prompt },
-                .timestamp = std.time.milliTimestamp(),
-            },
-        };
-
-        // Build tools
-        const tools = [_]agent.protocol.AgentTool{
-            bash_tool.makeTool(),
-        };
-
-        // Session writer — persists messages incrementally on message_end,
-        // gated on first assistant message (matches pi-mono behavior).
-        var sw = session.writer.SessionWriter.init(allocator, cwd_buf);
-
-        var handler = PrintSessionHandler{ .session_writer = &sw };
-
-        const prompts = [_]agent.protocol.AgentMessage{user_msg};
-        const context = agent.protocol.AgentContext{
-            .system_prompt = "You are a helpful assistant. Be concise. You have access to a bash tool to execute commands.",
-            .messages = &.{},
-            .tools = &tools,
-        };
-
-        // Wrap registry stream into a StreamHook
-        const RegistryStream = struct {
-            fn streamFn(
-                ctx: ?*anyopaque,
-                stream_alloc: std.mem.Allocator,
-                stream_model: ai.protocol.Model,
-                stream_context: ai.protocol.Context,
-                options: ai.protocol.SimpleStreamOptions,
-                callback: ai.provider.EventCallback,
-                callback_ctx: ?*anyopaque,
-            ) void {
-                const reg: *ai.provider.Registry = @ptrCast(@alignCast(ctx.?));
-                const api_str = ai.provider.apiToString(stream_model.api);
-                const prov2 = reg.get(api_str) orelse return;
-                prov2.streamSimple(stream_alloc, stream_model, stream_context, options, callback, callback_ctx);
+        // Load existing session for --continue
+        var initial_messages: []const agent.protocol.AgentMessage = &.{};
+        var session_id: ?[]const u8 = null;
+        if (continue_path) |path| {
+            const loaded = coding_agent.loadSessionContext(allocator, path) catch |err| {
+                try stderr.writeAll("error: could not load session: ");
+                const err_name = @errorName(err);
+                try stderr.writeAll(err_name);
+                try stderr.writeAll("\n");
+                std.process.exit(1);
+            };
+            initial_messages = loaded.messages;
+            session_id = loaded.session_id;
+            if (initial_messages.len == 0) {
+                try stderr.writeAll("error: session file has no messages\n");
+                std.process.exit(1);
             }
-        };
+        }
 
-        const config = agent.protocol.AgentLoopConfig{
+        var print_handler = PrintHandler{};
+
+        var ca = coding_agent.CodingAgent.init(allocator, .{
             .model = model,
-            .stream = .{ .func = RegistryStream.streamFn, .ctx = @ptrCast(&registry) },
-            .convert_to_llm = agent.defaultConvertToLlmHook(),
             .api_key = key,
+            .cwd = cwd_buf,
             .max_tokens = 4096,
-        };
+            .registry = &registry,
+            .event_handler = .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) },
+            .initial_messages = initial_messages,
+            .session_id = session_id,
+        });
+        defer ca.deinit();
 
-        agent.loop.runAgentLoop(
-            allocator,
-            &prompts,
-            context,
-            config,
-            &PrintSessionHandler.callback,
-            @ptrCast(&handler),
-            null,
-        );
+        if (is_continue) {
+            ca.continueSession() catch |err| {
+                if (err == error.NeedsPrompt) {
+                    try stderr.writeAll("session loaded but transcript ends with assistant. provide a prompt to continue.\n");
+                    std.process.exit(1);
+                }
+                try stderr.writeAll("error: could not continue session: ");
+                try stderr.writeAll(@errorName(err));
+                try stderr.writeAll("\n");
+                std.process.exit(1);
+            };
+        } else {
+            ca.run(prompt.?);
+        }
 
         try stdout.writeAll("\n");
 
-        if (sw.flushed) {
+        if (ca.sessionFlushed()) {
             stderr.writeAll("session: ") catch {};
-            stderr.writeAll(sw.session_file) catch {};
+            stderr.writeAll(ca.getSessionFile()) catch {};
             stderr.writeAll("\n") catch {};
         }
     } else {
@@ -223,12 +209,9 @@ pub fn main() !void {
     }
 }
 
-/// Event handler: prints to stdout/stderr AND persists messages on message_end.
-const PrintSessionHandler = struct {
-    session_writer: *session.writer.SessionWriter,
-
-    fn callback(event: agent.protocol.AgentEvent, ctx: ?*anyopaque) void {
-        const self: *PrintSessionHandler = @ptrCast(@alignCast(ctx));
+/// Print handler: renders events to stdout/stderr.
+const PrintHandler = struct {
+    fn callback(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {
         switch (event) {
             .message_update => |mu| {
                 switch (mu.assistant_message_event) {
@@ -248,14 +231,10 @@ const PrintSessionHandler = struct {
                 stderr.writeAll(te.tool_name) catch {};
                 stderr.writeAll("\n") catch {};
             },
-            .message_end => |me| {
-                self.session_writer.appendMessage(me.message);
-            },
             else => {},
         }
     }
 };
-
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
@@ -278,14 +257,13 @@ fn resolveModel(
     }
 
     // 2. Settings default
-    if (settings.getDefaultModel()) |model_id| {
-        if (ai.models.getModelById(model_id) orelse ai.models.findModel(model_id)) |m| {
+    if (settings.getDefaultModel()) |mid| {
+        if (ai.models.getModelById(mid) orelse ai.models.findModel(mid)) |m| {
             return m;
         }
     }
 
     // 3. Default model per provider, for providers with auth
-    // pi-mono: model-resolver.ts:540-546
     for (default_models_per_provider) |entry| {
         if (auth_storage.hasAuth(entry.provider)) {
             if (ai.models.getModelById(entry.model_id)) |m| return m;

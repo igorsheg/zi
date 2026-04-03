@@ -5,6 +5,7 @@ pub const PendingMessageQueue = @import("agent.zig").PendingMessageQueue;
 pub const QueueMode = @import("agent.zig").QueueMode;
 pub const defaultConvertToLlm = @import("agent.zig").defaultConvertToLlm;
 pub const defaultConvertToLlmHook = @import("agent.zig").defaultConvertToLlmHook;
+pub const SubscriptionToken = @import("agent.zig").SubscriptionToken;
 
 test {
     @import("std").testing.refAllDecls(@This());

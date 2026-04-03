@@ -5,4 +5,5 @@ test {
     _ = @import("settings/root.zig");
     _ = @import("agent/root.zig");
     _ = @import("session/root.zig");
+    _ = @import("coding_agent.zig");
 }
