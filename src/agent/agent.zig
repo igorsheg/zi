@@ -138,8 +138,12 @@ pub const Agent = struct {
             messages.append(aa, dupeAgentMessage(aa, m)) catch {};
         }
         // Sync state.messages to the owned copy so they share one backing store.
+        // Dupe error_message if seeded from initial state.
         var state = initial;
         state.messages = messages.items;
+        if (initial.error_message) |em| {
+            state.error_message = aa.dupe(u8, em) catch em;
+        }
         return .{
             .state = state,
             .listeners = .empty,
@@ -427,8 +431,12 @@ pub const Agent = struct {
 // -- Deep copy utility ------------------------------------------------------
 
 /// Deep-copy an AgentMessage into the given allocator.
-/// Copies all nested slices (text content, content block arrays, string fields)
+/// Copies all nested slices (text, content blocks, json values, string fields)
 /// so the result is fully owned by the allocator and independent of the source.
+///
+/// Best-effort: if any individual allocation fails, that field falls back to
+/// the borrowed original. This is acceptable because the allocator is typically
+/// an arena — OOM means the arena is exhausted, and we're already degraded.
 fn cloneJson(alloc: std.mem.Allocator, value: std.json.Value) std.json.Value {
     return json_util.cloneJsonValue(alloc, value) catch value;
 }
@@ -513,6 +521,13 @@ fn dupeAssistantMessage(alloc: std.mem.Allocator, msg: ai.protocol.AssistantMess
     }
     var result = msg;
     result.content = content;
+    result.model = alloc.dupe(u8, msg.model) catch msg.model;
+    if (msg.api == .custom) {
+        result.api = .{ .custom = alloc.dupe(u8, msg.api.custom) catch msg.api.custom };
+    }
+    if (msg.provider == .custom) {
+        result.provider = .{ .custom = alloc.dupe(u8, msg.provider.custom) catch msg.provider.custom };
+    }
     if (msg.error_message) |em| {
         result.error_message = alloc.dupe(u8, em) catch em;
     }
