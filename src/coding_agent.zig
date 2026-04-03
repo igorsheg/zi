@@ -47,6 +47,8 @@ pub const CodingAgent = struct {
         /// Seed with existing messages for --continue.
         initial_messages: []const protocol.AgentMessage = &.{},
         session_id: ?[]const u8 = null,
+        session_file: ?[]const u8 = null,
+        leaf_id: ?[]const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) CodingAgent {
@@ -56,7 +58,10 @@ pub const CodingAgent = struct {
             break :blk @as([]const protocol.AgentTool, t);
         };
 
-        const sw = SessionWriter.init(allocator, options.cwd);
+        const sw = if (options.session_file != null)
+            SessionWriter.initContinue(allocator, options.session_file.?, options.session_id.?, options.leaf_id)
+        else
+            SessionWriter.init(allocator, options.cwd);
 
         const closure = allocator.create(StreamClosure) catch @panic("OOM");
         closure.* = .{
@@ -251,10 +256,16 @@ pub fn convertToLlm(
                 } }) catch continue;
             },
             .custom => |c| {
-                const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
-                blocks[0] = .{ .text = .{ .text = c.content } };
+                const user_content: ai.protocol.UserMessage.UserMessageContent = switch (c.content) {
+                    .text => |t| blk: {
+                        const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
+                        blocks[0] = .{ .text = .{ .text = t } };
+                        break :blk .{ .blocks = blocks };
+                    },
+                    .blocks => |b| .{ .blocks = b },
+                };
                 result.append(allocator, .{ .user = .{
-                    .content = .{ .blocks = blocks },
+                    .content = user_content,
                     .timestamp = c.timestamp,
                 } }) catch continue;
             },
@@ -274,6 +285,8 @@ pub fn loadSessionContext(
     messages: []protocol.AgentMessage,
     session_id: ?[]const u8,
     leaf_id: ?[]const u8,
+    model: ?session_mod.context.SessionContext.ModelInfo,
+    thinking_level: []const u8,
 } {
     const data = try session_mod.reader.readSessionFile(allocator, session_path);
     const ctx = try session_mod.context.buildSessionContext(allocator, data.entries, null);
@@ -281,6 +294,8 @@ pub fn loadSessionContext(
         .messages = ctx.messages,
         .session_id = if (data.header) |h| h.id else null,
         .leaf_id = if (data.entries.len > 0) data.entries[data.entries.len - 1].id else null,
+        .model = ctx.model,
+        .thinking_level = ctx.thinking_level,
     };
 }
 
@@ -373,7 +388,7 @@ test "convertToLlm converts custom to user message" {
     const alloc = arena.allocator();
 
     const messages = &[_]protocol.AgentMessage{
-        .{ .custom = .{ .custom_type = "skill", .content = "Do X", .display = true, .timestamp = 1 } },
+        .{ .custom = .{ .custom_type = "skill", .content = .{ .text = "Do X" }, .display = true, .timestamp = 1 } },
     };
 
     const result = convertToLlm(alloc, messages, null);
@@ -410,7 +425,7 @@ test "convertToLlm handles mixed message types in order" {
             .timestamp = 2,
         } },
         .{ .branch_summary = .{ .summary = "Branch work", .from_id = "x", .timestamp = 3 } },
-        .{ .custom = .{ .custom_type = "ext", .content = "Custom content", .timestamp = 4 } },
+        .{ .custom = .{ .custom_type = "ext", .content = .{ .text = "Custom content" }, .timestamp = 4 } },
     };
 
     const result = convertToLlm(alloc, messages, null);

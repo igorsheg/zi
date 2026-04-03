@@ -463,7 +463,7 @@ fn dupeAgentMessage(alloc: std.mem.Allocator, msg: protocol.AgentMessage) protoc
         } },
         .custom => |c| .{ .custom = .{
             .custom_type = alloc.dupe(u8, c.custom_type) catch c.custom_type,
-            .content = alloc.dupe(u8, c.content) catch c.content,
+            .content = switch (c.content) { .text => |t| .{ .text = alloc.dupe(u8, t) catch t }, .blocks => |b| .{ .blocks = dupeUserBlocks(alloc, b) } },
             .display = c.display,
             .details = cloneOptionalJson(alloc, c.details),
             .timestamp = c.timestamp,

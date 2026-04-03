@@ -86,7 +86,7 @@ pub fn buildSessionContext(
         try messages.append(allocator, .{ .compaction_summary = .{
             .summary = cd.summary,
             .tokens_before = cd.tokens_before,
-            .timestamp = 0,
+            .timestamp = isoToEpochMs(entries[path_indices.items[compaction_path_pos.?]].timestamp),
         } });
 
         const compaction_pos = compaction_path_pos.?;
@@ -133,7 +133,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 .content = cm.content,
                 .display = cm.display,
                 .details = cm.details,
-                .timestamp = 0,
+                .timestamp = isoToEpochMs(entry.timestamp),
             } };
         },
         .branch_summary => |bs| {
@@ -142,7 +142,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 return .{ .branch_summary = .{
                     .summary = bs.summary,
                     .from_id = bs.from_id,
-                    .timestamp = 0,
+                    .timestamp = isoToEpochMs(entry.timestamp),
                 } };
             }
             return null;
@@ -508,4 +508,44 @@ fn providerToString(p: ai.protocol.Provider) []const u8 {
         .kimi_coding => "kimi-coding",
         .custom => |s| s,
     };
+}
+
+/// Parse an ISO 8601 timestamp ("YYYY-MM-DDTHH:MM:SS..." format) to epoch milliseconds.
+/// Returns 0 on parse failure.
+fn isoToEpochMs(timestamp: []const u8) i64 {
+    if (timestamp.len < 19) return 0;
+    const year = std.fmt.parseInt(i64, timestamp[0..4], 10) catch return 0;
+    const month = std.fmt.parseInt(i64, timestamp[5..7], 10) catch return 0;
+    const day = std.fmt.parseInt(i64, timestamp[8..10], 10) catch return 0;
+    const hour = std.fmt.parseInt(i64, timestamp[11..13], 10) catch return 0;
+    const min = std.fmt.parseInt(i64, timestamp[14..16], 10) catch return 0;
+    const sec = std.fmt.parseInt(i64, timestamp[17..19], 10) catch return 0;
+
+    // Days from complete years (year-1 because current year days added via month/day)
+    const y = year - 1;
+    const era_days = y * 365 + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400);
+    // Cumulative days before each month (non-leap)
+    const month_days = [_]i64{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    const m_idx: usize = @intCast(month - 1);
+    if (m_idx >= 12) return 0;
+    var days = era_days + month_days[m_idx] + day;
+    // Leap year adjustment for months after February
+    if (month > 2) {
+        const is_leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+        if (is_leap) days += 1;
+    }
+    // Unix epoch is Jan 1 1970 = day 719163 from year 0
+    const unix_days = days - 719163;
+    return (unix_days * 86400 + hour * 3600 + min * 60 + sec) * 1000;
+}
+
+test "isoToEpochMs parses standard ISO timestamps" {
+    // 2025-01-01T00:00:00Z = 1735689600000ms
+    try std.testing.expectEqual(@as(i64, 1735689600000), isoToEpochMs("2025-01-01T00:00:00Z"));
+    // 1970-01-01T00:00:00Z = 0ms
+    try std.testing.expectEqual(@as(i64, 0), isoToEpochMs("1970-01-01T00:00:00Z"));
+    // 2024-02-29T12:30:45Z (leap day)
+    try std.testing.expectEqual(@as(i64, 1709209845000), isoToEpochMs("2024-02-29T12:30:45Z"));
+    // Too short
+    try std.testing.expectEqual(@as(i64, 0), isoToEpochMs("2025"));
 }

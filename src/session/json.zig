@@ -122,7 +122,7 @@ pub fn serializeEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) !
             try jw.objectField("customType");
             try jw.write(cm.custom_type);
             try jw.objectField("content");
-            try jw.write(cm.content);
+            try writeCustomContent(&jw, cm.content);
             if (cm.details) |d| {
                 try jw.objectField("details");
                 try jw.write(d);
@@ -295,14 +295,32 @@ fn writeCustomMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CustomMes
     try jw.objectField("customType");
     try jw.write(msg.custom_type);
     try jw.objectField("content");
-    try jw.write(msg.content);
+    try writeCustomContent(jw, msg.content);
     if (msg.details) |d| {
         try jw.objectField("details");
         try jw.write(d);
     }
+    try jw.objectField("display");
+    try jw.write(msg.display);
     try jw.objectField("timestamp");
     try jw.write(msg.timestamp);
     try jw.endObject();
+}
+
+fn writeCustomContent(jw: *Stringify, content: agent.protocol.AgentMessage.CustomContent) !void {
+    switch (content) {
+        .text => |t| try jw.write(t),
+        .blocks => |blocks| {
+            try jw.beginArray();
+            for (blocks) |block| {
+                switch (block) {
+                    .text => |tc| try writeTextBlock(jw, tc),
+                    .image => |ic| try writeImageBlock(jw, ic),
+                }
+            }
+            try jw.endArray();
+        },
+    }
 }
 
 // ─── Content block writers ──────────────────────────────────────────
@@ -459,7 +477,7 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: [
     else if (std.mem.eql(u8, type_str, "custom_message"))
         .{ .custom_message = .{
             .custom_type = try allocator.dupe(u8, obj.get("customType").?.string),
-            .content = try allocator.dupe(u8, obj.get("content").?.string),
+            .content = try parseCustomContent(allocator, obj.get("content").?),
             .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
             .display = obj.get("display").?.bool,
         } }
@@ -642,10 +660,24 @@ fn parseToolResultMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap)
 fn parseCustomAgentMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !agent.protocol.AgentMessage.CustomMessage {
     return .{
         .custom_type = try allocator.dupe(u8, obj.get("customType").?.string),
-        .content = try allocator.dupe(u8, obj.get("content").?.string),
+        .content = try parseCustomContent(allocator, obj.get("content").?),
         .display = if (obj.get("display")) |v| v.bool else false,
         .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
         .timestamp = @intCast(obj.get("timestamp").?.integer),
+    };
+}
+
+fn parseCustomContent(allocator: std.mem.Allocator, val: std.json.Value) !agent.protocol.AgentMessage.CustomContent {
+    return switch (val) {
+        .string => |s| .{ .text = try allocator.dupe(u8, s) },
+        .array => |arr| blk: {
+            var blocks = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, arr.items.len);
+            for (arr.items, 0..) |item, i| {
+                blocks[i] = try parseUserContentBlock(allocator, item.object);
+            }
+            break :blk .{ .blocks = blocks };
+        },
+        else => error.InvalidCustomContent,
     };
 }
 

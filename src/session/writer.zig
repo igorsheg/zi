@@ -63,6 +63,24 @@ pub const SessionWriter = struct {
         };
     }
 
+    /// Continue writing to an existing session file.
+    /// Seeds leaf_id so new entries chain from where the session left off.
+    /// Skips header creation — the file already has one.
+    /// Marks as already flushed (file exists on disk).
+    pub fn initContinue(allocator: std.mem.Allocator, session_file: []const u8, session_id: []const u8, leaf_id: ?[]const u8) SessionWriter {
+        return .{
+            .allocator = allocator,
+            .session_id = session_id,
+            .session_file = session_file,
+            .cwd = "",
+            .leaf_id = leaf_id,
+            .ids = .{},
+            .flushed = true,
+            .has_assistant = true,
+            .buffered_entries = .empty,
+        };
+    }
+
     /// Append a message entry. Matches pi-mono's message_end persistence:
     /// - Buffers until first assistant message appears
     /// - Then flushes all buffered entries + appends incrementally

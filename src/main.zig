@@ -106,6 +106,34 @@ pub fn main() !void {
         };
         _ = &settings;
 
+        // Load session BEFORE model resolution (pi-mono sdk.ts:194-218)
+        var initial_messages: []const agent.protocol.AgentMessage = &.{};
+        var session_id: ?[]const u8 = null;
+        var leaf_id: ?[]const u8 = null;
+        if (continue_path) |path| {
+            const loaded = coding_agent.loadSessionContext(allocator, path) catch |err| {
+                try stderr.writeAll("error: could not load session: ");
+                const err_name = @errorName(err);
+                try stderr.writeAll(err_name);
+                try stderr.writeAll("\n");
+                std.process.exit(1);
+            };
+            initial_messages = loaded.messages;
+            session_id = loaded.session_id;
+            leaf_id = loaded.leaf_id;
+            if (initial_messages.len == 0) {
+                try stderr.writeAll("error: session file has no messages\n");
+                std.process.exit(1);
+            }
+
+            // Try session's model first (pi-mono sdk.ts:203-218)
+            if (loaded.model) |session_model| {
+                if (model_id == null) {
+                    model_id = session_model.model_id;
+                }
+            }
+        }
+
         const model = resolveModel(model_id, &settings, &auth_storage) orelse {
             try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
             try stderr.writeAll("use --list-models to see available models\n");
@@ -148,25 +176,6 @@ pub fn main() !void {
         defer registry.deinit();
         try registry.register("anthropic-messages", prov, null);
 
-        // Load existing session for --continue
-        var initial_messages: []const agent.protocol.AgentMessage = &.{};
-        var session_id: ?[]const u8 = null;
-        if (continue_path) |path| {
-            const loaded = coding_agent.loadSessionContext(allocator, path) catch |err| {
-                try stderr.writeAll("error: could not load session: ");
-                const err_name = @errorName(err);
-                try stderr.writeAll(err_name);
-                try stderr.writeAll("\n");
-                std.process.exit(1);
-            };
-            initial_messages = loaded.messages;
-            session_id = loaded.session_id;
-            if (initial_messages.len == 0) {
-                try stderr.writeAll("error: session file has no messages\n");
-                std.process.exit(1);
-            }
-        }
-
         var print_handler = PrintHandler{};
 
         var ca = coding_agent.CodingAgent.init(allocator, .{
@@ -178,6 +187,8 @@ pub fn main() !void {
             .event_handler = .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) },
             .initial_messages = initial_messages,
             .session_id = session_id,
+            .session_file = if (is_continue) continue_path else null,
+            .leaf_id = leaf_id,
         });
         defer ca.deinit();
 

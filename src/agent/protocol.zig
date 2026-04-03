@@ -134,9 +134,14 @@ pub const AgentMessage = union(enum) {
         timestamp: i64,
     };
 
+    pub const CustomContent = union(enum) {
+        text: []const u8,
+        blocks: []const ai.protocol.UserMessage.UserMessageContent.Block,
+    };
+
     pub const CustomMessage = struct {
         custom_type: []const u8,
-        content: []const u8,
+        content: CustomContent,
         display: bool = false,
         details: ?std.json.Value = null,
         timestamp: i64,

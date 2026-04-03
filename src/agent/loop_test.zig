@@ -461,7 +461,7 @@ test "convertToLlm: custom messages filtered before LLM call" {
     // Context with a custom message already in it
     const custom_msg = protocol.AgentMessage{ .custom = .{
         .custom_type = "notification",
-        .content = "This is a notification",
+        .content = .{ .text = "This is a notification" },
         .timestamp = std.time.milliTimestamp(),
     } };
 
@@ -1177,7 +1177,7 @@ test "agentLoopContinue: allows custom message as last message via convertToLlm"
     // Context ends with a custom message (not assistant)
     const custom_msg = protocol.AgentMessage{ .custom = .{
         .custom_type = "notification",
-        .content = "custom tail",
+        .content = .{ .text = "custom tail" },
         .timestamp = std.time.milliTimestamp(),
     } };
     const existing = [_]protocol.AgentMessage{

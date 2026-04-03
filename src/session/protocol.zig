@@ -70,7 +70,7 @@ pub const CustomEntry = struct {
 
 pub const CustomMessageEntry = struct {
     custom_type: []const u8,
-    content: []const u8, // simplified — string content for now
+    content: agent.protocol.AgentMessage.CustomContent,
     details: ?std.json.Value = null,
     display: bool,
 };
