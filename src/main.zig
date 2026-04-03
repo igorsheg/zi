@@ -195,7 +195,7 @@ pub fn main() !void {
         const config = agent.protocol.AgentLoopConfig{
             .model = model,
             .stream = .{ .func = RegistryStream.streamFn, .ctx = @ptrCast(&registry) },
-            .convert_to_llm = .{ .func = defaultConvertToLlm },
+            .convert_to_llm = agent.defaultConvertToLlmHook(),
             .api_key = key,
             .max_tokens = 4096,
         };
@@ -256,18 +256,6 @@ const PrintSessionHandler = struct {
     }
 };
 
-fn defaultConvertToLlm(allocator: std.mem.Allocator, messages: []const agent.protocol.AgentMessage, _: ?*anyopaque) []const ai.protocol.Message {
-    var result: std.ArrayListUnmanaged(ai.protocol.Message) = .empty;
-    for (messages) |msg| {
-        switch (msg) {
-            .user => |u| result.append(allocator, .{ .user = u }) catch continue,
-            .assistant => |a| result.append(allocator, .{ .assistant = a }) catch continue,
-            .tool_result => |t| result.append(allocator, .{ .tool_result = t }) catch continue,
-            .compaction_summary, .branch_summary, .custom => continue,
-        }
-    }
-    return result.items;
-}
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);

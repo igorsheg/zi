@@ -15,23 +15,19 @@ pub fn runAgentLoop(
     event_ctx: ?*anyopaque,
     signal: ?*anyopaque,
 ) void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
     // newMessages tracks only messages created during this run
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (prompts) |p| {
-        new_messages.append(aa, p) catch return;
+        new_messages.append(allocator, p) catch return;
     }
 
     // Working context = existing messages + prompts
     var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (context.messages) |m| {
-        ctx_messages.append(aa, m) catch return;
+        ctx_messages.append(allocator, m) catch return;
     }
     for (prompts) |p| {
-        ctx_messages.append(aa, p) catch return;
+        ctx_messages.append(allocator, p) catch return;
     }
 
     event_sink(.agent_start, event_ctx);
@@ -43,7 +39,7 @@ pub fn runAgentLoop(
         event_sink(.{ .message_end = .{ .message = p } }, event_ctx);
     }
 
-    runLoop(aa, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
+    runLoop(allocator, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
 }
 
 /// Continue an agent loop from existing context without adding a new message.
@@ -72,14 +68,10 @@ pub fn runAgentLoopContinue(
         return error.AssistantTail;
     }
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (context.messages) |m| {
-        ctx_messages.append(aa, m) catch return;
+        ctx_messages.append(allocator, m) catch return;
     }
 
     event_sink(.agent_start, event_ctx);
@@ -87,7 +79,7 @@ pub fn runAgentLoopContinue(
 
     // No message_start/end for existing messages — that's the key difference from runAgentLoop
 
-    runLoop(aa, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
+    runLoop(allocator, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
 }
 
 /// Main loop logic shared by runAgentLoop and runAgentLoopContinue.
@@ -95,7 +87,7 @@ pub fn runAgentLoopContinue(
 ///   outer loop: continues when follow-up messages arrive after agent would stop
 ///   inner loop: processes tool calls and steering messages
 fn runLoop(
-    aa: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     context: protocol.AgentContext,
@@ -110,7 +102,7 @@ fn runLoop(
     var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .empty;
     if (context.tools) |tools| {
         for (tools) |t| {
-            llm_tools.append(aa, .{
+            llm_tools.append(allocator, .{
                 .name = t.name,
                 .description = t.description,
                 .parameters = t.parameters,
@@ -123,7 +115,7 @@ fn runLoop(
     var pending_messages = if (config.skip_initial_steering_poll)
         @as([]const protocol.AgentMessage, &.{})
     else if (config.get_steering_messages) |hook|
-        hook.call(aa)
+        hook.call(allocator)
     else
         @as([]const protocol.AgentMessage, &.{});
 
@@ -144,19 +136,19 @@ fn runLoop(
                 for (pending_messages) |msg| {
                     event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
                     event_sink(.{ .message_end = .{ .message = msg } }, event_ctx);
-                    ctx_messages.append(aa, msg) catch {};
-                    new_messages.append(aa, msg) catch {};
+                    ctx_messages.append(allocator, msg) catch {};
+                    new_messages.append(allocator, msg) catch {};
                 }
                 pending_messages = &.{};
             }
 
             // Stream assistant response
-            const assistant_msg = streamAssistantResponse(aa, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
+            const assistant_msg = streamAssistantResponse(allocator, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
                 event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
                 return;
             };
 
-            new_messages.append(aa, .{ .assistant = assistant_msg }) catch {};
+            new_messages.append(allocator, .{ .assistant = assistant_msg }) catch {};
 
             if (assistant_msg.stop_reason == .@"error" or assistant_msg.stop_reason == .aborted) {
                 event_sink(.{ .turn_end = .{
@@ -179,7 +171,7 @@ fn runLoop(
 
             var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
             if (has_more_tool_calls) {
-                executeToolCalls(aa, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, signal, event_sink, event_ctx);
+                executeToolCalls(allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, signal, event_sink, event_ctx);
             }
 
             event_sink(.{ .turn_end = .{
@@ -189,14 +181,14 @@ fn runLoop(
 
             // Poll steering messages after tool execution
             pending_messages = if (config.get_steering_messages) |hook|
-                hook.call(aa)
+                hook.call(allocator)
             else
                 @as([]const protocol.AgentMessage, &.{});
         }
 
         // Agent would stop here. Check for follow-up messages.
         const follow_ups = if (config.get_follow_up_messages) |hook|
-            hook.call(aa)
+            hook.call(allocator)
         else
             @as([]const protocol.AgentMessage, &.{});
 
@@ -438,22 +430,3 @@ const StreamBridge = struct {
     }
 };
 
-fn makeErrorAssistantMessage(model: ai.protocol.Model, error_message: []const u8) ai.protocol.AssistantMessage {
-    return .{
-        .content = &.{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = .{
-            .input = 0,
-            .output = 0,
-            .cache_read = 0,
-            .cache_write = 0,
-            .total_tokens = 0,
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-        },
-        .stop_reason = .@"error",
-        .error_message = error_message,
-        .timestamp = std.time.milliTimestamp(),
-    };
-}

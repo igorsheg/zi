@@ -92,23 +92,38 @@ test "Agent: prompt returns error when already running" {
     });
     defer agent.deinit();
 
-    // First prompt succeeds
+    // Track whether nested prompt was rejected
+    const GuardState = struct {
+        agent_ptr: *Agent,
+        nested_rejected: bool = false,
+    };
+    var guard_state = GuardState{ .agent_ptr = &agent };
+
+    const GuardListener = struct {
+        fn listener(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
+            const s: *GuardState = @ptrCast(@alignCast(ctx.?));
+            if (event == .agent_start) {
+                // Try nested prompt while running — should fail
+                const nested_prompts = [_]protocol.AgentMessage{makeUserMessage("nested")};
+                const result = s.agent_ptr.prompt(&nested_prompts);
+                if (result) |_| {
+                    // Should not succeed
+                } else |err| {
+                    if (err == error.AlreadyProcessing) {
+                        s.nested_rejected = true;
+                    }
+                }
+            }
+        }
+    };
+
+    _ = agent.subscribe(GuardListener.listener, @ptrCast(&guard_state));
+
     const prompts = [_]protocol.AgentMessage{makeUserMessage("hello")};
     try agent.prompt(&prompts);
 
-    // Agent is no longer running after prompt returns (synchronous)
+    try std.testing.expect(guard_state.nested_rejected);
     try std.testing.expectEqual(false, agent.state.is_streaming);
-
-    // Second prompt also works (not concurrent in zig — synchronous)
-    var fp2 = faux.FauxProvider.init(allocator);
-    defer fp2.deinit();
-    const msg2 = createAssistantMessage(allocator, "ok2");
-    defer allocator.free(msg2.content);
-    fp2.setResponses(&.{msg2});
-    agent.stream_fn = fauxStreamHook(&fp2);
-
-    const prompts2 = [_]protocol.AgentMessage{makeUserMessage("hello2")};
-    try agent.prompt(&prompts2);
 }
 
 // ── contract 6: abort (agent.test.ts:176-212) ──

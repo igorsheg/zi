@@ -115,19 +115,7 @@ fn echoExecute(
     return .{ .content = content };
 }
 
-/// Default convertToLlm: filter to user/assistant/tool_result.
-fn defaultConvertToLlm(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage, _: ?*anyopaque) []const ai.protocol.Message {
-    var result: std.ArrayListUnmanaged(ai.protocol.Message) = .empty;
-    for (messages) |msg| {
-        switch (msg) {
-            .user => |u| result.append(allocator, .{ .user = u }) catch continue,
-            .assistant => |a| result.append(allocator, .{ .assistant = a }) catch continue,
-            .tool_result => |t| result.append(allocator, .{ .tool_result = t }) catch continue,
-            .compaction_summary, .branch_summary, .custom => continue,
-        }
-    }
-    return result.items;
-}
+const agent_mod = @import("agent.zig");
 
 /// Wrap faux provider stream_simple as a StreamHook.
 fn fauxStreamFn(
@@ -148,7 +136,7 @@ fn makeConfig(fp: *faux.FauxProvider) protocol.AgentLoopConfig {
     return .{
         .model = faux.fauxModel(),
         .stream = .{ .func = fauxStreamFn, .ctx = @ptrCast(fp) },
-        .convert_to_llm = .{ .func = defaultConvertToLlm },
+        .convert_to_llm = .{ .func = agent_mod.defaultConvertToLlm },
     };
 }
 
@@ -156,6 +144,8 @@ fn makeConfig(fp: *faux.FauxProvider) protocol.AgentLoopConfig {
 
 test "event ordering: text response emits canonical event sequence" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -179,7 +169,7 @@ test "event ordering: text response emits canonical event sequence" {
     _ = &config;
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,
@@ -218,6 +208,8 @@ test "event ordering: text response emits canonical event sequence" {
 
 test "tool call lifecycle: execute → result message → next turn" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -257,7 +249,7 @@ test "tool call lifecycle: execute → result message → next turn" {
     _ = &config;
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,
@@ -318,6 +310,8 @@ test "tool call lifecycle: execute → result message → next turn" {
 
 test "error terminal: stream error emits message_end then agent_end" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -340,7 +334,7 @@ test "error terminal: stream error emits message_end then agent_end" {
     _ = &config;
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,
@@ -378,6 +372,8 @@ test "error terminal: stream error emits message_end then agent_end" {
 test "no provider: stream error produces agent_end" {
     // Without a provider, the faux provider with no queued responses emits an error.
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -397,7 +393,7 @@ test "no provider: stream error produces agent_end" {
     _ = &config;
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,
@@ -428,6 +424,8 @@ test "no provider: stream error produces agent_end" {
 
 test "convertToLlm: custom messages filtered before LLM call" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -484,7 +482,7 @@ test "convertToLlm: custom messages filtered before LLM call" {
     defer collector.deinit();
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,
@@ -501,6 +499,8 @@ test "convertToLlm: custom messages filtered before LLM call" {
 
 test "transformContext: applied before convertToLlm, prunes old messages" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -582,7 +582,7 @@ test "transformContext: applied before convertToLlm, prunes old messages" {
     defer collector.deinit();
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,
@@ -601,6 +601,8 @@ test "transformContext: applied before convertToLlm, prunes old messages" {
 
 test "steering: queued messages injected after tool execution completes" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -668,7 +670,7 @@ test "steering: queued messages injected after tool execution completes" {
     config.get_steering_messages = .{ .func = steeringPollFn, .ctx = @ptrCast(&poll_state) };
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,
@@ -703,6 +705,8 @@ test "steering: queued messages injected after tool execution completes" {
 
 test "agentLoopContinue: resumes from context without emitting user message events" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -727,7 +731,7 @@ test "agentLoopContinue: resumes from context without emitting user message even
     _ = &config;
 
     try loop.runAgentLoopContinue(
-        allocator,
+        loop_arena.allocator(),
         context,
         config,
         EventCollector.sink,
@@ -763,6 +767,8 @@ test "agentLoopContinue: resumes from context without emitting user message even
 test "agentLoopContinue: returns error on empty context" {
     // pi-mono: expect(() => agentLoopContinue(context, config)).toThrow("Cannot continue: no messages in context")
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -779,7 +785,7 @@ test "agentLoopContinue: returns error on empty context" {
     _ = &config;
 
     const result = loop.runAgentLoopContinue(
-        allocator,
+        loop_arena.allocator(),
         context,
         config,
         EventCollector.sink,
@@ -794,6 +800,8 @@ test "agentLoopContinue: returns error on empty context" {
 
 test "agentLoopContinue: returns error when last message is assistant" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -819,7 +827,7 @@ test "agentLoopContinue: returns error when last message is assistant" {
     _ = &config;
 
     const result = loop.runAgentLoopContinue(
-        allocator,
+        loop_arena.allocator(),
         context,
         config,
         EventCollector.sink,
@@ -835,6 +843,8 @@ test "agentLoopContinue: returns error when last message is assistant" {
 
 test "follow-up: messages processed after agent would stop" {
     const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
@@ -886,7 +896,7 @@ test "follow-up: messages processed after agent would stop" {
     config.get_follow_up_messages = .{ .func = followUpFn, .ctx = @ptrCast(&fus) };
 
     loop.runAgentLoop(
-        allocator,
+        loop_arena.allocator(),
         &prompts,
         context,
         config,

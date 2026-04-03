@@ -89,8 +89,8 @@ pub const Agent = struct {
     convert_to_llm: protocol.ConvertToLlmHook,
     transform_context: ?protocol.TransformContextHook,
     stream_fn: protocol.StreamHook,
-    before_tool_call: ?*const fn (ctx: protocol.BeforeToolCallContext, signal: ?*anyopaque) ?protocol.BeforeToolCallResult,
-    after_tool_call: ?*const fn (ctx: protocol.AfterToolCallContext, signal: ?*anyopaque) ?protocol.AfterToolCallResult,
+    before_tool_call: ?protocol.BeforeToolCallHook,
+    after_tool_call: ?protocol.AfterToolCallHook,
 
     session_id: ?[]const u8,
     thinking_budgets: ?ai.protocol.ThinkingBudgets,
@@ -106,6 +106,10 @@ pub const Agent = struct {
     /// Pending tool call IDs tracked during execution.
     pending_tool_call_ids: std.ArrayList([]const u8),
 
+    /// Arena for all message content that outlives the loop.
+    /// Freed on reset() and deinit(). The loop allocates into this arena
+    /// so message content (text, content blocks) survives after the loop returns.
+    message_arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
 
     pub const Options = struct {
@@ -113,8 +117,8 @@ pub const Agent = struct {
         convert_to_llm: ?protocol.ConvertToLlmHook = null,
         transform_context: ?protocol.TransformContextHook = null,
         stream_fn: ?protocol.StreamHook = null,
-        before_tool_call: ?*const fn (ctx: protocol.BeforeToolCallContext, signal: ?*anyopaque) ?protocol.BeforeToolCallResult = null,
-        after_tool_call: ?*const fn (ctx: protocol.AfterToolCallContext, signal: ?*anyopaque) ?protocol.AfterToolCallResult = null,
+        before_tool_call: ?protocol.BeforeToolCallHook = null,
+        after_tool_call: ?protocol.AfterToolCallHook = null,
         steering_mode: QueueMode = .one_at_a_time,
         follow_up_mode: QueueMode = .one_at_a_time,
         session_id: ?[]const u8 = null,
@@ -126,10 +130,10 @@ pub const Agent = struct {
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Agent {
         const initial = options.initial_state orelse protocol.AgentState{};
-        // Copy initial messages into owned runtime list (pi-mono agent.ts:64-90)
+        var message_arena = std.heap.ArenaAllocator.init(allocator);
         var messages: std.ArrayList(protocol.AgentMessage) = .empty;
         for (initial.messages) |m| {
-            messages.append(allocator, m) catch {};
+            messages.append(message_arena.allocator(), m) catch {};
         }
         return .{
             .state = initial,
@@ -150,6 +154,7 @@ pub const Agent = struct {
             .abort_requested = false,
             .messages = messages,
             .pending_tool_call_ids = .empty,
+            .message_arena = message_arena,
             .allocator = allocator,
         };
     }
@@ -158,8 +163,8 @@ pub const Agent = struct {
         self.listeners.deinit(self.allocator);
         self.steering_queue.deinit();
         self.follow_up_queue.deinit();
-        self.messages.deinit(self.allocator);
-        self.pending_tool_call_ids.deinit(self.allocator);
+        // messages and pending_tool_call_ids are in message_arena — freed by arena deinit
+        self.message_arena.deinit();
     }
 
     /// Subscribe to agent lifecycle events. Returns a token for unsubscribing.
@@ -218,13 +223,15 @@ pub const Agent = struct {
     /// Clear transcript state, runtime state, and queued messages.
     /// pi-mono source: packages/agent/src/agent.ts:299-307
     pub fn reset(self: *Agent) void {
-        self.messages.clearRetainingCapacity();
+        // Reset arena — frees all message content in O(1)
+        _ = self.message_arena.reset(.retain_capacity);
+        self.messages = .empty;
         self.state.messages = &.{};
         self.state.is_streaming = false;
         self.state.streaming_message = null;
         self.state.pending_tool_calls = &.{};
         self.state.error_message = null;
-        self.pending_tool_call_ids.clearRetainingCapacity();
+        self.pending_tool_call_ids = .empty;
         self.clearAllQueues();
     }
 
@@ -293,7 +300,7 @@ pub const Agent = struct {
 
         if (is_continue) {
             loop_mod.runAgentLoopContinue(
-                self.allocator,
+                self.message_arena.allocator(),
                 context,
                 config,
                 processEventsSink,
@@ -302,7 +309,7 @@ pub const Agent = struct {
             ) catch {};
         } else {
             loop_mod.runAgentLoop(
-                self.allocator,
+                self.message_arena.allocator(),
                 prompt_messages.?,
                 context,
                 config,
@@ -376,11 +383,11 @@ pub const Agent = struct {
             },
             .message_end => |payload| {
                 self.state.streaming_message = null;
-                self.messages.append(self.allocator, payload.message) catch {};
+                self.messages.append(self.message_arena.allocator(), payload.message) catch {};
                 self.state.messages = self.messages.items;
             },
             .tool_execution_start => |payload| {
-                self.pending_tool_call_ids.append(self.allocator, payload.tool_call_id) catch {};
+                self.pending_tool_call_ids.append(self.message_arena.allocator(), payload.tool_call_id) catch {};
                 self.state.pending_tool_calls = self.pending_tool_call_ids.items;
             },
             .tool_execution_end => |payload| {
@@ -415,7 +422,7 @@ pub const Agent = struct {
 
 /// Default convertToLlm: pass through user/assistant/tool_result messages.
 /// pi-mono source: packages/agent/src/agent.ts:27-31
-fn defaultConvertToLlm(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage, _: ?*anyopaque) []const ai.protocol.Message {
+pub fn defaultConvertToLlm(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage, _: ?*anyopaque) []const ai.protocol.Message {
     var result: std.ArrayList(ai.protocol.Message) = .empty;
     for (messages) |msg| {
         switch (msg) {
@@ -428,7 +435,7 @@ fn defaultConvertToLlm(allocator: std.mem.Allocator, messages: []const protocol.
     return result.items;
 }
 
-fn defaultConvertToLlmHook() protocol.ConvertToLlmHook {
+pub fn defaultConvertToLlmHook() protocol.ConvertToLlmHook {
     return .{ .func = &defaultConvertToLlm, .ctx = null };
 }
 

@@ -250,6 +250,28 @@ pub const AfterToolCallContext = struct {
     context: AgentContext,
 };
 
+/// Hook: called before tool execution, after arg validation.
+/// Return block=true to prevent execution.
+pub const BeforeToolCallHook = struct {
+    func: *const fn (ctx_arg: BeforeToolCallContext, signal: ?*anyopaque, hook_ctx: ?*anyopaque) ?BeforeToolCallResult,
+    ctx: ?*anyopaque = null,
+
+    pub fn call(self: BeforeToolCallHook, context: BeforeToolCallContext, signal: ?*anyopaque) ?BeforeToolCallResult {
+        return self.func(context, signal, self.ctx);
+    }
+};
+
+/// Hook: called after tool execution.
+/// Return overrides for content/details/isError.
+pub const AfterToolCallHook = struct {
+    func: *const fn (ctx_arg: AfterToolCallContext, signal: ?*anyopaque, hook_ctx: ?*anyopaque) ?AfterToolCallResult,
+    ctx: ?*anyopaque = null,
+
+    pub fn call(self: AfterToolCallHook, context: AfterToolCallContext, signal: ?*anyopaque) ?AfterToolCallResult {
+        return self.func(context, signal, self.ctx);
+    }
+};
+
 /// Configuration for the agent loop — all hooks and options.
 /// pi-mono source: packages/agent/src/types.ts:96-214
 pub const AgentLoopConfig = struct {
@@ -261,8 +283,8 @@ pub const AgentLoopConfig = struct {
     get_follow_up_messages: ?GetMessagesHook = null,
     skip_initial_steering_poll: bool = false,
     tool_execution: ToolExecutionMode = .parallel,
-    before_tool_call: ?*const fn (ctx: BeforeToolCallContext, signal: ?*anyopaque) ?BeforeToolCallResult = null,
-    after_tool_call: ?*const fn (ctx: AfterToolCallContext, signal: ?*anyopaque) ?AfterToolCallResult = null,
+    before_tool_call: ?BeforeToolCallHook = null,
+    after_tool_call: ?AfterToolCallHook = null,
 
     // StreamOptions fields inlined from SimpleStreamOptions
     temperature: ?f64 = null,
