@@ -427,7 +427,7 @@ fn emitImmediateError(
     if (err_content_buf.len > 0) {
         err_content_buf[0] = .{ .text = .{ .text = msg } };
     }
-    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true };
+    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true, .details = .{ .object = std.json.ObjectMap.init(aa) } };
     const err_result = makeErrorToolResult(aa, tc.id, tc.name, msg);
     emitToolResult(event_sink, event_ctx, tc, err_result, true, err_tool_result);
     ctx_messages.append(aa, .{ .tool_result = err_result }) catch {};
@@ -467,6 +467,7 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = &.{},
+        .details = .{ .object = std.json.ObjectMap.init(allocator) },
         .is_error = true,
         .timestamp = std.time.milliTimestamp(),
     };
@@ -475,6 +476,7 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = content,
+        .details = .{ .object = std.json.ObjectMap.init(allocator) },
         .is_error = true,
         .timestamp = std.time.milliTimestamp(),
     };
