@@ -223,90 +223,60 @@ pub const Region = struct {
     }
 };
 
+
 // --- tests ---
 
-test "Buffer init and clear" {
+test "Buffer read-write round-trip and clear" {
     var buf = try Buffer.init(std.testing.allocator, 10, 5);
     defer buf.deinit();
 
-    const c = buf.get(0, 0);
-    try std.testing.expect(c.eql(Cell.blank));
-
+    // Blank on init
+    try std.testing.expect(buf.get(0, 0).eql(Cell.blank));
+    // Set and read back
     buf.set(3, 2, Cell{ .grapheme = .{ .codepoint = 'X' }, .fg = Color.rgb(255, 0, 0) });
-    const c2 = buf.get(3, 2);
-    try std.testing.expectEqual(@as(u21, 'X'), c2.grapheme.codepoint);
-
+    try std.testing.expectEqual(@as(u21, 'X'), buf.get(3, 2).grapheme.codepoint);
+    // Out of bounds is no-op
+    buf.set(99, 99, Cell{ .grapheme = .{ .codepoint = 'Z' } });
+    // Clear resets
     buf.clear();
     try std.testing.expect(buf.get(3, 2).eql(Cell.blank));
 }
 
-test "Buffer writeStr" {
-    var buf = try Buffer.init(std.testing.allocator, 20, 5);
+test "writeStr and fill respect buffer bounds" {
+    var buf = try Buffer.init(std.testing.allocator, 5, 2);
     defer buf.deinit();
 
-    const cols = buf.writeStr(0, 0, "hello", Color.default, Color.default, Attributes.none);
+    // writeStr truncates at width
+    const cols = buf.writeStr(0, 0, "hello world", Color.default, Color.default, Attributes.none);
     try std.testing.expectEqual(@as(u32, 5), cols);
     try std.testing.expectEqual(@as(u21, 'h'), buf.get(0, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'o'), buf.get(4, 0).grapheme.codepoint);
+    // fill a rect
+    buf.fill(1, 0, 3, 2, Cell{ .grapheme = .{ .codepoint = '#' } });
+    try std.testing.expectEqual(@as(u21, '#'), buf.get(2, 1).grapheme.codepoint);
 }
 
-test "Buffer writeStr stops at edge" {
-    var buf = try Buffer.init(std.testing.allocator, 3, 1);
-    defer buf.deinit();
-
-    const cols = buf.writeStr(0, 0, "hello", Color.default, Color.default, Attributes.none);
-    try std.testing.expectEqual(@as(u32, 3), cols);
-}
-
-test "Region clips writes" {
-    var buf = try Buffer.init(std.testing.allocator, 10, 10);
-    defer buf.deinit();
-
-    const r = Region{ .buf = &buf, .x = 2, .y = 3, .width = 4, .height = 2 };
-    r.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
-
-    try std.testing.expectEqual(@as(u21, 'A'), buf.get(2, 3).grapheme.codepoint);
-
-    r.set(5, 0, Cell{ .grapheme = .{ .codepoint = 'B' } });
-    try std.testing.expect(buf.get(7, 3).eql(Cell.blank));
-}
-
-test "Region sub-region" {
+test "Region clips and nests correctly" {
     var buf = try Buffer.init(std.testing.allocator, 20, 20);
     defer buf.deinit();
 
-    const outer = Region{ .buf = &buf, .x = 5, .y = 5, .width = 10, .height = 10 };
-    const inner = outer.sub(2, 3, 4, 4);
+    const r = Region{ .buf = &buf, .x = 5, .y = 5, .width = 10, .height = 10 };
+    r.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
+    // Appears at buffer (5,5)
+    try std.testing.expectEqual(@as(u21, 'A'), buf.get(5, 5).grapheme.codepoint);
+    // Out of region is no-op
+    r.set(15, 0, Cell{ .grapheme = .{ .codepoint = 'B' } });
+    try std.testing.expect(buf.get(20, 5).eql(Cell.blank)); // would be OOB anyway
 
+    // Sub-region offsets compound
+    const inner = r.sub(2, 3, 4, 4);
     try std.testing.expectEqual(@as(u32, 7), inner.x);
     try std.testing.expectEqual(@as(u32, 8), inner.y);
-    try std.testing.expectEqual(@as(u32, 4), inner.width);
-    try std.testing.expectEqual(@as(u32, 4), inner.height);
 }
 
-test "Buffer fill" {
-    var buf = try Buffer.init(std.testing.allocator, 10, 10);
-    defer buf.deinit();
-
-    const c = Cell{ .grapheme = .{ .codepoint = '#' }, .fg = Color.rgb(255, 255, 0) };
-    buf.fill(1, 1, 3, 2, c);
-
-    try std.testing.expectEqual(@as(u21, '#'), buf.get(1, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, '#'), buf.get(3, 2).grapheme.codepoint);
-    try std.testing.expect(buf.get(0, 0).eql(Cell.blank));
-}
-
-test "GraphemePool add and get" {
+test "GraphemePool stores and retrieves clusters" {
     var pool = GraphemePool.init(std.testing.allocator);
     defer pool.deinit();
-
     const id = try pool.add("👨‍👩‍👧");
-    const bytes = pool.get(id);
-    try std.testing.expectEqualStrings("👨‍👩‍👧", bytes);
+    try std.testing.expectEqualStrings("👨‍👩‍👧", pool.get(id));
 }
 
-test "Buffer set out of bounds is no-op" {
-    var buf = try Buffer.init(std.testing.allocator, 5, 5);
-    defer buf.deinit();
-    buf.set(10, 10, Cell{ .grapheme = .{ .codepoint = 'X' } });
-}

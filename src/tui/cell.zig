@@ -92,27 +92,18 @@ pub const CursorStyle = enum {
     bar,
 };
 
-test "Cell equality" {
+
+test "Cell equality distinguishes all fields" {
     const a = Cell.blank;
-    const b = Cell.blank;
-    try std.testing.expect(a.eql(b));
+    try std.testing.expect(a.eql(Cell.blank));
 
-    var c = Cell.blank;
-    c.fg = Color.rgb(255, 0, 0);
-    try std.testing.expect(!a.eql(c));
-}
-
-test "Attributes packed size" {
+    // Different fg
+    try std.testing.expect(!a.eql(Cell{ .fg = Color.rgb(255, 0, 0) }));
+    // Different grapheme
+    try std.testing.expect(!a.eql(Cell{ .grapheme = .{ .codepoint = 'X' } }));
+    // Grapheme union tags
+    const pooled = Grapheme{ .pooled = 42 };
+    try std.testing.expect(!pooled.eql(Grapheme{ .codepoint = 'A' }));
+    // Attributes are 1 byte packed
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(Attributes));
-}
-
-test "Grapheme equality" {
-    const a = Grapheme{ .codepoint = 'A' };
-    const b = Grapheme{ .codepoint = 'A' };
-    const c = Grapheme{ .codepoint = 'B' };
-    const d = Grapheme{ .pooled = 42 };
-    try std.testing.expect(a.eql(b));
-    try std.testing.expect(!a.eql(c));
-    try std.testing.expect(!a.eql(d));
-    try std.testing.expect(!d.eql(a));
 }

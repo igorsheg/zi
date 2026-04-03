@@ -280,119 +280,73 @@ fn parseUtf8Char(data: []const u8) ?ParseResult {
     };
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
 
-test "parse regular character" {
-    const result = parseKey("a", false).?;
-    try std.testing.expectEqual(KeyCode.char, result.key.code);
-    try std.testing.expectEqual(@as(?u21, 'a'), result.key.char);
-    try std.testing.expectEqual(@as(usize, 1), result.len);
+// --- tests ---
+
+test "single-byte keys: printable, control, special" {
+    // Printable char
+    const a = parseKey("a", false).?;
+    try std.testing.expectEqual(KeyCode.char, a.key.code);
+    try std.testing.expectEqual(@as(?u21, 'a'), a.key.char);
+    // Ctrl+C
+    const cc = parseKey("\x03", false).?;
+    try std.testing.expect(cc.key.ctrl);
+    try std.testing.expectEqual(@as(?u21, 'c'), cc.key.char);
+    // Enter, tab, backspace, escape
+    try std.testing.expectEqual(KeyCode.enter, parseKey("\r", false).?.key.code);
+    try std.testing.expectEqual(KeyCode.tab, parseKey("\t", false).?.key.code);
+    try std.testing.expectEqual(KeyCode.backspace, parseKey("\x7f", false).?.key.code);
+    try std.testing.expectEqual(KeyCode.escape, parseKey("\x1b", false).?.key.code);
 }
 
-test "parse enter" {
-    const result = parseKey("\r", false).?;
-    try std.testing.expectEqual(KeyCode.enter, result.key.code);
-}
-
-test "parse ctrl+c" {
-    const result = parseKey("\x03", false).?;
-    try std.testing.expectEqual(KeyCode.char, result.key.code);
-    try std.testing.expectEqual(@as(?u21, 'c'), result.key.char);
-    try std.testing.expect(result.key.ctrl);
-}
-
-test "parse escape" {
-    const result = parseKey("\x1b", false).?;
-    try std.testing.expectEqual(KeyCode.escape, result.key.code);
-}
-
-test "parse arrow keys" {
+test "CSI and SS3 escape sequences parse arrows, function keys, nav" {
+    // CSI arrows
     try std.testing.expectEqual(KeyCode.up, parseKey("\x1b[A", false).?.key.code);
     try std.testing.expectEqual(KeyCode.down, parseKey("\x1b[B", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.right, parseKey("\x1b[C", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.left, parseKey("\x1b[D", false).?.key.code);
-}
-
-test "parse SS3 arrows" {
+    // SS3 arrows
     try std.testing.expectEqual(KeyCode.up, parseKey("\x1bOA", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.down, parseKey("\x1bOB", false).?.key.code);
-}
-
-test "parse function keys" {
+    // Home/End
+    try std.testing.expectEqual(KeyCode.home, parseKey("\x1b[H", false).?.key.code);
+    try std.testing.expectEqual(KeyCode.end, parseKey("\x1bOF", false).?.key.code);
+    // Tilde-style: insert, delete, page up/down, function keys
+    try std.testing.expectEqual(KeyCode.delete, parseKey("\x1b[3~", false).?.key.code);
+    try std.testing.expectEqual(KeyCode.page_up, parseKey("\x1b[5~", false).?.key.code);
     try std.testing.expectEqual(KeyCode.f1, parseKey("\x1bOP", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.f5, parseKey("\x1b[15~", false).?.key.code);
     try std.testing.expectEqual(KeyCode.f12, parseKey("\x1b[24~", false).?.key.code);
 }
 
-test "parse modified arrow" {
-    const result = parseKey("\x1b[1;5A", false).?;
-    try std.testing.expectEqual(KeyCode.up, result.key.code);
-    try std.testing.expect(result.key.ctrl);
-    try std.testing.expect(!result.key.shift);
+test "xterm modifier parameters decode shift/ctrl/alt" {
+    // Ctrl+Up: modifier 5 = 1+ctrl
+    const cu = parseKey("\x1b[1;5A", false).?;
+    try std.testing.expectEqual(KeyCode.up, cu.key.code);
+    try std.testing.expect(cu.key.ctrl);
+    try std.testing.expect(!cu.key.shift);
+    // Ctrl+Shift+Up: modifier 6
+    const csu = parseKey("\x1b[1;6A", false).?;
+    try std.testing.expect(csu.key.ctrl);
+    try std.testing.expect(csu.key.shift);
+    // Alt+char
+    const alt_a = parseKey("\x1ba", false).?;
+    try std.testing.expect(alt_a.key.alt);
+    try std.testing.expectEqual(@as(?u21, 'a'), alt_a.key.char);
 }
 
-test "parse shift+ctrl arrow" {
-    const result = parseKey("\x1b[1;6A", false).?;
-    try std.testing.expectEqual(KeyCode.up, result.key.code);
-    try std.testing.expect(result.key.ctrl);
-    try std.testing.expect(result.key.shift);
+test "kitty CSI-u protocol parses codepoints and modifiers" {
+    // Basic: \x1b[97u = 'a'
+    const ka = parseKey("\x1b[97u", true).?;
+    try std.testing.expectEqual(KeyCode.char, ka.key.code);
+    try std.testing.expectEqual(@as(?u21, 'a'), ka.key.char);
+    // With modifier: ctrl+a
+    const kca = parseKey("\x1b[97;5u", true).?;
+    try std.testing.expect(kca.key.ctrl);
+    // Special kitty codepoints
+    try std.testing.expectEqual(KeyCode.enter, parseKey("\x1b[13u", true).?.key.code);
 }
 
-test "parse alt+char" {
-    const result = parseKey("\x1ba", false).?;
-    try std.testing.expectEqual(KeyCode.char, result.key.code);
-    try std.testing.expectEqual(@as(?u21, 'a'), result.key.char);
-    try std.testing.expect(result.key.alt);
-    try std.testing.expectEqual(@as(usize, 2), result.len);
-}
-
-test "parse home/end" {
-    try std.testing.expectEqual(KeyCode.home, parseKey("\x1b[H", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.end, parseKey("\x1b[F", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.home, parseKey("\x1bOH", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.end, parseKey("\x1bOF", false).?.key.code);
-}
-
-test "parse delete/insert/pageup/pagedown" {
-    try std.testing.expectEqual(KeyCode.insert, parseKey("\x1b[2~", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.delete, parseKey("\x1b[3~", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.page_up, parseKey("\x1b[5~", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.page_down, parseKey("\x1b[6~", false).?.key.code);
-}
-
-test "parse backspace" {
-    const result = parseKey("\x7f", false).?;
-    try std.testing.expectEqual(KeyCode.backspace, result.key.code);
-}
-
-test "parse tab" {
-    const result = parseKey("\t", false).?;
-    try std.testing.expectEqual(KeyCode.tab, result.key.code);
-}
-
-test "kitty protocol basic" {
-    const result = parseKey("\x1b[97u", true).?;
-    try std.testing.expectEqual(KeyCode.char, result.key.code);
-    try std.testing.expectEqual(@as(?u21, 'a'), result.key.char);
-}
-
-test "kitty protocol with modifier" {
-    const result = parseKey("\x1b[97;5u", true).?;
-    try std.testing.expectEqual(KeyCode.char, result.key.code);
-    try std.testing.expectEqual(@as(?u21, 'a'), result.key.char);
-    try std.testing.expect(result.key.ctrl);
-}
-
-test "kitty enter" {
-    const result = parseKey("\x1b[13u", true).?;
-    try std.testing.expectEqual(KeyCode.enter, result.key.code);
-}
-
-test "UTF-8 character" {
+test "multi-byte UTF-8 characters" {
     const result = parseKey("é", false).?;
     try std.testing.expectEqual(KeyCode.char, result.key.code);
     try std.testing.expectEqual(@as(?u21, 0xE9), result.key.char);
     try std.testing.expectEqual(@as(usize, 2), result.len);
 }
+

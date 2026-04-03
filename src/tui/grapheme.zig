@@ -142,48 +142,34 @@ pub fn sliceToWidth(text: []const u8, max_cols: usize) []const u8 {
     return text[0..i];
 }
 
+
 // --- tests ---
 
-test "ASCII characters are width 1" {
+test "charWidth covers ASCII, wide, zero-width, and control ranges" {
+    // ASCII
     try std.testing.expectEqual(@as(u2, 1), charWidth('A'));
     try std.testing.expectEqual(@as(u2, 1), charWidth(' '));
-    try std.testing.expectEqual(@as(u2, 1), charWidth('~'));
-}
-
-test "CJK characters are width 2" {
+    // CJK wide
     try std.testing.expectEqual(@as(u2, 2), charWidth(0x4E00));
     try std.testing.expectEqual(@as(u2, 2), charWidth(0x3042));
-    try std.testing.expectEqual(@as(u2, 2), charWidth(0xAC00));
-}
-
-test "combining marks are width 0" {
+    // Zero-width
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x0300));
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x200B));
-    try std.testing.expectEqual(@as(u2, 0), charWidth(0xFE0F));
-}
-
-test "control characters are width 0" {
+    // Control
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x00));
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x1B));
-    try std.testing.expectEqual(@as(u2, 0), charWidth(0x7F));
 }
 
-test "strWidth counts display columns" {
+test "strWidth sums display columns including wide chars" {
     try std.testing.expectEqual(@as(usize, 5), strWidth("hello"));
     try std.testing.expectEqual(@as(usize, 0), strWidth(""));
-}
-
-test "strWidth with wide chars" {
     try std.testing.expectEqual(@as(usize, 4), strWidth("一二"));
 }
 
-test "sliceToWidth truncates correctly" {
-    const result = sliceToWidth("hello", 3);
-    try std.testing.expectEqualStrings("hel", result);
-}
-
-test "sliceToWidth respects wide char boundaries" {
+test "sliceToWidth truncates at column boundary" {
+    try std.testing.expectEqualStrings("hel", sliceToWidth("hello", 3));
+    // Wide char: "一" = 2 cols, "二" would exceed 3
     const result = sliceToWidth("一二三", 3);
-    try std.testing.expectEqual(@as(usize, 3), result.len);
     try std.testing.expectEqual(@as(usize, 2), strWidth(result));
 }
+

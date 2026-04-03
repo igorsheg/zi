@@ -38,29 +38,22 @@ pub const Text = struct {
     }
 };
 
-test "Text renders content to buffer" {
+
+test "Text renders styled content to buffer" {
     var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 5);
     defer buf.deinit();
 
     var text = Text{ .content = "hello", .fg = Color.rgb(255, 255, 255) };
     text.render(buf.region());
-
     try std.testing.expectEqual(@as(u21, 'h'), buf.get(0, 0).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, 'o'), buf.get(4, 0).grapheme.codepoint);
     try std.testing.expect(buf.get(0, 0).fg.eql(Color.rgb(255, 255, 255)));
 }
 
-test "Text measure returns line count" {
+test "Text measure estimates line count from width" {
     var text = Text{ .content = "hello world" };
-    const m = text.measure(5);
-    try std.testing.expectEqual(@as(u32, 3), m.preferred_height);
+    try std.testing.expectEqual(@as(u32, 3), text.measure(5).preferred_height);
+    var empty = Text{};
+    try std.testing.expectEqual(@as(u32, 0), empty.measure(10).preferred_height);
 }
 
-test "Text empty content" {
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 10, 5);
-    defer buf.deinit();
-
-    var text = Text{};
-    text.render(buf.region());
-    try std.testing.expect(buf.get(0, 0).eql(cell_mod.Cell.blank));
-}

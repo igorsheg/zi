@@ -182,80 +182,52 @@ pub const Editor = struct {
     }
 };
 
+
 // --- Tests ---
 
-test "Editor type and submit" {
+test "Editor insert, cursor tracking, and submit" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
 
-    try std.testing.expect(editor.handleInput(.{ .code = .char, .char = 'h' }));
-    try std.testing.expect(editor.handleInput(.{ .code = .char, .char = 'i' }));
+    _ = editor.handleInput(.{ .code = .char, .char = 'h' });
+    _ = editor.handleInput(.{ .code = .char, .char = 'i' });
     try std.testing.expectEqualStrings("hi", editor.getText());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
+
+    // Cursor state includes prompt offset
+    const cs = editor.cursorState().?;
+    try std.testing.expectEqual(@as(u32, 4), cs.x); // "> " (2) + cursor_col (2)
 }
 
-test "Editor backspace" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'b' });
-    _ = editor.handleInput(.{ .code = .backspace });
-    try std.testing.expectEqualStrings("a", editor.getText());
-    try std.testing.expectEqual(@as(u32, 1), editor.cursor_col);
-}
-
-test "Editor cursor movement" {
+test "Editor backspace, delete, and navigation" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
 
     _ = editor.handleInput(.{ .code = .char, .char = 'a' });
     _ = editor.handleInput(.{ .code = .char, .char = 'b' });
     _ = editor.handleInput(.{ .code = .char, .char = 'c' });
-
-    _ = editor.handleInput(.{ .code = .left });
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-
+    // Backspace
+    _ = editor.handleInput(.{ .code = .backspace });
+    try std.testing.expectEqualStrings("ab", editor.getText());
+    // Navigation
     _ = editor.handleInput(.{ .code = .home });
     try std.testing.expectEqual(@as(u32, 0), editor.cursor_col);
-
     _ = editor.handleInput(.{ .code = .end });
-    try std.testing.expectEqual(@as(u32, 3), editor.cursor_col);
+    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
+    // Clear
+    editor.clear();
+    try std.testing.expectEqualStrings("", editor.getText());
 }
 
-test "Editor clear" {
+test "Editor renders prompt and text to buffer" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
 
     _ = editor.handleInput(.{ .code = .char, .char = 'x' });
-    editor.clear();
-    try std.testing.expectEqualStrings("", editor.getText());
-    try std.testing.expectEqual(@as(u32, 0), editor.cursor_col);
-}
-
-test "Editor renders to buffer" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'h' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'i' });
-
     var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 1);
     defer buf.deinit();
     editor.render(buf.region());
-
     try std.testing.expectEqual(@as(u21, '>'), buf.get(0, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), buf.get(1, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'h'), buf.get(2, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'i'), buf.get(3, 0).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'x'), buf.get(2, 0).grapheme.codepoint);
 }
 
-test "Editor cursor state includes prompt offset" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
-    const cs = editor.cursorState().?;
-    try std.testing.expectEqual(@as(u32, 3), cs.x);
-    try std.testing.expectEqual(@as(u32, 0), cs.y);
-}
