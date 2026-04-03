@@ -662,3 +662,213 @@ test "CodingAgent: session persistence round-trip" {
     // Clean up the session file
     std.fs.deleteFileAbsolute(session_file) catch {};
 }
+
+// tool call round-trip: faux returns tool_call → tool executes → faux called again
+test "CodingAgent: tool call triggers execution and second LLM call" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+
+    // First response: tool call
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("echo", "tc-1", .null),
+    };
+    // Second response: text after tool result
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done after tool")};
+    fp.setResponses(&.{
+        faux.fauxAssistantMessage(allocator, &tc_content, .toolUse),
+        faux.fauxAssistantMessage(allocator, &text_content, .stop),
+    });
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    // Simple echo tool
+    const echo_tool = protocol.AgentTool{
+        .name = "echo",
+        .description = "echo",
+        .label = "echo",
+        .parameters = .null,
+        .execute = &struct {
+            fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?*anyopaque, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
+                const c = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch return .{ .content = &.{} };
+                c[0] = .{ .text = .{ .text = "echoed" } };
+                return .{ .content = c };
+            }
+        }.exec,
+    };
+    const tools = [_]protocol.AgentTool{echo_tool};
+
+    var collector = EventCollector.init(allocator);
+    var ca = CodingAgent.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = &registry,
+        .tools = &tools,
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },
+    });
+    defer ca.deinit();
+
+    ca.run("use the tool");
+
+    // Faux called twice: once for tool call, once after tool result
+    try testing.expectEqual(@as(usize, 2), fp.call_count);
+
+    // Messages: user, assistant(tool_call), tool_result, assistant(text)
+    try testing.expectEqual(@as(usize, 4), ca.agent.state.messages.len);
+    try testing.expect(ca.agent.state.messages[0] == .user);
+    try testing.expect(ca.agent.state.messages[1] == .assistant);
+    try testing.expect(ca.agent.state.messages[2] == .tool_result);
+    try testing.expect(ca.agent.state.messages[3] == .assistant);
+
+    // Verify tool result content
+    const tr = ca.agent.state.messages[2].tool_result;
+    try testing.expectEqualStrings("echo", tr.tool_name);
+    try testing.expectEqual(@as(usize, 1), tr.content.len);
+
+    // Verify tool_execution events fired
+    try testing.expect(collector.countType(.tool_execution_start) >= 1);
+    try testing.expect(collector.countType(.tool_execution_end) >= 1);
+}
+
+// --continue round-trip: write session → load → continue → verify context sent to provider
+test "CodingAgent: continue sends restored context to provider" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Phase 1: create a session with one exchange
+    var fp1 = faux.FauxProvider.init(allocator);
+    const c1 = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("first response")};
+    fp1.setResponses(&.{faux.fauxAssistantMessage(allocator, &c1, .stop)});
+
+    var reg1 = ai.provider.Registry.init(allocator);
+    try reg1.register("faux", fp1.provider(), null);
+
+    var col1 = EventCollector.init(allocator);
+    var ca1 = CodingAgent.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = &reg1,
+        .tools = &.{},
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&col1) },
+    });
+    defer ca1.deinit();
+
+    ca1.run("hello");
+    try testing.expect(ca1.sessionFlushed());
+    const session_file = ca1.getSessionFile();
+
+    // Phase 2: load the session and continue with a new user message
+    const loaded = try loadSessionContext(allocator, session_file);
+    try testing.expectEqual(@as(usize, 2), loaded.messages.len);
+
+    var fp2 = faux.FauxProvider.init(allocator);
+    const c2 = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("continued response")};
+    fp2.setResponses(&.{faux.fauxAssistantMessage(allocator, &c2, .stop)});
+
+    var reg2 = ai.provider.Registry.init(allocator);
+    try reg2.register("faux", fp2.provider(), null);
+
+    var col2 = EventCollector.init(allocator);
+    // Seed with loaded messages + a new user prompt
+    const new_user = protocol.AgentMessage{ .user = .{
+        .content = .{ .text = "follow up" },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+    var all_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
+    try all_messages.appendSlice(allocator, loaded.messages);
+    try all_messages.append(allocator, new_user);
+
+    var ca2 = CodingAgent.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = &reg2,
+        .tools = &.{},
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&col2) },
+        .initial_messages = all_messages.items,
+        .session_file = session_file,
+        .leaf_id = loaded.leaf_id,
+        .session_id = loaded.session_id,
+    });
+    defer ca2.deinit();
+
+    // Continue — should send the full context to the provider
+    try ca2.continueSession();
+
+    try testing.expectEqual(@as(usize, 1), fp2.call_count);
+
+    // Provider should have received context with restored messages
+    try testing.expectEqual(@as(usize, 1), fp2.captured_contexts.items.len);
+    const ctx = fp2.captured_contexts.items[0];
+    // Context should have at least 3 LLM messages: user("hello"), assistant("first response"), user("follow up")
+    try testing.expect(ctx.messages.len >= 3);
+
+    // Clean up
+    std.fs.deleteFileAbsolute(session_file) catch {};
+}
+
+// convertToLlm through the loop: compaction_summary in initial state → provider receives wrapped text
+test "CodingAgent: compaction_summary converted to user message for provider" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const c = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("ok")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &c, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+
+    // Seed with compaction_summary + user message
+    const initial = [_]protocol.AgentMessage{
+        .{ .compaction_summary = .{ .summary = "Previous work done", .tokens_before = 5000, .timestamp = 1 } },
+        .{ .user = .{ .content = .{ .text = "next question" }, .timestamp = 2 } },
+    };
+
+    var ca = CodingAgent.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = &registry,
+        .tools = &.{},
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },
+        .initial_messages = &initial,
+    });
+    defer ca.deinit();
+
+    // Continue from the seeded state (last message is user, so continue works)
+    try ca.continueSession();
+
+    try testing.expectEqual(@as(usize, 1), fp.call_count);
+    try testing.expectEqual(@as(usize, 1), fp.captured_contexts.items.len);
+
+    const ctx = fp.captured_contexts.items[0];
+    // convertToLlm should have converted compaction_summary → user message with <summary> tags
+    // So provider sees: user(compaction), user("next question") = 2 messages
+    try testing.expectEqual(@as(usize, 2), ctx.messages.len);
+    try testing.expect(ctx.messages[0] == .user);
+    try testing.expect(ctx.messages[1] == .user);
+
+    // First message should contain the summary wrapped in tags
+    const first_user = ctx.messages[0].user;
+    switch (first_user.content) {
+        .blocks => |blocks| {
+            try testing.expect(blocks.len > 0);
+            const text = blocks[0].text.text;
+            try testing.expect(std.mem.indexOf(u8, text, "<summary>") != null);
+            try testing.expect(std.mem.indexOf(u8, text, "Previous work done") != null);
+        },
+        .text => |t| {
+            try testing.expect(std.mem.indexOf(u8, t, "<summary>") != null);
+        },
+    }
+}

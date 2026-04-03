@@ -58,6 +58,7 @@ pub fn fauxAssistantMessage(
 
 pub const FauxProvider = struct {
     responses: std.ArrayListUnmanaged(protocol.AssistantMessage),
+    captured_contexts: std.ArrayListUnmanaged(protocol.Context),
     call_count: usize,
     allocator: std.mem.Allocator,
 
@@ -71,6 +72,7 @@ pub const FauxProvider = struct {
     pub fn init(allocator: std.mem.Allocator) FauxProvider {
         return .{
             .responses = .empty,
+            .captured_contexts = .empty,
             .call_count = 0,
             .allocator = allocator,
         };
@@ -78,6 +80,7 @@ pub const FauxProvider = struct {
 
     pub fn deinit(self: *FauxProvider) void {
         self.responses.deinit(self.allocator);
+        self.captured_contexts.deinit(self.allocator);
     }
 
     pub fn setResponses(self: *FauxProvider, msgs: []const protocol.AssistantMessage) void {
@@ -101,13 +104,14 @@ pub const FauxProvider = struct {
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
         _: protocol.Model,
-        _: protocol.Context,
+        context: protocol.Context,
         _: protocol.StreamOptions,
         callback: ai_provider.EventCallback,
         callback_ctx: ?*anyopaque,
     ) void {
         const self = getSelf(ptr);
         self.call_count += 1;
+        self.captured_contexts.append(self.allocator, context) catch {};
 
         if (self.responses.items.len == 0) {
             const err_msg: protocol.AssistantMessage = .{
