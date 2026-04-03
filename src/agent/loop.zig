@@ -50,6 +50,11 @@ pub fn runAgentLoop(
 /// Used for retries — context already has user message or tool results.
 ///
 /// Matches pi-mono's runAgentLoopContinue (agent-loop.ts:120-143).
+pub const ContinueError = error{
+    EmptyContext,
+    AssistantTail,
+};
+
 pub fn runAgentLoopContinue(
     allocator: std.mem.Allocator,
     context: protocol.AgentContext,
@@ -57,17 +62,14 @@ pub fn runAgentLoopContinue(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
     signal: ?*anyopaque,
-) void {
+) ContinueError!void {
     if (context.messages.len == 0) {
-        // pi-mono throws "Cannot continue: no messages in context"
-        return;
+        return error.EmptyContext;
     }
 
-    // Check last message isn't assistant
     const last = context.messages[context.messages.len - 1];
     if (last == .assistant) {
-        // pi-mono throws "Cannot continue from message role: assistant"
-        return;
+        return error.AssistantTail;
     }
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -117,7 +119,10 @@ fn runLoop(
     }
 
     // Initial steering poll (pi-mono agent-loop.ts:165)
-    var pending_messages = if (config.get_steering_messages) |hook|
+    // Skip when continue() already drained one steering message (skipInitialSteeringPoll).
+    var pending_messages = if (config.skip_initial_steering_poll)
+        @as([]const protocol.AgentMessage, &.{})
+    else if (config.get_steering_messages) |hook|
         hook.call(aa)
     else
         @as([]const protocol.AgentMessage, &.{});
@@ -234,7 +239,8 @@ fn streamAssistantResponse(
         .tools = if (llm_tools.len > 0) llm_tools else null,
     };
 
-    const stream_options = config.buildStreamOptions();
+    var stream_options = config.buildStreamOptions();
+    stream_options.base.signal = signal;
 
     var bridge = StreamBridge{
         .sink = event_sink,
@@ -274,8 +280,13 @@ fn executeToolCalls(
 
                 const tool = findTool(tools, tc.name);
                 if (tool == null) {
+                    const err_content_buf = aa.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
+                    if (err_content_buf.len > 0) {
+                        err_content_buf[0] = .{ .text = .{ .text = "tool not found" } };
+                    }
+                    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true };
                     const err_result = makeErrorToolResult(aa, tc.id, tc.name, "tool not found");
-                    emitToolResult(event_sink, event_ctx, tc, err_result, true, null);
+                    emitToolResult(event_sink, event_ctx, tc, err_result, true, err_tool_result);
                     ctx_messages.append(aa, .{ .tool_result = err_result }) catch {};
                     new_messages.append(aa, .{ .tool_result = err_result }) catch {};
                     tool_results.append(aa, err_result) catch {};
@@ -310,7 +321,7 @@ fn executeToolCalls(
                     .timestamp = std.time.milliTimestamp(),
                 };
 
-                emitToolResult(event_sink, event_ctx, tc, tool_result_msg, result.is_error, result.details);
+                emitToolResult(event_sink, event_ctx, tc, tool_result_msg, result.is_error, result);
                 ctx_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
                 new_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
                 tool_results.append(aa, tool_result_msg) catch {};
@@ -328,12 +339,12 @@ fn emitToolResult(
     tc: ai.protocol.ToolCall,
     result: ai.protocol.ToolResultMessage,
     is_error: bool,
-    tool_result_value: ?std.json.Value,
+    tool_result: protocol.AgentToolResult,
 ) void {
     event_sink(.{ .tool_execution_end = .{
         .tool_call_id = tc.id,
         .tool_name = tc.name,
-        .result = tool_result_value,
+        .result = tool_result,
         .is_error = is_error,
     } }, event_ctx);
 

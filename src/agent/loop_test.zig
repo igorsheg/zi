@@ -726,7 +726,7 @@ test "agentLoopContinue: resumes from context without emitting user message even
     var config = makeConfig(&fp);
     _ = &config;
 
-    loop.runAgentLoopContinue(
+    try loop.runAgentLoopContinue(
         allocator,
         context,
         config,
@@ -756,6 +756,79 @@ test "agentLoopContinue: resumes from context without emitting user message even
     defer allocator.free(tags);
     try std.testing.expectEqual(EventTag.agent_start, tags[0]);
     try std.testing.expectEqual(EventTag.turn_start, tags[1]);
+}
+
+// ── contract: agentLoopContinue errors (pi-mono agent-loop.test.ts:641-654) ──
+
+test "agentLoopContinue: returns error on empty context" {
+    // pi-mono: expect(() => agentLoopContinue(context, config)).toThrow("Cannot continue: no messages in context")
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const context = protocol.AgentContext{
+        .system_prompt = "You are helpful.",
+        .messages = &.{},
+        .tools = null,
+    };
+    var config = makeConfig(&fp);
+    _ = &config;
+
+    const result = loop.runAgentLoopContinue(
+        allocator,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    try std.testing.expectError(loop.ContinueError.EmptyContext, result);
+    // No events should have been emitted
+    try std.testing.expectEqual(@as(usize, 0), collector.events.items.len);
+}
+
+test "agentLoopContinue: returns error when last message is assistant" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const assistant_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("response")};
+    const assistant_msg = faux.fauxAssistantMessage(allocator, &assistant_content, .stop);
+    defer allocator.free(assistant_msg.content);
+
+    const existing = [_]protocol.AgentMessage{
+        makeUserMessage("hello"),
+        .{ .assistant = assistant_msg },
+    };
+
+    const context = protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &existing,
+        .tools = null,
+    };
+    var config = makeConfig(&fp);
+    _ = &config;
+
+    const result = loop.runAgentLoopContinue(
+        allocator,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        null,
+    );
+
+    try std.testing.expectError(loop.ContinueError.AssistantTail, result);
+    try std.testing.expectEqual(@as(usize, 0), collector.events.items.len);
 }
 
 // ── contract: follow-up messages (pi-mono agent-loop.ts:219-225) ──

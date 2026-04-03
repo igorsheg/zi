@@ -126,6 +126,11 @@ pub const Agent = struct {
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Agent {
         const initial = options.initial_state orelse protocol.AgentState{};
+        // Copy initial messages into owned runtime list (pi-mono agent.ts:64-90)
+        var messages: std.ArrayList(protocol.AgentMessage) = .empty;
+        for (initial.messages) |m| {
+            messages.append(allocator, m) catch {};
+        }
         return .{
             .state = initial,
             .listeners = .empty,
@@ -143,7 +148,7 @@ pub const Agent = struct {
             .tool_execution = options.tool_execution,
             .is_running = false,
             .abort_requested = false,
-            .messages = .empty,
+            .messages = messages,
             .pending_tool_call_ids = .empty,
             .allocator = allocator,
         };
@@ -205,7 +210,9 @@ pub const Agent = struct {
 
     /// Set the abort flag. The loop checks this between turns.
     pub fn abort(self: *Agent) void {
-        self.abort_requested = true;
+        if (self.is_running) {
+            self.abort_requested = true;
+        }
     }
 
     /// Clear transcript state, runtime state, and queued messages.
@@ -226,7 +233,7 @@ pub const Agent = struct {
     /// pi-mono source: packages/agent/src/agent.ts:312-320
     pub fn prompt(self: *Agent, messages_in: []const protocol.AgentMessage) !void {
         if (self.is_running) return error.AlreadyProcessing;
-        self.runWithLifecycle(messages_in, false);
+        self.runWithLifecycle(messages_in, false, false);
     }
 
     /// Continue from the current transcript.
@@ -243,7 +250,7 @@ pub const Agent = struct {
                 defer arena.deinit();
                 const queued = self.steering_queue.drain(arena.allocator());
                 if (queued.len > 0) {
-                    self.runWithLifecycle(queued, false);
+                    self.runWithLifecycle(queued, false, true);
                     return;
                 }
             }
@@ -253,7 +260,7 @@ pub const Agent = struct {
                 defer arena.deinit();
                 const queued = self.follow_up_queue.drain(arena.allocator());
                 if (queued.len > 0) {
-                    self.runWithLifecycle(queued, false);
+                    self.runWithLifecycle(queued, false, false);
                     return;
                 }
             }
@@ -261,12 +268,12 @@ pub const Agent = struct {
             return error.CannotContinueFromAssistant;
         }
 
-        self.runWithLifecycle(null, true);
+        self.runWithLifecycle(null, true, false);
     }
 
     /// Run the loop with proper lifecycle management.
     /// pi-mono source: packages/agent/src/agent.ts:434-457
-    fn runWithLifecycle(self: *Agent, prompt_messages: ?[]const protocol.AgentMessage, is_continue: bool) void {
+    fn runWithLifecycle(self: *Agent, prompt_messages: ?[]const protocol.AgentMessage, is_continue: bool, skip_initial_steering_poll: bool) void {
         self.is_running = true;
         self.state.is_streaming = true;
         self.state.streaming_message = null;
@@ -281,7 +288,7 @@ pub const Agent = struct {
             self.state.pending_tool_calls = &.{};
         }
 
-        const config = self.createLoopConfig();
+        const config = self.createLoopConfig(skip_initial_steering_poll);
         const context = self.createContextSnapshot();
 
         if (is_continue) {
@@ -292,7 +299,7 @@ pub const Agent = struct {
                 processEventsSink,
                 @ptrCast(self),
                 @ptrCast(&self.abort_requested),
-            );
+            ) catch {};
         } else {
             loop_mod.runAgentLoop(
                 self.allocator,
@@ -317,7 +324,7 @@ pub const Agent = struct {
 
     /// Build the loop config from current agent state and hooks.
     /// pi-mono source: packages/agent/src/agent.ts:407-432
-    fn createLoopConfig(self: *Agent) protocol.AgentLoopConfig {
+    fn createLoopConfig(self: *Agent, skip_initial_steering_poll: bool) protocol.AgentLoopConfig {
         return .{
             .model = self.state.model,
             .stream = self.stream_fn,
@@ -331,6 +338,7 @@ pub const Agent = struct {
                 .func = drainFollowUpMessages,
                 .ctx = @ptrCast(self),
             },
+            .skip_initial_steering_poll = skip_initial_steering_poll,
             .tool_execution = self.tool_execution,
             .before_tool_call = self.before_tool_call,
             .after_tool_call = self.after_tool_call,

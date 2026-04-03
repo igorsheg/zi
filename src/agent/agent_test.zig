@@ -118,9 +118,9 @@ test "Agent: abort sets flag, safe when not running" {
     var agent = Agent.init(allocator, .{});
     defer agent.deinit();
 
-    // Should not panic when nothing is running
+    // Should be a no-op when nothing is running (pi-mono guards on is_running)
     agent.abort();
-    try std.testing.expectEqual(true, agent.abort_requested);
+    try std.testing.expectEqual(false, agent.abort_requested);
 }
 
 // ── contract 7: steering queue (agent.test.ts:253-261) ──
@@ -274,6 +274,155 @@ test "Agent: continue drains follow-up queue when no steering and last is assist
     // After: [user, assistant, user(follow-up), assistant]
     try std.testing.expectEqual(@as(usize, 4), agent.state.messages.len);
     try std.testing.expect(agent.state.messages[3] == .assistant);
+}
+
+// ── contract: one-at-a-time steering from assistant tail (agent.test.ts:394-436) ──
+// pi-mono: steer 2 messages, continue() drains first only, inner loop drains second
+
+test "Agent: continue keeps one-at-a-time steering semantics from assistant tail" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    // Need 3 responses: initial + 2 steering responses
+    // But continue() with one-at-a-time drains first steering, runs loop.
+    // The loop's inner getSteeringMessages will drain the second.
+    // So we need: 1 initial response + 2 steering responses = 3 total
+    const msg1 = createAssistantMessage(allocator, "Initial response");
+    defer allocator.free(msg1.content);
+    const msg2 = createAssistantMessage(allocator, "Processed 1");
+    defer allocator.free(msg2.content);
+    const msg3 = createAssistantMessage(allocator, "Processed 2");
+    defer allocator.free(msg3.content);
+    fp.setResponses(&.{ msg1, msg2, msg3 });
+
+    var agent = Agent.init(allocator, .{
+        .stream_fn = fauxStreamHook(&fp),
+    });
+    defer agent.deinit();
+
+    // Initial prompt
+    const prompts = [_]protocol.AgentMessage{makeUserMessage("Initial")};
+    try agent.prompt(&prompts);
+
+    // State: [user, assistant]
+    try std.testing.expectEqual(@as(usize, 2), agent.state.messages.len);
+
+    // Queue two steering messages
+    agent.steer(makeUserMessage("Steering 1"));
+    agent.steer(makeUserMessage("Steering 2"));
+
+    // continue() drains first steering (one-at-a-time), runs loop.
+    // The loop's getSteeringMessages poll drains the second.
+    // pi-mono assertion: recentMessages.map(m => m.role) === ["user", "assistant", "user", "assistant"]
+    // and responseCount === 2
+    try agent.@"continue"();
+
+    // pi-mono: last 4 messages are [user, assistant, user, assistant]
+    const len = agent.state.messages.len;
+    try std.testing.expect(len >= 4);
+    const recent = agent.state.messages[len - 4 .. len];
+    try std.testing.expect(recent[0] == .user);
+    try std.testing.expect(recent[1] == .assistant);
+    try std.testing.expect(recent[2] == .user);
+    try std.testing.expect(recent[3] == .assistant);
+
+    // pi-mono: responseCount === 2 (two LLM calls during continue)
+    // Initial prompt used 1 response, continue used 2 = 3 total
+    try std.testing.expectEqual(@as(usize, 3), fp.call_count);
+}
+
+// ── contract: continue with seeded initial state (agent.test.ts:356-392) ──
+
+test "Agent: continue processes follow-up from seeded initial state" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const msg = createAssistantMessage(allocator, "Processed");
+    defer allocator.free(msg.content);
+    fp.setResponses(&.{msg});
+
+    // Seed initial state with [user, assistant] — like pi-mono's agent.state.messages = [...]
+    const initial_user = makeUserMessage("Initial");
+    const initial_assistant_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("Initial response")};
+    const initial_assistant = faux.fauxAssistantMessage(allocator, &initial_assistant_content, .stop);
+    defer allocator.free(initial_assistant.content);
+
+    const initial_messages = [_]protocol.AgentMessage{
+        initial_user,
+        .{ .assistant = initial_assistant },
+    };
+
+    var agent = Agent.init(allocator, .{
+        .stream_fn = fauxStreamHook(&fp),
+        .initial_state = protocol.AgentState{
+            .messages = &initial_messages,
+        },
+    });
+    defer agent.deinit();
+
+    // Verify initial state loaded
+    try std.testing.expectEqual(@as(usize, 2), agent.state.messages.len);
+
+    // Queue follow-up
+    agent.followUp(makeUserMessage("Queued follow-up"));
+
+    // continue() should drain follow-up since last message is assistant
+    try agent.@"continue"();
+
+    // pi-mono assertion: hasQueuedFollowUp === true (the follow-up user message exists)
+    var has_follow_up = false;
+    for (agent.state.messages) |m| {
+        if (m == .user) {
+            if (m.user.content == .text) {
+                if (std.mem.eql(u8, m.user.content.text, "Queued follow-up")) {
+                    has_follow_up = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(has_follow_up);
+
+    // pi-mono: last message should be assistant
+    const last = agent.state.messages[agent.state.messages.len - 1];
+    try std.testing.expect(last == .assistant);
+}
+
+// ── contract: agentLoopContinue errors bubble through Agent.continue ──
+
+test "Agent: continue returns error on empty messages" {
+    const allocator = std.testing.allocator;
+    var agent = Agent.init(allocator, .{});
+    defer agent.deinit();
+
+    const result = agent.@"continue"();
+    try std.testing.expectError(error.NoMessages, result);
+}
+
+test "Agent: continue returns error on assistant tail with no queued messages" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const msg = createAssistantMessage(allocator, "ok");
+    defer allocator.free(msg.content);
+    fp.setResponses(&.{msg});
+
+    var agent = Agent.init(allocator, .{
+        .stream_fn = fauxStreamHook(&fp),
+    });
+    defer agent.deinit();
+
+    const prompts = [_]protocol.AgentMessage{makeUserMessage("hello")};
+    try agent.prompt(&prompts);
+
+    // Last message is assistant, no steering or follow-up queued
+    const result = agent.@"continue"();
+    try std.testing.expectError(error.CannotContinueFromAssistant, result);
 }
 
 // ── contract: reset clears everything ──

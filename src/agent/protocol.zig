@@ -259,6 +259,7 @@ pub const AgentLoopConfig = struct {
     transform_context: ?TransformContextHook = null,
     get_steering_messages: ?GetMessagesHook = null,
     get_follow_up_messages: ?GetMessagesHook = null,
+    skip_initial_steering_poll: bool = false,
     tool_execution: ToolExecutionMode = .parallel,
     before_tool_call: ?*const fn (ctx: BeforeToolCallContext, signal: ?*anyopaque) ?BeforeToolCallResult = null,
     after_tool_call: ?*const fn (ctx: AfterToolCallContext, signal: ?*anyopaque) ?AfterToolCallResult = null,
@@ -301,7 +302,7 @@ pub const AgentEvent = union(enum) {
     message_end: struct { message: AgentMessage },
     tool_execution_start: struct { tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value },
     tool_execution_update: struct { tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value, partial_result: ?AgentToolResult },
-    tool_execution_end: struct { tool_call_id: []const u8, tool_name: []const u8, result: ?std.json.Value, is_error: bool },
+    tool_execution_end: struct { tool_call_id: []const u8, tool_name: []const u8, result: AgentToolResult, is_error: bool },
 };
 
 /// Agent event callback.
