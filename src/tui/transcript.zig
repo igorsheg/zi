@@ -4,6 +4,7 @@ const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const grapheme = @import("grapheme.zig");
 const text_mod = @import("components/text.zig");
+const markdown_mod = @import("components/markdown.zig");
 const tool_display_mod = @import("tool_display.zig");
 const word_wrap_mod = @import("word_wrap.zig");
 
@@ -14,8 +15,8 @@ const ToolDisplay = tool_display_mod.ToolDisplay;
 
 /// A row in the conversation transcript.
 pub const TranscriptRow = union(enum) {
-    /// Accumulated assistant text (appended via text_delta events).
-    assistant_text: *text_mod.Text,
+    /// Accumulated assistant text rendered as markdown.
+    assistant_text: *markdown_mod.Markdown,
     /// A tool execution with its display component.
     tool_execution: *ToolExecution,
 };
@@ -61,9 +62,9 @@ pub const Transcript = struct {
     pub fn deinit(self: *Transcript) void {
         for (self.rows.items) |row| {
             switch (row) {
-                .assistant_text => |t| {
-                    t.deinit();
-                    self.allocator.destroy(t);
+                .assistant_text => |md| {
+                    md.deinit();
+                    self.allocator.destroy(md);
                 },
                 .tool_execution => |te| te.deinit(),
             }
@@ -85,17 +86,17 @@ pub const Transcript = struct {
         self.text_buf.appendSlice(self.allocator, delta) catch return;
 
         if (self.current_text_idx) |idx| {
-            // Update existing text row
+            // Update existing markdown row
             self.rows.items[idx].assistant_text.setContent(self.text_buf.items);
         } else {
-            // Create new text row
-            const text = self.allocator.create(text_mod.Text) catch return;
-            text.* = text_mod.Text.init(self.allocator);
-            text.padding_x = 1;
-            text.setContent(self.text_buf.items);
-            self.rows.append(self.allocator, .{ .assistant_text = text }) catch {
-                text.deinit();
-                self.allocator.destroy(text);
+            // Create new markdown row
+            const md = self.allocator.create(markdown_mod.Markdown) catch return;
+            md.* = markdown_mod.Markdown.init(self.allocator);
+            md.padding_x = 1;
+            md.setContent(self.text_buf.items);
+            self.rows.append(self.allocator, .{ .assistant_text = md }) catch {
+                md.deinit();
+                self.allocator.destroy(md);
                 return;
             };
             self.current_text_idx = self.rows.items.len - 1;
@@ -212,16 +213,16 @@ pub const Transcript = struct {
             const row_region = region.sub(0, screen_y, w, visible_h);
 
             switch (row) {
-                .assistant_text => |text| {
-                    // adjust text scroll for partial visibility
+                .assistant_text => |md| {
+                    // adjust scroll for partial visibility
                     const skip_lines = if (virtual_y < self.scroll_offset)
                         self.scroll_offset - virtual_y
                     else
                         0;
-                    const saved_scroll = text.scroll_offset;
-                    text.scroll_offset = skip_lines;
-                    text.render(row_region);
-                    text.scroll_offset = saved_scroll;
+                    const saved_scroll = md.scroll_offset;
+                    md.scroll_offset = skip_lines;
+                    md.render(row_region);
+                    md.scroll_offset = saved_scroll;
                 },
                 .tool_execution => |te| {
                     // render tool background
@@ -253,7 +254,7 @@ pub const Transcript = struct {
     fn rowHeight(self: *Transcript, row: TranscriptRow, width: u32) u32 {
         _ = self;
         return switch (row) {
-            .assistant_text => |text| @max(1, text.measure(width).preferred_height),
+            .assistant_text => |md| @max(1, md.measure(width).preferred_height),
             .tool_execution => |te| {
                 const content_w = if (width > 2) width - 2 else 1;
                 return @max(1, te.display.measure(content_w).preferred_height);

@@ -85,12 +85,10 @@ fn wrapSingleLine(
     var is_continuation = false;
 
     while (current_start < line.len) {
-        // skip leading whitespace on continuation lines
-        if (is_continuation and isWhitespace(line[current_start])) {
+        // skip leading whitespace on continuation lines (only at line start)
+        if (is_continuation and current_width == 0 and isWhitespace(line[current_start])) {
             const ws_end = skipWhitespace(line, current_start);
-            if (current_width == 0) {
-                line_begin = ws_end;
-            }
+            line_begin = ws_end;
             current_start = ws_end;
             if (current_start >= line.len) break;
         }
