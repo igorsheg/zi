@@ -203,9 +203,38 @@ pub const Interactive = struct {
             }
         }
 
+        // scroll: page up/down, shift+up/down
+        if (self.handleScroll(key)) return;
+
         if (self.editor.handleInput(key)) {
             self.dirty = true;
         }
+    }
+
+    fn handleScroll(self: *Interactive, key: Key) bool {
+        const output_h = self.outputHeight();
+        if (output_h == 0) return false;
+
+        const page_size = @max(1, output_h -| 2); // overlap 2 lines for context
+
+        const delta: ?i64 = switch (key.code) {
+            .page_up => -@as(i64, @intCast(page_size)),
+            .page_down => @as(i64, @intCast(page_size)),
+            .up => if (key.shift) @as(i64, -3) else null,
+            .down => if (key.shift) @as(i64, 3) else null,
+            else => null,
+        };
+
+        if (delta) |d| {
+            const total = self.output_text.totalLines(output_h);
+            const max_scroll: u32 = if (total > output_h) total - output_h else 0;
+            const current: i64 = @intCast(self.output_text.scroll_offset);
+            const new_val = @max(0, @min(current + d, @as(i64, @intCast(max_scroll))));
+            self.output_text.scroll_offset = @intCast(new_val);
+            self.dirty = true;
+            return true;
+        }
+        return false;
     }
 
     fn handleQueuedEvent(self: *Interactive, ev: QueuedEvent) void {
