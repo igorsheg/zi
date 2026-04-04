@@ -120,6 +120,7 @@ pub const Interactive = struct {
     /// Main loop — runs on the main thread.
     pub fn run(self: *Interactive) !void {
         try self.terminal.enterRawMode();
+        self.terminal.installSignalHandlers();
         self.terminal.hideCursor();
         self.terminal.enableBracketedPaste();
         self.terminal.queryKittyProtocol();

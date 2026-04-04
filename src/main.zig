@@ -5,6 +5,10 @@ const settings_mod = @import("settings/root.zig");
 const agent = @import("agent/root.zig");
 const coding_agent = @import("coding_agent.zig");
 const interactive_mod = @import("tui/interactive.zig");
+const terminal_mod = @import("tui/terminal.zig");
+
+/// Restore terminal on panic (raw mode, cursor, keyboard protocol).
+pub const panic = terminal_mod.panic;
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };

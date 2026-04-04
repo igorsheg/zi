@@ -1,6 +1,36 @@
 const std = @import("std");
 const posix = std.posix;
 
+/// Global terminal pointer for signal/panic cleanup.
+/// Set by Terminal.installSignalHandlers(), cleared by Terminal.deinit().
+var global_terminal: ?*Terminal = null;
+
+fn signalCleanupHandler(_: i32) callconv(.c) void {
+    if (global_terminal) |t| {
+        t.emergencyRestore();
+    }
+    // Re-raise with default handler to get correct exit code
+    const default_act = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = 0,
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &default_act, null);
+    posix.sigaction(posix.SIG.TERM, &default_act, null);
+    _ = posix.raise(posix.SIG.INT) catch {};
+}
+
+/// Override the default panic handler to restore terminal before crashing.
+pub const panic = struct {
+    pub fn call(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
+        if (global_terminal) |t| {
+            t.emergencyRestore();
+            global_terminal = null;
+        }
+        std.debug.defaultPanic(msg, ret_addr);
+    }
+}.call;
+
 pub const Terminal = struct {
     fd_in: posix.fd_t,
     fd_out: posix.fd_t,
@@ -142,6 +172,33 @@ pub const Terminal = struct {
         };
     }
 
+    /// Install signal handlers that restore terminal on SIGINT/SIGTERM.
+    /// Must be called after enterRawMode.
+    pub fn installSignalHandlers(self: *Terminal) void {
+        global_terminal = self;
+        const act = posix.Sigaction{
+            .handler = .{ .handler = signalCleanupHandler },
+            .mask = 0,
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.TERM, &act, null);
+        posix.sigaction(posix.SIG.INT, &act, null);
+    }
+
+    /// Minimal restore for signal/panic context (async-signal-safe).
+    /// Only uses write() — no allocations, no locks.
+    pub fn emergencyRestore(self: *Terminal) void {
+        const seq = "\x1b[?25h" ++ // show cursor
+            "\x1b[?2004l" ++ // disable bracketed paste
+            "\x1b[<u" ++ // disable kitty
+            "\x1b[>4;0m" ++ // disable modifyOtherKeys
+            "\x1b[0m"; // reset attributes
+        _ = posix.write(self.fd_out, seq) catch {};
+        if (self.original_termios) |orig| {
+            posix.tcsetattr(self.fd_in, .FLUSH, orig) catch {};
+        }
+    }
+
     /// Cleanup: restore terminal state.
     pub fn deinit(self: *Terminal) void {
         if (self.kitty_active) self.disableKittyProtocol();
@@ -149,6 +206,7 @@ pub const Terminal = struct {
         self.disableBracketedPaste();
         self.showCursor();
         self.exitRawMode();
+        if (global_terminal == self) global_terminal = null;
     }
 };
 
