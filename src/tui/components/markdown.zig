@@ -621,6 +621,10 @@ pub const Markdown = struct {
         return self.measure(visible_width).preferred_height;
     }
 
+    pub fn invalidate(self: *Markdown) void {
+        self.cached_lines = null;
+    }
+
     pub fn measure(self: *Markdown, width: u32) Measurement {
         if (self.content.len == 0) return .{ .min_height = 0, .preferred_height = 0 };
         if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };

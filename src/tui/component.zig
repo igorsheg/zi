@@ -31,6 +31,7 @@ pub const Component = struct {
         handle_input: *const fn (ptr: *anyopaque, key: Key) bool,
         measure: *const fn (ptr: *anyopaque, width: u32) Measurement,
         cursor_state: *const fn (ptr: *anyopaque) ?CursorState,
+        invalidate: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn init(comptime T: type, ptr: *T) Component {
@@ -41,7 +42,10 @@ pub const Component = struct {
             }
             fn handleInput(erased: *anyopaque, key: Key) bool {
                 const self: *T = @ptrCast(@alignCast(erased));
-                return self.handleInput(key);
+                if (@hasDecl(T, "handleInput")) {
+                    return self.handleInput(key);
+                }
+                return false;
             }
             fn measure(erased: *anyopaque, width: u32) Measurement {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -49,7 +53,16 @@ pub const Component = struct {
             }
             fn cursorState(erased: *anyopaque) ?CursorState {
                 const self: *T = @ptrCast(@alignCast(erased));
-                return self.cursorState();
+                if (@hasDecl(T, "cursorState")) {
+                    return self.cursorState();
+                }
+                return null;
+            }
+            fn invalidate(erased: *anyopaque) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                if (@hasDecl(T, "invalidate")) {
+                    self.invalidate();
+                }
             }
         };
         return .{
@@ -59,6 +72,7 @@ pub const Component = struct {
                 .handle_input = gen.handleInput,
                 .measure = gen.measure,
                 .cursor_state = gen.cursorState,
+                .invalidate = gen.invalidate,
             },
         };
     }
@@ -77,5 +91,9 @@ pub const Component = struct {
 
     pub fn cursorState(self: Component) ?CursorState {
         return self.vtable.cursor_state(self.ptr);
+    }
+
+    pub fn invalidate(self: Component) void {
+        self.vtable.invalidate(self.ptr);
     }
 };

@@ -10,6 +10,8 @@ pub const word_wrap = @import("word_wrap.zig");
 pub const ui_event = @import("ui_event.zig");
 pub const tool_display = @import("tool_display.zig");
 pub const transcript = @import("transcript.zig");
+pub const container = @import("container.zig");
+pub const theme = @import("theme.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
