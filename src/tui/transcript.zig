@@ -172,6 +172,15 @@ pub const Transcript = struct {
         }
     }
 
+    pub fn measure(self: *Transcript, width: u32) Measurement {
+        const total = self.totalHeight(width);
+        return .{ .min_height = 1, .preferred_height = total };
+    }
+
+    pub fn component(self: *Transcript) component_mod.Component {
+        return component_mod.Component.init(Transcript, self);
+    }
+
     /// Render visible rows into the region, respecting scroll_offset.
     pub fn render(self: *Transcript, region: Region) void {
         const w = region.width;

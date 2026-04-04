@@ -10,6 +10,7 @@ const text_mod = @import("components/text.zig");
 const editor_mod = @import("components/editor.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
+const container_mod = @import("container.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
 
@@ -92,6 +93,7 @@ pub const Interactive = struct {
     status_text: text_mod.Text,
     transcript: Transcript,
     registry: ToolDisplayRegistry,
+    root: container_mod.Container,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
 
     event_queue: EventQueue(UiEvent),
@@ -121,6 +123,7 @@ pub const Interactive = struct {
             .status_text = text_mod.Text.init(allocator),
             .transcript = Transcript.init(allocator),
             .registry = registry,
+            .root = container_mod.Container.init(allocator),
             .event_queue = EventQueue(UiEvent).init(allocator),
             .ca = ca,
         };
@@ -140,6 +143,7 @@ pub const Interactive = struct {
         }
         self.paste_buf.deinit(self.allocator);
         self.event_queue.deinit();
+        self.root.deinit();
         self.transcript.deinit();
         self.status_text.deinit();
         self.editor.deinit();
@@ -157,6 +161,13 @@ pub const Interactive = struct {
 
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
+
+        // Build component tree: transcript (flex) | status | editor (focused)
+        self.root.addChild(self.transcript.component());
+        self.root.addChild(self.status_text.component());
+        self.root.addChild(self.editor.component());
+        self.root.flex_child_index = 0;
+        self.root.focused_child_index = 2;
 
         self.dirty = true;
 
@@ -386,19 +397,15 @@ pub const Interactive = struct {
         }
     }
 
-    fn editorHeight(self: *Interactive) u32 {
-        // Cap editor to 30% of terminal, min 1, max max_visible_lines
-        const max_h = @max(3, self.renderer.height * 30 / 100);
-        self.editor.max_visible_lines = max_h;
-        const m = self.editor.measure(self.renderer.width);
-        return @max(1, m.preferred_height);
-    }
-
     fn outputHeight(self: *Interactive) u32 {
         const h = self.renderer.height;
-        const editor_h = self.editorHeight();
-        const status_height: u32 = 1;
-        return if (h > editor_h + status_height) h - editor_h - status_height else 0;
+        const w = self.renderer.width;
+        const max_h = @max(3, h * 30 / 100);
+        self.editor.max_visible_lines = max_h;
+        const editor_h = self.editor.measure(w).preferred_height;
+        const status_h = @max(1, self.status_text.measure(w).preferred_height);
+        const fixed = editor_h + status_h;
+        return if (h > fixed) h - fixed else 0;
     }
 
     fn renderFrame(self: *Interactive) void {
@@ -412,31 +419,16 @@ pub const Interactive = struct {
             return;
         }
 
-        // Centralized layout: output | status | editor (bottom)
-        const editor_h = self.editorHeight();
-        const status_height: u32 = 1;
-        const output_height = if (h > editor_h + status_height) h - editor_h - status_height else 0;
+        // Update editor max height before layout measures it
+        const max_h = @max(3, h * 30 / 100);
+        self.editor.max_visible_lines = max_h;
 
-        if (output_height > 0) {
-            const output_region = region.sub(0, 0, w, output_height);
-            self.transcript.render(output_region);
-        }
-
-        const status_y = output_height;
-        if (status_y < h) {
-            const status_region = region.sub(0, status_y, w, status_height);
-            self.status_text.render(status_region);
-        }
-
-        const editor_y = h - editor_h;
-        const editor_region = region.sub(0, editor_y, w, editor_h);
-        self.editor.render(editor_region);
-
+        self.root.render(region);
         self.renderer.end() catch {};
 
-        if (self.editor.cursorState()) |cs| {
+        if (self.root.cursorState()) |cs| {
             self.terminal.showCursor();
-            self.terminal.setCursorPos(cs.x, editor_y + cs.y);
+            self.terminal.setCursorPos(cs.x, cs.y);
         } else {
             self.terminal.hideCursor();
         }
