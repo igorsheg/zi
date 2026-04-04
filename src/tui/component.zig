@@ -22,6 +22,10 @@ pub const CursorState = struct {
 /// Type-erased component interface.
 /// Components implement render/handleInput/measure/cursorState and expose
 /// themselves via `component()` for use in layout containers.
+///
+/// Focus: components that can receive focus implement `setFocused(bool)`.
+/// The FocusManager (on Interactive) is the source of truth for who has focus.
+/// Components use `focused` state to gate input handling and cursor display.
 pub const Component = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -32,6 +36,7 @@ pub const Component = struct {
         measure: *const fn (ptr: *anyopaque, width: u32) Measurement,
         cursor_state: *const fn (ptr: *anyopaque) ?CursorState,
         invalidate: *const fn (ptr: *anyopaque) void,
+        set_focused: *const fn (ptr: *anyopaque, focused: bool) void,
     };
 
     pub fn init(comptime T: type, ptr: *T) Component {
@@ -64,6 +69,12 @@ pub const Component = struct {
                     self.invalidate();
                 }
             }
+            fn setFocused(erased: *anyopaque, focused: bool) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                if (@hasDecl(T, "setFocused")) {
+                    self.setFocused(focused);
+                }
+            }
         };
         return .{
             .ptr = @ptrCast(ptr),
@@ -73,8 +84,16 @@ pub const Component = struct {
                 .measure = gen.measure,
                 .cursor_state = gen.cursorState,
                 .invalidate = gen.invalidate,
+                .set_focused = gen.setFocused,
             },
         };
+    }
+
+    /// Component identity — two Components are equal iff they wrap the same object.
+    /// ptr is the instance pointer; vtable is shared per type so ptr alone suffices,
+    /// but checking both guards against accidental aliasing across type-erased boundaries.
+    pub fn eql(a: Component, b: Component) bool {
+        return a.ptr == b.ptr and a.vtable == b.vtable;
     }
 
     pub fn render(self: Component, region: Region) void {
@@ -95,5 +114,9 @@ pub const Component = struct {
 
     pub fn invalidate(self: Component) void {
         self.vtable.invalidate(self.ptr);
+    }
+
+    pub fn setFocused(self: Component, focused: bool) void {
+        self.vtable.set_focused(self.ptr, focused);
     }
 };

@@ -28,6 +28,7 @@ const Region = buffer_mod.Region;
 const Terminal = terminal_mod.Terminal;
 const Renderer = renderer_mod.Renderer;
 const Key = keys_mod.Key;
+const Component = component_mod.Component;
 const CursorState = component_mod.CursorState;
 const UiEvent = ui_event_mod.UiEvent;
 const Transcript = transcript_mod.Transcript;
@@ -87,6 +88,38 @@ fn EventQueue(comptime T: type) type {
 ///
 /// Uses UiEvent (deep-copied) instead of raw AgentEvent to ensure
 /// no borrowed pointers cross the thread boundary.
+/// Component-identity-based focus manager.
+/// Source of truth for which component receives input and shows cursor.
+/// Matches pi-mono's TUI.focusedComponent / TUI.setFocus().
+///
+/// Cursor position still comes from the container tree (root.cursorState())
+/// because containers translate child-relative y-offsets to screen-absolute.
+/// Overlay cursor will bypass the tree when H (overlay system) ships.
+const FocusManager = struct {
+    current: ?Component = null,
+
+    pub fn setFocus(self: *FocusManager, target: ?Component) void {
+        if (self.current) |prev| prev.setFocused(false);
+        self.current = target;
+        if (target) |t| t.setFocused(true);
+    }
+
+    pub fn handleInput(self: *FocusManager, key: Key) bool {
+        if (self.current) |focused| return focused.handleInput(key);
+        return false;
+    }
+
+    /// Save current focus for later restore (overlay push).
+    pub fn save(self: *FocusManager) ?Component {
+        return self.current;
+    }
+
+    /// Restore previously saved focus (overlay pop).
+    pub fn restore(self: *FocusManager, saved: ?Component) void {
+        self.setFocus(saved);
+    }
+};
+
 pub const Interactive = struct {
     allocator: std.mem.Allocator,
     terminal: Terminal,
@@ -100,6 +133,9 @@ pub const Interactive = struct {
     footer: footer_mod.Footer,
     transcript: Transcript,
     registry: ToolDisplayRegistry,
+
+    // ── Focus ─────────────────────────────────────────────────────
+    focus: FocusManager = .{},
 
     // ── Container slots (pi-mono parity) ──────────────────────────
     // Each slot is a Container that can hold 0..N children.
@@ -203,7 +239,10 @@ pub const Interactive = struct {
         self.header_container.addChild(self.header.component());
         self.status_container.addChild(self.status_text.component());
         self.editor_container.addChild(self.editor.component());
-        self.editor_container.focused_child_index = 0; // editor receives input
+        self.editor_container.focused_child_index = 0; // for cursor y-offset translation
+
+        // Set initial focus via FocusManager (source of truth for input routing)
+        self.focus.setFocus(self.editor.component());
 
         // Build root tree matching pi-mono slot structure:
         // headerContainer → chat(flex) → pending → status → widget_above → editor(focused) → widget_below → footer
@@ -299,6 +338,7 @@ pub const Interactive = struct {
     }
 
     fn handleKey(self: *Interactive, key: Key) void {
+        // App-level keybindings — handled before focus routing
         if (key.code == .escape) {
             if (self.is_streaming) {
                 self.ca.agent.abort();
@@ -324,7 +364,8 @@ pub const Interactive = struct {
         // scroll: page up/down, shift+up/down
         if (self.handleScroll(key)) return;
 
-        if (self.editor.handleInput(key)) {
+        // Route to focused component via FocusManager
+        if (self.focus.handleInput(key)) {
             self.dirty = true;
         }
     }
@@ -427,11 +468,10 @@ pub const Interactive = struct {
             },
             .agent_finished => {
                 self.is_streaming = false;
-                // join the thread before dropping the handle
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.status_text.setContent("");
-                self.editor.focused = true;
+                self.focus.setFocus(self.editor.component());
                 self.dirty = true;
             },
             .agent_error => {
@@ -440,7 +480,7 @@ pub const Interactive = struct {
                 self.agent_thread = null;
                 self.status_text.setContent("error occurred");
                 self.status_text.fg = self.theme.fg(.@"error");
-                self.editor.focused = true;
+                self.focus.setFocus(self.editor.component());
                 self.dirty = true;
             },
         }
@@ -498,14 +538,14 @@ pub const Interactive = struct {
 
         self.editor.clear();
         self.is_streaming = true;
-        self.editor.focused = false;
+        self.focus.setFocus(null); // defocus editor during streaming
         self.status_text.setContent("sending...");
         self.status_text.fg = self.theme.fg(.muted);
         self.dirty = true;
 
         self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, prompt_copy }) catch {
             self.is_streaming = false;
-            self.editor.focused = true;
+            self.focus.setFocus(self.editor.component());
             self.status_text.setContent("failed to start agent");
             self.status_text.fg = self.theme.fg(.@"error");
             self.allocator.free(prompt_copy);

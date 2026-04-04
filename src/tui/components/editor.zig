@@ -314,6 +314,10 @@ pub const Editor = struct {
         };
     }
 
+    pub fn setFocused(self: *Editor, focused: bool) void {
+        self.focused = focused;
+    }
+
     pub fn component(self: *Editor) Component {
         return Component.init(Editor, self);
     }
