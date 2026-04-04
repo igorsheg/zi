@@ -270,7 +270,8 @@ pub fn main() !void {
         });
         defer ca.deinit();
 
-        var interactive = try interactive_mod.Interactive.init(allocator, &ca);
+        const tool_display = @import("tui/tool_display.zig");
+        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_display.default_registry);
         defer interactive.deinit();
         try interactive.run();
     }

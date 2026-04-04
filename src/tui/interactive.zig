@@ -8,12 +8,16 @@ const keys_mod = @import("keys.zig");
 const component_mod = @import("component.zig");
 const text_mod = @import("components/text.zig");
 const editor_mod = @import("components/editor.zig");
+const ui_event_mod = @import("ui_event.zig");
+const transcript_mod = @import("transcript.zig");
+const tool_display_mod = @import("tool_display.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
-const AssistantMessageEvent = agent_mod.protocol.AssistantMessageEvent;
+const AgentToolResult = agent_mod.protocol.AgentToolResult;
 const CodingAgent = coding_agent_mod.CodingAgent;
+const json_util = @import("../ai/json_util.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -21,6 +25,10 @@ const Terminal = terminal_mod.Terminal;
 const Renderer = renderer_mod.Renderer;
 const Key = keys_mod.Key;
 const CursorState = component_mod.CursorState;
+const UiEvent = ui_event_mod.UiEvent;
+const Transcript = transcript_mod.Transcript;
+const ToolDisplayRegistry = tool_display_mod.ToolDisplayRegistry;
+const ToolDisplay = tool_display_mod.ToolDisplay;
 
 /// Thread-safe queue: agent thread pushes, main thread drains.
 fn EventQueue(comptime T: type) type {
@@ -63,41 +71,36 @@ fn EventQueue(comptime T: type) type {
     };
 }
 
-/// Wrapper: either an agent event or a control signal from the agent thread.
-const QueuedEvent = union(enum) {
-    agent_event: AgentEvent,
-    agent_finished: void,
-    agent_error: void,
-};
-
 /// Interactive mode — wires CodingAgent (blocking on its thread)
 /// to the TUI (main thread) via a thread-safe event queue.
+///
+/// Uses UiEvent (deep-copied) instead of raw AgentEvent to ensure
+/// no borrowed pointers cross the thread boundary.
 pub const Interactive = struct {
     allocator: std.mem.Allocator,
     terminal: Terminal,
     renderer: Renderer,
     editor: editor_mod.Editor,
     status_text: text_mod.Text,
-    output_text: text_mod.Text,
+    transcript: Transcript,
+    registry: ToolDisplayRegistry,
 
-    event_queue: EventQueue(QueuedEvent),
+    event_queue: EventQueue(UiEvent),
     ca: *CodingAgent,
     agent_thread: ?std.Thread = null,
     dirty: bool = true,
     running: bool = true,
     is_streaming: bool = false,
 
-    /// Accumulated assistant response text (append text_deltas here).
-    response_buf: std.ArrayListUnmanaged(u8) = .empty,
-
-    pub fn init(allocator: std.mem.Allocator, ca: *CodingAgent) !Interactive {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ca: *CodingAgent,
+        registry: ToolDisplayRegistry,
+    ) !Interactive {
         var term = Terminal.init();
         term.updateSize();
 
         const rend = try Renderer.init(allocator, term.fd_out, term.width, term.height);
-
-        var output = text_mod.Text.init(allocator);
-        output.padding_x = 1;
 
         return .{
             .allocator = allocator,
@@ -105,17 +108,24 @@ pub const Interactive = struct {
             .renderer = rend,
             .editor = editor_mod.Editor.init(allocator),
             .status_text = text_mod.Text.init(allocator),
-            .output_text = output,
-            .event_queue = EventQueue(QueuedEvent).init(allocator),
+            .transcript = Transcript.init(allocator),
+            .registry = registry,
+            .event_queue = EventQueue(UiEvent).init(allocator),
             .ca = ca,
         };
     }
 
     pub fn deinit(self: *Interactive) void {
         if (self.agent_thread) |t| t.join();
-        self.response_buf.deinit(self.allocator);
+        // drain and free any remaining events
+        var drain_buf: [64]UiEvent = undefined;
+        while (true) {
+            const count = self.event_queue.drainInto(&drain_buf);
+            if (count == 0) break;
+            for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
+        }
         self.event_queue.deinit();
-        self.output_text.deinit();
+        self.transcript.deinit();
         self.status_text.deinit();
         self.editor.deinit();
         self.renderer.deinit();
@@ -136,11 +146,12 @@ pub const Interactive = struct {
         self.dirty = true;
 
         while (self.running) {
-            // 1. Drain agent events
-            var event_buf: [64]QueuedEvent = undefined;
+            // 1. Drain UI events (owned, thread-safe)
+            var event_buf: [64]UiEvent = undefined;
             const count = self.event_queue.drainInto(&event_buf);
-            for (event_buf[0..count]) |ev| {
-                self.handleQueuedEvent(ev);
+            for (event_buf[0..count]) |*ev| {
+                self.handleUiEvent(ev);
+                ev.deinit(self.allocator);
             }
 
             // 2. Poll terminal input (non-blocking: MIN=0, TIME=0)
@@ -215,7 +226,7 @@ pub const Interactive = struct {
         const output_h = self.outputHeight();
         if (output_h == 0) return false;
 
-        const page_size = @max(1, output_h -| 2); // overlap 2 lines for context
+        const page_size = @max(1, output_h -| 2);
 
         const delta: ?i64 = switch (key.code) {
             .page_up => -@as(i64, @intCast(page_size)),
@@ -226,20 +237,65 @@ pub const Interactive = struct {
         };
 
         if (delta) |d| {
-            const total = self.output_text.totalLines(output_h);
+            const w = self.renderer.width;
+            const total = self.transcript.totalHeight(w);
             const max_scroll: u32 = if (total > output_h) total - output_h else 0;
-            const current: i64 = @intCast(self.output_text.scroll_offset);
+            const current: i64 = @intCast(self.transcript.scroll_offset);
             const new_val = @max(0, @min(current + d, @as(i64, @intCast(max_scroll))));
-            self.output_text.scroll_offset = @intCast(new_val);
+            self.transcript.scroll_offset = @intCast(new_val);
             self.dirty = true;
             return true;
         }
         return false;
     }
 
-    fn handleQueuedEvent(self: *Interactive, ev: QueuedEvent) void {
-        switch (ev) {
-            .agent_event => |ae| self.handleAgentEvent(ae),
+    fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
+        switch (ev.*) {
+            .text_delta => |d| {
+                self.transcript.appendText(d.delta);
+                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
+                self.dirty = true;
+            },
+            .error_message => |e| {
+                self.status_text.setContent(e.message);
+                self.status_text.fg = Color.rgb(255, 80, 80);
+                self.dirty = true;
+            },
+            .message_start_assistant => {
+                self.transcript.beginAssistantMessage();
+                self.status_text.setContent("thinking...");
+                self.status_text.fg = Color.rgb(150, 150, 150);
+                self.dirty = true;
+            },
+            .message_start_user => {},
+            .tool_start => |t| {
+                const display = self.registry.create(self.allocator, t.tool_name);
+                self.transcript.addToolExecution(t.tool_call_id, display);
+                self.transcript.updateTool(t.tool_call_id, .{ .start = .{
+                    .tool_name = t.tool_name,
+                    .args_json = t.args_json,
+                } });
+                self.status_text.setContent(t.tool_name);
+                self.status_text.fg = Color.rgb(100, 200, 255);
+                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
+                self.dirty = true;
+            },
+            .tool_update => |t| {
+                self.transcript.updateTool(t.tool_call_id, .{ .update = .{
+                    .result_text = t.result_text,
+                    .is_error = t.is_error,
+                } });
+                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
+                self.dirty = true;
+            },
+            .tool_end => |t| {
+                self.transcript.updateTool(t.tool_call_id, .{ .end = .{
+                    .result_text = t.result_text,
+                    .is_error = t.is_error,
+                } });
+                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
+                self.dirty = true;
+            },
             .agent_finished => {
                 self.is_streaming = false;
                 self.agent_thread = null;
@@ -255,52 +311,6 @@ pub const Interactive = struct {
                 self.editor.focused = true;
                 self.dirty = true;
             },
-        }
-    }
-
-    fn handleAgentEvent(self: *Interactive, event: AgentEvent) void {
-        switch (event) {
-            .message_update => |mu| {
-                switch (mu.assistant_message_event) {
-                    .text_delta => |d| {
-                        self.response_buf.appendSlice(self.allocator, d.delta) catch {};
-                        self.output_text.setContent(self.response_buf.items);
-                        // auto-scroll to bottom so streaming output stays visible
-                        const output_height = self.outputHeight();
-                        self.output_text.scrollToBottom(output_height);
-                        self.dirty = true;
-                    },
-                    .@"error" => |e| {
-                        if (e.@"error".error_message) |msg| {
-                            self.status_text.setContent(msg);
-                            self.status_text.fg = Color.rgb(255, 80, 80);
-                            self.dirty = true;
-                        }
-                    },
-                    else => {},
-                }
-            },
-            .message_start => |ms| {
-                switch (ms.message) {
-                    .user => {},
-                    .assistant => {
-                        self.response_buf.items.len = 0;
-                        self.status_text.setContent("thinking...");
-                        self.status_text.fg = Color.rgb(150, 150, 150);
-                        self.dirty = true;
-                    },
-                    .tool_result => {},
-                    .compaction_summary, .branch_summary, .custom => {},
-                }
-            },
-            .tool_execution_start => |te| {
-                self.status_text.setContent(te.tool_name);
-                self.status_text.fg = Color.rgb(100, 200, 255);
-                self.dirty = true;
-            },
-            .agent_end, .agent_start, .turn_start, .turn_end,
-            .message_end, .tool_execution_update, .tool_execution_end,
-            => {},
         }
     }
 
@@ -328,7 +338,7 @@ pub const Interactive = struct {
 
         if (output_height > 0) {
             const output_region = region.sub(0, 0, w, output_height);
-            self.output_text.render(output_region);
+            self.transcript.render(output_region);
         }
 
         if (h > editor_height) {
@@ -338,7 +348,6 @@ pub const Interactive = struct {
 
         const editor_region = region.sub(0, h - editor_height, w, editor_height);
         self.editor.render(editor_region);
-
 
         self.renderer.end() catch {};
 
@@ -386,8 +395,119 @@ pub const Interactive = struct {
         self.event_queue.push(.{ .agent_finished = {} });
     }
 
+    /// Agent event callback — runs on the AGENT THREAD.
+    /// Deep-copies event data into a UiEvent before pushing to the queue.
     fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.event_queue.push(.{ .agent_event = event });
+        const ui_event = convertAgentEvent(event, self.allocator) orelse return;
+        self.event_queue.push(ui_event);
     }
 };
+
+/// Convert an AgentEvent to a TUI-owned UiEvent with deep-copied data.
+/// Runs on the agent thread. Returns null for events the TUI doesn't need.
+fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
+    switch (event) {
+        .message_start => |ms| {
+            return switch (ms.message) {
+                .assistant => .message_start_assistant,
+                .user => .message_start_user,
+                else => null,
+            };
+        },
+        .message_update => |mu| {
+            switch (mu.assistant_message_event) {
+                .text_delta => |d| {
+                    const delta = allocator.dupe(u8, d.delta) catch return null;
+                    return .{ .text_delta = .{ .delta = delta } };
+                },
+                .@"error" => |e| {
+                    if (e.@"error".error_message) |msg| {
+                        const owned = allocator.dupe(u8, msg) catch return null;
+                        return .{ .error_message = .{ .message = owned } };
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        },
+        .tool_execution_start => |te| {
+            const id = allocator.dupe(u8, te.tool_call_id) catch return null;
+            errdefer allocator.free(id);
+            const name = allocator.dupe(u8, te.tool_name) catch return null;
+            errdefer allocator.free(name);
+            const args_json = serializeJson(te.args, allocator) catch return null;
+            return .{ .tool_start = .{
+                .tool_call_id = id,
+                .tool_name = name,
+                .args_json = args_json,
+            } };
+        },
+        .tool_execution_update => |te| {
+            const id = allocator.dupe(u8, te.tool_call_id) catch return null;
+            errdefer allocator.free(id);
+            const text = extractResultText(te.partial_result, allocator);
+            return .{ .tool_update = .{
+                .tool_call_id = id,
+                .result_text = text,
+                .is_error = if (te.partial_result) |r| r.is_error else false,
+            } };
+        },
+        .tool_execution_end => |te| {
+            const id = allocator.dupe(u8, te.tool_call_id) catch return null;
+            errdefer allocator.free(id);
+            const text = extractResultText(te.result, allocator);
+            return .{ .tool_end = .{
+                .tool_call_id = id,
+                .result_text = text,
+                .is_error = te.is_error,
+            } };
+        },
+        .agent_end, .agent_start, .turn_start, .turn_end, .message_end => return null,
+    }
+}
+
+/// Serialize a json.Value to an owned string.
+fn serializeJson(value: std.json.Value, allocator: std.mem.Allocator) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(allocator);
+    var out = std.io.Writer.Allocating.fromArrayList(allocator, &buf);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    jw.write(value) catch return error.OutOfMemory;
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Extract text output from a tool result into an owned string.
+/// Accepts both optional and non-optional AgentToolResult.
+fn extractResultText(result: anytype, allocator: std.mem.Allocator) ?[]u8 {
+    const T = @TypeOf(result);
+    const r = if (@typeInfo(T) == .optional) (result orelse return null) else result;
+    var total_len: usize = 0;
+    for (r.content) |block| {
+        switch (block) {
+            .text => |t| total_len += t.text.len + 1,
+            .image => {},
+        }
+    }
+    if (total_len == 0) return null;
+
+    const buf = allocator.alloc(u8, total_len) catch return null;
+    var pos: usize = 0;
+    for (r.content) |block| {
+        switch (block) {
+            .text => |t| {
+                if (pos > 0) {
+                    buf[pos] = '\n';
+                    pos += 1;
+                }
+                @memcpy(buf[pos..][0..t.text.len], t.text);
+                pos += t.text.len;
+            },
+            .image => {},
+        }
+    }
+    if (pos < buf.len) {
+        return allocator.realloc(buf, pos) catch buf;
+    }
+    return buf;
+}

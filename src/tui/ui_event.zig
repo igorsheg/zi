@@ -1,0 +1,92 @@
+const std = @import("std");
+
+/// TUI-owned event type. All fields are deep-copied and owned by the
+/// main thread. The agent thread converts AgentEvent → UiEvent before
+/// pushing to the EventQueue, ensuring no borrowed pointers cross
+/// the thread boundary.
+pub const UiEvent = union(enum) {
+    // --- message lifecycle ---
+    message_start_assistant: void,
+    message_start_user: void,
+
+    // --- streaming content ---
+    text_delta: struct { delta: []u8 },
+
+    // --- errors ---
+    error_message: struct { message: []u8 },
+
+    // --- tool execution lifecycle ---
+    tool_start: struct {
+        tool_call_id: []u8,
+        tool_name: []u8,
+        args_json: []u8, // serialized JSON — avoids json.Value ownership complexity
+    },
+    tool_update: struct {
+        tool_call_id: []u8,
+        result_text: ?[]u8,
+        is_error: bool,
+    },
+    tool_end: struct {
+        tool_call_id: []u8,
+        result_text: ?[]u8,
+        is_error: bool,
+    },
+
+    // --- agent lifecycle ---
+    agent_finished: void,
+    agent_error: void,
+
+    /// Free all owned memory.
+    pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .text_delta => |d| allocator.free(d.delta),
+            .error_message => |e| allocator.free(e.message),
+            .tool_start => |t| {
+                allocator.free(t.tool_call_id);
+                allocator.free(t.tool_name);
+                allocator.free(t.args_json);
+            },
+            .tool_update => |t| {
+                allocator.free(t.tool_call_id);
+                if (t.result_text) |txt| allocator.free(txt);
+            },
+            .tool_end => |t| {
+                allocator.free(t.tool_call_id);
+                if (t.result_text) |txt| allocator.free(txt);
+            },
+            .message_start_assistant, .message_start_user,
+            .agent_finished, .agent_error,
+            => {},
+        }
+    }
+};
+
+// --- tests ---
+
+const testing = std.testing;
+
+test "UiEvent deinit frees owned fields" {
+    var ev = UiEvent{ .text_delta = .{
+        .delta = try testing.allocator.dupe(u8, "hello"),
+    } };
+    ev.deinit(testing.allocator);
+    // no leak = pass (allocator detects leaks)
+}
+
+test "UiEvent deinit handles tool_start fields" {
+    var ev = UiEvent{ .tool_start = .{
+        .tool_call_id = try testing.allocator.dupe(u8, "id-1"),
+        .tool_name = try testing.allocator.dupe(u8, "bash"),
+        .args_json = try testing.allocator.dupe(u8, "{\"command\":\"echo hi\"}"),
+    } };
+    ev.deinit(testing.allocator);
+}
+
+test "UiEvent deinit handles null result_text" {
+    var ev = UiEvent{ .tool_end = .{
+        .tool_call_id = try testing.allocator.dupe(u8, "id-2"),
+        .result_text = null,
+        .is_error = false,
+    } };
+    ev.deinit(testing.allocator);
+}
