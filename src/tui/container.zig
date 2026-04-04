@@ -65,6 +65,12 @@ pub const Container = struct {
         return self.children.items.len;
     }
 
+    pub fn clear(self: *Container) void {
+        self.children.items.len = 0;
+        self.flex_child_index = null;
+        self.focused_child_index = null;
+    }
+
     // ── Component interface ────────────────────────────────────────
 
     pub fn render(self: *Container, region: Region) void {

@@ -29,6 +29,10 @@ pub const Text = struct {
     scroll_offset: u32 = 0,
     allocator: std.mem.Allocator,
 
+    /// Owned content buffer — setContent copies into this so callers
+    /// don't need to keep the source alive.
+    content_buf: std.ArrayListUnmanaged(u8) = .empty,
+
     // wrap cache — invalidated on content or width change
     cached_lines: ?[]Line = null,
     cached_width: u32 = 0,
@@ -40,7 +44,9 @@ pub const Text = struct {
     }
 
     pub fn setContent(self: *Text, text: []const u8) void {
-        self.content = text;
+        self.content_buf.clearRetainingCapacity();
+        self.content_buf.appendSlice(self.allocator, text) catch return;
+        self.content = self.content_buf.items;
         self.invalidateCache();
     }
 
@@ -166,6 +172,7 @@ pub const Text = struct {
     }
 
     pub fn deinit(self: *Text) void {
+        self.content_buf.deinit(self.allocator);
         self.invalidateCache();
     }
 };
