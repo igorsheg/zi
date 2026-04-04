@@ -25,6 +25,7 @@ pub const Editor = struct {
     on_submit_ctx: ?*anyopaque = null,
     prompt_fg: Color = Color.rgb(100, 100, 100),
     text_fg: Color = Color.default,
+    border_color: Color = Color.rgb(0x50, 0x50, 0x50),
     allocator: std.mem.Allocator,
     focused: bool = true,
 
@@ -238,6 +239,27 @@ pub const Editor = struct {
     // --- Rendering ---
 
     pub fn render(self: *Editor, region: Region) void {
+        const w = region.width;
+        const h = region.height;
+        if (w == 0 or h < 3) return;
+
+        // Top border
+        {
+            var col: u32 = 0;
+            while (col < w) : (col += 1) {
+                region.set(col, 0, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.border_color });
+            }
+        }
+        // Bottom border
+        {
+            var col: u32 = 0;
+            while (col < w) : (col += 1) {
+                region.set(col, h - 1, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.border_color });
+            }
+        }
+
+        // Content between borders
+        const content = region.sub(0, 1, w, h - 2);
         const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
         const continuation = "  ";
         const items = self.buf.items;
@@ -246,28 +268,27 @@ pub const Editor = struct {
         var line_start: u32 = 0;
         var visible_row: u32 = 0;
 
-        while (visible_row < region.height) {
-            // find end of this line
+        while (visible_row < content.height) {
             var line_end: u32 = line_start;
             while (line_end < items.len and items[line_end] != '\n') : (line_end += 1) {}
 
             if (line_idx >= self.scroll_y) {
                 const line_text = items[line_start..line_end];
                 if (line_idx == 0) {
-                    _ = region.writeStr(0, visible_row, self.prompt, self.prompt_fg, Color.default, .{});
+                    _ = content.writeStr(0, visible_row, self.prompt, self.prompt_fg, Color.default, .{});
                 } else {
-                    _ = region.writeStr(0, visible_row, continuation, self.prompt_fg, Color.default, .{});
+                    _ = content.writeStr(0, visible_row, continuation, self.prompt_fg, Color.default, .{});
                 }
 
                 if (line_text.len > 0) {
-                    _ = region.writeStr(prompt_width, visible_row, line_text, self.text_fg, Color.default, .{});
+                    _ = content.writeStr(prompt_width, visible_row, line_text, self.text_fg, Color.default, .{});
                 }
                 visible_row += 1;
             }
 
             line_idx += 1;
             if (line_end >= items.len) break;
-            line_start = line_end + 1; // skip the \n
+            line_start = line_end + 1;
         }
     }
 
@@ -275,8 +296,8 @@ pub const Editor = struct {
         _ = width;
         const lc = self.lineCount();
         return .{
-            .min_height = 1,
-            .preferred_height = @min(lc, self.max_visible_lines),
+            .min_height = 3,
+            .preferred_height = @min(lc, self.max_visible_lines) + 2,
         };
     }
 
@@ -288,7 +309,7 @@ pub const Editor = struct {
         const visual_y = cur_line - self.scroll_y;
         return .{
             .x = prompt_width + self.cursor_col,
-            .y = visual_y,
+            .y = visual_y + 1,
             .style = .bar,
         };
     }
@@ -449,11 +470,13 @@ test "Editor renders prompt and text to buffer" {
     defer editor.deinit();
 
     _ = editor.handleInput(.{ .code = .char, .char = 'x' });
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 1);
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 3);
     defer buf.deinit();
     editor.render(buf.region());
-    try std.testing.expectEqual(@as(u21, '>'), buf.get(0, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'x'), buf.get(2, 0).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 0x2500), buf.get(0, 0).grapheme.codepoint); // top border
+    try std.testing.expectEqual(@as(u21, '>'), buf.get(0, 1).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'x'), buf.get(2, 1).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 0x2500), buf.get(0, 2).grapheme.codepoint); // bottom border
 }
 
 
@@ -461,7 +484,7 @@ test "editor render after backspace clears deleted char from buffer" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
 
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 1);
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 3);
     defer buf.deinit();
 
     _ = editor.handleInput(.{ .code = .char, .char = 'a' });
@@ -470,7 +493,7 @@ test "editor render after backspace clears deleted char from buffer" {
 
     // Frame 1: render "> abc"
     editor.render(buf.region());
-    try std.testing.expectEqual(@as(u21, 'c'), buf.get(4, 0).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'c'), buf.get(4, 1).grapheme.codepoint);
 
     // Backspace removes 'c'
     _ = editor.handleInput(.{ .code = .backspace });
@@ -480,13 +503,13 @@ test "editor render after backspace clears deleted char from buffer" {
     editor.render(buf.region());
 
     // Position 4 must be blank, not ghost 'c'
-    try std.testing.expectEqual(@as(u21, 'b'), buf.get(3, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), buf.get(4, 0).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), buf.get(3, 1).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), buf.get(4, 1).grapheme.codepoint);
 
-    // Cursor should be at prompt_width(2) + cursor_col(2) = 4
+    // Cursor should be at prompt_width(2) + cursor_col(2) = 4, y=1 for border
     const cs = editor.cursorState().?;
     try std.testing.expectEqual(@as(u32, 4), cs.x);
-    try std.testing.expectEqual(@as(u32, 0), cs.y);
+    try std.testing.expectEqual(@as(u32, 1), cs.y);
 }
 
 test "Editor handles newline insertion and cross-line backspace" {
