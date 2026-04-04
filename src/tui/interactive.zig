@@ -96,13 +96,16 @@ pub const Interactive = struct {
 
         const rend = try Renderer.init(allocator, term.fd_out, term.width, term.height);
 
+        var output = text_mod.Text.init(allocator);
+        output.padding_x = 1;
+
         return .{
             .allocator = allocator,
             .terminal = term,
             .renderer = rend,
             .editor = editor_mod.Editor.init(allocator),
-            .status_text = .{},
-            .output_text = .{},
+            .status_text = text_mod.Text.init(allocator),
+            .output_text = output,
             .event_queue = EventQueue(QueuedEvent).init(allocator),
             .ca = ca,
         };
@@ -112,6 +115,8 @@ pub const Interactive = struct {
         if (self.agent_thread) |t| t.join();
         self.response_buf.deinit(self.allocator);
         self.event_queue.deinit();
+        self.output_text.deinit();
+        self.status_text.deinit();
         self.editor.deinit();
         self.renderer.deinit();
         self.terminal.deinit();
@@ -231,6 +236,9 @@ pub const Interactive = struct {
                     .text_delta => |d| {
                         self.response_buf.appendSlice(self.allocator, d.delta) catch {};
                         self.output_text.setContent(self.response_buf.items);
+                        // auto-scroll to bottom so streaming output stays visible
+                        const output_height = self.outputHeight();
+                        self.output_text.scrollToBottom(output_height);
                         self.dirty = true;
                     },
                     .@"error" => |e| {
@@ -267,6 +275,13 @@ pub const Interactive = struct {
         }
     }
 
+    fn outputHeight(self: *Interactive) u32 {
+        const h = self.renderer.height;
+        const editor_height: u32 = 1;
+        const status_height: u32 = 1;
+        return if (h > editor_height + status_height) h - editor_height - status_height else 0;
+    }
+
     fn renderFrame(self: *Interactive) void {
         const region = self.renderer.begin();
         const w = region.width;
@@ -280,7 +295,7 @@ pub const Interactive = struct {
 
         const editor_height: u32 = 1;
         const status_height: u32 = 1;
-        const output_height: u32 = if (h > editor_height + status_height) h - editor_height - status_height else 0;
+        const output_height = self.outputHeight();
 
         if (output_height > 0) {
             const output_region = region.sub(0, 0, w, output_height);
