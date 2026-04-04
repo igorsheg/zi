@@ -271,7 +271,7 @@ pub fn main() !void {
         defer ca.deinit();
 
         const tool_display = @import("tui/tool_display.zig");
-        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_display.default_registry);
+        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_display.default_registry, cwd_buf);
         defer interactive.deinit();
         try interactive.run();
     }

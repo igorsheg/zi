@@ -7,6 +7,8 @@ const terminal_mod = @import("terminal.zig");
 const keys_mod = @import("keys.zig");
 const component_mod = @import("component.zig");
 const text_mod = @import("components/text.zig");
+const header_mod = @import("components/header.zig");
+const footer_mod = @import("components/footer.zig");
 const editor_mod = @import("components/editor.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
@@ -89,12 +91,27 @@ pub const Interactive = struct {
     allocator: std.mem.Allocator,
     terminal: Terminal,
     renderer: Renderer,
+    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+
+    // ── Owned components ──────────────────────────────────────────
     editor: editor_mod.Editor,
     status_text: text_mod.Text,
+    header: header_mod.Header,
+    footer: footer_mod.Footer,
     transcript: Transcript,
     registry: ToolDisplayRegistry,
+
+    // ── Container slots (pi-mono parity) ──────────────────────────
+    // Each slot is a Container that can hold 0..N children.
+    // Extensions swap/add/remove children inside these containers
+    // without touching the root layout indices.
     root: container_mod.Container,
-    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    header_container: container_mod.Container,
+    pending_container: container_mod.Container,
+    status_container: container_mod.Container,
+    widget_above_container: container_mod.Container,
+    editor_container: container_mod.Container,
+    widget_below_container: container_mod.Container,
 
     event_queue: EventQueue(UiEvent),
     ca: *CodingAgent,
@@ -109,26 +126,38 @@ pub const Interactive = struct {
         allocator: std.mem.Allocator,
         ca: *CodingAgent,
         registry: ToolDisplayRegistry,
+        cwd: []const u8,
     ) !Interactive {
         var term = Terminal.init();
         term.updateSize();
 
         const rend = try Renderer.init(allocator, term.fd_out, term.width, term.height);
+        const theme = &theme_mod.Theme.dark;
 
         var self: Interactive = .{
             .allocator = allocator,
             .terminal = term,
             .renderer = rend,
+            .theme = theme,
             .editor = editor_mod.Editor.init(allocator),
             .status_text = text_mod.Text.init(allocator),
+            .header = .{ .theme = theme, .version = "0.1.0" },
+            .footer = .{ .theme = theme, .cwd = cwd, .model_name = ca.agent.state.model.id },
             .transcript = Transcript.init(allocator),
             .registry = registry,
             .root = container_mod.Container.init(allocator),
+            .header_container = container_mod.Container.init(allocator),
+            .pending_container = container_mod.Container.init(allocator),
+            .status_container = container_mod.Container.init(allocator),
+            .widget_above_container = container_mod.Container.init(allocator),
+            .editor_container = container_mod.Container.init(allocator),
+            .widget_below_container = container_mod.Container.init(allocator),
             .event_queue = EventQueue(UiEvent).init(allocator),
             .ca = ca,
         };
-        self.editor.prompt_fg = self.theme.fg(.muted);
-        self.transcript.theme = self.theme;
+        self.editor.prompt_fg = theme.fg(.muted);
+        self.editor.border_color = theme.fg(.border_muted);
+        self.transcript.theme = theme;
         return self;
     }
 
@@ -144,6 +173,12 @@ pub const Interactive = struct {
         self.paste_buf.deinit(self.allocator);
         self.event_queue.deinit();
         self.root.deinit();
+        self.widget_below_container.deinit();
+        self.editor_container.deinit();
+        self.widget_above_container.deinit();
+        self.status_container.deinit();
+        self.pending_container.deinit();
+        self.header_container.deinit();
         self.transcript.deinit();
         self.status_text.deinit();
         self.editor.deinit();
@@ -162,12 +197,26 @@ pub const Interactive = struct {
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
 
-        // Build component tree: transcript (flex) | status | editor (focused)
-        self.root.addChild(self.transcript.component());
-        self.root.addChild(self.status_text.component());
-        self.root.addChild(self.editor.component());
-        self.root.flex_child_index = 0;
-        self.root.focused_child_index = 2;
+        // Populate container slots with their initial children.
+        // Each slot is a Container so extensions can swap/add/remove children
+        // without touching the root layout indices.
+        self.header_container.addChild(self.header.component());
+        self.status_container.addChild(self.status_text.component());
+        self.editor_container.addChild(self.editor.component());
+        self.editor_container.focused_child_index = 0; // editor receives input
+
+        // Build root tree matching pi-mono slot structure:
+        // headerContainer → chat(flex) → pending → status → widget_above → editor(focused) → widget_below → footer
+        self.root.addChild(self.header_container.component()); // [0] headerContainer
+        self.root.addChild(self.transcript.component()); // [1] chat (flex)
+        self.root.addChild(self.pending_container.component()); // [2] pendingContainer
+        self.root.addChild(self.status_container.component()); // [3] statusContainer
+        self.root.addChild(self.widget_above_container.component()); // [4] widgetAboveContainer
+        self.root.addChild(self.editor_container.component()); // [5] editorContainer
+        self.root.addChild(self.widget_below_container.component()); // [6] widgetBelowContainer
+        self.root.addChild(self.footer.component()); // [7] footer (direct, no wrapper needed)
+        self.root.flex_child_index = 1; // transcript is flex
+        self.root.focused_child_index = 5; // editorContainer receives input
 
         self.dirty = true;
 
@@ -402,10 +451,15 @@ pub const Interactive = struct {
         const w = self.renderer.width;
         const max_h = @max(3, h * 30 / 100);
         self.editor.max_visible_lines = max_h;
-        const editor_h = self.editor.measure(w).preferred_height;
-        const status_h = @max(1, self.status_text.measure(w).preferred_height);
-        const fixed = editor_h + status_h;
-        return if (h > fixed) h - fixed else 0;
+
+        // Sum all non-flex children's measured heights
+        var fixed_total: u32 = 0;
+        for (self.root.children.items, 0..) |child, i| {
+            if (self.root.flex_child_index != null and i == self.root.flex_child_index.?) continue;
+            var c = child;
+            fixed_total += c.measure(w).preferred_height;
+        }
+        return if (h > fixed_total) h - fixed_total else 0;
     }
 
     fn renderFrame(self: *Interactive) void {
@@ -457,6 +511,11 @@ pub const Interactive = struct {
             self.allocator.free(prompt_copy);
             return;
         };
+
+        // Add user message after successful spawn (prompt_copy is safe to read here —
+        // the agent thread doesn't free it until run() completes)
+        self.transcript.addUserMessage(prompt_copy);
+        self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
     }
 
     fn agentThreadFn(self: *Interactive, prompt_copy: []const u8) void {
