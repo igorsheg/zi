@@ -13,6 +13,7 @@ const editor_mod = @import("components/editor.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
 const container_mod = @import("container.zig");
+const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
 
@@ -137,6 +138,9 @@ pub const Interactive = struct {
     // ── Focus ─────────────────────────────────────────────────────
     focus: FocusManager = .{},
 
+    // ── Overlays ──────────────────────────────────────────────────
+    overlays: overlay_mod.OverlayManager,
+
     // ── Container slots (pi-mono parity) ──────────────────────────
     // Each slot is a Container that can hold 0..N children.
     // Extensions swap/add/remove children inside these containers
@@ -181,6 +185,7 @@ pub const Interactive = struct {
             .footer = .{ .theme = theme, .cwd = cwd, .model_name = ca.agent.state.model.id },
             .transcript = Transcript.init(allocator),
             .registry = registry,
+            .overlays = overlay_mod.OverlayManager.init(allocator),
             .root = container_mod.Container.init(allocator),
             .header_container = container_mod.Container.init(allocator),
             .pending_container = container_mod.Container.init(allocator),
@@ -208,6 +213,7 @@ pub const Interactive = struct {
         }
         self.paste_buf.deinit(self.allocator);
         self.event_queue.deinit();
+        self.overlays.deinit();
         self.root.deinit();
         self.widget_below_container.deinit();
         self.editor_container.deinit();
@@ -518,6 +524,12 @@ pub const Interactive = struct {
         self.editor.max_visible_lines = max_h;
 
         self.root.render(region);
+
+        // Render overlays on top of base content (cell-buffer compositing)
+        if (self.overlays.hasVisibleOverlays()) {
+            self.overlays.renderOverlays(region);
+        }
+
         self.renderer.end() catch {};
 
         if (self.root.cursorState()) |cs| {
