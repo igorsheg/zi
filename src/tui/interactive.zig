@@ -51,7 +51,14 @@ fn EventQueue(comptime T: type) type {
         pub fn push(self: *Self, item: T) void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            self.items.append(self.allocator, item) catch return;
+            self.items.append(self.allocator, item) catch {
+                // On allocation failure, clean up the owned event to prevent leaks
+                var mutable = item;
+                if (@hasDecl(T, "deinit")) {
+                    mutable.deinit(self.allocator);
+                }
+                return;
+            };
             self.cond.signal();
         }
 
@@ -298,6 +305,8 @@ pub const Interactive = struct {
             },
             .agent_finished => {
                 self.is_streaming = false;
+                // join the thread before dropping the handle
+                if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.status_text.setContent("");
                 self.editor.focused = true;
@@ -305,6 +314,7 @@ pub const Interactive = struct {
             },
             .agent_error => {
                 self.is_streaming = false;
+                if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.status_text.setContent("error occurred");
                 self.status_text.fg = Color.rgb(255, 80, 80);

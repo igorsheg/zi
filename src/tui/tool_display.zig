@@ -150,10 +150,9 @@ pub const ToolDisplayRegistry = struct {
 pub const GenericDisplay = struct {
     allocator: std.mem.Allocator,
     tool_name: []u8 = &.{},
-    call_line: []u8 = &.{},
+    args_json: []u8 = &.{},
     result_text: []u8 = &.{},
     is_error: bool = false,
-    is_complete: bool = false,
 
     pub fn create(allocator: std.mem.Allocator, _: []const u8) ?ToolDisplay {
         const self = allocator.create(GenericDisplay) catch return null;
@@ -166,8 +165,8 @@ pub const GenericDisplay = struct {
             .start => |s| {
                 self.freeField(&self.tool_name);
                 self.tool_name = self.allocator.dupe(u8, s.tool_name) catch &.{};
-                self.freeField(&self.call_line);
-                self.call_line = self.allocator.dupe(u8, s.args_json) catch &.{};
+                self.freeField(&self.args_json);
+                self.args_json = self.allocator.dupe(u8, s.args_json) catch &.{};
             },
             .update => |u| {
                 if (u.result_text) |txt| {
@@ -182,7 +181,6 @@ pub const GenericDisplay = struct {
                     self.result_text = self.allocator.dupe(u8, txt) catch &.{};
                 }
                 self.is_error = e.is_error;
-                self.is_complete = true;
             },
         }
     }
@@ -249,7 +247,7 @@ pub const GenericDisplay = struct {
 
     pub fn deinit(self: *GenericDisplay) void {
         self.freeField(&self.tool_name);
-        self.freeField(&self.call_line);
+        self.freeField(&self.args_json);
         self.freeField(&self.result_text);
         self.allocator.destroy(self);
     }
