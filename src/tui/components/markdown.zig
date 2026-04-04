@@ -413,7 +413,8 @@ fn appendSingleSpan(
     arena: std.mem.Allocator,
 ) !void {
     const span = try arena.alloc(Span, 1);
-    span[0] = .{ .text = text, .fg = fg, .bg = bg, .attrs = attrs };
+    // Arena-dupe text so spans never borrow from external content
+    span[0] = .{ .text = try arena.dupe(u8, text), .fg = fg, .bg = bg, .attrs = attrs };
     try lines.append(arena, .{ .spans = span });
 }
 
@@ -432,7 +433,8 @@ fn appendCodeLine(
         const avail = if (width > indent_width) width - indent_width else 0;
         const clipped = grapheme_mod.sliceToWidth(raw_line, avail);
         if (clipped.len > 0) {
-            try spans.append(arena, .{ .text = clipped, .fg = code_block_fg });
+            // Arena-dupe so spans don't borrow from external content
+            try spans.append(arena, .{ .text = try arena.dupe(u8, clipped), .fg = code_block_fg });
         }
     }
     try lines.append(arena, .{ .spans = try spans.toOwnedSlice(arena) });
@@ -572,10 +574,13 @@ pub const Markdown = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
 
-    // Cache — keyed on (content_ptr, content_len, width)
+    /// Owned content buffer — Markdown owns its text to avoid
+    /// borrowing from external mutable storage (e.g. transcript text_buf).
+    content_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    // Cache — keyed on content_len + width (content is owned, ptr is stable)
     cached_lines: ?[]const RenderedLine = null,
     cached_width: u32 = 0,
-    cached_content_ptr: ?[*]const u8 = null,
     cached_content_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Markdown {
@@ -586,11 +591,21 @@ pub const Markdown = struct {
     }
 
     pub fn deinit(self: *Markdown) void {
+        self.content_buf.deinit(self.allocator);
         self.arena.deinit();
     }
 
+    /// Replace content entirely (copies into owned buffer).
     pub fn setContent(self: *Markdown, text: []const u8) void {
-        self.content = text;
+        self.content_buf.clearRetainingCapacity();
+        self.content_buf.appendSlice(self.allocator, text) catch return;
+        self.content = self.content_buf.items;
+    }
+
+    /// Append streaming content (avoids full copy on each delta).
+    pub fn appendContent(self: *Markdown, delta: []const u8) void {
+        self.content_buf.appendSlice(self.allocator, delta) catch return;
+        self.content = self.content_buf.items;
     }
 
     pub fn scrollToBottom(self: *Markdown, visible_height: u32) void {
@@ -668,9 +683,11 @@ pub const Markdown = struct {
     }
 
     fn getRenderedLines(self: *Markdown, content_width: u32) ?[]const RenderedLine {
+        // Cache key: content_len + width. Content is owned (stable ptr),
+        // and len only grows during streaming (appendContent), so a len
+        // match means the bytes haven't changed.
         if (self.cached_lines) |cached| {
             if (self.cached_width == content_width and
-                self.cached_content_ptr == self.content.ptr and
                 self.cached_content_len == self.content.len)
             {
                 return cached;
@@ -684,7 +701,6 @@ pub const Markdown = struct {
         const built = buildLines(self.content, content_width, self.fg, arena_alloc) catch return null;
         self.cached_lines = built;
         self.cached_width = content_width;
-        self.cached_content_ptr = self.content.ptr;
         self.cached_content_len = self.content.len;
         return built;
     }

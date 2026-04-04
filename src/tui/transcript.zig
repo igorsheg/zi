@@ -3,7 +3,6 @@ const component_mod = @import("component.zig");
 const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const grapheme = @import("grapheme.zig");
-const text_mod = @import("components/text.zig");
 const markdown_mod = @import("components/markdown.zig");
 const tool_display_mod = @import("tool_display.zig");
 const word_wrap_mod = @import("word_wrap.zig");
@@ -49,8 +48,6 @@ pub const Transcript = struct {
     pending_tools: std.StringHashMapUnmanaged(usize) = .{},
     /// Current assistant text row being appended to (index into rows).
     current_text_idx: ?usize = null,
-    /// Buffer for accumulating text_delta content.
-    text_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     allocator: std.mem.Allocator,
     scroll_offset: u32 = 0,
@@ -70,30 +67,25 @@ pub const Transcript = struct {
             }
         }
         self.rows.deinit(self.allocator);
-        self.text_buf.deinit(self.allocator);
         // pending_tools keys are borrowed from ToolExecution.tool_call_id — don't free
         self.pending_tools.deinit(self.allocator);
     }
 
-    /// Start a new assistant message (clears text accumulator).
+    /// Start a new assistant message.
     pub fn beginAssistantMessage(self: *Transcript) void {
-        self.text_buf.items.len = 0;
         self.current_text_idx = null;
     }
 
-    /// Append streaming text content.
+    /// Append streaming text content. Each Markdown row owns its content
+    /// buffer, so old rows are not affected by new messages.
     pub fn appendText(self: *Transcript, delta: []const u8) void {
-        self.text_buf.appendSlice(self.allocator, delta) catch return;
-
         if (self.current_text_idx) |idx| {
-            // Update existing markdown row
-            self.rows.items[idx].assistant_text.setContent(self.text_buf.items);
+            self.rows.items[idx].assistant_text.appendContent(delta);
         } else {
-            // Create new markdown row
             const md = self.allocator.create(markdown_mod.Markdown) catch return;
             md.* = markdown_mod.Markdown.init(self.allocator);
             md.padding_x = 1;
-            md.setContent(self.text_buf.items);
+            md.appendContent(delta);
             self.rows.append(self.allocator, .{ .assistant_text = md }) catch {
                 md.deinit();
                 self.allocator.destroy(md);
