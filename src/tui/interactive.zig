@@ -98,6 +98,8 @@ pub const Interactive = struct {
     dirty: bool = true,
     running: bool = true,
     is_streaming: bool = false,
+    in_paste: bool = false,
+    paste_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -131,6 +133,7 @@ pub const Interactive = struct {
             if (count == 0) break;
             for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
         }
+        self.paste_buf.deinit(self.allocator);
         self.event_queue.deinit();
         self.transcript.deinit();
         self.status_text.deinit();
@@ -162,7 +165,7 @@ pub const Interactive = struct {
             }
 
             // 2. Poll terminal input (non-blocking: MIN=0, TIME=0)
-            var input_buf: [256]u8 = undefined;
+            var input_buf: [4096]u8 = undefined;
             const n = self.terminal.readInput(&input_buf) catch 0;
             if (n > 0) {
                 self.handleRawInput(input_buf[0..n]);
@@ -189,6 +192,38 @@ pub const Interactive = struct {
     fn handleRawInput(self: *Interactive, data: []const u8) void {
         var offset: usize = 0;
         while (offset < data.len) {
+            // Bracketed paste: buffer until end marker
+            if (self.in_paste) {
+                if (std.mem.indexOfPos(u8, data, offset, "\x1b[201~")) |end_pos| {
+                    self.paste_buf.appendSlice(self.allocator, data[offset..end_pos]) catch {};
+                    self.editor.insertText(self.paste_buf.items);
+                    self.paste_buf.items.len = 0;
+                    self.in_paste = false;
+                    self.dirty = true;
+                    offset = end_pos + 6; // skip "\x1b[201~"
+                    continue;
+                } else {
+                    self.paste_buf.appendSlice(self.allocator, data[offset..]) catch {};
+                    return;
+                }
+            }
+
+            // Detect paste start marker
+            if (offset + 5 < data.len and std.mem.eql(u8, data[offset .. offset + 6], "\x1b[200~")) {
+                self.in_paste = true;
+                self.paste_buf.items.len = 0;
+                offset += 6;
+                continue;
+            }
+
+            // Also treat bare \n as newline insertion (some terminals send this for shift+enter)
+            if (data[offset] == '\n') {
+                self.editor.insertText("\n");
+                self.dirty = true;
+                offset += 1;
+                continue;
+            }
+
             const result = keys_mod.parseKey(data[offset..], self.terminal.kitty_active) orelse {
                 offset += 1;
                 continue;
@@ -346,11 +381,19 @@ pub const Interactive = struct {
         }
     }
 
+    fn editorHeight(self: *Interactive) u32 {
+        // Cap editor to 30% of terminal, min 1, max max_visible_lines
+        const max_h = @max(3, self.renderer.height * 30 / 100);
+        self.editor.max_visible_lines = max_h;
+        const m = self.editor.measure(self.renderer.width);
+        return @max(1, m.preferred_height);
+    }
+
     fn outputHeight(self: *Interactive) u32 {
         const h = self.renderer.height;
-        const editor_height: u32 = 1;
+        const editor_h = self.editorHeight();
         const status_height: u32 = 1;
-        return if (h > editor_height + status_height) h - editor_height - status_height else 0;
+        return if (h > editor_h + status_height) h - editor_h - status_height else 0;
     }
 
     fn renderFrame(self: *Interactive) void {
@@ -364,28 +407,31 @@ pub const Interactive = struct {
             return;
         }
 
-        const editor_height: u32 = 1;
+        // Centralized layout: output | status | editor (bottom)
+        const editor_h = self.editorHeight();
         const status_height: u32 = 1;
-        const output_height = self.outputHeight();
+        const output_height = if (h > editor_h + status_height) h - editor_h - status_height else 0;
 
         if (output_height > 0) {
             const output_region = region.sub(0, 0, w, output_height);
             self.transcript.render(output_region);
         }
 
-        if (h > editor_height) {
-            const status_region = region.sub(0, output_height, w, status_height);
+        const status_y = output_height;
+        if (status_y < h) {
+            const status_region = region.sub(0, status_y, w, status_height);
             self.status_text.render(status_region);
         }
 
-        const editor_region = region.sub(0, h - editor_height, w, editor_height);
+        const editor_y = h - editor_h;
+        const editor_region = region.sub(0, editor_y, w, editor_h);
         self.editor.render(editor_region);
 
         self.renderer.end() catch {};
 
         if (self.editor.cursorState()) |cs| {
             self.terminal.showCursor();
-            self.terminal.setCursorPos(cs.x, h - editor_height + cs.y);
+            self.terminal.setCursorPos(cs.x, editor_y + cs.y);
         } else {
             self.terminal.hideCursor();
         }
