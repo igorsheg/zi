@@ -4,6 +4,8 @@ Issue tracking: `bd prime`
 
 pi-mono is cloned locally at `.references/pi-mono/`. When you need to reference pi-mono source (types, implementations, patterns), always use local reads/greps against `.references/pi-mono/` - never the github tools. The code is on disk.
 
+opentui is cloned locally at `.references/opentui/`. When you need to reference opentui source (zig TUI patterns, buffer/renderer/utf8), always use local reads/greps against `.references/opentui/` - never the github tools. The code is on disk.
+
 ## Doctrine
 
 zi must never be less capable than pi-mono at the architecture, design, or product layer. minimum bar: parity with pi-mono. maximum bar: extend pi-mono while preserving its contracts. zig is an implementation advantage, not a reason to collapse product surfaces, remove composition seams, or replace dedicated flows with narrower shortcuts.
