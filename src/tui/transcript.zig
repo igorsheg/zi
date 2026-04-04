@@ -102,12 +102,18 @@ pub const Transcript = struct {
         }
     }
 
-    /// Register a new tool execution.
+    /// Register a new tool execution. Idempotent — skips if tool_call_id already exists.
     pub fn addToolExecution(
         self: *Transcript,
         tool_call_id: []const u8,
         display: ToolDisplay,
     ) void {
+        // Already registered (e.g., created during streaming, now getting tool_execution_start)
+        if (self.pending_tools.contains(tool_call_id)) {
+            display.deinitDisplay();
+            return;
+        }
+
         // End current text accumulation — tool breaks the text flow
         self.current_text_idx = null;
 

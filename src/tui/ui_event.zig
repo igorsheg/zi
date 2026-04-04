@@ -15,11 +15,24 @@ pub const UiEvent = union(enum) {
     // --- errors ---
     error_message: struct { message: []u8 },
 
+    // --- tool call streaming (from assistant message content, before execution) ---
+    tool_call_streaming: struct {
+        tool_call_id: []u8,
+        tool_name: []u8,
+        args_json: []u8,
+    },
+
+    // --- assistant message finalization ---
+    message_end_assistant: struct {
+        is_aborted: bool,
+        error_message: ?[]u8,
+    },
+
     // --- tool execution lifecycle ---
     tool_start: struct {
         tool_call_id: []u8,
         tool_name: []u8,
-        args_json: []u8, // serialized JSON — avoids json.Value ownership complexity
+        args_json: []u8,
     },
     tool_update: struct {
         tool_call_id: []u8,
@@ -41,6 +54,14 @@ pub const UiEvent = union(enum) {
         switch (self.*) {
             .text_delta => |d| allocator.free(d.delta),
             .error_message => |e| allocator.free(e.message),
+            .tool_call_streaming => |t| {
+                allocator.free(t.tool_call_id);
+                allocator.free(t.tool_name);
+                allocator.free(t.args_json);
+            },
+            .message_end_assistant => |m| {
+                if (m.error_message) |msg| allocator.free(msg);
+            },
             .tool_start => |t| {
                 allocator.free(t.tool_call_id);
                 allocator.free(t.tool_name);

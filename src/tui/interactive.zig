@@ -275,6 +275,28 @@ pub const Interactive = struct {
                 self.dirty = true;
             },
             .message_start_user => {},
+            .tool_call_streaming => |t| {
+                // create display early (before tool_execution_start)
+                const display = self.registry.create(self.allocator, t.tool_name);
+                self.transcript.addToolExecution(t.tool_call_id, display);
+                self.transcript.updateTool(t.tool_call_id, .{ .start = .{
+                    .tool_name = t.tool_name,
+                    .args_json = t.args_json,
+                } });
+                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
+                self.dirty = true;
+            },
+            .message_end_assistant => |m| {
+                if (m.is_aborted) {
+                    self.status_text.setContent(m.error_message orelse "aborted");
+                    self.status_text.fg = Color.rgb(255, 80, 80);
+                    self.dirty = true;
+                } else if (m.error_message) |msg| {
+                    self.status_text.setContent(msg);
+                    self.status_text.fg = Color.rgb(255, 80, 80);
+                    self.dirty = true;
+                }
+            },
             .tool_start => |t| {
                 const display = self.registry.create(self.allocator, t.tool_name);
                 self.transcript.addToolExecution(t.tool_call_id, display);
@@ -438,6 +460,18 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
                     }
                     return null;
                 },
+                .toolcall_end => |tc| {
+                    const id = allocator.dupe(u8, tc.tool_call.id) catch return null;
+                    errdefer allocator.free(id);
+                    const name = allocator.dupe(u8, tc.tool_call.name) catch return null;
+                    errdefer allocator.free(name);
+                    const args_json = serializeJson(tc.tool_call.arguments, allocator) catch return null;
+                    return .{ .tool_call_streaming = .{
+                        .tool_call_id = id,
+                        .tool_name = name,
+                        .args_json = args_json,
+                    } };
+                },
                 else => return null,
             }
         },
@@ -473,7 +507,25 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
                 .is_error = te.is_error,
             } };
         },
-        .agent_end, .agent_start, .turn_start, .turn_end, .message_end => return null,
+        .message_end => |me| {
+            switch (me.message) {
+                .assistant => |am| {
+                    if (am.stop_reason == .aborted or am.stop_reason == .@"error") {
+                        const err_msg = if (am.error_message) |msg|
+                            (allocator.dupe(u8, msg) catch null)
+                        else
+                            null;
+                        return .{ .message_end_assistant = .{
+                            .is_aborted = am.stop_reason == .aborted,
+                            .error_message = err_msg,
+                        } };
+                    }
+                    return null;
+                },
+                else => return null,
+            }
+        },
+        .agent_end, .agent_start, .turn_start, .turn_end => return null,
     }
 }
 
