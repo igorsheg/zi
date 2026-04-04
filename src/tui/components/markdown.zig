@@ -627,6 +627,10 @@ pub const Markdown = struct {
         self.cached_lines = null;
     }
 
+    pub fn component(self: *Markdown) component_mod.Component {
+        return component_mod.Component.init(Markdown, self);
+    }
+
     pub fn measure(self: *Markdown, width: u32) Measurement {
         if (self.content.len == 0) return .{ .min_height = 0, .preferred_height = 0 };
         if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
