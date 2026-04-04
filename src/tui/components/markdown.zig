@@ -479,7 +479,7 @@ fn appendHR(
     width: u32,
     arena: std.mem.Allocator,
 ) !void {
-    const hr_width = @min(width, 80);
+    const hr_width: usize = @min(width, 80);
     // "─" is U+2500, 3 bytes in UTF-8
     const hr_text = try arena.alloc(u8, hr_width * 3);
     for (0..hr_width) |i| {
