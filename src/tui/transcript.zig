@@ -19,6 +19,8 @@ pub const TranscriptRow = union(enum) {
     assistant_text: *markdown_mod.Markdown,
     /// A tool execution with its display component.
     tool_execution: *ToolExecution,
+    /// A user message bubble rendered as markdown.
+    user_message: *markdown_mod.Markdown,
 };
 
 /// State for a single tool execution within the transcript.
@@ -66,6 +68,10 @@ pub const Transcript = struct {
                     self.allocator.destroy(md);
                 },
                 .tool_execution => |te| te.deinit(),
+                .user_message => |md| {
+                    md.deinit();
+                    self.allocator.destroy(md);
+                },
             }
         }
         self.rows.deinit(self.allocator);
@@ -129,6 +135,25 @@ pub const Transcript = struct {
             return;
         };
         self.pending_tools.put(self.allocator, te.tool_call_id, row_idx) catch {};
+    }
+
+    /// Add a user message bubble to the transcript.
+    pub fn addUserMessage(self: *Transcript, text: []const u8) void {
+        self.current_text_idx = null;
+
+        const md = self.allocator.create(markdown_mod.Markdown) catch return;
+        md.* = markdown_mod.Markdown.init(self.allocator);
+        md.padding_x = 1;
+        md.padding_y = 1;
+        md.bg = self.theme.bg(.user_message_bg);
+        md.fg = self.theme.fg(.user_message_text);
+        md.setContent(text);
+
+        self.rows.append(self.allocator, .{ .user_message = md }) catch {
+            md.deinit();
+            self.allocator.destroy(md);
+            return;
+        };
     }
 
     /// Route an event to a tool execution by ID.
@@ -204,13 +229,9 @@ pub const Transcript = struct {
             if (screen_y >= h) break;
 
             // calculate visible portion of this row
-            const row_start_in_viewport = if (virtual_y >= self.scroll_offset)
-                virtual_y - self.scroll_offset
-            else
-                0;
-            _ = row_start_in_viewport;
-
-            const visible_h = @min(row_h, h - screen_y);
+            const skipped = if (virtual_y < self.scroll_offset) self.scroll_offset - virtual_y else 0;
+            const remaining_in_row = row_h - skipped;
+            const visible_h = @min(remaining_in_row, h - screen_y);
 
             // create a sub-region for this row
             const row_region = region.sub(0, screen_y, w, visible_h);
@@ -230,11 +251,11 @@ pub const Transcript = struct {
                 .tool_execution => |te| {
                     // render tool background
                     const bg = if (!te.is_complete)
-                        self.theme.bg(.tool_pending_bg) // pending
+                        self.theme.bg(.tool_pending_bg)
                     else if (te.is_error)
-                        self.theme.bg(.tool_error_bg) // error
+                        self.theme.bg(.tool_error_bg)
                     else
-                        Color.default; // success — no bg
+                        self.theme.bg(.tool_success_bg);
 
                     if (!bg.eql(Color.default)) {
                         row_region.fill(0, 0, w, visible_h, .{
@@ -246,6 +267,19 @@ pub const Transcript = struct {
                     // render display content with padding
                     const content_region = row_region.sub(1, 0, if (w > 2) w - 2 else 1, visible_h);
                     te.display.render(content_region);
+                },
+                .user_message => |md| {
+                    const row_skip = if (virtual_y < self.scroll_offset) self.scroll_offset - virtual_y else 0;
+                    if (row_skip == 0) {
+                        if (visible_h > 1) {
+                            const md_region = row_region.sub(0, 1, w, visible_h - 1);
+                            md.scroll_offset = 0;
+                            md.render(md_region);
+                        }
+                    } else {
+                        md.scroll_offset = row_skip - 1;
+                        md.render(row_region);
+                    }
                 },
             }
 
@@ -262,6 +296,7 @@ pub const Transcript = struct {
                 const content_w = if (width > 2) width - 2 else 1;
                 return @max(1, te.display.measure(content_w).preferred_height);
             },
+            .user_message => |md| @max(1, md.measure(width).preferred_height) + 1,
         };
     }
 };
