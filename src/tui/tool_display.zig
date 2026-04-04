@@ -5,6 +5,8 @@ const cell_mod = @import("cell.zig");
 const grapheme = @import("grapheme.zig");
 const word_wrap_mod = @import("word_wrap.zig");
 
+const theme_mod = @import("theme.zig");
+
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
@@ -149,6 +151,7 @@ pub const ToolDisplayRegistry = struct {
 /// Displays: bold(tool_name) on the call line, plain text output for results.
 pub const GenericDisplay = struct {
     allocator: std.mem.Allocator,
+    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
     tool_name: []u8 = &.{},
     args_json: []u8 = &.{},
     result_text: []u8 = &.{},
@@ -199,7 +202,7 @@ pub const GenericDisplay = struct {
 
         // result text
         if (self.result_text.len > 0 and row < region.height) {
-            const fg = if (self.is_error) Color.rgb(255, 80, 80) else Color.rgb(150, 150, 150);
+            const fg = if (self.is_error) self.theme.fg(.@"error") else self.theme.fg(.tool_output);
             const lines = word_wrap_mod.wordWrap(self.result_text, w, self.allocator) catch return;
             defer self.allocator.free(lines);
 
@@ -216,7 +219,7 @@ pub const GenericDisplay = struct {
                 const remaining = lines.len - max_preview;
                 var hint_buf: [64]u8 = undefined;
                 const hint = std.fmt.bufPrint(&hint_buf, "... ({d} more lines)", .{remaining}) catch "...";
-                _ = region.writeStr(0, row, hint, Color.rgb(120, 120, 120), Color.default, .{});
+                _ = region.writeStr(0, row, hint, self.theme.fg(.dim), Color.default, .{});
             }
         }
     }

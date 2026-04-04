@@ -5,6 +5,7 @@ const cell_mod = @import("cell.zig");
 const grapheme = @import("grapheme.zig");
 const markdown_mod = @import("components/markdown.zig");
 const tool_display_mod = @import("tool_display.zig");
+const theme_mod = @import("theme.zig");
 const word_wrap_mod = @import("word_wrap.zig");
 
 const Measurement = component_mod.Measurement;
@@ -50,6 +51,7 @@ pub const Transcript = struct {
     current_text_idx: ?usize = null,
 
     allocator: std.mem.Allocator,
+    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
     scroll_offset: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Transcript {
@@ -219,9 +221,9 @@ pub const Transcript = struct {
                 .tool_execution => |te| {
                     // render tool background
                     const bg = if (!te.is_complete)
-                        Color.rgb(40, 40, 50) // pending
+                        self.theme.bg(.tool_pending_bg) // pending
                     else if (te.is_error)
-                        Color.rgb(60, 40, 40) // error
+                        self.theme.bg(.tool_error_bg) // error
                     else
                         Color.default; // success — no bg
 

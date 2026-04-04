@@ -11,6 +11,7 @@ const editor_mod = @import("components/editor.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
 const tool_display_mod = @import("tool_display.zig");
+const theme_mod = @import("theme.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -91,6 +92,7 @@ pub const Interactive = struct {
     status_text: text_mod.Text,
     transcript: Transcript,
     registry: ToolDisplayRegistry,
+    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
 
     event_queue: EventQueue(UiEvent),
     ca: *CodingAgent,
@@ -111,7 +113,7 @@ pub const Interactive = struct {
 
         const rend = try Renderer.init(allocator, term.fd_out, term.width, term.height);
 
-        return .{
+        var self: Interactive = .{
             .allocator = allocator,
             .terminal = term,
             .renderer = rend,
@@ -122,6 +124,9 @@ pub const Interactive = struct {
             .event_queue = EventQueue(UiEvent).init(allocator),
             .ca = ca,
         };
+        self.editor.prompt_fg = self.theme.fg(.muted);
+        self.transcript.theme = self.theme;
+        return self;
     }
 
     pub fn deinit(self: *Interactive) void {
@@ -238,7 +243,7 @@ pub const Interactive = struct {
             if (self.is_streaming) {
                 self.ca.agent.abort();
                 self.status_text.setContent("aborted");
-                self.status_text.fg = Color.rgb(255, 80, 80);
+                self.status_text.fg = self.theme.fg(.@"error");
                 self.dirty = true;
             }
             return;
@@ -300,13 +305,13 @@ pub const Interactive = struct {
             },
             .error_message => |e| {
                 self.status_text.setContent(e.message);
-                self.status_text.fg = Color.rgb(255, 80, 80);
+                self.status_text.fg = self.theme.fg(.@"error");
                 self.dirty = true;
             },
             .message_start_assistant => {
                 self.transcript.beginAssistantMessage();
                 self.status_text.setContent("thinking...");
-                self.status_text.fg = Color.rgb(150, 150, 150);
+                self.status_text.fg = self.theme.fg(.muted);
                 self.dirty = true;
             },
             .message_start_user => {},
@@ -324,11 +329,11 @@ pub const Interactive = struct {
             .message_end_assistant => |m| {
                 if (m.is_aborted) {
                     self.status_text.setContent(m.error_message orelse "aborted");
-                    self.status_text.fg = Color.rgb(255, 80, 80);
+                    self.status_text.fg = self.theme.fg(.@"error");
                     self.dirty = true;
                 } else if (m.error_message) |msg| {
                     self.status_text.setContent(msg);
-                    self.status_text.fg = Color.rgb(255, 80, 80);
+                    self.status_text.fg = self.theme.fg(.@"error");
                     self.dirty = true;
                 }
             },
@@ -340,7 +345,7 @@ pub const Interactive = struct {
                     .args_json = t.args_json,
                 } });
                 self.status_text.setContent(t.tool_name);
-                self.status_text.fg = Color.rgb(100, 200, 255);
+                self.status_text.fg = self.theme.fg(.accent);
                 self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
                 self.dirty = true;
             },
@@ -374,7 +379,7 @@ pub const Interactive = struct {
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.status_text.setContent("error occurred");
-                self.status_text.fg = Color.rgb(255, 80, 80);
+                self.status_text.fg = self.theme.fg(.@"error");
                 self.editor.focused = true;
                 self.dirty = true;
             },
@@ -402,7 +407,7 @@ pub const Interactive = struct {
         const h = region.height;
 
         if (h < 3 or w < 10) {
-            _ = region.writeStr(0, 0, "terminal too small", Color.rgb(255, 80, 80), Color.default, .{});
+            _ = region.writeStr(0, 0, "terminal too small", self.theme.fg(.@"error"), Color.default, .{});
             self.renderer.end() catch {};
             return;
         }
@@ -449,14 +454,14 @@ pub const Interactive = struct {
         self.is_streaming = true;
         self.editor.focused = false;
         self.status_text.setContent("sending...");
-        self.status_text.fg = Color.rgb(150, 150, 150);
+        self.status_text.fg = self.theme.fg(.muted);
         self.dirty = true;
 
         self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, prompt_copy }) catch {
             self.is_streaming = false;
             self.editor.focused = true;
             self.status_text.setContent("failed to start agent");
-            self.status_text.fg = Color.rgb(255, 80, 80);
+            self.status_text.fg = self.theme.fg(.@"error");
             self.allocator.free(prompt_copy);
             return;
         };

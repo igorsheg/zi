@@ -4,6 +4,7 @@ const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
 const word_wrap_mod = @import("../word_wrap.zig");
 const grapheme_mod = @import("../grapheme.zig");
+const theme_mod = @import("../theme.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -34,15 +35,8 @@ const InlineRun = struct {
 
 // ── Theme ──────────────────────────────────────────────────────────
 
-const heading_fg = Color.rgb(255, 255, 255);
-const code_inline_fg = Color.rgb(200, 175, 235);
+/// Inline code background — not in pi-mono's theme (applied via component styling).
 const code_inline_bg = Color.rgb(45, 40, 60);
-const code_block_fg = Color.rgb(190, 190, 190);
-const code_border_fg = Color.rgb(100, 100, 100);
-const list_bullet_fg = Color.rgb(100, 200, 255);
-const quote_border_fg = Color.rgb(100, 100, 100);
-const quote_text_fg = Color.rgb(170, 170, 170);
-const hr_fg = Color.rgb(80, 80, 80);
 
 // ── Inline Parser ──────────────────────────────────────────────────
 //
@@ -62,6 +56,7 @@ const InlineContent = struct {
 fn parseInline(
     source: []const u8,
     base_fg: Color,
+    theme: *const theme_mod.Theme,
     arena: std.mem.Allocator,
 ) !InlineContent {
     var text_buf: std.ArrayListUnmanaged(u8) = .{};
@@ -86,7 +81,7 @@ fn parseInline(
                 // Emit code run
                 const code_start = text_buf.items.len;
                 try text_buf.appendSlice(arena, source[pos + 1 .. close]);
-                try flushRun(&runs, code_start, text_buf.items.len, code_inline_fg, code_inline_bg, .{}, arena);
+                try flushRun(&runs, code_start, text_buf.items.len, theme.fg(.md_code), code_inline_bg, .{}, arena);
                 run_start = text_buf.items.len;
                 pos = close + 1;
                 continue;
@@ -327,6 +322,7 @@ fn buildLines(
     source: []const u8,
     content_width: u32,
     base_fg: Color,
+    theme: *const theme_mod.Theme,
     arena: std.mem.Allocator,
 ) ![]const RenderedLine {
     if (content_width == 0) return &.{};
@@ -345,11 +341,11 @@ fn buildLines(
             const trimmed = std.mem.trimLeft(u8, raw_line, " \t");
             if (std.mem.startsWith(u8, trimmed, "```")) {
                 in_code_block = false;
-                try appendSingleSpan(&lines, "```", code_border_fg, Color.default, .{ .dim = true }, arena);
+                try appendSingleSpan(&lines, "```", theme.fg(.md_code_block_border), Color.default, .{ .dim = true }, arena);
                 last_was_blank = false;
             } else {
                 // Code line: preserve whitespace, hard-clip at width. No wordWrap.
-                try appendCodeLine(&lines, raw_line, content_width, arena);
+                try appendCodeLine(&lines, raw_line, content_width, theme, arena);
                 last_was_blank = false;
             }
         } else {
@@ -364,25 +360,25 @@ fn buildLines(
             } else if (std.mem.startsWith(u8, trimmed, "```")) {
                 // Code fence start
                 in_code_block = true;
-                try appendSingleSpan(&lines, trimmed, code_border_fg, Color.default, .{ .dim = true }, arena);
+                try appendSingleSpan(&lines, trimmed, theme.fg(.md_code_block_border), Color.default, .{ .dim = true }, arena);
                 last_was_blank = false;
             } else if (detectHeading(trimmed)) |h| {
-                try appendHeading(&lines, h, content_width, base_fg, arena);
+                try appendHeading(&lines, h, content_width, base_fg, theme, arena);
                 last_was_blank = false;
             } else if (isHorizontalRule(trimmed)) {
-                try appendHR(&lines, content_width, arena);
+                try appendHR(&lines, content_width, theme, arena);
                 last_was_blank = false;
             } else if (trimmed.len > 0 and trimmed[0] == '>' and (trimmed.len == 1 or trimmed[1] == ' ')) {
                 const qcontent = if (trimmed.len > 2) trimmed[2..] else "";
-                try appendBlockquote(&lines, qcontent, content_width, base_fg, arena);
+                try appendBlockquote(&lines, qcontent, content_width, base_fg, theme, arena);
                 last_was_blank = false;
             } else if (detectListItem(trimmed)) |li| {
-                try appendListItem(&lines, li, content_width, base_fg, arena);
+                try appendListItem(&lines, li, content_width, base_fg, theme, arena);
                 last_was_blank = false;
             } else {
                 // Paragraph line — each physical line rendered independently
                 // (no cross-line joining; avoids reflow jank during streaming)
-                const inline_content = try parseInline(trimmed, base_fg, arena);
+                const inline_content = try parseInline(trimmed, base_fg, theme, arena);
                 const wrapped = try wrapContent(inline_content.text, inline_content.runs, content_width, arena);
                 try lines.appendSlice(arena, wrapped);
                 last_was_blank = false;
@@ -422,19 +418,20 @@ fn appendCodeLine(
     lines: *std.ArrayListUnmanaged(RenderedLine),
     raw_line: []const u8,
     width: u32,
+    theme: *const theme_mod.Theme,
     arena: std.mem.Allocator,
 ) !void {
     // "  " indent + source line, hard-clipped to width. No wordWrap.
     const indent = "  ";
     const indent_width: u32 = 2;
     var spans: std.ArrayListUnmanaged(Span) = .{};
-    try spans.append(arena, .{ .text = indent, .fg = code_block_fg });
+    try spans.append(arena, .{ .text = indent, .fg = theme.fg(.md_code_block) });
     if (raw_line.len > 0) {
         const avail = if (width > indent_width) width - indent_width else 0;
         const clipped = grapheme_mod.sliceToWidth(raw_line, avail);
         if (clipped.len > 0) {
             // Arena-dupe so spans don't borrow from external content
-            try spans.append(arena, .{ .text = try arena.dupe(u8, clipped), .fg = code_block_fg });
+            try spans.append(arena, .{ .text = try arena.dupe(u8, clipped), .fg = theme.fg(.md_code_block) });
         }
     }
     try lines.append(arena, .{ .spans = try spans.toOwnedSlice(arena) });
@@ -445,6 +442,7 @@ fn appendHeading(
     h: HeadingInfo,
     width: u32,
     base_fg: Color,
+    theme: *const theme_mod.Theme,
     arena: std.mem.Allocator,
 ) !void {
     _ = base_fg;
@@ -453,20 +451,20 @@ fn appendHeading(
 
     if (h.level >= 3) {
         // "### " prefix + content
-        const content = try parseInline(h.content, heading_fg, arena);
-        const heading_runs = try overrideRunStyle(content.runs, heading_fg, heading_attrs, arena);
+        const content = try parseInline(h.content, theme.fg(.md_heading), theme, arena);
+        const heading_runs = try overrideRunStyle(content.runs, theme.fg(.md_heading), heading_attrs, arena);
         const prefix_len = @as(usize, h.level) + 1;
         const prefix_text = try arena.alloc(u8, prefix_len);
         @memset(prefix_text[0..h.level], '#');
         prefix_text[h.level] = ' ';
         const prefix = try arena.alloc(Span, 1);
-        prefix[0] = .{ .text = prefix_text, .fg = heading_fg, .attrs = heading_attrs };
+        prefix[0] = .{ .text = prefix_text, .fg = theme.fg(.md_heading), .attrs = heading_attrs };
         const wrapped = try wrapWithPrefix(prefix, @intCast(prefix_len), content.text, heading_runs, width, arena);
         try lines.appendSlice(arena, wrapped);
     } else {
         // h1/h2: styled content, no prefix
-        const content = try parseInline(h.content, heading_fg, arena);
-        const heading_runs = try overrideRunStyle(content.runs, heading_fg, heading_attrs, arena);
+        const content = try parseInline(h.content, theme.fg(.md_heading), theme, arena);
+        const heading_runs = try overrideRunStyle(content.runs, theme.fg(.md_heading), heading_attrs, arena);
         const wrapped = try wrapContent(content.text, heading_runs, width, arena);
         try lines.appendSlice(arena, wrapped);
     }
@@ -477,6 +475,7 @@ fn appendHeading(
 fn appendHR(
     lines: *std.ArrayListUnmanaged(RenderedLine),
     width: u32,
+    theme: *const theme_mod.Theme,
     arena: std.mem.Allocator,
 ) !void {
     const hr_width: usize = @min(width, 80);
@@ -487,7 +486,7 @@ fn appendHR(
         hr_text[i * 3 + 1] = 0x94;
         hr_text[i * 3 + 2] = 0x80;
     }
-    try appendSingleSpan(lines, hr_text, hr_fg, Color.default, .{ .dim = true }, arena);
+    try appendSingleSpan(lines, hr_text, theme.fg(.md_hr), Color.default, .{ .dim = true }, arena);
 }
 
 fn appendBlockquote(
@@ -495,14 +494,15 @@ fn appendBlockquote(
     content: []const u8,
     width: u32,
     base_fg: Color,
+    theme: *const theme_mod.Theme,
     arena: std.mem.Allocator,
 ) !void {
     _ = base_fg;
-    const inline_content = try parseInline(content, quote_text_fg, arena);
-    const quote_runs = try overrideRunStyle(inline_content.runs, quote_text_fg, .{ .italic = true }, arena);
+    const inline_content = try parseInline(content, theme.fg(.md_quote), theme, arena);
+    const quote_runs = try overrideRunStyle(inline_content.runs, theme.fg(.md_quote), .{ .italic = true }, arena);
 
     const prefix = try arena.alloc(Span, 1);
-    prefix[0] = .{ .text = "│ ", .fg = quote_border_fg, .attrs = .{ .dim = true } };
+    prefix[0] = .{ .text = "│ ", .fg = theme.fg(.md_quote_border), .attrs = .{ .dim = true } };
     // "│" is 1 display column + " " = 2
     const wrapped = try wrapWithPrefix(prefix, 2, inline_content.text, quote_runs, width, arena);
     try lines.appendSlice(arena, wrapped);
@@ -513,9 +513,10 @@ fn appendListItem(
     li: ListItemInfo,
     width: u32,
     base_fg: Color,
+    theme: *const theme_mod.Theme,
     arena: std.mem.Allocator,
 ) !void {
-    const inline_content = try parseInline(li.content, base_fg, arena);
+    const inline_content = try parseInline(li.content, base_fg, theme, arena);
 
     const indent_len = @min(li.indent, 20);
     const prefix_text_len = indent_len + li.bullet_text.len;
@@ -524,7 +525,7 @@ fn appendListItem(
     @memcpy(prefix_text[indent_len..prefix_text_len], li.bullet_text);
 
     const prefix = try arena.alloc(Span, 1);
-    prefix[0] = .{ .text = prefix_text, .fg = list_bullet_fg };
+    prefix[0] = .{ .text = prefix_text, .fg = theme.fg(.md_list_bullet) };
 
     const prefix_display_width: u32 = @intCast(grapheme_mod.strWidth(prefix_text));
     const wrapped = try wrapWithPrefix(prefix, prefix_display_width, inline_content.text, inline_content.runs, width, arena);
@@ -571,6 +572,7 @@ pub const Markdown = struct {
     padding_x: u32 = 0,
     padding_y: u32 = 0,
     scroll_offset: u32 = 0,
+    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
 
@@ -702,7 +704,7 @@ pub const Markdown = struct {
         _ = self.arena.reset(.retain_capacity);
         const arena_alloc = self.arena.allocator();
 
-        const built = buildLines(self.content, content_width, self.fg, arena_alloc) catch return null;
+        const built = buildLines(self.content, content_width, self.fg, self.theme, arena_alloc) catch return null;
         self.cached_lines = built;
         self.cached_width = content_width;
         self.cached_content_len = self.content.len;
@@ -804,7 +806,7 @@ test "markdown renders list items with styled bullet" {
 
     // "- " bullet in list_bullet_fg color
     try testing.expectEqual(@as(u21, '-'), buf.get(0, 0).grapheme.codepoint);
-    try testing.expect(buf.get(0, 0).fg.eql(list_bullet_fg));
+    try testing.expect(buf.get(0, 0).fg.eql(theme_mod.Theme.dark.fg(.md_list_bullet)));
     // Content "first item" starts at col 2
     try testing.expectEqual(@as(u21, 'f'), buf.get(2, 0).grapheme.codepoint);
     // Second item on next line
