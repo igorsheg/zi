@@ -126,6 +126,9 @@ pub const Interactive = struct {
     is_streaming: bool = false,
     in_paste: bool = false,
     paste_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Kitty protocol negotiation: deadline (ns timestamp) for query response.
+    /// null = negotiation complete.
+    kitty_deadline_ns: ?i128 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -193,6 +196,7 @@ pub const Interactive = struct {
         self.tui.terminal.hideCursor();
         self.tui.terminal.enableBracketedPaste();
         self.tui.terminal.queryKittyProtocol();
+        self.kitty_deadline_ns = std.time.nanoTimestamp() + 150_000_000; // 150ms
 
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
@@ -237,7 +241,23 @@ pub const Interactive = struct {
             var input_buf: [4096]u8 = undefined;
             const n = self.tui.terminal.readInput(&input_buf) catch 0;
             if (n > 0) {
-                self.handleRawInput(input_buf[0..n]);
+                const input = input_buf[0..n];
+                // During kitty negotiation, intercept the query response
+                if (self.kitty_deadline_ns != null) {
+                    if (self.tryConsumeKittyResponse(input)) |remainder| {
+                        if (remainder.len > 0) self.handleRawInput(remainder);
+                        continue;
+                    }
+                }
+                self.handleRawInput(input);
+            }
+
+            // 2b. Kitty negotiation timeout → fall back to modifyOtherKeys
+            if (self.kitty_deadline_ns) |deadline| {
+                if (std.time.nanoTimestamp() >= deadline) {
+                    self.tui.terminal.enableModifyOtherKeys();
+                    self.kitty_deadline_ns = null;
+                }
             }
 
             // 3. Check for terminal resize
@@ -252,6 +272,36 @@ pub const Interactive = struct {
             // 5. Brief sleep to avoid busy-wait (1ms)
             std.Thread.sleep(1_000_000);
         }
+    }
+
+    /// Check if raw input contains the kitty protocol query response (\x1b[?<digits>u).
+    /// If found, enable kitty protocol and return any remaining bytes after the response.
+    /// Returns null if no response found in this input.
+    fn tryConsumeKittyResponse(self: *Interactive, data: []const u8) ?[]const u8 {
+        // Look for \x1b[? prefix
+        const prefix = "\x1b[?";
+        const start = std.mem.indexOf(u8, data, prefix) orelse return null;
+        const after_prefix = start + prefix.len;
+        if (after_prefix >= data.len) return null;
+
+        // Find 'u' terminator after digits
+        var i = after_prefix;
+        while (i < data.len and data[i] >= '0' and data[i] <= '9') : (i += 1) {}
+        if (i >= data.len or data[i] != 'u') return null;
+
+        // Matched \x1b[?<digits>u — this is the kitty response
+        self.tui.terminal.enableKittyProtocol();
+        self.kitty_deadline_ns = null;
+
+        // Return any bytes after the response (and before it, though unlikely)
+        const response_end = i + 1;
+        if (start > 0 or response_end < data.len) {
+            // Concatenating before+after would require allocation; for simplicity
+            // just return the remainder after the response. Pre-response bytes
+            // during negotiation are likely just the response itself.
+            return data[response_end..];
+        }
+        return data[0..0]; // empty slice = fully consumed
     }
 
     fn handleRawInput(self: *Interactive, data: []const u8) void {

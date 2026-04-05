@@ -161,6 +161,11 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
 
     // kitty CSI u format: \x1b[<codepoint>u or \x1b[<codepoint>;<modifier>u
     if (terminator == 'u' and kitty_active) {
+        // Filter release events (event type 3, encoded as :<event> after modifier)
+        if (param_count > 1) {
+            const event_type = extractEventType(params_slice);
+            if (event_type == 3) return .{ .key = .{ .code = .escape }, .len = seq_len }; // consume but ignore release
+        }
         return parseKittyU(params[0], if (param_count > 1) params[1] else 0, seq_len);
     }
 
@@ -232,7 +237,6 @@ fn decodeModifier(value: u16) Modifiers {
 }
 
 fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
-    // strip colon-suffixed event type from modifier (handled in parseNum)
     const mods = decodeModifier(modifier_raw);
 
     // special kitty codepoints
@@ -241,6 +245,25 @@ fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
         9 => .{ .code = .tab, .ch = null },
         13 => .{ .code = .enter, .ch = null },
         127 => .{ .code = .backspace, .ch = null },
+        // Kitty functional codepoints (Private Use Area)
+        57399...57408 => .{ .code = .char, .ch = @as(u21, codepoint - 57399) + '0' }, // KP_0-KP_9
+        57409 => .{ .code = .char, .ch = '.' }, // KP_DECIMAL
+        57410 => .{ .code = .char, .ch = '/' }, // KP_DIVIDE
+        57411 => .{ .code = .char, .ch = '*' }, // KP_MULTIPLY
+        57412 => .{ .code = .char, .ch = '-' }, // KP_SUBTRACT
+        57413 => .{ .code = .char, .ch = '+' }, // KP_ADD
+        57414 => .{ .code = .enter, .ch = null }, // KP_ENTER
+        57415 => .{ .code = .char, .ch = '=' }, // KP_EQUAL
+        57417 => .{ .code = .left, .ch = null }, // KP_LEFT
+        57418 => .{ .code = .right, .ch = null }, // KP_RIGHT
+        57419 => .{ .code = .up, .ch = null }, // KP_UP
+        57420 => .{ .code = .down, .ch = null }, // KP_DOWN
+        57421 => .{ .code = .page_up, .ch = null }, // KP_PAGE_UP
+        57422 => .{ .code = .page_down, .ch = null }, // KP_PAGE_DOWN
+        57423 => .{ .code = .home, .ch = null }, // KP_HOME
+        57424 => .{ .code = .end, .ch = null }, // KP_END
+        57425 => .{ .code = .insert, .ch = null }, // KP_INSERT
+        57426 => .{ .code = .delete, .ch = null }, // KP_DELETE
         else => if (codepoint >= 32) .{ .code = .char, .ch = @as(u21, codepoint) } else null,
     };
 
@@ -256,6 +279,20 @@ fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
     };
 
     return null;
+}
+
+/// Extract the kitty event type from the raw params slice.
+/// Format: \"<codepoint>;<modifier>:<event>\" — event type is after the
+/// LAST colon in the second (modifier) param. Returns 0 if absent.
+fn extractEventType(params_slice: []const u8) u8 {
+    // Find the semicolon separating codepoint from modifier
+    const semi = std.mem.indexOfScalar(u8, params_slice, ';') orelse return 0;
+    const mod_part = params_slice[semi + 1 ..];
+    // Find the colon separating modifier value from event type
+    const colon = std.mem.indexOfScalar(u8, mod_part, ':') orelse return 0;
+    const event_str = mod_part[colon + 1 ..];
+    if (event_str.len == 0) return 0;
+    return std.fmt.parseInt(u8, event_str, 10) catch 0;
 }
 
 /// Parse a decimal number from a slice, stopping at first ':' (colon sub-params).
@@ -341,6 +378,23 @@ test "kitty CSI-u protocol parses codepoints and modifiers" {
     try std.testing.expect(kca.key.ctrl);
     // Special kitty codepoints
     try std.testing.expectEqual(KeyCode.enter, parseKey("\x1b[13u", true).?.key.code);
+
+    // Shift+Enter: \x1b[13;2u
+    const se = parseKey("\x1b[13;2u", true).?;
+    try std.testing.expectEqual(KeyCode.enter, se.key.code);
+    try std.testing.expect(se.key.shift);
+
+    // Kitty functional codepoints (keypad)
+    try std.testing.expectEqual(KeyCode.enter, parseKey("\x1b[57414u", true).?.key.code); // KP_ENTER
+    try std.testing.expectEqual(KeyCode.left, parseKey("\x1b[57417u", true).?.key.code); // KP_LEFT
+    try std.testing.expectEqual(KeyCode.delete, parseKey("\x1b[57426u", true).?.key.code); // KP_DELETE
+    const kp0 = parseKey("\x1b[57399u", true).?;
+    try std.testing.expectEqual(@as(?u21, '0'), kp0.key.char); // KP_0
+
+    // Release events (event type 3) are filtered
+    const release = parseKey("\x1b[97;1:3u", true).?;
+    try std.testing.expectEqual(@as(usize, 9), release.len); // consumed (ESC [ 9 7 ; 1 : 3 u)
+    try std.testing.expectEqual(KeyCode.escape, release.key.code);
 }
 
 test "multi-byte UTF-8 characters" {
