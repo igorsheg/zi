@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const json_util = @import("../ai/json_util.zig");
 
 // Re-export ai protocol for convenience
 pub const Message = ai.protocol.Message;
@@ -160,6 +161,63 @@ pub const AgentToolResult = struct {
         text: TextContent,
         image: ImageContent,
     };
+
+    /// Deep-clone into owned memory so the caller can outlive the source.
+    pub fn clone(self: AgentToolResult, allocator: std.mem.Allocator) !AgentToolResult {
+        const content = try allocator.alloc(ContentBlock, self.content.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (content[0..initialized]) |block| switch (block) {
+                .text => |t| {
+                    allocator.free(t.text);
+                    if (t.text_signature) |sig| allocator.free(sig);
+                },
+                .image => |img| {
+                    allocator.free(img.data);
+                    allocator.free(img.mime_type);
+                },
+            };
+            allocator.free(content);
+        }
+
+        for (self.content, 0..) |block, i| {
+            content[i] = switch (block) {
+                .text => |t| .{ .text = .{
+                    .text = try allocator.dupe(u8, t.text),
+                    .text_signature = if (t.text_signature) |sig| try allocator.dupe(u8, sig) else null,
+                } },
+                .image => |img| .{ .image = .{
+                    .data = try allocator.dupe(u8, img.data),
+                    .mime_type = try allocator.dupe(u8, img.mime_type),
+                } },
+            };
+            initialized += 1;
+        }
+
+        const details = try json_util.cloneJsonValue(allocator, self.details);
+
+        return .{
+            .content = content,
+            .details = details,
+            .is_error = self.is_error,
+        };
+    }
+
+    /// Free all owned memory produced by clone.
+    pub fn free(self: AgentToolResult, allocator: std.mem.Allocator) void {
+        for (self.content) |block| switch (block) {
+            .text => |t| {
+                allocator.free(t.text);
+                if (t.text_signature) |sig| allocator.free(sig);
+            },
+            .image => |img| {
+                allocator.free(img.data);
+                allocator.free(img.mime_type);
+            },
+        };
+        allocator.free(self.content);
+        json_util.freeJsonValue(allocator, self.details);
+    }
 };
 
 /// Callback for streaming tool execution updates.
@@ -350,3 +408,80 @@ pub const AgentEvent = union(enum) {
 
 /// Agent event callback.
 pub const AgentEventSink = *const fn (event: AgentEvent, ctx: ?*anyopaque) void;
+
+// -----------------------------------------------------------------------------
+// Tests: AgentToolResult.clone / free
+// -----------------------------------------------------------------------------
+
+test "AgentToolResult clone+free round-trip with text content" {
+    const allocator = std.testing.allocator;
+
+    const original = AgentToolResult{
+        .content = &.{
+            .{ .text = .{ .text = "hello world", .text_signature = "sig123" } },
+        },
+        .is_error = true,
+    };
+
+    const cloned = try original.clone(allocator);
+    defer cloned.free(allocator);
+
+    try std.testing.expectEqualStrings("hello world", cloned.content[0].text.text);
+    try std.testing.expectEqualStrings("sig123", cloned.content[0].text.text_signature.?);
+    try std.testing.expect(cloned.is_error);
+    // verify independence
+    try std.testing.expect(cloned.content.ptr != original.content.ptr);
+    try std.testing.expect(cloned.content[0].text.text.ptr != original.content[0].text.text.ptr);
+}
+
+test "AgentToolResult clone+free round-trip with image content" {
+    const allocator = std.testing.allocator;
+
+    const original = AgentToolResult{
+        .content = &.{
+            .{ .image = .{ .data = "base64data", .mime_type = "image/png" } },
+        },
+    };
+
+    const cloned = try original.clone(allocator);
+    defer cloned.free(allocator);
+
+    try std.testing.expectEqualStrings("base64data", cloned.content[0].image.data);
+    try std.testing.expectEqualStrings("image/png", cloned.content[0].image.mime_type);
+    try std.testing.expect(cloned.content[0].image.data.ptr != original.content[0].image.data.ptr);
+}
+
+test "AgentToolResult clone+free with json details" {
+    const allocator = std.testing.allocator;
+
+    // Build a json object for details
+    var obj = std.json.ObjectMap.init(allocator);
+    try obj.put("key", .{ .string = "value" });
+    defer {
+        var m = obj;
+        m.deinit();
+    }
+
+    const original = AgentToolResult{
+        .content = &.{},
+        .details = .{ .object = obj },
+    };
+
+    const cloned = try original.clone(allocator);
+    defer cloned.free(allocator);
+
+    const val = cloned.details.object.get("key").?;
+    try std.testing.expectEqualStrings("value", val.string);
+}
+
+test "AgentToolResult free on empty result" {
+    const allocator = std.testing.allocator;
+
+    const empty = AgentToolResult{
+        .content = &.{},
+    };
+
+    const cloned = try empty.clone(allocator);
+    cloned.free(allocator);
+    // no crash = pass
+}

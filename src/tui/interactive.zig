@@ -36,8 +36,7 @@ const Component = component_mod.Component;
 const CursorState = component_mod.CursorState;
 const UiEvent = ui_event_mod.UiEvent;
 const Transcript = transcript_mod.Transcript;
-const ToolDisplayRegistry = tool_display_mod.ToolDisplayRegistry;
-const ToolDisplay = tool_display_mod.ToolDisplay;
+const ToolRendererRegistry = tool_display_mod.ToolRendererRegistry;
 const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
 
@@ -110,7 +109,7 @@ pub const Interactive = struct {
     header: header_mod.Header,
     footer: footer_mod.Footer,
     transcript: Transcript,
-    registry: ToolDisplayRegistry,
+    registry: ToolRendererRegistry,
 
     // ── Container slots (pi-mono parity) ──────────────────────────
     header_container: container_mod.Container,
@@ -125,6 +124,7 @@ pub const Interactive = struct {
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
+    tool_output_expanded: bool = false,
     /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
     input: input_buffer_mod.InputBuffer,
     /// Kitty protocol negotiation: deadline (ns timestamp) for query response.
@@ -134,7 +134,7 @@ pub const Interactive = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ca: *CodingAgent,
-        registry: ToolDisplayRegistry,
+        registry: ToolRendererRegistry,
         cwd: []const u8,
     ) !Interactive {
         const theme = &theme_mod.Theme.dark;
@@ -336,6 +336,14 @@ pub const Interactive = struct {
             }
         }
 
+        // ctrl+o — toggle tool output expansion
+        if (key.code == .char and key.char != null and key.char.? == 'o' and key.ctrl) {
+            self.tool_output_expanded = !self.tool_output_expanded;
+            self.transcript.setToolOutputExpanded(self.tool_output_expanded);
+            self.tui.dirty = true;
+            return;
+        }
+
         // scroll: page up/down, shift+up/down
         if (self.handleScroll(key)) return;
 
@@ -392,12 +400,10 @@ pub const Interactive = struct {
             },
             .message_start_user => {},
             .tool_call_streaming => |t| {
-                const display = self.registry.create(self.allocator, t.tool_name);
-                self.transcript.addToolExecution(t.tool_call_id, display);
-                self.transcript.updateTool(t.tool_call_id, .{ .start = .{
-                    .tool_name = t.tool_name,
-                    .args_json = t.args_json,
-                } });
+                const renderer = self.registry.get(t.tool_name);
+                self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
+                self.transcript.toolSetArgs(t.tool_call_id, t.args);
+                self.transcript.toolSetArgsComplete(t.tool_call_id);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
@@ -413,30 +419,22 @@ pub const Interactive = struct {
                 }
             },
             .tool_start => |t| {
-                const display = self.registry.create(self.allocator, t.tool_name);
-                self.transcript.addToolExecution(t.tool_call_id, display);
-                self.transcript.updateTool(t.tool_call_id, .{ .start = .{
-                    .tool_name = t.tool_name,
-                    .args_json = t.args_json,
-                } });
+                const renderer = self.registry.get(t.tool_name);
+                self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
+                self.transcript.toolSetArgs(t.tool_call_id, t.args);
+                self.transcript.toolMarkExecutionStarted(t.tool_call_id);
                 self.status_text.setContent(t.tool_name);
                 self.status_text.fg = self.theme.fg(.accent);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .tool_update => |t| {
-                self.transcript.updateTool(t.tool_call_id, .{ .update = .{
-                    .result_text = t.result_text,
-                    .is_error = t.is_error,
-                } });
+                self.transcript.toolSetPartialResult(t.tool_call_id, t.result, t.is_error);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .tool_end => |t| {
-                self.transcript.updateTool(t.tool_call_id, .{ .end = .{
-                    .result_text = t.result_text,
-                    .is_error = t.is_error,
-                } });
+                self.transcript.toolSetFinalResult(t.tool_call_id, t.result, t.is_error);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
@@ -579,11 +577,11 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
                     errdefer allocator.free(id);
                     const name = allocator.dupe(u8, tc.tool_call.name) catch return null;
                     errdefer allocator.free(name);
-                    const args_json = serializeJson(tc.tool_call.arguments, allocator) catch return null;
+                    const args = json_util.cloneJsonValue(allocator, tc.tool_call.arguments) catch return null;
                     return .{ .tool_call_streaming = .{
                         .tool_call_id = id,
                         .tool_name = name,
-                        .args_json = args_json,
+                        .args = args,
                     } };
                 },
                 else => return null,
@@ -594,30 +592,30 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
             errdefer allocator.free(id);
             const name = allocator.dupe(u8, te.tool_name) catch return null;
             errdefer allocator.free(name);
-            const args_json = serializeJson(te.args, allocator) catch return null;
+            const args = json_util.cloneJsonValue(allocator, te.args) catch return null;
             return .{ .tool_start = .{
                 .tool_call_id = id,
                 .tool_name = name,
-                .args_json = args_json,
+                .args = args,
             } };
         },
         .tool_execution_update => |te| {
             const id = allocator.dupe(u8, te.tool_call_id) catch return null;
             errdefer allocator.free(id);
-            const text = extractResultText(te.partial_result, allocator);
+            const result = if (te.partial_result) |r| (r.clone(allocator) catch return null) else null;
             return .{ .tool_update = .{
                 .tool_call_id = id,
-                .result_text = text,
+                .result = result,
                 .is_error = if (te.partial_result) |r| r.is_error else false,
             } };
         },
         .tool_execution_end => |te| {
             const id = allocator.dupe(u8, te.tool_call_id) catch return null;
             errdefer allocator.free(id);
-            const text = extractResultText(te.result, allocator);
+            const result = te.result.clone(allocator) catch return null;
             return .{ .tool_end = .{
                 .tool_call_id = id,
-                .result_text = text,
+                .result = result,
                 .is_error = te.is_error,
             } };
         },
@@ -641,49 +639,4 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
         },
         .agent_end, .agent_start, .turn_start, .turn_end => return null,
     }
-}
-
-/// Serialize a json.Value to an owned string.
-fn serializeJson(value: std.json.Value, allocator: std.mem.Allocator) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    errdefer buf.deinit(allocator);
-    var out = std.io.Writer.Allocating.fromArrayList(allocator, &buf);
-    var jw: std.json.Stringify = .{ .writer = &out.writer };
-    jw.write(value) catch return error.OutOfMemory;
-    return buf.toOwnedSlice(allocator);
-}
-
-/// Extract text output from a tool result into an owned string.
-/// Accepts both optional and non-optional AgentToolResult.
-fn extractResultText(result: anytype, allocator: std.mem.Allocator) ?[]u8 {
-    const T = @TypeOf(result);
-    const r = if (@typeInfo(T) == .optional) (result orelse return null) else result;
-    var total_len: usize = 0;
-    for (r.content) |block| {
-        switch (block) {
-            .text => |t| total_len += t.text.len + 1,
-            .image => {},
-        }
-    }
-    if (total_len == 0) return null;
-
-    const buf = allocator.alloc(u8, total_len) catch return null;
-    var pos: usize = 0;
-    for (r.content) |block| {
-        switch (block) {
-            .text => |t| {
-                if (pos > 0) {
-                    buf[pos] = '\n';
-                    pos += 1;
-                }
-                @memcpy(buf[pos..][0..t.text.len], t.text);
-                pos += t.text.len;
-            },
-            .image => {},
-        }
-    }
-    if (pos < buf.len) {
-        return allocator.realloc(buf, pos) catch buf;
-    }
-    return buf;
 }

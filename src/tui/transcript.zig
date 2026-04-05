@@ -5,6 +5,9 @@ const cell_mod = @import("cell.zig");
 const grapheme = @import("grapheme.zig");
 const markdown_mod = @import("components/markdown.zig");
 const tool_display_mod = @import("tool_display.zig");
+const agent_protocol = @import("../agent/root.zig").protocol;
+const AgentToolResult = agent_protocol.AgentToolResult;
+const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
 const word_wrap_mod = @import("word_wrap.zig");
 
@@ -12,7 +15,6 @@ const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
-const ToolDisplay = tool_display_mod.ToolDisplay;
 
 // ── Transcript Item ───────────────────────────────────────────────
 
@@ -54,15 +56,33 @@ pub const TranscriptItem = struct {
 // ── Tool Execution ────────────────────────────────────────────────
 
 /// State for a single tool execution within the transcript.
+/// Owns all data (deep-cloned from events). Handles its own rendering
+/// with bg fill, call summary, and result display.
+///
+/// Rendering uses optional ToolRenderer functions for per-tool formatting.
+/// Falls back to: bold(tool_name) for call, truncated text for result.
 pub const ToolExecution = struct {
     tool_call_id: []u8,
-    display: ToolDisplay,
-    is_complete: bool = false,
+    tool_name: []u8,
+    args: std.json.Value = .null,
+    result: ?AgentToolResult = null,
+    is_partial: bool = true,
     is_error: bool = false,
+    execution_started: bool = false,
+    args_complete: bool = false,
+    expanded: bool = false,
+    renderer: tool_display_mod.ToolRenderer = .{},
+    renderer_state: ?*anyopaque = null,
     allocator: std.mem.Allocator,
+    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
 
     pub fn deinit(self: *ToolExecution) void {
-        self.display.deinitDisplay();
+        if (self.renderer.deinit_state) |deinit_fn| {
+            if (self.renderer_state) |state| deinit_fn(state, self.allocator);
+        }
+        if (self.result) |r| r.free(self.allocator);
+        json_util.freeJsonValue(self.allocator, self.args);
+        self.allocator.free(self.tool_name);
         self.allocator.free(self.tool_call_id);
         self.allocator.destroy(self);
     }
@@ -72,17 +92,199 @@ pub const ToolExecution = struct {
         self.deinit();
     }
 
+    /// Set args (from tool_call_streaming or tool_start). Deep-clones the value.
+    pub fn setArgs(self: *ToolExecution, args: std.json.Value) void {
+        json_util.freeJsonValue(self.allocator, self.args);
+        self.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
+    }
+
+    /// Mark that execution has started (tool_start received).
+    pub fn markExecutionStarted(self: *ToolExecution) void {
+        self.execution_started = true;
+    }
+
+    /// Mark that args are complete (tool_call_streaming finished).
+    pub fn setArgsComplete(self: *ToolExecution) void {
+        self.args_complete = true;
+    }
+
+    /// Set partial result (from tool_update). Deep-clones.
+    pub fn setPartialResult(self: *ToolExecution, result: ?AgentToolResult, is_error: bool) void {
+        if (self.result) |old| old.free(self.allocator);
+        self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
+        self.is_error = is_error;
+        self.is_partial = true;
+    }
+
+    /// Set final result (from tool_end). Deep-clones.
+    pub fn setFinalResult(self: *ToolExecution, result: ?AgentToolResult, is_error: bool) void {
+        if (self.result) |old| old.free(self.allocator);
+        self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
+        self.is_error = is_error;
+        self.is_partial = false;
+    }
+
+    // ── Rendering ─────────────────────────────────────────────────
+
+    fn bgColor(self: *ToolExecution) Color {
+        if (self.is_partial)
+            return self.theme.bg(.tool_pending_bg);
+        if (self.is_error)
+            return self.theme.bg(.tool_error_bg);
+        return self.theme.bg(.tool_success_bg);
+    }
+
     pub fn measure(self: *ToolExecution, width: u32) Measurement {
+        if (width == 0) return .{ .min_height = 0, .preferred_height = 0 };
         const content_w = if (width > 2) width - 2 else 1;
-        return .{
-            .min_height = 1,
-            .preferred_height = @max(1, self.display.measure(content_w).preferred_height),
-        };
+        var h: u32 = 0;
+        h += 1;
+        h += self.measureResult(content_w);
+        return .{ .min_height = 1, .preferred_height = @max(1, h) };
     }
 
     pub fn render(self: *ToolExecution, region: Region) void {
-        const content_region = region.sub(1, 0, if (region.width > 2) region.width - 2 else 1, region.height);
-        self.display.render(content_region);
+        const w = region.width;
+        const h = region.height;
+        if (w == 0 or h == 0) return;
+
+        const bg = self.bgColor();
+        if (!bg.eql(Color.default)) {
+            region.fill(0, 0, w, h, .{
+                .grapheme = .{ .codepoint = ' ' },
+                .bg = bg,
+            });
+        }
+
+        const content_w = if (w > 2) w - 2 else 1;
+        var row: u32 = 0;
+
+        if (row < h) {
+            const call_region = region.sub(1, row, content_w, 1);
+            self.renderCall(call_region);
+            row += 1;
+        }
+
+        if (row < h) {
+            const result_h = h - row;
+            const result_region = region.sub(1, row, content_w, result_h);
+            self.renderResult(result_region);
+        }
+    }
+
+    fn renderCall(self: *ToolExecution, region: Region) void {
+        if (self.renderer.render_call) |render_fn| {
+            var ctx = self.makeRenderContext(region);
+            render_fn(&ctx);
+        } else {
+            self.renderCallFallback(region);
+        }
+    }
+
+    fn renderCallFallback(self: *ToolExecution, region: Region) void {
+        _ = region.writeStr(0, 0, self.tool_name, self.theme.fg(.tool_title), Color.default, .{ .bold = true });
+    }
+
+    fn renderResult(self: *ToolExecution, region: Region) void {
+        if (self.renderer.render_result) |render_fn| {
+            var ctx = self.makeRenderContext(region);
+            render_fn(&ctx);
+        } else {
+            self.renderResultFallback(region);
+        }
+    }
+
+    fn renderResultFallback(self: *ToolExecution, region: Region) void {
+        const result_text = self.getResultText() orelse return;
+        defer self.allocator.free(result_text);
+
+        const fg = if (self.is_error) self.theme.fg(.@"error") else self.theme.fg(.tool_output);
+        const w: usize = @intCast(region.width);
+        const lines = word_wrap_mod.wordWrap(result_text, w, self.allocator) catch return;
+        defer self.allocator.free(lines);
+
+        const max_preview: u32 = if (self.expanded) @intCast(lines.len) else 5;
+        var row: u32 = 0;
+        var line_idx: u32 = 0;
+        while (line_idx < @min(@as(u32, @intCast(lines.len)), max_preview) and row < region.height) {
+            const line = lines[line_idx];
+            _ = region.writeStr(0, row, line.text(result_text), fg, Color.default, .{});
+            row += 1;
+            line_idx += 1;
+        }
+
+        if (!self.expanded and lines.len > max_preview and row < region.height) {
+            const remaining = lines.len - max_preview;
+            var hint_buf: [64]u8 = undefined;
+            const hint = std.fmt.bufPrint(&hint_buf, "... ({d} more lines)", .{remaining}) catch "...";
+            _ = region.writeStr(0, row, hint, self.theme.fg(.dim), Color.default, .{});
+        }
+    }
+
+    fn measureResult(self: *ToolExecution, width: u32) u32 {
+        const result_text = self.getResultText() orelse return 0;
+        defer self.allocator.free(result_text);
+
+        const w: usize = @intCast(width);
+        const lines = word_wrap_mod.wordWrap(result_text, w, self.allocator) catch return 1;
+        defer self.allocator.free(lines);
+
+        if (self.expanded) return @intCast(lines.len);
+        const max_preview: u32 = 5;
+        if (lines.len > max_preview) return max_preview + 1;
+        return @intCast(lines.len);
+    }
+
+    /// Extract joined text from result content blocks.
+    fn getResultText(self: *ToolExecution) ?[]u8 {
+        const result = self.result orelse return null;
+        var total_len: usize = 0;
+        for (result.content) |block| {
+            switch (block) {
+                .text => |t| total_len += t.text.len + 1,
+                .image => {},
+            }
+        }
+        if (total_len == 0) return null;
+
+        const buf = self.allocator.alloc(u8, total_len) catch return null;
+        var pos: usize = 0;
+        for (result.content) |block| {
+            switch (block) {
+                .text => |t| {
+                    if (pos > 0) {
+                        buf[pos] = '\n';
+                        pos += 1;
+                    }
+                    @memcpy(buf[pos..][0..t.text.len], t.text);
+                    pos += t.text.len;
+                },
+                .image => {},
+            }
+        }
+        if (pos < buf.len) {
+            return self.allocator.realloc(buf, pos) catch buf[0..pos];
+        }
+        return buf;
+    }
+
+    fn makeRenderContext(self: *ToolExecution, region: Region) tool_display_mod.ToolRenderContext {
+        return .{
+            .tool_name = self.tool_name,
+            .tool_call_id = self.tool_call_id,
+            .args = self.args,
+            .result = self.result,
+            .is_partial = self.is_partial,
+            .is_error = self.is_error,
+            .expanded = self.expanded,
+            .execution_started = self.execution_started,
+            .args_complete = self.args_complete,
+            .theme = self.theme,
+            .allocator = self.allocator,
+            .state = self.renderer_state,
+            .region = region,
+            .width = region.width,
+        };
     }
 
     pub fn component(self: *ToolExecution) Component {
@@ -225,25 +427,33 @@ pub const Transcript = struct {
     pub fn addToolExecution(
         self: *Transcript,
         tool_call_id: []const u8,
-        display: ToolDisplay,
+        tool_name: []const u8,
+        renderer: tool_display_mod.ToolRenderer,
     ) void {
-        if (self.pending_tools.contains(tool_call_id)) {
-            display.deinitDisplay();
-            return;
-        }
+        if (self.pending_tools.contains(tool_call_id)) return;
 
         self.current_text_idx = null;
 
         const id = self.allocator.dupe(u8, tool_call_id) catch return;
+        const name = self.allocator.dupe(u8, tool_name) catch {
+            self.allocator.free(id);
+            return;
+        };
         const te = self.allocator.create(ToolExecution) catch {
+            self.allocator.free(name);
             self.allocator.free(id);
             return;
         };
         te.* = .{
             .tool_call_id = id,
-            .display = display,
+            .tool_name = name,
             .allocator = self.allocator,
+            .theme = self.theme,
+            .renderer = renderer,
         };
+        if (renderer.init_state) |init_fn| {
+            te.renderer_state = init_fn(self.allocator);
+        }
 
         const item_idx = self.items.items.len;
         self.items.append(self.allocator, .{
@@ -259,21 +469,53 @@ pub const Transcript = struct {
         self.pending_tools.put(self.allocator, te.tool_call_id, item_idx) catch {};
     }
 
-    /// Route an event to a tool execution by ID.
-    pub fn updateTool(self: *Transcript, tool_call_id: []const u8, event: ToolDisplay.Event) void {
-        const idx = self.pending_tools.get(tool_call_id) orelse return;
-        if (idx >= self.items.items.len) return;
+    /// Get the ToolExecution for a pending tool by ID.
+    fn getToolExecution(self: *Transcript, tool_call_id: []const u8) ?*ToolExecution {
+        const idx = self.pending_tools.get(tool_call_id) orelse return null;
+        if (idx >= self.items.items.len) return null;
         const item = &self.items.items[idx];
-        if (item.kind != .tool_execution) return;
-        const te: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
-        te.display.apply(event);
-        switch (event) {
-            .end => |e| {
-                te.is_complete = true;
-                te.is_error = e.is_error;
-                _ = self.pending_tools.remove(tool_call_id);
-            },
-            else => {},
+        if (item.kind != .tool_execution) return null;
+        return @ptrCast(@alignCast(item.deinit_ctx.?));
+    }
+
+    /// Set args on a tool execution (from tool_call_streaming or tool_start).
+    pub fn toolSetArgs(self: *Transcript, tool_call_id: []const u8, args: std.json.Value) void {
+        const te = self.getToolExecution(tool_call_id) orelse return;
+        te.setArgs(args);
+    }
+
+    /// Mark a tool execution as started.
+    pub fn toolMarkExecutionStarted(self: *Transcript, tool_call_id: []const u8) void {
+        const te = self.getToolExecution(tool_call_id) orelse return;
+        te.markExecutionStarted();
+    }
+
+    /// Mark args as complete on a tool execution.
+    pub fn toolSetArgsComplete(self: *Transcript, tool_call_id: []const u8) void {
+        const te = self.getToolExecution(tool_call_id) orelse return;
+        te.setArgsComplete();
+    }
+
+    /// Set partial result on a tool execution.
+    pub fn toolSetPartialResult(self: *Transcript, tool_call_id: []const u8, result: ?AgentToolResult, is_error: bool) void {
+        const te = self.getToolExecution(tool_call_id) orelse return;
+        te.setPartialResult(result, is_error);
+    }
+
+    /// Set final result on a tool execution and remove from pending.
+    pub fn toolSetFinalResult(self: *Transcript, tool_call_id: []const u8, result: ?AgentToolResult, is_error: bool) void {
+        const te = self.getToolExecution(tool_call_id) orelse return;
+        te.setFinalResult(result, is_error);
+        _ = self.pending_tools.remove(tool_call_id);
+    }
+
+    /// Toggle expansion state on all tool executions.
+    pub fn setToolOutputExpanded(self: *Transcript, expanded: bool) void {
+        for (self.items.items) |*item| {
+            if (item.kind == .tool_execution) {
+                const te: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
+                te.expanded = expanded;
+            }
         }
     }
 
@@ -375,24 +617,9 @@ pub const Transcript = struct {
         }
     }
 
-    fn renderItem(self: *Transcript, item: *TranscriptItem, row_region: Region, skipped: u32, visible_h: u32, w: u32) void {
+    fn renderItem(_: *Transcript, item: *TranscriptItem, row_region: Region, skipped: u32, visible_h: u32, w: u32) void {
         switch (item.kind) {
             .tool_execution => {
-                // Tool bg fill
-                const te: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
-                const bg = if (!te.is_complete)
-                    self.theme.bg(.tool_pending_bg)
-                else if (te.is_error)
-                    self.theme.bg(.tool_error_bg)
-                else
-                    self.theme.bg(.tool_success_bg);
-
-                if (!bg.eql(Color.default)) {
-                    row_region.fill(0, 0, w, visible_h, .{
-                        .grapheme = .{ .codepoint = ' ' },
-                        .bg = bg,
-                    });
-                }
                 item.component.render(row_region);
             },
             .user_message => {
@@ -451,10 +678,15 @@ test "Transcript renders assistant text and tool execution in order" {
     transcript.beginAssistantMessage();
     transcript.appendText("hello from assistant");
 
-    const display = tool_display_mod.GenericDisplay.create(testing.allocator, "bash").?;
-    transcript.addToolExecution("tool-1", display);
-    transcript.updateTool("tool-1", .{ .start = .{ .tool_name = "bash", .args_json = "echo hi" } });
-    transcript.updateTool("tool-1", .{ .end = .{ .result_text = "hi", .is_error = false } });
+    transcript.addToolExecution("tool-1", "bash", .{});
+    transcript.toolSetArgs("tool-1", .null);
+    transcript.toolSetArgsComplete("tool-1");
+    transcript.toolMarkExecutionStarted("tool-1");
+
+    var content = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "hi" } },
+    };
+    transcript.toolSetFinalResult("tool-1", .{ .content = &content, .is_error = false }, false);
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 
