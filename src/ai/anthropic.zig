@@ -209,13 +209,25 @@ pub const AnthropicProvider = struct {
         // Abort signal: pointer to bool set by another thread (agent.abort())
         const abort_flag: ?*const bool = if (options.signal) |s| @ptrCast(@alignCast(s)) else null;
 
+        // Set socket read timeout (100ms) so blocking reads return periodically.
+        // This lets us check the abort flag during long thinking pauses.
+        // SO_RCVTIMEO causes the socket read to return EAGAIN on timeout,
+        // which propagates as error.ReadFailed through TLS and HTTP layers
+        // WITHOUT poisoning the TLS state (verified: TLS passes ReadFailed
+        // through without calling failRead/setting read_err).
+        if (abort_flag != null) {
+            if (req.connection) |conn| {
+                setReadTimeout(conn.stream_reader.getStream().handle, 100);
+            }
+        }
+
         // Emit start event
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
-        // Process SSE events line by line (zig 0.15: takeDelimiterInclusive)
+        // Process SSE events line by line.
 
         while (true) {
-            // Check abort between chunks
+            // Check abort
             if (abort_flag) |flag| {
                 if (flag.*) {
                     state.partial.stop_reason = .aborted;
@@ -231,6 +243,10 @@ pub const AnthropicProvider = struct {
                         }
                     }
                     break;
+                },
+                error.ReadFailed => {
+                    // SO_RCVTIMEO fired — loop back to check abort flag
+                    continue;
                 },
                 else => {
                     emitError(allocator, callback, callback_ctx, "stream read error: {s}", .{@errorName(err)});
@@ -809,6 +825,17 @@ fn emitError(allocator: std.mem.Allocator, callback: ai_provider.EventCallback, 
     };
     defer allocator.free(msg);
     emitErrorDirect(callback, ctx, msg);
+}
+
+/// Set SO_RCVTIMEO on a socket so blocking reads return after timeout_ms.
+/// On timeout, the socket read returns EAGAIN which propagates as
+/// error.ReadFailed through zig's TLS and HTTP reader layers.
+fn setReadTimeout(fd: std.posix.fd_t, timeout_ms: u32) void {
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
 fn emitErrorDirect(callback: ai_provider.EventCallback, ctx: ?*anyopaque, msg: []const u8) void {
