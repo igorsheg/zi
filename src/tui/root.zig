@@ -13,6 +13,7 @@ pub const transcript = @import("transcript.zig");
 pub const container = @import("container.zig");
 pub const overlay = @import("overlay.zig");
 pub const tui = @import("tui.zig");
+pub const editor_iface = @import("editor_iface.zig");
 pub const theme = @import("theme.zig");
 
 test {

@@ -17,6 +17,7 @@ const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
 const tui_mod = @import("tui.zig");
+const editor_iface_mod = @import("editor_iface.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -37,6 +38,7 @@ const Transcript = transcript_mod.Transcript;
 const ToolDisplayRegistry = tool_display_mod.ToolDisplayRegistry;
 const ToolDisplay = tool_display_mod.ToolDisplay;
 const TUI = tui_mod.TUI;
+const EditorInterface = editor_iface_mod.EditorInterface;
 
 /// Thread-safe queue: agent thread pushes, main thread drains.
 fn EventQueue(comptime T: type) type {
@@ -99,6 +101,10 @@ pub const Interactive = struct {
 
     // ── Owned components ──────────────────────────────────────────
     editor: editor_mod.Editor,
+    /// Active editor interface — routes paste/newline/ctrl+d/clear.
+    /// Defaults to the built-in editor. Extensions can swap via setEditor().
+    /// Initialized in init() after self.editor is set up.
+    active_editor: EditorInterface = undefined,
     status_text: text_mod.Text,
     header: header_mod.Header,
     footer: footer_mod.Footer,
@@ -150,6 +156,7 @@ pub const Interactive = struct {
         };
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
+        self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
         self.transcript.theme = theme;
         return self;
     }
@@ -191,11 +198,11 @@ pub const Interactive = struct {
         // Populate container slots with their initial children.
         self.header_container.addChild(self.header.component());
         self.status_container.addChild(self.status_text.component());
-        self.editor_container.addChild(self.editor.component());
+        self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
 
         // Set initial focus via TUI (source of truth for input routing)
-        self.tui.setFocus(self.editor.component());
+        self.tui.setFocus(self.active_editor.component());
 
         // Build root tree matching pi-mono slot structure:
         // headerContainer → chat(flex) → pending → status → widget_above → editor(focused) → widget_below → footer
@@ -249,7 +256,7 @@ pub const Interactive = struct {
             if (self.in_paste) {
                 if (std.mem.indexOfPos(u8, data, offset, "\x1b[201~")) |end_pos| {
                     self.paste_buf.appendSlice(self.allocator, data[offset..end_pos]) catch {};
-                    self.editor.insertText(self.paste_buf.items);
+                    self.active_editor.insertText(self.paste_buf.items);
                     self.paste_buf.items.len = 0;
                     self.in_paste = false;
                     self.tui.dirty = true;
@@ -271,7 +278,7 @@ pub const Interactive = struct {
 
             // Also treat bare \n as newline insertion (some terminals send this for shift+enter)
             if (data[offset] == '\n') {
-                self.editor.insertText("\n");
+                self.active_editor.insertText("\n");
                 self.tui.dirty = true;
                 offset += 1;
                 continue;
@@ -304,7 +311,7 @@ pub const Interactive = struct {
         }
 
         if (key.code == .char and key.char != null and key.char.? == 'd' and key.ctrl) {
-            if (self.editor.getText().len == 0) {
+            if (self.active_editor.getText().len == 0) {
                 self.running = false;
                 return;
             }
@@ -419,7 +426,7 @@ pub const Interactive = struct {
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.status_text.setContent("");
-                self.tui.setFocus(self.editor.component());
+                self.tui.setFocus(self.active_editor.component());
                 self.tui.dirty = true;
             },
             .agent_error => {
@@ -428,7 +435,7 @@ pub const Interactive = struct {
                 self.agent_thread = null;
                 self.status_text.setContent("error occurred");
                 self.status_text.fg = self.theme.fg(.@"error");
-                self.tui.setFocus(self.editor.component());
+                self.tui.setFocus(self.active_editor.component());
                 self.tui.dirty = true;
             },
         }
@@ -482,7 +489,7 @@ pub const Interactive = struct {
 
         const prompt_copy = self.allocator.dupe(u8, text) catch return;
 
-        self.editor.clear();
+        self.active_editor.clear();
         self.is_streaming = true;
         self.tui.setFocus(null); // defocus editor during streaming
         self.status_text.setContent("sending...");
@@ -491,7 +498,7 @@ pub const Interactive = struct {
 
         self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, prompt_copy }) catch {
             self.is_streaming = false;
-            self.tui.setFocus(self.editor.component());
+            self.tui.setFocus(self.active_editor.component());
             self.status_text.setContent("failed to start agent");
             self.status_text.fg = self.theme.fg(.@"error");
             self.allocator.free(prompt_copy);
