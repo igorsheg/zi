@@ -206,19 +206,28 @@ pub const AnthropicProvider = struct {
             state.content_blocks.deinit(allocator);
         }
 
-        // Abort signal: pointer to bool set by another thread (agent.abort())
+        // Abort: the signal is a *const bool. When set, we need to break
+        // out of the blocking read. Since zig's chunked HTTP parser is NOT
+        // retry-safe (SO_RCVTIMEO corrupts parser state), we close the
+        // socket from a watchdog thread. This causes the blocking read to
+        // fail with an error, which we catch and classify as aborted.
         const abort_flag: ?*const bool = if (options.signal) |s| @ptrCast(@alignCast(s)) else null;
+        const socket_fd: ?std.posix.fd_t = if (req.connection) |conn|
+            conn.stream_reader.getStream().handle
+        else
+            null;
 
-        // Set socket read timeout (100ms) so blocking reads return periodically.
-        // This lets us check the abort flag during long thinking pauses.
-        // SO_RCVTIMEO causes the socket read to return EAGAIN on timeout,
-        // which propagates as error.ReadFailed through TLS and HTTP layers
-        // WITHOUT poisoning the TLS state (verified: TLS passes ReadFailed
-        // through without calling failRead/setting read_err).
-        if (abort_flag != null) {
-            if (req.connection) |conn| {
-                setReadTimeout(conn.stream_reader.getStream().handle, 100);
-            }
+        // Spawn abort watchdog: polls the abort flag every 100ms,
+        // shuts down the socket when abort is requested.
+        var watchdog_done: bool = false;
+        var watchdog_thread: ?std.Thread = null;
+        if (abort_flag != null and socket_fd != null) {
+            const wd_ctx = WatchdogCtx{ .abort_flag = abort_flag.?, .socket_fd = socket_fd.?, .done = &watchdog_done };
+            watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{wd_ctx}) catch null;
+        }
+        defer {
+            watchdog_done = true;
+            if (watchdog_thread) |t| t.join();
         }
 
         // Emit start event
@@ -227,14 +236,6 @@ pub const AnthropicProvider = struct {
         // Process SSE events line by line.
 
         while (true) {
-            // Check abort
-            if (abort_flag) |flag| {
-                if (flag.*) {
-                    state.partial.stop_reason = .aborted;
-                    break;
-                }
-            }
-
             const line_with_nl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => {
                     if (parser.has_data or parser.event_len > 0) {
@@ -244,11 +245,14 @@ pub const AnthropicProvider = struct {
                     }
                     break;
                 },
-                error.ReadFailed => {
-                    // SO_RCVTIMEO fired — loop back to check abort flag
-                    continue;
-                },
                 else => {
+                    // Check if this was caused by abort
+                    if (abort_flag) |flag| {
+                        if (flag.*) {
+                            state.partial.stop_reason = .aborted;
+                            break;
+                        }
+                    }
                     emitError(allocator, callback, callback_ctx, "stream read error: {s}", .{@errorName(err)});
                     return;
                 },
@@ -827,15 +831,26 @@ fn emitError(allocator: std.mem.Allocator, callback: ai_provider.EventCallback, 
     emitErrorDirect(callback, ctx, msg);
 }
 
-/// Set SO_RCVTIMEO on a socket so blocking reads return after timeout_ms.
-/// On timeout, the socket read returns EAGAIN which propagates as
-/// error.ReadFailed through zig's TLS and HTTP reader layers.
-fn setReadTimeout(fd: std.posix.fd_t, timeout_ms: u32) void {
-    const tv = std.posix.timeval{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+const WatchdogCtx = struct {
+    abort_flag: *const bool,
+    socket_fd: std.posix.fd_t,
+    /// Set to true when the stream ends normally so the watchdog exits.
+    done: *bool,
+};
+
+/// Watchdog thread: polls abort flag every 100ms. When set, shuts down
+/// the socket to unblock any blocking read on the SSE reader thread.
+/// Uses shutdown() instead of close() to avoid double-close with req.deinit().
+fn abortWatchdog(ctx: WatchdogCtx) void {
+    while (!ctx.abort_flag.* and !ctx.done.*) {
+        std.Thread.sleep(100_000_000); // 100ms
+    }
+    if (ctx.done.*) return; // stream ended normally
+    // Shutdown the socket (not close) to unblock reads.
+    // shutdown() makes the fd return 0/error on reads but keeps it valid
+    // for req.deinit() to close later.
+    const SHUT_RDWR = 2;
+    _ = std.posix.system.shutdown(ctx.socket_fd, SHUT_RDWR);
 }
 
 fn emitErrorDirect(callback: ai_provider.EventCallback, ctx: ?*anyopaque, msg: []const u8) void {
