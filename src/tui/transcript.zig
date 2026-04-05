@@ -228,6 +228,14 @@ pub const ToolExecution = struct {
     }
 
     fn measureResult(self: *ToolExecution, width: u32) u32 {
+        if (self.renderer.measure_result) |measure_fn| {
+            var ctx = self.makeMeasureContext(width);
+            return measure_fn(&ctx);
+        }
+        return self.measureResultFallback(width);
+    }
+
+    fn measureResultFallback(self: *ToolExecution, width: u32) u32 {
         const result_text = self.getResultText() orelse return 0;
         defer self.allocator.free(result_text);
 
@@ -272,6 +280,25 @@ pub const ToolExecution = struct {
             return self.allocator.realloc(buf, pos) catch buf[0..pos];
         }
         return buf;
+    }
+
+    fn makeMeasureContext(self: *ToolExecution, width: u32) tool_display_mod.ToolRenderContext {
+        return .{
+            .tool_name = self.tool_name,
+            .tool_call_id = self.tool_call_id,
+            .args = self.args,
+            .result = self.result,
+            .is_partial = self.is_partial,
+            .is_error = self.is_error,
+            .expanded = self.expanded,
+            .execution_started = self.execution_started,
+            .args_complete = self.args_complete,
+            .theme = self.theme,
+            .allocator = self.allocator,
+            .state = self.renderer_state,
+            .region = undefined,
+            .width = width,
+        };
     }
 
     fn makeRenderContext(self: *ToolExecution, region: Region) tool_display_mod.ToolRenderContext {

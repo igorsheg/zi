@@ -8,6 +8,7 @@ const AgentToolResult = agent_protocol.AgentToolResult;
 pub const ToolRenderer = struct {
     render_call: ?*const fn (ctx: *const ToolRenderContext) void = null,
     render_result: ?*const fn (ctx: *const ToolRenderContext) void = null,
+    measure_result: ?*const fn (ctx: *const ToolRenderContext) u32 = null,
     init_state: ?*const fn (allocator: std.mem.Allocator) ?*anyopaque = null,
     deinit_state: ?*const fn (state: *anyopaque, allocator: std.mem.Allocator) void = null,
 };
@@ -60,6 +61,7 @@ test "ToolRendererRegistry returns empty renderer for unknown tool" {
     const renderer = registry.get("unknown");
     try testing.expect(renderer.render_call == null);
     try testing.expect(renderer.render_result == null);
+    try testing.expect(renderer.measure_result == null);
     try testing.expect(renderer.init_state == null);
     try testing.expect(renderer.deinit_state == null);
 }
