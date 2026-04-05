@@ -134,12 +134,16 @@ pub const ToolExecution = struct {
         return self.theme.bg(.tool_success_bg);
     }
 
+    // Vertical padding inside the bg box (pi-mono: Box(paddingX=1, paddingY=1))
+    const padding_y: u32 = 1;
+
     pub fn measure(self: *ToolExecution, width: u32) Measurement {
         if (width == 0) return .{ .min_height = 0, .preferred_height = 0 };
         const content_w = if (width > 2) width - 2 else 1;
-        var h: u32 = 0;
-        h += 1;
+        var h: u32 = padding_y; // top padding
+        h += 1; // call line
         h += self.measureResult(content_w);
+        h += padding_y; // bottom padding
         return .{ .min_height = 1, .preferred_height = @max(1, h) };
     }
 
@@ -157,7 +161,7 @@ pub const ToolExecution = struct {
         }
 
         const content_w = if (w > 2) w - 2 else 1;
-        var row: u32 = 0;
+        var row: u32 = padding_y; // skip top padding
 
         if (row < h) {
             const call_region = region.sub(1, row, content_w, 1);
@@ -165,10 +169,12 @@ pub const ToolExecution = struct {
             row += 1;
         }
 
-        if (row < h) {
-            const result_h = h - row;
-            const result_region = region.sub(1, row, content_w, result_h);
-            self.renderResult(result_region);
+        if (row < h -| padding_y) {
+            const result_h = h -| row -| padding_y; // leave room for bottom padding
+            if (result_h > 0) {
+                const result_region = region.sub(1, row, content_w, result_h);
+                self.renderResult(result_region);
+            }
         }
     }
 
@@ -460,6 +466,7 @@ pub const Transcript = struct {
             .component = te.component(),
             .kind = .tool_execution,
             .tool_call_id = te.tool_call_id,
+            .extra_height = 1, // spacer before tool (pi-mono: Spacer(1))
             .deinit_ctx = @ptrCast(te),
             .deinit_fn = ToolExecution.deinitItem,
         }) catch {
@@ -620,7 +627,19 @@ pub const Transcript = struct {
     fn renderItem(_: *Transcript, item: *TranscriptItem, row_region: Region, skipped: u32, visible_h: u32, w: u32) void {
         switch (item.kind) {
             .tool_execution => {
-                item.component.render(row_region);
+                // Tool execution: extra_height=1 spacer before the bg box
+                const row_skip = skipped;
+                if (item.extra_height > 0 and row_skip < item.extra_height) {
+                    // Spacer still visible — render tool into remaining space
+                    const spacer_visible = item.extra_height - row_skip;
+                    if (visible_h > spacer_visible) {
+                        const tool_region = row_region.sub(0, spacer_visible, w, visible_h - spacer_visible);
+                        item.component.render(tool_region);
+                    }
+                } else {
+                    // Spacer scrolled past — render tool directly
+                    item.component.render(row_region);
+                }
             },
             .user_message => {
                 // User message: extra_height=1 spacer before the markdown bubble
