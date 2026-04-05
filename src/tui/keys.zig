@@ -48,6 +48,36 @@ pub const ParseResult = struct {
     len: usize,
 };
 
+
+pub const MouseButton = enum {
+    left,
+    middle,
+    right,
+    scroll_up,
+    scroll_down,
+    none,
+};
+
+pub const MouseEvent = struct {
+    button: MouseButton,
+    x: u16,
+    y: u16,
+    ctrl: bool = false,
+    alt: bool = false,
+    shift: bool = false,
+};
+
+pub const MouseResult = struct {
+    event: MouseEvent,
+    len: usize,
+};
+
+pub const InputEvent = union(enum) {
+    key: ParseResult,
+    mouse: MouseResult,
+};
+
+
 /// Parse a terminal input sequence into a Key event.
 /// Returns null if the input is not a recognized sequence or is incomplete.
 pub fn parseKey(data: []const u8, kitty_active: bool) ?ParseResult {
@@ -69,6 +99,23 @@ pub fn parseKey(data: []const u8, kitty_active: bool) ?ParseResult {
 
     return null;
 }
+
+/// Parse terminal input as either a key or mouse event.
+/// Returns null if unrecognized or incomplete.
+pub fn parseInput(data: []const u8, kitty_active: bool) ?InputEvent {
+    if (data.len == 0) return null;
+
+    // Try SGR mouse first: ESC[<...M or ESC[<...m
+    if (data.len >= 3 and data[0] == 0x1B and data[1] == '[' and data[2] == '<') {
+        if (parseSgrMouse(data)) |m| return .{ .mouse = m };
+    }
+
+    // Fall back to key parsing
+    if (parseKey(data, kitty_active)) |k| return .{ .key = k };
+
+    return null;
+}
+
 
 fn parseEscape(data: []const u8, kitty_active: bool) ?ParseResult {
     if (data.len == 1) return .{ .key = .{ .code = .escape }, .len = 1 };
@@ -331,6 +378,81 @@ fn parseNum(s: []const u8) u16 {
     return result;
 }
 
+/// Parse SGR mouse sequence: ESC[<button;x;yM or ESC[<button;x;ym
+fn parseSgrMouse(data: []const u8) ?MouseResult {
+    // ESC[< already confirmed by caller
+    // Find terminator M (press) or m (release)
+    var i: usize = 3;
+    while (i < data.len) : (i += 1) {
+        if (data[i] == 'M' or data[i] == 'm') break;
+    }
+    if (i >= data.len) return null; // incomplete
+
+    const is_release = data[i] == 'm';
+    const seq_len = i + 1;
+    const params = data[3..i];
+
+    // Parse three semicolon-separated numbers: button;x;y
+    var nums: [3]u16 = .{ 0, 0, 0 };
+    var num_idx: usize = 0;
+    var start: usize = 0;
+    for (params, 0..) |c, j| {
+        if (c == ';') {
+            if (num_idx < 3) {
+                nums[num_idx] = parseNum(params[start..j]);
+                num_idx += 1;
+            }
+            start = j + 1;
+        }
+    }
+    if (num_idx < 3) {
+        nums[num_idx] = parseNum(params[start..]);
+        num_idx += 1;
+    }
+    if (num_idx < 3) return null; // need all 3 params
+
+    const button_code = nums[0];
+    const x = if (nums[1] > 0) nums[1] - 1 else 0; // 1-based to 0-based
+    const y = if (nums[2] > 0) nums[2] - 1 else 0;
+
+    // Decode modifiers from button code
+    const ctrl = (button_code & 16) != 0;
+    const alt_mod = (button_code & 8) != 0;
+    const shift_mod = (button_code & 4) != 0;
+    const base_button = button_code & ~@as(u16, 0x1C); // strip modifier bits (4+8+16)
+
+    // Decode button
+    const button: MouseButton = switch (base_button) {
+        0 => .left,
+        1 => .middle,
+        2 => .right,
+        64 => .scroll_up,
+        65 => .scroll_down,
+        else => .none,
+    };
+
+    // For regular buttons, ignore release events (we only care about press)
+    // For scroll, there's no release — it's always 'M'
+    if (is_release and button != .scroll_up and button != .scroll_down) {
+        return .{
+            .event = .{ .button = .none, .x = x, .y = y },
+            .len = seq_len,
+        };
+    }
+
+    return .{
+        .event = .{
+            .button = button,
+            .x = x,
+            .y = y,
+            .ctrl = ctrl,
+            .alt = alt_mod,
+            .shift = shift_mod,
+        },
+        .len = seq_len,
+    };
+}
+
 fn parseUtf8Char(data: []const u8) ?ParseResult {
     const len = std.unicode.utf8ByteSequenceLength(data[0]) catch return null;
     if (data.len < len) return null;
@@ -450,5 +572,37 @@ test "multi-byte UTF-8 characters" {
     try std.testing.expectEqual(KeyCode.char, result.key.code);
     try std.testing.expectEqual(@as(?u21, 0xE9), result.key.char);
     try std.testing.expectEqual(@as(usize, 2), result.len);
+}
+
+test "parseSgrMouse scroll up" {
+    const result = parseSgrMouse("\x1b[<64;10;20M");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(MouseButton.scroll_up, result.?.event.button);
+    try std.testing.expectEqual(@as(u16, 9), result.?.event.x);
+    try std.testing.expectEqual(@as(u16, 19), result.?.event.y);
+}
+
+test "parseSgrMouse scroll down" {
+    const result = parseSgrMouse("\x1b[<65;5;15M");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(MouseButton.scroll_down, result.?.event.button);
+}
+
+test "parseInput returns mouse for SGR scroll" {
+    const result = parseInput("\x1b[<64;1;1M", false);
+    try std.testing.expect(result != null);
+    switch (result.?) {
+        .mouse => |m| try std.testing.expectEqual(MouseButton.scroll_up, m.event.button),
+        .key => try std.testing.expect(false),
+    }
+}
+
+test "parseInput returns key for regular input" {
+    const result = parseInput("a", false);
+    try std.testing.expect(result != null);
+    switch (result.?) {
+        .key => |k| try std.testing.expectEqual(KeyCode.char, k.key.code),
+        .mouse => try std.testing.expect(false),
+    }
 }
 

@@ -198,6 +198,7 @@ pub const Interactive = struct {
         self.tui.terminal.hideCursor();
         self.tui.terminal.enableBracketedPaste();
         self.tui.terminal.queryKittyProtocol();
+        self.tui.terminal.enableMouseTracking();
         self.kitty_deadline_ns = std.time.nanoTimestamp() + 150_000_000; // 150ms
 
         self.editor.on_submit = &onEditorSubmit;
@@ -301,8 +302,11 @@ pub const Interactive = struct {
             return;
         }
 
-        const result = keys_mod.parseKey(seq, self.tui.terminal.kitty_active) orelse return;
-        self.handleKey(result.key);
+        const result = keys_mod.parseInput(seq, self.tui.terminal.kitty_active) orelse return;
+        switch (result) {
+            .key => |k| self.handleKey(k.key),
+            .mouse => |m| self.handleMouse(m.event),
+        }
     }
 
     /// Called by InputBuffer when paste content is complete.
@@ -379,6 +383,34 @@ pub const Interactive = struct {
         }
         return false;
     }
+
+    fn handleMouse(self: *Interactive, event: keys_mod.MouseEvent) void {
+        switch (event.button) {
+            .scroll_up => {
+                const w = self.tui.width();
+                const total = self.transcript.totalHeight(w);
+                const output_h = self.outputHeight();
+                _ = total;
+                _ = output_h;
+                if (self.transcript.scroll_offset >= 3) {
+                    self.transcript.scroll_offset -= 3;
+                } else {
+                    self.transcript.scroll_offset = 0;
+                }
+                self.tui.dirty = true;
+            },
+            .scroll_down => {
+                const w = self.tui.width();
+                const total = self.transcript.totalHeight(w);
+                const output_h = self.outputHeight();
+                const max_scroll: u32 = if (total > output_h) total - output_h else 0;
+                self.transcript.scroll_offset = @min(self.transcript.scroll_offset + 3, max_scroll);
+                self.tui.dirty = true;
+            },
+            else => {},
+        }
+    }
+
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {

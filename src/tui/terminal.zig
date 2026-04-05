@@ -164,6 +164,17 @@ pub const Terminal = struct {
         self.modify_other_keys_active = false;
     }
 
+    /// Enable SGR mouse tracking (button events + scroll wheel).
+    pub fn enableMouseTracking(self: *Terminal) void {
+        self.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    }
+
+    /// Disable mouse tracking.
+    pub fn disableMouseTracking(self: *Terminal) void {
+        self.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    }
+
+
     /// Read available input bytes (non-blocking if raw mode with MIN=0).
     pub fn readInput(self: *Terminal, buf: []u8) !usize {
         return posix.read(self.fd_in, buf) catch |err| switch (err) {
@@ -192,6 +203,7 @@ pub const Terminal = struct {
             "\x1b[?2004l" ++ // disable bracketed paste
             "\x1b[<u" ++ // disable kitty
             "\x1b[>4;0m" ++ // disable modifyOtherKeys
+            "\x1b[?1006l\x1b[?1002l\x1b[?1000l" ++ // disable mouse tracking
             "\x1b[0m"; // reset attributes
         _ = posix.write(self.fd_out, seq) catch {};
         if (self.original_termios) |orig| {
@@ -203,6 +215,7 @@ pub const Terminal = struct {
     pub fn deinit(self: *Terminal) void {
         if (self.kitty_active) self.disableKittyProtocol();
         if (self.modify_other_keys_active) self.disableModifyOtherKeys();
+        self.disableMouseTracking();
         self.disableBracketedPaste();
         self.showCursor();
         self.exitRawMode();
