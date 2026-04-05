@@ -18,6 +18,7 @@ const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
+const input_buffer_mod = @import("input_buffer.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -124,13 +125,11 @@ pub const Interactive = struct {
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
-    in_paste: bool = false,
-    paste_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
+    input: input_buffer_mod.InputBuffer,
     /// Kitty protocol negotiation: deadline (ns timestamp) for query response.
     /// null = negotiation complete.
     kitty_deadline_ns: ?i128 = null,
-    /// Buffer for kitty protocol probe response that may arrive split across reads.
-    kitty_probe_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -156,6 +155,7 @@ pub const Interactive = struct {
             .widget_above_container = container_mod.Container.init(allocator),
             .editor_container = container_mod.Container.init(allocator),
             .widget_below_container = container_mod.Container.init(allocator),
+            .input = input_buffer_mod.InputBuffer.init(allocator),
             .event_queue = EventQueue(UiEvent).init(allocator),
             .ca = ca,
         };
@@ -177,8 +177,7 @@ pub const Interactive = struct {
             if (count == 0) break;
             for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
         }
-        self.paste_buf.deinit(self.allocator);
-        self.kitty_probe_buf.deinit(self.allocator);
+        self.input.deinit();
         self.event_queue.deinit();
         self.widget_below_container.deinit();
         self.editor_container.deinit();
@@ -241,31 +240,34 @@ pub const Interactive = struct {
             }
 
             // 2. Poll terminal input (non-blocking: MIN=0, TIME=0)
-            var input_buf: [4096]u8 = undefined;
-            const n = self.tui.terminal.readInput(&input_buf) catch 0;
+            var input_raw: [4096]u8 = undefined;
+            const n = self.tui.terminal.readInput(&input_raw) catch 0;
             if (n > 0) {
-                const input = input_buf[0..n];
-                // During kitty negotiation, buffer input and scan for response
+                // During kitty negotiation, feed through InputBuffer and check for response
                 if (self.kitty_deadline_ns != null) {
-                    self.kitty_probe_buf.appendSlice(self.allocator, input) catch {};
-                    if (self.tryConsumeKittyResponse(self.kitty_probe_buf.items)) |remainder| {
-                        if (remainder.len > 0) self.handleRawInput(remainder);
-                        self.kitty_probe_buf.items.len = 0;
+                    self.input.buf.appendSlice(self.allocator, input_raw[0..n]) catch {};
+                    if (self.input.consumeKittyResponse()) {
+                        self.tui.terminal.enableKittyProtocol();
+                        self.kitty_deadline_ns = null;
                     }
-                    continue; // don't process raw input during negotiation
+                    // Don't drain sequences during negotiation — hold for kitty or timeout
+                    if (self.kitty_deadline_ns != null) continue;
                 }
-                self.handleRawInput(input);
+                // Feed through InputBuffer — emits complete sequences via callbacks
+                self.input.feed(input_raw[0..n], &onInputSequence, &onInputPaste, @ptrCast(self));
             }
 
-            // 2b. Kitty negotiation timeout → fall back to modifyOtherKeys
+            // 2b. Check InputBuffer timeout (lone ESC, incomplete sequences)
+            self.input.checkTimeout(&onInputSequence, @ptrCast(self));
+
+            // 2c. Kitty negotiation timeout → fall back to modifyOtherKeys
             if (self.kitty_deadline_ns) |deadline| {
                 if (std.time.nanoTimestamp() >= deadline) {
                     self.tui.terminal.enableModifyOtherKeys();
                     self.kitty_deadline_ns = null;
-                    // Flush any buffered input that arrived during negotiation
-                    if (self.kitty_probe_buf.items.len > 0) {
-                        self.handleRawInput(self.kitty_probe_buf.items);
-                        self.kitty_probe_buf.items.len = 0;
+                    // Drain any buffered input from negotiation period
+                    if (self.input.buf.items.len > 0) {
+                        self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
                     }
                 }
             }
@@ -284,78 +286,28 @@ pub const Interactive = struct {
         }
     }
 
-    /// Check if raw input contains the kitty protocol query response (\x1b[?<digits>u).
-    /// If found, enable kitty protocol and return any remaining bytes after the response.
-    /// Returns null if no response found in this input.
-    fn tryConsumeKittyResponse(self: *Interactive, data: []const u8) ?[]const u8 {
-        // Look for \x1b[? prefix
-        const prefix = "\x1b[?";
-        const start = std.mem.indexOf(u8, data, prefix) orelse return null;
-        const after_prefix = start + prefix.len;
-        if (after_prefix >= data.len) return null;
+    // ── InputBuffer callbacks ───────────────────────────────────────
 
-        // Find 'u' terminator after digits
-        var i = after_prefix;
-        while (i < data.len and data[i] >= '0' and data[i] <= '9') : (i += 1) {}
-        if (i >= data.len or data[i] != 'u') return null;
+    /// Called by InputBuffer for each complete input sequence.
+    fn onInputSequence(seq: []const u8, raw_ctx: *anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(raw_ctx));
 
-        // Matched \x1b[?<digits>u — this is the kitty response
-        self.tui.terminal.enableKittyProtocol();
-        self.kitty_deadline_ns = null;
-
-        // Return any bytes after the response (and before it, though unlikely)
-        const response_end = i + 1;
-        if (start > 0 or response_end < data.len) {
-            // Concatenating before+after would require allocation; for simplicity
-            // just return the remainder after the response. Pre-response bytes
-            // during negotiation are likely just the response itself.
-            return data[response_end..];
+        // Bare \n = newline insertion (some terminals send this for shift+enter)
+        if (seq.len == 1 and seq[0] == '\n') {
+            self.active_editor.insertText("\n");
+            self.tui.dirty = true;
+            return;
         }
-        return data[0..0]; // empty slice = fully consumed
+
+        const result = keys_mod.parseKey(seq, self.tui.terminal.kitty_active) orelse return;
+        self.handleKey(result.key);
     }
 
-    fn handleRawInput(self: *Interactive, data: []const u8) void {
-        var offset: usize = 0;
-        while (offset < data.len) {
-            // Bracketed paste: buffer until end marker
-            if (self.in_paste) {
-                if (std.mem.indexOfPos(u8, data, offset, "\x1b[201~")) |end_pos| {
-                    self.paste_buf.appendSlice(self.allocator, data[offset..end_pos]) catch {};
-                    self.active_editor.insertText(self.paste_buf.items);
-                    self.paste_buf.items.len = 0;
-                    self.in_paste = false;
-                    self.tui.dirty = true;
-                    offset = end_pos + 6;
-                    continue;
-                } else {
-                    self.paste_buf.appendSlice(self.allocator, data[offset..]) catch {};
-                    return;
-                }
-            }
-
-            // Detect paste start marker
-            if (offset + 5 < data.len and std.mem.eql(u8, data[offset .. offset + 6], "\x1b[200~")) {
-                self.in_paste = true;
-                self.paste_buf.items.len = 0;
-                offset += 6;
-                continue;
-            }
-
-            // Also treat bare \n as newline insertion (some terminals send this for shift+enter)
-            if (data[offset] == '\n') {
-                self.active_editor.insertText("\n");
-                self.tui.dirty = true;
-                offset += 1;
-                continue;
-            }
-
-            const result = keys_mod.parseKey(data[offset..], self.tui.terminal.kitty_active) orelse {
-                offset += 1;
-                continue;
-            };
-            self.handleKey(result.key);
-            offset += result.len;
-        }
+    /// Called by InputBuffer when paste content is complete.
+    fn onInputPaste(content: []const u8, raw_ctx: *anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(raw_ctx));
+        self.active_editor.insertText(content);
+        self.tui.dirty = true;
     }
 
     fn handleKey(self: *Interactive, key: Key) void {

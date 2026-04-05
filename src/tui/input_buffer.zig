@@ -1,0 +1,410 @@
+const std = @import("std");
+const keys_mod = @import("keys.zig");
+
+/// Input sequence buffer — accumulates raw terminal bytes and emits
+/// complete escape sequences. Handles partial sequences that arrive
+/// split across read boundaries.
+///
+/// Sits between Terminal.readInput() and key parsing:
+///   terminal → InputBuffer.feed() → onSequence callback → parseKey
+///
+/// Matches pi-mono's StdinBuffer (packages/tui/src/stdin-buffer.ts).
+///
+/// Escape sequence boundaries are detected by checking the final byte
+/// of CSI/SS3/OSC/DCS/APC sequences per ECMA-48. Incomplete sequences
+/// are held until more data arrives or the timeout fires.
+pub const InputBuffer = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    allocator: std.mem.Allocator,
+    /// Nanosecond timestamp when incomplete data should be flushed.
+    /// null = no pending incomplete sequence.
+    flush_deadline_ns: ?i128 = null,
+    /// Timeout for incomplete escape sequences (nanoseconds).
+    timeout_ns: i128 = 10_000_000, // 10ms
+
+    // Paste state
+    in_paste: bool = false,
+    paste_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) InputBuffer {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *InputBuffer) void {
+        self.buf.deinit(self.allocator);
+        self.paste_buf.deinit(self.allocator);
+    }
+
+    /// Feed raw bytes from terminal. Emits complete sequences via callbacks.
+    /// `on_seq`: called for each complete key sequence (escape seq or single byte)
+    /// `on_paste`: called with paste content (between bracketed paste markers)
+    pub fn feed(
+        self: *InputBuffer,
+        data: []const u8,
+        on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
+        on_paste: *const fn (content: []const u8, ctx: *anyopaque) void,
+        ctx: *anyopaque,
+    ) void {
+        self.buf.appendSlice(self.allocator, data) catch return;
+        self.flush_deadline_ns = null;
+        self.drain(on_seq, on_paste, ctx);
+    }
+
+    /// Check timeout — call from the event loop to flush incomplete sequences.
+    pub fn checkTimeout(
+        self: *InputBuffer,
+        on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
+        ctx: *anyopaque,
+    ) void {
+        if (self.flush_deadline_ns) |deadline| {
+            if (std.time.nanoTimestamp() >= deadline) {
+                self.flush_deadline_ns = null;
+                if (self.buf.items.len > 0) {
+                    self.flushRaw(on_seq, ctx);
+                }
+            }
+        }
+    }
+
+    pub fn drain(
+        self: *InputBuffer,
+        on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
+        on_paste: *const fn (content: []const u8, ctx: *anyopaque) void,
+        ctx: *anyopaque,
+    ) void {
+        while (self.buf.items.len > 0) {
+            // Paste mode: accumulate until end marker
+            if (self.in_paste) {
+                if (std.mem.indexOf(u8, self.buf.items, "\x1b[201~")) |end_pos| {
+                    // Append everything before end marker to paste buffer
+                    self.paste_buf.appendSlice(self.allocator, self.buf.items[0..end_pos]) catch {};
+                    // Emit paste content
+                    on_paste(self.paste_buf.items, ctx);
+                    self.paste_buf.items.len = 0;
+                    self.in_paste = false;
+                    // Remove paste content + end marker from buffer
+                    const after = end_pos + 6;
+                    if (after < self.buf.items.len) {
+                        std.mem.copyForwards(u8, self.buf.items[0..], self.buf.items[after..]);
+                        self.buf.items.len -= after;
+                    } else {
+                        self.buf.items.len = 0;
+                    }
+                    continue;
+                } else {
+                    // No end marker yet — move everything to paste buffer and wait
+                    self.paste_buf.appendSlice(self.allocator, self.buf.items) catch {};
+                    self.buf.items.len = 0;
+                    return;
+                }
+            }
+
+            // Check for paste start marker
+            if (self.buf.items.len >= 6 and std.mem.eql(u8, self.buf.items[0..6], "\x1b[200~")) {
+                self.in_paste = true;
+                self.paste_buf.items.len = 0;
+                // Remove start marker
+                if (self.buf.items.len > 6) {
+                    std.mem.copyForwards(u8, self.buf.items[0..], self.buf.items[6..]);
+                    self.buf.items.len -= 6;
+                } else {
+                    self.buf.items.len = 0;
+                }
+                continue;
+            }
+            // Partial paste start — could be split. Hold for more data.
+            if (self.buf.items[0] == 0x1b and self.buf.items.len < 6) {
+                if (std.mem.startsWith(u8, "\x1b[200~", self.buf.items)) {
+                    self.flush_deadline_ns = std.time.nanoTimestamp() + self.timeout_ns;
+                    return;
+                }
+            }
+
+            // Not in paste mode — extract sequences
+            if (self.buf.items[0] == 0x1b) {
+                const status = classifyEscapeSequence(self.buf.items);
+                switch (status) {
+                    .complete => |len| {
+                        on_seq(self.buf.items[0..len], ctx);
+                        self.consume(len);
+                    },
+                    .incomplete => {
+                        // Wait for more data or timeout
+                        self.flush_deadline_ns = std.time.nanoTimestamp() + self.timeout_ns;
+                        return;
+                    },
+                }
+            } else {
+                // Single non-escape byte
+                on_seq(self.buf.items[0..1], ctx);
+                self.consume(1);
+            }
+        }
+    }
+
+    /// Flush remaining buffer as raw bytes (on timeout).
+    fn flushRaw(
+        self: *InputBuffer,
+        on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
+        ctx: *anyopaque,
+    ) void {
+        // A lone ESC after timeout = actual ESC keypress
+        if (self.buf.items.len == 1 and self.buf.items[0] == 0x1b) {
+            on_seq(self.buf.items[0..1], ctx);
+            self.buf.items.len = 0;
+            return;
+        }
+        // Multi-byte incomplete sequence — emit byte by byte
+        while (self.buf.items.len > 0) {
+            on_seq(self.buf.items[0..1], ctx);
+            self.consume(1);
+        }
+    }
+
+    fn consume(self: *InputBuffer, n: usize) void {
+        if (n >= self.buf.items.len) {
+            self.buf.items.len = 0;
+        } else {
+            std.mem.copyForwards(u8, self.buf.items[0..], self.buf.items[n..]);
+            self.buf.items.len -= n;
+        }
+    }
+
+    /// Check for kitty protocol query response (\x1b[?<digits>u) in the buffer.
+    /// If found, removes it and returns true. Remaining data stays in the buffer.
+    pub fn consumeKittyResponse(self: *InputBuffer) bool {
+        const prefix = "\x1b[?";
+        const start = std.mem.indexOf(u8, self.buf.items, prefix) orelse return false;
+        const after_prefix = start + prefix.len;
+        if (after_prefix >= self.buf.items.len) return false;
+
+        var i = after_prefix;
+        while (i < self.buf.items.len and self.buf.items[i] >= '0' and self.buf.items[i] <= '9') : (i += 1) {}
+        if (i >= self.buf.items.len or self.buf.items[i] != 'u') return false;
+
+        // Remove the response from the buffer
+        const response_end = i + 1;
+        if (response_end < self.buf.items.len) {
+            std.mem.copyForwards(u8, self.buf.items[start..], self.buf.items[response_end..]);
+            self.buf.items.len -= (response_end - start);
+        } else {
+            self.buf.items.len = start;
+        }
+        return true;
+    }
+};
+
+/// Classification result for an escape sequence at the start of a buffer.
+const SeqStatus = union(enum) {
+    complete: usize, // sequence length
+    incomplete, // need more bytes
+};
+
+/// Classify an escape sequence starting at data[0] == ESC.
+/// Returns the length if complete, or .incomplete if more bytes needed.
+fn classifyEscapeSequence(data: []const u8) SeqStatus {
+    if (data.len < 2) return .incomplete;
+
+    switch (data[1]) {
+        '[' => return classifyCsi(data),
+        'O' => {
+            // SS3: ESC O <char>
+            if (data.len < 3) return .incomplete;
+            return .{ .complete = 3 };
+        },
+        ']' => {
+            // OSC: ESC ] ... (BEL or ESC \)
+            return classifyStringTerminated(data, 2, true);
+        },
+        'P' => {
+            // DCS: ESC P ... ESC \
+            return classifyStringTerminated(data, 2, false);
+        },
+        '_' => {
+            // APC: ESC _ ... ESC \
+            return classifyStringTerminated(data, 2, false);
+        },
+        else => {
+            // Meta/alt: ESC + single char
+            return .{ .complete = 2 };
+        },
+    }
+}
+
+/// Classify a CSI sequence (ESC [ ...).
+/// CSI sequences end with a byte in 0x40-0x7E range (@ through ~).
+fn classifyCsi(data: []const u8) SeqStatus {
+    if (data.len < 3) return .incomplete;
+
+    // Special: old-style mouse ESC[M + 3 bytes
+    if (data.len >= 3 and data[2] == 'M') {
+        if (data.len < 6) return .incomplete;
+        return .{ .complete = 6 };
+    }
+
+    // Scan for final byte (0x40-0x7E)
+    var i: usize = 2;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (c >= 0x40 and c <= 0x7E) {
+            return .{ .complete = i + 1 };
+        }
+        // Intermediate bytes (0x20-0x3F) and parameter bytes are OK
+        if (c < 0x20 or c > 0x7E) {
+            // Invalid byte in CSI — treat as complete (malformed)
+            return .{ .complete = i + 1 };
+        }
+    }
+    return .incomplete;
+}
+
+/// Classify a string-terminated sequence (OSC, DCS, APC).
+/// Ends with ESC \ (ST) or BEL (0x07, OSC only).
+fn classifyStringTerminated(data: []const u8, start: usize, allow_bel: bool) SeqStatus {
+    var i = start;
+    while (i < data.len) : (i += 1) {
+        if (allow_bel and data[i] == 0x07) {
+            return .{ .complete = i + 1 };
+        }
+        if (data[i] == 0x1b and i + 1 < data.len and data[i + 1] == '\\') {
+            return .{ .complete = i + 2 };
+        }
+    }
+    return .incomplete;
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+const TestCtx = struct {
+    sequences: std.ArrayListUnmanaged([]u8) = .empty,
+    pastes: std.ArrayListUnmanaged([]u8) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn onSeq(seq: []const u8, raw_ctx: *anyopaque) void {
+        const ctx: *TestCtx = @ptrCast(@alignCast(raw_ctx));
+        const copy = ctx.allocator.dupe(u8, seq) catch return;
+        ctx.sequences.append(ctx.allocator, copy) catch {};
+    }
+
+    fn onPaste(content: []const u8, raw_ctx: *anyopaque) void {
+        const ctx: *TestCtx = @ptrCast(@alignCast(raw_ctx));
+        const copy = ctx.allocator.dupe(u8, content) catch return;
+        ctx.pastes.append(ctx.allocator, copy) catch {};
+    }
+
+    fn deinit(self: *TestCtx) void {
+        for (self.sequences.items) |s| self.allocator.free(s);
+        self.sequences.deinit(self.allocator);
+        for (self.pastes.items) |p| self.allocator.free(p);
+        self.pastes.deinit(self.allocator);
+    }
+};
+
+test "InputBuffer emits complete CSI sequence in one feed" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+    var ctx = TestCtx{ .allocator = testing.allocator };
+    defer ctx.deinit();
+
+    buf.feed("\x1b[13;2u", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+
+    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
+    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[0]);
+}
+
+test "InputBuffer reassembles CSI sequence split across feeds" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+    var ctx = TestCtx{ .allocator = testing.allocator };
+    defer ctx.deinit();
+
+    buf.feed("\x1b[13", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
+
+    buf.feed(";2u", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
+    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[0]);
+}
+
+test "InputBuffer emits lone ESC after timeout" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+    buf.timeout_ns = 0; // immediate timeout for testing
+    var ctx = TestCtx{ .allocator = testing.allocator };
+    defer ctx.deinit();
+
+    buf.feed("\x1b", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
+    try testing.expect(buf.flush_deadline_ns != null);
+
+    // Simulate timeout
+    buf.flush_deadline_ns = 0;
+    buf.checkTimeout(&TestCtx.onSeq, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
+    try testing.expectEqualStrings("\x1b", ctx.sequences.items[0]);
+}
+
+test "InputBuffer handles bracketed paste" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+    var ctx = TestCtx{ .allocator = testing.allocator };
+    defer ctx.deinit();
+
+    buf.feed("\x1b[200~hello world\x1b[201~", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+
+    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
+    try testing.expectEqual(@as(usize, 1), ctx.pastes.items.len);
+    try testing.expectEqualStrings("hello world", ctx.pastes.items[0]);
+}
+
+test "InputBuffer handles paste split across feeds" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+    var ctx = TestCtx{ .allocator = testing.allocator };
+    defer ctx.deinit();
+
+    buf.feed("\x1b[200~hello", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 0), ctx.pastes.items.len);
+
+    buf.feed(" world\x1b[201~", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 1), ctx.pastes.items.len);
+    try testing.expectEqualStrings("hello world", ctx.pastes.items[0]);
+}
+
+test "InputBuffer emits plain chars immediately" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+    var ctx = TestCtx{ .allocator = testing.allocator };
+    defer ctx.deinit();
+
+    buf.feed("abc", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+
+    try testing.expectEqual(@as(usize, 3), ctx.sequences.items.len);
+    try testing.expectEqualStrings("a", ctx.sequences.items[0]);
+    try testing.expectEqualStrings("b", ctx.sequences.items[1]);
+    try testing.expectEqualStrings("c", ctx.sequences.items[2]);
+}
+
+test "InputBuffer detects kitty protocol response" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    buf.buf.appendSlice(testing.allocator, "\x1b[?0u") catch {};
+    try testing.expect(buf.consumeKittyResponse());
+    try testing.expectEqual(@as(usize, 0), buf.buf.items.len);
+}
+
+test "classifyEscapeSequence identifies CSI, SS3, meta" {
+    // CSI complete: ESC [ 1 3 ; 2 u = 7 bytes
+    try testing.expectEqual(SeqStatus{ .complete = 7 }, classifyEscapeSequence("\x1b[13;2u"));
+    // CSI incomplete
+    try testing.expectEqual(SeqStatus.incomplete, classifyEscapeSequence("\x1b[13"));
+    // SS3
+    try testing.expectEqual(SeqStatus{ .complete = 3 }, classifyEscapeSequence("\x1bOA"));
+    // Meta
+    try testing.expectEqual(SeqStatus{ .complete = 2 }, classifyEscapeSequence("\x1ba"));
+    // Lone ESC
+    try testing.expectEqual(SeqStatus.incomplete, classifyEscapeSequence("\x1b"));
+}
