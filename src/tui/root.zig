@@ -16,6 +16,7 @@ pub const tui = @import("tui.zig");
 pub const input_buffer = @import("input_buffer.zig");
 pub const editor_iface = @import("editor_iface.zig");
 pub const theme = @import("theme.zig");
+pub const renderers = @import("renderers/root.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

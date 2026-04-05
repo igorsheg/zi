@@ -271,7 +271,13 @@ pub fn main() !void {
         defer ca.deinit();
 
         const tool_display = @import("tui/tool_display.zig");
-        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_display.default_registry, cwd_buf);
+        const bash_renderer = @import("tui/renderers/bash.zig");
+        const tool_registry = tool_display.ToolRendererRegistry{
+            .entries = &.{
+                .{ .tool_name = "Bash", .renderer = bash_renderer.renderer },
+            },
+        };
+        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_registry, cwd_buf);
         defer interactive.deinit();
         try interactive.run();
     }
