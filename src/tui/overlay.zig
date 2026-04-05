@@ -54,18 +54,16 @@ pub const OverlayEntry = struct {
     focus_order: u64,
 };
 
-/// Handle returned by showOverlay for controlling the overlay.
-/// Callers use this to hide/show/focus the overlay.
+/// Legacy handle — kept for tests that use OverlayManager directly.
+/// Production code should use tui.OverlayHandle which is wired into focus.
 pub const OverlayHandle = struct {
     id: u64,
     manager: *OverlayManager,
 
-    /// Permanently remove the overlay.
     pub fn hide(self: OverlayHandle) void {
         _ = self.manager.removeOverlay(self.id);
     }
 
-    /// Temporarily hide or show the overlay.
     pub fn setHidden(self: OverlayHandle, hidden: bool) void {
         if (self.manager.findEntry(self.id)) |entry| {
             entry.hidden = hidden;
@@ -94,7 +92,7 @@ pub const OverlayManager = struct {
         self.stack.deinit(self.allocator);
     }
 
-    /// Show an overlay. Returns a handle for controlling it.
+    /// Show an overlay. Returns a legacy handle (for direct OverlayManager usage).
     /// `pre_focus` is the currently focused component (saved for restore).
     pub fn showOverlay(
         self: *OverlayManager,
@@ -102,6 +100,17 @@ pub const OverlayManager = struct {
         options: OverlayOptions,
         pre_focus: ?Component,
     ) OverlayHandle {
+        const id = self.showOverlayReturnId(comp, options, pre_focus);
+        return .{ .id = id, .manager = self };
+    }
+
+    /// Show an overlay and return the entry ID (for TUI-level handle construction).
+    pub fn showOverlayReturnId(
+        self: *OverlayManager,
+        comp: Component,
+        options: OverlayOptions,
+        pre_focus: ?Component,
+    ) u64 {
         self.focus_order_counter += 1;
         const id = self.next_id;
         self.next_id += 1;
@@ -114,14 +123,18 @@ pub const OverlayManager = struct {
             .focus_order = self.focus_order_counter,
         }) catch {};
 
-        return .{ .id = id, .manager = self };
+        return id;
     }
 
-    /// Hide the topmost overlay. Returns the pre_focus to restore.
-    pub fn hideTopmost(self: *OverlayManager) ?Component {
-        if (self.stack.items.len == 0) return null;
+    pub const HideResult = struct {
+        restored_focus: ?Component = null,
+    };
+
+    /// Hide the topmost overlay. Returns pre_focus for the caller to restore.
+    pub fn hideTopmost(self: *OverlayManager) HideResult {
+        if (self.stack.items.len == 0) return .{};
         const entry = self.stack.pop();
-        return entry.?.pre_focus;
+        return .{ .restored_focus = if (entry) |e| e.pre_focus else null };
     }
 
     /// Remove a specific overlay by handle ID. Returns pre_focus if found.
@@ -172,7 +185,15 @@ pub const OverlayManager = struct {
         }
     }
 
-    fn findEntry(self: *OverlayManager, id: u64) ?*OverlayEntry {
+    /// Bump the focus_order for an overlay (brings to front).
+    pub fn bumpFocusOrder(self: *OverlayManager, id: u64) void {
+        if (self.findEntry(id)) |entry| {
+            self.focus_order_counter += 1;
+            entry.focus_order = self.focus_order_counter;
+        }
+    }
+
+    pub fn findEntry(self: *OverlayManager, id: u64) ?*OverlayEntry {
         for (self.stack.items) |*entry| {
             if (entry.id == id) return entry;
         }
@@ -180,14 +201,14 @@ pub const OverlayManager = struct {
     }
 };
 
-const ResolvedLayout = struct {
+pub const ResolvedLayout = struct {
     row: u32,
     col: u32,
     width: u32,
     height: u32,
 };
 
-fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term_h: u32) ResolvedLayout {
+pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term_h: u32) ResolvedLayout {
     const margin_h = options.margin_left + options.margin_right;
     const margin_v = options.margin_top + options.margin_bottom;
     const avail_w = if (term_w > margin_h) term_w - margin_h else 1;
@@ -294,9 +315,9 @@ test "OverlayManager show and hide topmost" {
     try testing.expect(mgr.hasVisibleOverlays());
 
     // Hide topmost returns pre_focus of d2 (which is d1)
-    const restored = mgr.hideTopmost();
-    try testing.expect(restored != null);
-    try testing.expect(Component.eql(restored.?, d1.component()));
+    const result = mgr.hideTopmost();
+    try testing.expect(result.restored_focus != null);
+    try testing.expect(Component.eql(result.restored_focus.?, d1.component()));
     try testing.expectEqual(@as(usize, 1), mgr.stack.items.len);
 }
 

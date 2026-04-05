@@ -24,7 +24,7 @@ pub const CursorState = struct {
 /// themselves via `component()` for use in layout containers.
 ///
 /// Focus: components that can receive focus implement `setFocused(bool)`.
-/// The FocusManager (on Interactive) is the source of truth for who has focus.
+/// The FocusManager (on TUI) is the source of truth for who has focus.
 /// Components use `focused` state to gate input handling and cursor display.
 pub const Component = struct {
     ptr: *anyopaque,

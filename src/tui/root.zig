@@ -12,6 +12,7 @@ pub const tool_display = @import("tool_display.zig");
 pub const transcript = @import("transcript.zig");
 pub const container = @import("container.zig");
 pub const overlay = @import("overlay.zig");
+pub const tui = @import("tui.zig");
 pub const theme = @import("theme.zig");
 
 test {
