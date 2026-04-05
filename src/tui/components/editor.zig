@@ -6,6 +6,9 @@ const keys_mod = @import("../keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const box_chrome = @import("../box_chrome.zig");
 const status_data_mod = @import("../status_data.zig");
+const autocomplete_mod = @import("../autocomplete.zig");
+const select_list_mod = @import("select_list.zig");
+const theme_mod = @import("../theme.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -15,6 +18,14 @@ const Measurement = component_mod.Measurement;
 const CursorState = component_mod.CursorState;
 const Key = keys_mod.Key;
 const StatusData = status_data_mod.StatusData;
+const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
+const Suggestions = autocomplete_mod.Suggestions;
+const SuggestionSink = autocomplete_mod.SuggestionSink;
+const RequestSnapshot = autocomplete_mod.RequestSnapshot;
+const SelectItem = select_list_mod.SelectItem;
+const SelectList = select_list_mod.SelectList;
+const InputResult = select_list_mod.InputResult;
+const Theme = theme_mod.Theme;
 
 pub const Editor = struct {
     buf: std.ArrayList(u8),
@@ -37,6 +48,13 @@ pub const Editor = struct {
     git_branch_len: u8 = 0,
     allocator: std.mem.Allocator,
     focused: bool = true,
+
+    // ── Autocomplete ──────────────────────────────────────────────
+    autocomplete_provider: ?AutocompleteProvider = null,
+    autocomplete_list: SelectList = undefined,
+    autocomplete_active: bool = false,
+    autocomplete_prefix: []const u8 = "",
+    theme: ?*const Theme = null,
 
     pub fn init(allocator: std.mem.Allocator) Editor {
         return .{
@@ -90,10 +108,109 @@ pub const Editor = struct {
         self.ensureCursorVisible();
     }
 
+    // --- Autocomplete ---
+
+    pub fn setAutocompleteProvider(self: *Editor, prov: AutocompleteProvider) void {
+        self.cancelAutocomplete();
+        self.autocomplete_provider = prov;
+    }
+
+    fn tryAutocomplete(self: *Editor) void {
+        const prov = self.autocomplete_provider orelse return;
+
+        if (self.buf.items.len > 0 and self.buf.items[0] == '/') {
+            var sink_ctx = AutocompleteSinkCtx{ .editor = self };
+            prov.request(
+                .{ .text = self.buf.items, .cursor_byte = self.cursor_byte },
+                .{ .ptr = @ptrCast(&sink_ctx), .publish_fn = &autocompleteSinkCallback },
+            );
+        } else if (self.autocomplete_active) {
+            self.cancelAutocomplete();
+        }
+    }
+
+    const AutocompleteSinkCtx = struct {
+        editor: *Editor,
+    };
+
+    fn autocompleteSinkCallback(ptr: *anyopaque, suggestions: ?Suggestions) void {
+        const ctx: *AutocompleteSinkCtx = @ptrCast(@alignCast(ptr));
+        const self = ctx.editor;
+
+        if (suggestions) |s| {
+            if (s.items.len > 0) {
+                self.autocomplete_list = .{
+                    .theme = self.theme orelse &Theme.dark,
+                };
+                self.autocomplete_list.setItems(s.items);
+                self.autocomplete_prefix = s.prefix;
+                self.autocomplete_active = true;
+                return;
+            }
+        }
+        self.cancelAutocomplete();
+    }
+
+    fn acceptAutocomplete(self: *Editor) void {
+        const prov = self.autocomplete_provider orelse return;
+        const item = self.autocomplete_list.getSelectedItem() orelse return;
+
+        const result = prov.apply(
+            self.buf.items,
+            self.cursor_byte,
+            item,
+            self.autocomplete_prefix,
+        ) orelse return;
+
+        self.buf.items.len = 0;
+        self.buf.appendSlice(self.allocator, result.new_text) catch return;
+        self.cursor_byte = result.new_cursor;
+
+        const line_start = if (std.mem.lastIndexOfScalar(u8, self.buf.items[0..self.cursor_byte], '\n')) |pos| pos + 1 else 0;
+        self.cursor_col = @intCast(grapheme_mod.strWidth(self.buf.items[line_start..self.cursor_byte]));
+
+        self.cancelAutocomplete();
+    }
+
+    pub fn cancelAutocomplete(self: *Editor) void {
+        self.autocomplete_active = false;
+        self.autocomplete_prefix = "";
+    }
+
     // --- Input handling ---
 
     pub fn handleInput(self: *Editor, key: Key) bool {
         if (!self.focused) return false;
+
+        // Autocomplete interception — when picker is active, handle its keys first
+        if (self.autocomplete_active) {
+            const result = self.autocomplete_list.processInput(key);
+            switch (result) {
+                .selected => {
+                    self.acceptAutocomplete();
+                    if (key.code == .enter) {
+                        if (self.on_submit) |cb| {
+                            cb(self.buf.items, self.on_submit_ctx);
+                        }
+                    }
+                    return true;
+                },
+                .cancelled => {
+                    self.cancelAutocomplete();
+                    return true;
+                },
+                .consumed => return true,
+                .unhandled => {
+                    if (key.code == .char and !key.ctrl and !key.alt) {
+                        // let char fall through to normal handling, then tryAutocomplete
+                    } else if (key.code == .backspace) {
+                        // let backspace fall through, then tryAutocomplete
+                    } else {
+                        self.cancelAutocomplete();
+                    }
+                },
+            }
+        }
 
         switch (key.code) {
             .enter => {
@@ -125,6 +242,7 @@ pub const Editor = struct {
                     self.cursor_byte += @intCast(len);
                     self.cursor_col += @as(u32, grapheme_mod.charWidth(cp));
                     self.ensureCursorVisible();
+                    self.tryAutocomplete();
                     return true;
                 }
                 return false;
@@ -141,6 +259,7 @@ pub const Editor = struct {
                     self.buf.items.len -= 1;
                     self.cursor_byte = prev;
                     self.ensureCursorVisible();
+                    self.tryAutocomplete();
                     return true;
                 }
                 const prev = self.prevCodepointBoundary();
@@ -152,6 +271,7 @@ pub const Editor = struct {
                 self.buf.items.len -= removed_bytes;
                 self.cursor_byte = prev;
                 self.cursor_col -= removed_width;
+                self.tryAutocomplete();
                 return true;
             },
             .delete => {
@@ -243,6 +363,9 @@ pub const Editor = struct {
         const h = region.height;
         if (w == 0 or h < 3) return;
 
+        const lc = self.lineCount();
+        const editor_h: u32 = @min(@min(lc, self.max_visible_lines) + 2, h);
+
         // Top border with rounded corners and inline status
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
@@ -255,11 +378,11 @@ pub const Editor = struct {
         // Bottom border with rounded corners
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
-            _ = box_chrome.drawClosedBottom(region, h - 1, style);
+            _ = box_chrome.drawClosedBottom(region, editor_h - 1, style);
         }
 
         // Content between borders
-        const content = region.sub(0, 1, w, h - 2);
+        const content = region.sub(0, 1, w, editor_h - 2);
         const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
         const continuation = "  ";
         const items = self.buf.items;
@@ -299,14 +422,28 @@ pub const Editor = struct {
             if (line_end >= items.len) break;
             line_start = line_end + 1;
         }
+
+        // Autocomplete picker below bottom border
+        if (self.autocomplete_active and self.autocomplete_list.items.len > 0) {
+            if (h > editor_h) {
+                const picker_region = region.sub(0, editor_h, w, h - editor_h);
+                self.autocomplete_list.render(picker_region);
+            }
+        }
     }
 
     pub fn measure(self: *Editor, width: u32) Measurement {
-        _ = width;
         const lc = self.lineCount();
+        const box_height = @min(lc, self.max_visible_lines) + 2;
+
+        var picker_height: u32 = 0;
+        if (self.autocomplete_active and self.autocomplete_list.items.len > 0) {
+            picker_height = self.autocomplete_list.measure(width).preferred_height;
+        }
+
         return .{
             .min_height = 3,
-            .preferred_height = @min(lc, self.max_visible_lines) + 2,
+            .preferred_height = box_height + picker_height,
         };
     }
 

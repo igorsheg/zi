@@ -21,6 +21,12 @@ const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
 const status_data_mod = @import("status_data.zig");
 
+const autocomplete_mod = @import("autocomplete.zig");
+const slash_commands_mod = @import("../slash_commands.zig");
+const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
+const SlashCommandProvider = autocomplete_mod.SlashCommandProvider;
+const CommandRegistry = slash_commands_mod.CommandRegistry;
+
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
@@ -122,6 +128,10 @@ pub const Interactive = struct {
     editor_container: container_mod.Container,
     widget_below_container: container_mod.Container,
 
+    // ── Slash commands ──────────────────────────────────────────
+    command_registry: CommandRegistry,
+    slash_provider: SlashCommandProvider = undefined,
+
     event_queue: EventQueue(UiEvent),
     ca: *CodingAgent,
     agent_thread: ?std.Thread = null,
@@ -159,6 +169,7 @@ pub const Interactive = struct {
             .widget_above_container = container_mod.Container.init(allocator),
             .editor_container = container_mod.Container.init(allocator),
             .widget_below_container = container_mod.Container.init(allocator),
+            .command_registry = CommandRegistry.init(allocator),
             .input = input_buffer_mod.InputBuffer.init(allocator),
             .event_queue = EventQueue(UiEvent).init(allocator),
             .ca = ca,
@@ -183,6 +194,7 @@ pub const Interactive = struct {
             if (count == 0) break;
             for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
         }
+        self.command_registry.deinit();
         self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
@@ -215,6 +227,12 @@ pub const Interactive = struct {
 
         // Bind pointers now that self is at its stable address (not a stack copy).
         self.editor.status_data = &self.status_data;
+        self.editor.theme = self.theme;
+
+        // Wire autocomplete: registry → provider → editor
+        self.slash_provider = SlashCommandProvider.init(&self.command_registry);
+        self.editor.setAutocompleteProvider(self.slash_provider.provider());
+
         self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
 
         // Populate container slots with their initial children.
@@ -563,6 +581,11 @@ pub const Interactive = struct {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         if (text.len == 0) return;
 
+        // Slash command dispatch
+        if (text[0] == '/') {
+            if (self.dispatchSlashCommand(text)) return;
+        }
+
         const prompt_copy = self.allocator.dupe(u8, text) catch return;
 
         self.active_editor.clear();
@@ -585,6 +608,58 @@ pub const Interactive = struct {
         // the agent thread doesn't free it until run() completes)
         self.transcript.addUserMessage(prompt_copy);
         self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+    }
+
+    /// Dispatch a slash command. Returns true if handled (caller should not send to agent).
+    fn dispatchSlashCommand(self: *Interactive, text: []const u8) bool {
+        // Parse "/command args" → name="command", args="args"
+        const after_slash = text[1..];
+        const space_idx = std.mem.indexOfScalar(u8, after_slash, ' ');
+        const name = if (space_idx) |si| after_slash[0..si] else after_slash;
+        const args = if (space_idx) |si| std.mem.trimLeft(u8, after_slash[si + 1 ..], " ") else "";
+
+        if (name.len == 0) return false;
+
+        const cmd = self.command_registry.findCommand(name) orelse return false;
+
+        self.active_editor.clear();
+        self.tui.dirty = true;
+
+        // Built-in commands with Interactive access
+        if (cmd.source == .builtin) {
+            if (std.mem.eql(u8, name, "quit")) {
+                self.running = false;
+                return true;
+            }
+            if (std.mem.eql(u8, name, "clear") or std.mem.eql(u8, name, "new")) {
+                self.transcript.clearAll();
+                self.status_text.setContent("");
+                return true;
+            }
+        }
+
+        switch (cmd.action) {
+            .builtin => |handler| {
+                var cmd_ctx = slash_commands_mod.CommandContext{ ._reserved = @ptrCast(self) };
+                handler(args, &cmd_ctx) catch {
+                    self.status_text.setContent("command failed");
+                    self.status_text.fg = self.theme.fg(.@"error");
+                };
+            },
+            .extension => |ext| {
+                var cmd_ctx = slash_commands_mod.CommandContext{ ._reserved = @ptrCast(self) };
+                ext.handler(args, &cmd_ctx, ext.user_ctx) catch {
+                    self.status_text.setContent("extension command failed");
+                    self.status_text.fg = self.theme.fg(.@"error");
+                };
+            },
+            .prompt_template, .skill => {
+                self.status_text.setContent("not yet implemented");
+                self.status_text.fg = self.theme.fg(.warning);
+            },
+        }
+
+        return true;
     }
 
     fn agentThreadFn(self: *Interactive, prompt_copy: []const u8) void {

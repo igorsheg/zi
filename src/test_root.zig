@@ -8,4 +8,5 @@ test {
     _ = @import("coding_agent.zig");
     _ = @import("system_prompt.zig");
     _ = @import("tui/root.zig");
+    _ = @import("slash_commands.zig");
 }
