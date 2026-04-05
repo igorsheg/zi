@@ -219,14 +219,16 @@ pub const AnthropicProvider = struct {
 
         // Spawn abort watchdog: polls the abort flag every 100ms,
         // shuts down the socket when abort is requested.
-        var watchdog_done: bool = false;
+        var watchdog_done = std.atomic.Value(bool).init(false);
         var watchdog_thread: ?std.Thread = null;
         if (abort_flag != null and socket_fd != null) {
             const wd_ctx = WatchdogCtx{ .abort_flag = abort_flag.?, .socket_fd = socket_fd.?, .done = &watchdog_done };
             watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{wd_ctx}) catch null;
         }
         defer {
-            watchdog_done = true;
+            // Signal watchdog to exit and wait for it BEFORE req.deinit()
+            // closes the socket fd.
+            watchdog_done.store(true, .release);
             if (watchdog_thread) |t| t.join();
         }
 
@@ -835,17 +837,23 @@ const WatchdogCtx = struct {
     abort_flag: *const bool,
     socket_fd: std.posix.fd_t,
     /// Set to true when the stream ends normally so the watchdog exits.
-    done: *bool,
+    /// Accessed atomically across threads.
+    done: *std.atomic.Value(bool),
 };
 
 /// Watchdog thread: polls abort flag every 100ms. When set, shuts down
 /// the socket to unblock any blocking read on the SSE reader thread.
 /// Uses shutdown() instead of close() to avoid double-close with req.deinit().
 fn abortWatchdog(ctx: WatchdogCtx) void {
-    while (!ctx.abort_flag.* and !ctx.done.*) {
+    while (true) {
+        // Check done FIRST (acquire fence ensures we see the main thread's write)
+        if (ctx.done.load(.acquire)) return;
+        if (ctx.abort_flag.*) break;
         std.Thread.sleep(100_000_000); // 100ms
     }
-    if (ctx.done.*) return; // stream ended normally
+    // Double-check done after seeing abort — the stream may have
+    // finished between the abort check and now.
+    if (ctx.done.load(.acquire)) return;
     // Shutdown the socket (not close) to unblock reads.
     // shutdown() makes the fd return 0/error on reads but keeps it valid
     // for req.deinit() to close later.
