@@ -1,19 +1,23 @@
 const std = @import("std");
 
-/// Shared status data for the TUI — cwd, model, git branch, extension statuses.
+/// Agent-internal state shared across TUI components.
 ///
-/// Owned by Interactive (the composition root). Read by editor border,
-/// footer, and future extension widgets. Extensions will mutate via
+/// Carries only data that extensions can't trivially obtain on their own:
+/// model identity, context window usage, streaming state, extension statuses.
+///
+/// Owned by Interactive (the composition root). Read by editor border
+/// and future extension widgets. Extensions will mutate via
 /// setStatus(key, text) on the extension API.
-///
-/// Design: pi-mono's FooterDataProvider provides git branch + extension
-/// statuses. We match that contract: a single mutable provider with a
-/// read-only snapshot view. No allocations on the render path.
 pub const StatusData = struct {
-    cwd: []const u8 = "",
+    /// Current model identifier (borrowed from agent state).
     model_id: []const u8 = "",
-    git_branch: ?[]const u8 = null,
-    /// Extension-owned named statuses. Future: setStatus(key, text).
+    /// Estimated context window usage (tokens consumed / total).
+    /// null = unknown (e.g., before first LLM response).
+    context_tokens: ?u32 = null,
+    context_window: u32 = 0,
+    /// Whether the agent is currently streaming.
+    is_streaming: bool = false,
+    /// Extension-owned named statuses. Future: setStatus(key, text) API.
     extension_statuses: std.StringHashMapUnmanaged([]const u8) = .{},
     allocator: std.mem.Allocator,
 
@@ -22,19 +26,12 @@ pub const StatusData = struct {
     }
 
     pub fn deinit(self: *StatusData) void {
-        if (self.git_branch) |b| self.allocator.free(b);
         var iter = self.extension_statuses.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.*);
         }
         self.extension_statuses.deinit(self.allocator);
-    }
-
-    /// Set git branch (deep-copies). Pass null to clear.
-    pub fn setGitBranch(self: *StatusData, branch: ?[]const u8) void {
-        if (self.git_branch) |old| self.allocator.free(old);
-        self.git_branch = if (branch) |b| (self.allocator.dupe(u8, b) catch null) else null;
     }
 
     /// Set an extension status entry (deep-copies both key and value).
@@ -65,18 +62,11 @@ pub const StatusData = struct {
 
 const testing = std.testing;
 
-test "StatusData git branch set and clear" {
+test "StatusData model_id is borrowed" {
     var sd = StatusData.init(testing.allocator);
     defer sd.deinit();
-
-    sd.setGitBranch("main");
-    try testing.expectEqualStrings("main", sd.git_branch.?);
-
-    sd.setGitBranch("feature/foo");
-    try testing.expectEqualStrings("feature/foo", sd.git_branch.?);
-
-    sd.setGitBranch(null);
-    try testing.expect(sd.git_branch == null);
+    sd.model_id = "claude-4-opus";
+    try testing.expectEqualStrings("claude-4-opus", sd.model_id);
 }
 
 test "StatusData extension status set and remove" {

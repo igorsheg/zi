@@ -165,10 +165,9 @@ pub const Interactive = struct {
         };
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
-        self.status_data.cwd = cwd;
         self.status_data.model_id = ca.agent.state.model.id;
+        self.editor.cwd = cwd;
         self.editor.status_data = &self.status_data;
-        self.footer.status_data = &self.status_data;
         // NOTE: active_editor is bound in run() where self is at its final address.
         // Binding here would capture a pointer to the local `self` that becomes
         // dangling after the by-value return.
@@ -530,7 +529,7 @@ pub const Interactive = struct {
         if (result.term.Exited == 0) {
             const branch = std.mem.trimRight(u8, result.stdout, " \t\n\r");
             if (branch.len > 0) {
-                self.status_data.setGitBranch(branch);
+                self.editor.setGitBranch(branch);
             }
         }
     }

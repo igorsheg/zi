@@ -30,6 +30,11 @@ pub const Editor = struct {
     text_fg: Color = Color.default,
     border_color: Color = Color.rgb(0x50, 0x50, 0x50),
     status_data: ?*const StatusData = null,
+    /// Working directory displayed in top border (borrowed, set by Interactive).
+    cwd: []const u8 = "",
+    /// Git branch displayed in top border (fixed buffer, set by Interactive).
+    git_branch_buf: [128]u8 = undefined,
+    git_branch_len: u8 = 0,
     allocator: std.mem.Allocator,
     focused: bool = true,
 
@@ -326,31 +331,47 @@ pub const Editor = struct {
         return Component.init(Editor, self);
     }
 
-    // --- Status formatting (reads from StatusData, no allocations) ---
+    // --- Git branch (owned fixed buffer) ---
+
+    pub fn setGitBranch(self: *Editor, branch: ?[]const u8) void {
+        if (branch) |b| {
+            const len: u8 = @intCast(@min(b.len, self.git_branch_buf.len));
+            @memcpy(self.git_branch_buf[0..len], b[0..len]);
+            self.git_branch_len = len;
+        } else {
+            self.git_branch_len = 0;
+        }
+    }
+
+    fn getGitBranch(self: *const Editor) ?[]const u8 {
+        if (self.git_branch_len == 0) return null;
+        return self.git_branch_buf[0..self.git_branch_len];
+    }
+
+    // --- Status formatting (no allocations) ---
 
     fn formatStatusLeft(self: *const Editor, buf: []u8) ?[]const u8 {
-        const sd = self.status_data orelse return null;
         var pos: usize = 0;
 
-        if (sd.cwd.len > 0) {
+        if (self.cwd.len > 0) {
             const home = std.posix.getenv("HOME") orelse "";
-            if (home.len > 0 and std.mem.startsWith(u8, sd.cwd, home)) {
+            if (home.len > 0 and std.mem.startsWith(u8, self.cwd, home)) {
                 if (pos + 1 < buf.len) {
                     buf[pos] = '~';
                     pos += 1;
                 }
-                const rest = sd.cwd[home.len..];
+                const rest = self.cwd[home.len..];
                 const copy_len = @min(rest.len, buf.len - pos);
                 @memcpy(buf[pos..][0..copy_len], rest[0..copy_len]);
                 pos += copy_len;
             } else {
-                const copy_len = @min(sd.cwd.len, buf.len - pos);
-                @memcpy(buf[pos..][0..copy_len], sd.cwd[0..copy_len]);
+                const copy_len = @min(self.cwd.len, buf.len - pos);
+                @memcpy(buf[pos..][0..copy_len], self.cwd[0..copy_len]);
                 pos += copy_len;
             }
         }
 
-        if (sd.git_branch) |branch| {
+        if (self.getGitBranch()) |branch| {
             const sep = " \xC2\xB7 ";
             if (branch.len > 0 and pos + sep.len + branch.len < buf.len) {
                 @memcpy(buf[pos..][0..sep.len], sep);
