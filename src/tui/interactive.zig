@@ -129,6 +129,8 @@ pub const Interactive = struct {
     /// Kitty protocol negotiation: deadline (ns timestamp) for query response.
     /// null = negotiation complete.
     kitty_deadline_ns: ?i128 = null,
+    /// Buffer for kitty protocol probe response that may arrive split across reads.
+    kitty_probe_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -176,6 +178,7 @@ pub const Interactive = struct {
             for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
         }
         self.paste_buf.deinit(self.allocator);
+        self.kitty_probe_buf.deinit(self.allocator);
         self.event_queue.deinit();
         self.widget_below_container.deinit();
         self.editor_container.deinit();
@@ -242,12 +245,14 @@ pub const Interactive = struct {
             const n = self.tui.terminal.readInput(&input_buf) catch 0;
             if (n > 0) {
                 const input = input_buf[0..n];
-                // During kitty negotiation, intercept the query response
+                // During kitty negotiation, buffer input and scan for response
                 if (self.kitty_deadline_ns != null) {
-                    if (self.tryConsumeKittyResponse(input)) |remainder| {
+                    self.kitty_probe_buf.appendSlice(self.allocator, input) catch {};
+                    if (self.tryConsumeKittyResponse(self.kitty_probe_buf.items)) |remainder| {
                         if (remainder.len > 0) self.handleRawInput(remainder);
-                        continue;
+                        self.kitty_probe_buf.items.len = 0;
                     }
+                    continue; // don't process raw input during negotiation
                 }
                 self.handleRawInput(input);
             }
@@ -257,6 +262,11 @@ pub const Interactive = struct {
                 if (std.time.nanoTimestamp() >= deadline) {
                     self.tui.terminal.enableModifyOtherKeys();
                     self.kitty_deadline_ns = null;
+                    // Flush any buffered input that arrived during negotiation
+                    if (self.kitty_probe_buf.items.len > 0) {
+                        self.handleRawInput(self.kitty_probe_buf.items);
+                        self.kitty_probe_buf.items.len = 0;
+                    }
                 }
             }
 

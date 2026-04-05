@@ -169,6 +169,30 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
         return parseKittyU(params[0], if (param_count > 1) params[1] else 0, seq_len);
     }
 
+
+    // xterm modifyOtherKeys: \x1b[27;<modifier>;<keycode>~
+    // Sent when modifyOtherKeys mode 2 is active and kitty protocol is not.
+    if (terminator == '~' and param_count >= 3 and params[0] == 27) {
+        const mods = decodeModifier(params[1]);
+        const keycode = params[2];
+        const mok_key: ?KeyCode = switch (keycode) {
+            13 => .enter,
+            9 => .tab,
+            127 => .backspace,
+            27 => .escape,
+            else => if (keycode >= 32 and keycode < 128) .char else null,
+        };
+        if (mok_key) |k| return .{
+            .key = .{
+                .code = k,
+                .char = if (k == .char) @as(?u21, @intCast(keycode)) else null,
+                .ctrl = mods.ctrl,
+                .alt = mods.alt,
+                .shift = mods.shift,
+            },
+            .len = seq_len,
+        };
+    }
     // tilde-style: \x1b[<num>~ or \x1b[<num>;<modifier>~
     if (terminator == '~') {
         const modifier = if (param_count > 1) params[1] else @as(u16, 0);
@@ -366,6 +390,30 @@ test "xterm modifier parameters decode shift/ctrl/alt" {
     const alt_a = parseKey("\x1ba", false).?;
     try std.testing.expect(alt_a.key.alt);
     try std.testing.expectEqual(@as(?u21, 'a'), alt_a.key.char);
+}
+
+test "modifyOtherKeys sequences parse enter with modifiers" {
+    // Shift+Enter: \x1b[27;2;13~
+    const se = parseKey("\x1b[27;2;13~", false).?;
+    try std.testing.expectEqual(KeyCode.enter, se.key.code);
+    try std.testing.expect(se.key.shift);
+    try std.testing.expect(!se.key.ctrl);
+
+    // Ctrl+Enter: \x1b[27;5;13~
+    const ce = parseKey("\x1b[27;5;13~", false).?;
+    try std.testing.expectEqual(KeyCode.enter, ce.key.code);
+    try std.testing.expect(ce.key.ctrl);
+
+    // Shift+Tab: \x1b[27;2;9~
+    const st = parseKey("\x1b[27;2;9~", false).?;
+    try std.testing.expectEqual(KeyCode.tab, st.key.code);
+    try std.testing.expect(st.key.shift);
+
+    // modifyOtherKeys char: \x1b[27;2;97~ = shift+a
+    const sa = parseKey("\x1b[27;2;97~", false).?;
+    try std.testing.expectEqual(KeyCode.char, sa.key.code);
+    try std.testing.expectEqual(@as(?u21, 'a'), sa.key.char);
+    try std.testing.expect(sa.key.shift);
 }
 
 test "kitty CSI-u protocol parses codepoints and modifiers" {

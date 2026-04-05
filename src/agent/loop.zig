@@ -180,6 +180,12 @@ fn runLoop(
             var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
             if (has_more_tool_calls) {
                 executeToolCalls(allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
+
+                // Abort during tool execution — exit without emitting turn_end
+                if (isAborted(signal)) {
+                    event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                    return;
+                }
             }
 
             event_sink(.{ .turn_end = .{
@@ -372,6 +378,9 @@ fn executeToolCalls(
                     @ptrCast(&update_bridge),
                 );
 
+                // Abort after tool execution — don't emit result or persist
+                if (isAborted(signal)) return;
+
                 // --- Phase 3: finalizeExecutedToolCall (pi-mono agent-loop.ts:561-595) ---
 
                 var final_content = result.content;
@@ -397,6 +406,8 @@ fn executeToolCalls(
                         if (after_result.is_error) |e| final_is_error = e;
                     }
                 }
+
+                if (isAborted(signal)) return;
 
                 // Build final AgentToolResult and ToolResultMessage
                 const final_agent_result = protocol.AgentToolResult{
