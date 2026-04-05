@@ -90,87 +90,106 @@ pub const Theme = struct {
         return self.bg_colors[@intFromEnum(color)];
     }
 
-    /// dark.json with all variable references resolved to RGB.
+    /// zi default dark theme — kanso-muted inspired.
+    ///
+    /// key design choices vs pi-mono's dark.json:
+    /// - toolSuccessBg is empty (no bg tint on completed tools)
+    /// - softer warning yellow (#E6C384 vs #FFFF00)
+    /// - tiered gray scale for dim/muted/output hierarchy
+    /// - bashMode uses yellow (command stands out from output)
+    /// - borders use dim gray (subtle) not blue (loud)
     pub const dark: Theme = blk: {
-        // Vars from dark.json
-        const cyan = Color.rgb(0x00, 0xd7, 0xff);
-        const blue = Color.rgb(0x5f, 0x87, 0xff);
-        const green = Color.rgb(0xb5, 0xbd, 0x68);
-        const red = Color.rgb(0xcc, 0x66, 0x66);
-        const yellow = Color.rgb(0xff, 0xff, 0x00);
-        const gray = Color.rgb(0x80, 0x80, 0x80);
-        const dim_gray = Color.rgb(0x66, 0x66, 0x66);
-        const dark_gray = Color.rgb(0x50, 0x50, 0x50);
-        const accent = Color.rgb(0x8a, 0xbe, 0xb7);
+        // Tiered gray scale (kanso-muted: tier1=brightest, tier7=dimmest)
+        const tier1 = Color.rgb(0xBE, 0xC2, 0xC0);
+        const tier2 = Color.rgb(0xB2, 0xB6, 0xB4);
+        const tier3 = Color.rgb(0xA5, 0xA9, 0xA7);
+        const tier4 = Color.rgb(0x9B, 0x96, 0x90);
+        const tier5 = Color.rgb(0x7F, 0x83, 0x81);
+        const tier6 = Color.rgb(0x6A, 0x6E, 0x6C);
+        const tier7 = Color.rgb(0x53, 0x57, 0x55);
+        const scaffold = Color.rgb(0x62, 0x66, 0x64);
+
+        // Semantic colors
+        const teal = Color.rgb(0x7A, 0xA8, 0x9F);
+        const blue = Color.rgb(0x7F, 0xB4, 0xCA);
+        const green = Color.rgb(0x87, 0xA9, 0x87);
+        const red = Color.rgb(0xE4, 0x68, 0x76);
+        const yellow = Color.rgb(0xE6, 0xC3, 0x84);
+        const purple = Color.rgb(0x93, 0x8A, 0xA9);
+
+        // Background tones
+        const panel_bg = Color.rgb(0x0D, 0x12, 0x18);
+        const panel_bg_red = Color.rgb(0x1A, 0x0F, 0x12);
+        const selection = Color.rgb(0x39, 0x3B, 0x44);
 
         var t: Theme = undefined;
 
         // Core UI
-        t.fg_colors[@intFromEnum(FgColor.accent)] = accent;
-        t.fg_colors[@intFromEnum(FgColor.border)] = blue;
-        t.fg_colors[@intFromEnum(FgColor.border_accent)] = cyan;
-        t.fg_colors[@intFromEnum(FgColor.border_muted)] = dark_gray;
+        t.fg_colors[@intFromEnum(FgColor.accent)] = teal;
+        t.fg_colors[@intFromEnum(FgColor.border)] = tier6;
+        t.fg_colors[@intFromEnum(FgColor.border_accent)] = blue;
+        t.fg_colors[@intFromEnum(FgColor.border_muted)] = tier7;
         t.fg_colors[@intFromEnum(FgColor.success)] = green;
         t.fg_colors[@intFromEnum(FgColor.@"error")] = red;
         t.fg_colors[@intFromEnum(FgColor.warning)] = yellow;
-        t.fg_colors[@intFromEnum(FgColor.muted)] = gray;
-        t.fg_colors[@intFromEnum(FgColor.dim)] = dim_gray;
-        t.fg_colors[@intFromEnum(FgColor.text)] = Color.default; // "" in dark.json
-        t.fg_colors[@intFromEnum(FgColor.thinking_text)] = gray;
+        t.fg_colors[@intFromEnum(FgColor.muted)] = tier5;
+        t.fg_colors[@intFromEnum(FgColor.dim)] = tier6;
+        t.fg_colors[@intFromEnum(FgColor.text)] = Color.default;
+        t.fg_colors[@intFromEnum(FgColor.thinking_text)] = tier5;
 
         // Content text
-        t.fg_colors[@intFromEnum(FgColor.user_message_text)] = Color.default; // ""
-        t.fg_colors[@intFromEnum(FgColor.custom_message_text)] = Color.default; // ""
-        t.fg_colors[@intFromEnum(FgColor.custom_message_label)] = Color.rgb(0x95, 0x75, 0xcd);
-        t.fg_colors[@intFromEnum(FgColor.tool_title)] = Color.default; // ""
-        t.fg_colors[@intFromEnum(FgColor.tool_output)] = gray;
+        t.fg_colors[@intFromEnum(FgColor.user_message_text)] = Color.default;
+        t.fg_colors[@intFromEnum(FgColor.custom_message_text)] = Color.default;
+        t.fg_colors[@intFromEnum(FgColor.custom_message_label)] = purple;
+        t.fg_colors[@intFromEnum(FgColor.tool_title)] = Color.default;
+        t.fg_colors[@intFromEnum(FgColor.tool_output)] = tier5;
 
         // Markdown
-        t.fg_colors[@intFromEnum(FgColor.md_heading)] = Color.rgb(0xf0, 0xc6, 0x74);
-        t.fg_colors[@intFromEnum(FgColor.md_link)] = Color.rgb(0x81, 0xa2, 0xbe);
-        t.fg_colors[@intFromEnum(FgColor.md_link_url)] = dim_gray;
-        t.fg_colors[@intFromEnum(FgColor.md_code)] = accent;
-        t.fg_colors[@intFromEnum(FgColor.md_code_block)] = green;
-        t.fg_colors[@intFromEnum(FgColor.md_code_block_border)] = gray;
-        t.fg_colors[@intFromEnum(FgColor.md_quote)] = gray;
-        t.fg_colors[@intFromEnum(FgColor.md_quote_border)] = gray;
-        t.fg_colors[@intFromEnum(FgColor.md_hr)] = gray;
-        t.fg_colors[@intFromEnum(FgColor.md_list_bullet)] = accent;
+        t.fg_colors[@intFromEnum(FgColor.md_heading)] = yellow;
+        t.fg_colors[@intFromEnum(FgColor.md_link)] = blue;
+        t.fg_colors[@intFromEnum(FgColor.md_link_url)] = tier6;
+        t.fg_colors[@intFromEnum(FgColor.md_code)] = teal;
+        t.fg_colors[@intFromEnum(FgColor.md_code_block)] = tier3;
+        t.fg_colors[@intFromEnum(FgColor.md_code_block_border)] = tier7;
+        t.fg_colors[@intFromEnum(FgColor.md_quote)] = tier5;
+        t.fg_colors[@intFromEnum(FgColor.md_quote_border)] = tier7;
+        t.fg_colors[@intFromEnum(FgColor.md_hr)] = tier7;
+        t.fg_colors[@intFromEnum(FgColor.md_list_bullet)] = teal;
 
         // Tool diffs
-        t.fg_colors[@intFromEnum(FgColor.tool_diff_added)] = green;
+        t.fg_colors[@intFromEnum(FgColor.tool_diff_added)] = Color.rgb(0x98, 0xBB, 0x6C);
         t.fg_colors[@intFromEnum(FgColor.tool_diff_removed)] = red;
-        t.fg_colors[@intFromEnum(FgColor.tool_diff_context)] = gray;
+        t.fg_colors[@intFromEnum(FgColor.tool_diff_context)] = tier7;
 
-        // Syntax highlighting
-        t.fg_colors[@intFromEnum(FgColor.syntax_comment)] = Color.rgb(0x6A, 0x99, 0x55);
-        t.fg_colors[@intFromEnum(FgColor.syntax_keyword)] = Color.rgb(0x56, 0x9C, 0xD6);
-        t.fg_colors[@intFromEnum(FgColor.syntax_function)] = Color.rgb(0xDC, 0xDC, 0xAA);
-        t.fg_colors[@intFromEnum(FgColor.syntax_variable)] = Color.rgb(0x9C, 0xDC, 0xFE);
-        t.fg_colors[@intFromEnum(FgColor.syntax_string)] = Color.rgb(0xCE, 0x91, 0x78);
-        t.fg_colors[@intFromEnum(FgColor.syntax_number)] = Color.rgb(0xB5, 0xCE, 0xA8);
-        t.fg_colors[@intFromEnum(FgColor.syntax_type)] = Color.rgb(0x4E, 0xC9, 0xB0);
-        t.fg_colors[@intFromEnum(FgColor.syntax_operator)] = Color.rgb(0xD4, 0xD4, 0xD4);
-        t.fg_colors[@intFromEnum(FgColor.syntax_punctuation)] = Color.rgb(0xD4, 0xD4, 0xD4);
+        // Syntax highlighting (tiered grays — no rainbow, just hierarchy)
+        t.fg_colors[@intFromEnum(FgColor.syntax_comment)] = tier7;
+        t.fg_colors[@intFromEnum(FgColor.syntax_keyword)] = tier1;
+        t.fg_colors[@intFromEnum(FgColor.syntax_function)] = tier2;
+        t.fg_colors[@intFromEnum(FgColor.syntax_variable)] = tier3;
+        t.fg_colors[@intFromEnum(FgColor.syntax_string)] = tier4;
+        t.fg_colors[@intFromEnum(FgColor.syntax_number)] = tier4;
+        t.fg_colors[@intFromEnum(FgColor.syntax_type)] = tier5;
+        t.fg_colors[@intFromEnum(FgColor.syntax_operator)] = tier6;
+        t.fg_colors[@intFromEnum(FgColor.syntax_punctuation)] = scaffold;
 
         // Thinking levels
-        t.fg_colors[@intFromEnum(FgColor.thinking_off)] = dark_gray;
-        t.fg_colors[@intFromEnum(FgColor.thinking_minimal)] = Color.rgb(0x6e, 0x6e, 0x6e);
-        t.fg_colors[@intFromEnum(FgColor.thinking_low)] = Color.rgb(0x5f, 0x87, 0xaf);
-        t.fg_colors[@intFromEnum(FgColor.thinking_medium)] = Color.rgb(0x81, 0xa2, 0xbe);
-        t.fg_colors[@intFromEnum(FgColor.thinking_high)] = Color.rgb(0xb2, 0x94, 0xbb);
-        t.fg_colors[@intFromEnum(FgColor.thinking_xhigh)] = Color.rgb(0xd1, 0x83, 0xe8);
+        t.fg_colors[@intFromEnum(FgColor.thinking_off)] = tier7;
+        t.fg_colors[@intFromEnum(FgColor.thinking_minimal)] = tier6;
+        t.fg_colors[@intFromEnum(FgColor.thinking_low)] = tier5;
+        t.fg_colors[@intFromEnum(FgColor.thinking_medium)] = teal;
+        t.fg_colors[@intFromEnum(FgColor.thinking_high)] = purple;
+        t.fg_colors[@intFromEnum(FgColor.thinking_xhigh)] = blue;
 
         // Bash mode
-        t.fg_colors[@intFromEnum(FgColor.bash_mode)] = green;
+        t.fg_colors[@intFromEnum(FgColor.bash_mode)] = yellow;
 
         // Backgrounds
-        t.bg_colors[@intFromEnum(BgColor.selected_bg)] = Color.rgb(0x3a, 0x3a, 0x4a);
-        t.bg_colors[@intFromEnum(BgColor.user_message_bg)] = Color.rgb(0x34, 0x35, 0x41);
-        t.bg_colors[@intFromEnum(BgColor.custom_message_bg)] = Color.rgb(0x2d, 0x28, 0x38);
-        t.bg_colors[@intFromEnum(BgColor.tool_pending_bg)] = Color.rgb(0x28, 0x28, 0x32);
-        t.bg_colors[@intFromEnum(BgColor.tool_success_bg)] = Color.rgb(0x28, 0x32, 0x28);
-        t.bg_colors[@intFromEnum(BgColor.tool_error_bg)] = Color.rgb(0x3c, 0x28, 0x28);
+        t.bg_colors[@intFromEnum(BgColor.selected_bg)] = selection;
+        t.bg_colors[@intFromEnum(BgColor.user_message_bg)] = panel_bg;
+        t.bg_colors[@intFromEnum(BgColor.custom_message_bg)] = Color.rgb(0x11, 0x18, 0x20);
+        t.bg_colors[@intFromEnum(BgColor.tool_pending_bg)] = panel_bg;
+        t.bg_colors[@intFromEnum(BgColor.tool_success_bg)] = Color.default; // no bg on success
+        t.bg_colors[@intFromEnum(BgColor.tool_error_bg)] = panel_bg_red;
 
         break :blk t;
     };
@@ -178,25 +197,25 @@ pub const Theme = struct {
 
 // ── Tests ──────────────────────────────────────────────────────────
 
-test "dark theme has correct accent color from dark.json" {
+test "dark theme has correct accent color" {
     const t = Theme.dark;
-    // accent var = #8abeb7
+    // accent = teal #7AA89F
     const accent = t.fg(.accent);
-    try @import("std").testing.expectEqual(@as(u8, 0x8a), accent.r);
-    try @import("std").testing.expectEqual(@as(u8, 0xbe), accent.g);
-    try @import("std").testing.expectEqual(@as(u8, 0xb7), accent.b);
+    try @import("std").testing.expectEqual(@as(u8, 0x7A), accent.r);
+    try @import("std").testing.expectEqual(@as(u8, 0xA8), accent.g);
+    try @import("std").testing.expectEqual(@as(u8, 0x9F), accent.b);
 }
 
-test "dark theme fg and bg lookups match dark.json" {
+test "dark theme fg and bg lookups" {
     const t = Theme.dark;
-    // mdHeading = #f0c674
+    // mdHeading = yellow #E6C384
     const heading = t.fg(.md_heading);
-    try @import("std").testing.expectEqual(@as(u8, 0xf0), heading.r);
-    // userMessageBg = #343541
+    try @import("std").testing.expectEqual(@as(u8, 0xE6), heading.r);
+    // userMessageBg = panelBg #0D1218
     const user_bg = t.bg(.user_message_bg);
-    try @import("std").testing.expectEqual(@as(u8, 0x34), user_bg.r);
-    try @import("std").testing.expectEqual(@as(u8, 0x35), user_bg.g);
-    try @import("std").testing.expectEqual(@as(u8, 0x41), user_bg.b);
+    try @import("std").testing.expectEqual(@as(u8, 0x0D), user_bg.r);
+    // toolSuccessBg = default (no bg)
+    try @import("std").testing.expect(t.bg(.tool_success_bg).is_default);
     // text = "" → Color.default
     try @import("std").testing.expect(t.fg(.text).is_default);
 }
