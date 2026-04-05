@@ -141,6 +141,40 @@ pub const Transcript = struct {
         self.items.append(self.allocator, .{ .component = comp }) catch return;
     }
 
+    /// Remove a specific component by identity. Used by extensions to retract items.
+    /// Matches pi-mono's Container.removeChild() identity-based removal.
+    pub fn removeComponent(self: *Transcript, comp: Component) void {
+        var i: usize = 0;
+        while (i < self.items.items.len) {
+            if (Component.eql(self.items.items[i].component, comp)) {
+                var item = self.items.items[i];
+                // Clean up tool index if this was a tool execution
+                if (item.tool_call_id) |id| {
+                    _ = self.pending_tools.remove(id);
+                }
+                item.deinit(self.allocator);
+                _ = self.items.orderedRemove(i);
+                // Fix up pending_tools indices for items after the removed one
+                var iter = self.pending_tools.iterator();
+                while (iter.next()) |entry| {
+                    if (entry.value_ptr.* > i) {
+                        entry.value_ptr.* -= 1;
+                    }
+                }
+                // Fix up current_text_idx
+                if (self.current_text_idx) |idx| {
+                    if (idx == i) {
+                        self.current_text_idx = null;
+                    } else if (idx > i) {
+                        self.current_text_idx = idx - 1;
+                    }
+                }
+                return; // remove first match only
+            }
+            i += 1;
+        }
+    }
+
     /// Remove all items and reset state. Used on session reset / /clear.
     pub fn clearAll(self: *Transcript) void {
         for (self.items.items) |*item| item.deinit(self.allocator);
@@ -414,6 +448,45 @@ test "Transcript renders assistant text and tool execution in order" {
     transcript.render(buf.region());
 
     try testing.expectEqual(@as(u21, 'h'), buf.get(1, 0).grapheme.codepoint);
+}
+
+test "Transcript removeComponent removes item by identity and fixes indices" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    // Use a simple component wrapper for identity testing
+    const Wrapper = struct {
+        val: u8 = 0,
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn measure(_: *@This(), _: u32) component_mod.Measurement {
+            return .{ .min_height = 1, .preferred_height = 1 };
+        }
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var w1 = Wrapper{ .val = 1 };
+    var w2 = Wrapper{ .val = 2 };
+    var w3 = Wrapper{ .val = 3 };
+
+    transcript.addComponent(w1.component());
+    transcript.addComponent(w2.component());
+    transcript.addComponent(w3.component());
+
+    try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
+
+    // Remove middle item
+    transcript.removeComponent(w2.component());
+    try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+
+    // Remaining items should be w1 and w3
+    try testing.expect(Component.eql(transcript.items.items[0].component, w1.component()));
+    try testing.expect(Component.eql(transcript.items.items[1].component, w3.component()));
+
+    // Remove non-existent — no-op
+    transcript.removeComponent(w2.component());
+    try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 }
 
 test "Transcript clearAll removes all items and resets state" {

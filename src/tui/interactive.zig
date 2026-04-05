@@ -16,6 +16,7 @@ const container_mod = @import("container.zig");
 const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
+const tui_mod = @import("tui.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -35,6 +36,7 @@ const UiEvent = ui_event_mod.UiEvent;
 const Transcript = transcript_mod.Transcript;
 const ToolDisplayRegistry = tool_display_mod.ToolDisplayRegistry;
 const ToolDisplay = tool_display_mod.ToolDisplay;
+const TUI = tui_mod.TUI;
 
 /// Thread-safe queue: agent thread pushes, main thread drains.
 fn EventQueue(comptime T: type) type {
@@ -58,7 +60,6 @@ fn EventQueue(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.items.append(self.allocator, item) catch {
-                // On allocation failure, clean up the owned event to prevent leaks
                 var mutable = item;
                 if (@hasDecl(T, "deinit")) {
                     mutable.deinit(self.allocator);
@@ -68,7 +69,6 @@ fn EventQueue(comptime T: type) type {
             self.cond.signal();
         }
 
-        /// Drain all queued items into caller's buffer. Non-blocking.
         pub fn drainInto(self: *Self, out: []T) usize {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -89,42 +89,12 @@ fn EventQueue(comptime T: type) type {
 ///
 /// Uses UiEvent (deep-copied) instead of raw AgentEvent to ensure
 /// no borrowed pointers cross the thread boundary.
-/// Component-identity-based focus manager.
-/// Source of truth for which component receives input and shows cursor.
-/// Matches pi-mono's TUI.focusedComponent / TUI.setFocus().
 ///
-/// Cursor position still comes from the container tree (root.cursorState())
-/// because containers translate child-relative y-offsets to screen-absolute.
-/// Overlay cursor will bypass the tree when H (overlay system) ships.
-const FocusManager = struct {
-    current: ?Component = null,
-
-    pub fn setFocus(self: *FocusManager, target: ?Component) void {
-        if (self.current) |prev| prev.setFocused(false);
-        self.current = target;
-        if (target) |t| t.setFocused(true);
-    }
-
-    pub fn handleInput(self: *FocusManager, key: Key) bool {
-        if (self.current) |focused| return focused.handleInput(key);
-        return false;
-    }
-
-    /// Save current focus for later restore (overlay push).
-    pub fn save(self: *FocusManager) ?Component {
-        return self.current;
-    }
-
-    /// Restore previously saved focus (overlay pop).
-    pub fn restore(self: *FocusManager, saved: ?Component) void {
-        self.setFocus(saved);
-    }
-};
-
+/// Composes TUI (reusable rendering/focus/overlay infrastructure)
+/// with domain-specific state (editor, transcript, agent, containers).
 pub const Interactive = struct {
     allocator: std.mem.Allocator,
-    terminal: Terminal,
-    renderer: Renderer,
+    tui: TUI,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
 
     // ── Owned components ──────────────────────────────────────────
@@ -135,17 +105,7 @@ pub const Interactive = struct {
     transcript: Transcript,
     registry: ToolDisplayRegistry,
 
-    // ── Focus ─────────────────────────────────────────────────────
-    focus: FocusManager = .{},
-
-    // ── Overlays ──────────────────────────────────────────────────
-    overlays: overlay_mod.OverlayManager,
-
     // ── Container slots (pi-mono parity) ──────────────────────────
-    // Each slot is a Container that can hold 0..N children.
-    // Extensions swap/add/remove children inside these containers
-    // without touching the root layout indices.
-    root: container_mod.Container,
     header_container: container_mod.Container,
     pending_container: container_mod.Container,
     status_container: container_mod.Container,
@@ -156,7 +116,6 @@ pub const Interactive = struct {
     event_queue: EventQueue(UiEvent),
     ca: *CodingAgent,
     agent_thread: ?std.Thread = null,
-    dirty: bool = true,
     running: bool = true,
     is_streaming: bool = false,
     in_paste: bool = false,
@@ -168,16 +127,11 @@ pub const Interactive = struct {
         registry: ToolDisplayRegistry,
         cwd: []const u8,
     ) !Interactive {
-        var term = Terminal.init();
-        term.updateSize();
-
-        const rend = try Renderer.init(allocator, term.fd_out, term.width, term.height);
         const theme = &theme_mod.Theme.dark;
 
         var self: Interactive = .{
             .allocator = allocator,
-            .terminal = term,
-            .renderer = rend,
+            .tui = try TUI.init(allocator),
             .theme = theme,
             .editor = editor_mod.Editor.init(allocator),
             .status_text = text_mod.Text.init(allocator),
@@ -185,8 +139,6 @@ pub const Interactive = struct {
             .footer = .{ .theme = theme, .cwd = cwd, .model_name = ca.agent.state.model.id },
             .transcript = Transcript.init(allocator),
             .registry = registry,
-            .overlays = overlay_mod.OverlayManager.init(allocator),
-            .root = container_mod.Container.init(allocator),
             .header_container = container_mod.Container.init(allocator),
             .pending_container = container_mod.Container.init(allocator),
             .status_container = container_mod.Container.init(allocator),
@@ -213,8 +165,6 @@ pub const Interactive = struct {
         }
         self.paste_buf.deinit(self.allocator);
         self.event_queue.deinit();
-        self.overlays.deinit();
-        self.root.deinit();
         self.widget_below_container.deinit();
         self.editor_container.deinit();
         self.widget_above_container.deinit();
@@ -224,46 +174,43 @@ pub const Interactive = struct {
         self.transcript.deinit();
         self.status_text.deinit();
         self.editor.deinit();
-        self.renderer.deinit();
-        self.terminal.deinit();
+        self.tui.deinit();
     }
 
     /// Main loop — runs on the main thread.
     pub fn run(self: *Interactive) !void {
-        try self.terminal.enterRawMode();
-        self.terminal.installSignalHandlers();
-        self.terminal.hideCursor();
-        self.terminal.enableBracketedPaste();
-        self.terminal.queryKittyProtocol();
+        try self.tui.terminal.enterRawMode();
+        self.tui.terminal.installSignalHandlers();
+        self.tui.terminal.hideCursor();
+        self.tui.terminal.enableBracketedPaste();
+        self.tui.terminal.queryKittyProtocol();
 
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
 
         // Populate container slots with their initial children.
-        // Each slot is a Container so extensions can swap/add/remove children
-        // without touching the root layout indices.
         self.header_container.addChild(self.header.component());
         self.status_container.addChild(self.status_text.component());
         self.editor_container.addChild(self.editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
 
-        // Set initial focus via FocusManager (source of truth for input routing)
-        self.focus.setFocus(self.editor.component());
+        // Set initial focus via TUI (source of truth for input routing)
+        self.tui.setFocus(self.editor.component());
 
         // Build root tree matching pi-mono slot structure:
         // headerContainer → chat(flex) → pending → status → widget_above → editor(focused) → widget_below → footer
-        self.root.addChild(self.header_container.component()); // [0] headerContainer
-        self.root.addChild(self.transcript.component()); // [1] chat (flex)
-        self.root.addChild(self.pending_container.component()); // [2] pendingContainer
-        self.root.addChild(self.status_container.component()); // [3] statusContainer
-        self.root.addChild(self.widget_above_container.component()); // [4] widgetAboveContainer
-        self.root.addChild(self.editor_container.component()); // [5] editorContainer
-        self.root.addChild(self.widget_below_container.component()); // [6] widgetBelowContainer
-        self.root.addChild(self.footer.component()); // [7] footer (direct, no wrapper needed)
-        self.root.flex_child_index = 1; // transcript is flex
-        self.root.focused_child_index = 5; // editorContainer receives input
+        self.tui.root.addChild(self.header_container.component()); // [0] headerContainer
+        self.tui.root.addChild(self.transcript.component()); // [1] chat (flex)
+        self.tui.root.addChild(self.pending_container.component()); // [2] pendingContainer
+        self.tui.root.addChild(self.status_container.component()); // [3] statusContainer
+        self.tui.root.addChild(self.widget_above_container.component()); // [4] widgetAboveContainer
+        self.tui.root.addChild(self.editor_container.component()); // [5] editorContainer
+        self.tui.root.addChild(self.widget_below_container.component()); // [6] widgetBelowContainer
+        self.tui.root.addChild(self.footer.component()); // [7] footer (direct, no wrapper)
+        self.tui.root.flex_child_index = 1; // transcript is flex
+        self.tui.root.focused_child_index = 5; // editorContainer for cursor y-offset
 
-        self.dirty = true;
+        self.tui.dirty = true;
 
         while (self.running) {
             // 1. Drain UI events (owned, thread-safe)
@@ -276,22 +223,18 @@ pub const Interactive = struct {
 
             // 2. Poll terminal input (non-blocking: MIN=0, TIME=0)
             var input_buf: [4096]u8 = undefined;
-            const n = self.terminal.readInput(&input_buf) catch 0;
+            const n = self.tui.terminal.readInput(&input_buf) catch 0;
             if (n > 0) {
                 self.handleRawInput(input_buf[0..n]);
             }
 
             // 3. Check for terminal resize
-            self.terminal.updateSize();
-            if (self.terminal.width != self.renderer.width or self.terminal.height != self.renderer.height) {
-                self.renderer.resize(self.terminal.width, self.terminal.height) catch {};
-                self.dirty = true;
-            }
+            _ = self.tui.checkResize();
 
             // 4. Render if dirty
-            if (self.dirty) {
+            if (self.tui.dirty) {
                 self.renderFrame();
-                self.dirty = false;
+                self.tui.dirty = false;
             }
 
             // 5. Brief sleep to avoid busy-wait (1ms)
@@ -309,8 +252,8 @@ pub const Interactive = struct {
                     self.editor.insertText(self.paste_buf.items);
                     self.paste_buf.items.len = 0;
                     self.in_paste = false;
-                    self.dirty = true;
-                    offset = end_pos + 6; // skip "\x1b[201~"
+                    self.tui.dirty = true;
+                    offset = end_pos + 6;
                     continue;
                 } else {
                     self.paste_buf.appendSlice(self.allocator, data[offset..]) catch {};
@@ -329,12 +272,12 @@ pub const Interactive = struct {
             // Also treat bare \n as newline insertion (some terminals send this for shift+enter)
             if (data[offset] == '\n') {
                 self.editor.insertText("\n");
-                self.dirty = true;
+                self.tui.dirty = true;
                 offset += 1;
                 continue;
             }
 
-            const result = keys_mod.parseKey(data[offset..], self.terminal.kitty_active) orelse {
+            const result = keys_mod.parseKey(data[offset..], self.tui.terminal.kitty_active) orelse {
                 offset += 1;
                 continue;
             };
@@ -350,7 +293,7 @@ pub const Interactive = struct {
                 self.ca.agent.abort();
                 self.status_text.setContent("aborted");
                 self.status_text.fg = self.theme.fg(.@"error");
-                self.dirty = true;
+                self.tui.dirty = true;
             }
             return;
         }
@@ -370,9 +313,9 @@ pub const Interactive = struct {
         // scroll: page up/down, shift+up/down
         if (self.handleScroll(key)) return;
 
-        // Route to focused component via FocusManager
-        if (self.focus.handleInput(key)) {
-            self.dirty = true;
+        // Route to focused component via TUI
+        if (self.tui.handleInput(key)) {
+            self.tui.dirty = true;
         }
     }
 
@@ -391,13 +334,13 @@ pub const Interactive = struct {
         };
 
         if (delta) |d| {
-            const w = self.renderer.width;
+            const w = self.tui.width();
             const total = self.transcript.totalHeight(w);
             const max_scroll: u32 = if (total > output_h) total - output_h else 0;
             const current: i64 = @intCast(self.transcript.scroll_offset);
             const new_val = @max(0, @min(current + d, @as(i64, @intCast(max_scroll))));
             self.transcript.scroll_offset = @intCast(new_val);
-            self.dirty = true;
+            self.tui.dirty = true;
             return true;
         }
         return false;
@@ -407,41 +350,40 @@ pub const Interactive = struct {
         switch (ev.*) {
             .text_delta => |d| {
                 self.transcript.appendText(d.delta);
-                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
-                self.dirty = true;
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.tui.dirty = true;
             },
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
-                self.dirty = true;
+                self.tui.dirty = true;
             },
             .message_start_assistant => {
                 self.transcript.beginAssistantMessage();
                 self.status_text.setContent("thinking...");
                 self.status_text.fg = self.theme.fg(.muted);
-                self.dirty = true;
+                self.tui.dirty = true;
             },
             .message_start_user => {},
             .tool_call_streaming => |t| {
-                // create display early (before tool_execution_start)
                 const display = self.registry.create(self.allocator, t.tool_name);
                 self.transcript.addToolExecution(t.tool_call_id, display);
                 self.transcript.updateTool(t.tool_call_id, .{ .start = .{
                     .tool_name = t.tool_name,
                     .args_json = t.args_json,
                 } });
-                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
-                self.dirty = true;
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.tui.dirty = true;
             },
             .message_end_assistant => |m| {
                 if (m.is_aborted) {
                     self.status_text.setContent(m.error_message orelse "aborted");
                     self.status_text.fg = self.theme.fg(.@"error");
-                    self.dirty = true;
+                    self.tui.dirty = true;
                 } else if (m.error_message) |msg| {
                     self.status_text.setContent(msg);
                     self.status_text.fg = self.theme.fg(.@"error");
-                    self.dirty = true;
+                    self.tui.dirty = true;
                 }
             },
             .tool_start => |t| {
@@ -453,32 +395,32 @@ pub const Interactive = struct {
                 } });
                 self.status_text.setContent(t.tool_name);
                 self.status_text.fg = self.theme.fg(.accent);
-                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
-                self.dirty = true;
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.tui.dirty = true;
             },
             .tool_update => |t| {
                 self.transcript.updateTool(t.tool_call_id, .{ .update = .{
                     .result_text = t.result_text,
                     .is_error = t.is_error,
                 } });
-                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
-                self.dirty = true;
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.tui.dirty = true;
             },
             .tool_end => |t| {
                 self.transcript.updateTool(t.tool_call_id, .{ .end = .{
                     .result_text = t.result_text,
                     .is_error = t.is_error,
                 } });
-                self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
-                self.dirty = true;
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.tui.dirty = true;
             },
             .agent_finished => {
                 self.is_streaming = false;
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.status_text.setContent("");
-                self.focus.setFocus(self.editor.component());
-                self.dirty = true;
+                self.tui.setFocus(self.editor.component());
+                self.tui.dirty = true;
             },
             .agent_error => {
                 self.is_streaming = false;
@@ -486,22 +428,22 @@ pub const Interactive = struct {
                 self.agent_thread = null;
                 self.status_text.setContent("error occurred");
                 self.status_text.fg = self.theme.fg(.@"error");
-                self.focus.setFocus(self.editor.component());
-                self.dirty = true;
+                self.tui.setFocus(self.editor.component());
+                self.tui.dirty = true;
             },
         }
     }
 
     fn outputHeight(self: *Interactive) u32 {
-        const h = self.renderer.height;
-        const w = self.renderer.width;
+        const h = self.tui.height();
+        const w = self.tui.width();
         const max_h = @max(3, h * 30 / 100);
         self.editor.max_visible_lines = max_h;
 
         // Sum all non-flex children's measured heights
         var fixed_total: u32 = 0;
-        for (self.root.children.items, 0..) |child, i| {
-            if (self.root.flex_child_index != null and i == self.root.flex_child_index.?) continue;
+        for (self.tui.root.children.items, 0..) |child, i| {
+            if (self.tui.root.flex_child_index != null and i == self.tui.root.flex_child_index.?) continue;
             var c = child;
             fixed_total += c.measure(w).preferred_height;
         }
@@ -509,13 +451,13 @@ pub const Interactive = struct {
     }
 
     fn renderFrame(self: *Interactive) void {
-        const region = self.renderer.begin();
-        const w = region.width;
-        const h = region.height;
+        const w = self.tui.width();
+        const h = self.tui.height();
 
         if (h < 3 or w < 10) {
+            const region = self.tui.renderer.begin();
             _ = region.writeStr(0, 0, "terminal too small", self.theme.fg(.@"error"), Color.default, .{});
-            self.renderer.end() catch {};
+            self.tui.renderer.end() catch {};
             return;
         }
 
@@ -523,20 +465,12 @@ pub const Interactive = struct {
         const max_h = @max(3, h * 30 / 100);
         self.editor.max_visible_lines = max_h;
 
-        self.root.render(region);
-
-        // Render overlays on top of base content (cell-buffer compositing)
-        if (self.overlays.hasVisibleOverlays()) {
-            self.overlays.renderOverlays(region);
-        }
-
-        self.renderer.end() catch {};
-
-        if (self.root.cursorState()) |cs| {
-            self.terminal.showCursor();
-            self.terminal.setCursorPos(cs.x, cs.y);
+        // Render via TUI (root tree + overlays) and get cursor state
+        if (self.tui.render()) |cs| {
+            self.tui.terminal.showCursor();
+            self.tui.terminal.setCursorPos(cs.x, cs.y);
         } else {
-            self.terminal.hideCursor();
+            self.tui.terminal.hideCursor();
         }
     }
 
@@ -550,14 +484,14 @@ pub const Interactive = struct {
 
         self.editor.clear();
         self.is_streaming = true;
-        self.focus.setFocus(null); // defocus editor during streaming
+        self.tui.setFocus(null); // defocus editor during streaming
         self.status_text.setContent("sending...");
         self.status_text.fg = self.theme.fg(.muted);
-        self.dirty = true;
+        self.tui.dirty = true;
 
         self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, prompt_copy }) catch {
             self.is_streaming = false;
-            self.focus.setFocus(self.editor.component());
+            self.tui.setFocus(self.editor.component());
             self.status_text.setContent("failed to start agent");
             self.status_text.fg = self.theme.fg(.@"error");
             self.allocator.free(prompt_copy);
@@ -567,7 +501,7 @@ pub const Interactive = struct {
         // Add user message after successful spawn (prompt_copy is safe to read here —
         // the agent thread doesn't free it until run() completes)
         self.transcript.addUserMessage(prompt_copy);
-        self.transcript.scrollToBottom(self.renderer.width, self.outputHeight());
+        self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
     }
 
     fn agentThreadFn(self: *Interactive, prompt_copy: []const u8) void {
