@@ -163,3 +163,117 @@ test "measureHeight" {
     try testing.expectEqual(@as(u32, 12), measureHeight(10, 0));
     try testing.expectEqual(@as(u32, 8), measureHeight(5, 1));
 }
+
+// ── Closed variant (editor/overlay style) ─────────────────────────
+// ╭─ left text ────── right text ─╮
+// │ content                       │
+// ╰─ left text ────── right text ─╯
+
+const grapheme_mod = @import("grapheme.zig");
+
+/// Draw closed top border: ╭─ {left} ──── {right} ─╮
+/// Labels are optional. Fill with ─ between them.
+pub fn drawClosedTop(region: Region, row: u32, left: ?[]const u8, right: ?[]const u8, style: Style) u32 {
+    if (row >= region.height or region.width < 4) return 0;
+    const w = region.width;
+    var col: u32 = 0;
+
+    // ╭─
+    col += region.writeStr(col, row, "╭─", style.chrome, Color.default, .{});
+
+    // left label with spacing
+    var left_w: u32 = 0;
+    if (left) |l| {
+        if (l.len > 0) {
+            col += region.writeStr(col, row, " ", Color.default, Color.default, .{});
+            const wrote = region.writeStr(col, row, l, style.fg, Color.default, .{});
+            col += wrote;
+            left_w = wrote + 1; // +1 for leading space
+            col += region.writeStr(col, row, " ", Color.default, Color.default, .{});
+            left_w += 1; // trailing space
+        }
+    }
+
+    // right label — measure width for fill calculation
+    var right_w: u32 = 0;
+    if (right) |r| {
+        if (r.len > 0) {
+            right_w = @intCast(grapheme_mod.strWidth(r));
+            right_w += 2; // spaces around label
+        }
+    }
+
+    // ─ fill between left and right
+    // Budget: w - 2 (╭─) - left_w - right_w - 2 (─╮)
+    const used = 2 + left_w + right_w + 2;
+    if (w > used) {
+        const fill = w - used;
+        var i: u32 = 0;
+        while (i < fill) : (i += 1) {
+            col += region.writeStr(col, row, "─", style.chrome, Color.default, .{});
+        }
+    }
+
+    // right label
+    if (right) |r| {
+        if (r.len > 0) {
+            col += region.writeStr(col, row, " ", Color.default, Color.default, .{});
+            col += region.writeStr(col, row, r, style.dim, Color.default, .{});
+            col += region.writeStr(col, row, " ", Color.default, Color.default, .{});
+        }
+    }
+
+    // ─╮
+    col += region.writeStr(col, row, "─╮", style.chrome, Color.default, .{});
+    return 1;
+}
+
+/// Draw closed bottom border: ╰─────╯
+pub fn drawClosedBottom(region: Region, row: u32, style: Style) u32 {
+    if (row >= region.height or region.width < 4) return 0;
+    const w = region.width;
+    var col: u32 = 0;
+
+    col += region.writeStr(col, row, "╰", style.chrome, Color.default, .{});
+
+    const fill = if (w > 2) w - 2 else 0;
+    var i: u32 = 0;
+    while (i < fill) : (i += 1) {
+        col += region.writeStr(col, row, "─", style.chrome, Color.default, .{});
+    }
+
+    _ = region.writeStr(col, row, "╯", style.chrome, Color.default, .{});
+    return 1;
+}
+
+/// Draw closed content line prefix: │ at col 0.
+/// Returns 1 (rows consumed, not cols).
+pub fn drawClosedContentPrefix(region: Region, row: u32, style: Style) u32 {
+    if (row >= region.height) return 0;
+    _ = region.writeStr(0, row, "│", style.chrome, Color.default, .{});
+    return 1;
+}
+
+test "drawClosedTop renders with labels" {
+    var buf = try Buffer.init(testing.allocator, 40, 1);
+    defer buf.deinit();
+    _ = drawClosedTop(buf.region(), 0, "left", "right", test_style);
+    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '╮'), buf.get(39, 0).grapheme.codepoint);
+}
+
+test "drawClosedTop renders without labels" {
+    var buf = try Buffer.init(testing.allocator, 20, 1);
+    defer buf.deinit();
+    _ = drawClosedTop(buf.region(), 0, null, null, test_style);
+    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '╮'), buf.get(19, 0).grapheme.codepoint);
+}
+
+test "drawClosedBottom renders corners" {
+    var buf = try Buffer.init(testing.allocator, 20, 1);
+    defer buf.deinit();
+    _ = drawClosedBottom(buf.region(), 0, test_style);
+    try testing.expectEqual(@as(u21, '╰'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '╯'), buf.get(19, 0).grapheme.codepoint);
+}

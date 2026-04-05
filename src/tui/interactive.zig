@@ -161,6 +161,7 @@ pub const Interactive = struct {
         };
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
+        self.editor.status_left = cwd;
         // NOTE: active_editor is bound in run() where self is at its final address.
         // Binding here would capture a pointer to the local `self` that becomes
         // dangling after the by-value return.
