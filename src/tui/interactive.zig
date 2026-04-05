@@ -19,6 +19,7 @@ const theme_mod = @import("theme.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
+const status_data_mod = @import("status_data.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -39,6 +40,7 @@ const Transcript = transcript_mod.Transcript;
 const ToolRendererRegistry = tool_display_mod.ToolRendererRegistry;
 const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
+const StatusData = status_data_mod.StatusData;
 
 /// Thread-safe queue: agent thread pushes, main thread drains.
 fn EventQueue(comptime T: type) type {
@@ -110,6 +112,7 @@ pub const Interactive = struct {
     footer: footer_mod.Footer,
     transcript: Transcript,
     registry: ToolRendererRegistry,
+    status_data: StatusData,
 
     // ── Container slots (pi-mono parity) ──────────────────────────
     header_container: container_mod.Container,
@@ -146,9 +149,10 @@ pub const Interactive = struct {
             .editor = editor_mod.Editor.init(allocator),
             .status_text = text_mod.Text.init(allocator),
             .header = .{ .theme = theme, .version = "0.1.0" },
-            .footer = .{ .theme = theme, .cwd = cwd, .model_name = ca.agent.state.model.id },
+            .footer = .{ .theme = theme },
             .transcript = Transcript.init(allocator),
             .registry = registry,
+            .status_data = StatusData.init(allocator),
             .header_container = container_mod.Container.init(allocator),
             .pending_container = container_mod.Container.init(allocator),
             .status_container = container_mod.Container.init(allocator),
@@ -161,7 +165,10 @@ pub const Interactive = struct {
         };
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
-        self.editor.status_left = cwd;
+        self.status_data.cwd = cwd;
+        self.status_data.model_id = ca.agent.state.model.id;
+        self.editor.status_data = &self.status_data;
+        self.footer.status_data = &self.status_data;
         // NOTE: active_editor is bound in run() where self is at its final address.
         // Binding here would capture a pointer to the local `self` that becomes
         // dangling after the by-value return.
@@ -178,6 +185,7 @@ pub const Interactive = struct {
             if (count == 0) break;
             for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
         }
+        self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
         self.widget_below_container.deinit();
@@ -201,6 +209,8 @@ pub const Interactive = struct {
         self.tui.terminal.queryKittyProtocol();
         self.tui.terminal.enableMouseTracking();
         self.kitty_deadline_ns = std.time.nanoTimestamp() + 150_000_000; // 150ms
+
+        self.detectGitBranch();
 
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
@@ -507,6 +517,23 @@ pub const Interactive = struct {
         return if (h > fixed_total) h - fixed_total else 0;
     }
 
+
+    fn detectGitBranch(self: *Interactive) void {
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
+            .max_output_bytes = 256,
+        }) catch return;
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        if (result.term.Exited == 0) {
+            const branch = std.mem.trimRight(u8, result.stdout, " \t\n\r");
+            if (branch.len > 0) {
+                self.status_data.setGitBranch(branch);
+            }
+        }
+    }
     fn renderFrame(self: *Interactive) void {
         const w = self.tui.width();
         const h = self.tui.height();

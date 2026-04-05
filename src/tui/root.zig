@@ -19,6 +19,7 @@ pub const theme = @import("theme.zig");
 pub const renderers = @import("renderers/root.zig");
 pub const excerpt = @import("excerpt.zig");
 pub const box_chrome = @import("box_chrome.zig");
+pub const status_data = @import("status_data.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -5,6 +5,7 @@ const component_mod = @import("../component.zig");
 const keys_mod = @import("../keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const box_chrome = @import("../box_chrome.zig");
+const status_data_mod = @import("../status_data.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -13,6 +14,7 @@ const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const CursorState = component_mod.CursorState;
 const Key = keys_mod.Key;
+const StatusData = status_data_mod.StatusData;
 
 pub const Editor = struct {
     buf: std.ArrayList(u8),
@@ -27,8 +29,7 @@ pub const Editor = struct {
     prompt_fg: Color = Color.rgb(100, 100, 100),
     text_fg: Color = Color.default,
     border_color: Color = Color.rgb(0x50, 0x50, 0x50),
-    status_left: []const u8 = "",
-    status_right: []const u8 = "",
+    status_data: ?*const StatusData = null,
     allocator: std.mem.Allocator,
     focused: bool = true,
 
@@ -59,7 +60,6 @@ pub const Editor = struct {
         self.buf.items.len = 0;
         self.buf.appendSlice(self.allocator, text) catch return;
         self.cursor_byte = @intCast(text.len);
-        // cursor_col is display col within the last line
         const last_line_start = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |pos| pos + 1 else 0;
         self.cursor_col = @intCast(grapheme_mod.strWidth(text[last_line_start..]));
         self.scroll_x = 0;
@@ -68,7 +68,6 @@ pub const Editor = struct {
 
     pub fn insertText(self: *Editor, text: []const u8) void {
         self.buf.insertSlice(self.allocator, self.cursor_byte, text) catch return;
-        // advance cursor through inserted text, tracking col on last line
         var i: usize = 0;
         while (i < text.len) {
             if (text[i] == '\n') {
@@ -97,15 +96,13 @@ pub const Editor = struct {
                     self.insertNewline();
                     return true;
                 }
-                // backslash-enter: delete backslash, insert newline
                 if (self.cursor_byte > 0 and self.buf.items[self.cursor_byte - 1] == '\\') {
-                    // remove the backslash
                     const prev = self.cursor_byte - 1;
                     const items = self.buf.items;
                     std.mem.copyForwards(u8, items[prev..], items[self.cursor_byte..]);
                     self.buf.items.len -= 1;
                     self.cursor_byte = prev;
-                    self.cursor_col -= 1; // backslash is 1 col wide
+                    self.cursor_col -= 1;
                     self.insertNewline();
                     return true;
                 }
@@ -129,10 +126,8 @@ pub const Editor = struct {
             },
             .backspace => {
                 if (self.cursor_byte == 0) return true;
-                // newline: merge lines
                 if (self.buf.items[self.cursor_byte - 1] == '\n') {
                     const prev = self.cursor_byte - 1;
-                    // cursor_col becomes display width of the previous line (now end of merged line)
                     const prev_line_start = self.lineStartByIndex(self.cursorLine() -| 1);
                     self.cursor_col = self.displayColAtByte(prev);
                     _ = prev_line_start;
@@ -156,7 +151,6 @@ pub const Editor = struct {
             },
             .delete => {
                 if (self.cursor_byte >= self.buf.items.len) return true;
-                // newline at cursor: merge with next line
                 if (self.buf.items[self.cursor_byte] == '\n') {
                     const items = self.buf.items;
                     const next = self.cursor_byte + 1;
@@ -174,7 +168,6 @@ pub const Editor = struct {
             .left => {
                 if (self.cursor_byte == 0) return true;
                 if (self.buf.items[self.cursor_byte - 1] == '\n') {
-                    // move to end of previous line
                     self.cursor_byte -= 1;
                     self.cursor_col = self.displayColAtByte(self.cursor_byte);
                     self.ensureCursorVisible();
@@ -190,7 +183,6 @@ pub const Editor = struct {
             .right => {
                 if (self.cursor_byte >= self.buf.items.len) return true;
                 if (self.buf.items[self.cursor_byte] == '\n') {
-                    // move to start of next line
                     self.cursor_byte += 1;
                     self.cursor_col = 0;
                     self.ensureCursorVisible();
@@ -208,7 +200,7 @@ pub const Editor = struct {
                 if (cur_line == 0) return true;
                 const target_col = self.cursor_col;
                 const prev_line_start = self.lineStartByIndex(cur_line - 1);
-                const prev_line_end = self.currentLineStart() - 1; // the \n before current line
+                const prev_line_end = self.currentLineStart() - 1;
                 self.cursor_byte = self.byteAtDisplayCol(prev_line_start, prev_line_end, target_col);
                 self.cursor_col = self.displayColAtByte(self.cursor_byte);
                 self.ensureCursorVisible();
@@ -249,10 +241,11 @@ pub const Editor = struct {
         // Top border with rounded corners and inline status
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
-            _ = box_chrome.drawClosedTop(region, 0,
-                if (self.status_left.len > 0) self.status_left else null,
-                if (self.status_right.len > 0) self.status_right else null,
-                style);
+            var left_buf: [256]u8 = undefined;
+            var right_buf: [128]u8 = undefined;
+            const left_text = self.formatStatusLeft(&left_buf);
+            const right_text = self.formatStatusRight(&right_buf);
+            _ = box_chrome.drawClosedTop(region, 0, left_text, right_text, style);
         }
         // Bottom border with rounded corners
         {
@@ -266,7 +259,7 @@ pub const Editor = struct {
         const continuation = "  ";
         const items = self.buf.items;
 
-        // Draw left border │ on all content rows
+        // Draw left border on all content rows
         {
             const chrome_style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
             var row: u32 = 0;
@@ -333,6 +326,54 @@ pub const Editor = struct {
         return Component.init(Editor, self);
     }
 
+    // --- Status formatting (reads from StatusData, no allocations) ---
+
+    fn formatStatusLeft(self: *const Editor, buf: []u8) ?[]const u8 {
+        const sd = self.status_data orelse return null;
+        var pos: usize = 0;
+
+        if (sd.cwd.len > 0) {
+            const home = std.posix.getenv("HOME") orelse "";
+            if (home.len > 0 and std.mem.startsWith(u8, sd.cwd, home)) {
+                if (pos + 1 < buf.len) {
+                    buf[pos] = '~';
+                    pos += 1;
+                }
+                const rest = sd.cwd[home.len..];
+                const copy_len = @min(rest.len, buf.len - pos);
+                @memcpy(buf[pos..][0..copy_len], rest[0..copy_len]);
+                pos += copy_len;
+            } else {
+                const copy_len = @min(sd.cwd.len, buf.len - pos);
+                @memcpy(buf[pos..][0..copy_len], sd.cwd[0..copy_len]);
+                pos += copy_len;
+            }
+        }
+
+        if (sd.git_branch) |branch| {
+            const sep = " \xC2\xB7 ";
+            if (branch.len > 0 and pos + sep.len + branch.len < buf.len) {
+                @memcpy(buf[pos..][0..sep.len], sep);
+                pos += sep.len;
+                const copy_len = @min(branch.len, buf.len - pos);
+                @memcpy(buf[pos..][0..copy_len], branch[0..copy_len]);
+                pos += copy_len;
+            }
+        }
+
+        if (pos == 0) return null;
+        return buf[0..pos];
+    }
+
+    fn formatStatusRight(self: *const Editor, buf: []u8) ?[]const u8 {
+        const sd = self.status_data orelse return null;
+        if (sd.model_id.len == 0) return null;
+
+        const copy_len = @min(sd.model_id.len, buf.len);
+        @memcpy(buf[0..copy_len], sd.model_id[0..copy_len]);
+        return buf[0..copy_len];
+    }
+
     // --- Internal helpers ---
 
     fn insertNewline(self: *Editor) void {
@@ -392,7 +433,6 @@ pub const Editor = struct {
     }
 
     fn displayColAtByte(self: *const Editor, byte: u32) u32 {
-        // find start of the line containing `byte`
         var line_start: u32 = 0;
         if (byte > 0) {
             var i: u32 = byte - 1;
@@ -411,9 +451,9 @@ pub const Editor = struct {
             const cp_len: u32 = @intCast(std.unicode.utf8ByteSequenceLength(self.buf.items[i]) catch 1);
             const end = @min(i + cp_len, line_end);
             const cp = std.unicode.utf8Decode(self.buf.items[i..end]) catch '_';
-            const w: u32 = @as(u32, grapheme_mod.charWidth(cp));
-            if (col + w > target_col) break;
-            col += w;
+            const w_val: u32 = @as(u32, grapheme_mod.charWidth(cp));
+            if (col + w_val > target_col) break;
+            col += w_val;
             i = end;
         }
         return i;
@@ -455,9 +495,8 @@ test "Editor insert, cursor tracking, and submit" {
     try std.testing.expectEqualStrings("hi", editor.getText());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
 
-    // Cursor state includes prompt offset
     const cs = editor.cursorState().?;
-    try std.testing.expectEqual(@as(u32, 5), cs.x); // "> " (2) + cursor_col (2)
+    try std.testing.expectEqual(@as(u32, 5), cs.x);
 }
 
 test "Editor backspace, delete, and navigation" {
@@ -467,15 +506,12 @@ test "Editor backspace, delete, and navigation" {
     _ = editor.handleInput(.{ .code = .char, .char = 'a' });
     _ = editor.handleInput(.{ .code = .char, .char = 'b' });
     _ = editor.handleInput(.{ .code = .char, .char = 'c' });
-    // Backspace
     _ = editor.handleInput(.{ .code = .backspace });
     try std.testing.expectEqualStrings("ab", editor.getText());
-    // Navigation
     _ = editor.handleInput(.{ .code = .home });
     try std.testing.expectEqual(@as(u32, 0), editor.cursor_col);
     _ = editor.handleInput(.{ .code = .end });
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-    // Clear
     editor.clear();
     try std.testing.expectEqualStrings("", editor.getText());
 }
@@ -488,10 +524,10 @@ test "Editor renders prompt and text to buffer" {
     var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 3);
     defer buf.deinit();
     editor.render(buf.region());
-    try std.testing.expectEqual(@as(u21, 0x256D), buf.get(0, 0).grapheme.codepoint); // top border
+    try std.testing.expectEqual(@as(u21, 0x256D), buf.get(0, 0).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, '>'), buf.get(1, 1).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, 'x'), buf.get(3, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 0x2570), buf.get(0, 2).grapheme.codepoint); // bottom border
+    try std.testing.expectEqual(@as(u21, 0x2570), buf.get(0, 2).grapheme.codepoint);
 }
 
 
@@ -506,22 +542,17 @@ test "editor render after backspace clears deleted char from buffer" {
     _ = editor.handleInput(.{ .code = .char, .char = 'b' });
     _ = editor.handleInput(.{ .code = .char, .char = 'c' });
 
-    // Frame 1: render "> abc"
     editor.render(buf.region());
     try std.testing.expectEqual(@as(u21, 'c'), buf.get(5, 1).grapheme.codepoint);
 
-    // Backspace removes 'c'
     _ = editor.handleInput(.{ .code = .backspace });
 
-    // Frame 2: clear buffer (simulates renderer.begin()), re-render
     buf.clear();
     editor.render(buf.region());
 
-    // Position 4 must be blank, not ghost 'c'
     try std.testing.expectEqual(@as(u21, 'b'), buf.get(4, 1).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), buf.get(5, 1).grapheme.codepoint);
 
-    // Cursor should be at prompt_width(2) + cursor_col(2) = 4, y=1 for border
     const cs = editor.cursorState().?;
     try std.testing.expectEqual(@as(u32, 5), cs.x);
     try std.testing.expectEqual(@as(u32, 1), cs.y);
@@ -531,7 +562,6 @@ test "Editor handles newline insertion and cross-line backspace" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
 
-    // Type "ab", shift+enter for newline, type "cd"
     _ = editor.handleInput(.{ .code = .char, .char = 'a' });
     _ = editor.handleInput(.{ .code = .char, .char = 'b' });
     _ = editor.handleInput(.{ .code = .enter, .shift = true });
@@ -542,7 +572,6 @@ test "Editor handles newline insertion and cross-line backspace" {
     try std.testing.expectEqual(@as(u32, 1), editor.cursorLine());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
 
-    // Backslash-enter also inserts newline
     editor.clear();
     _ = editor.handleInput(.{ .code = .char, .char = 'x' });
     _ = editor.handleInput(.{ .code = .char, .char = '\\' });
@@ -550,41 +579,34 @@ test "Editor handles newline insertion and cross-line backspace" {
     _ = editor.handleInput(.{ .code = .char, .char = 'y' });
     try std.testing.expectEqualStrings("x\ny", editor.getText());
 
-    // Backspace at line start merges lines
-    // cursor is after 'y' on line 1 — move home first
     _ = editor.handleInput(.{ .code = .home });
     try std.testing.expectEqual(@as(u32, 0), editor.cursor_col);
     _ = editor.handleInput(.{ .code = .backspace });
     try std.testing.expectEqualStrings("xy", editor.getText());
-    try std.testing.expectEqual(@as(u32, 1), editor.cursor_col); // after 'x'
+    try std.testing.expectEqual(@as(u32, 1), editor.cursor_col);
 }
 
 test "Editor up/down navigation moves between lines" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
 
-    // Build "abc\nde\nfghij" via insertText
     editor.insertText("abc\nde\nfghij");
     try std.testing.expectEqualStrings("abc\nde\nfghij", editor.getText());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursorLine()); // on line 2
-    try std.testing.expectEqual(@as(u32, 5), editor.cursor_col); // after "fghij"
+    try std.testing.expectEqual(@as(u32, 2), editor.cursorLine());
+    try std.testing.expectEqual(@as(u32, 5), editor.cursor_col);
 
-    // Up to line 1 — col clamps to 2 (line "de" is 2 wide)
     _ = editor.handleInput(.{ .code = .up });
     try std.testing.expectEqual(@as(u32, 1), editor.cursorLine());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
 
-    // Up to line 0 — col stays 2 (line "abc" has room)
     _ = editor.handleInput(.{ .code = .up });
     try std.testing.expectEqual(@as(u32, 0), editor.cursorLine());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
 
-    // Down back to line 1
     _ = editor.handleInput(.{ .code = .down });
     try std.testing.expectEqual(@as(u32, 1), editor.cursorLine());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
 
-    // Down to line 2 — col stays 2
     _ = editor.handleInput(.{ .code = .down });
     try std.testing.expectEqual(@as(u32, 2), editor.cursorLine());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
