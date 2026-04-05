@@ -243,15 +243,17 @@ pub const Interactive = struct {
             var input_raw: [4096]u8 = undefined;
             const n = self.tui.terminal.readInput(&input_raw) catch 0;
             if (n > 0) {
-                // During kitty negotiation, feed through InputBuffer and check for response
+                // During kitty negotiation, buffer input and check for response
                 if (self.kitty_deadline_ns != null) {
                     self.input.buf.appendSlice(self.allocator, input_raw[0..n]) catch {};
                     if (self.input.consumeKittyResponse()) {
                         self.tui.terminal.enableKittyProtocol();
                         self.kitty_deadline_ns = null;
+                        // Drain buffered input now that kitty is active
+                        self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
                     }
-                    // Don't drain sequences during negotiation — hold for kitty or timeout
-                    if (self.kitty_deadline_ns != null) continue;
+                    // Still negotiating — hold bytes for timeout
+                    continue;
                 }
                 // Feed through InputBuffer — emits complete sequences via callbacks
                 self.input.feed(input_raw[0..n], &onInputSequence, &onInputPaste, @ptrCast(self));
