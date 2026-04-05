@@ -91,12 +91,20 @@ pub const TUI = struct {
     }
 
     /// Hide the topmost overlay and restore previous focus.
-    /// Matches pi-mono TUI.hideOverlay().
+    /// Matches pi-mono TUI.hideOverlay() — restores focus when the popped
+    /// overlay had focus, even if pre_focus is null.
     pub fn hideOverlay(self: *TUI) void {
+        if (self.overlays.stack.items.len == 0) return;
+        const top = self.overlays.stack.items[self.overlays.stack.items.len - 1];
+        const overlay_had_focus = if (self.focus.current) |focused|
+            Component.eql(focused, top.component)
+        else
+            false;
         const result = self.overlays.hideTopmost();
-        if (result.restored_focus) |pre_focus| {
+
+        if (overlay_had_focus) {
             const top_visible = self.overlays.topmostCapturingComponent();
-            self.focus.setFocus(top_visible orelse pre_focus);
+            self.focus.setFocus(top_visible orelse result.pre_focus);
         }
         if (self.overlays.stack.items.len == 0) self.terminal.hideCursor();
         self.dirty = true;

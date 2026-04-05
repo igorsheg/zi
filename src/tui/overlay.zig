@@ -127,14 +127,14 @@ pub const OverlayManager = struct {
     }
 
     pub const HideResult = struct {
-        restored_focus: ?Component = null,
+        pre_focus: ?Component = null,
     };
 
     /// Hide the topmost overlay. Returns pre_focus for the caller to restore.
     pub fn hideTopmost(self: *OverlayManager) HideResult {
         if (self.stack.items.len == 0) return .{};
         const entry = self.stack.pop();
-        return .{ .restored_focus = if (entry) |e| e.pre_focus else null };
+        return .{ .pre_focus = if (entry) |e| e.pre_focus else null };
     }
 
     /// Remove a specific overlay by handle ID. Returns pre_focus if found.
@@ -168,15 +168,37 @@ pub const OverlayManager = struct {
         return null;
     }
 
-    /// Render all visible overlays into the buffer region.
-    /// Called after the main tree is rendered — overlays composite on top.
+    /// Render all visible overlays into the buffer region, sorted by focus_order
+    /// (lower first = behind, higher = on top). Matches pi-mono's compositeOverlays
+    /// which sorts visibleEntries by focusOrder before compositing.
     pub fn renderOverlays(self: *OverlayManager, region: Region) void {
         const term_w = region.width;
         const term_h = region.height;
 
-        for (self.stack.items) |*entry| {
-            if (entry.hidden) continue;
+        // Collect visible entries and sort by focus_order (ascending = back to front)
+        var visible: [32]usize = undefined;
+        var visible_count: usize = 0;
+        for (self.stack.items, 0..) |*entry, i| {
+            if (!entry.hidden and visible_count < visible.len) {
+                visible[visible_count] = i;
+                visible_count += 1;
+            }
+        }
 
+        // Insertion sort by focus_order (overlay stacks are small)
+        for (1..visible_count) |i| {
+            const key = visible[i];
+            const key_order = self.stack.items[key].focus_order;
+            var j: usize = i;
+            while (j > 0 and self.stack.items[visible[j - 1]].focus_order > key_order) {
+                visible[j] = visible[j - 1];
+                j -= 1;
+            }
+            visible[j] = key;
+        }
+
+        for (visible[0..visible_count]) |idx| {
+            const entry = &self.stack.items[idx];
             const layout = resolveLayout(entry.options, entry.component, term_w, term_h);
             if (layout.width == 0 or layout.height == 0) continue;
 
@@ -316,8 +338,8 @@ test "OverlayManager show and hide topmost" {
 
     // Hide topmost returns pre_focus of d2 (which is d1)
     const result = mgr.hideTopmost();
-    try testing.expect(result.restored_focus != null);
-    try testing.expect(Component.eql(result.restored_focus.?, d1.component()));
+    try testing.expect(result.pre_focus != null);
+    try testing.expect(Component.eql(result.pre_focus.?, d1.component()));
     try testing.expectEqual(@as(usize, 1), mgr.stack.items.len);
 }
 

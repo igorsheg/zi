@@ -156,7 +156,9 @@ pub const Interactive = struct {
         };
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
-        self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
+        // NOTE: active_editor is bound in run() where self is at its final address.
+        // Binding here would capture a pointer to the local `self` that becomes
+        // dangling after the by-value return.
         self.transcript.theme = theme;
         return self;
     }
@@ -194,6 +196,9 @@ pub const Interactive = struct {
 
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
+
+        // Bind active_editor now that self is at its stable address.
+        self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
 
         // Populate container slots with their initial children.
         self.header_container.addChild(self.header.component());
