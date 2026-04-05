@@ -1,3 +1,4 @@
+const abort_signal_mod = @import("../abort_signal.zig");
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const loop_mod = @import("loop.zig");
@@ -101,7 +102,7 @@ pub const Agent = struct {
     get_api_key: ?protocol.GetApiKeyHook,
 
     is_running: bool,
-    abort_requested: bool,
+    abort_requested: std.atomic.Value(bool),
 
     /// Owned messages list — grows via processEvents on message_end.
     messages: std.ArrayList(protocol.AgentMessage),
@@ -163,7 +164,7 @@ pub const Agent = struct {
             .tool_execution = options.tool_execution,
             .get_api_key = options.get_api_key,
             .is_running = false,
-            .abort_requested = false,
+            .abort_requested = std.atomic.Value(bool).init(false),
             .messages = messages,
             .pending_tool_call_ids = .empty,
             .message_arena = message_arena,
@@ -228,7 +229,7 @@ pub const Agent = struct {
     /// Set the abort flag. The loop checks this between turns.
     pub fn abort(self: *Agent) void {
         if (self.is_running) {
-            self.abort_requested = true;
+            self.abort_requested.store(true, .release);
         }
     }
 
@@ -297,7 +298,7 @@ pub const Agent = struct {
         self.state.is_streaming = true;
         self.state.streaming_message = null;
         self.state.error_message = null;
-        self.abort_requested = false;
+        self.abort_requested.store(false, .release);
 
         defer {
             self.is_running = false;
@@ -317,7 +318,7 @@ pub const Agent = struct {
                 config,
                 processEventsSink,
                 @ptrCast(self),
-                @ptrCast(&self.abort_requested),
+                abort_signal_mod.AbortSignal{ .flag = &self.abort_requested },
             ) catch {};
         } else {
             loop_mod.runAgentLoop(
@@ -327,7 +328,7 @@ pub const Agent = struct {
                 config,
                 processEventsSink,
                 @ptrCast(self),
-                @ptrCast(&self.abort_requested),
+                abort_signal_mod.AbortSignal{ .flag = &self.abort_requested },
             );
         }
     }

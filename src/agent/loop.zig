@@ -1,3 +1,4 @@
+const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
@@ -14,7 +15,7 @@ pub fn runAgentLoop(
     config: protocol.AgentLoopConfig,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-    signal: ?*anyopaque,
+    signal: AbortSignal,
 ) void {
     // newMessages tracks only messages created during this run
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
@@ -58,7 +59,7 @@ pub fn runAgentLoopContinue(
     config: protocol.AgentLoopConfig,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-    signal: ?*anyopaque,
+    signal: AbortSignal,
 ) ContinueError!void {
     if (context.messages.len == 0) {
         return error.EmptyContext;
@@ -93,7 +94,7 @@ fn runLoop(
     new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     context: protocol.AgentContext,
     config: protocol.AgentLoopConfig,
-    signal: ?*anyopaque,
+    signal: AbortSignal,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
@@ -217,7 +218,7 @@ fn streamAssistantResponse(
     aa: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     config: protocol.AgentLoopConfig,
-    signal: ?*anyopaque,
+    signal: AbortSignal,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
     llm_tools: []const ai.protocol.Tool,
@@ -297,7 +298,7 @@ fn executeToolCalls(
     tools: []const protocol.AgentTool,
     config: protocol.AgentLoopConfig,
     system_prompt: []const u8,
-    signal: ?*anyopaque,
+    signal: AbortSignal,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
@@ -502,13 +503,9 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
     };
 }
 
-/// Check if the abort signal is set. The signal is a *const bool
-/// passed as ?*anyopaque from Agent.abort_requested.
-fn isAborted(signal: ?*anyopaque) bool {
-    const flag: *const bool = if (signal) |s| @ptrCast(@alignCast(s)) else return false;
-    return flag.*;
+fn isAborted(signal: AbortSignal) bool {
+    return signal.isAborted();
 }
-
 /// Bridge between provider events and agent events.
 /// Translates AssistantMessageEvent → AgentEvent.
 const StreamBridge = struct {

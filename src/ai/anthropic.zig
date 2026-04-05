@@ -1,3 +1,4 @@
+const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const sse = @import("sse.zig");
@@ -206,12 +207,12 @@ pub const AnthropicProvider = struct {
             state.content_blocks.deinit(allocator);
         }
 
-        // Abort: the signal is a *const bool. When set, we need to break
+        // Abort: the signal is a typed AbortSignal. When set, we need to break
         // out of the blocking read. Since zig's chunked HTTP parser is NOT
         // retry-safe (SO_RCVTIMEO corrupts parser state), we close the
         // socket from a watchdog thread. This causes the blocking read to
         // fail with an error, which we catch and classify as aborted.
-        const abort_flag: ?*const bool = if (options.signal) |s| @ptrCast(@alignCast(s)) else null;
+        const abort_flag = options.signal;
         const socket_fd: ?std.posix.fd_t = if (req.connection) |conn|
             conn.stream_reader.getStream().handle
         else
@@ -221,8 +222,8 @@ pub const AnthropicProvider = struct {
         // shuts down the socket when abort is requested.
         var watchdog_done = std.atomic.Value(bool).init(false);
         var watchdog_thread: ?std.Thread = null;
-        if (abort_flag != null and socket_fd != null) {
-            const wd_ctx = WatchdogCtx{ .abort_flag = abort_flag.?, .socket_fd = socket_fd.?, .done = &watchdog_done };
+        if (!abort_flag.isNone() and socket_fd != null) {
+            const wd_ctx = WatchdogCtx{ .signal = abort_flag, .socket_fd = socket_fd.?, .done = &watchdog_done };
             watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{wd_ctx}) catch null;
         }
         defer {
@@ -249,13 +250,10 @@ pub const AnthropicProvider = struct {
                 },
                 else => {
                     // Check if this was caused by abort
-                    if (abort_flag) |flag| {
-                        if (flag.*) {
-                            state.partial.stop_reason = .aborted;
-                            break;
-                        }
-                    }
-                    emitError(allocator, callback, callback_ctx, "stream read error: {s}", .{@errorName(err)});
+                    if (abort_flag.isAborted()) {
+                        state.partial.stop_reason = .aborted;
+                        break;
+                    }                    emitError(allocator, callback, callback_ctx, "stream read error: {s}", .{@errorName(err)});
                     return;
                 },
             };
@@ -834,7 +832,7 @@ fn emitError(allocator: std.mem.Allocator, callback: ai_provider.EventCallback, 
 }
 
 const WatchdogCtx = struct {
-    abort_flag: *const bool,
+    signal: AbortSignal,
     socket_fd: std.posix.fd_t,
     /// Set to true when the stream ends normally so the watchdog exits.
     /// Accessed atomically across threads.
@@ -848,7 +846,7 @@ fn abortWatchdog(ctx: WatchdogCtx) void {
     while (true) {
         // Check done FIRST (acquire fence ensures we see the main thread's write)
         if (ctx.done.load(.acquire)) return;
-        if (ctx.abort_flag.*) break;
+        if (ctx.signal.isAborted()) break;
         std.Thread.sleep(100_000_000); // 100ms
     }
     // Double-check done after seeing abort — the stream may have
@@ -860,7 +858,6 @@ fn abortWatchdog(ctx: WatchdogCtx) void {
     const SHUT_RDWR = 2;
     _ = std.posix.system.shutdown(ctx.socket_fd, SHUT_RDWR);
 }
-
 fn emitErrorDirect(callback: ai_provider.EventCallback, ctx: ?*anyopaque, msg: []const u8) void {
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = .{
         .content = &.{},

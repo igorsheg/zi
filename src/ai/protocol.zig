@@ -1,3 +1,4 @@
+const abort_signal_mod = @import("../abort_signal.zig");
 const std = @import("std");
 
 /// Known API types. Custom values supported via `.custom` variant.
@@ -78,7 +79,7 @@ pub const Transport = enum {
 pub const StreamOptions = struct {
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
-    signal: ?*anyopaque = null, // AbortSignal - no direct zig equivalent
+    signal: abort_signal_mod.AbortSignal = abort_signal_mod.AbortSignal.none,
     api_key: ?[]const u8 = null,
     /// Preferred transport for providers that support multiple transports.
     transport: ?Transport = null,

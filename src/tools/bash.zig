@@ -28,12 +28,13 @@ fn parseSchema() std.json.Value {
     return parsed.value;
 }
 
+
 fn execute(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
-    _: ?*anyopaque,
+    _: agent.protocol.AbortSignal,
     _: ?agent.protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) agent.protocol.AgentToolResult {

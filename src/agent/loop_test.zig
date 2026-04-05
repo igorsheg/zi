@@ -1,3 +1,4 @@
+const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
@@ -105,7 +106,7 @@ fn echoExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     _: std.json.Value,
-    _: ?*anyopaque,
+    _: AbortSignal,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {
@@ -175,7 +176,7 @@ test "event ordering: text response emits canonical event sequence" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     const tags = collector.tags();
@@ -255,7 +256,7 @@ test "tool call lifecycle: execute → result message → next turn" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     const tags = collector.tags();
@@ -340,7 +341,7 @@ test "error terminal: stream error emits message_end then agent_end" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     const tags = collector.tags();
@@ -399,7 +400,7 @@ test "no provider: stream error produces agent_end" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     const tags = collector.tags();
@@ -488,7 +489,7 @@ test "convertToLlm: custom messages filtered before LLM call" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Custom message should have been filtered out — only user message passed to LLM
@@ -518,7 +519,7 @@ test "transformContext: applied before convertToLlm, prunes old messages" {
 
     // transformContext: keep only last 2 messages
     const transformFn = struct {
-        fn func(alloc: std.mem.Allocator, messages: []const protocol.AgentMessage, _: ?*anyopaque, ctx: ?*anyopaque) []const protocol.AgentMessage {
+        fn func(alloc: std.mem.Allocator, messages: []const protocol.AgentMessage, _: AbortSignal, ctx: ?*anyopaque) []const protocol.AgentMessage {
             const s: *TransformState = @ptrCast(@alignCast(ctx.?));
             if (messages.len <= 2) {
                 s.transformed_count = messages.len;
@@ -588,7 +589,7 @@ test "transformContext: applied before convertToLlm, prunes old messages" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // transformContext kept only last 2 messages
@@ -676,7 +677,7 @@ test "steering: queued messages injected after tool execution completes" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Verify the interrupt message appears in events after tool result
@@ -736,7 +737,7 @@ test "agentLoopContinue: resumes from context without emitting user message even
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Should only return the new assistant message (not existing user)
@@ -790,7 +791,7 @@ test "agentLoopContinue: returns error on empty context" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     try std.testing.expectError(loop.ContinueError.EmptyContext, result);
@@ -832,7 +833,7 @@ test "agentLoopContinue: returns error when last message is assistant" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     try std.testing.expectError(loop.ContinueError.AssistantTail, result);
@@ -902,7 +903,7 @@ test "follow-up: messages processed after agent would stop" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Two LLM calls: initial + follow-up
@@ -924,7 +925,7 @@ fn trackingEchoExecute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     args: std.json.Value,
-    _: ?*anyopaque,
+    _: AbortSignal,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {
@@ -1001,7 +1002,7 @@ test "tool call lifecycle: execute receives correct tool_call_id and args" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Tool was executed exactly once
@@ -1093,7 +1094,7 @@ test "steering: injected after ALL tool executions complete, visible in LLM cont
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Both tool_execution_end events should be non-error
@@ -1200,7 +1201,7 @@ test "agentLoopContinue: allows custom message as last message via convertToLlm"
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Result has 1 assistant message, no user message events
@@ -1269,7 +1270,7 @@ test "prepareArguments: rewrites args before execution receives them" {
             alloc: std.mem.Allocator,
             _: []const u8,
             args: std.json.Value,
-            _: ?*anyopaque,
+            _: AbortSignal,
             _: ?protocol.AgentToolUpdateCallback,
             _: ?*anyopaque,
         ) protocol.AgentToolResult {
@@ -1314,7 +1315,7 @@ test "prepareArguments: rewrites args before execution receives them" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Execute was called exactly once
@@ -1357,7 +1358,7 @@ test "beforeToolCall: block=true prevents execution and emits error" {
             alloc: std.mem.Allocator,
             _: []const u8,
             _: std.json.Value,
-            _: ?*anyopaque,
+            _: AbortSignal,
             _: ?protocol.AgentToolUpdateCallback,
             _: ?*anyopaque,
         ) protocol.AgentToolResult {
@@ -1380,7 +1381,7 @@ test "beforeToolCall: block=true prevents execution and emits error" {
     };
 
     const blockHookFn = struct {
-        fn func(_: protocol.BeforeToolCallContext, _: ?*anyopaque, _: ?*anyopaque) ?protocol.BeforeToolCallResult {
+        fn func(_: protocol.BeforeToolCallContext, _: AbortSignal, _: ?*anyopaque) ?protocol.BeforeToolCallResult {
             return .{ .block = true, .reason = "not allowed" };
         }
     }.func;
@@ -1406,7 +1407,7 @@ test "beforeToolCall: block=true prevents execution and emits error" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // Execute was NOT called
@@ -1465,7 +1466,7 @@ test "afterToolCall: overrides content and isError in emitted result" {
             alloc: std.mem.Allocator,
             _: []const u8,
             _: std.json.Value,
-            _: ?*anyopaque,
+            _: AbortSignal,
             _: ?protocol.AgentToolUpdateCallback,
             _: ?*anyopaque,
         ) protocol.AgentToolResult {
@@ -1486,7 +1487,7 @@ test "afterToolCall: overrides content and isError in emitted result" {
 
     // afterToolCall overrides content and flips is_error to true
     const afterHookFn = struct {
-        fn func(_: protocol.AfterToolCallContext, _: ?*anyopaque, hook_ctx: ?*anyopaque) ?protocol.AfterToolCallResult {
+        fn func(_: protocol.AfterToolCallContext, _: AbortSignal, hook_ctx: ?*anyopaque) ?protocol.AfterToolCallResult {
             _ = hook_ctx;
             return .{
                 .content = &.{.{ .text = .{ .text = "overridden" } }},
@@ -1516,7 +1517,7 @@ test "afterToolCall: overrides content and isError in emitted result" {
         config,
         EventCollector.sink,
         &collector,
-        null,
+        AbortSignal.none,
     );
 
     // tool_execution_end should have the overridden values

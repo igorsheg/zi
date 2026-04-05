@@ -15,6 +15,7 @@ pub const ToolResultMessage = ai.protocol.ToolResultMessage;
 pub const Usage = ai.protocol.Usage;
 pub const StopReason = ai.protocol.StopReason;
 pub const StreamOptions = ai.protocol.StreamOptions;
+pub const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 pub const SimpleStreamOptions = ai.protocol.SimpleStreamOptions;
 
 /// Stream hook — wraps provider's streamSimple with context for closure state.
@@ -65,12 +66,12 @@ pub const TransformContextHook = struct {
     func: *const fn (
         allocator: std.mem.Allocator,
         messages: []const AgentMessage,
-        signal: ?*anyopaque,
+        signal: AbortSignal,
         ctx: ?*anyopaque,
     ) []const AgentMessage,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: TransformContextHook, allocator: std.mem.Allocator, messages: []const AgentMessage, signal: ?*anyopaque) []const AgentMessage {
+    pub fn call(self: TransformContextHook, allocator: std.mem.Allocator, messages: []const AgentMessage, signal: AbortSignal) []const AgentMessage {
         return self.func(allocator, messages, signal, self.ctx);
     }
 };
@@ -181,7 +182,7 @@ pub const AgentTool = struct {
         allocator: std.mem.Allocator,
         tool_call_id: []const u8,
         args: std.json.Value,
-        signal: ?*anyopaque,
+        signal: AbortSignal,
         on_update: ?AgentToolUpdateCallback,
         update_ctx: ?*anyopaque,
     ) AgentToolResult,
@@ -258,10 +259,10 @@ pub const AfterToolCallContext = struct {
 /// Hook: called before tool execution, after arg validation.
 /// Return block=true to prevent execution.
 pub const BeforeToolCallHook = struct {
-    func: *const fn (ctx_arg: BeforeToolCallContext, signal: ?*anyopaque, hook_ctx: ?*anyopaque) ?BeforeToolCallResult,
+    func: *const fn (ctx_arg: BeforeToolCallContext, signal: AbortSignal, hook_ctx: ?*anyopaque) ?BeforeToolCallResult,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: BeforeToolCallHook, context: BeforeToolCallContext, signal: ?*anyopaque) ?BeforeToolCallResult {
+    pub fn call(self: BeforeToolCallHook, context: BeforeToolCallContext, signal: AbortSignal) ?BeforeToolCallResult {
         return self.func(context, signal, self.ctx);
     }
 };
@@ -269,10 +270,10 @@ pub const BeforeToolCallHook = struct {
 /// Hook: called after tool execution.
 /// Return overrides for content/details/isError.
 pub const AfterToolCallHook = struct {
-    func: *const fn (ctx_arg: AfterToolCallContext, signal: ?*anyopaque, hook_ctx: ?*anyopaque) ?AfterToolCallResult,
+    func: *const fn (ctx_arg: AfterToolCallContext, signal: AbortSignal, hook_ctx: ?*anyopaque) ?AfterToolCallResult,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: AfterToolCallHook, context: AfterToolCallContext, signal: ?*anyopaque) ?AfterToolCallResult {
+    pub fn call(self: AfterToolCallHook, context: AfterToolCallContext, signal: AbortSignal) ?AfterToolCallResult {
         return self.func(context, signal, self.ctx);
     }
 };

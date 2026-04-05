@@ -730,7 +730,7 @@ test "CodingAgent: tool call triggers execution and second LLM call" {
         .label = "echo",
         .parameters = .null,
         .execute = &struct {
-            fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: ?*anyopaque, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
+            fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: protocol.AbortSignal, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
                 const c = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch return .{ .content = &.{} };
                 c[0] = .{ .text = .{ .text = "echoed" } };
                 return .{ .content = c };
