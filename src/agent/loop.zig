@@ -126,6 +126,12 @@ fn runLoop(
 
         // Inner loop: process tool calls and steering messages
         while (has_more_tool_calls or pending_messages.len > 0) {
+            // Check abort before each turn (catches abort during tool execution)
+            if (isAborted(signal)) {
+                event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                return;
+            }
+
             if (!first_turn) {
                 event_sink(.turn_start, event_ctx);
             } else {
@@ -298,6 +304,9 @@ fn executeToolCalls(
     for (assistant_msg.content) |block| {
         switch (block) {
             .tool_call => |tc| {
+                // Check abort between tool calls
+                if (isAborted(signal)) return;
+
                 // --- Phase 1: prepareToolCall (pi-mono agent-loop.ts:472-522) ---
 
                 event_sink(.{ .tool_execution_start = .{
@@ -491,6 +500,13 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .is_error = true,
         .timestamp = std.time.milliTimestamp(),
     };
+}
+
+/// Check if the abort signal is set. The signal is a *const bool
+/// passed as ?*anyopaque from Agent.abort_requested.
+fn isAborted(signal: ?*anyopaque) bool {
+    const flag: *const bool = if (signal) |s| @ptrCast(@alignCast(s)) else return false;
+    return flag.*;
 }
 
 /// Bridge between provider events and agent events.
