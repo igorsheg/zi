@@ -206,12 +206,23 @@ pub const AnthropicProvider = struct {
             state.content_blocks.deinit(allocator);
         }
 
+        // Abort signal: pointer to bool set by another thread (agent.abort())
+        const abort_flag: ?*const bool = if (options.signal) |s| @ptrCast(@alignCast(s)) else null;
+
         // Emit start event
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
         // Process SSE events line by line (zig 0.15: takeDelimiterInclusive)
 
         while (true) {
+            // Check abort between chunks
+            if (abort_flag) |flag| {
+                if (flag.*) {
+                    state.partial.stop_reason = .aborted;
+                    break;
+                }
+            }
+
             const line_with_nl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => {
                     if (parser.has_data or parser.event_len > 0) {
@@ -242,7 +253,9 @@ pub const AnthropicProvider = struct {
         state.partial.content = buildFinalContent(allocator, state.content_blocks.items) catch &.{};
 
         // Emit final done event
-        if (state.stop_reason) |sr| {
+        if (state.partial.stop_reason == .aborted) {
+            callback(.{ .done = .{ .reason = .stop, .message = state.partial } }, callback_ctx);
+        } else if (state.stop_reason) |sr| {
             const done_reason: protocol.AssistantMessageEvent.DoneReason = switch (sr) {
                 .end_turn => .stop,
                 .max_tokens => .length,
