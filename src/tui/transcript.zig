@@ -122,6 +122,8 @@ pub const Transcript = struct {
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
     scroll_offset: u32 = 0,
+    /// Cached from last render() call, used by clampScroll().
+    last_render_width: u32 = 80,
 
     pub fn init(allocator: std.mem.Allocator) Transcript {
         return .{ .allocator = allocator };
@@ -169,6 +171,8 @@ pub const Transcript = struct {
                         self.current_text_idx = idx - 1;
                     }
                 }
+                // Clamp scroll_offset so content doesn't render blank
+                self.clampScroll();
                 return; // remove first match only
             }
             i += 1;
@@ -320,6 +324,16 @@ pub const Transcript = struct {
         }
     }
 
+    /// Clamp scroll_offset so it doesn't exceed content height.
+    /// Uses last_render_width for measurement. Called after mutations
+    /// that shrink content (removeComponent).
+    fn clampScroll(self: *Transcript) void {
+        const total = self.totalHeight(self.last_render_width);
+        if (self.scroll_offset > total) {
+            self.scroll_offset = total;
+        }
+    }
+
     pub fn measure(self: *Transcript, width: u32) Measurement {
         const total = self.totalHeight(width);
         return .{ .min_height = 1, .preferred_height = total };
@@ -334,6 +348,7 @@ pub const Transcript = struct {
         const w = region.width;
         const h = region.height;
         if (w == 0 or h == 0) return;
+        self.last_render_width = w;
 
         var virtual_y: u32 = 0;
         var screen_y: u32 = 0;
@@ -487,6 +502,12 @@ test "Transcript removeComponent removes item by identity and fixes indices" {
     // Remove non-existent — no-op
     transcript.removeComponent(w2.component());
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+
+    // Scroll clamp: set scroll past total, remove item, verify clamped
+    transcript.scroll_offset = 100;
+    transcript.removeComponent(w3.component());
+    // total height is now 1 (just w1), so scroll_offset should be clamped to ≤ 1
+    try testing.expect(transcript.scroll_offset <= 1);
 }
 
 test "Transcript clearAll removes all items and resets state" {
