@@ -167,10 +167,9 @@ pub const Interactive = struct {
         self.editor.border_color = theme.fg(.border_muted);
         self.status_data.model_id = ca.agent.state.model.id;
         self.editor.cwd = cwd;
-        self.editor.status_data = &self.status_data;
-        // NOTE: active_editor is bound in run() where self is at its final address.
-        // Binding here would capture a pointer to the local `self` that becomes
-        // dangling after the by-value return.
+        // NOTE: status_data pointer and active_editor are bound in run() where
+        // self is at its final address. Binding here would capture a pointer to
+        // the local `self` that becomes dangling after the by-value return.
         self.transcript.theme = theme;
         return self;
     }
@@ -214,7 +213,8 @@ pub const Interactive = struct {
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
 
-        // Bind active_editor now that self is at its stable address.
+        // Bind pointers now that self is at its stable address (not a stack copy).
+        self.editor.status_data = &self.status_data;
         self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
 
         // Populate container slots with their initial children.
