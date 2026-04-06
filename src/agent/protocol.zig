@@ -281,9 +281,18 @@ pub const AgentState = struct {
 
 /// Result from beforeToolCall hook.
 /// pi-mono source: packages/agent/src/types.ts:46-49
+///
+/// `args` replaces the arguments passed to the tool. `null` means
+/// "use the prepared args unchanged" — the agent loop resolves this
+/// with `effective_args = hook_result.args orelse prepared_args`.
+/// Used by the extension runner's `tool_call` event dispatch: Lua
+/// handlers return a replacement `input` table, which the runner
+/// deep-copies into an owned `std.json.Value` and surfaces here.
+/// See docs/extensions.md § Agent Core Seams § Mutable tool_call args.
 pub const BeforeToolCallResult = struct {
     block: bool = false,
     reason: ?[]const u8 = null,
+    args: ?std.json.Value = null,
 };
 
 /// Context passed to beforeToolCall hook.
@@ -337,6 +346,26 @@ pub const AfterToolCallHook = struct {
 };
 
 
+/// Hook: transforms the raw provider request payload before HTTP send.
+///
+/// Reserves the seam for v2's `before_provider_request` event. pi-mono
+/// intercepts the JSON payload inside the provider stream wrapper, not in
+/// the agent loop itself — the zig call site will follow suit when the
+/// provider layer grows a pre-send hook. v1 keeps the type and the
+/// AgentLoopConfig slot so extensions (and tests) can register handlers
+/// against a stable shape; until the provider-layer wiring lands, the
+/// field is unused at runtime.
+///
+/// See docs/extensions.md § Agent Core Seams § Provider payload transform.
+pub const OnPayloadHook = struct {
+    func: *const fn (payload: std.json.Value, model: Model, ctx: ?*anyopaque) std.json.Value,
+    ctx: ?*anyopaque = null,
+
+    pub fn call(self: OnPayloadHook, payload: std.json.Value, model: Model) std.json.Value {
+        return self.func(payload, model, self.ctx);
+    }
+};
+
 /// Hook: resolves API key dynamically per LLM request (e.g. expiring OAuth tokens).
 /// pi-mono source: packages/agent/src/types.ts:157
 pub const GetApiKeyHook = struct {
@@ -361,6 +390,7 @@ pub const AgentLoopConfig = struct {
     tool_execution: ToolExecutionMode = .parallel,
     before_tool_call: ?BeforeToolCallHook = null,
     after_tool_call: ?AfterToolCallHook = null,
+    on_payload: ?OnPayloadHook = null,
 
     // StreamOptions fields inlined from SimpleStreamOptions
     temperature: ?f64 = null,

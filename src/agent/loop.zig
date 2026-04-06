@@ -337,7 +337,11 @@ fn executeToolCalls(
                 else
                     tc.arguments;
 
-                // beforeToolCall hook: can block execution
+                // beforeToolCall hook: can block execution OR replace args.
+                // Replacement args come from extension `tool_call` handlers
+                // that return a new input table; null means "unchanged".
+                // See docs/extensions.md § Agent Core Seams § Mutable args.
+                var effective_args = prepared_args;
                 if (config.before_tool_call) |hook| {
                     const hook_ctx = protocol.BeforeToolCallContext{
                         .assistant_message = assistant_msg,
@@ -355,6 +359,9 @@ fn executeToolCalls(
                             emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, reason, event_sink, event_ctx);
                             continue;
                         }
+                        if (before_result.args) |replacement| {
+                            effective_args = replacement;
+                        }
                     }
                 }
 
@@ -365,14 +372,14 @@ fn executeToolCalls(
                     .sink_ctx = event_ctx,
                     .tool_call_id = tc.id,
                     .tool_name = tc.name,
-                    .args = tc.arguments,
+                    .args = effective_args,
                 };
 
                 const result = t.execute(
                     t.ctx,
                     aa,
                     tc.id,
-                    prepared_args,
+                    effective_args,
                     signal,
                     &UpdateBridge.callback,
                     @ptrCast(&update_bridge),
@@ -391,7 +398,7 @@ fn executeToolCalls(
                     const hook_ctx = protocol.AfterToolCallContext{
                         .assistant_message = assistant_msg,
                         .tool_call = tc,
-                        .args = prepared_args,
+                        .args = effective_args,
                         .result = result,
                         .is_error = result.is_error,
                         .context = .{
