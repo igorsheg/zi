@@ -26,6 +26,12 @@ const slash_commands_mod = @import("../slash_commands.zig");
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const SlashCommandProvider = autocomplete_mod.SlashCommandProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
+const list_picker_mod = @import("components/list_picker.zig");
+const select_list_mod = @import("components/select_list.zig");
+const ListPicker = list_picker_mod.ListPicker;
+const SelectItem = select_list_mod.SelectItem;
+const session_store_mod = @import("../session/store.zig");
+const SessionStore = session_store_mod.SessionStore;
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -131,6 +137,13 @@ pub const Interactive = struct {
     // ── Slash commands ──────────────────────────────────────────
     command_registry: CommandRegistry,
     slash_provider: SlashCommandProvider = undefined,
+
+    // ── Session picker (for /resume) ────────────────────────────
+    session_picker: ListPicker = undefined,
+    session_picker_items: [64]SelectItem = undefined,
+    session_picker_paths: [64][]const u8 = undefined,
+    session_picker_count: usize = 0,
+    session_picker_handle: ?tui_mod.OverlayHandle = null,
 
     event_queue: EventQueue(UiEvent),
     ca: *CodingAgent,
@@ -636,6 +649,10 @@ pub const Interactive = struct {
                 self.status_text.setContent("");
                 return true;
             }
+            if (std.mem.eql(u8, name, "resume")) {
+                self.showSessionPicker();
+                return true;
+            }
         }
 
         switch (cmd.action) {
@@ -660,6 +677,127 @@ pub const Interactive = struct {
         }
 
         return true;
+    }
+
+    // ── Session picker (/resume) ────────────────────────────────
+
+    fn showSessionPicker(self: *Interactive) void {
+        // List sessions for current cwd
+        const cwd = self.ca.session_store.writer.cwd;
+        const effective_cwd = if (cwd.len > 0) cwd else self.editor.cwd;
+        const sessions = session_store_mod.listSessions(self.allocator, effective_cwd) catch {
+            self.status_text.setContent("failed to list sessions");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+
+        if (sessions.len == 0) {
+            self.status_text.setContent("no sessions found");
+            self.status_text.fg = self.theme.fg(.muted);
+            return;
+        }
+
+        // Build picker items from session metadata
+        const count = @min(sessions.len, self.session_picker_items.len);
+        for (0..count) |i| {
+            self.session_picker_items[i] = .{
+                .value = sessions[i].session_id,
+                .label = sessions[i].timestamp,
+                .description = sessions[i].path,
+            };
+            self.session_picker_paths[i] = sessions[i].path;
+        }
+        self.session_picker_count = count;
+
+        // Set up picker
+        self.session_picker = ListPicker.init(self.theme);
+        self.session_picker.title = "Resume session";
+        self.session_picker.list.max_visible = 10;
+        self.session_picker.list.setItems(self.session_picker_items[0..count]);
+        self.session_picker.on_select = &onSessionSelected;
+        self.session_picker.on_cancel = &onSessionPickerCancel;
+        self.session_picker.callback_ctx = @ptrCast(self);
+
+        // Show as overlay
+        self.session_picker_handle = self.tui.showOverlay(
+            self.session_picker.component(),
+            .{
+                .anchor = .center,
+                .width_percent = 80,
+                .max_height = 15,
+            },
+        );
+    }
+
+    fn onSessionSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+
+        // Find the path for this selection
+        var selected_path: ?[]const u8 = null;
+        for (0..self.session_picker_count) |i| {
+            if (std.mem.eql(u8, self.session_picker_items[i].value, item.value)) {
+                selected_path = self.session_picker_paths[i];
+                break;
+            }
+        }
+
+        // Dismiss picker
+        if (self.session_picker_handle) |h| {
+            h.hide();
+            self.session_picker_handle = null;
+        }
+
+        const path = selected_path orelse {
+            self.status_text.setContent("session not found");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+
+        // Load the selected session
+        const loaded = coding_agent_mod.openSession(self.allocator, path) catch {
+            self.status_text.setContent("failed to load session");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+
+        // Rewire: replace session store, reload agent messages
+        self.ca.session_store = loaded.store;
+        self.ca.agent.state.messages = loaded.messages;
+
+        // Rebuild transcript from loaded messages
+        self.transcript.clearAll();
+        for (loaded.messages) |msg| {
+            switch (msg) {
+                .user => |u| {
+                    switch (u.content) {
+                        .text => |t| self.transcript.addUserMessage(t),
+                        else => {},
+                    }
+                },
+                .assistant => |a| {
+                    self.transcript.beginAssistantMessage();
+                    for (a.content) |block| {
+                        switch (block) {
+                            .text => |tc| self.transcript.appendText(tc.text),
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        self.status_text.setContent("session resumed");
+        self.status_text.fg = self.theme.fg(.success);
+        self.tui.dirty = true;
+    }
+
+    fn onSessionPickerCancel(ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.session_picker_handle) |h| {
+            h.hide();
+            self.session_picker_handle = null;
+        }
     }
 
     fn agentThreadFn(self: *Interactive, prompt_copy: []const u8) void {
