@@ -38,7 +38,7 @@ const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
-const CodingAgent = coding_agent_mod.CodingAgent;
+const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
 const auth_storage_mod = @import("../auth/storage.zig");
 const oauth_mod = @import("../auth/oauth.zig");
@@ -106,7 +106,7 @@ fn EventQueue(comptime T: type) type {
     };
 }
 
-/// Interactive mode — wires CodingAgent (blocking on its thread)
+/// Interactive mode — wires AgentSession (blocking on its thread)
 /// to the TUI (main thread) via a thread-safe event queue.
 ///
 /// Uses UiEvent (deep-copied) instead of raw AgentEvent to ensure
@@ -171,7 +171,7 @@ pub const Interactive = struct {
     login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     event_queue: EventQueue(UiEvent),
-    ca: *CodingAgent,
+    ca: *AgentSession,
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
@@ -185,7 +185,7 @@ pub const Interactive = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        ca: *CodingAgent,
+        ca: *AgentSession,
         registry: ToolRendererRegistry,
         cwd: []const u8,
         auth_storage: *auth_storage_mod.AuthStorage,

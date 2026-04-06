@@ -245,12 +245,12 @@ pub fn main() !void {
 
         var json_handler = JsonHandler{};
         var print_handler = PrintHandler{};
-        const event_handler: coding_agent.CodingAgent.EventHandler = if (mode == .json)
+        const event_handler: coding_agent.AgentSession.EventHandler = if (mode == .json)
             .{ .func = &JsonHandler.callback, .ctx = @ptrCast(&json_handler) }
         else
             .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) };
 
-        var ca = coding_agent.CodingAgent.init(allocator, .{
+        var ca = coding_agent.AgentSession.init(allocator, .{
             .model = model,
             .api_key = key,
             .cwd = cwd_buf,
@@ -340,7 +340,7 @@ pub fn main() !void {
         defer registry.deinit();
         try registry.register("anthropic-messages", prov, null);
 
-        var ca = coding_agent.CodingAgent.init(allocator, .{
+        var ca = coding_agent.AgentSession.init(allocator, .{
             .model = effective_model,
             .api_key = api_key,
             .cwd = cwd_buf,

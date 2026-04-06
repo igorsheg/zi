@@ -23,7 +23,7 @@ pub const SessionStore = session_mod.store.SessionStore;
 /// - convertToLlm that handles compaction_summary, branch_summary, custom
 /// - transformContext hook point (wired but no-op until compaction lands)
 /// - Stream hook wrapping provider registry
-pub const CodingAgent = struct {
+pub const AgentSession = struct {
     agent: Agent,
     session_store: SessionStore,
     allocator: std.mem.Allocator,
@@ -58,7 +58,7 @@ pub const CodingAgent = struct {
         append_system_prompt: ?[]const u8 = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator, options: Options) CodingAgent {
+    pub fn init(allocator: std.mem.Allocator, options: Options) AgentSession {
         const tools = options.tools orelse blk: {
             const t = allocator.alloc(protocol.AgentTool, 1) catch break :blk @as([]const protocol.AgentTool, &.{});
             t[0] = bash_tool.makeTool();
@@ -123,7 +123,7 @@ pub const CodingAgent = struct {
             .get_api_key = get_api_key_hook,
         });
 
-        const self = CodingAgent{
+        const self = AgentSession{
             .agent = a,
             .session_store = store,
             .allocator = allocator,
@@ -142,7 +142,7 @@ pub const CodingAgent = struct {
         return self;
     }
 
-    pub fn deinit(self: *CodingAgent) void {
+    pub fn deinit(self: *AgentSession) void {
         if (self._subscription_token) |token| {
             self.agent.unsubscribe(token);
         }
@@ -152,13 +152,13 @@ pub const CodingAgent = struct {
 
     /// Subscribe the session persistence listener.
     /// Must be called after self is pinned (not moved).
-    fn wireSubscription(self: *CodingAgent) void {
+    fn wireSubscription(self: *AgentSession) void {
         if (self._subscription_token != null) return;
         self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
     }
 
     /// Run a new prompt. Wires session persistence, then delegates to Agent.prompt.
-    pub fn run(self: *CodingAgent, prompt_text: []const u8) !void {
+    pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
         self.wireSubscription();
 
         const user_msg = protocol.AgentMessage{
@@ -175,7 +175,7 @@ pub const CodingAgent = struct {
     /// Expects initial_messages were seeded via Options.
     /// If transcript ends with assistant (nothing to continue from),
     /// returns NeedsPrompt so the caller can provide one.
-    pub fn continueSession(self: *CodingAgent) !void {
+    pub fn continueSession(self: *AgentSession) !void {
         self.wireSubscription();
         self.agent.@"continue"() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
@@ -184,18 +184,18 @@ pub const CodingAgent = struct {
     }
 
     /// Get session file path (valid after first flush).
-    pub fn getSessionFile(self: *const CodingAgent) []const u8 {
+    pub fn getSessionFile(self: *const AgentSession) []const u8 {
         return self.session_store.sessionFile();
     }
 
-    pub fn sessionFlushed(self: *const CodingAgent) bool {
+    pub fn sessionFlushed(self: *const AgentSession) bool {
         return self.session_store.writer.flushed;
     }
 
     /// Event listener: forwards to user-provided handler, then persists.
     /// pi-mono ordering: extensions → listeners → persistence (agent-session.ts:507-530)
     fn eventListener(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
-        const self: *CodingAgent = @ptrCast(@alignCast(ctx));
+        const self: *AgentSession = @ptrCast(@alignCast(ctx));
 
         // Forward to external handler first
         if (self.event_handler) |handler| {
@@ -481,18 +481,18 @@ test "convertToLlm handles mixed message types in order" {
     try testing.expect(result[4] == .user); // custom
 }
 
-// ── CodingAgent e2e tests (ported from pi-mono test-harness.test.ts) ───
+// ── AgentSession e2e tests (ported from pi-mono test-harness.test.ts) ───
 
 const faux = ai.faux;
 
-/// Test helper: create a CodingAgent wired to a faux provider.
-fn createTestCodingAgent(
+/// Test helper: create a AgentSession wired to a faux provider.
+fn createTestAgentSession(
     allocator: std.mem.Allocator,
     _: *faux.FauxProvider,
     registry: *ai.provider.Registry,
     collector: *EventCollector,
-) CodingAgent {
-    return CodingAgent.init(allocator, .{
+) AgentSession {
+    return AgentSession.init(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -541,7 +541,7 @@ const EventCollector = struct {
 };
 
 // pi-mono test-harness.test.ts: "simple text response"
-test "CodingAgent: simple text response" {
+test "AgentSession: simple text response" {
     // Use arena — SessionWriter allocates internally with no deinit
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -557,7 +557,7 @@ test "CodingAgent: simple text response" {
     try registry.register("faux", prov, null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("hi");
@@ -576,7 +576,7 @@ test "CodingAgent: simple text response" {
 }
 
 // pi-mono test-harness.test.ts: "error response"
-test "CodingAgent: error response sets stop_reason" {
+test "AgentSession: error response sets stop_reason" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -589,7 +589,7 @@ test "CodingAgent: error response sets stop_reason" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("hi");
@@ -601,7 +601,7 @@ test "CodingAgent: error response sets stop_reason" {
 }
 
 // pi-mono test-harness.test.ts: "event capture"
-test "CodingAgent: events emitted in correct order" {
+test "AgentSession: events emitted in correct order" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -615,7 +615,7 @@ test "CodingAgent: events emitted in correct order" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("hello");
@@ -630,7 +630,7 @@ test "CodingAgent: events emitted in correct order" {
 }
 
 // pi-mono test-harness.test.ts: "response sequence"
-test "CodingAgent: response sequence across multiple prompts" {
+test "AgentSession: response sequence across multiple prompts" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -647,7 +647,7 @@ test "CodingAgent: response sequence across multiple prompts" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("a");
@@ -669,7 +669,7 @@ test "CodingAgent: response sequence across multiple prompts" {
 }
 
 // session persistence: prompt → JSONL written → read back → context matches
-test "CodingAgent: session persistence round-trip" {
+test "AgentSession: session persistence round-trip" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -682,7 +682,7 @@ test "CodingAgent: session persistence round-trip" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("persist me");
@@ -719,7 +719,7 @@ test "CodingAgent: session persistence round-trip" {
 }
 
 // tool call round-trip: faux returns tool_call → tool executes → faux called again
-test "CodingAgent: tool call triggers execution and second LLM call" {
+test "AgentSession: tool call triggers execution and second LLM call" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -757,7 +757,7 @@ test "CodingAgent: tool call triggers execution and second LLM call" {
     const tools = [_]protocol.AgentTool{echo_tool};
 
     var collector = EventCollector.init(allocator);
-    var ca = CodingAgent.init(allocator, .{
+    var ca = AgentSession.init(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -790,7 +790,7 @@ test "CodingAgent: tool call triggers execution and second LLM call" {
 }
 
 // --continue round-trip: write session → load → continue → verify context sent to provider
-test "CodingAgent: continue sends restored context to provider" {
+test "AgentSession: continue sends restored context to provider" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -804,7 +804,7 @@ test "CodingAgent: continue sends restored context to provider" {
     try reg1.register("faux", fp1.provider(), null);
 
     var col1 = EventCollector.init(allocator);
-    var ca1 = CodingAgent.init(allocator, .{
+    var ca1 = AgentSession.init(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -839,7 +839,7 @@ test "CodingAgent: continue sends restored context to provider" {
     try all_messages.appendSlice(allocator, loaded.messages);
     try all_messages.append(allocator, new_user);
 
-    var ca2 = CodingAgent.init(allocator, .{
+    var ca2 = AgentSession.init(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -867,7 +867,7 @@ test "CodingAgent: continue sends restored context to provider" {
 }
 
 // convertToLlm through the loop: compaction_summary in initial state → provider receives wrapped text
-test "CodingAgent: compaction_summary converted to user message for provider" {
+test "AgentSession: compaction_summary converted to user message for provider" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -887,7 +887,7 @@ test "CodingAgent: compaction_summary converted to user message for provider" {
         .{ .user = .{ .content = .{ .text = "next question" }, .timestamp = 2 } },
     };
 
-    var ca = CodingAgent.init(allocator, .{
+    var ca = AgentSession.init(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -927,7 +927,7 @@ test "CodingAgent: compaction_summary converted to user message for provider" {
 }
 
 // pi-mono test-harness.test.ts: "context capture"
-test "CodingAgent: context capture — provider receives user message" {
+test "AgentSession: context capture — provider receives user message" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -940,7 +940,7 @@ test "CodingAgent: context capture — provider receives user message" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("my question");
@@ -959,7 +959,7 @@ test "CodingAgent: context capture — provider receives user message" {
 }
 
 // pi-mono test-harness.test.ts: "streams text deltas"
-test "CodingAgent: text deltas reconstruct full response" {
+test "AgentSession: text deltas reconstruct full response" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -972,7 +972,7 @@ test "CodingAgent: text deltas reconstruct full response" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("hi");
@@ -993,7 +993,7 @@ test "CodingAgent: text deltas reconstruct full response" {
 }
 
 // pi-mono test-harness.test.ts: "streams thinking deltas"
-test "CodingAgent: thinking events emitted for thinking content" {
+test "AgentSession: thinking events emitted for thinking content" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1009,7 +1009,7 @@ test "CodingAgent: thinking events emitted for thinking content" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     ca.run("hi");
@@ -1061,7 +1061,7 @@ test "resumed session context is sent to LLM" {
     try registry.register("faux", fp.provider(), null);
 
     var collector = EventCollector.init(allocator);
-    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
     // Simulate /resume: load prior messages into agent
