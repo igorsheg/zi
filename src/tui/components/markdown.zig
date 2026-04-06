@@ -683,7 +683,9 @@ pub const Markdown = struct {
                         .bg = span.bg,
                     });
                 }
-                const written = region.writeStr(col, row, span.text, span.fg, span.bg, span.attrs);
+                // Use component bg as fallback so text doesn't punch through the fill
+                const effective_bg = if (span.bg.eql(Color.default)) self.bg else span.bg;
+                const written = region.writeStr(col, row, span.text, span.fg, effective_bg, span.attrs);
                 col += written;
             }
 
