@@ -10,6 +10,7 @@ const text_mod = @import("components/text.zig");
 const header_mod = @import("components/header.zig");
 const footer_mod = @import("components/footer.zig");
 const editor_mod = @import("components/editor.zig");
+const loader_mod = @import("components/loader.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
 const container_mod = @import("container.zig");
@@ -54,6 +55,7 @@ const CursorState = component_mod.CursorState;
 const UiEvent = ui_event_mod.UiEvent;
 const Transcript = transcript_mod.Transcript;
 const ToolRendererRegistry = tool_display_mod.ToolRendererRegistry;
+const Loader = loader_mod.Loader;
 const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
 const StatusData = status_data_mod.StatusData;
@@ -129,6 +131,8 @@ pub const Interactive = struct {
     transcript: Transcript,
     registry: ToolRendererRegistry,
     status_data: StatusData,
+    loader: Loader = .{},
+    loader_active: bool = false,
 
     // ── Container slots (pi-mono parity) ──────────────────────────
     header_container: container_mod.Container,
@@ -213,6 +217,8 @@ pub const Interactive = struct {
         };
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
+        self.loader.spinner_fg = theme.fg(.accent);
+        self.loader.message_fg = theme.fg(.muted);
         self.status_data.model_id = ca.agent.state.model.id;
         self.editor.cwd = cwd;
         // NOTE: status_data pointer and active_editor are bound in run() where
@@ -350,6 +356,12 @@ pub const Interactive = struct {
             // 3. Check for terminal resize
             _ = self.tui.checkResize();
 
+            // 3b. Tick loader animation
+            if (self.loader_active) {
+                if (self.loader.tick()) {
+                    self.tui.dirty = true;
+                }
+            }
             // 4. Render if dirty
             if (self.tui.dirty) {
                 self.renderFrame();
@@ -540,8 +552,7 @@ pub const Interactive = struct {
             },
             .message_start_assistant => {
                 self.transcript.beginAssistantMessage();
-                self.status_text.setContent("thinking...");
-                self.status_text.fg = self.theme.fg(.muted);
+                self.showLoader("thinking...");
                 self.tui.dirty = true;
             },
             .message_start_user => {},
@@ -570,6 +581,7 @@ pub const Interactive = struct {
                 self.transcript.toolSetArgs(t.tool_call_id, t.args);
                 self.transcript.toolMarkExecutionStarted(t.tool_call_id);
                 self.status_text.setContent(t.tool_name);
+                if (self.loader_active) self.loader.setMessage(t.tool_name);
                 self.status_text.fg = self.theme.fg(.accent);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
@@ -602,6 +614,7 @@ pub const Interactive = struct {
                 self.is_streaming = false;
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
+                self.hideLoader();
                 self.status_text.setContent("");
                 self.tui.setFocus(self.active_editor.component());
                 self.tui.dirty = true;
@@ -610,6 +623,7 @@ pub const Interactive = struct {
                 self.is_streaming = false;
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
+                self.hideLoader();
                 self.status_text.setContent("error occurred");
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.setFocus(self.active_editor.component());
@@ -634,6 +648,23 @@ pub const Interactive = struct {
         return if (h > fixed_total) h - fixed_total else 0;
     }
 
+
+    fn showLoader(self: *Interactive, message: []const u8) void {
+        self.loader.setMessage(message);
+        self.loader.start();
+        self.loader_active = true;
+        self.status_container.clear();
+        self.status_container.addChild(self.loader.component());
+    }
+
+    fn hideLoader(self: *Interactive) void {
+        if (!self.loader_active) return;
+        self.loader.stop();
+        self.loader_active = false;
+        self.status_container.clear();
+        self.status_container.addChild(self.status_text.component());
+        self.status_text.setContent("");
+    }
 
     fn detectGitBranch(self: *Interactive) void {
         const result = std.process.Child.run(.{
