@@ -5,11 +5,13 @@ const session_mod = @import("session/root.zig");
 const bash_tool = @import("tools/bash.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const auth_storage_mod = @import("auth/storage.zig");
+const extension_runner_mod = @import("extensions/runner.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
 const SubscriptionToken = agent_mod.SubscriptionToken;
 pub const SessionStore = session_mod.store.SessionStore;
+pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 
 /// Composition root: wires Agent + SessionStore + tools + model resolution.
 ///
@@ -32,6 +34,15 @@ pub const AgentSession = struct {
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
+
+    /// Owned ExtensionRunner — current generation. Populated by the
+    /// sdk factory in Phase A3+; nil in v1 bootstraps until the runner
+    /// construction path is wired. Reload replaces this pointer
+    /// atomically with a new generation (see docs/extensions.md §
+    /// Ownership and Reload). When set, `deinit` takes it down before
+    /// the agent so any final event observers can still fire against
+    /// a live session.
+    _extension_runner: ?*ExtensionRunner = null,
 
     pub const EventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -145,6 +156,14 @@ pub const AgentSession = struct {
     pub fn deinit(self: *AgentSession) void {
         if (self._subscription_token) |token| {
             self.agent.unsubscribe(token);
+        }
+        // Tear down the extension runner BEFORE the agent, so any
+        // session_shutdown observers can still see a live Agent.
+        // v1: no-op when null; A3+ wires real construction.
+        if (self._extension_runner) |runner| {
+            runner.deinit();
+            self.allocator.destroy(runner);
+            self._extension_runner = null;
         }
         self.allocator.destroy(self._stream_closure);
         self.agent.deinit();
