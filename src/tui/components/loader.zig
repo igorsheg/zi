@@ -20,7 +20,9 @@ const Measurement = component_mod.Measurement;
 pub const Loader = struct {
     frame: u8 = 0,
     last_tick_ns: i128 = 0,
-    message: []const u8 = "Working...",
+    /// Owned message buffer — setMessage copies into this.
+    message_buf: [128]u8 = undefined,
+    message_len: u8 = 0,
     spinner_fg: Color = Color.default,
     message_fg: Color = Color.default,
     active: bool = true,
@@ -44,8 +46,14 @@ pub const Loader = struct {
         return false;
     }
 
+    pub fn message(self: *const Loader) []const u8 {
+        return self.message_buf[0..self.message_len];
+    }
+
     pub fn setMessage(self: *Loader, msg: []const u8) void {
-        self.message = msg;
+        const len = @min(msg.len, self.message_buf.len);
+        @memcpy(self.message_buf[0..len], msg[0..len]);
+        self.message_len = @intCast(len);
     }
 
     pub fn stop(self: *Loader) void {
@@ -66,7 +74,7 @@ pub const Loader = struct {
         var col: u32 = 1; // 1 col left padding
         col += region.writeStr(col, 1, frames[self.frame], self.spinner_fg, Color.default, Attributes.none);
         col += 1; // space
-        _ = region.writeStr(col, 1, self.message, self.message_fg, Color.default, Attributes.none);
+        _ = region.writeStr(col, 1, self.message(), self.message_fg, Color.default, Attributes.none);
     }
 
     pub fn measure(_: *Loader, _: u32) Measurement {
