@@ -765,11 +765,11 @@ pub const Interactive = struct {
         }
         self.session_picker_count = count;
 
-        // Set up picker
+        // Set up picker with fuzzy search
         self.session_picker = ListPicker.init(self.theme);
         self.session_picker.title = "Resume session";
         self.session_picker.list.max_visible = 10;
-        self.session_picker.list.setItems(self.session_picker_items[0..count]);
+        self.session_picker.setSearchableItems(self.session_picker_items[0..count], null);
         self.session_picker.on_select = &onSessionSelected;
         self.session_picker.on_cancel = &onSessionPickerCancel;
         self.session_picker.callback_ctx = @ptrCast(self);

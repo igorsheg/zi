@@ -38,7 +38,9 @@ pub const SelectList = struct {
     }
 
     pub fn processInput(self: *SelectList, key: Key) InputResult {
-        if (key.code == .enter and !key.ctrl and !key.alt) return .selected;
+        if (key.code == .enter and !key.ctrl and !key.alt) {
+            return if (self.items.len > 0) .selected else .consumed;
+        }
         if (key.code == .escape and !key.ctrl and !key.alt) return .cancelled;
 
         if (key.code == .up and !key.ctrl and !key.alt) {
