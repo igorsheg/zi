@@ -41,8 +41,10 @@ pub fn fuzzyFilter(
 ) usize {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) {
+        // Empty query: return all items, sorted alphabetically for predictable UX.
         const n = @min(texts.len, out_indices.len);
         for (0..n) |i| out_indices[i] = i;
+        sortAlphabetically(out_indices[0..n], texts);
         return n;
     }
 
@@ -87,7 +89,7 @@ pub fn fuzzyFilter(
         }
     }
 
-    sortByScore(out_indices[0..count], scores_buf[0..count]);
+    sortByScore(out_indices[0..count], scores_buf[0..count], texts);
     return count;
 }
 
@@ -183,18 +185,51 @@ fn buildSwappedQuery(query: []const u8, buf: []u8) ?[]const u8 {
     return buf[0..query.len];
 }
 
-fn sortByScore(indices: []usize, scores: []f64) void {
+/// Sort by score ascending (lower = better). Alphabetical tiebreaker
+/// when scores are equal — ensures deterministic ordering so the list
+/// doesn't flicker between items with similar relevance.
+fn sortByScore(indices: []usize, scores: []f64, texts: []const []const u8) void {
     var i: usize = 1;
     while (i < indices.len) : (i += 1) {
         const idx = indices[i];
         const sc = scores[i];
         var j: usize = i;
-        while (j > 0 and scores[j - 1] > sc) : (j -= 1) {
+        while (j > 0 and scoreLessThan(sc, idx, scores[j - 1], indices[j - 1], texts)) : (j -= 1) {
             indices[j] = indices[j - 1];
             scores[j] = scores[j - 1];
         }
         indices[j] = idx;
         scores[j] = sc;
+    }
+}
+
+/// Returns true if (score_a, text_a) should sort before (score_b, text_b).
+/// Lower score wins. Equal scores: alphabetical on the text.
+fn scoreLessThan(score_a: f64, idx_a: usize, score_b: f64, idx_b: usize, texts: []const []const u8) bool {
+    if (score_a < score_b) return true;
+    if (score_a > score_b) return false;
+    // Equal scores — alphabetical tiebreaker
+    const text_a = if (idx_a < texts.len) texts[idx_a] else "";
+    const text_b = if (idx_b < texts.len) texts[idx_b] else "";
+    return std.mem.lessThan(u8, text_a, text_b);
+}
+
+/// Sort indices alphabetically by their corresponding text.
+fn sortAlphabetically(indices: []usize, texts: []const []const u8) void {
+    var i: usize = 1;
+    while (i < indices.len) : (i += 1) {
+        const idx = indices[i];
+        const text = if (idx < texts.len) texts[idx] else "";
+        var j: usize = i;
+        while (j > 0) {
+            const prev_idx = indices[j - 1];
+            const prev_text = if (prev_idx < texts.len) texts[prev_idx] else "";
+            if (std.mem.lessThan(u8, text, prev_text)) {
+                indices[j] = indices[j - 1];
+                j -= 1;
+            } else break;
+        }
+        indices[j] = idx;
     }
 }
 
@@ -253,9 +288,26 @@ test "fuzzyFilter sorts by score" {
     try std.testing.expectEqual(@as(usize, 1), out[0]);
 }
 
-test "fuzzyFilter empty query returns all" {
-    const texts = [_][]const u8{ "a", "b", "c" };
+test "fuzzyFilter empty query returns all in alphabetical order" {
+    const texts = [_][]const u8{ "cherry", "apple", "banana" };
     var out: [3]usize = undefined;
     const n = fuzzyFilter("", &texts, &out);
     try std.testing.expectEqual(@as(usize, 3), n);
+    // Should be sorted alphabetically: apple(1), banana(2), cherry(0)
+    try std.testing.expectEqual(@as(usize, 1), out[0]); // apple
+    try std.testing.expectEqual(@as(usize, 2), out[1]); // banana
+    try std.testing.expectEqual(@as(usize, 0), out[2]); // cherry
+}
+
+test "fuzzyFilter deterministic tiebreaker on equal scores" {
+    // "a" and "b" both start with a single char match at position 0
+    // with query "x" — wait, that won't match. Use items that produce equal scores.
+    // Two items where query matches identically: "xa" and "xb" with query "x"
+    const texts = [_][]const u8{ "xb", "xa" };
+    var out: [2]usize = undefined;
+    const n = fuzzyFilter("x", &texts, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    // Equal scores → alphabetical: "xa"(1) before "xb"(0)
+    try std.testing.expectEqual(@as(usize, 1), out[0]); // xa
+    try std.testing.expectEqual(@as(usize, 0), out[1]); // xb
 }
