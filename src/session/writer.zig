@@ -84,18 +84,7 @@ pub const SessionWriter = struct {
     /// - Buffers until first assistant message appears
     /// - Then flushes all buffered entries + appends incrementally
     pub fn appendMessage(self: *SessionWriter, msg: agent.protocol.AgentMessage) void {
-        const entry_id = self.generateId() catch return;
-        const entry_timestamp = isoTimestamp(self.allocator) catch return;
-
-        const entry = proto.SessionEntry{
-            .id = entry_id,
-            .parent_id = self.leaf_id,
-            .timestamp = entry_timestamp,
-            .entry = .{ .message = .{ .message = msg } },
-        };
-
-        self.leaf_id = entry_id;
-        self.ids.put(self.allocator, entry_id, {}) catch {};
+        const entry = self.createEntry(.{ .message = .{ .message = msg } }) orelse return;
 
         // Track if we've seen an assistant message
         switch (msg) {
@@ -118,6 +107,86 @@ pub const SessionWriter = struct {
 
         // Already flushed — append incrementally
         self.appendToFile(entry) catch {};
+    }
+
+    /// Append a thinking level change entry.
+    pub fn appendThinkingLevelChange(self: *SessionWriter, level: []const u8) void {
+        self.appendEntry(.{ .thinking_level_change = .{ .thinking_level = level } });
+    }
+
+    /// Append a model change entry.
+    pub fn appendModelChange(self: *SessionWriter, provider: []const u8, model_id: []const u8) void {
+        self.appendEntry(.{ .model_change = .{ .provider = provider, .model_id = model_id } });
+    }
+
+    /// Append a compaction entry.
+    pub fn appendCompaction(self: *SessionWriter, summary: []const u8, first_kept_entry_id: []const u8, tokens_before: u64) void {
+        self.appendEntry(.{ .compaction = .{
+            .summary = summary,
+            .first_kept_entry_id = first_kept_entry_id,
+            .tokens_before = tokens_before,
+        } });
+    }
+
+    /// Append a branch summary entry.
+    pub fn appendBranchSummary(self: *SessionWriter, from_id: []const u8, summary: []const u8) void {
+        self.appendEntry(.{ .branch_summary = .{ .from_id = from_id, .summary = summary } });
+    }
+
+    /// Append a custom entry (extension state, NOT in LLM context).
+    pub fn appendCustomEntry(self: *SessionWriter, custom_type: []const u8, data: ?std.json.Value) void {
+        self.appendEntry(.{ .custom = .{ .custom_type = custom_type, .data = data } });
+    }
+
+    /// Append a custom message entry (extension message, IN LLM context).
+    pub fn appendCustomMessage(self: *SessionWriter, custom_type: []const u8, content: agent.protocol.AgentMessage.CustomContent, display: bool, details: ?std.json.Value) void {
+        self.appendEntry(.{ .custom_message = .{
+            .custom_type = custom_type,
+            .content = content,
+            .display = display,
+            .details = details,
+        } });
+    }
+
+    /// Append a label entry (bookmark on another entry).
+    pub fn appendLabel(self: *SessionWriter, target_id: []const u8, label: ?[]const u8) void {
+        self.appendEntry(.{ .label = .{ .target_id = target_id, .label = label } });
+    }
+
+    /// Append a session info entry (display name, etc).
+    pub fn appendSessionInfo(self: *SessionWriter, name: ?[]const u8) void {
+        self.appendEntry(.{ .session_info = .{ .name = name } });
+    }
+
+    /// Shared logic for appending any non-message entry type.
+    /// Non-message entries write immediately if flushed, otherwise buffer.
+    fn appendEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) void {
+        const entry = self.createEntry(entry_data) orelse return;
+
+        if (!self.flushed) {
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch {};
+            return;
+        }
+
+        self.appendToFile(entry) catch {};
+    }
+
+    /// Create a session entry and update tree state (leaf_id, ids).
+    fn createEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) ?proto.SessionEntry {
+        const entry_id = self.generateId() catch return null;
+        const entry_timestamp = isoTimestamp(self.allocator) catch return null;
+
+        const entry = proto.SessionEntry{
+            .id = entry_id,
+            .parent_id = self.leaf_id,
+            .timestamp = entry_timestamp,
+            .entry = entry_data,
+        };
+
+        self.leaf_id = entry_id;
+        self.ids.put(self.allocator, entry_id, {}) catch {};
+
+        return entry;
     }
 
     /// Flush all buffered entries to disk (header + entries).
@@ -199,5 +268,3 @@ fn generateUuid(buf: *[36]u8) void {
         random_bytes[10], random_bytes[11], random_bytes[12], random_bytes[13], random_bytes[14], random_bytes[15],
     }) catch {};
 }
-
-
