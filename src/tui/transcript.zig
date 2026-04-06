@@ -445,6 +445,7 @@ pub const Transcript = struct {
             self.items.append(self.allocator, .{
                 .component = md.component(),
                 .kind = .assistant_text,
+                .extra_height = 1, // spacer before assistant text (pi-mono: Spacer(1))
                 .deinit_ctx = @ptrCast(md),
                 .deinit_fn = deinitMarkdown,
             }) catch {
@@ -692,11 +693,23 @@ pub const Transcript = struct {
                 }
             },
             .assistant_text => {
-                // Assistant text: partial scroll adjustment
+                // Assistant text: extra_height=1 spacer before content
                 const md: *markdown_mod.Markdown = @ptrCast(@alignCast(item.deinit_ctx.?));
                 const saved = md.scroll_offset;
-                md.scroll_offset = skipped;
-                md.render(row_region);
+                const row_skip = skipped;
+                if (item.extra_height > 0 and row_skip < item.extra_height) {
+                    // Spacer still visible
+                    const spacer_visible = item.extra_height - row_skip;
+                    if (visible_h > spacer_visible) {
+                        const md_region = row_region.sub(0, spacer_visible, w, visible_h - spacer_visible);
+                        md.scroll_offset = 0;
+                        md.render(md_region);
+                    }
+                } else {
+                    // Spacer scrolled past
+                    md.scroll_offset = row_skip -| item.extra_height;
+                    md.render(row_region);
+                }
                 md.scroll_offset = saved;
             },
             .generic => {
