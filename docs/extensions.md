@@ -67,18 +67,21 @@
    - Users can override built-in tools by registering first
    - Event hooks (`tool_call`, `tool_result`) work uniformly across built-in and extension tools
    - The system prompt builds its snippets/guidelines from the same metadata source
-4. **First-registered-wins collision semantics.** Load order: user extensions first, then project extensions, then built-in defaults. A user override "wins" by loading before the built-in default.
+4. **First-registered-wins collision semantics.** Load order: **explicit (--extension) → user-global → project-local → built-in**. More specific / user-authored sources load first and win collisions. A user `~/.zi/agent/extensions/task.lua` overrides the built-in Task tool because it registers first. (This deliberately inverts pi-mono's loader order, which loads project before global. zi prioritizes user intent over team configuration; override this by using `--extension` for explicit opt-in.)
 5. **Single Lua state, agent-thread affinity.** The Lua state lives on the agent thread. Agent hooks (before/after_tool_call) run Lua inline. UI requests from Lua marshal to the TUI thread, do their work, and resume the Lua coroutine back on the agent thread.
 6. **Forward-declared ExtensionRunner ref.** The Agent is constructed with `stream_fn` / `transform_context` / `on_payload` closures that reference a mutable ref. The ref is populated when AgentSession creates the ExtensionRunner. This mirrors pi-mono's `extensionRunnerRef: { current?: ExtensionRunner }` pattern.
+7. **Session directory resolution happens BEFORE SessionStore creation.** Even though the `session_directory` hook is v2, zi's bootstrap reorders session path resolution ahead of `SessionStore.create()` so the hook can be added later without moving session ownership. See [Session Directory Resolution](#session-directory-resolution).
+8. **Two context types from day one: `ExtensionContext` and `ExtensionCommandContext`.** Tools and events receive `ExtensionContext`. Command handlers (v2) receive `ExtensionCommandContext`, which extends it with session-control methods (`wait_for_idle`, `new_session`, `fork`, `navigate_tree`, `switch_session`, `reload`). The second type is reserved in the runtime bind seam even though `zi.register_command` is v2. See [Context Types](#context-types).
+9. **Generation-based reload model.** Each reload produces a new ExtensionRunner generation. The old generation is destroyed only after the new one is fully bound and active tool list swapped atomically. See [Ownership and Reload](#ownership-and-reload).
 
 ### Discovery
 
 ```
-  ORDER              PATH                                PURPOSE
-  ─────              ────                                ───────
+  LOAD ORDER         PATH                                PURPOSE
+  ──────────         ────                                ───────
   1. explicit        --extension <path> CLI flag         testing, opt-in
-  2. project-local   .zi/extensions/*.lua                team-shared
-  3. user-global     ~/.zi/agent/extensions/*.lua        personal config
+  2. user-global     ~/.zi/agent/extensions/*.lua        personal config
+  3. project-local   .zi/extensions/*.lua                team-shared
   4. built-in        (compiled into binary)              defaults
 
   Within each directory:
@@ -86,7 +89,9 @@
   - foo/init.lua           → directory extension with helper files
 ```
 
-Collision rule: first-registered-wins **per identifier** (tool name, command name). User extensions load before built-ins, so a `~/.zi/agent/extensions/task.lua` overrides the built-in Task tool. Multiple extensions registering the same tool name: earliest in load order wins, others log a warning.
+**Collision rule**: first-registered-wins **per identifier** (tool name, command name, provider name, flag name). Load order determines precedence: earlier loaders register first, so they win. Later registrations with the same identifier are silently dropped with a diagnostic log entry (`extension X tried to register tool "Y" but it is already registered by Z`).
+
+**Precedence summary**: `explicit > user > project > builtin`. A user `~/.zi/agent/extensions/task.lua` wins over the built-in Task tool. An `--extension ./dev-task.lua` wins over everything.
 
 ### Lifecycle
 
@@ -399,15 +404,34 @@ Used for: `tool_call`, `session_before_switch/fork/compact/tree`.
 
 ```lua
 zi.on("tool_call", function(event, ctx)
-  -- mutate event.input in place to patch args
-  event.input.command = "..."
+  -- return nil to allow with no changes
+  if event.tool_name == "bash" and event.input.command:match("rm%s+-rf%s+/") then
+    return { block = true, reason = "refused: dangerous path" }
+  end
 
-  -- return nil to allow, or a table to block:
-  return { block = true, reason = "..." }
+  -- return { input = new_input } to replace args before execution
+  if event.tool_name == "bash" then
+    return { input = { command = "nice -n 10 " .. event.input.command } }
+  end
 end)
 ```
 
-Multiple handlers chain: earlier mutations are visible to later handlers. If any handler returns `{ block = true }`, execution stops and the reason is surfaced.
+**Important**: Lua handlers return a **replacement** `input` table — they do not mutate the original event. This is because:
+- Lua tables and zig `std.json.Value` are separate memory; in-place mutation would require round-trip serialization on every access.
+- Returning a new table is cheaper, simpler, and makes the handler chain explicit.
+- The zig runner deserializes the returned `input` table into a new `std.json.Value` and passes that to the tool execution.
+
+Multiple handlers chain: handler N+1 receives the event with `input` already replaced by handler N's return value (if any). If any handler returns `{ block = true }`, the chain stops and execution is blocked.
+
+**Core zig hook contract** (required to support this):
+```zig
+pub const BeforeToolCallResult = struct {
+    block: bool = false,
+    reason: ?[]const u8 = null,
+    args: ?std.json.Value = null,  // replacement args, null = unchanged
+};
+```
+The agent loop uses `result.args orelse original_args` when executing the tool. This seam exists from Phase B — v1 Lua uses it, v2 extensions reuse it.
 
 ### Transformable
 
@@ -436,14 +460,20 @@ Every yieldable Lua operation carries the current `AbortSignal` from the agent l
 
 1. Pending child processes (from `zi.spawn`) get SIGTERM → SIGKILL
 2. Pending UI dialogs get dismissed
-3. The Lua coroutine resumes with a cancellation result:
+3. The Lua coroutine **resumes with a normal result** carrying `cancelled = true`:
    ```lua
    local result = zi.spawn({ task = "..." })
    if result.cancelled then
      -- handle cancellation
    end
    ```
-4. Extension event handlers may catch and continue, or re-raise to abort the current operation
+4. Cancellation does NOT raise a Lua error — it always returns a value. Extensions check the `cancelled` field explicitly.
+
+**Cancellation vs errors**:
+- **Cancellation** (user abort, timeout, parent process killed): resumes coroutine with `{ cancelled = true, ... }`. Normal control flow, extensions must handle it explicitly.
+- **Hard failure** (spawn failed, UI unavailable, network error): raises a Lua error via `lua_error()`. Caught by the runner's `lua_pcall` wrapper, logged, and surfaced as a tool error result.
+
+This distinction matters: extensions can compose (`if result.cancelled then return early end`) without being forced into `pcall` for every yieldable call.
 
 This matches zi's existing `AbortSignal` threading through tool execution and spawn.
 
@@ -456,6 +486,202 @@ This matches zi's existing `AbortSignal` threading through tool execution and sp
 - Repeated failures from the same extension (3+) log a warning; the extension stays loaded (user's responsibility).
 - In print/json modes, errors write to stderr. In interactive mode, errors write to the status area.
 - `error_message` events are raised on the extension runner for extensions that want to surface errors to the user.
+
+---
+
+## Lua Coroutine C-Call Model
+
+Lua 5.4 supports yielding across C boundaries ONLY when host functions use continuation-safe primitives. Naive `lua_pcall` + C callback bridges cannot suspend — they raise `attempt to yield across C-call boundary` errors.
+
+zi's coroutine model:
+
+1. **Every tool execution and event handler runs in a dedicated Lua coroutine**, not in the main Lua state. This means zig can always `lua_resume` them.
+2. **Yieldable host functions use `lua_yieldk` with a continuation function**. Example:
+   ```c
+   int zi_spawn(lua_State *L) {
+       // ... start spawn, register callback ...
+       return lua_yieldk(L, 0, ctx, zi_spawn_continue);
+   }
+
+   int zi_spawn_continue(lua_State *L, int status, lua_KContext ctx) {
+       // called when coroutine is resumed with spawn result
+       push_result_table(L, spawn_result);
+       return 1;  // one return value
+   }
+   ```
+3. **Zig resumes coroutines with `lua_resume`**, pushing result values onto the stack first.
+4. **Non-yieldable operations** (pure computation, simple API calls like `get_active_tools()`) use regular `lua_pcall` — they don't yield.
+5. **Errors from resumed coroutines** are normalized by the runner: Lua errors → logged + wrapped as tool error results; uncaught exceptions → the whole handler fails gracefully.
+
+**Anti-pattern**: Do NOT use regular `lua_pcall` to call handlers that might yield on `zi.spawn` or `ctx.ui.*`. The stack unwinds wrong and you get runtime errors. Use `lua_resume` for all handlers that might yield.
+
+---
+
+## Ownership and Reload
+
+Zig has no GC. Explicit ownership rules prevent use-after-free and leaks across extension reloads.
+
+### Generation model
+
+Each call to `reload()` produces a new `ExtensionRunner` **generation**. Generations are numbered `(0, 1, 2, ...)` and never reused.
+
+```
+  agent_session
+    ├─ owns: current runner generation (one at a time)
+    └─ owns: current active tool slice (points into runner)
+
+  extension_runner[generation N]
+    ├─ owns: Lua state (lua_State *)
+    ├─ owns: loaded Lua chunks (compiled bytecode)
+    ├─ owns: handler refs (luaL_ref registry entries)
+    ├─ owns: registry entries (tool defs, event handlers, commands)
+    ├─ owns: schema JSON values (std.json.Value, deep-copied from Lua)
+    └─ owns: tool ctx wrappers (one per Lua-backed tool, points back to runner)
+```
+
+### Reload sequence
+
+```
+  1. wait for agent idle (no in-flight turn)
+  2. emit session_shutdown on runner[N]
+  3. discover extensions (fresh filesystem scan)
+  4. build runner[N+1] in parallel (doesn't touch runner[N])
+  5. atomically swap:
+     - agent_session._runner = runner[N+1]
+     - agent_session._active_tools = runner[N+1].getTools()
+  6. emit session_start on runner[N+1] with reason="reload"
+  7. destroy runner[N]:
+     - lua_close(state) — releases all Lua memory
+     - free registry entries
+     - free schema JSON
+     - free tool ctx wrappers
+```
+
+### Invariants
+
+- **Lua never holds borrowed zig pointers past the current host call.** Pointers passed into Lua (e.g., strings) are either copied into Lua memory immediately or valid only for the duration of the C function.
+- **Zig never stores pointers into Lua-managed memory.** When extracting values from Lua (strings, tables), zig clones them into owned allocator memory before the Lua stack unwinds.
+- **Tool ctx wrappers are owned by the runner**, not by `AgentTool.ctx`. The tool's `ctx` field points into runner-owned memory; when the runner is destroyed, tools from that generation become invalid.
+- **Reload requires idle.** Attempting reload during an active turn blocks until idle or errors out. Never swap the runner mid-execution.
+- **Schema JSON is deep-copied on registration.** When a Lua extension calls `zi.register_tool({ parameters = {...} })`, the parameters table is converted to `std.json.Value` with all strings/arrays owned by the runner's allocator. The Lua table can be garbage collected afterward.
+
+### Cross-generation references
+
+**Problem**: If the TUI holds a reference to a tool from generation N, and reload creates generation N+1, the TUI's reference becomes dangling.
+
+**Solution**: The active tool slice is looked up by name at each use site. The TUI never caches `AgentTool` pointers across reload — it caches tool names and re-resolves them. Tool registration updates a generation counter; consumers that care check it.
+
+---
+
+## Session Directory Resolution
+
+The `session_directory` event (v2) lets extensions override where session files are stored. It must fire BEFORE `SessionStore` is created. To preserve this seam without refactoring bootstrap later, zi's session path resolution is factored out of `SessionStore.create()` into a separate step that can be intercepted later:
+
+```
+  (current flow, no extension override)          (v2 flow, with hook)
+  1. resolve cwd                                  1. resolve cwd
+  2. resolveSessionDir(cwd)                       2. resolveSessionDir(cwd)
+       → default: ~/.zi/agent/sessions/<cwd>           → runner.emit("session_directory", cwd)
+                                                       → extension can return custom path
+  3. SessionStore.create(session_dir)             3. SessionStore.create(session_dir)
+```
+
+In v1, `resolveSessionDir` just returns the default. In v2, the ExtensionRunner hooks into it between step 1 and 2 without changing the bootstrap signature.
+
+**Required refactor in Phase A**: Move session directory resolution out of `SessionWriter.init()` into a pre-step that happens before `AgentSession` construction. The resolved path is passed to `SessionStore.create(allocator, session_dir, cwd)`.
+
+---
+
+## Context Types
+
+Two distinct context types are exposed to Lua handlers, matching pi-mono's `ExtensionContext` / `ExtensionCommandContext` split.
+
+### ExtensionContext (v1)
+
+Passed to tool `execute` functions and event handlers. Provides read-only session access and basic actions.
+
+```lua
+ctx = {
+  cwd = string,                -- current working directory
+  has_ui = boolean,            -- true in interactive mode
+  ui = { ... } | nil,          -- UI primitives (v2)
+  signal = AbortSignal,        -- current abort signal, or nil when idle
+  model = { id, name, ... },   -- current model info
+  is_idle = function() end,
+  get_context_usage = function() end,
+  get_system_prompt = function() end,
+}
+```
+
+### ExtensionCommandContext (v2)
+
+Passed to slash command handlers. Extends `ExtensionContext` with session-control methods that are only safe in user-initiated commands.
+
+```lua
+cmd_ctx = {
+  -- all ExtensionContext fields, plus:
+  wait_for_idle = function() end,
+  new_session = function(opts) end,
+  fork = function(entry_id) end,
+  navigate_tree = function(target_id, opts) end,
+  switch_session = function(path) end,
+  reload = function() end,
+}
+```
+
+**Phase B/D requirement**: The runtime's `bindRuntime()` method must bind BOTH context types, even though v1 only exposes `ExtensionContext` to Lua. The internal seam:
+
+```zig
+pub const ExtensionRuntime = union(enum) {
+    stub: void,
+    bound: struct {
+        session: *AgentSession,
+        ui: ?*ExtensionUIContext,
+        // command context actions — called from command handlers only
+        command_actions: ?*ExtensionCommandActions,
+    },
+};
+```
+
+v1 leaves `command_actions = null` (no commands registered). v2 wires the pointer when the command registry gains entries.
+
+---
+
+## Agent Core Seams (required by Phase B)
+
+The following seams must exist in `src/agent/protocol.zig` and the agent loop from Phase B, even if the public Lua API doesn't expose them until v2. Adding them later would be retrofits into the core agent loop.
+
+### 1. Mutable tool_call args
+
+```zig
+pub const BeforeToolCallResult = struct {
+    block: bool = false,
+    reason: ?[]const u8 = null,
+    args: ?std.json.Value = null,  // NEW — replacement args
+};
+```
+
+Loop usage: `const effective_args = hook_result.args orelse prepared_args;`
+
+### 2. Provider payload transform hook
+
+```zig
+pub const OnPayloadHook = struct {
+    func: *const fn (payload: std.json.Value, model: Model, ctx: ?*anyopaque) std.json.Value,
+    ctx: ?*anyopaque = null,
+};
+
+pub const AgentLoopConfig = struct {
+    // ... existing fields ...
+    on_payload: ?OnPayloadHook = null,  // NEW — called before provider request
+};
+```
+
+Called in the agent loop after `convert_to_llm` and before `stream_fn`. v1 doesn't expose this to Lua; v2 wires `before_provider_request` to it.
+
+### 3. Context transform hook (already exists)
+
+zi already has `transform_context`. No change needed; Phase D wires `context` event handlers to it.
 
 ---
 
@@ -500,18 +726,41 @@ This matches zi's existing `AbortSignal` threading through tool execution and sp
 - Two-phase load/bind lifecycle with `session_start`/`session_shutdown`
 
 **Sufficient to rebuild:**
-- Task, Oracle, Finder, HyperTask (the user's current `~/.pi` extensions)
+- Task, Oracle, Finder, HyperTask (the user's current `~/.pi` extensions) — the tool-body subset
 - Custom tool wrappers and safety interceptors
 - Custom logging / observability hooks
 - Session-bound state via `zi.spawn`
 
-**Deferred to v2+ (◐):**
-- Commands, shortcuts, flags, providers, message renderers
-- Transform events (context, input, before_agent_start, before_provider_request)
-- Session lifecycle hooks beyond start/shutdown (before_switch, before_fork, compact, tree)
-- UI context (widgets, dialogs, status bar, footer/header, editor control)
-- Resource discovery beyond extensions (.md agents, skills, prompts, themes)
-- Inter-extension event bus (`zi.events`)
+**NOT sufficient for v1** (if your extension needs these, wait for v2):
+- Extensions that register slash commands or shortcuts
+- Extensions that render custom widgets or dialogs
+- Extensions that transform user input or the context before LLM calls
+- Extensions that override session directory or add resource paths
+- Extensions that register custom providers or OAuth flows
+
+**Deferred to v2+ (◐)**:
+
+Each item below is categorized by whether its internal seam must exist in v1 or can be added later:
+
+*Pure wiring (internal seam trivial, just expose to Lua)*:
+- `context` event — Lua wrapper around existing `transform_context` hook
+- `before_agent_start` event — session-layer seam
+- `resources_discover` event — ResourceLoader already separate
+- Providers — `provider_queue` already flushed at bind
+- UI context methods beyond dialogs — tui integration, no core changes
+- `zi.events` bus — in-memory pub/sub, no core changes
+
+*Requires core seam in v1 (must land in Phase B regardless of Lua exposure)*:
+- `before_provider_request` — `on_payload` hook in `AgentLoopConfig`
+- Mutable `tool_call` args — `BeforeToolCallResult.args` field
+- `session_directory` — bootstrap reordering to resolve path before `SessionStore.create`
+- Commands — `ExtensionCommandContext` type + bind seam
+
+*Still requires work in v2 (non-trivial)*:
+- Session lifecycle hooks (before_switch, before_fork, compact, tree) — each needs its own cancel point
+- `input` event — TUI integration for input interception
+- Shortcuts — TUI keybinding integration
+- Message renderers — custom component rendering pipeline
 
 **Never supported (✗):**
 - `ctx.ui.setEditorComponent(factory)` — would require exposing full TUI component vtable across FFI
