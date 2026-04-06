@@ -48,6 +48,13 @@ pub const UiEvent = union(enum) {
         is_error: bool,
     },
 
+    // --- login lifecycle ---
+    login_complete: struct {
+        provider_id: []u8,
+        success: bool,
+        message: []u8,
+    },
+
     // --- agent lifecycle ---
     agent_finished: void,
     agent_error: void,
@@ -77,6 +84,10 @@ pub const UiEvent = union(enum) {
             .tool_end => |t| {
                 allocator.free(t.tool_call_id);
                 if (t.result) |r| r.free(allocator);
+            },
+            .login_complete => |l| {
+                allocator.free(l.provider_id);
+                allocator.free(l.message);
             },
             .message_start_assistant, .message_start_user,
             .agent_finished, .agent_error,

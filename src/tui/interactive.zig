@@ -39,6 +39,10 @@ const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
 const CodingAgent = coding_agent_mod.CodingAgent;
 const json_util = @import("../ai/json_util.zig");
+const auth_storage_mod = @import("../auth/storage.zig");
+const oauth_mod = @import("../auth/oauth.zig");
+const ai_models = @import("../ai/models.zig");
+const ai_protocol = @import("../ai/protocol.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -145,6 +149,23 @@ pub const Interactive = struct {
     session_picker_count: usize = 0,
     session_picker_handle: ?tui_mod.OverlayHandle = null,
 
+    // ── Model picker (for /model) ───────────────────────────────
+    auth_storage: *auth_storage_mod.AuthStorage,
+    model_picker: ListPicker = undefined,
+    model_picker_items: [256]SelectItem = undefined,
+    model_picker_search_texts: [256][]const u8 = undefined,
+    model_picker_models: [256]ai_protocol.Model = undefined,
+    model_picker_count: usize = 0,
+    model_picker_handle: ?tui_mod.OverlayHandle = null,
+
+    // ── Login state (/login) ────────────────────────────────────────
+    login_picker: ListPicker = undefined,
+    login_picker_items: [8]SelectItem = undefined,
+    login_picker_count: usize = 0,
+    login_picker_handle: ?tui_mod.OverlayHandle = null,
+    login_thread: ?std.Thread = null,
+    login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     event_queue: EventQueue(UiEvent),
     ca: *CodingAgent,
     agent_thread: ?std.Thread = null,
@@ -163,6 +184,7 @@ pub const Interactive = struct {
         ca: *CodingAgent,
         registry: ToolRendererRegistry,
         cwd: []const u8,
+        auth_storage: *auth_storage_mod.AuthStorage,
     ) !Interactive {
         const theme = &theme_mod.Theme.dark;
 
@@ -187,6 +209,7 @@ pub const Interactive = struct {
             .input = input_buffer_mod.InputBuffer.init(allocator),
             .event_queue = EventQueue(UiEvent).init(allocator),
             .ca = ca,
+            .auth_storage = auth_storage,
         };
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
@@ -200,6 +223,12 @@ pub const Interactive = struct {
     }
 
     pub fn deinit(self: *Interactive) void {
+        // Cancel and join login thread if active
+        if (self.login_thread != null) {
+            self.login_cancelled.store(true, .release);
+            if (self.login_thread) |t| t.join();
+            self.login_thread = null;
+        }
         if (self.agent_thread) |t| t.join();
         // drain and free any remaining events
         var drain_buf: [64]UiEvent = undefined;
@@ -208,6 +237,7 @@ pub const Interactive = struct {
             if (count == 0) break;
             for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
         }
+        self.freeModelPickerSearchTexts();
         self.command_registry.deinit();
         self.status_data.deinit();
         self.input.deinit();
@@ -393,6 +423,10 @@ pub const Interactive = struct {
         // Ctrl+C: double-tap guard (pi-mono parity)
         // First press: clear editor. Second press within 500ms: exit.
         if (key.code == .char and key.char != null and key.char.? == 'c' and key.ctrl) {
+            if (self.login_thread != null) {
+                self.login_cancelled.store(true, .release);
+                return;
+            }
             if (self.is_streaming) {
                 self.ca.agent.abort();
                 self.status_text.setContent("aborted");
@@ -550,6 +584,20 @@ pub const Interactive = struct {
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
+            .login_complete => |l| {
+                if (self.login_thread) |t| t.join();
+                self.login_thread = null;
+
+                if (l.success) {
+                    self.status_text.setContent(l.message);
+                    self.status_text.fg = self.theme.fg(.success);
+                    self.status_data.model_id = self.ca.agent.state.model.id;
+                } else {
+                    self.status_text.setContent(l.message);
+                    self.status_text.fg = self.theme.fg(.@"error");
+                }
+                self.tui.dirty = true;
+            },
             .agent_finished => {
                 self.is_streaming = false;
                 if (self.agent_thread) |t| t.join();
@@ -690,6 +738,22 @@ pub const Interactive = struct {
             }
             if (std.mem.eql(u8, name, "resume")) {
                 self.showSessionPicker();
+                return true;
+            }
+            if (std.mem.eql(u8, name, "model")) {
+                if (args.len > 0) {
+                    self.switchModelDirect(args);
+                } else {
+                    self.showModelPicker();
+                }
+                return true;
+            }
+            if (std.mem.eql(u8, name, "login")) {
+                if (args.len > 0) {
+                    self.startLogin(args);
+                } else {
+                    self.showLoginPicker();
+                }
                 return true;
             }
         }
@@ -857,6 +921,293 @@ pub const Interactive = struct {
             h.hide();
             self.session_picker_handle = null;
         }
+    }
+
+    // ── Model picker (/model) ───────────────────────────────────
+
+    fn switchModelDirect(self: *Interactive, pattern: []const u8) void {
+        const m = ai_models.getModelById(pattern) orelse ai_models.findModel(pattern) orelse {
+            self.status_text.setContent("model not found");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+        self.applyModelSwitch(m);
+    }
+
+    fn freeModelPickerSearchTexts(self: *Interactive) void {
+        for (0..self.model_picker_count) |i| {
+            // Only free if it was heap-allocated (not a static fallback from m.id)
+            const txt = self.model_picker_search_texts[i];
+            if (txt.len > 0 and txt.ptr != self.model_picker_items[i].label.ptr) {
+                self.allocator.free(txt);
+            }
+        }
+        self.model_picker_count = 0;
+    }
+
+    fn showModelPicker(self: *Interactive) void {
+        self.freeModelPickerSearchTexts();
+        const all = ai_models.getAllModels();
+        var count: usize = 0;
+
+        for (all) |m| {
+            if (count >= self.model_picker_items.len) break;
+            if (m.api != .anthropic_messages) continue;
+            const provider_str = json_util.providerToString(m.provider);
+            if (!self.auth_storage.hasAuth(provider_str)) continue;
+
+            self.model_picker_models[count] = m;
+            self.model_picker_items[count] = .{
+                .value = m.id,
+                .label = m.id,
+                .description = provider_str,
+            };
+            var search_buf: [128]u8 = undefined;
+            const search_text = std.fmt.bufPrint(&search_buf, "{s} {s}", .{ provider_str, m.id }) catch m.id;
+            self.model_picker_search_texts[count] = self.allocator.dupe(u8, search_text) catch m.id;
+            count += 1;
+        }
+        self.model_picker_count = count;
+
+        if (count == 0) {
+            self.status_text.setContent("no models available");
+            self.status_text.fg = self.theme.fg(.muted);
+            return;
+        }
+
+        self.model_picker = ListPicker.init(self.theme);
+        self.model_picker.title = "Select model";
+        self.model_picker.list.max_visible = 12;
+        self.model_picker.setSearchableItems(
+            self.model_picker_items[0..count],
+            self.model_picker_search_texts[0..count],
+        );
+        self.model_picker.on_select = &onModelSelected;
+        self.model_picker.on_cancel = &onModelPickerCancel;
+        self.model_picker.callback_ctx = @ptrCast(self);
+
+        self.model_picker_handle = self.tui.showOverlay(
+            self.model_picker.component(),
+            self.bottomPanelOptions(),
+        );
+    }
+
+    fn onModelSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+
+        var selected_model: ?ai_protocol.Model = null;
+        for (0..self.model_picker_count) |i| {
+            if (std.mem.eql(u8, self.model_picker_items[i].value, item.value) and
+                std.mem.eql(u8, self.model_picker_items[i].description.?, item.description.?))
+            {
+                selected_model = self.model_picker_models[i];
+                break;
+            }
+        }
+
+        if (self.model_picker_handle) |h| {
+            h.hide();
+            self.model_picker_handle = null;
+        }
+        self.freeModelPickerSearchTexts();
+
+        const m = selected_model orelse {
+            self.status_text.setContent("model not found");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+
+        self.applyModelSwitch(m);
+    }
+
+    fn onModelPickerCancel(ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.model_picker_handle) |h| {
+            h.hide();
+            self.model_picker_handle = null;
+        }
+        self.freeModelPickerSearchTexts();
+    }
+
+    fn applyModelSwitch(self: *Interactive, m: ai_protocol.Model) void {
+        self.ca.agent.state.model = m;
+        self.status_data.model_id = m.id;
+
+        const provider_str = json_util.providerToString(m.provider);
+        self.ca.session_store.appendModelChange(provider_str, m.id);
+
+        var buf: [80]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
+        self.status_text.setContent(msg);
+        self.status_text.fg = self.theme.fg(.success);
+        self.tui.dirty = true;
+    }
+
+
+    // ── Login picker (/login) ───────────────────────────────────
+
+    fn showLoginPicker(self: *Interactive) void {
+        var count: usize = 0;
+        for (&oauth_mod.PROVIDERS) |*p| {
+            if (count >= self.login_picker_items.len) break;
+            self.login_picker_items[count] = .{
+                .value = p.id,
+                .label = p.name,
+                .description = null,
+            };
+            count += 1;
+        }
+        self.login_picker_count = count;
+
+        if (count == 0) {
+            self.status_text.setContent("no OAuth providers available");
+            self.status_text.fg = self.theme.fg(.muted);
+            return;
+        }
+
+        self.login_picker = ListPicker.init(self.theme);
+        self.login_picker.title = "Login";
+        self.login_picker.list.max_visible = 8;
+        self.login_picker.list.setItems(self.login_picker_items[0..count]);
+        self.login_picker.on_select = &onLoginProviderSelected;
+        self.login_picker.on_cancel = &onLoginPickerCancel;
+        self.login_picker.callback_ctx = @ptrCast(self);
+
+        self.login_picker_handle = self.tui.showOverlay(
+            self.login_picker.component(),
+            self.bottomPanelOptions(),
+        );
+    }
+
+    fn onLoginProviderSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.login_picker_handle) |h| {
+            h.hide();
+            self.login_picker_handle = null;
+        }
+        self.startLogin(item.value);
+    }
+
+    fn onLoginPickerCancel(ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.login_picker_handle) |h| {
+            h.hide();
+            self.login_picker_handle = null;
+        }
+    }
+
+    fn startLogin(self: *Interactive, provider_id: []const u8) void {
+        if (self.login_thread != null) {
+            self.status_text.setContent("login already in progress");
+            self.status_text.fg = self.theme.fg(.warning);
+            return;
+        }
+
+        const provider = oauth_mod.findProvider(provider_id) orelse {
+            self.status_text.setContent("unknown OAuth provider");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+
+        self.login_cancelled.store(false, .release);
+
+        self.status_text.setContent("starting login...");
+        self.status_text.fg = self.theme.fg(.muted);
+        self.tui.dirty = true;
+
+        const login_ctx = self.allocator.create(LoginContext) catch {
+            self.status_text.setContent("failed to start login");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+        login_ctx.* = .{
+            .interactive = self,
+            .provider = provider,
+        };
+
+        self.login_thread = std.Thread.spawn(.{}, loginThreadFn, .{login_ctx}) catch {
+            self.allocator.destroy(login_ctx);
+            self.status_text.setContent("failed to spawn login thread");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+    }
+
+    const LoginContext = struct {
+        interactive: *Interactive,
+        provider: oauth_mod.OAuthProvider,
+    };
+
+    fn loginThreadFn(ctx: *LoginContext) void {
+        const self = ctx.interactive;
+        const provider = ctx.provider;
+        self.allocator.destroy(ctx);
+
+        const result = oauth_mod.login(
+            self.allocator,
+            provider,
+            .{
+                .on_auth = &onLoginAuth,
+                .on_progress = &onLoginProgress,
+                .ctx = @ptrCast(self),
+            },
+            &self.login_cancelled,
+        );
+
+        const provider_id = self.allocator.dupe(u8, provider.id) catch return;
+        switch (result) {
+            .success => |cred| {
+                self.auth_storage.set(provider.id, .{ .oauth = cred });
+                // auth_storage.set() dupes the credential; free the originals
+                self.allocator.free(cred.refresh);
+                self.allocator.free(cred.access);
+                var extras = cred.extras;
+                extras.deinit();
+
+                self.event_queue.push(.{ .login_complete = .{
+                    .provider_id = provider_id,
+                    .success = true,
+                    .message = self.allocator.dupe(u8, "logged in") catch return,
+                }});
+            },
+            .cancelled => {
+                self.event_queue.push(.{ .login_complete = .{
+                    .provider_id = provider_id,
+                    .success = false,
+                    .message = self.allocator.dupe(u8, "login cancelled") catch return,
+                }});
+            },
+            .err => |msg| {
+                self.event_queue.push(.{ .login_complete = .{
+                    .provider_id = provider_id,
+                    .success = false,
+                    .message = self.allocator.dupe(u8, msg) catch return,
+                }});
+            },
+        }
+    }
+
+    fn onLoginAuth(url: []const u8, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+
+        _ = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = if (@import("builtin").os.tag == .macos)
+                &.{ "open", url }
+            else
+                &.{ "xdg-open", url },
+        }) catch {};
+
+        self.status_text.setContent("login: check your browser");
+        self.status_text.fg = self.theme.fg(.accent);
+        self.tui.dirty = true;
+    }
+
+    fn onLoginProgress(msg: []const u8, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.status_text.setContent(msg);
+        self.status_text.fg = self.theme.fg(.muted);
+        self.tui.dirty = true;
     }
 
     /// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y"

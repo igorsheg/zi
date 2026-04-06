@@ -4,6 +4,7 @@ const agent_mod = @import("agent/root.zig");
 const session_mod = @import("session/root.zig");
 const bash_tool = @import("tools/bash.zig");
 const system_prompt_mod = @import("system_prompt.zig");
+const auth_storage_mod = @import("auth/storage.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -30,6 +31,7 @@ pub const CodingAgent = struct {
     event_handler: ?EventHandler,
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
+    auth_storage: ?*auth_storage_mod.AuthStorage,
 
     pub const EventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -46,6 +48,7 @@ pub const CodingAgent = struct {
         tools: ?[]const protocol.AgentTool = null,
         registry: *ai.provider.Registry,
         event_handler: ?EventHandler = null,
+        auth_storage: ?*auth_storage_mod.AuthStorage = null,
         /// Seed with existing messages for --continue.
         initial_messages: []const protocol.AgentMessage = &.{},
         /// Pre-built session store (from SessionStore.open for --continue).
@@ -95,6 +98,11 @@ pub const CodingAgent = struct {
             }) catch "You are a helpful coding assistant.";
         };
 
+        const get_api_key_hook: ?protocol.GetApiKeyHook = if (options.auth_storage) |as| .{
+            .func = &getApiKeyFromStorage,
+            .ctx = @ptrCast(@constCast(as)),
+        } else null;
+
         const a = Agent.init(allocator, .{
             .initial_state = .{
                 .system_prompt = sys_prompt,
@@ -105,6 +113,7 @@ pub const CodingAgent = struct {
             .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
             .stream_fn = stream_hook,
             .session_id = if (options.session_store) |s| s.sessionId() else null,
+            .get_api_key = get_api_key_hook,
         });
 
         const self = CodingAgent{
@@ -115,6 +124,7 @@ pub const CodingAgent = struct {
             .event_handler = options.event_handler,
             ._subscription_token = null,
             ._stream_closure = closure,
+            .auth_storage = options.auth_storage,
         };
 
         // Subscribe for session persistence: write message_end entries.
@@ -198,6 +208,11 @@ pub const CodingAgent = struct {
     // pi-mono injects auth in the streamFn closure (sdk.ts:274-283).
     // We do the same: capture registry + api_key so the Agent doesn't need
     // to thread auth through AgentLoopConfig.
+
+    fn getApiKeyFromStorage(provider_str: []const u8, ctx: ?*anyopaque) ?[]const u8 {
+        const storage: *auth_storage_mod.AuthStorage = @ptrCast(@alignCast(ctx.?));
+        return storage.getApiKey(provider_str);
+    }
 
     const StreamClosure = struct {
         registry: *ai.provider.Registry,

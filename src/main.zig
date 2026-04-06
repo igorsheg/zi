@@ -221,33 +221,44 @@ pub fn main() !void {
             try stderr.writeAll("warning: could not load auth storage\n");
             unreachable;
         };
-        _ = &auth_storage;
 
         const cwd_buf = std.fs.cwd().realpathAlloc(allocator, ".") catch "/unknown";
         var settings = settings_mod.manager.SettingsManager.create(allocator, cwd_buf, null) catch {
             try stderr.writeAll("warning: could not load settings\n");
             unreachable;
         };
-        _ = &settings;
 
-        const model = resolveModel(model_id, &settings, &auth_storage) orelse {
-            try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
-            try stderr.writeAll("use --list-models to see available models\n");
-            std.process.exit(1);
-        };
+        // Try to resolve model, but don't exit if none found
+        const model = resolveModel(model_id, &settings, &auth_storage);
+        var api_key: []const u8 = "";
+        var needs_auth = false;
 
-        if (!std.meta.eql(model.api, .anthropic_messages)) {
-            try stderr.writeAll("error: only anthropic models supported currently\n");
-            std.process.exit(1);
+        if (model) |m| {
+            if (std.meta.eql(m.api, .anthropic_messages)) {
+                const provider_str = ai.json_util.providerToString(m.provider);
+                if (api_key_arg) |cli_key| {
+                    auth_storage.setRuntimeApiKey(provider_str, cli_key);
+                }
+                api_key = auth_storage.getApiKey(provider_str) orelse "";
+                if (api_key.len == 0) needs_auth = true;
+            } else {
+                needs_auth = true;
+            }
+        } else {
+            needs_auth = true;
         }
 
-        const provider_str = ai.json_util.providerToString(model.provider);
-        if (api_key_arg) |cli_key| {
-            auth_storage.setRuntimeApiKey(provider_str, cli_key);
-        }
-        const key = auth_storage.getApiKey(provider_str) orelse {
-            try stderr.writeAll("error: no API key. run `pi login` or set ANTHROPIC_API_KEY\n");
-            std.process.exit(1);
+        const effective_model = model orelse ai.models.findModel("claude-sonnet-4") orelse ai.protocol.Model{
+            .id = "claude-sonnet-4-20250514",
+            .name = "Claude Sonnet 4",
+            .api = .anthropic_messages,
+            .provider = .anthropic,
+            .base_url = "https://api.anthropic.com",
+            .reasoning = false,
+            .input = &.{.text},
+            .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+            .context_window = 200000,
+            .max_tokens = 16384,
         };
 
         var anthropic_prov = ai.anthropic.AnthropicProvider.init(allocator);
@@ -258,11 +269,12 @@ pub fn main() !void {
         try registry.register("anthropic-messages", prov, null);
 
         var ca = coding_agent.CodingAgent.init(allocator, .{
-            .model = model,
-            .api_key = key,
+            .model = effective_model,
+            .api_key = api_key,
             .cwd = cwd_buf,
             .max_tokens = 4096,
             .registry = &registry,
+            .auth_storage = &auth_storage,
         });
         defer ca.deinit();
 
@@ -273,8 +285,14 @@ pub fn main() !void {
                 .{ .tool_name = "Bash", .renderer = bash_renderer.renderer },
             },
         };
-        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_registry, cwd_buf);
+        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_registry, cwd_buf, &auth_storage);
         defer interactive.deinit();
+
+        if (needs_auth) {
+            interactive.status_text.setContent("no API key — use /login to authenticate");
+            interactive.status_text.fg = interactive.theme.fg(.warning);
+        }
+
         try interactive.run();
     }
 }
