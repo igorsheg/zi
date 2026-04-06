@@ -358,7 +358,27 @@ pub const Interactive = struct {
     }
 
     fn handleKey(self: *Interactive, key: Key) void {
-        // App-level keybindings — handled before focus routing
+        // When an overlay has focus, route input there FIRST.
+        // Overlays own Esc/Ctrl+C for dismiss — app-level handlers are fallbacks.
+        if (self.tui.hasOverlay()) {
+            if (self.tui.handleInput(key)) {
+                self.tui.dirty = true;
+                return;
+            }
+            // Overlay didn't consume it — Esc dismisses the topmost overlay
+            if (key.code == .escape) {
+                self.tui.hideOverlay();
+                return;
+            }
+            // Ctrl+C also dismisses overlay instead of exiting
+            if (key.code == .char and key.char != null and key.char.? == 'c' and key.ctrl) {
+                self.tui.hideOverlay();
+                return;
+            }
+            return;
+        }
+
+        // App-level keybindings — no overlay active
         if (key.code == .escape) {
             if (self.is_streaming) {
                 self.ca.agent.abort();
