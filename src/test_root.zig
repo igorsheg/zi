@@ -9,4 +9,5 @@ test {
     _ = @import("system_prompt.zig");
     _ = @import("tui/root.zig");
     _ = @import("slash_commands.zig");
+    _ = @import("spawn/root.zig");
 }

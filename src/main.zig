@@ -7,6 +7,8 @@ const coding_agent = @import("coding_agent.zig");
 const agent_json = @import("agent/json.zig");
 const interactive_mod = @import("tui/interactive.zig");
 const terminal_mod = @import("tui/terminal.zig");
+const bash_tool = @import("tools/bash.zig");
+const protocol = agent.protocol;
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
 pub const panic = terminal_mod.panic;
@@ -217,6 +219,30 @@ pub fn main() !void {
                 append_system_prompt = asp;
             }
         }
+        // Resolve --tools filter: comma-separated tool names -> filtered tool slice
+        var tools_opt: ?[]const protocol.AgentTool = null;
+        if (tools_filter) |filter_str| {
+            const all_tools: []const protocol.AgentTool = &.{bash_tool.makeTool()};
+            var filtered: std.ArrayListUnmanaged(protocol.AgentTool) = .empty;
+
+            var filter_iter = std.mem.splitScalar(u8, filter_str, ',');
+            while (filter_iter.next()) |name| {
+                const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
+                if (trimmed.len == 0) continue;
+                for (all_tools) |tool| {
+                    if (std.ascii.eqlIgnoreCase(trimmed, tool.name) or std.ascii.eqlIgnoreCase(trimmed, tool.label)) {
+                        filtered.append(allocator, tool) catch {};
+                        break;
+                    }
+                }
+            }
+            if (filtered.items.len > 0) {
+                tools_opt = filtered.items;
+            } else {
+                tools_opt = &.{};
+            }
+        }
+
         var json_handler = JsonHandler{};
         var print_handler = PrintHandler{};
         const event_handler: coding_agent.CodingAgent.EventHandler = if (mode == .json)
@@ -235,6 +261,7 @@ pub fn main() !void {
             .session_store = session_store,
             .no_session = no_session,
             .append_system_prompt = append_system_prompt,
+            .tools = tools_opt,
         });
         defer ca.deinit();
 
