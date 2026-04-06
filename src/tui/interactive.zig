@@ -912,9 +912,9 @@ pub const Interactive = struct {
             return;
         };
 
-        // Rewire: replace session store, reload agent messages
+        // Rewire: replace session store, reload agent context
         self.ca.session_store = loaded.store;
-        self.ca.agent.state.messages = loaded.messages;
+        self.ca.agent.loadMessages(loaded.messages);
 
         // Rebuild transcript from loaded messages
         self.transcript.clearAll();

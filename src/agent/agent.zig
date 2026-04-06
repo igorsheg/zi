@@ -248,6 +248,18 @@ pub const Agent = struct {
         self.clearAllQueues();
     }
 
+    /// Replace all messages (e.g., after loading a resumed session).
+    /// Resets the arena and repopulates from the given slice.
+    pub fn loadMessages(self: *Agent, new_messages: []const protocol.AgentMessage) void {
+        _ = self.message_arena.reset(.retain_capacity);
+        self.messages = .empty;
+        const aa = self.message_arena.allocator();
+        for (new_messages) |m| {
+            self.messages.append(aa, dupeAgentMessage(aa, m)) catch {};
+        }
+        self.state.messages = self.messages.items;
+    }
+
     /// Start a new prompt. Blocks until loop completes.
     /// Returns error.AlreadyProcessing if a run is already active.
     /// pi-mono source: packages/agent/src/agent.ts:312-320
