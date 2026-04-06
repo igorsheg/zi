@@ -1023,3 +1023,53 @@ test "CodingAgent: thinking events emitted for thinking content" {
     try testing.expect(thinking_deltas > 0);
     try testing.expectEqual(@as(usize, 1), thinking_ends);
 }
+
+test "resumed session context is sent to LLM" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Simulate a prior conversation (user + assistant)
+    const prior_assistant_content = allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1) catch unreachable;
+    prior_assistant_content[0] = faux.fauxText("I explained X");
+
+    const prior_messages = &[_]protocol.AgentMessage{
+        .{ .user = .{ .content = .{ .text = "explain X" }, .timestamp = 1 } },
+        .{ .assistant = .{
+            .content = prior_assistant_content,
+            .api = .{ .custom = "faux" },
+            .provider = .{ .custom = "faux" },
+            .model = "faux-model",
+            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+            .stop_reason = .stop,
+            .timestamp = 2,
+        } },
+    };
+
+    var fp = faux.FauxProvider.init(allocator);
+    const reply_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("follow-up answer")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &reply_content, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestCodingAgent(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    // Simulate /resume: load prior messages into agent
+    ca.agent.loadMessages(prior_messages);
+    try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
+
+    // Send a new prompt (the "follow-up" after resume)
+    ca.run("now explain Y");
+
+    // The LLM should have received the full context: prior user + prior assistant + new user
+    try testing.expectEqual(@as(usize, 1), fp.call_count);
+    const ctx = fp.captured_contexts.items[0];
+    // convertToLlm maps AgentMessage → LLM Message; prior user + prior assistant + new user = 3
+    try testing.expectEqual(@as(usize, 3), ctx.messages.len);
+    try testing.expect(ctx.messages[0] == .user);
+    try testing.expect(ctx.messages[1] == .assistant);
+    try testing.expect(ctx.messages[2] == .user);
+}
