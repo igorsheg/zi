@@ -1080,3 +1080,70 @@ test "resumed session context is sent to LLM" {
     try testing.expect(ctx.messages[1] == .assistant);
     try testing.expect(ctx.messages[2] == .user);
 }
+
+/// Context passed to extension tool `execute` functions and event handlers.
+///
+/// v1 shape — read-only session access + basic actions. Populated by the
+/// ExtensionRunner when dispatching to a Lua handler (or a builtin tool
+/// with the same signature). `signal` is non-null only inside an active
+/// turn; `ui` is non-null only when the runner was bound with a TUI
+/// context (interactive mode).
+///
+/// Ownership: the context is stack-allocated by the runner per call and
+/// never escapes the handler. All pointers are borrowed.
+pub const ExtensionContext = struct {
+    /// Opaque back-pointer to the owning AgentSession. Handlers that need
+    /// session state go through action methods on the runtime, not this
+    /// pointer — the field exists so action methods can resolve it
+    /// without another parameter.
+    session: *anyopaque,
+
+    /// Current working directory for this turn.
+    cwd: []const u8,
+
+    /// True when bound in interactive mode. Gates access to `ui`.
+    has_ui: bool,
+
+    /// Abort signal for the current in-flight operation, or null when idle.
+    /// Yieldable host functions (zi.spawn, ctx.ui.*) check this to
+    /// short-circuit into a cancelled result instead of blocking.
+    signal: ?*anyopaque = null,
+
+    /// UI primitive bag, non-null only when `has_ui`. Opaque here to
+    /// avoid a cycle between tui/ and extensions/; the real type is
+    /// bound by the runner in interactive mode.
+    ui: ?*anyopaque = null,
+};
+
+/// Context passed to slash command handlers (v2). Extends ExtensionContext
+/// with session-control methods that are only safe inside a user-initiated
+/// command — never inside a tool execute() or an event observer, because
+/// those run mid-turn and can't legally fork / switch / reload.
+///
+/// The internal seam exists from v1: ExtensionRuntime.Bound.command_actions
+/// is typed as *anyopaque and stays null until the command registry gains
+/// entries in v2. Reserving the type here means v2 is pure wiring, not a
+/// struct reshuffle.
+///
+/// Matches pi-mono's ExtensionCommandContext:
+///   .references/pi-mono/packages/coding-agent/src/core/extensions/runtime.ts
+pub const ExtensionCommandContext = struct {
+    /// Embedded base context — every command context IS an extension
+    /// context with extra capabilities.
+    base: ExtensionContext,
+
+    // v2 action method seats — left as anyopaque function pointers so
+    // the table can be populated without importing the concrete types
+    // (AgentSession, SessionStore, ExtensionRunner) that would create
+    // circular deps. The ExtensionRunner binds real fn pointers into
+    // these slots in bindRuntime() once the command registry is active.
+    //
+    // v1: all null. v2: runner populates before dispatching commands.
+
+    wait_for_idle: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    new_session: ?*const fn (ctx: *anyopaque, opts: *const anyopaque) anyerror!void = null,
+    fork: ?*const fn (ctx: *anyopaque, entry_id: []const u8) anyerror!void = null,
+    navigate_tree: ?*const fn (ctx: *anyopaque, target_id: []const u8) anyerror!void = null,
+    switch_session: ?*const fn (ctx: *anyopaque, path: []const u8) anyerror!void = null,
+    reload: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+};
