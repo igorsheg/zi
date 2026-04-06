@@ -4,6 +4,7 @@ const auth = @import("auth/root.zig");
 const settings_mod = @import("settings/root.zig");
 const agent = @import("agent/root.zig");
 const coding_agent = @import("coding_agent.zig");
+const sdk = @import("sdk.zig");
 const agent_json = @import("agent/json.zig");
 const interactive_mod = @import("tui/interactive.zig");
 const terminal_mod = @import("tui/terminal.zig");
@@ -250,7 +251,7 @@ pub fn main() !void {
         else
             .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) };
 
-        var ca = coding_agent.AgentSession.init(allocator, .{
+        var ca = sdk.createAgentSession(allocator, .{
             .model = model,
             .api_key = key,
             .cwd = cwd_buf,
@@ -340,7 +341,7 @@ pub fn main() !void {
         defer registry.deinit();
         try registry.register("anthropic-messages", prov, null);
 
-        var ca = coding_agent.AgentSession.init(allocator, .{
+        var ca = sdk.createAgentSession(allocator, .{
             .model = effective_model,
             .api_key = api_key,
             .cwd = cwd_buf,
