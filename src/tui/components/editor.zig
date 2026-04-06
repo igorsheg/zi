@@ -780,3 +780,53 @@ test "Editor up/down navigation moves between lines" {
     try std.testing.expectEqual(@as(u32, 2), editor.cursorLine());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
 }
+
+test "slash command autocomplete end-to-end" {
+    const allocator = std.testing.allocator;
+
+    const slash_commands_mod = @import("../../slash_commands.zig");
+    var registry = slash_commands_mod.CommandRegistry.init(allocator);
+    defer registry.deinit();
+
+    var slash_provider = autocomplete_mod.SlashCommandProvider.init(&registry);
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    editor.setAutocompleteProvider(slash_provider.provider());
+    editor.theme = &theme_mod.Theme.dark;
+
+    var submitted: ?[]const u8 = null;
+    const SubmitCtx = struct { submitted: *?[]const u8 };
+    var submit_ctx = SubmitCtx{ .submitted = &submitted };
+    editor.on_submit = struct {
+        fn cb(text: []const u8, ctx: ?*anyopaque) void {
+            const sc: *SubmitCtx = @ptrCast(@alignCast(ctx));
+            sc.submitted.* = text;
+        }
+    }.cb;
+    editor.on_submit_ctx = @ptrCast(&submit_ctx);
+
+    // Type "/" → autocomplete activates with all commands
+    _ = editor.handleInput(.{ .code = .char, .char = '/' });
+    try std.testing.expect(editor.autocomplete_active);
+
+    // Type "m" → narrows to commands starting with "m" (model)
+    _ = editor.handleInput(.{ .code = .char, .char = 'm' });
+    try std.testing.expect(editor.autocomplete_active);
+    const item = editor.autocomplete_list.getSelectedItem();
+    try std.testing.expect(item != null);
+    try std.testing.expectEqualStrings("model", item.?.value);
+
+    // Press Enter → accept autocomplete + submit
+    _ = editor.handleInput(.{ .code = .enter });
+
+    // Autocomplete dismissed
+    try std.testing.expect(!editor.autocomplete_active);
+
+    // Editor text is "/model "
+    try std.testing.expectEqualStrings("/model ", editor.getText());
+
+    // Submit fired with "/model "
+    try std.testing.expect(submitted != null);
+    try std.testing.expectEqualStrings("/model ", submitted.?);
+}
