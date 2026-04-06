@@ -4,6 +4,7 @@ const auth = @import("auth/root.zig");
 const settings_mod = @import("settings/root.zig");
 const agent = @import("agent/root.zig");
 const coding_agent = @import("coding_agent.zig");
+const agent_json = @import("agent/json.zig");
 const interactive_mod = @import("tui/interactive.zig");
 const terminal_mod = @import("tui/terminal.zig");
 
@@ -29,6 +30,10 @@ pub fn main() !void {
     var list_models = false;
     var prompt_text: ?[]const u8 = null;
     var continue_path: ?[]const u8 = null;
+    var mode: enum { text, json } = .text;
+    var no_session = false;
+    var tools_filter: ?[]const u8 = null;
+    var append_system_prompt_arg: ?[]const u8 = null;
 
     var args = std.process.args();
     _ = args.next();
@@ -47,6 +52,25 @@ pub fn main() !void {
             list_models = true;
         } else if (eql(arg, "--continue")) {
             continue_path = args.next();
+        } else if (eql(arg, "--mode")) {
+            if (args.next()) |m| {
+                if (eql(m, "json")) {
+                    mode = .json;
+                } else if (eql(m, "text")) {
+                    mode = .text;
+                } else {
+                    try stderr.writeAll("error: unknown mode '");
+                    try stderr.writeAll(m);
+                    try stderr.writeAll("'. use 'json' or 'text'\n");
+                    std.process.exit(1);
+                }
+            }
+        } else if (eql(arg, "--no-session")) {
+            no_session = true;
+        } else if (eql(arg, "--tools")) {
+            tools_filter = args.next();
+        } else if (eql(arg, "--append-system-prompt")) {
+            append_system_prompt_arg = args.next();
         } else if (arg.len > 0 and arg[0] != '-') {
             prompt_text = arg;
         }
@@ -67,6 +91,10 @@ pub fn main() !void {
             \\  --model <id>          Model ID or pattern (default: from settings or claude-sonnet-4)
             \\  --api-key <key>       API key override (also reads ~/.zi/agent/auth.json)
             \\  --continue <path>     Continue from a session file
+            \\  --mode <text|json>    Output mode (default: text)
+            \\  --no-session          Disable session persistence
+            \\  --tools <filter>      Comma-separated list of allowed tools
+            \\  --append-system-prompt <text|path>  Append to system prompt (literal text or file path)
             \\  --list-models         List available models
             \\  -h, --help            Show help
             \\  -v, --version         Show version
@@ -88,7 +116,7 @@ pub fn main() !void {
         return;
     }
 
-    const has_prompt = print_mode or prompt_text != null;
+    const has_prompt = print_mode or mode == .json or prompt_text != null;
     const is_continue = continue_path != null;
 
     if (has_prompt or is_continue) {
@@ -179,7 +207,22 @@ pub fn main() !void {
         defer registry.deinit();
         try registry.register("anthropic-messages", prov, null);
 
+        // Resolve --append-system-prompt: file path -> read contents, else treat as literal text
+        var append_system_prompt: ?[]const u8 = null;
+        if (append_system_prompt_arg) |asp| {
+            if (std.fs.cwd().openFile(asp, .{})) |file| {
+                defer file.close();
+                append_system_prompt = file.readToEndAlloc(allocator, 1024 * 1024) catch null;
+            } else |_| {
+                append_system_prompt = asp;
+            }
+        }
+        var json_handler = JsonHandler{};
         var print_handler = PrintHandler{};
+        const event_handler: coding_agent.CodingAgent.EventHandler = if (mode == .json)
+            .{ .func = &JsonHandler.callback, .ctx = @ptrCast(&json_handler) }
+        else
+            .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) };
 
         var ca = coding_agent.CodingAgent.init(allocator, .{
             .model = model,
@@ -187,9 +230,11 @@ pub fn main() !void {
             .cwd = cwd_buf,
             .max_tokens = 4096,
             .registry = &registry,
-            .event_handler = .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) },
+            .event_handler = event_handler,
             .initial_messages = initial_messages,
             .session_store = session_store,
+            .no_session = no_session,
+            .append_system_prompt = append_system_prompt,
         });
         defer ca.deinit();
 
@@ -205,7 +250,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
         } else {
-            ca.run(prompt.?);
+            try ca.run(prompt.?);
         }
 
         try stdout.writeAll("\n");
@@ -321,6 +366,19 @@ const PrintHandler = struct {
             },
             else => {},
         }
+    }
+};
+
+/// JSON handler: serializes each AgentEvent as a JSONL line to stdout.
+const JsonHandler = struct {
+    fn callback(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {
+        const serialized = agent_json.serializeAgentEvent(
+            std.heap.page_allocator,
+            event,
+        ) catch return;
+        defer std.heap.page_allocator.free(serialized);
+        stdout.writeAll(serialized) catch {};
+        stdout.writeAll("\n") catch {};
     }
 };
 

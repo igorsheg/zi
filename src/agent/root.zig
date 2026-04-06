@@ -1,4 +1,5 @@
 pub const protocol = @import("protocol.zig");
+pub const json = @import("json.zig");
 pub const loop = @import("loop.zig");
 pub const Agent = @import("agent.zig").Agent;
 pub const PendingMessageQueue = @import("agent.zig").PendingMessageQueue;

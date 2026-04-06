@@ -1302,7 +1302,7 @@ pub const Interactive = struct {
         const token = self.ca.agent.subscribe(&agentEventCallback, @ptrCast(self));
         defer self.ca.agent.unsubscribe(token);
 
-        self.ca.run(prompt_copy);
+        self.ca.run(prompt_copy) catch {};
 
         self.event_queue.push(.{ .agent_finished = {} });
     }

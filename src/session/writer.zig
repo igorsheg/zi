@@ -21,6 +21,7 @@ pub const SessionWriter = struct {
     flushed: bool,
     has_assistant: bool,
     buffered_entries: std.ArrayListUnmanaged(proto.FileEntry),
+    persist: bool,
 
     pub fn init(allocator: std.mem.Allocator, cwd: []const u8) SessionWriter {
         var uuid_buf: [36]u8 = undefined;
@@ -59,8 +60,32 @@ pub const SessionWriter = struct {
             .flushed = false,
             .has_assistant = false,
             .buffered_entries = buffered,
+            .persist = true,
         };
     }
+
+
+    /// Create an ephemeral writer that tracks state in memory but never writes to disk.
+    /// Used for --no-session sub-agents.
+    pub fn initEphemeral(allocator: std.mem.Allocator) SessionWriter {
+        var uuid_buf: [36]u8 = undefined;
+        generateUuid(&uuid_buf);
+        const session_id = allocator.dupe(u8, &uuid_buf) catch @panic("OOM");
+
+        return .{
+            .allocator = allocator,
+            .session_id = session_id,
+            .session_file = "",
+            .cwd = "",
+            .leaf_id = null,
+            .ids = .{},
+            .flushed = false,
+            .has_assistant = false,
+            .buffered_entries = .empty,
+            .persist = false,
+        };
+    }
+
 
     /// Continue writing to an existing session file.
     /// Seeds leaf_id so new entries chain from where the session left off.
@@ -77,6 +102,7 @@ pub const SessionWriter = struct {
             .flushed = true,
             .has_assistant = true,
             .buffered_entries = .empty,
+            .persist = true,
         };
     }
 
@@ -191,6 +217,11 @@ pub const SessionWriter = struct {
 
     /// Flush all buffered entries to disk (header + entries).
     fn flushAll(self: *SessionWriter) void {
+        if (!self.persist) {
+            self.flushed = true;
+            self.buffered_entries.clearRetainingCapacity();
+            return;
+        }
         const file = std.fs.createFileAbsolute(self.session_file, .{}) catch return;
         defer file.close();
 
@@ -208,6 +239,7 @@ pub const SessionWriter = struct {
 
     /// Append a single entry to the already-flushed file.
     fn appendToFile(self: *SessionWriter, entry: proto.SessionEntry) !void {
+        if (!self.persist) return;
         const line = try json.serializeEntry(self.allocator, entry);
         const file = try std.fs.openFileAbsolute(self.session_file, .{ .mode = .read_write });
         defer file.close();

@@ -35,6 +35,15 @@ pub const SessionStore = struct {
         };
     }
 
+    /// Create an ephemeral session (no disk persistence).
+    /// Used for --no-session sub-agents.
+    pub fn createEphemeral(allocator: std.mem.Allocator) SessionStore {
+        return .{
+            .allocator = allocator,
+            .writer = writer_mod.SessionWriter.initEphemeral(allocator),
+        };
+    }
+
     /// Open an existing session file.
     /// Reads entries, seeds the writer for continuation.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SessionStore {

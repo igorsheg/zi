@@ -54,6 +54,8 @@ pub const CodingAgent = struct {
         /// Pre-built session store (from SessionStore.open for --continue).
         /// If null, a new session is created for `cwd`.
         session_store: ?SessionStore = null,
+        no_session: bool = false,
+        append_system_prompt: ?[]const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) CodingAgent {
@@ -63,7 +65,10 @@ pub const CodingAgent = struct {
             break :blk @as([]const protocol.AgentTool, t);
         };
 
-        const store = options.session_store orelse SessionStore.create(allocator, options.cwd);
+        const store = options.session_store orelse if (options.no_session)
+            SessionStore.createEphemeral(allocator)
+        else
+            SessionStore.create(allocator, options.cwd);
 
         const closure = allocator.create(StreamClosure) catch @panic("OOM");
         closure.* = .{
@@ -89,12 +94,14 @@ pub const CodingAgent = struct {
                     .cwd = options.cwd,
                     .context_files = options.context_files,
                     .tool_names = tool_name_slice,
+                    .append_system_prompt = options.append_system_prompt,
                 }) catch custom;
             }
             break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
                 .cwd = options.cwd,
                 .tool_names = tool_name_slice,
                 .context_files = options.context_files,
+                .append_system_prompt = options.append_system_prompt,
             }) catch "You are a helpful coding assistant.";
         };
 
@@ -151,7 +158,7 @@ pub const CodingAgent = struct {
     }
 
     /// Run a new prompt. Wires session persistence, then delegates to Agent.prompt.
-    pub fn run(self: *CodingAgent, prompt_text: []const u8) void {
+    pub fn run(self: *CodingAgent, prompt_text: []const u8) !void {
         self.wireSubscription();
 
         const user_msg = protocol.AgentMessage{
@@ -161,7 +168,7 @@ pub const CodingAgent = struct {
             },
         };
         const prompts = [_]protocol.AgentMessage{user_msg};
-        self.agent.prompt(&prompts) catch {};
+        try self.agent.prompt(&prompts);
     }
 
     /// Continue from loaded session context.

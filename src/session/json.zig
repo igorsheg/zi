@@ -152,7 +152,7 @@ pub fn serializeEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) !
 
 // ─── Message writers ────────────────────────────────────────────────
 
-fn writeAgentMessage(jw: *Stringify, msg: agent.protocol.AgentMessage) !void {
+pub fn writeAgentMessage(jw: *Stringify, msg: agent.protocol.AgentMessage) !void {
     switch (msg) {
         .user => |u| try writeUserMessage(jw, u),
         .assistant => |a| try writeAssistantMessage(jw, a),
@@ -163,7 +163,7 @@ fn writeAgentMessage(jw: *Stringify, msg: agent.protocol.AgentMessage) !void {
     }
 }
 
-fn writeUserMessage(jw: *Stringify, msg: ai.protocol.UserMessage) !void {
+pub fn writeUserMessage(jw: *Stringify, msg: ai.protocol.UserMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("user");
@@ -188,7 +188,7 @@ fn writeUserMessage(jw: *Stringify, msg: ai.protocol.UserMessage) !void {
     try jw.endObject();
 }
 
-fn writeAssistantMessage(jw: *Stringify, msg: ai.protocol.AssistantMessage) !void {
+pub fn writeAssistantMessage(jw: *Stringify, msg: ai.protocol.AssistantMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("assistant");
@@ -232,7 +232,7 @@ fn writeAssistantMessage(jw: *Stringify, msg: ai.protocol.AssistantMessage) !voi
     try jw.endObject();
 }
 
-fn writeToolResultMessage(jw: *Stringify, msg: ai.protocol.ToolResultMessage) !void {
+pub fn writeToolResultMessage(jw: *Stringify, msg: ai.protocol.ToolResultMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("toolResult");
@@ -262,7 +262,7 @@ fn writeToolResultMessage(jw: *Stringify, msg: ai.protocol.ToolResultMessage) !v
     try jw.endObject();
 }
 
-fn writeCompactionSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CompactionSummaryMessage) !void {
+pub fn writeCompactionSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CompactionSummaryMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("compactionSummary");
@@ -275,7 +275,7 @@ fn writeCompactionSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessag
     try jw.endObject();
 }
 
-fn writeBranchSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.BranchSummaryMessage) !void {
+pub fn writeBranchSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.BranchSummaryMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("branchSummary");
@@ -288,7 +288,7 @@ fn writeBranchSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.Br
     try jw.endObject();
 }
 
-fn writeCustomMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CustomMessage) !void {
+pub fn writeCustomMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CustomMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("custom");
@@ -307,7 +307,7 @@ fn writeCustomMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CustomMes
     try jw.endObject();
 }
 
-fn writeCustomContent(jw: *Stringify, content: agent.protocol.AgentMessage.CustomContent) !void {
+pub fn writeCustomContent(jw: *Stringify, content: agent.protocol.AgentMessage.CustomContent) !void {
     switch (content) {
         .text => |t| try jw.write(t),
         .blocks => |blocks| {
@@ -325,7 +325,7 @@ fn writeCustomContent(jw: *Stringify, content: agent.protocol.AgentMessage.Custo
 
 // ─── Content block writers ──────────────────────────────────────────
 
-fn writeTextBlock(jw: *Stringify, tc: ai.protocol.TextContent) !void {
+pub fn writeTextBlock(jw: *Stringify, tc: ai.protocol.TextContent) !void {
     try jw.beginObject();
     try jw.objectField("type");
     try jw.write("text");
@@ -338,7 +338,7 @@ fn writeTextBlock(jw: *Stringify, tc: ai.protocol.TextContent) !void {
     try jw.endObject();
 }
 
-fn writeThinkingBlock(jw: *Stringify, th: ai.protocol.ThinkingContent) !void {
+pub fn writeThinkingBlock(jw: *Stringify, th: ai.protocol.ThinkingContent) !void {
     try jw.beginObject();
     try jw.objectField("type");
     try jw.write("thinking");
@@ -355,7 +355,7 @@ fn writeThinkingBlock(jw: *Stringify, th: ai.protocol.ThinkingContent) !void {
     try jw.endObject();
 }
 
-fn writeToolCallBlock(jw: *Stringify, tc: ai.protocol.ToolCall) !void {
+pub fn writeToolCallBlock(jw: *Stringify, tc: ai.protocol.ToolCall) !void {
     try jw.beginObject();
     try jw.objectField("type");
     try jw.write("toolCall");
@@ -372,7 +372,7 @@ fn writeToolCallBlock(jw: *Stringify, tc: ai.protocol.ToolCall) !void {
     try jw.endObject();
 }
 
-fn writeImageBlock(jw: *Stringify, ic: ai.protocol.ImageContent) !void {
+pub fn writeImageBlock(jw: *Stringify, ic: ai.protocol.ImageContent) !void {
     try jw.beginObject();
     try jw.objectField("type");
     try jw.write("image");
@@ -383,7 +383,7 @@ fn writeImageBlock(jw: *Stringify, ic: ai.protocol.ImageContent) !void {
     try jw.endObject();
 }
 
-fn writeUsage(jw: *Stringify, usage: ai.protocol.Usage) !void {
+pub fn writeUsage(jw: *Stringify, usage: ai.protocol.Usage) !void {
     try jw.beginObject();
     try jw.objectField("input");
     try jw.write(usage.input);
