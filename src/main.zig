@@ -65,7 +65,7 @@ pub fn main() !void {
             \\Options:
             \\  -p, --print           Non-interactive mode
             \\  --model <id>          Model ID or pattern (default: from settings or claude-sonnet-4)
-            \\  --api-key <key>       API key override (also reads ~/.pi/agent/auth.json)
+            \\  --api-key <key>       API key override (also reads ~/.zi/agent/auth.json)
             \\  --continue <path>     Continue from a session file
             \\  --list-models         List available models
             \\  -h, --help            Show help

@@ -26,7 +26,9 @@ pub const FileSettingsStorage = struct {
 
         const global_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
         defer allocator.free(global_path);
-        const project_path = try std.fs.path.join(allocator, &.{ cwd, ".pi", "settings.json" });
+        const project_dir = try shared.getProjectDir(allocator, cwd);
+        defer allocator.free(project_dir);
+        const project_path = try std.fs.path.join(allocator, &.{ project_dir, "settings.json" });
         defer allocator.free(project_path);
 
         var global = try shared.LockedFile.init(allocator, global_path);

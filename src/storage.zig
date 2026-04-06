@@ -1,8 +1,8 @@
 /// Shared file storage primitives — lockdir protocol, file I/O with permissions,
-/// and agent directory resolution. Used by auth and settings.
+/// and path resolution for all persistent data.
 ///
-/// Lock protocol is proper-lockfile compatible (mkdir-based, 30s stale detection)
-/// so zi and pi-mono can safely share ~/.pi/agent/ files.
+/// All zi data lives under ~/.zi/ (or ZI_CODING_AGENT_DIR override).
+/// Lock protocol uses proper-lockfile compatible mkdir-based locking (30s stale).
 const std = @import("std");
 const posix = std.posix;
 
@@ -130,29 +130,87 @@ pub const MemoryFile = struct {
     pub fn releaseLock(_: *const MemoryFile) void {}
 };
 
-/// Get the agent directory. Honors PI_CODING_AGENT_DIR env var.
-/// Default: ~/.pi/agent
-/// pi-mono: config.ts:187-196
+// ── Path resolution ─────────────────────────────────────────────────
+//
+// All zi persistent data lives under a single root:
+//   ~/.zi/agent/          (default, or ZI_CODING_AGENT_DIR override)
+//
+// Directory layout:
+//   ~/.zi/agent/auth.json
+//   ~/.zi/agent/settings.json
+//   ~/.zi/agent/models.json
+//   ~/.zi/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl
+//
+// Project-local:
+//   <cwd>/.zi/settings.json
+
+/// Get the agent directory. Honors ZI_CODING_AGENT_DIR env var.
+/// Default: ~/.zi/agent
 pub fn getAgentDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]const u8 {
     if (override) |dir| return allocator.dupe(u8, dir);
 
-    if (posix.getenv("PI_CODING_AGENT_DIR")) |dir| {
-        if (std.mem.eql(u8, dir, "~")) {
-            const home = posix.getenv("HOME") orelse return error.NoHomeDir;
-            return allocator.dupe(u8, home);
-        }
-        if (dir.len > 1 and dir[0] == '~' and dir[1] == '/') {
-            const home = posix.getenv("HOME") orelse return error.NoHomeDir;
-            return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, dir[1..] });
-        }
-        return allocator.dupe(u8, dir);
+    if (posix.getenv("ZI_CODING_AGENT_DIR")) |dir| {
+        return expandTilde(allocator, dir);
     }
 
     const home = posix.getenv("HOME") orelse return error.NoHomeDir;
-    return std.fs.path.join(allocator, &.{ home, ".pi", "agent" });
+    return std.fs.path.join(allocator, &.{ home, ".zi", "agent" });
 }
 
-// ── tests ───────────────────────────────────────────────────────────
+/// Get the project-local config directory: <cwd>/.zi
+pub fn getProjectDir(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ cwd, ".zi" });
+}
+
+/// Get the sessions root directory: <agent_dir>/sessions
+pub fn getSessionsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
+    const agent_dir = try getAgentDir(allocator, agent_dir_override);
+    defer allocator.free(agent_dir);
+    return std.fs.path.join(allocator, &.{ agent_dir, "sessions" });
+}
+
+/// Get the session directory for a specific cwd: <agent_dir>/sessions/<encoded-cwd>
+pub fn getSessionDirForCwd(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) ![]const u8 {
+    const sessions_dir = try getSessionsDir(allocator, agent_dir_override);
+    defer allocator.free(sessions_dir);
+    const safe_cwd = try encodeCwd(allocator, cwd);
+    defer allocator.free(safe_cwd);
+    return std.fs.path.join(allocator, &.{ sessions_dir, safe_cwd });
+}
+
+/// Encode cwd into a safe directory name.
+/// /Users/foo/bar → --Users-foo-bar--
+/// Matches pi-mono's getDefaultSessionDir encoding.
+pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
+    var start: usize = 0;
+    if (cwd.len > 0 and (cwd[0] == '/' or cwd[0] == '\\')) start = 1;
+    const stripped = cwd[start..];
+
+    var result = try allocator.alloc(u8, stripped.len + 4);
+    result[0] = '-';
+    result[1] = '-';
+    for (stripped, 0..) |c, i| {
+        result[i + 2] = if (c == '/' or c == '\\' or c == ':') '-' else c;
+    }
+    result[stripped.len + 2] = '-';
+    result[stripped.len + 3] = '-';
+    return result;
+}
+
+/// Expand ~ prefix in a path.
+fn expandTilde(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, dir, "~")) {
+        const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+        return allocator.dupe(u8, home);
+    }
+    if (dir.len > 1 and dir[0] == '~' and dir[1] == '/') {
+        const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, dir[1..] });
+    }
+    return allocator.dupe(u8, dir);
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
 
 test "memory file round-trips content" {
     const allocator = std.testing.allocator;
@@ -190,4 +248,23 @@ test "locked file acquire and release" {
         else => return err,
     };
     return error.TestUnexpectedResult;
+}
+
+test "encodeCwd encodes paths matching pi-mono format" {
+    const allocator = std.testing.allocator;
+
+    const r1 = try encodeCwd(allocator, "/Users/foo/bar");
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("--Users-foo-bar--", r1);
+
+    const r2 = try encodeCwd(allocator, "/tmp");
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings("--tmp--", r2);
+}
+
+test "getProjectDir joins cwd with .zi" {
+    const allocator = std.testing.allocator;
+    const dir = try getProjectDir(allocator, "/home/user/project");
+    defer allocator.free(dir);
+    try std.testing.expectEqualStrings("/home/user/project/.zi", dir);
 }

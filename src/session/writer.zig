@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const json = @import("json.zig");
+const storage = @import("../storage.zig");
 
 /// Manages writing session entries to a JSONL file.
 /// Tracks leafId for tree structure and generates unique entry IDs.
@@ -28,9 +29,7 @@ pub const SessionWriter = struct {
 
         const timestamp = isoTimestamp(allocator) catch @panic("OOM");
 
-        const home = std.posix.getenv("HOME") orelse "/tmp";
-        const safe_cwd = encodeCwd(allocator, cwd) catch @panic("OOM");
-        const session_dir = std.fmt.allocPrint(allocator, "{s}/.pi/agent/sessions/{s}", .{ home, safe_cwd }) catch @panic("OOM");
+        const session_dir = storage.getSessionDirForCwd(allocator, cwd, null) catch @panic("OOM");
 
         // Ensure directory exists
         std.fs.cwd().makePath(session_dir) catch {};
@@ -201,20 +200,4 @@ fn generateUuid(buf: *[36]u8) void {
     }) catch {};
 }
 
-/// Encode cwd into a safe directory name matching pi-mono's getDefaultSessionDir.
-/// /Users/foo/bar → --Users-foo-bar--
-fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
-    var start: usize = 0;
-    if (cwd.len > 0 and (cwd[0] == '/' or cwd[0] == '\\')) start = 1;
-    const stripped = cwd[start..];
 
-    var result = try allocator.alloc(u8, stripped.len + 4);
-    result[0] = '-';
-    result[1] = '-';
-    for (stripped, 0..) |c, i| {
-        result[i + 2] = if (c == '/' or c == '\\' or c == ':') '-' else c;
-    }
-    result[stripped.len + 2] = '-';
-    result[stripped.len + 3] = '-';
-    return result;
-}
