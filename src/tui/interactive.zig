@@ -662,7 +662,8 @@ pub const Interactive = struct {
         self.loader_active = false;
         self.status_container.clear();
         self.status_container.addChild(self.status_text.component());
-        self.status_text.setContent("");
+        // Don't blank status_text — preserve any error/abort message
+        // that was set while the loader was active.
     }
 
     fn detectGitBranch(self: *Interactive) void {
