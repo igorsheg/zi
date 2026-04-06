@@ -39,17 +39,29 @@ pub const SlashCommand = struct {
 
 fn stubHandler(_: []const u8, _: *CommandContext) anyerror!void {}
 
+/// Matches pi-mono's BUILTIN_SLASH_COMMANDS (packages/coding-agent/src/core/slash-commands.ts)
 pub const BUILTIN_COMMANDS = [_]SlashCommand{
     .{ .name = "model", .description = "Select model", .source = .builtin, .action = .{ .builtin = &stubHandler } },
-    .{ .name = "clear", .description = "Clear conversation", .source = .builtin, .action = .{ .builtin = &stubHandler } },
-    .{ .name = "new", .description = "Start a new session", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "compact", .description = "Compact session context", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "new", .description = "Start a new session", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "clear", .description = "Clear conversation", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "quit", .description = "Quit zi", .source = .builtin, .action = .{ .builtin = &stubHandler } },
-    .{ .name = "hotkeys", .description = "Show keyboard shortcuts", .source = .builtin, .action = .{ .builtin = &stubHandler } },
-    .{ .name = "session", .description = "Show session info", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "resume", .description = "Resume a different session", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "fork", .description = "Create a new fork from a previous message", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "tree", .description = "Navigate session tree", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "export", .description = "Export session", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "import", .description = "Import and resume a session from a JSONL file", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "copy", .description = "Copy last agent message to clipboard", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "name", .description = "Set session display name", .source = .builtin, .action = .{ .builtin = &stubHandler } },
-    .{ .name = "reload", .description = "Reload configuration", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "session", .description = "Show session info and stats", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "hotkeys", .description = "Show all keyboard shortcuts", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "settings", .description = "Open settings menu", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "login", .description = "Login with OAuth provider", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "logout", .description = "Logout from OAuth provider", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "reload", .description = "Reload keybindings, extensions, skills, prompts, and themes", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "share", .description = "Share session as a secret GitHub gist", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "changelog", .description = "Show changelog entries", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "scoped-models", .description = "Enable/disable models for Ctrl+P cycling", .source = .builtin, .action = .{ .builtin = &stubHandler } },
 };
 
 /// Owns the dynamic set of slash commands.
@@ -141,10 +153,10 @@ test "CommandRegistry count includes both" {
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    try std.testing.expectEqual(@as(usize, 10), reg.count());
+    try std.testing.expectEqual(@as(usize, BUILTIN_COMMANDS.len), reg.count());
 
     reg.register(.{ .name = "extra", .source = .skill, .action = .skill });
-    try std.testing.expectEqual(@as(usize, 11), reg.count());
+    try std.testing.expectEqual(@as(usize, BUILTIN_COMMANDS.len + 1), reg.count());
 }
 
 test "CommandRegistry builtin takes precedence" {
