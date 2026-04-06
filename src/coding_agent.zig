@@ -8,23 +8,23 @@ const system_prompt_mod = @import("system_prompt.zig");
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
 const SubscriptionToken = agent_mod.SubscriptionToken;
-const SessionWriter = session_mod.writer.SessionWriter;
+pub const SessionStore = session_mod.store.SessionStore;
 
-/// Composition root: wires Agent + SessionWriter + tools + model resolution.
+/// Composition root: wires Agent + SessionStore + tools + model resolution.
 ///
 /// pi-mono equivalent: packages/coding-agent/src/core/sdk.ts (createAgentSession)
 /// + packages/coding-agent/src/core/agent-session.ts (AgentSession)
 ///
 /// Owns:
 /// - Agent (dual-loop, tool pipeline, event system)
-/// - SessionWriter (JSONL persistence gated on first assistant message)
+/// - SessionStore (JSONL persistence + context building)
 /// - Tool registry (bash + future tools)
 /// - convertToLlm that handles compaction_summary, branch_summary, custom
 /// - transformContext hook point (wired but no-op until compaction lands)
 /// - Stream hook wrapping provider registry
 pub const CodingAgent = struct {
     agent: Agent,
-    session_writer: SessionWriter,
+    session_store: SessionStore,
     allocator: std.mem.Allocator,
     tools: []const protocol.AgentTool,
     event_handler: ?EventHandler,
@@ -48,9 +48,9 @@ pub const CodingAgent = struct {
         event_handler: ?EventHandler = null,
         /// Seed with existing messages for --continue.
         initial_messages: []const protocol.AgentMessage = &.{},
-        session_id: ?[]const u8 = null,
-        session_file: ?[]const u8 = null,
-        leaf_id: ?[]const u8 = null,
+        /// Pre-built session store (from SessionStore.open for --continue).
+        /// If null, a new session is created for `cwd`.
+        session_store: ?SessionStore = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) CodingAgent {
@@ -60,10 +60,7 @@ pub const CodingAgent = struct {
             break :blk @as([]const protocol.AgentTool, t);
         };
 
-        const sw = if (options.session_file != null)
-            SessionWriter.initContinue(allocator, options.session_file.?, options.session_id.?, options.leaf_id)
-        else
-            SessionWriter.init(allocator, options.cwd);
+        const store = options.session_store orelse SessionStore.create(allocator, options.cwd);
 
         const closure = allocator.create(StreamClosure) catch @panic("OOM");
         closure.* = .{
@@ -107,12 +104,12 @@ pub const CodingAgent = struct {
             },
             .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
             .stream_fn = stream_hook,
-            .session_id = options.session_id,
+            .session_id = if (options.session_store) |s| s.sessionId() else null,
         });
 
         const self = CodingAgent{
             .agent = a,
-            .session_writer = sw,
+            .session_store = store,
             .allocator = allocator,
             .tools = tools,
             .event_handler = options.event_handler,
@@ -171,11 +168,11 @@ pub const CodingAgent = struct {
 
     /// Get session file path (valid after first flush).
     pub fn getSessionFile(self: *const CodingAgent) []const u8 {
-        return self.session_writer.session_file;
+        return self.session_store.sessionFile();
     }
 
     pub fn sessionFlushed(self: *const CodingAgent) bool {
-        return self.session_writer.flushed;
+        return self.session_store.writer.flushed;
     }
 
     /// Event listener: forwards to user-provided handler, then persists.
@@ -191,7 +188,7 @@ pub const CodingAgent = struct {
         // Session persistence on message_end
         switch (event) {
             .message_end => |me| {
-                self.session_writer.appendMessage(me.message);
+                self.session_store.appendMessage(me.message);
             },
             else => {},
         }
@@ -300,26 +297,24 @@ pub fn convertToLlm(
     return result.items;
 }
 
-/// Load a session file and build context for --continue.
-/// Returns messages that can be passed as CodingAgent.Options.initial_messages.
+/// Open a session file and build context for --continue.
+/// Returns a SessionStore (ready for appending) and the resolved context.
 ///
 /// pi-mono: SessionManager.buildSessionContext → Agent.state.messages = existingSession.messages
-pub fn loadSessionContext(
+pub fn openSession(
     allocator: std.mem.Allocator,
     session_path: []const u8,
 ) !struct {
+    store: SessionStore,
     messages: []protocol.AgentMessage,
-    session_id: ?[]const u8,
-    leaf_id: ?[]const u8,
     model: ?session_mod.context.SessionContext.ModelInfo,
     thinking_level: []const u8,
 } {
-    const data = try session_mod.reader.readSessionFile(allocator, session_path);
-    const ctx = try session_mod.context.buildSessionContext(allocator, data.entries, null);
+    var store = try SessionStore.open(allocator, session_path);
+    const ctx = try store.buildContext(null);
     return .{
+        .store = store,
         .messages = ctx.messages,
-        .session_id = if (data.header) |h| h.id else null,
-        .leaf_id = if (data.entries.len > 0) data.entries[data.entries.len - 1].id else null,
         .model = ctx.model,
         .thinking_level = ctx.thinking_level,
     };
@@ -675,7 +670,7 @@ test "CodingAgent: session persistence round-trip" {
     const session_file = ca.getSessionFile();
 
     // Read back the session file
-    const loaded = try loadSessionContext(allocator, session_file);
+    const loaded = try openSession(allocator, session_file);
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
     // First message: user
@@ -802,7 +797,7 @@ test "CodingAgent: continue sends restored context to provider" {
     const session_file = ca1.getSessionFile();
 
     // Phase 2: load the session and continue with a new user message
-    const loaded = try loadSessionContext(allocator, session_file);
+    const loaded = try openSession(allocator, session_file);
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
     var fp2 = faux.FauxProvider.init(allocator);
@@ -830,9 +825,7 @@ test "CodingAgent: continue sends restored context to provider" {
         .tools = &.{},
         .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&col2) },
         .initial_messages = all_messages.items,
-        .session_file = session_file,
-        .leaf_id = loaded.leaf_id,
-        .session_id = loaded.session_id,
+        .session_store = loaded.store,
     });
     defer ca2.deinit();
 

@@ -113,10 +113,9 @@ pub fn main() !void {
 
         // Load session BEFORE model resolution (pi-mono sdk.ts:194-218)
         var initial_messages: []const agent.protocol.AgentMessage = &.{};
-        var session_id: ?[]const u8 = null;
-        var leaf_id: ?[]const u8 = null;
+        var session_store: ?coding_agent.SessionStore = null;
         if (continue_path) |path| {
-            const loaded = coding_agent.loadSessionContext(allocator, path) catch |err| {
+            const loaded = coding_agent.openSession(allocator, path) catch |err| {
                 try stderr.writeAll("error: could not load session: ");
                 const err_name = @errorName(err);
                 try stderr.writeAll(err_name);
@@ -124,8 +123,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             initial_messages = loaded.messages;
-            session_id = loaded.session_id;
-            leaf_id = loaded.leaf_id;
+            session_store = loaded.store;
             if (initial_messages.len == 0) {
                 try stderr.writeAll("error: session file has no messages\n");
                 std.process.exit(1);
@@ -191,9 +189,7 @@ pub fn main() !void {
             .registry = &registry,
             .event_handler = .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) },
             .initial_messages = initial_messages,
-            .session_id = session_id,
-            .session_file = if (is_continue) continue_path else null,
-            .leaf_id = leaf_id,
+            .session_store = session_store,
         });
         defer ca.deinit();
 
