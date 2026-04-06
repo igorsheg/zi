@@ -679,6 +679,23 @@ pub const Interactive = struct {
         return true;
     }
 
+    // ── App-level overlay presets ──────────────────────────────
+    // These know about the Interactive layout (footer height, etc).
+    // Generic presets live in overlay.zig (OverlayPresets).
+
+    fn bottomPanelOptions(self: *Interactive) overlay_mod.OverlayOptions {
+        // Reserve space for footer (1 row) + header (1 row)
+        const header_h: u32 = 1;
+        const footer_h = self.footer.measure(self.tui.width()).preferred_height;
+        return .{
+            .anchor = .bottom_left,
+            .width_percent = 100,
+            .max_height_percent = 40,
+            .margin_bottom = footer_h,
+            .margin_top = header_h,
+        };
+    }
+
     // ── Session picker (/resume) ────────────────────────────────
 
     fn showSessionPicker(self: *Interactive) void {
@@ -718,14 +735,10 @@ pub const Interactive = struct {
         self.session_picker.on_cancel = &onSessionPickerCancel;
         self.session_picker.callback_ctx = @ptrCast(self);
 
-        // Show as overlay
+        // Show as bottom panel overlay (ivy-style, preserves footer)
         self.session_picker_handle = self.tui.showOverlay(
             self.session_picker.component(),
-            .{
-                .anchor = .center,
-                .width_percent = 80,
-                .max_height = 15,
-            },
+            self.bottomPanelOptions(),
         );
     }
 

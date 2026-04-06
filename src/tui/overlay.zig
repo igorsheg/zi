@@ -44,6 +44,34 @@ pub const OverlayOptions = struct {
     non_capturing: bool = false,
 };
 
+/// Generic overlay layout presets. Terminal-level only — no knowledge of
+/// app layout slots (editor, footer, etc.). App-specific presets that
+/// account for layout belong in the composition root (e.g., interactive.zig).
+pub const OverlayPresets = struct {
+    /// Centered modal dialog — confirmations, settings, selectors.
+    pub fn centerDialog() OverlayOptions {
+        return .{
+            .anchor = .center,
+            .width_percent = 70,
+            .max_height_percent = 60,
+            .margin_top = 2,
+            .margin_bottom = 2,
+        };
+    }
+
+    /// Non-capturing top-right toast — transient notifications.
+    pub fn topToast() OverlayOptions {
+        return .{
+            .anchor = .top_right,
+            .width = 30,
+            .max_height = 3,
+            .non_capturing = true,
+            .margin_top = 1,
+            .margin_right = 2,
+        };
+    }
+};
+
 /// Internal overlay entry in the stack.
 pub const OverlayEntry = struct {
     id: u64,
