@@ -552,7 +552,6 @@ pub const Interactive = struct {
             },
             .message_start_assistant => {
                 self.transcript.beginAssistantMessage();
-                self.showLoader("thinking...");
                 self.tui.dirty = true;
             },
             .message_start_user => {},
@@ -722,8 +721,7 @@ pub const Interactive = struct {
         self.active_editor.clear();
         self.is_streaming = true;
         self.tui.setFocus(null); // defocus editor during streaming
-        self.status_text.setContent("sending...");
-        self.status_text.fg = self.theme.fg(.muted);
+        self.showLoader("Working...");
         self.tui.dirty = true;
 
         self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, prompt_copy }) catch {
