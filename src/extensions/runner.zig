@@ -59,6 +59,33 @@ pub const ExtensionRuntime = union(enum) {
 /// D1 scaffold only. Registries, Lua state, and event dispatch come in later
 /// phases. The struct shape is intentionally minimal to let D1 land
 /// independently while preserving the generation and runtime-bind contracts.
+/// Forward-declared runner cell — the "`ref: { current?: ExtensionRunner }`"
+/// pattern from pi-mono (sdk.ts:294). Exists to break a chicken-and-egg
+/// problem:
+///
+///   1. The `Agent` is constructed with `stream_fn`, `transform_context`,
+///      and `on_payload` closures that need to CALL INTO the runner.
+///   2. The runner, in turn, needs a live `AgentSession` (which owns
+///      the `Agent`) to flush its provider queue, bind ctx.ui, and
+///      emit `session_start`.
+///
+/// Without this cell, neither can be constructed first. With it,
+/// `sdk.createAgentSession` allocates an empty `ExtensionRunnerRef`
+/// up front, wires Agent closures against it, builds the session,
+/// builds the runner, and finally writes `ref.current = runner`.
+/// Closures that fire before that last step see `.current == null`
+/// and no-op gracefully (there are no extensions registered yet —
+/// the runner's own construction phase must not depend on itself).
+///
+/// Reload uses the same cell: the slot is re-assigned to the new
+/// generation atomically. Closures never re-capture a pointer — they
+/// dereference `ref.current` on every call. This is what makes a
+/// tool ctx wrapper from generation N safe to drop the moment the
+/// active slice swaps to generation N+1.
+pub const ExtensionRunnerRef = struct {
+    current: ?*ExtensionRunner = null,
+};
+
 pub const ExtensionRunner = struct {
     allocator: std.mem.Allocator,
 

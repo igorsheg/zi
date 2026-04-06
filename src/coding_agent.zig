@@ -12,6 +12,7 @@ const Agent = agent_mod.Agent;
 const SubscriptionToken = agent_mod.SubscriptionToken;
 pub const SessionStore = session_mod.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
+pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 
 /// Composition root: wires Agent + SessionStore + tools + model resolution.
 ///
