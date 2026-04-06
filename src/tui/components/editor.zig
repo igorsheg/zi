@@ -53,7 +53,7 @@ pub const Editor = struct {
     autocomplete_provider: ?AutocompleteProvider = null,
     autocomplete_list: SelectList = undefined,
     autocomplete_active: bool = false,
-    autocomplete_prefix: []const u8 = "",
+    autocomplete_prefix_len: u32 = 0,
     sink_ctx: AutocompleteSinkCtx = .{},
     theme: ?*const Theme = null,
 
@@ -146,7 +146,7 @@ pub const Editor = struct {
                     .theme = self.theme orelse &Theme.dark,
                 };
                 self.autocomplete_list.setItems(s.items);
-                self.autocomplete_prefix = s.prefix;
+                self.autocomplete_prefix_len = @intCast(s.prefix.len);
                 self.autocomplete_active = true;
                 return;
             }
@@ -158,11 +158,13 @@ pub const Editor = struct {
         const prov = self.autocomplete_provider orelse return false;
         const item = self.autocomplete_list.getSelectedItem() orelse return false;
 
+        const prefix_len = self.autocomplete_prefix_len;
+        const prefix = if (prefix_len <= self.buf.items.len) self.buf.items[0..prefix_len] else self.buf.items;
         const result = prov.apply(
             self.buf.items,
             self.cursor_byte,
             item,
-            self.autocomplete_prefix,
+            prefix,
         ) orelse return false;
 
         self.buf.items.len = 0;
@@ -181,7 +183,7 @@ pub const Editor = struct {
             if (self.autocomplete_provider) |prov| prov.cancel();
         }
         self.autocomplete_active = false;
-        self.autocomplete_prefix = "";
+        self.autocomplete_prefix_len = 0;
     }
 
     // --- Input handling ---
@@ -212,7 +214,12 @@ pub const Editor = struct {
                 },
                 .consumed => return true,
                 .unhandled => {
-                    if (key.code == .char and !key.ctrl and !key.alt) {
+                    if (key.code == .tab and !key.ctrl and !key.alt) {
+                        // Tab accepts the top pick without submitting
+                        if (self.acceptAutocomplete()) return true;
+                        self.cancelAutocomplete();
+                        return true;
+                    } else if (key.code == .char and !key.ctrl and !key.alt) {
                         // let char fall through to normal handling, then tryAutocomplete
                     } else if (key.code == .backspace) {
                         // let backspace fall through, then tryAutocomplete
@@ -829,4 +836,86 @@ test "slash command autocomplete end-to-end" {
     // Submit fired with "/model "
     try std.testing.expect(submitted != null);
     try std.testing.expectEqualStrings("/model ", submitted.?);
+}
+
+test "slash command Tab accepts top pick without submitting" {
+    const allocator = std.testing.allocator;
+
+    const slash_commands_mod = @import("../../slash_commands.zig");
+    var registry = slash_commands_mod.CommandRegistry.init(allocator);
+    defer registry.deinit();
+
+    var slash_provider = autocomplete_mod.SlashCommandProvider.init(&registry);
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    editor.setAutocompleteProvider(slash_provider.provider());
+    editor.theme = &theme_mod.Theme.dark;
+
+    var submitted: ?[]const u8 = null;
+    const SubmitCtx = struct { submitted: *?[]const u8 };
+    var submit_ctx = SubmitCtx{ .submitted = &submitted };
+    editor.on_submit = struct {
+        fn cb(text: []const u8, ctx: ?*anyopaque) void {
+            const sc: *SubmitCtx = @ptrCast(@alignCast(ctx));
+            sc.submitted.* = text;
+        }
+    }.cb;
+    editor.on_submit_ctx = @ptrCast(&submit_ctx);
+
+    // Type "/re" → autocomplete shows "resume" as top pick
+    _ = editor.handleInput(.{ .code = .char, .char = '/' });
+    _ = editor.handleInput(.{ .code = .char, .char = 'r' });
+    _ = editor.handleInput(.{ .code = .char, .char = 'e' });
+    try std.testing.expect(editor.autocomplete_active);
+
+    // Tab → accept top pick, but do NOT submit
+    _ = editor.handleInput(.{ .code = .tab });
+    try std.testing.expect(!editor.autocomplete_active);
+    try std.testing.expectEqualStrings("/resume ", editor.getText());
+    try std.testing.expect(submitted == null); // no submit on Tab
+
+    // Now Enter submits the completed text
+    _ = editor.handleInput(.{ .code = .enter });
+    try std.testing.expect(submitted != null);
+    try std.testing.expectEqualStrings("/resume ", submitted.?);
+}
+
+test "slash command Enter on partial text accepts top pick and submits" {
+    const allocator = std.testing.allocator;
+
+    const slash_commands_mod = @import("../../slash_commands.zig");
+    var registry = slash_commands_mod.CommandRegistry.init(allocator);
+    defer registry.deinit();
+
+    var slash_provider = autocomplete_mod.SlashCommandProvider.init(&registry);
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    editor.setAutocompleteProvider(slash_provider.provider());
+    editor.theme = &theme_mod.Theme.dark;
+
+    var submitted: ?[]const u8 = null;
+    const SubmitCtx = struct { submitted: *?[]const u8 };
+    var submit_ctx = SubmitCtx{ .submitted = &submitted };
+    editor.on_submit = struct {
+        fn cb(text: []const u8, ctx: ?*anyopaque) void {
+            const sc: *SubmitCtx = @ptrCast(@alignCast(ctx));
+            sc.submitted.* = text;
+        }
+    }.cb;
+    editor.on_submit_ctx = @ptrCast(&submit_ctx);
+
+    // Type "/re" → autocomplete active, top pick is "resume"
+    _ = editor.handleInput(.{ .code = .char, .char = '/' });
+    _ = editor.handleInput(.{ .code = .char, .char = 'r' });
+    _ = editor.handleInput(.{ .code = .char, .char = 'e' });
+    try std.testing.expect(editor.autocomplete_active);
+
+    // Enter → accept top pick + submit in one action
+    _ = editor.handleInput(.{ .code = .enter });
+    try std.testing.expect(!editor.autocomplete_active);
+    try std.testing.expectEqualStrings("/resume ", editor.getText());
+    try std.testing.expect(submitted != null);
+    try std.testing.expectEqualStrings("/resume ", submitted.?);
 }
