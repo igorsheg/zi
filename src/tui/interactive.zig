@@ -580,7 +580,6 @@ pub const Interactive = struct {
                 self.transcript.toolSetArgs(t.tool_call_id, t.args);
                 self.transcript.toolMarkExecutionStarted(t.tool_call_id);
                 self.status_text.setContent(t.tool_name);
-                if (self.loader_active) self.loader.setMessage(t.tool_name);
                 self.status_text.fg = self.theme.fg(.accent);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
