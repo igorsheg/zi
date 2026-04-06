@@ -29,25 +29,63 @@
 
 const std = @import("std");
 const coding_agent = @import("coding_agent.zig");
+const storage = @import("storage.zig");
+const extension_runner_mod = @import("extensions/runner.zig");
 
 pub const AgentSession = coding_agent.AgentSession;
+pub const SessionStore = coding_agent.SessionStore;
+pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 
 /// Options forwarded to `AgentSession.init`. Re-exported so callers
 /// only need to import `sdk.zig`, not `coding_agent.zig`.
 pub const CreateOptions = AgentSession.Options;
+
+/// Resolve the on-disk directory for a session's files. Runs BEFORE
+/// `SessionStore.create` so v2's `session_directory` extension event
+/// has a chance to override the default.
+///
+/// v1: `runner_ref` is accepted but unused — the function always
+/// returns `storage.getSessionDirForCwd(cwd)`. v2 will check
+/// `runner_ref.current` and, if present, emit the `session_directory`
+/// event into the runner and return the extension's override.
+///
+/// Caller owns the returned slice.
+///
+/// See docs/extensions.md § Session Directory Resolution.
+pub fn resolveSessionDir(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    runner_ref: ?*ExtensionRunnerRef,
+) ![]const u8 {
+    _ = runner_ref; // v1: no hook wiring yet.
+    return storage.getSessionDirForCwd(allocator, cwd, null);
+}
 
 /// Build a fully-initialized `AgentSession` from resolved external
 /// dependencies (model, api key, registry, etc.). The caller still
 /// owns auth/settings/model resolution because those have mode-specific
 /// error handling (print mode exits, interactive mode surfaces a prompt).
 ///
+/// Bootstrap order (v1):
+///   1. resolveSessionDir(cwd, null) — v2 hook point
+///   2. SessionStore.create(session_dir, cwd) — if no store was passed in
+///   3. AgentSession.init(...) — wires Agent + SessionStore + tools
+///
 /// Returned session is owned by the caller — `defer session.deinit()`.
 pub fn createAgentSession(
     allocator: std.mem.Allocator,
     options: CreateOptions,
-) AgentSession {
-    // v1: pass-through. A3 grows this body with ExtensionRunner
-    // construction; A4 adds the forward-declared runner ref; A5 moves
-    // session directory resolution here. Tracked in beads Phase A.
-    return AgentSession.init(allocator, options);
+) !AgentSession {
+    var opts = options;
+
+    // Pre-build the session store using the resolved directory.
+    // A store passed in by the caller (e.g. from --continue via
+    // SessionStore.open) wins — we never overwrite it.
+    if (opts.session_store == null and !opts.no_session) {
+        const session_dir = try resolveSessionDir(allocator, opts.cwd, null);
+        opts.session_store = SessionStore.create(allocator, session_dir, opts.cwd);
+    }
+
+    // A3+ will construct and attach the ExtensionRunner here.
+    return AgentSession.init(allocator, opts);
 }

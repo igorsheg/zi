@@ -251,7 +251,7 @@ pub fn main() !void {
         else
             .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) };
 
-        var ca = sdk.createAgentSession(allocator, .{
+        var ca = try sdk.createAgentSession(allocator, .{
             .model = model,
             .api_key = key,
             .cwd = cwd_buf,
@@ -341,7 +341,7 @@ pub fn main() !void {
         defer registry.deinit();
         try registry.register("anthropic-messages", prov, null);
 
-        var ca = sdk.createAgentSession(allocator, .{
+        var ca = try sdk.createAgentSession(allocator, .{
             .model = effective_model,
             .api_key = api_key,
             .cwd = cwd_buf,

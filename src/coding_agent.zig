@@ -5,6 +5,7 @@ const session_mod = @import("session/root.zig");
 const bash_tool = @import("tools/bash.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const auth_storage_mod = @import("auth/storage.zig");
+const storage = @import("storage.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 
 const protocol = agent_mod.protocol;
@@ -77,10 +78,17 @@ pub const AgentSession = struct {
             break :blk @as([]const protocol.AgentTool, t);
         };
 
+        // Fallback path when no store was pre-built by the sdk factory.
+        // The preferred entry point is `sdk.createAgentSession`, which
+        // runs `resolveSessionDir` up front (v2 hook point). Direct
+        // `AgentSession.init` callers — tests, the odd standalone — get
+        // the default directory here without the extension hook.
         const store = options.session_store orelse if (options.no_session)
             SessionStore.createEphemeral(allocator)
-        else
-            SessionStore.create(allocator, options.cwd);
+        else blk: {
+            const default_dir = storage.getSessionDirForCwd(allocator, options.cwd, null) catch @panic("OOM");
+            break :blk SessionStore.create(allocator, default_dir, options.cwd);
+        };
 
         const closure = allocator.create(StreamClosure) catch @panic("OOM");
         closure.* = .{
@@ -237,8 +245,8 @@ pub const AgentSession = struct {
     // to thread auth through AgentLoopConfig.
 
     fn getApiKeyFromStorage(provider_str: []const u8, ctx: ?*anyopaque) ?[]const u8 {
-        const storage: *auth_storage_mod.AuthStorage = @ptrCast(@alignCast(ctx.?));
-        return storage.getApiKey(provider_str);
+        const auth: *auth_storage_mod.AuthStorage = @ptrCast(@alignCast(ctx.?));
+        return auth.getApiKey(provider_str);
     }
 
     const StreamClosure = struct {

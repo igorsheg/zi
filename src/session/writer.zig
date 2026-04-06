@@ -2,7 +2,6 @@ const std = @import("std");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const json = @import("json.zig");
-const storage = @import("../storage.zig");
 
 /// Manages writing session entries to a JSONL file.
 /// Tracks leafId for tree structure and generates unique entry IDs.
@@ -23,14 +22,17 @@ pub const SessionWriter = struct {
     buffered_entries: std.ArrayListUnmanaged(proto.FileEntry),
     persist: bool,
 
-    pub fn init(allocator: std.mem.Allocator, cwd: []const u8) SessionWriter {
+    /// Construct a new writer. `session_dir` is the already-resolved directory
+    /// for this session's files — the sdk layer computes it via
+    /// `sdk.resolveSessionDir` BEFORE reaching here so v2's `session_directory`
+    /// extension hook gets a chance to override it. See
+    /// docs/extensions.md § Session Directory Resolution.
+    pub fn init(allocator: std.mem.Allocator, session_dir: []const u8, cwd: []const u8) SessionWriter {
         var uuid_buf: [36]u8 = undefined;
         generateUuid(&uuid_buf);
         const session_id = allocator.dupe(u8, &uuid_buf) catch @panic("OOM");
 
         const timestamp = isoTimestamp(allocator) catch @panic("OOM");
-
-        const session_dir = storage.getSessionDirForCwd(allocator, cwd, null) catch @panic("OOM");
 
         // Ensure directory exists
         std.fs.cwd().makePath(session_dir) catch {};

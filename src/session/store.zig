@@ -27,11 +27,14 @@ pub const SessionStore = struct {
     cached_entries: ?[]proto.SessionEntry = null,
     cached_header: ?proto.SessionHeader = null,
 
-    /// Create a new session for the given cwd.
-    pub fn create(allocator: std.mem.Allocator, cwd: []const u8) SessionStore {
+    /// Create a new session. `session_dir` is the already-resolved directory
+    /// (from `sdk.resolveSessionDir`) so v2's `session_directory` extension
+    /// hook has a chance to override it before the store exists. Callers
+    /// that don't care can pass `storage.getSessionDirForCwd(...)` directly.
+    pub fn create(allocator: std.mem.Allocator, session_dir: []const u8, cwd: []const u8) SessionStore {
         return .{
             .allocator = allocator,
-            .writer = writer_mod.SessionWriter.init(allocator, cwd),
+            .writer = writer_mod.SessionWriter.init(allocator, session_dir, cwd),
         };
     }
 
