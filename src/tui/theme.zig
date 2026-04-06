@@ -185,7 +185,7 @@ pub const Theme = struct {
 
         // Backgrounds
         t.bg_colors[@intFromEnum(BgColor.selected_bg)] = selection;
-        t.bg_colors[@intFromEnum(BgColor.user_message_bg)] = panel_bg; // kanso-muted: #0D1218
+        t.bg_colors[@intFromEnum(BgColor.user_message_bg)] = Color.rgb(0x15, 0x1B, 0x22);
         t.bg_colors[@intFromEnum(BgColor.custom_message_bg)] = Color.rgb(0x11, 0x18, 0x20);
         t.bg_colors[@intFromEnum(BgColor.tool_pending_bg)] = panel_bg;
         t.bg_colors[@intFromEnum(BgColor.tool_success_bg)] = Color.default; // no bg on success
@@ -211,9 +211,9 @@ test "dark theme fg and bg lookups" {
     // mdHeading = yellow #E6C384
     const heading = t.fg(.md_heading);
     try @import("std").testing.expectEqual(@as(u8, 0xE6), heading.r);
-    // userMessageBg = panelBg #0D1218 (kanso-muted)
+    // userMessageBg = #151B22 (kanso-muted midpoint — subtle but visible)
     const user_bg = t.bg(.user_message_bg);
-    try @import("std").testing.expectEqual(@as(u8, 0x0D), user_bg.r);
+    try @import("std").testing.expectEqual(@as(u8, 0x15), user_bg.r);
     // toolSuccessBg = default (no bg)
     try @import("std").testing.expect(t.bg(.tool_success_bg).is_default);
     // text = "" → Color.default
