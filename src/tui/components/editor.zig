@@ -54,6 +54,7 @@ pub const Editor = struct {
     autocomplete_list: SelectList = undefined,
     autocomplete_active: bool = false,
     autocomplete_prefix: []const u8 = "",
+    sink_ctx: AutocompleteSinkCtx = .{},
     theme: ?*const Theme = null,
 
     pub fn init(allocator: std.mem.Allocator) Editor {
@@ -119,10 +120,12 @@ pub const Editor = struct {
         const prov = self.autocomplete_provider orelse return;
 
         if (self.buf.items.len > 0 and self.buf.items[0] == '/') {
-            var sink_ctx = AutocompleteSinkCtx{ .editor = self };
+            // Sink context lives on Editor (not stack) so async providers
+            // can publish results after request() returns.
+            self.sink_ctx = .{ .editor = self };
             prov.request(
                 .{ .text = self.buf.items, .cursor_byte = self.cursor_byte },
-                .{ .ptr = @ptrCast(&sink_ctx), .publish_fn = &autocompleteSinkCallback },
+                .{ .ptr = @ptrCast(&self.sink_ctx), .publish_fn = &autocompleteSinkCallback },
             );
         } else if (self.autocomplete_active) {
             self.cancelAutocomplete();
@@ -130,7 +133,7 @@ pub const Editor = struct {
     }
 
     const AutocompleteSinkCtx = struct {
-        editor: *Editor,
+        editor: *Editor = undefined,
     };
 
     fn autocompleteSinkCallback(ptr: *anyopaque, suggestions: ?Suggestions) void {
@@ -151,28 +154,32 @@ pub const Editor = struct {
         self.cancelAutocomplete();
     }
 
-    fn acceptAutocomplete(self: *Editor) void {
-        const prov = self.autocomplete_provider orelse return;
-        const item = self.autocomplete_list.getSelectedItem() orelse return;
+    fn acceptAutocomplete(self: *Editor) bool {
+        const prov = self.autocomplete_provider orelse return false;
+        const item = self.autocomplete_list.getSelectedItem() orelse return false;
 
         const result = prov.apply(
             self.buf.items,
             self.cursor_byte,
             item,
             self.autocomplete_prefix,
-        ) orelse return;
+        ) orelse return false;
 
         self.buf.items.len = 0;
-        self.buf.appendSlice(self.allocator, result.new_text) catch return;
+        self.buf.appendSlice(self.allocator, result.new_text) catch return false;
         self.cursor_byte = result.new_cursor;
 
         const line_start = if (std.mem.lastIndexOfScalar(u8, self.buf.items[0..self.cursor_byte], '\n')) |pos| pos + 1 else 0;
         self.cursor_col = @intCast(grapheme_mod.strWidth(self.buf.items[line_start..self.cursor_byte]));
 
         self.cancelAutocomplete();
+        return true;
     }
 
     pub fn cancelAutocomplete(self: *Editor) void {
+        if (self.autocomplete_active) {
+            if (self.autocomplete_provider) |prov| prov.cancel();
+        }
         self.autocomplete_active = false;
         self.autocomplete_prefix = "";
     }
@@ -187,11 +194,15 @@ pub const Editor = struct {
             const result = self.autocomplete_list.processInput(key);
             switch (result) {
                 .selected => {
-                    self.acceptAutocomplete();
-                    if (key.code == .enter) {
-                        if (self.on_submit) |cb| {
-                            cb(self.buf.items, self.on_submit_ctx);
+                    if (self.acceptAutocomplete()) {
+                        // Apply succeeded — submit the completed command
+                        if (key.code == .enter) {
+                            if (self.on_submit) |cb| {
+                                cb(self.buf.items, self.on_submit_ctx);
+                            }
                         }
+                    } else {
+                        self.cancelAutocomplete();
                     }
                     return true;
                 },
