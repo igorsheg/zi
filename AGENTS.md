@@ -81,6 +81,77 @@ test types, in priority order:
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 
+## TUI Architecture
+
+zi's TUI is a reusable component framework, not ad-hoc rendering. understand these patterns before making changes.
+
+### Component model
+- `Component` (component.zig): vtable interface — `render(Region)`, `handleInput(Key) → bool`, `measure(width) → Measurement`, `cursorState() → ?CursorState`, `setFocused(bool)`. every visible element implements this.
+- `Container` (container.zig): vertical stack layout. one child can be `flex` (fills remaining space). one child is `focused` (receives input, provides cursor offset).
+- components are borrowed, not owned. containers don't manage lifetimes.
+
+### Layout tree
+Interactive (composition root) owns the tree:
+```
+root Container (flex=transcript)
+  [0] header_container
+  [1] transcript (flex child — fills remaining space)
+  [2] pending_container
+  [3] status_container
+  [4] widget_above_container
+  [5] editor_container (focused — cursor comes from here)
+  [6] widget_below_container
+  [7] footer
+```
+when the editor's autocomplete picker is active, `editor.measure()` grows → transcript shrinks → picker appears inline below the editor border. this is NOT an overlay — it's the container re-laying out.
+
+### Overlay system
+- `OverlayManager` (overlay.zig): z-ordered stack. overlays render on top of the root tree into the same cell buffer.
+- `TUI.showOverlay(component, options) → OverlayHandle`: pushes overlay, captures focus. `hideOverlay()` pops, restores focus.
+- `OverlayPresets` (overlay.zig): generic presets (`centerDialog`, `topToast`). app-specific presets live in interactive.zig (`bottomPanelOptions` — accounts for header/footer height).
+- input priority: when overlay is active, keys route to overlay first. Esc/Ctrl+C dismiss overlay before reaching app-level handlers.
+
+### Reusable picker infrastructure
+three composable pieces:
+1. **`SelectList`** (components/select_list.zig): dumb renderer/navigator. receives pre-filtered items, handles ↑↓/Enter/Esc, reports `InputResult { consumed, selected, cancelled, unhandled }`. NOT a Component — no vtable.
+2. **`ListPicker`** (components/list_picker.zig): wraps SelectList as a Component for overlay use. bordered box with title. opt-in fuzzy search input (`setSearchableItems`). owns query buffer + filtered scratch. reports cursor for search input.
+3. **`fuzzy.zig`**: pure algorithm — `fuzzyMatch(query, text) → {matches, score}`, `fuzzyFilter(query, texts, out_indices) → count`. deterministic sort (alphabetical tiebreaker). empty query returns alphabetical order.
+
+to build a new picker overlay:
+```zig
+var picker = ListPicker.init(self.theme);
+picker.setSearchableItems(items, null);  // null = search on .label
+picker.on_select = &callback;
+picker.callback_ctx = @ptrCast(self);
+self.handle = self.tui.showOverlay(picker.component(), self.bottomPanelOptions());
+```
+
+### Autocomplete (inline, not overlay)
+slash command autocomplete uses a different path — it's inline in the editor, not an overlay:
+- `AutocompleteProvider` (autocomplete.zig): vtable with `request(snapshot, sink)`, `cancel()`, `apply()`. `SuggestionSink` allows sync or async delivery.
+- `SlashCommandProvider`: reads from `CommandRegistry`, runs `fuzzyFilter`, publishes via sink synchronously.
+- editor owns the `SelectList` instance and renders it below the bottom border. `measure()` grows when active.
+- `autocomplete_prefix_len: u32` — stored as length, NOT a borrowed slice (buffer can reallocate).
+
+### Slash commands
+- `CommandRegistry` (slash_commands.zig): static builtins + dynamic list. `SlashCommand` has `CommandAction` tagged union (builtin/extension/prompt_template/skill).
+- dispatch in `interactive.zig`: `/quit`, `/clear`, `/resume` have real handlers. others fall through to `stubHandler` or action-based dispatch.
+- extension seam: `registry.register(SlashCommand{ .action = .{ .extension = ... } })` — no TUI changes needed.
+
+### Persistence
+all paths go through `storage.zig`:
+- `getAgentDir()` → `~/.zi/agent` (or `ZI_CODING_AGENT_DIR`)
+- `getProjectDir(cwd)` → `<cwd>/.zi`
+- `getSessionDirForCwd()` → `~/.zi/agent/sessions/<encoded-cwd>`
+- `SessionStore` (session/store.zig): facade over writer/reader/context. `create()`, `open()`, `findMostRecent()`, `listSessions()`, `buildContext()`, all 9 entry type appenders.
+
+### Key anti-patterns to avoid
+- do NOT make SelectList a Component — it returns InputResult, not bool. ListPicker is the adapter.
+- do NOT store borrowed slices into editor.buf across input events — use lengths/indices instead.
+- do NOT add overlay dismiss logic to individual components — the composition root handles it via input priority chain.
+- do NOT hardcode paths — use storage.zig helpers.
+- do NOT run `zig build test` — it times out. use `zig build` for compilation checks, `zig test src/file.zig` for standalone files.
+
 pi-mono is 5 products stacked:
 
 ```
