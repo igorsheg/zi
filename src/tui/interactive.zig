@@ -150,6 +150,7 @@ pub const Interactive = struct {
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
+    last_ctrl_c_ns: i128 = 0,
     tool_output_expanded: bool = false,
     /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
     input: input_buffer_mod.InputBuffer,
@@ -389,11 +390,29 @@ pub const Interactive = struct {
             return;
         }
 
+        // Ctrl+C: double-tap guard (pi-mono parity)
+        // First press: clear editor. Second press within 500ms: exit.
         if (key.code == .char and key.char != null and key.char.? == 'c' and key.ctrl) {
-            self.running = false;
+            if (self.is_streaming) {
+                self.ca.agent.abort();
+                self.status_text.setContent("aborted");
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+                return;
+            }
+            const now = std.time.nanoTimestamp();
+            const double_tap_ns: i128 = 500 * std.time.ns_per_ms;
+            if (now - self.last_ctrl_c_ns < double_tap_ns) {
+                self.running = false;
+                return;
+            }
+            self.active_editor.clear();
+            self.last_ctrl_c_ns = now;
+            self.tui.dirty = true;
             return;
         }
 
+        // Ctrl+D: exit only when editor is empty (pi-mono parity)
         if (key.code == .char and key.char != null and key.char.? == 'd' and key.ctrl) {
             if (self.active_editor.getText().len == 0) {
                 self.running = false;
