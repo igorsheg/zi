@@ -753,13 +753,20 @@ pub const Interactive = struct {
             return;
         }
 
-        // Build picker items from session metadata
+        // Build picker items: "first message preview" + "N msgs · relative time"
         const count = @min(sessions.len, self.session_picker_items.len);
         for (0..count) |i| {
+            // Format description: "N msgs · time ago"
+            var desc_buf: [64]u8 = undefined;
+            const desc = std.fmt.bufPrint(&desc_buf, "{d} msgs \xC2\xB7 {s}", .{
+                sessions[i].message_count,
+                formatRelativeTime(sessions[i].timestamp),
+            }) catch sessions[i].timestamp;
+
             self.session_picker_items[i] = .{
                 .value = sessions[i].session_id,
-                .label = sessions[i].timestamp,
-                .description = sessions[i].path,
+                .label = sessions[i].first_message,
+                .description = self.allocator.dupe(u8, desc) catch sessions[i].timestamp,
             };
             self.session_picker_paths[i] = sessions[i].path;
         }
@@ -850,6 +857,63 @@ pub const Interactive = struct {
             h.hide();
             self.session_picker_handle = null;
         }
+    }
+
+    /// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y"
+    fn formatRelativeTime(iso_ts: []const u8) []const u8 {
+        // Parse "YYYY-MM-DDThh:mm:ss" → epoch seconds
+        if (iso_ts.len < 19) return iso_ts;
+        const year = std.fmt.parseInt(i64, iso_ts[0..4], 10) catch return iso_ts;
+        const month = std.fmt.parseInt(u8, iso_ts[5..7], 10) catch return iso_ts;
+        const day = std.fmt.parseInt(u8, iso_ts[8..10], 10) catch return iso_ts;
+        const hour = std.fmt.parseInt(u8, iso_ts[11..13], 10) catch return iso_ts;
+        const min = std.fmt.parseInt(u8, iso_ts[14..16], 10) catch return iso_ts;
+        const sec = std.fmt.parseInt(u8, iso_ts[17..19], 10) catch return iso_ts;
+
+        // Rough epoch calculation (no leap second precision needed for "time ago")
+        const days_in_month = [_]u16{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+        if (month < 1 or month > 12) return iso_ts;
+        const year_days = (year - 1970) * 365 + @divTrunc(year - 1969, 4);
+        const month_days: i64 = days_in_month[month - 1];
+        const ts_epoch = (year_days + month_days + day - 1) * 86400 + @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
+
+        const now = std.time.timestamp();
+        const diff = now - ts_epoch;
+        if (diff < 0) return "now";
+
+        const diff_u: u64 = @intCast(diff);
+        if (diff_u < 60) return "now";
+        if (diff_u < 3600) {
+            const mins = diff_u / 60;
+            return switch (mins) {
+                1 => "1m",
+                2 => "2m",
+                3 => "3m",
+                5 => "5m",
+                10 => "10m",
+                15 => "15m",
+                30 => "30m",
+                else => if (mins < 5) "few min" else if (mins < 30) "<30m" else "<1h",
+            };
+        }
+        if (diff_u < 86400) {
+            const hours = diff_u / 3600;
+            return switch (hours) {
+                1 => "1h",
+                2 => "2h",
+                3 => "3h",
+                else => if (hours < 12) "<12h" else "<1d",
+            };
+        }
+        const days = diff_u / 86400;
+        if (days == 1) return "yesterday";
+        if (days < 7) return if (days == 2) "2d" else if (days < 4) "few days" else "<1w";
+        if (days < 30) return if (days < 14) "1w" else if (days < 21) "2w" else "3w";
+        if (days < 365) {
+            const months = days / 30;
+            return if (months <= 1) "1mo" else if (months <= 2) "2mo" else if (months <= 6) "<6mo" else "<1y";
+        }
+        return ">1y";
     }
 
     fn agentThreadFn(self: *Interactive, prompt_copy: []const u8) void {
