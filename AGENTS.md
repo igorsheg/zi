@@ -54,6 +54,64 @@ test types, in priority order:
 2. **boundary** - exercise the contract between two modules (e.g., session write → read → buildSessionContext round-trip).
 3. **behavior** - test what a module DOES, not how (e.g., "compaction keeps recent messages and produces summary" not "findCutPoint returns index 7").
 
+## Threading & Allocator Ownership
+
+zi runs two long-lived threads — **TUI** and **agent** — plus short-lived helpers (login, spawn children). Every resource has **exactly one owning thread for its entire lifetime**. No "usually X, sometimes Y with a mutex." Full rationale + phase history: `.zi/design-notes/threading-doctrine.md`. This section is the operational summary.
+
+### Owner table (frozen)
+
+| Resource | Owner | Notes |
+|---|---|---|
+| `lua_State`, `ExtensionRunner` | agent | bound explicitly at agent-thread start via `bindLuaOwnerThread`; `assertOnLuaThread` is fatal in safe builds |
+| `ca.session_store`, `ca.agent.state` (model, messages, thinking_level) | agent | TUI never mutates directly |
+| `tools`, `render_registry`, extension registries | agent | writes agent-only; TUI reads via published snapshots |
+| `transcript`, widgets, overlays, editor, components | TUI | render from snapshots, never call back into agent |
+| `pending_renders` map | shared via `pending_renders_mutex` | producer: agent; consumer: TUI paint (bounded critical section) |
+| `tui_arena` | TUI only | widget/layout scratch |
+| `agent_arena` | agent only | lua, session, tool exec scratch |
+| `msg_allocator` (thread-safe GPA) | shared | backing storage AND payloads for anything crossing threads |
+
+### Two channels, no third
+
+```
+   TUI thread                             agent thread
+   ──────────                             ────────────
+
+   request_queue.push(AgentRequest)  ──▶  drain → dispatch → publish result
+   (resume_session, set_model,            via event_queue
+    shutdown)
+
+   event_queue.drain() ──◀── push UiEvent (AgentEvent bridge, login thread,
+   apply to widgets, repaint              ext runner — all via msg_allocator)
+```
+
+`AgentRequest` variants live in `src/agent/request.zig`. Current set: `resume_session`, `set_model`, `shutdown`. Add new variants there when the TUI needs the agent to DO something.
+
+### Snapshot vs request (rule of thumb)
+
+- **Snapshot** — TUI needs to *read* data to render or filter. Agent publishes an immutable frozen value (pointer-swap under a mutex). Examples: `pending_renders` for transcript paint, `CommandSnapshot` for slash-command fuzzy filter. **Never** per-keystroke RPC into lua.
+- **Request** — TUI needs the agent to *mutate state, run code, or perform I/O*. Always an `AgentRequest` queue entry, never a direct call.
+
+### Allocator rule (doctrine R3)
+
+Anything crossing threads — **queue backing storage AND payloads** — must come from `msg_allocator`. If you migrate a queue, migrate `ArrayListUnmanaged.items`, key tables, payloads, and the consumer's free path. Half-migration reintroduces the arena race.
+
+### Adding a new cross-thread action
+
+1. Add a variant to `AgentRequest` in `src/agent/request.zig`; extend `deinit` to free any payload slices.
+2. On the TUI side, `dupe` payload slices into `self.msg_allocator`, then `self.request_queue.push(.{ .your_variant = ... })`.
+3. On the agent side, add a `handle*` method in `interactive.zig` that runs on the agent thread. Mutate agent-owned state directly. Publish results via `self.event_queue.push(.{ .your_event = ... })` with `msg_allocator`-cloned fields.
+4. On the TUI side, handle the resulting `UiEvent` in the event drain and update widgets.
+
+### Anti-patterns (will panic or race)
+
+- **Direct mutation from TUI**: `self.ca.agent.state.model = ...` from TUI code. Use `AgentRequest.set_model`.
+- **Lua from TUI**: calling anything that touches `lua_State` from the TUI thread. `assertOnLuaThread` is fatal in safe builds — this will crash.
+- **Arena sharing**: handing `tui_arena` or `agent_arena` to the other thread, or to a queue payload. Use `msg_allocator`.
+- **Borrowed payload slices**: passing a slice owned by the sender's arena through a queue. The receiver frees with `msg_allocator` — must be duped first.
+- **Reaching across for "just a read"**: e.g. reading `ca.session_store.writer.cwd` from TUI (this was zi-wub.26). Publish a snapshot at bind time or via event.
+- **Adding a mutex to defend against unclear ownership**: ask "am I encoding ownership or papering over its absence?" The latter belongs on a follow-up ticket, not in the hot path.
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
