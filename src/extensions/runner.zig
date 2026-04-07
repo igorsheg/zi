@@ -1,4 +1,5 @@
 const std = @import("std");
+const registries = @import("registries/root.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 /// 
@@ -95,50 +96,60 @@ pub const ExtensionRunner = struct {
     /// Runtime state — starts as stub, transitions to bound once.
     runtime: ExtensionRuntime,
 
-    // Placeholder fields for later phases — kept as comments to document
-    // the eventual shape without blocking D1 compilation:
+    /// Tool registry — maps tool name → ExtensionTool. First-
+    /// registered-wins; populated during load, consumed by
+    /// AgentSession to build the active tool list. Owns every
+    /// entry's strings and JSON schema for the runner generation.
+    tool_registry: registries.ToolRegistry,
+
+    /// Event registry — maps EventKind → ordered handler chain.
+    /// D2 stores subscriptions; D4 implements dispatch on top.
+    /// Handler `lua_ref` values are released when the Lua state is
+    /// closed during runner deinit, not per-entry here.
+    event_registry: registries.EventRegistry,
+
+    /// Command registry — slash commands. v1 leaves this empty
+    /// (commands are v2) but the slot exists so the bind seam
+    /// (`ExtensionRuntime.Bound.command_actions`) has a target.
+    command_registry: registries.CommandRegistry,
+
+    /// Provider queue — pending custom-provider registrations that
+    /// arrived during the pre-bind load phase. Drained by
+    /// `bindRuntime` (D7) into the AI provider registry. v1 leaves
+    /// this empty; v2 wires `zi.register_provider`.
+    provider_queue: registries.ProviderQueue,
+
+    // Future fields documented as comments so the runner shape is
+    // visible without compiling unused state:
     //
-    // /// Lua 5.4 state owned by this runner. All extensions for this generation
-    // /// share this state. Closed on deinit.
-    // lua_state: ?*anyopaque = null,  // D2/Phase B
-    //
-    // /// Tool registry — maps tool name → ExtensionTool (builtin or lua).
-    // /// First-registered-wins semantics. Populated during load, consumed
-    // /// by AgentSession to build the active tool list.
-    // tool_registry: ToolRegistry = .empty,  // D2
-    //
-    // /// Event registry — maps event type → list of handler references.
-    // /// Used by dispatch() to fan out events to subscribed extensions.
-    // event_registry: EventRegistry = .empty,  // D2
-    //
-    // /// Command registry — slash commands registered by extensions.
-    // /// v2 feature, but the registry slot exists for bind-time wiring.
-    // command_registry: CommandRegistry = .empty,  // D2
-    //
-    // /// Provider queue — registrations that arrived pre-bind are queued
-    // /// and flushed into ModelRegistry during bindRuntime().
-    // provider_queue: std.ArrayList(ProviderRegistration) = .empty,  // D2
-    //
-    // /// Flag values storage — populated by setFlagValue(), queried by
-    // /// extensions via zi.get_flag(). Persists for the generation lifetime.
-    // flag_values: std.StringHashMap(FlagValue) = .empty,  // D2+
+    //   lua_state: ?*lua_runtime.LuaState = null,        — D3
+    //   flag_values: std.StringHashMap(FlagValue) = .empty,  — v2
 
     pub fn init(allocator: std.mem.Allocator, generation: Generation) ExtensionRunner {
         return .{
             .allocator = allocator,
             .generation = generation,
             .runtime = .{ .stub = {} },
+            .tool_registry = registries.ToolRegistry.init(allocator),
+            .event_registry = registries.EventRegistry.init(allocator),
+            .command_registry = registries.CommandRegistry.init(allocator),
+            .provider_queue = registries.ProviderQueue.init(allocator),
         };
     }
 
     pub fn deinit(self: *ExtensionRunner) void {
-        // D1: nothing to free yet. Later phases add:
-        //   - close lua_state (lua_close)
-        //   - free all registry entries (tool, event, command)
-        //   - free handler refs (luaL_unref)
-        //   - free schema JSON values (std.json.Value deep copies)
-        //   - free tool ctx wrappers (owned by runner, referenced by AgentTool)
-        _ = self;
+        // Tear down in REVERSE construction order. The provider
+        // queue holds Lua registry refs that the lua_state (when
+        // we add it) will collect on close — destroying registries
+        // first then closing the state is correct because the refs
+        // are integers, not pointers, so order doesn't matter for
+        // memory safety. Order matters only when v2 adds tool ctx
+        // wrappers that hold zig pointers into runner state; D9
+        // will revisit this.
+        self.provider_queue.deinit();
+        self.command_registry.deinit();
+        self.event_registry.deinit();
+        self.tool_registry.deinit();
     }
 
     /// Swap the runtime from stub to bound. Idempotent guard: errors if
@@ -199,4 +210,48 @@ test "bindRuntime rejects double-bind" {
 
     const result = runner.bindRuntime(bound2);
     try std.testing.expectError(error.AlreadyBound, result);
+}
+
+test "ExtensionRunner owns four empty registries on init" {
+    const allocator = std.testing.allocator;
+    var runner = ExtensionRunner.init(allocator, 2);
+    defer runner.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), runner.tool_registry.count());
+    try std.testing.expectEqual(@as(usize, 0), runner.event_registry.count());
+    try std.testing.expectEqual(@as(usize, 0), runner.command_registry.count());
+    try std.testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
+}
+
+test "ExtensionRunner registries survive populated deinit" {
+    const allocator = std.testing.allocator;
+    var runner = ExtensionRunner.init(allocator, 3);
+    defer runner.deinit();
+
+    // Tool: ownership transferred to registry on accept.
+    const params = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    const accepted = try runner.tool_registry.register(.{
+        .name = try allocator.dupe(u8, "task"),
+        .label = try allocator.dupe(u8, "Task"),
+        .description = try allocator.dupe(u8, "spawn a sub-agent"),
+        .parameters = params,
+        .impl = .{ .lua = 7 },
+        .source = .{ .kind = "user", .id = "task.lua" },
+    });
+    try std.testing.expect(accepted);
+
+    // Event: pure append.
+    try runner.event_registry.subscribe(.tool_call, .{ .lua_ref = 8, .source_id = "task.lua" });
+
+    // Provider queue: pre-bind enqueue, never drained in this test.
+    try runner.provider_queue.enqueue(.{
+        .api = try allocator.dupe(u8, "anthropic-messages"),
+        .config_ref = 9,
+        .source = .{ .kind = "user", .id = "task.lua" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), runner.tool_registry.count());
+    try std.testing.expectEqual(@as(usize, 1), runner.event_registry.count());
+    try std.testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
+    // deinit (via defer) frees everything; testing.allocator catches leaks.
 }

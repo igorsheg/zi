@@ -11,4 +11,6 @@ test {
     _ = @import("slash_commands.zig");
     _ = @import("spawn/root.zig");
     _ = @import("extensions/lua_runtime.zig");
+    _ = @import("extensions/registries/root.zig");
+    _ = @import("extensions/runner.zig");
 }
