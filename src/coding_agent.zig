@@ -11,6 +11,7 @@ const lua_runtime = @import("extensions/lua_runtime.zig");
 const extension_api = @import("extensions/api.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const extension_loader = @import("extensions/loader.zig");
+const lua_tool_mod = @import("extensions/lua_tool.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -105,7 +106,7 @@ pub const AgentSession = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) AgentSession {
-        const tools = options.tools orelse blk: {
+        const builtin_tools = options.tools orelse blk: {
             const t = allocator.alloc(protocol.AgentTool, 1) catch break :blk @as([]const protocol.AgentTool, &.{});
             t[0] = bash_tool.makeTool();
             break :blk @as([]const protocol.AgentTool, t);
@@ -146,40 +147,11 @@ pub const AgentSession = struct {
             .ctx = @ptrCast(closure),
         };
 
-        const tool_name_slice: []const []const u8 = blk: {
-            const tn = allocator.alloc([]const u8, tools.len) catch break :blk &.{};
-            for (tools, 0..) |t, i| tn[i] = t.name;
-            break :blk tn;
-        };
-
-        const sys_prompt = blk: {
-            if (options.system_prompt) |custom| {
-                break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
-                    .custom_prompt = custom,
-                    .cwd = options.cwd,
-                    .context_files = options.context_files,
-                    .tool_names = tool_name_slice,
-                    .append_system_prompt = options.append_system_prompt,
-                }) catch custom;
-            }
-            break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
-                .cwd = options.cwd,
-                .tool_names = tool_name_slice,
-                .context_files = options.context_files,
-                .append_system_prompt = options.append_system_prompt,
-            }) catch "You are a helpful coding assistant.";
-        };
-
-        const get_api_key_hook: ?protocol.GetApiKeyHook = if (options.auth_storage) |as| .{
-            .func = &getApiKeyFromStorage,
-            .ctx = @ptrCast(@constCast(as)),
-        } else null;
-
-        // Construct the extension runtime FIRST (state + runner +
-        // discover + load) so the agent can be wired with extension
-        // tool-call hooks at construction time. The before/after
-        // hooks need a stable runner pointer; the runner itself is
-        // heap-allocated, so the closure-via-ctx pattern is safe.
+        // Construct the extension runtime BEFORE building the tools
+        // list so Lua-registered tools can join the agent's tool set.
+        // Failures here are non-fatal: ext_state/ext_runner stay null,
+        // builtin tools still flow through, agent runs without
+        // extensions. See docs/extensions.md § Bootstrap order.
         var ext_state: ?*lua_runtime.LuaState = null;
         var ext_runner: ?*ExtensionRunner = null;
         ext_setup: {
@@ -219,6 +191,62 @@ pub const AgentSession = struct {
                 );
             }
         }
+
+        // Merge builtin + Lua-registered tools. Each Lua tool wraps
+        // the registry entry's handler ref via `lua_tool.buildAgentTool`.
+        // Lifetime of the lua AgentTools is bounded by the runner
+        // generation — the borrowed strings (name/desc/parameters)
+        // are runner-owned and the per-tool LuaToolCtx is allocated
+        // from the session allocator.
+        const tools: []const protocol.AgentTool = if (ext_runner) |r| build_blk: {
+            const lua_count = r.tool_registry.count();
+            if (lua_count == 0) break :build_blk builtin_tools;
+            const merged = allocator.alloc(protocol.AgentTool, builtin_tools.len + lua_count) catch
+                break :build_blk builtin_tools;
+            @memcpy(merged[0..builtin_tools.len], builtin_tools);
+            var n: usize = builtin_tools.len;
+            for (r.tool_registry.items()) |entry| {
+                const at = lua_tool_mod.buildAgentTool(allocator, r, entry) catch |err| {
+                    std.log.scoped(.extensions).warn(
+                        "failed to build agent tool for {s}: {s}",
+                        .{ entry.name, @errorName(err) },
+                    );
+                    continue;
+                };
+                merged[n] = at;
+                n += 1;
+            }
+            break :build_blk merged[0..n];
+        } else builtin_tools;
+
+        const tool_name_slice: []const []const u8 = blk: {
+            const tn = allocator.alloc([]const u8, tools.len) catch break :blk &.{};
+            for (tools, 0..) |t, i| tn[i] = t.name;
+            break :blk tn;
+        };
+
+        const sys_prompt = blk: {
+            if (options.system_prompt) |custom| {
+                break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
+                    .custom_prompt = custom,
+                    .cwd = options.cwd,
+                    .context_files = options.context_files,
+                    .tool_names = tool_name_slice,
+                    .append_system_prompt = options.append_system_prompt,
+                }) catch custom;
+            }
+            break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
+                .cwd = options.cwd,
+                .tool_names = tool_name_slice,
+                .context_files = options.context_files,
+                .append_system_prompt = options.append_system_prompt,
+            }) catch "You are a helpful coding assistant.";
+        };
+
+        const get_api_key_hook: ?protocol.GetApiKeyHook = if (options.auth_storage) |as| .{
+            .func = &getApiKeyFromStorage,
+            .ctx = @ptrCast(@constCast(as)),
+        } else null;
 
         // Build hooks AFTER ext setup so we can use the runner ptr
         // as the hook ctx. Hooks are nil when no runner exists; the
