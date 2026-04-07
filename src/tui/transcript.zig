@@ -646,7 +646,8 @@ pub const Transcript = struct {
     /// stashed for this tool call and assign it to the
     /// ToolExecution. Pure data move — does not touch the Lua
     /// state, so this is safe to call from the TUI thread without
-    /// blocking on the runner's lua mutex.
+    /// reaching into `lua_state` (which the agent thread owns since
+    /// zi-wub.5/.6).
     ///
     /// The render itself is computed on the agent thread inside
     /// `lua_tool.precomputeRender`, which fires once on each

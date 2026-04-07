@@ -120,9 +120,9 @@ fn execute(
         return errorResult(allocator, @errorName(err));
     };
 
-    // Precompute the FINAL render now, while we still hold the
-    // lua mutex and the agent thread is the only one touching
-    // Lua. The TUI thread will pick this up via
+    // Precompute the FINAL render now, while we're still on the
+    // agent thread (single owner of `lua_state`). The TUI thread
+    // will pick this up via
     // `runner.takePendingRender(tool_call_id)` when it processes
     // `tool_execution_end`. Without this, the final tree wouldn't
     // appear until the next time something invalidated the cache.
@@ -134,8 +134,8 @@ fn execute(
 /// Run the Lua render hook for `tool_name` against `(args, result)`
 /// and stash the resulting `LuaRenderState` in the runner's
 /// cross-thread inbox keyed by `tool_call_id`. No-op if the tool
-/// has no render hook or the dispatch fails. Caller must hold
-/// the lua mutex.
+/// has no render hook or the dispatch fails. Caller must be on
+/// the agent thread (the lua_state owner).
 fn precomputeRender(
     runner: *runner_mod.ExtensionRunner,
     tool_name: []const u8,
@@ -421,11 +421,11 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
     // safely free everything.
     cb(partial, runner.current_update_ctx);
 
-    // Precompute the render NOW on this same thread (still inside
-    // the lua mutex) so the TUI can pick up the fresh tree without
-    // needing to touch Lua at all. The TUI thread reads from
-    // `runner.pending_renders` during `toolSetPartialResult` and
-    // never blocks on the lua mutex.
+    // Precompute the render NOW on this same thread (still on the
+    // agent thread, the sole lua_state owner) so the TUI can pick
+    // up the fresh tree without needing to touch Lua at all. The
+    // TUI thread reads from `runner.pending_renders` during
+    // `toolSetPartialResult` and never reaches into lua_state.
     if (runner.current_tool_call_id) |id| {
         if (runner.current_tool_name) |name| {
             // Pass our `L` (the currently executing thread) so the

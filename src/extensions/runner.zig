@@ -198,16 +198,17 @@ pub const ExtensionRunner = struct {
     /// `tool_call_id`.
     ///
     /// Why this exists: render hooks for Lua tools used to fire
-    /// from the TUI render path, which meant the TUI thread had
-    /// to acquire the runner's lua mutex. Long-running tools
-    /// (Task with a multi-second child process) hold that mutex
-    /// for their entire lifetime, freezing the TUI. Now the
-    /// agent thread (which is already inside Lua, already holding
-    /// the mutex, already has the partial result in hand) runs
-    /// the render hook itself and stashes the result here. The
-    /// TUI thread reads from this map under a small fast mutex
-    /// during `toolSetPartialResult` / `toolSetFinalResult`. No
-    /// Lua state access required from the TUI thread.
+    /// from the TUI render path. Back then a runner-level lua mutex
+    /// existed and the TUI thread had to acquire it on every paint;
+    /// long-running tools (Task with a multi-second child process)
+    /// would freeze the TUI for their entire lifetime. zi-wub.5/.6
+    /// removed the lua mutex entirely and made the agent thread the
+    /// single owner of `lua_state`. The agent thread (which is
+    /// already inside Lua and already has the partial result in
+    /// hand) now runs the render hook itself and stashes the result
+    /// here. The TUI thread reads from this map under a small fast
+    /// mutex during `toolSetPartialResult` / `toolSetFinalResult`.
+    /// No Lua state access required from the TUI thread.
     ///
     /// Pointers are `*anyopaque` to avoid a circular import on
     /// `lua_renderer.LuaRenderState`. Each entry carries a deinit
@@ -401,7 +402,9 @@ pub const ExtensionRunner = struct {
     /// Store a precomputed render for `tool_call_id`. Replaces any
     /// pending entry for the same id (the new render supersedes
     /// the old one) and frees the old state via its deinit fn.
-    /// Called from the agent thread under the lua mutex.
+    /// Called from the agent thread, which is the single owner of
+    /// `lua_state` (zi-wub.5/.6 — no lua mutex; ownership is enforced
+    /// by `bindLuaOwnerThread`).
     pub fn stashPendingRender(
         self: *ExtensionRunner,
         tool_call_id: []const u8,
