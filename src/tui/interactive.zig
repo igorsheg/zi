@@ -965,10 +965,15 @@ pub const Interactive = struct {
     // ── Session picker (/resume) ────────────────────────────────
 
     fn showSessionPicker(self: *Interactive) void {
-        // List sessions for current cwd
-        const cwd = self.ca.session_store.writer.cwd;
-        const effective_cwd = if (cwd.len > 0) cwd else self.editor.cwd;
-        const sessions = session_store_mod.listSessions(self.allocator, effective_cwd) catch {
+        // zi-wub.26: cwd lives on the TUI side (Interactive was
+        // constructed with it; editor.cwd is the canonical copy).
+        // Reading from ca.session_store.writer.cwd would reach into
+        // agent-owned state from the TUI thread, violating the
+        // doctrine. The session store path tracks the *current*
+        // session's cwd which in zi is always the process cwd
+        // (we don't support per-session cwd switching), so this is
+        // strictly equivalent.
+        const sessions = session_store_mod.listSessions(self.allocator, self.editor.cwd) catch {
             self.status_text.setContent("failed to list sessions");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
