@@ -381,10 +381,21 @@ pub const ExtensionRunner = struct {
         );
         const owner = prev orelse tid;
         if (owner != tid) {
-            // SOFT TRACE (zi-wub.3): log once per unique offending
-            // tid so phase 1 audit can enumerate distinct violators
-            // without one busy thread drowning the log. Removed by
-            // zi-wub.21 once phase 2 lands the explicit bind.
+            // zi-wub.7: hard fatal in debug/safe builds. Phase 2's
+            // explicit bind (zi-wub.5/.6) and phase 4's request-queue
+            // routing (.14-.17) plus the shutdown variant (.28) close
+            // every cross-thread touch we know about. Surviving
+            // wrong-thread access is a bug, not a soft warning.
+            // ReleaseFast/Small still no-op the assert path so prod
+            // does not pay the check.
+            if (std.debug.runtime_safety) {
+                std.debug.panic(
+                    "[zi-wub.7] lua_state touched from wrong thread: this={d} owner={d}",
+                    .{ tid, owner },
+                );
+            }
+            // Soft-trace fallback (kept until zi-wub.21 prunes the
+            // tracking fields entirely) for non-safety builds.
             self.lua_wrong_thread_mutex.lock();
             defer self.lua_wrong_thread_mutex.unlock();
             const seen_slice = self.lua_wrong_thread_seen[0..self.lua_wrong_thread_seen_count];
@@ -393,7 +404,7 @@ pub const ExtensionRunner = struct {
             self.lua_wrong_thread_seen[self.lua_wrong_thread_seen_count] = tid;
             self.lua_wrong_thread_seen_count += 1;
             std.log.warn(
-                "[zi-wub.3] lua_state touched from wrong thread: this={d} owner={d} (unique offender #{d})",
+                "[zi-wub.7] lua_state touched from wrong thread: this={d} owner={d} (unique offender #{d})",
                 .{ tid, owner, self.lua_wrong_thread_seen_count },
             );
         }
