@@ -38,6 +38,8 @@ const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
+const AgentRequest = agent_mod.AgentRequest;
+const RequestQueue = agent_mod.RequestQueue;
 const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
 const auth_storage_mod = @import("../auth/storage.zig");
@@ -179,6 +181,13 @@ pub const Interactive = struct {
     login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     event_queue: EventQueue(UiEvent),
+    /// TUI → agent mutation channel (zi-wub.14). TUI thread enqueues
+    /// AgentRequest values, the agent thread drains at turn boundary.
+    /// See `src/agent/request.zig` and the threading doctrine.
+    /// Consumers land in zi-wub.15 (/resume) and .16 (/model); .14
+    /// only introduces the channel, so the queue is wired but no one
+    /// pushes to it yet. Backed by `msg_allocator` per doctrine R3.
+    request_queue: RequestQueue,
     ca: *AgentSession,
     agent_thread: ?std.Thread = null,
     running: bool = true,
@@ -222,6 +231,7 @@ pub const Interactive = struct {
             .command_registry = CommandRegistry.init(allocator),
             .input = input_buffer_mod.InputBuffer.init(allocator),
             .event_queue = EventQueue(UiEvent).init(msg_allocator),
+            .request_queue = RequestQueue.init(msg_allocator),
             .ca = ca,
             .auth_storage = auth_storage,
         };
@@ -264,6 +274,10 @@ pub const Interactive = struct {
         self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
+        // Drain any leftover requests (no consumers in .14, but be
+        // defensive once .15+ start pushing). Agent thread is joined
+        // above, so this runs without contention.
+        self.request_queue.deinit();
         self.widget_below_container.deinit();
         self.editor_container.deinit();
         self.widget_above_container.deinit();
@@ -1318,9 +1332,45 @@ pub const Interactive = struct {
         const token = self.ca.agent.subscribe(&agentEventCallback, @ptrCast(self));
         defer self.ca.agent.unsubscribe(token);
 
+        // zi-wub.14: drain pending TUI→agent requests at the turn
+        // boundary, before issuing the stream. This is the "safe
+        // point" the doctrine specifies — we are on the agent thread,
+        // owner of lua_state and ca.agent.state, and not yet inside
+        // a stream. Mid-stream draining is explicitly out of scope
+        // (R5: no event loop in this epic).
+        self.processAgentRequests();
+
         self.ca.run(prompt_copy) catch {};
 
         self.event_queue.push(.{ .agent_finished = {} });
+    }
+
+    /// Drain the AgentRequest queue and dispatch each request on the
+    /// agent thread. zi-wub.14 introduces this as plumbing only —
+    /// no producers exist yet, so the switch arms are stubs that log
+    /// and free. zi-wub.15/.16 fill in /resume and /model dispatch.
+    ///
+    /// MUST run on the agent thread. The drain itself is a bounded
+    /// critical section under the queue mutex; dispatch happens
+    /// outside the lock so handlers can publish UiEvents back via
+    /// EventQueue without re-entering the request side.
+    fn processAgentRequests(self: *Interactive) void {
+        var buf: [16]AgentRequest = undefined;
+        while (true) {
+            const n = self.request_queue.drainInto(&buf);
+            if (n == 0) return;
+            for (buf[0..n]) |*req| {
+                switch (req.*) {
+                    .resume_session => {
+                        std.log.warn("zi-wub.14: resume_session request received but no consumer (zi-wub.15)", .{});
+                    },
+                    .set_model => {
+                        std.log.warn("zi-wub.14: set_model request received but no consumer (zi-wub.16)", .{});
+                    },
+                }
+                req.deinit(self.msg_allocator);
+            }
+        }
     }
 
     /// Agent event callback — runs on the AGENT THREAD.
