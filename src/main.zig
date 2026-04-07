@@ -21,18 +21,16 @@ pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
 
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena.deinit();
-    // The agent thread and the TUI thread both alloc/free against
-    // this allocator (event-queue clones, transcript partial-result
-    // clones, lua tool update fan-out, etc). ArenaAllocator is not
-    // thread-safe — concurrent allocs corrupt its internal state and
-    // later requests return misaligned pointers, panicking inside
-    // `allocBytesWithAlignment`. Wrap it in a mutex so multi-threaded
-    // callers are safe. Single-threaded paths pay one uncontended
-    // lock per alloc, which is negligible vs. the arena bump itself.
-    var ts_alloc: std.heap.ThreadSafeAllocator = .{ .child_allocator = arena.allocator() };
-    const allocator = ts_alloc.allocator();
+    // zi-wub.12: dedicated arena owned by the agent thread. Single
+    // owner during steady state — TUI thread only touches it during
+    // pre-spawn init (auth, settings, ca creation) and post-join
+    // deinit, never concurrently with the agent thread. Cross-thread
+    // payloads route through msg_allocator (zi-wub.9/.10) and the
+    // TUI thread allocates from its own tui_arena (zi-wub.11), so
+    // the ThreadSafeAllocator band-aid (.13) is no longer needed.
+    var agent_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer agent_arena.deinit();
+    const allocator = agent_arena.allocator();
 
     // zi-wub.8: dedicated thread-safe GPA for cross-thread message
     // payloads and queue backing storage (EventQueue, AgentRequest
