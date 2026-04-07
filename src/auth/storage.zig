@@ -4,6 +4,7 @@ const shared_storage = @import("../storage.zig");
 const types = @import("types.zig");
 const file_backend = @import("file_backend.zig");
 const resolve_config_value = @import("resolve_config_value.zig");
+const oauth_mod = @import("oauth.zig");
 
 const log = std.log.scoped(.auth_storage);
 
@@ -213,14 +214,17 @@ pub const AuthStorage = struct {
     /// Get API key for a provider. 5-tier priority:
     /// 1. Runtime override (CLI --api-key)
     /// 2. API key from auth.json (resolved via resolveConfigValue)
-    /// 3. OAuth token from auth.json (access token — NO auto-refresh in v1)
+    /// 3. OAuth token from auth.json — auto-refreshed under a backend
+    ///    lock when expired
     /// 4. Environment variable (via ai.env_api_keys.getEnvApiKey)
     /// 5. Fallback resolver
     ///
-    /// NOTE: OAuth auto-refresh with locking is deferred to v2.
-    /// For now, we return the stored access token as-is.
+    /// Mutates self when an OAuth token is refreshed: the new credential
+    /// is written into both `data` and the on-disk auth.json under the
+    /// existing backend lock. Receiver is non-const for that reason.
+    ///
     /// pi-mono source: auth-storage.ts:424-485
-    pub fn getApiKey(self: *const AuthStorage, provider: []const u8) ?[]const u8 {
+    pub fn getApiKey(self: *AuthStorage, provider: []const u8) ?[]const u8 {
         // 1. Runtime override
         if (self.runtime_overrides.get(provider)) |key| return key;
 
@@ -228,7 +232,23 @@ pub const AuthStorage = struct {
         if (self.data.get(provider)) |cred| {
             switch (cred) {
                 .api_key => |ak| return resolve_config_value.resolveConfigValue(ak.key),
-                .oauth => |oa| return oa.access,
+                .oauth => |oa| {
+                    // Fast path: token still valid. The 5-minute safety
+                    // buffer is baked into `expires` at refresh time
+                    // (oauth.zig: now + expires_in*1000 - 5*60*1000), so
+                    // any expired check here doesn't need its own slack.
+                    const now_ms = std.time.milliTimestamp();
+                    if (now_ms < oa.expires) return oa.access;
+
+                    // Slow path: refresh under lock. On failure, fall
+                    // through and let the rest of the priority chain
+                    // try (env var, fallback resolver) — the user can
+                    // /login to re-authenticate without losing the
+                    // stale credential, which is preserved on disk.
+                    if (self.refreshOAuthLocked(provider)) |refreshed| {
+                        return refreshed;
+                    }
+                },
             }
         }
 
@@ -241,6 +261,145 @@ pub const AuthStorage = struct {
         }
 
         return null;
+    }
+
+    /// Refresh an expired OAuth token under the backend lock. Returns
+    /// the new access token on success, null on failure (provider
+    /// unknown, network error, lock contention, persist failure).
+    ///
+    /// Race protection mirrors pi-mono auth-storage.ts:369-413: we
+    /// take the lock, reload from disk, and re-check expiry. If a
+    /// peer process refreshed in the lock-acquisition window, we use
+    /// their credential and skip the refresh exchange.
+    ///
+    /// On success the new credential is written to both in-memory
+    /// `data` and the on-disk file BEFORE releasing the lock so the
+    /// next reader sees a consistent view.
+    fn refreshOAuthLocked(self: *AuthStorage, provider: []const u8) ?[]const u8 {
+        const oauth_provider = oauth_mod.findProvider(provider) orelse {
+            log.warn("oauth refresh requested for unknown provider '{s}'", .{provider});
+            return null;
+        };
+
+        if (self.load_error) return null;
+        if (!self.backend.acquireLock()) {
+            log.warn("oauth refresh: failed to acquire backend lock for '{s}'", .{provider});
+            return null;
+        }
+        defer self.backend.releaseLock();
+
+        // Re-read from disk inside the lock — another process may
+        // have refreshed for us already. We use a scratch arena for
+        // the parsed file so we don't leak when discarding it.
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const fresh_content = self.backend.readContent(arena_alloc);
+        const fresh_data_opt: ?types.AuthStorageData = if (fresh_content) |c|
+            (types.parseAuthJson(arena_alloc, c) catch null)
+        else
+            null;
+
+        // Pick the credential to base the refresh on: prefer the
+        // re-read disk copy (most recent), fall back to the in-memory
+        // copy if the file is missing or corrupt.
+        var base_cred: types.OAuthCredential = undefined;
+        var base_from_disk = false;
+        if (fresh_data_opt) |fd| {
+            if (fd.get(provider)) |c| switch (c) {
+                .oauth => |oa| {
+                    base_cred = oa;
+                    base_from_disk = true;
+                },
+                else => {},
+            };
+        }
+        if (!base_from_disk) {
+            const c = self.data.get(provider) orelse return null;
+            base_cred = switch (c) {
+                .oauth => |oa| oa,
+                else => return null,
+            };
+        }
+
+        // Race-window check: did the disk copy already get refreshed
+        // by a peer? If so, install it in-memory and return.
+        const now_ms = std.time.milliTimestamp();
+        if (base_from_disk and now_ms < base_cred.expires) {
+            self.installRefreshedCredential(provider, base_cred) catch return null;
+            // Look up the just-installed credential — installRefreshedCredential
+            // dupes into self.allocator, so the slice we return is owned by
+            // self.data, not by the arena that's about to die.
+            return switch (self.data.get(provider) orelse return null) {
+                .oauth => |oa| oa.access,
+                else => null,
+            };
+        }
+
+        // Actually exchange. The refresh helper allocates the new
+        // credential strings with `self.allocator` so they survive
+        // arena teardown — we hand them straight to data + persist.
+        const exchange = oauth_provider.refresh_token(self.allocator, base_cred);
+        switch (exchange) {
+            .err => |msg| {
+                log.warn("oauth refresh failed for '{s}': {s}", .{ provider, msg });
+                return null;
+            },
+            .success => |new_cred| {
+                // installRefreshedCredential clones into self.allocator,
+                // so we always free the original `new_cred` (allocated
+                // by oauth_provider.refresh_token with self.allocator)
+                // after install regardless of outcome.
+                defer freeCredential(self.allocator, .{ .oauth = new_cred });
+                self.installRefreshedCredential(provider, new_cred) catch return null;
+                // Persist the new state to disk while still under lock.
+                self.persistInsideLock(arena_alloc) catch |e| {
+                    log.warn("oauth refresh persisted in-memory but disk write failed for '{s}': {s}", .{ provider, @errorName(e) });
+                };
+                return switch (self.data.get(provider) orelse return null) {
+                    .oauth => |oa| oa.access,
+                    else => null,
+                };
+            },
+        }
+    }
+
+    /// Install a refreshed OAuth credential into in-memory `data`,
+    /// freeing any previous entry for the same provider. The new
+    /// credential MUST already own its strings via `self.allocator`
+    /// (i.e. came from oauth.refresh_token or was deep-cloned from
+    /// arena memory before calling this).
+    fn installRefreshedCredential(
+        self: *AuthStorage,
+        provider: []const u8,
+        new_cred: types.OAuthCredential,
+    ) !void {
+        // Deep-clone via the existing helper so the entry is owned by
+        // self.allocator regardless of where `new_cred`'s strings came
+        // from (arena vs the success path's allocator). Caller is
+        // responsible for freeing the original on rollback.
+        const cloned = try dupeCredential(self.allocator, .{ .oauth = new_cred });
+        errdefer freeCredential(self.allocator, cloned);
+
+        const key_dup = try self.allocator.dupe(u8, provider);
+        errdefer self.allocator.free(key_dup);
+
+        if (self.data.fetchPut(key_dup, cloned) catch |e| {
+            return e;
+        }) |old| {
+            freeCredential(self.allocator, old.value);
+            self.allocator.free(old.key);
+        }
+    }
+
+    /// Write the current in-memory `data` to the backend. Caller
+    /// MUST already hold the backend lock — this skips the acquire
+    /// step that `persistProviderChange` does. Used by the refresh
+    /// path which needs the read+exchange+write to be atomic.
+    fn persistInsideLock(self: *AuthStorage, arena_alloc: std.mem.Allocator) !void {
+        const json = try types.serializeAuthJson(arena_alloc, &self.data);
+        try self.backend.writeContent(json);
     }
 
     /// Persist a provider change to the backend with locking.
