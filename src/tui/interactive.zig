@@ -257,7 +257,7 @@ pub const Interactive = struct {
         while (true) {
             const count = self.event_queue.drainInto(&drain_buf);
             if (count == 0) break;
-            for (drain_buf[0..count]) |*ev| ev.deinit(self.allocator);
+            for (drain_buf[0..count]) |*ev| ev.deinit(self.msg_allocator);
         }
         self.freeModelPickerSearchTexts();
         self.command_registry.deinit();
@@ -331,7 +331,7 @@ pub const Interactive = struct {
             const count = self.event_queue.drainInto(&event_buf);
             for (event_buf[0..count]) |*ev| {
                 self.handleUiEvent(ev);
-                ev.deinit(self.allocator);
+                ev.deinit(self.msg_allocator);
             }
 
             // 2. Poll terminal input (non-blocking: MIN=0, TIME=0)
@@ -1327,7 +1327,7 @@ pub const Interactive = struct {
     /// Deep-copies event data into a UiEvent before pushing to the queue.
     fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        const ui_event = convertAgentEvent(event, self.allocator) orelse return;
+        const ui_event = convertAgentEvent(event, self.msg_allocator) orelse return;
         self.event_queue.push(ui_event);
     }
 };
