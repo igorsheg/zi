@@ -175,26 +175,11 @@ pub const AgentSession = struct {
             .ctx = @ptrCast(@constCast(as)),
         } else null;
 
-        const a = Agent.init(allocator, .{
-            .initial_state = .{
-                .system_prompt = sys_prompt,
-                .model = options.model,
-                .tools = tools,
-                .messages = options.initial_messages,
-            },
-            .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
-            .stream_fn = stream_hook,
-            .session_id = if (options.session_store) |s| s.sessionId() else null,
-            .get_api_key = get_api_key_hook,
-        });
-
-        // Construct the extension runtime: heap-allocated LuaState +
-        // ExtensionRunner, install the `zi.*` global, attach state to
-        // runner. On any failure we log and leave both null — the agent
-        // remains fully functional, just without extensions. This
-        // matches the @panic-on-OOM convention used elsewhere in this
-        // function for true fatal allocs while keeping extension setup
-        // optional.
+        // Construct the extension runtime FIRST (state + runner +
+        // discover + load) so the agent can be wired with extension
+        // tool-call hooks at construction time. The before/after
+        // hooks need a stable runner pointer; the runner itself is
+        // heap-allocated, so the closure-via-ctx pattern is safe.
         var ext_state: ?*lua_runtime.LuaState = null;
         var ext_runner: ?*ExtensionRunner = null;
         ext_setup: {
@@ -214,10 +199,6 @@ pub const AgentSession = struct {
             ext_state = state_ptr;
             ext_runner = runner_ptr;
 
-            // Discover + execute .lua files from explicit > user >
-            // project paths. Every file runs as a flat script against
-            // the shared state; registrations land in the runner's
-            // registries. Per-extension errors are logged and skipped.
             const discovered: []extension_loader.LoadedExtension = extension_loader.discover(.{
                 .allocator = allocator,
                 .cwd = options.cwd,
@@ -238,6 +219,33 @@ pub const AgentSession = struct {
                 );
             }
         }
+
+        // Build hooks AFTER ext setup so we can use the runner ptr
+        // as the hook ctx. Hooks are nil when no runner exists; the
+        // agent loop already short-circuits null hooks.
+        const before_tool_hook: ?protocol.BeforeToolCallHook = if (ext_runner) |r| .{
+            .func = &event_bridge.beforeToolCall,
+            .ctx = @ptrCast(r),
+        } else null;
+        const after_tool_hook: ?protocol.AfterToolCallHook = if (ext_runner) |r| .{
+            .func = &event_bridge.afterToolCall,
+            .ctx = @ptrCast(r),
+        } else null;
+
+        const a = Agent.init(allocator, .{
+            .initial_state = .{
+                .system_prompt = sys_prompt,
+                .model = options.model,
+                .tools = tools,
+                .messages = options.initial_messages,
+            },
+            .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
+            .stream_fn = stream_hook,
+            .session_id = if (options.session_store) |s| s.sessionId() else null,
+            .get_api_key = get_api_key_hook,
+            .before_tool_call = before_tool_hook,
+            .after_tool_call = after_tool_hook,
+        });
 
         const self = AgentSession{
             .agent = a,

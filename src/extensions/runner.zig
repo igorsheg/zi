@@ -137,6 +137,27 @@ pub const ExtensionRunner = struct {
     /// instances stay valid (they just can't dispatch).
     lua_state: ?*lua_runtime.LuaState = null,
 
+    /// Scratch arena for hook return values that the agent loop must
+    /// hold across a tool-call iteration. The agent's hook signatures
+    /// take no allocator, so the bridge needs a place to put owned
+    /// JSON values, content-block strings, and reason strings that
+    /// outlive the dispatch call but don't need to outlive the runner
+    /// generation.
+    ///
+    /// Lifetime: arena lives for the entire runner generation
+    /// (one session in v1 — reload destroys the runner). Allocations
+    /// pile up; for typical sessions (~thousands of tool calls,
+    /// hook results sized in hundreds of bytes) the working set is
+    /// well under a MiB. v2 will revisit if compaction-heavy or
+    /// long-running sessions stress this.
+    ///
+    /// Why not use the agent's loop arena: hooks fire from inside
+    /// the loop body but pi-mono's hook ABI doesn't pass the loop
+    /// allocator through, and bolting one on would mean changing
+    /// every embedder's hook signature. The runner-owned scratch is
+    /// the smallest seam.
+    hook_arena: std.heap.ArenaAllocator,
+
     // Future fields documented as comments so the runner shape is
     // visible without compiling unused state:
     //
@@ -151,7 +172,15 @@ pub const ExtensionRunner = struct {
             .event_registry = registries.EventRegistry.init(allocator),
             .command_registry = registries.CommandRegistry.init(allocator),
             .provider_queue = registries.ProviderQueue.init(allocator),
+            .hook_arena = std.heap.ArenaAllocator.init(allocator),
         };
+    }
+
+    /// Allocator backed by the hook scratch arena. Bridge code calls
+    /// this when it needs to produce memory that survives until the
+    /// runner is destroyed.
+    pub fn hookAllocator(self: *ExtensionRunner) std.mem.Allocator {
+        return self.hook_arena.allocator();
     }
 
     /// Attach a borrowed Lua state. Called by the SDK factory once
@@ -176,6 +205,7 @@ pub const ExtensionRunner = struct {
         self.command_registry.deinit();
         self.event_registry.deinit();
         self.tool_registry.deinit();
+        self.hook_arena.deinit();
     }
 
     /// Swap the runtime from stub to bound. Idempotent guard: errors if
