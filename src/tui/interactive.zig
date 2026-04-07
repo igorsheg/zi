@@ -54,7 +54,7 @@ const Component = component_mod.Component;
 const CursorState = component_mod.CursorState;
 const UiEvent = ui_event_mod.UiEvent;
 const Transcript = transcript_mod.Transcript;
-const ToolRendererRegistry = tool_display_mod.ToolRendererRegistry;
+const ToolRendererResolver = tool_display_mod.ToolRendererResolver;
 const Loader = loader_mod.Loader;
 const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
@@ -129,7 +129,7 @@ pub const Interactive = struct {
     header: header_mod.Header,
     footer: footer_mod.Footer,
     transcript: Transcript,
-    registry: ToolRendererRegistry,
+    resolver: ToolRendererResolver,
     status_data: StatusData,
     loader: Loader = .{},
     loader_active: bool = false,
@@ -186,7 +186,7 @@ pub const Interactive = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         ca: *AgentSession,
-        registry: ToolRendererRegistry,
+        resolver: ToolRendererResolver,
         cwd: []const u8,
         auth_storage: *auth_storage_mod.AuthStorage,
     ) !Interactive {
@@ -201,7 +201,7 @@ pub const Interactive = struct {
             .header = .{ .theme = theme, .version = "0.1.0" },
             .footer = .{ .theme = theme },
             .transcript = Transcript.init(allocator),
-            .registry = registry,
+            .resolver = resolver,
             .status_data = StatusData.init(allocator),
             .header_container = container_mod.Container.init(allocator),
             .pending_container = container_mod.Container.init(allocator),
@@ -215,6 +215,12 @@ pub const Interactive = struct {
             .ca = ca,
             .auth_storage = auth_storage,
         };
+        // Wire the extension runner into the transcript so
+        // tool_execution_end can dispatch Lua render_result hooks
+        // for tools that registered one. Null in tests or
+        // extensionless modes; the transcript no-ops gracefully.
+        self.transcript.lua_runner = ca.extensionRunner();
+
         self.editor.prompt_fg = theme.fg(.muted);
         self.editor.border_color = theme.fg(.border_muted);
         self.loader.spinner_fg = theme.fg(.accent);
@@ -556,7 +562,7 @@ pub const Interactive = struct {
             },
             .message_start_user => {},
             .tool_call_streaming => |t| {
-                const renderer = self.registry.get(t.tool_name);
+                const renderer = self.resolver.resolve(t.tool_name);
                 self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
                 self.transcript.toolSetArgs(t.tool_call_id, t.args);
                 self.transcript.toolSetArgsComplete(t.tool_call_id);
@@ -575,7 +581,7 @@ pub const Interactive = struct {
                 }
             },
             .tool_start => |t| {
-                const renderer = self.registry.get(t.tool_name);
+                const renderer = self.resolver.resolve(t.tool_name);
                 self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
                 self.transcript.toolSetArgs(t.tool_call_id, t.args);
                 self.transcript.toolMarkExecutionStarted(t.tool_call_id);

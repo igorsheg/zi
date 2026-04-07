@@ -60,6 +60,10 @@ pub fn handleAgentEvent(
 ) !void {
     const state = runner.lua_state orelse return error.NoState;
 
+    // Single-thread contract: agent thread owns lua_state. See
+    // `runner.zig` `lua_owner_thread` for the architecture.
+    runner.assertOnLuaThread();
+
     // Each branch:
     //   1. Pushes a payload table onto the main stack (via the
     //      pushPayloadFor* helper).
@@ -291,6 +295,8 @@ fn beforeToolCallImpl(
     const state = runner.lua_state orelse return null;
     if (runner.event_registry.handlers(.tool_call).len == 0) return null;
 
+    runner.assertOnLuaThread();
+
     try pushToolCallPayload(state.L, ctx_arg.tool_call, ctx_arg.args);
     defer c.lua_pop(state.L, 1);
 
@@ -348,6 +354,8 @@ fn afterToolCallImpl(
 ) !?agent_protocol.AfterToolCallResult {
     const state = runner.lua_state orelse return null;
     if (runner.event_registry.handlers(.tool_result).len == 0) return null;
+
+    runner.assertOnLuaThread();
 
     try pushToolResultPayload(state.L, ctx_arg.tool_call, ctx_arg.result);
     defer c.lua_pop(state.L, 1);

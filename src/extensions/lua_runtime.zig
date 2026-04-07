@@ -189,6 +189,39 @@ pub const LuaState = struct {
         c.lua_pushlightuserdata(self.L, ud);
         c.lua_pushcclosure(self.L, func, 1);
     }
+
+    /// Configure Lua's `package.path` so extensions can
+    /// `require("lib/foo")` relative to their extension dir.
+    ///
+    /// Builds the canonical `<dir>/?.lua;<dir>/?/init.lua` pair for
+    /// each search directory. Empty string entries are skipped.
+    /// Silently tolerates allocation failure (package.path stays at
+    /// the Lua default — extensions that use `require` will just
+    /// fail to find modules, which is caught by the loader's
+    /// per-extension error handling).
+    ///
+    /// Why not use the agent dir's `lib/` directly: matching
+    /// pi-mono's convention, each extension is self-contained and
+    /// its `lib/` is a subdirectory of the extension dir. A tool
+    /// in `.zi/extensions/task.lua` can `require("lib/render")`
+    /// and Lua resolves that to `.zi/extensions/lib/render.lua`.
+    pub fn setPackagePath(self: *LuaState, dirs: []const []const u8) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        for (dirs) |d| {
+            if (d.len == 0) continue;
+            if (buf.items.len > 0) try buf.append(self.allocator, ';');
+            try buf.writer(self.allocator).print("{s}/?.lua;{s}/?/init.lua", .{ d, d });
+        }
+        if (buf.items.len == 0) return;
+
+        // package.path = <buf>
+        _ = c.lua_getglobal(self.L, "package");
+        defer c.lua_pop(self.L, 1);
+        if (c.lua_type(self.L, -1) != c.LUA_TTABLE) return;
+        _ = c.lua_pushlstring(self.L, buf.items.ptr, buf.items.len);
+        c.lua_setfield(self.L, -2, "path");
+    }
 };
 
 // =============================================================================
@@ -429,10 +462,24 @@ pub const Coroutine = struct {
     /// expected to push a function (and any initial args) before the
     /// first `resume`.
     pub fn init(parent: *LuaState) LuaError!Coroutine {
-        const L = c.lua_newthread(parent.L) orelse return error.OutOfMemory;
-        // The new thread sits on top of the parent stack. Pop it into
+        return initFrom(parent, parent.L);
+    }
+
+    /// Like `init`, but allocates the new thread off `from_L` instead
+    /// of `parent.L`. Use this when you're called from inside a host
+    /// C function that's running on a coroutine — Lua API calls must
+    /// happen on the *currently executing* thread, not on the main
+    /// state, otherwise `lua_newthread` pushes onto a non-current
+    /// stack and the next `lua_resume` corrupts state.
+    ///
+    /// `parent` is still kept around so `deinit` has a known-alive
+    /// state to call `luaL_unref` on (the registry is global to the
+    /// shared global_State, so any thread works).
+    pub fn initFrom(parent: *LuaState, from_L: *c.lua_State) LuaError!Coroutine {
+        const L = c.lua_newthread(from_L) orelse return error.OutOfMemory;
+        // The new thread sits on top of `from_L`'s stack. Pop it into
         // the registry so it stays alive across `resume` calls.
-        const ref = c.luaL_ref(parent.L, c.LUA_REGISTRYINDEX);
+        const ref = c.luaL_ref(from_L, c.LUA_REGISTRYINDEX);
         if (ref == c.LUA_REFNIL or ref == c.LUA_NOREF) return error.InvalidCoroutineState;
         return .{ .parent = parent, .ref = ref, .L = L };
     }

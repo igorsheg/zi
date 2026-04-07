@@ -10,6 +10,8 @@ const AgentToolResult = agent_protocol.AgentToolResult;
 const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
 const word_wrap_mod = @import("word_wrap.zig");
+const lua_renderer_mod = @import("../extensions/lua_renderer.zig");
+const runner_mod = @import("../extensions/runner.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -76,15 +78,32 @@ pub const ToolExecution = struct {
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
 
+    /// Optional pre-computed span tree from a Lua render_result hook.
+    /// When present, `renderResult` paints from these spans instead
+    /// of the zig-native vtable or the text fallback. Computed by
+    /// `Transcript.lua_renderer_ctx` dispatch at
+    /// `setFinalResult`/`setPartialResult`/`setArgs` time.
+    lua_render_state: ?*lua_renderer_mod.LuaRenderState = null,
+
     pub fn deinit(self: *ToolExecution) void {
         if (self.renderer.deinit_state) |deinit_fn| {
             if (self.renderer_state) |state| deinit_fn(state, self.allocator);
         }
+        if (self.lua_render_state) |s| s.deinit(self.allocator);
         if (self.result) |r| r.free(self.allocator);
         json_util.freeJsonValue(self.allocator, self.args);
         self.allocator.free(self.tool_name);
         self.allocator.free(self.tool_call_id);
         self.allocator.destroy(self);
+    }
+
+    /// Clear the cached lua render state. Called from any mutator
+    /// that invalidates what the hook would have produced.
+    fn invalidateLuaRender(self: *ToolExecution) void {
+        if (self.lua_render_state) |s| {
+            s.deinit(self.allocator);
+            self.lua_render_state = null;
+        }
     }
 
     fn deinitItem(ctx: *anyopaque, _: std.mem.Allocator) void {
@@ -96,6 +115,7 @@ pub const ToolExecution = struct {
     pub fn setArgs(self: *ToolExecution, args: std.json.Value) void {
         json_util.freeJsonValue(self.allocator, self.args);
         self.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
+        self.invalidateLuaRender();
     }
 
     /// Mark that execution has started (tool_start received).
@@ -114,6 +134,7 @@ pub const ToolExecution = struct {
         self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
         self.is_error = is_error;
         self.is_partial = true;
+        self.invalidateLuaRender();
     }
 
     /// Set final result (from tool_end). Deep-clones.
@@ -122,6 +143,7 @@ pub const ToolExecution = struct {
         self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
         self.is_error = is_error;
         self.is_partial = false;
+        self.invalidateLuaRender();
     }
 
     // ── Rendering ─────────────────────────────────────────────────
@@ -179,6 +201,17 @@ pub const ToolExecution = struct {
     }
 
     fn renderCall(self: *ToolExecution, region: Region) void {
+        // When a Lua render hook owns this tool, `lines[0]` of the
+        // precomputed spans is the title line (e.g. "Task <desc>").
+        // Paint it here instead of the default bold-toolname
+        // fallback so we don't double up.
+        if (self.lua_render_state) |s| {
+            const lines = if (self.expanded) s.expanded else s.collapsed;
+            if (lines.len > 0) {
+                self.renderSpanLine(region, 0, lines[0]);
+                return;
+            }
+        }
         if (self.renderer.render_call) |render_fn| {
             var ctx = self.makeRenderContext(region);
             render_fn(&ctx);
@@ -192,11 +225,56 @@ pub const ToolExecution = struct {
     }
 
     fn renderResult(self: *ToolExecution, region: Region) void {
+        if (self.lua_render_state) |s| {
+            // lines[0] was painted in renderCall; the rest goes
+            // here. When there are no extra lines (tool with
+            // only a title), the result region stays blank.
+            const lines = if (self.expanded) s.expanded else s.collapsed;
+            if (lines.len > 1) {
+                self.renderSpanLines(region, lines[1..]);
+            }
+            return;
+        }
         if (self.renderer.render_result) |render_fn| {
             var ctx = self.makeRenderContext(region);
             render_fn(&ctx);
         } else {
             self.renderResultFallback(region);
+        }
+    }
+
+    /// Paint a single span-line at `row` inside `region`. Used for
+    /// both the call row (1 line) and individual result rows.
+    fn renderSpanLine(self: *ToolExecution, region: Region, row: u32, line: lua_renderer_mod.Line) void {
+        if (row >= region.height) return;
+        var col: u32 = 0;
+        for (line) |span| {
+            if (col >= region.width) break;
+            const fg = if (span.fg) |role| self.theme.fg(role) else Color.default;
+            const bg = if (span.bg) |role| self.theme.bg(role) else Color.default;
+            const attrs = cell_mod.Attributes{
+                .bold = span.bold,
+                .dim = span.dim,
+                .italic = span.italic,
+                .underline = span.underline,
+            };
+            const written = region.writeStr(col, row, span.text, fg, bg, attrs);
+            col += written;
+        }
+    }
+
+    /// Paint pre-computed styled lines into the region. Used by
+    /// Lua renderers; strings and roles are arena-owned by
+    /// `lua_render_state`. Each span resolves its theme role to
+    /// concrete colors at paint time so theme swaps work without
+    /// re-dispatching the Lua hook.
+    fn renderSpanLines(self: *ToolExecution, region: Region, lines: []const lua_renderer_mod.Line) void {
+        const max_h = region.height;
+        var row: u32 = 0;
+        for (lines) |line| {
+            if (row >= max_h) break;
+            self.renderSpanLine(region, row, line);
+            row += 1;
         }
     }
 
@@ -228,6 +306,12 @@ pub const ToolExecution = struct {
     }
 
     fn measureResult(self: *ToolExecution, width: u32) u32 {
+        if (self.lua_render_state) |s| {
+            // lines[0] is painted in the call row; the rest is
+            // the result region's height.
+            const lines = if (self.expanded) s.expanded else s.collapsed;
+            return if (lines.len > 0) @intCast(lines.len - 1) else 0;
+        }
         if (self.renderer.measure_result) |measure_fn| {
             var ctx = self.makeMeasureContext(width);
             return measure_fn(&ctx);
@@ -359,6 +443,12 @@ pub const Transcript = struct {
     scroll_offset: u32 = 0,
     /// Cached from last render() call, used by clampScroll().
     last_render_width: u32 = 80,
+
+    /// Optional runner pointer used to dispatch Lua `render_result`
+    /// hooks at tool_execution_end time. When null (tests, headless
+    /// modes, no-extensions build), Lua renderers are never invoked
+    /// and the transcript falls back to its default formatting.
+    lua_runner: ?*runner_mod.ExtensionRunner = null,
 
     pub fn init(allocator: std.mem.Allocator) Transcript {
         return .{ .allocator = allocator };
@@ -535,6 +625,10 @@ pub const Transcript = struct {
     pub fn toolSetPartialResult(self: *Transcript, tool_call_id: []const u8, result: ?AgentToolResult, is_error: bool) void {
         const te = self.getToolExecution(tool_call_id) orelse return;
         te.setPartialResult(result, is_error);
+        // Re-dispatch the render hook so the tree view reflects
+        // the new partial state. Tools without a render hook
+        // no-op gracefully.
+        self.refreshLuaRender(te);
     }
 
     /// Set final result on a tool execution and remove from pending.
@@ -542,6 +636,28 @@ pub const Transcript = struct {
         const te = self.getToolExecution(tool_call_id) orelse return;
         te.setFinalResult(result, is_error);
         _ = self.pending_tools.remove(tool_call_id);
+        // Kick off the Lua render_result hook (if any) now that we
+        // have a final result in hand. `refreshLuaRender` is a
+        // no-op for tools without a registered render hook.
+        self.refreshLuaRender(te);
+    }
+
+    /// Pick up any precomputed render that the agent thread
+    /// stashed for this tool call and assign it to the
+    /// ToolExecution. Pure data move — does not touch the Lua
+    /// state, so this is safe to call from the TUI thread without
+    /// blocking on the runner's lua mutex.
+    ///
+    /// The render itself is computed on the agent thread inside
+    /// `lua_tool.precomputeRender`, which fires once on each
+    /// `ctx.update(...)` call and once on tool completion. See
+    /// `runner.zig` `pending_renders` for the cross-thread inbox
+    /// rationale.
+    fn refreshLuaRender(self: *Transcript, te: *ToolExecution) void {
+        const runner = self.lua_runner orelse return;
+        const pending = runner.takePendingRender(te.tool_call_id) orelse return;
+        te.invalidateLuaRender();
+        te.lua_render_state = @ptrCast(@alignCast(pending.state));
     }
 
     /// Toggle expansion state on all tool executions.

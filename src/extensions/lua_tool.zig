@@ -27,6 +27,7 @@ const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const agent_protocol = @import("../agent/protocol.zig");
 const abort_signal_mod = @import("../abort_signal.zig");
+const lua_renderer = @import("lua_renderer.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_tool);
@@ -34,11 +35,15 @@ const log = std.log.scoped(.zi_lua_tool);
 const AgentToolResult = agent_protocol.AgentToolResult;
 
 /// Per-tool execution context. The `AgentTool.ctx` slot is one
-/// pointer; we use it to find both the runner (for the lua_state)
-/// and the handler ref (the registry entry's `lua_ref`).
+/// pointer; we use it to find the runner (for the lua_state),
+/// the handler ref, and the tool name (for routing render-hook
+/// dispatch back through `runner.tool_registry`).
 pub const LuaToolCtx = struct {
     runner: *runner_mod.ExtensionRunner,
     lua_ref: c_int,
+    /// Borrowed from `ExtensionTool.name` in the runner's tool
+    /// registry. Lifetime matches the runner generation.
+    name: []const u8,
 };
 
 /// Build an `AgentTool` from a registered ExtensionTool.
@@ -59,7 +64,7 @@ pub fn buildAgentTool(
         .builtin => return error.NotALuaTool,
     };
     const ctx = try allocator.create(LuaToolCtx);
-    ctx.* = .{ .runner = runner, .lua_ref = lua_ref };
+    ctx.* = .{ .runner = runner, .lua_ref = lua_ref, .name = ext_tool.name };
 
     return .{
         .name = ext_tool.name,
@@ -84,25 +89,101 @@ fn execute(
     on_update: ?agent_protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) AgentToolResult {
-    _ = tool_call_id;
-    _ = signal;
-    _ = on_update;
-    _ = update_ctx;
-
     const tctx: *LuaToolCtx = @ptrCast(@alignCast(ctx.?));
     const state = tctx.runner.lua_state orelse {
         return errorResult(allocator, "lua state not attached");
     };
 
-    return runHandler(allocator, state, tctx.lua_ref, args) catch |err| {
+    // Single-thread contract: only the agent thread should ever
+    // call into Lua. Panics if violated. See `runner.zig`
+    // `lua_owner_thread` doc for the rationale.
+    tctx.runner.assertOnLuaThread();
+
+    // Stash per-call state so host functions invoked from inside
+    // the Lua handler can forward abort, partial updates, and
+    // precomputed renders for the right tool. Cleared on return.
+    tctx.runner.current_signal = signal;
+    tctx.runner.current_update_callback = on_update;
+    tctx.runner.current_update_ctx = update_ctx;
+    tctx.runner.current_tool_call_id = tool_call_id;
+    tctx.runner.current_tool_name = tctx.name;
+    defer {
+        tctx.runner.current_signal = null;
+        tctx.runner.current_update_callback = null;
+        tctx.runner.current_update_ctx = null;
+        tctx.runner.current_tool_call_id = null;
+        tctx.runner.current_tool_name = null;
+    }
+
+    const result = runHandler(allocator, state, tctx.runner, tctx.lua_ref, args) catch |err| {
         log.warn("lua tool execution failed: {s}", .{@errorName(err)});
         return errorResult(allocator, @errorName(err));
     };
+
+    // Precompute the FINAL render now, while we still hold the
+    // lua mutex and the agent thread is the only one touching
+    // Lua. The TUI thread will pick this up via
+    // `runner.takePendingRender(tool_call_id)` when it processes
+    // `tool_execution_end`. Without this, the final tree wouldn't
+    // appear until the next time something invalidated the cache.
+    precomputeRender(tctx.runner, tctx.name, tool_call_id, args, result);
+
+    return result;
+}
+
+/// Run the Lua render hook for `tool_name` against `(args, result)`
+/// and stash the resulting `LuaRenderState` in the runner's
+/// cross-thread inbox keyed by `tool_call_id`. No-op if the tool
+/// has no render hook or the dispatch fails. Caller must hold
+/// the lua mutex.
+fn precomputeRender(
+    runner: *runner_mod.ExtensionRunner,
+    tool_name: []const u8,
+    tool_call_id: []const u8,
+    args: std.json.Value,
+    result: AgentToolResult,
+) void {
+    precomputeRenderOn(runner, tool_name, tool_call_id, args, result, null);
+}
+
+/// Same as `precomputeRender`, but `current_L` lets the caller pin
+/// the *currently running* lua_State. Required when called from a
+/// host C function that's executing on a coroutine (e.g. ctx.update
+/// fired from inside zi.spawn's event trampoline).
+fn precomputeRenderOn(
+    runner: *runner_mod.ExtensionRunner,
+    tool_name: []const u8,
+    tool_call_id: []const u8,
+    args: std.json.Value,
+    result: AgentToolResult,
+    current_L: ?*c.lua_State,
+) void {
+    const tool = runner.tool_registry.get(tool_name) orelse return;
+    if (tool.render_result_ref == null) return;
+
+    const state = lua_renderer.dispatchRenderResultFromResultOn(
+        runner.allocator,
+        runner,
+        .{
+            .tool_name = tool_name,
+            .args = args,
+            .result = result,
+            .width = 80, // TODO: thread real width through; spans are width-agnostic anyway
+            .is_error = result.is_error,
+        },
+        current_L,
+    ) orelse return;
+
+    runner.stashPendingRender(tool_call_id, .{
+        .state = @ptrCast(state),
+        .deinit = &lua_renderer.LuaRenderState.deinitOpaque,
+    });
 }
 
 fn runHandler(
     allocator: std.mem.Allocator,
     state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
     handler_ref: c_int,
     args: std.json.Value,
 ) !AgentToolResult {
@@ -116,10 +197,21 @@ fn runHandler(
         return error.HandlerNotAFunction;
     }
 
-    // Push args as the single argument.
+    // arg 1: tool args
     try lua_runtime.pushJsonValue(co.L, args);
 
-    const r = try co.resumeWith(1);
+    // arg 2: ctx table.
+    //   - update(partial) → C closure that forwards through the
+    //     update callback stashed on the runner
+    //   - cwd → parent agent's working directory
+    c.lua_createtable(co.L, 0, 2);
+    c.lua_pushlightuserdata(co.L, runner);
+    c.lua_pushcclosure(co.L, &luaToolUpdate, 1);
+    c.lua_setfield(co.L, -2, "update");
+    _ = c.lua_pushlstring(co.L, runner.cwd.ptr, runner.cwd.len);
+    c.lua_setfield(co.L, -2, "cwd");
+
+    const r = try co.resumeWith(2);
     switch (r.status) {
         .yielded => return error.UnexpectedYield,
         .ok, .finished => {},
@@ -154,6 +246,18 @@ fn parseReturn(
         const is_error = c.lua_toboolean(L, -1) != 0;
         c.lua_pop(L, 1);
 
+        // Read `details` (optional, deep-cloned via
+        // luaValueToJson). Tools like Task put their tree state
+        // here so render hooks can draw a rich display. Without
+        // this extraction the final render would see empty
+        // details and collapse to just the header row.
+        var details: std.json.Value = .null;
+        _ = c.lua_getfield(L, idx, "details");
+        if (c.lua_type(L, -1) != c.LUA_TNIL) {
+            details = lua_runtime.luaValueToJson(L, -1, allocator) catch .null;
+        }
+        c.lua_pop(L, 1);
+
         // Inspect the content field.
         _ = c.lua_getfield(L, idx, "content");
         defer c.lua_pop(L, 1);
@@ -161,17 +265,19 @@ fn parseReturn(
         const content_ty = c.lua_type(L, -1);
 
         if (content_ty == c.LUA_TSTRING) {
-            return try textResult(allocator, lstring(L, -1), is_error);
+            var result = try textResult(allocator, lstring(L, -1), is_error);
+            result.details = details;
+            return result;
         }
 
         if (content_ty == c.LUA_TTABLE) {
             const blocks = try parseContentBlocks(allocator, L, -1);
-            return .{ .content = blocks, .is_error = is_error };
+            return .{ .content = blocks, .is_error = is_error, .details = details };
         }
 
         // Table with no content field → empty result with the
-        // is_error flag honored.
-        return .{ .content = &.{}, .is_error = is_error };
+        // is_error flag and details honored.
+        return .{ .content = &.{}, .is_error = is_error, .details = details };
     }
 
     // Anything else (number, bool, nil): treat as empty success.
@@ -245,6 +351,92 @@ fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
     var len: usize = 0;
     const ptr = c.lua_tolstring(L, idx, &len) orelse return &.{};
     return ptr[0..len];
+}
+
+// =============================================================================
+// ctx.update host function
+// =============================================================================
+
+/// `ctx.update(partial)` — Lua-callable that forwards a partial
+/// tool result back through the agent loop. Used by long-running
+/// tools (Task, Oracle, anything that wraps `zi.spawn`) to surface
+/// progressive state to the TUI without waiting for `execute` to
+/// return.
+///
+/// Lua signature: `ctx.update({ content?, is_error?, details? })`
+///
+///   - `content`  optional content blocks (defaults to `{}`)
+///   - `is_error` optional bool flag
+///   - `details`  optional table; deep-cloned via luaValueToJson
+///
+/// Lifetime: every owned slice for the partial result is allocated
+/// from a stack-scoped arena that lives only for the duration of
+/// this call. The downstream `tool_execution_update` event handler
+/// (`interactive.zig` event-queue translator) deep-copies what it
+/// needs into its own allocator before this returns, so the arena
+/// is safe to drop.
+fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
+    const runner: *runner_mod.ExtensionRunner = @ptrCast(@alignCast(ud.?));
+
+    const cb = runner.current_update_callback orelse return 0;
+
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return 0;
+
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // -- is_error --
+    var is_error = false;
+    _ = c.lua_getfield(L, 1, "is_error");
+    if (c.lua_type(L, -1) == c.LUA_TBOOLEAN) is_error = c.lua_toboolean(L, -1) != 0;
+    c.lua_pop(L, 1);
+
+    // -- content (optional, may be table or absent) --
+    var content_blocks: []const AgentToolResult.ContentBlock = &.{};
+    _ = c.lua_getfield(L, 1, "content");
+    if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+        content_blocks = parseContentBlocks(aa, L, -1) catch &.{};
+    }
+    c.lua_pop(L, 1);
+
+    // -- details (optional json value, deep-cloned via luaValueToJson) --
+    var details: std.json.Value = .null;
+    _ = c.lua_getfield(L, 1, "details");
+    if (c.lua_type(L, -1) != c.LUA_TNIL) {
+        details = lua_runtime.luaValueToJson(L, -1, aa) catch .null;
+    }
+    c.lua_pop(L, 1);
+
+    const partial = AgentToolResult{
+        .content = content_blocks,
+        .details = details,
+        .is_error = is_error,
+    };
+
+    // Fire the callback. The downstream consumer clones what it
+    // needs synchronously, so when this returns the arena can
+    // safely free everything.
+    cb(partial, runner.current_update_ctx);
+
+    // Precompute the render NOW on this same thread (still inside
+    // the lua mutex) so the TUI can pick up the fresh tree without
+    // needing to touch Lua at all. The TUI thread reads from
+    // `runner.pending_renders` during `toolSetPartialResult` and
+    // never blocks on the lua mutex.
+    if (runner.current_tool_call_id) |id| {
+        if (runner.current_tool_name) |name| {
+            // Pass our `L` (the currently executing thread) so the
+            // render coroutine is allocated off the right state. We
+            // may be running inside `zi.spawn`'s event trampoline,
+            // which means `L` is the tool's coroutine, not main.
+            precomputeRenderOn(runner, name, id, .null, partial, L);
+        }
+    }
+
+    return 0;
 }
 
 // =============================================================================

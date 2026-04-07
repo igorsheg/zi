@@ -1,6 +1,8 @@
 const std = @import("std");
 const registries = @import("registries/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
+const abort_signal = @import("../abort_signal.zig");
+const agent_protocol = @import("../agent/protocol.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 /// 
@@ -88,6 +90,15 @@ pub const ExtensionRunnerRef = struct {
     current: ?*ExtensionRunner = null,
 };
 
+/// Cross-thread render slot value. The state pointer is owned
+/// (caller of `takePendingRender` must invoke `deinit`). Stored
+/// as `*anyopaque` to keep `runner.zig` from importing
+/// `lua_renderer.zig` (which already imports `runner.zig`).
+pub const PendingRender = struct {
+    state: *anyopaque,
+    deinit: *const fn (*anyopaque, std.mem.Allocator) void,
+};
+
 pub const ExtensionRunner = struct {
     allocator: std.mem.Allocator,
 
@@ -136,6 +147,118 @@ pub const ExtensionRunner = struct {
     /// pre-bind registrations don't crash and runner-without-state
     /// instances stay valid (they just can't dispatch).
     lua_state: ?*lua_runtime.LuaState = null,
+
+    /// Abort signal for the currently executing Lua tool. Set by
+    /// `lua_tool.execute` before invoking the user's handler and
+    /// cleared on return. Read by host functions like `zi.spawn`
+    /// that need to forward the parent's abort into a child
+    /// subprocess.
+    ///
+    /// Single-threaded contract: the Lua state runs one coroutine
+    /// at a time, so a single mutable slot is safe without locking.
+    /// If concurrent tools ever land, this becomes per-coroutine
+    /// state.
+    ///
+    /// Null when no Lua tool is running. `zi.spawn` callers from
+    /// non-tool contexts (e.g. an event handler that wants to
+    /// fan out a sub-agent) will see no abort forwarding — the
+    /// child runs uninterruptible from the parent's POV.
+    current_signal: ?abort_signal.AbortSignal = null,
+
+    /// Update callback + ctx for the currently executing Lua tool.
+    /// Set by `lua_tool.execute` before invoking the user's
+    /// handler so the Lua-callable `ctx.update(partial)` host
+    /// function can forward partial results back through the
+    /// agent loop's update bridge.
+    ///
+    /// Lifetime + thread contract is identical to `current_signal`:
+    /// single-threaded slot, valid for the duration of one tool
+    /// execution, cleared on return.
+    current_update_callback: ?agent_protocol.AgentToolUpdateCallback = null,
+    current_update_ctx: ?*anyopaque = null,
+
+    /// Working directory of the parent agent. Surfaced to Lua tools
+    /// via `ctx.cwd` so they can spawn child processes in the
+    /// right directory and resolve relative paths. Set once at
+    /// session bootstrap; static for the runner generation.
+    cwd: []const u8 = ".",
+
+    /// Tool call id of the currently executing Lua tool. Stashed
+    /// by `lua_tool.execute` so the `ctx.update` host function
+    /// can route precomputed renders into the right
+    /// `pending_renders` slot. Null when no Lua tool is running.
+    current_tool_call_id: ?[]const u8 = null,
+
+    /// Tool name of the currently executing Lua tool. Stashed
+    /// alongside `current_tool_call_id` so render dispatch can
+    /// look up `tool_registry.get(name)` for the render hook ref.
+    current_tool_name: ?[]const u8 = null,
+
+    /// Cross-thread inbox for precomputed render spans, keyed by
+    /// `tool_call_id`.
+    ///
+    /// Why this exists: render hooks for Lua tools used to fire
+    /// from the TUI render path, which meant the TUI thread had
+    /// to acquire the runner's lua mutex. Long-running tools
+    /// (Task with a multi-second child process) hold that mutex
+    /// for their entire lifetime, freezing the TUI. Now the
+    /// agent thread (which is already inside Lua, already holding
+    /// the mutex, already has the partial result in hand) runs
+    /// the render hook itself and stashes the result here. The
+    /// TUI thread reads from this map under a small fast mutex
+    /// during `toolSetPartialResult` / `toolSetFinalResult`. No
+    /// Lua state access required from the TUI thread.
+    ///
+    /// Pointers are `*anyopaque` to avoid a circular import on
+    /// `lua_renderer.LuaRenderState`. Each entry carries a deinit
+    /// fn pointer so the consumer can release the right type
+    /// without runner.zig knowing the layout.
+    pending_renders: std.StringHashMapUnmanaged(PendingRender) = .empty,
+    pending_renders_mutex: std.Thread.Mutex = .{},
+
+    /// Identity of the thread that owns the `lua_state`.
+    ///
+    /// ## Threading contract
+    ///
+    /// `lua_State *` is non-reentrant: only one thread may make
+    /// any Lua C API call at a time, and Lua's GC bookkeeping
+    /// corrupts horribly when this is violated (the symptom is a
+    /// SIGSEGV inside `_sweeplist` or similar mark/sweep
+    /// internals — see git history if curious).
+    ///
+    /// zi enforces this contract via convention, not via locking:
+    ///
+    ///   - exactly one thread (the agent thread in interactive
+    ///     mode, or the test thread in unit tests) ever calls
+    ///     into Lua. That thread "owns" the lua_State for the
+    ///     entire runner generation.
+    ///
+    ///   - the TUI thread NEVER calls Lua. When it needs render
+    ///     output, it reads from `pending_renders` — a typed
+    ///     cross-thread inbox populated by the agent thread on
+    ///     each tool update.
+    ///
+    ///   - every Lua entry point (lua_tool.execute, event_bridge
+    ///     dispatch, before/afterToolCall hooks, render hook
+    ///     precompute) calls `assertOnLuaThread()` at entry.
+    ///     The first call claims ownership; subsequent calls
+    ///     verify the same thread is calling. Mismatched threads
+    ///     `@panic` with a clear message instead of corrupting
+    ///     the GC.
+    ///
+    /// `lua_owner_thread` is `0` when no thread has claimed
+    /// ownership yet (between `init` and the first Lua entry).
+    ///
+    /// Why no mutex: a mutex would let multiple threads call Lua
+    /// in turn, but it doesn't help us — Lua entry points can be
+    /// long-running (a Task tool holds the lock for the whole
+    /// child subprocess lifetime, multiple seconds). Any other
+    /// thread that tried to enter Lua during that time would
+    /// block, freezing the UI. The right architecture is "one
+    /// thread, no contention", which we get for free by having
+    /// the agent thread own everything and the TUI thread read
+    /// pre-computed data.
+    lua_owner_thread: std.atomic.Value(std.Thread.Id) = .{ .raw = 0 },
 
     /// Scratch arena for hook return values that the agent loop must
     /// hold across a tool-call iteration. The agent's hook signatures
@@ -192,6 +315,88 @@ pub const ExtensionRunner = struct {
         self.lua_state = state;
     }
 
+    /// Assert that the current thread is allowed to call into
+    /// `lua_state`. Must be invoked at every Lua entry point
+    /// (lua_tool.execute, event_bridge dispatch, render hook
+    /// precompute, etc.) before any Lua C API call.
+    ///
+    /// Behavior:
+    ///   - First call ever: claims the current thread as the
+    ///     owner via an atomic compare-and-swap. All future calls
+    ///     must come from this same thread.
+    ///   - Subsequent calls from the same thread: no-op.
+    ///   - Subsequent calls from a different thread: `@panic`
+    ///     with the offending thread id and the owning thread
+    ///     id. This is intentional — silently allowing the call
+    ///     would corrupt Lua's GC and crash deep inside libC
+    ///     with no breadcrumb trail.
+    ///
+    /// Why an assertion instead of a mutex: see the doc comment
+    /// on `lua_owner_thread`. The short version: locking would
+    /// freeze the UI behind long-running tools; "single owner
+    /// thread + cross-thread inboxes" gives us correctness AND
+    /// responsiveness for free.
+    pub fn assertOnLuaThread(self: *ExtensionRunner) void {
+        const tid = std.Thread.getCurrentId();
+        // Try to claim ownership if it's still vacant. cmpxchgStrong
+        // is race-free: if two threads try to claim simultaneously,
+        // exactly one wins and the loser sees the winner's id.
+        const prev = self.lua_owner_thread.cmpxchgStrong(
+            0,
+            tid,
+            .acq_rel,
+            .acquire,
+        );
+        const owner = prev orelse tid;
+        if (owner != tid) {
+            std.debug.panic(
+                "lua_state accessed from wrong thread: this={d} owner={d}. " ++
+                    "All Lua entry points must run on the agent thread. " ++
+                    "TUI thread should read from runner.pending_renders instead.",
+                .{ tid, owner },
+            );
+        }
+    }
+
+    /// Store a precomputed render for `tool_call_id`. Replaces any
+    /// pending entry for the same id (the new render supersedes
+    /// the old one) and frees the old state via its deinit fn.
+    /// Called from the agent thread under the lua mutex.
+    pub fn stashPendingRender(
+        self: *ExtensionRunner,
+        tool_call_id: []const u8,
+        render: PendingRender,
+    ) void {
+        self.pending_renders_mutex.lock();
+        defer self.pending_renders_mutex.unlock();
+
+        if (self.pending_renders.fetchRemove(tool_call_id)) |old| {
+            old.value.deinit(old.value.state, self.allocator);
+            self.allocator.free(old.key);
+        }
+        const key = self.allocator.dupe(u8, tool_call_id) catch return;
+        self.pending_renders.put(self.allocator, key, render) catch {
+            self.allocator.free(key);
+            render.deinit(render.state, self.allocator);
+        };
+    }
+
+    /// Atomically remove and return the pending render for
+    /// `tool_call_id`. Caller takes ownership and must call the
+    /// returned deinit fn when done. Returns null if no render
+    /// is queued for that id.
+    pub fn takePendingRender(
+        self: *ExtensionRunner,
+        tool_call_id: []const u8,
+    ) ?PendingRender {
+        self.pending_renders_mutex.lock();
+        defer self.pending_renders_mutex.unlock();
+
+        const entry = self.pending_renders.fetchRemove(tool_call_id) orelse return null;
+        self.allocator.free(entry.key);
+        return entry.value;
+    }
+
     pub fn deinit(self: *ExtensionRunner) void {
         // Tear down in REVERSE construction order. The provider
         // queue holds Lua registry refs that the lua_state (when
@@ -201,6 +406,12 @@ pub const ExtensionRunner = struct {
         // memory safety. Order matters only when v2 adds tool ctx
         // wrappers that hold zig pointers into runner state; D9
         // will revisit this.
+        var prit = self.pending_renders.iterator();
+        while (prit.next()) |kv| {
+            kv.value_ptr.deinit(kv.value_ptr.state, self.allocator);
+            self.allocator.free(kv.key_ptr.*);
+        }
+        self.pending_renders.deinit(self.allocator);
         self.provider_queue.deinit();
         self.command_registry.deinit();
         self.event_registry.deinit();

@@ -30,55 +30,91 @@ pub const ToolRenderContext = struct {
     width: u32,
 };
 
-pub const ToolRendererRegistry = struct {
-    entries: []const Registration,
+/// Static registration of a zig-native tool renderer (built-in tools
+/// like bash, read, find — compiled into the binary, looked up by
+/// name once at tool-call start).
+pub const Registration = struct {
+    tool_name: []const u8,
+    renderer: ToolRenderer,
+};
 
-    pub const Registration = struct {
-        tool_name: []const u8,
-        renderer: ToolRenderer,
-    };
+/// Resolver seam between tool names and renderers.
+///
+/// Two reasons this is a resolver and not a plain slice:
+///
+///   1. **dynamic sources**: Lua-registered tools live in the
+///      runtime `ExtensionRunner` and only exist once the loader
+///      has run. A static array can't see them.
+///
+///   2. **reload safety**: the Lua-renderer path (F1c) needs the
+///      runner pointer so it can look up the handler ref for the
+///      active generation, not a stale slice captured at startup.
+///
+/// `interactive.zig` builds a resolver with `ctx = extension_runner_ref`
+/// and a `resolve_fn` that consults both built-in entries and the
+/// runner's tool registry. Tests build one with a fixed slice and no
+/// extension runner.
+pub const ToolRendererResolver = struct {
+    ctx: ?*anyopaque = null,
+    resolve_fn: *const fn (ctx: ?*anyopaque, tool_name: []const u8) ToolRenderer,
 
-    pub fn get(self: *const ToolRendererRegistry, tool_name: []const u8) ToolRenderer {
-        for (self.entries) |entry| {
-            if (std.mem.eql(u8, entry.tool_name, tool_name)) {
-                return entry.renderer;
+    pub fn resolve(self: *const ToolRendererResolver, tool_name: []const u8) ToolRenderer {
+        return self.resolve_fn(self.ctx, tool_name);
+    }
+
+    /// Build a resolver backed by a static `[]const Registration`
+    /// slice. Matches the old `ToolRendererRegistry.get` behavior
+    /// and is what tests use.
+    pub fn fromStatic(entries: *const []const Registration) ToolRendererResolver {
+        const S = struct {
+            fn resolveStatic(ctx: ?*anyopaque, tool_name: []const u8) ToolRenderer {
+                const slice_ptr: *const []const Registration = @ptrCast(@alignCast(ctx.?));
+                for (slice_ptr.*) |entry| {
+                    if (std.mem.eql(u8, entry.tool_name, tool_name)) {
+                        return entry.renderer;
+                    }
+                }
+                return .{};
             }
-        }
-        return .{};
+        };
+        return .{ .ctx = @ptrCast(@constCast(entries)), .resolve_fn = S.resolveStatic };
     }
 };
 
-pub const default_registry = ToolRendererRegistry{
-    .entries = &.{},
+/// Empty resolver — resolves nothing, all tools use fallbacks.
+pub const empty_resolver = ToolRendererResolver{
+    .ctx = null,
+    .resolve_fn = struct {
+        fn resolveNone(_: ?*anyopaque, _: []const u8) ToolRenderer {
+            return .{};
+        }
+    }.resolveNone,
 };
 
 // --- tests ---
 
 const testing = std.testing;
 
-test "ToolRendererRegistry returns empty renderer for unknown tool" {
-    const registry = ToolRendererRegistry{ .entries = &.{} };
-    const renderer = registry.get("unknown");
+test "empty resolver returns empty renderer for any name" {
+    const renderer = empty_resolver.resolve("anything");
     try testing.expect(renderer.render_call == null);
     try testing.expect(renderer.render_result == null);
-    try testing.expect(renderer.measure_result == null);
-    try testing.expect(renderer.init_state == null);
-    try testing.expect(renderer.deinit_state == null);
 }
 
-test "ToolRendererRegistry finds registered renderer" {
+test "fromStatic resolver finds registered renderer by name" {
     const S = struct {
         fn renderCall(_: *const ToolRenderContext) void {}
     };
-    const entries = [_]ToolRendererRegistry.Registration{
+    const entries = [_]Registration{
         .{ .tool_name = "bash", .renderer = .{ .render_call = &S.renderCall } },
     };
-    const registry = ToolRendererRegistry{ .entries = &entries };
-    const renderer = registry.get("bash");
-    try testing.expect(renderer.render_call != null);
-    try testing.expect(renderer.render_result == null);
-}
+    const slice: []const Registration = &entries;
+    const resolver = ToolRendererResolver.fromStatic(&slice);
 
-test "default_registry has no entries" {
-    try testing.expectEqual(@as(usize, 0), default_registry.entries.len);
+    const hit = resolver.resolve("bash");
+    try testing.expect(hit.render_call != null);
+    try testing.expect(hit.render_result == null);
+
+    const miss = resolver.resolve("unknown");
+    try testing.expect(miss.render_call == null);
 }

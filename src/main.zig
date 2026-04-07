@@ -23,7 +23,16 @@ pub fn main() !void {
 
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
-    const allocator = arena.allocator();
+    // The agent thread and the TUI thread both alloc/free against
+    // this allocator (event-queue clones, transcript partial-result
+    // clones, lua tool update fan-out, etc). ArenaAllocator is not
+    // thread-safe — concurrent allocs corrupt its internal state and
+    // later requests return misaligned pointers, panicking inside
+    // `allocBytesWithAlignment`. Wrap it in a mutex so multi-threaded
+    // callers are safe. Single-threaded paths pay one uncontended
+    // lock per alloc, which is negligible vs. the arena bump itself.
+    var ts_alloc: std.heap.ThreadSafeAllocator = .{ .child_allocator = arena.allocator() };
+    const allocator = ts_alloc.allocator();
 
     var print_mode = false;
     var show_help = false;
@@ -343,12 +352,14 @@ pub fn main() !void {
 
         const tool_display = @import("tui/tool_display.zig");
         const bash_renderer = @import("tui/renderers/bash.zig");
-        const tool_registry = tool_display.ToolRendererRegistry{
-            .entries = &.{
-                .{ .tool_name = "Bash", .renderer = bash_renderer.renderer },
-            },
+        // Static built-in entries. The resolver hands these out when
+        // no Lua render hook claims the tool name. Lua-registered
+        // tools hook in via the composed resolver inside Interactive.
+        const static_entries: []const tool_display.Registration = &.{
+            .{ .tool_name = "Bash", .renderer = bash_renderer.renderer },
         };
-        var interactive = try interactive_mod.Interactive.init(allocator, &ca, tool_registry, cwd_buf, &auth_storage);
+        const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
+        var interactive = try interactive_mod.Interactive.init(allocator, &ca, resolver, cwd_buf, &auth_storage);
         defer interactive.deinit();
 
         if (needs_auth) {

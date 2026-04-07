@@ -4,6 +4,24 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 
+/// Per-event observer callback. Fires once for every parsed JSONL line
+/// from the child's stdout, BEFORE ziSpawn's built-in extractors run,
+/// so callers see every event the child emits — not just message_end.
+///
+/// Runs synchronously inside the parent's stdout read loop. The
+/// callback MUST be cheap and MUST NOT block: a slow callback
+/// back-pressures the child via the OS pipe buffer.
+///
+/// `kind` is the event's `type` string ("message_end",
+/// "tool_execution_start", ...). `event` is the parsed JSON value;
+/// it is only valid for the duration of the callback — copy out
+/// anything you need to retain.
+pub const EventCallback = *const fn (
+    kind: []const u8,
+    event: std.json.Value,
+    ctx: ?*anyopaque,
+) void;
+
 pub const UsageStats = struct {
     input: u64 = 0,
     output: u64 = 0,
@@ -53,4 +71,17 @@ pub const SpawnConfig = struct {
     tools: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
     signal: ?*const std.atomic.Value(bool) = null,
+
+    /// Optional per-event observer. See `EventCallback` for the
+    /// contract. `on_event_ctx` is passed through verbatim.
+    on_event: ?EventCallback = null,
+    on_event_ctx: ?*anyopaque = null,
+
+    /// Test-only escape hatch. When set, ziSpawn skips its own
+    /// argv construction (self-exe + --mode json + ...) and runs
+    /// this command instead. Used by spawn tests to point at a
+    /// canned `sh -c` script that prints fixed JSONL, so the test
+    /// suite never needs real API keys or a child zi process.
+    /// Production code MUST leave this null.
+    argv_override: ?[]const []const u8 = null,
 };

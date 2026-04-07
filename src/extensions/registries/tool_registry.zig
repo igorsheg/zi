@@ -80,6 +80,19 @@ pub const ExtensionTool = struct {
     impl: ToolImpl,
     /// Where this registration came from. Borrowed.
     source: RegistrationSource,
+
+    /// Optional Lua function ref (`luaL_ref` slot) for the
+    /// tool's result renderer. When present, the TUI calls it at
+    /// `tool_execution_end` time to produce structured render spans
+    /// for the transcript (see extensions/lua_renderer.zig).
+    ///
+    /// `null` → no custom result rendering; the transcript falls
+    /// back to its default text-wrap formatter.
+    ///
+    /// Lifetime: released when the Lua state closes during runner
+    /// teardown (all refs get GC'd wholesale), so we don't track
+    /// it individually here.
+    render_result_ref: ?c_int = null,
 };
 
 /// First-registered-wins map.

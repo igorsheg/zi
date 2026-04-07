@@ -166,10 +166,35 @@ pub const AgentSession = struct {
                 break :ext_setup;
             };
             runner_ptr.* = ExtensionRunner.init(allocator, 0);
+            runner_ptr.cwd = options.cwd;
             runner_ptr.attachLuaState(state_ptr);
             extension_api.installZiTable(state_ptr, runner_ptr);
             ext_state = state_ptr;
             ext_runner = runner_ptr;
+
+            // Configure `package.path` so extensions can
+            // `require("lib/foo")` relative to their extension dir.
+            // Dirs are best-effort — missing ones are silently
+            // skipped.
+            const agent_dir = storage.getAgentDir(allocator, null) catch null;
+            defer if (agent_dir) |d| allocator.free(d);
+            const project_dir = storage.getProjectDir(allocator, options.cwd) catch null;
+            defer if (project_dir) |d| allocator.free(d);
+            const agent_ext = if (agent_dir) |d| std.fs.path.join(allocator, &.{ d, "extensions" }) catch null else null;
+            defer if (agent_ext) |d| allocator.free(d);
+            const project_ext = if (project_dir) |d| std.fs.path.join(allocator, &.{ d, "extensions" }) catch null else null;
+            defer if (project_ext) |d| allocator.free(d);
+            var dirs_buf: [2][]const u8 = .{ "", "" };
+            var dirs_n: usize = 0;
+            if (project_ext) |d| {
+                dirs_buf[dirs_n] = d;
+                dirs_n += 1;
+            }
+            if (agent_ext) |d| {
+                dirs_buf[dirs_n] = d;
+                dirs_n += 1;
+            }
+            state_ptr.setPackagePath(dirs_buf[0..dirs_n]) catch {};
 
             const discovered: []extension_loader.LoadedExtension = extension_loader.discover(.{
                 .allocator = allocator,
@@ -382,6 +407,14 @@ pub const AgentSession = struct {
     /// Get session file path (valid after first flush).
     pub fn getSessionFile(self: *const AgentSession) []const u8 {
         return self.session_store.sessionFile();
+    }
+
+    /// Public accessor — the TUI layer uses this to wire the
+    /// runner into `Transcript.lua_runner` for render hook
+    /// dispatch. Returns null in modes without extensions or
+    /// when the runner failed to initialize.
+    pub fn extensionRunner(self: *AgentSession) ?*ExtensionRunner {
+        return self._extension_runner;
     }
 
     pub fn sessionFlushed(self: *const AgentSession) bool {
@@ -776,7 +809,7 @@ test "AgentSession: simple text response" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("hi");
+    try ca.run("hi");
 
     try testing.expectEqual(@as(usize, 1), fp.call_count);
     try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
@@ -808,7 +841,7 @@ test "AgentSession: error response sets stop_reason" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("hi");
+    try ca.run("hi");
 
     try testing.expectEqual(@as(usize, 1), fp.call_count);
     try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
@@ -834,7 +867,7 @@ test "AgentSession: events emitted in correct order" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("hello");
+    try ca.run("hello");
 
     // Should have: agent_start, turn_start, message_start(user), message_end(user),
     // message_start(assistant-stream), message_update*, message_end(assistant),
@@ -866,8 +899,8 @@ test "AgentSession: response sequence across multiple prompts" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("a");
-    ca.run("b");
+    try ca.run("a");
+    try ca.run("b");
 
     try testing.expectEqual(@as(usize, 2), fp.call_count);
     try testing.expectEqual(@as(usize, 4), ca.agent.state.messages.len);
@@ -901,7 +934,7 @@ test "AgentSession: session persistence round-trip" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("persist me");
+    try ca.run("persist me");
 
     // Session should have been flushed (assistant message triggers flush)
     try testing.expect(ca.sessionFlushed());
@@ -983,7 +1016,7 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     });
     defer ca.deinit();
 
-    ca.run("use the tool");
+    try ca.run("use the tool");
 
     // Faux called twice: once for tool call, once after tool result
     try testing.expectEqual(@as(usize, 2), fp.call_count);
@@ -1030,7 +1063,7 @@ test "AgentSession: continue sends restored context to provider" {
     });
     defer ca1.deinit();
 
-    ca1.run("hello");
+    try ca1.run("hello");
     try testing.expect(ca1.sessionFlushed());
     const session_file = ca1.getSessionFile();
 
@@ -1159,7 +1192,7 @@ test "AgentSession: context capture — provider receives user message" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("my question");
+    try ca.run("my question");
 
     try testing.expectEqual(@as(usize, 1), fp.captured_contexts.items.len);
     const ctx = fp.captured_contexts.items[0];
@@ -1191,7 +1224,7 @@ test "AgentSession: text deltas reconstruct full response" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("hi");
+    try ca.run("hi");
 
     const deltas = collector.getTextDeltas();
     try testing.expect(deltas.len > 0);
@@ -1228,7 +1261,7 @@ test "AgentSession: thinking events emitted for thinking content" {
     var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
     defer ca.deinit();
 
-    ca.run("hi");
+    try ca.run("hi");
 
     // Check for thinking events in message_update
     var thinking_starts: usize = 0;
@@ -1285,7 +1318,7 @@ test "resumed session context is sent to LLM" {
     try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
 
     // Send a new prompt (the "follow-up" after resume)
-    ca.run("now explain Y");
+    try ca.run("now explain Y");
 
     // The LLM should have received the full context: prior user + prior assistant + new user
     try testing.expectEqual(@as(usize, 1), fp.call_count);

@@ -18,4 +18,5 @@ test {
     _ = @import("extensions/event_bridge.zig");
     _ = @import("extensions/loader.zig");
     _ = @import("extensions/lua_tool.zig");
+    _ = @import("extensions/lua_renderer.zig");
 }
