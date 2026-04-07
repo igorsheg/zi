@@ -102,6 +102,14 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
+    // --- /model outcomes (zi-wub.16) ---
+    // Published by the agent thread after processing a set_model
+    // AgentRequest. The model id is owned (cloned into msg_allocator)
+    // so the TUI can display it without reaching back into agent state.
+    model_switched: struct {
+        id: []u8,
+    },
+
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -137,6 +145,7 @@ pub const UiEvent = union(enum) {
                 allocator.free(s.entries);
             },
             .session_resume_failed => |f| allocator.free(f.message),
+            .model_switched => |m| allocator.free(m.id),
             .message_start_assistant, .message_start_user,
             .agent_finished, .agent_error, .request_worker_finished,
             => {},

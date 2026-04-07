@@ -703,6 +703,18 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
+            .model_switched => |m| {
+                // status_data.model_id is a borrow into the live
+                // model in agent state — agent thread already
+                // updated ca.agent.state.model, so reading it here
+                // is safe (the catalog slice is static, no race).
+                self.status_data.model_id = self.ca.agent.state.model.id;
+                var buf: [80]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
+                self.status_text.setContent(msg);
+                self.status_text.fg = self.theme.fg(.success);
+                self.tui.dirty = true;
+            },
         }
     }
 
@@ -1137,18 +1149,41 @@ pub const Interactive = struct {
         self.freeModelPickerSearchTexts();
     }
 
+    /// Enqueue a /model switch through the AgentRequest queue
+    /// (zi-wub.16). The actual mutation runs on the agent thread
+    /// inside `handleSetModel`. Same shape as the .15 /resume path:
+    /// block during streaming, push request, spawn drain_only worker
+    /// when idle. Status update happens when `.model_switched`
+    /// drains back through the event queue.
+    ///
+    /// Model is a static catalog value (its slices live forever in
+    /// `ai_models`), so we pass it by value into the request without
+    /// cloning the inner strings.
     fn applyModelSwitch(self: *Interactive, m: ai_protocol.Model) void {
-        self.ca.agent.state.model = m;
-        self.status_data.model_id = m.id;
+        if (self.is_streaming or self.agent_thread != null) {
+            self.status_text.setContent("cannot switch model while agent is running");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        }
 
-        const provider_str = json_util.providerToString(m.provider);
-        self.ca.session_store.appendModelChange(provider_str, m.id);
+        self.request_queue.push(.{ .set_model = .{ .model = m } });
 
-        var buf: [80]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
-        self.status_text.setContent(msg);
-        self.status_text.fg = self.theme.fg(.success);
+        self.showLoader("Switching model...");
         self.tui.dirty = true;
+
+        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
+            self.hideLoader();
+            self.status_text.setContent("failed to spawn model-switch worker");
+            self.status_text.fg = self.theme.fg(.@"error");
+            // Drain leaked request to free its payload (set_model
+            // currently has no allocations, but stay symmetric with
+            // the .15 path).
+            var drain_buf: [4]AgentRequest = undefined;
+            const n = self.request_queue.drainInto(&drain_buf);
+            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
+            return;
+        };
     }
 
 
@@ -1438,9 +1473,7 @@ pub const Interactive = struct {
             for (buf[0..n]) |*req| {
                 switch (req.*) {
                     .resume_session => |r| self.handleResumeSession(r.path),
-                    .set_model => {
-                        std.log.warn("zi-wub.14: set_model request received but no consumer (zi-wub.16)", .{});
-                    },
+                    .set_model => |s| self.handleSetModel(s.model),
                 }
                 req.deinit(self.msg_allocator);
             }
@@ -1511,6 +1544,21 @@ pub const Interactive = struct {
             return;
         };
         self.event_queue.push(.{ .session_resumed = .{ .entries = owned_entries } });
+    }
+
+    /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
+    /// Mutates ca.agent.state.model and appends a model_change entry
+    /// to the session store — both agent-owned per the doctrine.
+    /// Publishes `.model_switched` with an msg_allocator-cloned id
+    /// so the TUI can update status_data without reaching back into
+    /// agent state.
+    fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
+        self.ca.agent.state.model = m;
+        const provider_str = json_util.providerToString(m.provider);
+        self.ca.session_store.appendModelChange(provider_str, m.id);
+
+        const id_copy = self.msg_allocator.dupe(u8, m.id) catch return;
+        self.event_queue.push(.{ .model_switched = .{ .id = id_copy } });
     }
 
     /// Agent event callback — runs on the AGENT THREAD.
