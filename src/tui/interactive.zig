@@ -732,7 +732,7 @@ pub const Interactive = struct {
             if (self.dispatchSlashCommand(text)) return;
         }
 
-        const prompt_copy = self.allocator.dupe(u8, text) catch return;
+        const prompt_copy = self.msg_allocator.dupe(u8, text) catch return;
 
         self.active_editor.clear();
         self.is_streaming = true;
@@ -745,7 +745,7 @@ pub const Interactive = struct {
             self.tui.setFocus(self.active_editor.component());
             self.status_text.setContent("failed to start agent");
             self.status_text.fg = self.theme.fg(.@"error");
-            self.allocator.free(prompt_copy);
+            self.msg_allocator.free(prompt_copy);
             return;
         };
 
@@ -1160,7 +1160,7 @@ pub const Interactive = struct {
         self.status_text.fg = self.theme.fg(.muted);
         self.tui.dirty = true;
 
-        const login_ctx = self.allocator.create(LoginContext) catch {
+        const login_ctx = self.msg_allocator.create(LoginContext) catch {
             self.status_text.setContent("failed to start login");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
@@ -1171,7 +1171,7 @@ pub const Interactive = struct {
         };
 
         self.login_thread = std.Thread.spawn(.{}, loginThreadFn, .{login_ctx}) catch {
-            self.allocator.destroy(login_ctx);
+            self.msg_allocator.destroy(login_ctx);
             self.status_text.setContent("failed to spawn login thread");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
@@ -1186,10 +1186,10 @@ pub const Interactive = struct {
     fn loginThreadFn(ctx: *LoginContext) void {
         const self = ctx.interactive;
         const provider = ctx.provider;
-        self.allocator.destroy(ctx);
+        self.msg_allocator.destroy(ctx);
 
         const result = oauth_mod.login(
-            self.allocator,
+            self.msg_allocator,
             provider,
             .{
                 .on_auth = &onLoginAuth,
@@ -1199,34 +1199,34 @@ pub const Interactive = struct {
             &self.login_cancelled,
         );
 
-        const provider_id = self.allocator.dupe(u8, provider.id) catch return;
+        const provider_id = self.msg_allocator.dupe(u8, provider.id) catch return;
         switch (result) {
             .success => |cred| {
                 self.auth_storage.set(provider.id, .{ .oauth = cred });
                 // auth_storage.set() dupes the credential; free the originals
-                self.allocator.free(cred.refresh);
-                self.allocator.free(cred.access);
+                self.msg_allocator.free(cred.refresh);
+                self.msg_allocator.free(cred.access);
                 var extras = cred.extras;
                 extras.deinit();
 
                 self.event_queue.push(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = true,
-                    .message = self.allocator.dupe(u8, "logged in") catch return,
+                    .message = self.msg_allocator.dupe(u8, "logged in") catch return,
                 }});
             },
             .cancelled => {
                 self.event_queue.push(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = false,
-                    .message = self.allocator.dupe(u8, "login cancelled") catch return,
+                    .message = self.msg_allocator.dupe(u8, "login cancelled") catch return,
                 }});
             },
             .err => |msg| {
                 self.event_queue.push(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = false,
-                    .message = self.allocator.dupe(u8, msg) catch return,
+                    .message = self.msg_allocator.dupe(u8, msg) catch return,
                 }});
             },
         }
@@ -1236,7 +1236,7 @@ pub const Interactive = struct {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
 
         _ = std.process.Child.run(.{
-            .allocator = self.allocator,
+            .allocator = self.msg_allocator,
             .argv = if (@import("builtin").os.tag == .macos)
                 &.{ "open", url }
             else
@@ -1313,7 +1313,7 @@ pub const Interactive = struct {
     }
 
     fn agentThreadFn(self: *Interactive, prompt_copy: []const u8) void {
-        defer self.allocator.free(prompt_copy);
+        defer self.msg_allocator.free(prompt_copy);
 
         const token = self.ca.agent.subscribe(&agentEventCallback, @ptrCast(self));
         defer self.ca.agent.unsubscribe(token);

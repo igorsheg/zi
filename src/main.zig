@@ -369,7 +369,13 @@ pub fn main() !void {
             .{ .tool_name = "Bash", .renderer = bash_renderer.renderer },
         };
         const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
-        var interactive = try interactive_mod.Interactive.init(allocator, msg_allocator, &ca, resolver, cwd_buf, &auth_storage);
+        // zi-wub.11: TUI thread owns its own arena. Single-thread,
+        // no ThreadSafeAllocator wrap — all consumers live on the
+        // TUI thread. Cross-thread payloads use msg_allocator;
+        // cross-thread requests use ca's shared allocator (until .12).
+        var tui_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+        defer tui_arena.deinit();
+        var interactive = try interactive_mod.Interactive.init(tui_arena.allocator(), msg_allocator, &ca, resolver, cwd_buf, &auth_storage);
         defer interactive.deinit();
 
         if (needs_auth) {
