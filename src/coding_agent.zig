@@ -7,6 +7,11 @@ const system_prompt_mod = @import("system_prompt.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const storage = @import("storage.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
+// Force the event bridge into the main compilation graph so `zig
+// build` validates it. Nothing in coding_agent.zig calls into it
+// yet — D5 wiring (subscribe runner to agent events) lands as a
+// follow-up commit; this import keeps the bridge compiled today.
+const _force_compile_bridge = @import("extensions/event_bridge.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;

@@ -327,6 +327,63 @@ fn isSequence(L: *c.lua_State, table_idx: c_int, expected_len: usize) bool {
     return true;
 }
 
+/// Push a `std.json.Value` onto the Lua stack as the equivalent
+/// Lua type. The inverse of `luaValueToJson` — used by the event
+/// bridge to convert agent-side payloads (which carry
+/// `std.json.Value` for tool args, message content, etc.) into Lua
+/// tables that handlers can read.
+///
+/// Ownership: the pushed Lua values are independent copies. Strings
+/// are duplicated by Lua's own allocator (`lua_pushlstring` copies);
+/// nested tables are constructed inline. Caller may free the source
+/// `std.json.Value` immediately after the call returns.
+///
+/// On allocator failure (Lua's internal allocator is wired to the
+/// runner's gpa via `LuaState.init`), this returns
+/// `error.OutOfMemory` and the partial state is left on the stack
+/// for the caller to clean up via `lua_settop`.
+pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
+    switch (value) {
+        .null => c.lua_pushnil(L),
+        .bool => |b| c.lua_pushboolean(L, if (b) 1 else 0),
+        .integer => |i| c.lua_pushinteger(L, i),
+        .float => |f| c.lua_pushnumber(L, f),
+        .number_string => |s| {
+            // JSON's "number_string" only appears for numbers that
+            // overflow i64. Pass them through as Lua strings; the
+            // handler can re-parse if it cares.
+            _ = c.lua_pushlstring(L, s.ptr, s.len);
+        },
+        .string => |s| {
+            _ = c.lua_pushlstring(L, s.ptr, s.len);
+        },
+        .array => |arr| {
+            c.lua_createtable(L, @intCast(arr.items.len), 0);
+            for (arr.items, 0..) |item, i| {
+                try pushJsonValue(L, item);
+                // Lua arrays are 1-indexed.
+                c.lua_rawseti(L, -2, @intCast(i + 1));
+            }
+        },
+        .object => |obj| {
+            c.lua_createtable(L, 0, @intCast(obj.count()));
+            var it = obj.iterator();
+            while (it.next()) |kv| {
+                try pushJsonValue(L, kv.value_ptr.*);
+                // lua_setfield needs a null-terminated key. Object
+                // keys come from `luaValueToJson`'s allocator (or
+                // a JSON parse) and aren't guaranteed sentinel-
+                // terminated, so we use lua_pushlstring + lua_settable.
+                _ = c.lua_pushlstring(L, kv.key_ptr.*.ptr, kv.key_ptr.*.len);
+                // Stack: ... table value key
+                // We need: table key value, then settable
+                c.lua_insert(L, -2);
+                c.lua_settable(L, -3);
+            }
+        },
+    }
+}
+
 /// Free a `std.json.Value` previously produced by `luaValueToJson`.
 /// Local helper duplicated from `ai/json_util.zig` to keep the
 /// extensions package free of upward dependencies. Recursive walk

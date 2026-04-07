@@ -1,5 +1,6 @@
 const std = @import("std");
 const registries = @import("registries/root.zig");
+const lua_runtime = @import("lua_runtime.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 /// 
@@ -119,10 +120,26 @@ pub const ExtensionRunner = struct {
     /// this empty; v2 wires `zi.register_provider`.
     provider_queue: registries.ProviderQueue,
 
+    /// Lua state for this generation. Borrowed (NOT owned) — the
+    /// state is constructed and owned by the SDK factory or the
+    /// test scaffold, and passed in via `attachLuaState`. The runner
+    /// uses it to dispatch Lua handlers from the agent's event
+    /// stream and to host the `zi.*` API table.
+    ///
+    /// Why borrowed instead of owned: the state's lifetime is tied
+    /// to the SDK bootstrap order — it must outlive any in-flight
+    /// agent stream that may be holding a coroutine reference. The
+    /// SDK owns it; the runner just dispatches against it.
+    ///
+    /// Null until `attachLuaState` is called. The dispatch helpers
+    /// in `event_bridge.zig` no-op when the state is missing, so
+    /// pre-bind registrations don't crash and runner-without-state
+    /// instances stay valid (they just can't dispatch).
+    lua_state: ?*lua_runtime.LuaState = null,
+
     // Future fields documented as comments so the runner shape is
     // visible without compiling unused state:
     //
-    //   lua_state: ?*lua_runtime.LuaState = null,        — D3
     //   flag_values: std.StringHashMap(FlagValue) = .empty,  — v2
 
     pub fn init(allocator: std.mem.Allocator, generation: Generation) ExtensionRunner {
@@ -135,6 +152,15 @@ pub const ExtensionRunner = struct {
             .command_registry = registries.CommandRegistry.init(allocator),
             .provider_queue = registries.ProviderQueue.init(allocator),
         };
+    }
+
+    /// Attach a borrowed Lua state. Called by the SDK factory once
+    /// it has constructed the LuaState and installed the `zi.*` API
+    /// table; the runner uses the state for handler dispatch but
+    /// does NOT own its lifetime. Caller must keep the state alive
+    /// for the runner's full lifetime.
+    pub fn attachLuaState(self: *ExtensionRunner, state: *lua_runtime.LuaState) void {
+        self.lua_state = state;
     }
 
     pub fn deinit(self: *ExtensionRunner) void {

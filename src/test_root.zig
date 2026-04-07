@@ -15,4 +15,5 @@ test {
     _ = @import("extensions/runner.zig");
     _ = @import("extensions/api.zig");
     _ = @import("extensions/dispatch.zig");
+    _ = @import("extensions/event_bridge.zig");
 }
