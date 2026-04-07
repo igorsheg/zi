@@ -203,12 +203,9 @@ pub fn main() !void {
             std.process.exit(1);
         };
 
-        var anthropic_prov = ai.anthropic.AnthropicProvider.init(allocator);
-        const prov = anthropic_prov.provider();
-
-        var registry = ai.provider.Registry.init(allocator);
-        defer registry.deinit();
-        try registry.register("anthropic-messages", prov, null);
+        // Provider registry is built inside AgentSession via the
+        // canonical `ai.provider_defaults.Bundle`. main.zig no longer
+        // hand-registers providers per mode.
 
         // Resolve --append-system-prompt: file path -> read contents, else treat as literal text
         var append_system_prompt: ?[]const u8 = null;
@@ -256,7 +253,7 @@ pub fn main() !void {
             .api_key = key,
             .cwd = cwd_buf,
             .max_tokens = 4096,
-            .registry = &registry,
+            .auth_storage = &auth_storage,
             .event_handler = event_handler,
             .initial_messages = initial_messages,
             .session_store = session_store,
@@ -334,19 +331,12 @@ pub fn main() !void {
             .max_tokens = 16384,
         };
 
-        var anthropic_prov = ai.anthropic.AnthropicProvider.init(allocator);
-        const prov = anthropic_prov.provider();
-
-        var registry = ai.provider.Registry.init(allocator);
-        defer registry.deinit();
-        try registry.register("anthropic-messages", prov, null);
-
+        // Provider registry is owned by AgentSession via Bundle.
         var ca = try sdk.createAgentSession(allocator, .{
             .model = effective_model,
             .api_key = api_key,
             .cwd = cwd_buf,
             .max_tokens = 4096,
-            .registry = &registry,
             .auth_storage = &auth_storage,
         });
         defer ca.deinit();

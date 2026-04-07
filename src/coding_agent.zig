@@ -46,6 +46,14 @@ pub const AgentSession = struct {
     /// a live session.
     _extension_runner: ?*ExtensionRunner = null,
 
+    /// Owned built-in provider bundle. Set when the sdk factory created
+    /// the registry on the caller's behalf (the common path); null when
+    /// the caller passed their own pre-built `Options.registry` (tests,
+    /// embedders that want a custom provider set). When set, `deinit`
+    /// drops it AFTER the agent — provider structs and the registry
+    /// must outlive any in-flight stream that might still hold them.
+    _owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
+
     pub const EventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque = null,
@@ -53,13 +61,21 @@ pub const AgentSession = struct {
 
     pub const Options = struct {
         model: ai.protocol.Model,
-        api_key: []const u8,
+        /// Static API key fallback. Used only when no `auth_storage` is
+        /// attached or its lookup returns empty. Tests pass this; real
+        /// callers should set `auth_storage` so token refresh / login
+        /// flows are picked up live by the stream closure.
+        api_key: []const u8 = "",
         cwd: []const u8,
         system_prompt: ?[]const u8 = null,
         context_files: []const system_prompt_mod.ContextFile = &.{},
         max_tokens: ?u64 = 4096,
         tools: ?[]const protocol.AgentTool = null,
-        registry: *ai.provider.Registry,
+        /// Optional pre-built provider registry. When null, the sdk
+        /// factory creates one via `ai.provider_defaults.Bundle` and
+        /// the session takes ownership. Tests typically pass their own
+        /// faux-only registry and skip the bundle.
+        registry: ?*ai.provider.Registry = null,
         event_handler: ?EventHandler = null,
         auth_storage: ?*auth_storage_mod.AuthStorage = null,
         /// Seed with existing messages for --continue.
@@ -90,9 +106,21 @@ pub const AgentSession = struct {
             break :blk SessionStore.create(allocator, default_dir, options.cwd);
         };
 
+        // Resolve the provider registry. The preferred path: sdk passes
+        // null and we own a Bundle for the session lifetime. Tests pass
+        // their own faux registry and we skip the bundle. Either way the
+        // closure sees a real `*Registry` and never branches on null.
+        var owned_bundle: ?*ai.provider_defaults.Bundle = null;
+        const registry: *ai.provider.Registry = options.registry orelse blk: {
+            const bundle = ai.provider_defaults.Bundle.init(allocator) catch @panic("OOM");
+            owned_bundle = bundle;
+            break :blk bundle.registry;
+        };
+
         const closure = allocator.create(StreamClosure) catch @panic("OOM");
         closure.* = .{
-            .registry = options.registry,
+            .registry = registry,
+            .auth_storage = options.auth_storage,
             .api_key = options.api_key,
             .max_tokens = options.max_tokens,
         };
@@ -152,6 +180,7 @@ pub const AgentSession = struct {
             ._subscription_token = null,
             ._stream_closure = closure,
             .auth_storage = options.auth_storage,
+            ._owned_provider_bundle = owned_bundle,
         };
 
         // Subscribe for session persistence: write message_end entries.
@@ -176,6 +205,13 @@ pub const AgentSession = struct {
         }
         self.allocator.destroy(self._stream_closure);
         self.agent.deinit();
+        // Provider bundle goes last — the agent's stream closure may
+        // still hold references into the registry until agent.deinit
+        // returns. Destroying earlier is a use-after-free risk.
+        if (self._owned_provider_bundle) |bundle| {
+            bundle.deinit();
+            self._owned_provider_bundle = null;
+        }
     }
 
     /// Subscribe the session persistence listener.
@@ -249,8 +285,15 @@ pub const AgentSession = struct {
         return auth.getApiKey(provider_str);
     }
 
+    /// Captured at session construction. The api key is resolved
+    /// LIVE on every stream — the closure prefers `auth_storage`
+    /// (so post-`/login` token refresh is picked up without
+    /// rebuilding the session) and falls back to the static
+    /// `api_key` snapshot only when no auth storage is attached
+    /// (the test path). See beads zi-yjc for the bug this fixes.
     const StreamClosure = struct {
         registry: *ai.provider.Registry,
+        auth_storage: ?*auth_storage_mod.AuthStorage,
         api_key: []const u8,
         max_tokens: ?u64,
 
@@ -268,10 +311,23 @@ pub const AgentSession = struct {
             const prov = self.registry.get(api_str) orelse return;
             var opts = options;
             if (opts.base.api_key == null or opts.base.api_key.?.len == 0) {
-                opts.base.api_key = self.api_key;
+                opts.base.api_key = self.resolveApiKey(model);
             }
             if (self.max_tokens) |mt| opts.base.max_tokens = mt;
             prov.streamSimple(stream_alloc, model, stream_context, opts, callback, callback_ctx);
+        }
+
+        /// Live key lookup. Auth storage wins so /login + token
+        /// refresh take effect without restart; the static snapshot
+        /// is the test fallback.
+        fn resolveApiKey(self: *const StreamClosure, model: ai.protocol.Model) []const u8 {
+            if (self.auth_storage) |as| {
+                const provider_str = ai.json_util.providerToString(model.provider);
+                if (as.getApiKey(provider_str)) |k| {
+                    if (k.len > 0) return k;
+                }
+            }
+            return self.api_key;
         }
     };
 };
