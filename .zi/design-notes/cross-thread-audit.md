@@ -83,6 +83,31 @@ each entry: file:line — current wrong path — phase-4 routing hint.
 - watchdog threads in `anthropic.zig` / `spawn.zig` are self-contained and do not touch doctrine-listed resources.
 - the real violation surface is concentrated in `interactive.zig` lines 716-1170 (slash dispatch + login). fix all 9 by introducing `AgentRequest` (phase 4) and re-routing the login callbacks through `event_queue` with `msg_allocator` payloads.
 
+## paint path (zi-wub.18, verified 5538d2b)
+
+`dispatchRenderResult*` has exactly two non-test callers, both inside
+`src/extensions/lua_tool.zig`:
+
+- `precomputeRender` at `:129` — fires from the lua tool execute path
+  (agent thread, holds lua mutex).
+- `precomputeRenderOn` at `:435` — fires from the `ctx.update` host
+  callback that runs inside a lua coroutine (still agent thread, still
+  inside the mutex).
+
+Both stash the resulting `LuaRenderState` into
+`runner.pending_renders` (mutex-protected `StringHashMap`). The TUI
+thread reads from the inbox via `transcript.refreshLuaRender` →
+`runner.takePendingRender`, which is a pure data move — never reaches
+into `lua_State`.
+
+Contract: **the TUI thread MUST NOT call `dispatchRenderResult*`**.
+The render is precomputed on the writer side and consumed as a
+typed snapshot on the reader side. This is the canonical
+push-snapshot pattern and the model future paint additions should
+follow.
+
+Verified clean as of 5538d2b. No code change required.
+
 ## violation count
 
 **9** (3 login-thread→TUI, 4 TUI→agent-state, 1 HUNCH login-thread→auth_storage, 1 ext-handler on TUI thread). plus 3 HUNCH snapshot reads to tighten post-phase-4.
