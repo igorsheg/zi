@@ -7,6 +7,21 @@ const AgentToolResult = agent_protocol.AgentToolResult;
 /// main thread. The agent thread converts AgentEvent → UiEvent before
 /// pushing to the EventQueue, ensuring no borrowed pointers cross
 /// the thread boundary.
+/// Projection of a session message into a form the transcript can
+/// rebuild from without borrowing agent-owned AgentMessage data.
+/// Extended by zi-wub.24 to cover tool calls + results.
+pub const ResumedEntry = union(enum) {
+    user_text: []u8,
+    assistant_text: []u8,
+
+    pub fn deinit(self: *ResumedEntry, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .user_text => |s| allocator.free(s),
+            .assistant_text => |s| allocator.free(s),
+        }
+    }
+};
+
 pub const UiEvent = union(enum) {
     // --- message lifecycle ---
     message_start_assistant: void,
@@ -59,6 +74,34 @@ pub const UiEvent = union(enum) {
     agent_finished: void,
     agent_error: void,
 
+    // --- request-worker lifecycle (zi-wub.15) ---
+    // Emitted by a drain-only agent worker thread after it finishes
+    // processing AgentRequests. Separate from `agent_finished` so the
+    // TUI can run request-mode cleanup (e.g. hide the "loading session"
+    // loader) WITHOUT stomping on status_text that a successful resume
+    // just set. See oracle review for .15: `.agent_finished` already
+    // clears status_text and restores editor focus — reusing it for
+    // request work would wipe the success message.
+    request_worker_finished: void,
+
+    // --- /resume outcomes (zi-wub.15) ---
+    // Published by the agent thread after processing a
+    // resume_session AgentRequest. The TUI rebuilds the transcript
+    // from `entries` and frees them.
+    //
+    // Payload shape is intentionally a display projection, NOT the
+    // full AgentMessage list — AgentMessage ownership stays on the
+    // agent thread (doctrine R3). The shape is extensible: today
+    // only `user_text` and `assistant_text` are populated, matching
+    // pre-.15 rebuild fidelity. zi-wub.24 will extend it to carry
+    // tool calls and results for full parity with pi-mono.
+    session_resumed: struct {
+        entries: []ResumedEntry,
+    },
+    session_resume_failed: struct {
+        message: []u8,
+    },
+
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -89,8 +132,13 @@ pub const UiEvent = union(enum) {
                 allocator.free(l.provider_id);
                 allocator.free(l.message);
             },
+            .session_resumed => |s| {
+                for (s.entries) |*e| e.deinit(allocator);
+                allocator.free(s.entries);
+            },
+            .session_resume_failed => |f| allocator.free(f.message),
             .message_start_assistant, .message_start_user,
-            .agent_finished, .agent_error,
+            .agent_finished, .agent_error, .request_worker_finished,
             => {},
         }
     }

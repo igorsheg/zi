@@ -40,6 +40,19 @@ const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
 const AgentRequest = agent_mod.AgentRequest;
 const RequestQueue = agent_mod.RequestQueue;
+const ResumedEntry = ui_event_mod.ResumedEntry;
+const agent_protocol = agent_mod.protocol;
+
+/// Discriminates what a spawned agent worker thread is doing.
+/// `prompt` is the classic path (subscribe + ca.run); `drain_only`
+/// is zi-wub.15's spawn-on-idle for request-queue work when no
+/// prompt is in flight. Both paths drain AgentRequests at the top.
+/// See oracle review on zi-wub.15 for why this is one thread fn
+/// with a work discriminator rather than two entry points.
+const AgentWork = union(enum) {
+    prompt: []const u8,
+    drain_only: void,
+};
 const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
 const auth_storage_mod = @import("../auth/storage.zig");
@@ -657,6 +670,39 @@ pub const Interactive = struct {
                 self.tui.setFocus(self.active_editor.component());
                 self.tui.dirty = true;
             },
+            .request_worker_finished => {
+                // zi-wub.15: drain-only worker completed. Just join
+                // and hide the loader — do NOT touch status_text or
+                // focus here, the individual request handlers
+                // (.session_resumed / .session_resume_failed) owned
+                // that UI state already. See oracle note on why this
+                // is separate from .agent_finished.
+                if (self.agent_thread) |t| t.join();
+                self.agent_thread = null;
+                self.hideLoader();
+                self.tui.dirty = true;
+            },
+            .session_resumed => |r| {
+                self.transcript.clearAll();
+                for (r.entries) |entry| {
+                    switch (entry) {
+                        .user_text => |t| self.transcript.addUserMessage(t),
+                        .assistant_text => |t| {
+                            self.transcript.beginAssistantMessage();
+                            self.transcript.appendText(t);
+                        },
+                    }
+                }
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.status_text.setContent("session resumed");
+                self.status_text.fg = self.theme.fg(.success);
+                self.tui.dirty = true;
+            },
+            .session_resume_failed => |f| {
+                self.status_text.setContent(f.message);
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+            },
         }
     }
 
@@ -754,7 +800,7 @@ pub const Interactive = struct {
         self.showLoader("Working...");
         self.tui.dirty = true;
 
-        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, prompt_copy }) catch {
+        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .prompt = prompt_copy } }) catch {
             self.is_streaming = false;
             self.tui.setFocus(self.active_editor.component());
             self.status_text.setContent("failed to start agent");
@@ -935,43 +981,46 @@ pub const Interactive = struct {
             return;
         };
 
-        // Load the selected session
-        const loaded = coding_agent_mod.openSession(self.allocator, path) catch {
-            self.status_text.setContent("failed to load session");
+        // zi-wub.15: block /resume during streaming. Rebuilding the
+        // transcript while a stream is still emitting events is
+        // chaos, and our single pre-run drain point would delay the
+        // request until the *next* prompt otherwise.
+        if (self.is_streaming or self.agent_thread != null) {
+            self.status_text.setContent("cannot resume while agent is running");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        }
+
+        // Clone path into msg_allocator (doctrine R3: cross-thread
+        // payload slices must be thread-safe allocated).
+        const path_copy = self.msg_allocator.dupe(u8, path) catch {
+            self.status_text.setContent("out of memory");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
         };
 
-        // Rewire: replace session store, reload agent context
-        self.ca.session_store = loaded.store;
-        self.ca.agent.loadMessages(loaded.messages);
+        self.request_queue.push(.{ .resume_session = .{ .path = path_copy } });
 
-        // Rebuild transcript from loaded messages
-        self.transcript.clearAll();
-        for (loaded.messages) |msg| {
-            switch (msg) {
-                .user => |u| {
-                    switch (u.content) {
-                        .text => |t| self.transcript.addUserMessage(t),
-                        else => {},
-                    }
-                },
-                .assistant => |a| {
-                    self.transcript.beginAssistantMessage();
-                    for (a.content) |block| {
-                        switch (block) {
-                            .text => |tc| self.transcript.appendText(tc.text),
-                            else => {},
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-
-        self.status_text.setContent("session resumed");
-        self.status_text.fg = self.theme.fg(.success);
+        // Spawn a drain-only worker to process it. Agent thread is
+        // idle (checked above), so this starts a fresh thread whose
+        // only job is to bind lua ownership, drain the request
+        // queue, and exit.
+        self.showLoader("Loading session...");
         self.tui.dirty = true;
+
+        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
+            self.hideLoader();
+            self.status_text.setContent("failed to spawn resume worker");
+            self.status_text.fg = self.theme.fg(.@"error");
+            // Request is still in the queue — drain it ourselves to
+            // avoid leaking the path copy. Safe because no thread is
+            // concurrently touching it.
+            var drain_buf: [4]AgentRequest = undefined;
+            const n = self.request_queue.drainInto(&drain_buf);
+            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
+            return;
+        };
     }
 
     fn onSessionPickerCancel(ctx: ?*anyopaque) void {
@@ -1326,11 +1375,31 @@ pub const Interactive = struct {
         return ">1y";
     }
 
-    fn agentThreadFn(self: *Interactive, prompt_copy: []const u8) void {
-        defer self.msg_allocator.free(prompt_copy);
+    /// Agent worker thread entry point. Handles both streaming
+    /// prompts and drain-only request work (zi-wub.15). This is the
+    /// ONLY path that runs on the agent thread — any future work
+    /// that needs agent-thread ownership should extend `AgentWork`
+    /// rather than adding a second thread fn.
+    ///
+    /// Completion events are mode-aware:
+    ///   - prompt     → `.agent_finished` (classic cleanup: hide
+    ///                  loader, clear status, restore focus)
+    ///   - drain_only → `.request_worker_finished` (join only; the
+    ///                  individual request handlers publish their
+    ///                  own success/failure events, so the TUI
+    ///                  state unwinds without wiping a good status)
+    fn agentThreadFn(self: *Interactive, work: AgentWork) void {
+        defer switch (work) {
+            .prompt => |p| self.msg_allocator.free(p),
+            .drain_only => {},
+        };
 
-        const token = self.ca.agent.subscribe(&agentEventCallback, @ptrCast(self));
-        defer self.ca.agent.unsubscribe(token);
+        // Subscribe only for prompts — drain_only work doesn't stream.
+        const maybe_token: ?agent_mod.SubscriptionToken = switch (work) {
+            .prompt => self.ca.agent.subscribe(&agentEventCallback, @ptrCast(self)),
+            .drain_only => null,
+        };
+        defer if (maybe_token) |t| self.ca.agent.unsubscribe(t);
 
         // zi-wub.14: drain pending TUI→agent requests at the turn
         // boundary, before issuing the stream. This is the "safe
@@ -1338,22 +1407,29 @@ pub const Interactive = struct {
         // owner of lua_state and ca.agent.state, and not yet inside
         // a stream. Mid-stream draining is explicitly out of scope
         // (R5: no event loop in this epic).
+        //
+        // For drain_only work this IS the whole job. For prompt work
+        // it lets a queued /resume or /model take effect before the
+        // next stream starts.
         self.processAgentRequests();
 
-        self.ca.run(prompt_copy) catch {};
-
-        self.event_queue.push(.{ .agent_finished = {} });
+        switch (work) {
+            .prompt => |p| {
+                self.ca.run(p) catch {};
+                self.event_queue.push(.{ .agent_finished = {} });
+            },
+            .drain_only => {
+                self.event_queue.push(.{ .request_worker_finished = {} });
+            },
+        }
     }
 
     /// Drain the AgentRequest queue and dispatch each request on the
-    /// agent thread. zi-wub.14 introduces this as plumbing only —
-    /// no producers exist yet, so the switch arms are stubs that log
-    /// and free. zi-wub.15/.16 fill in /resume and /model dispatch.
+    /// agent thread. Runs inside `agentThreadFn` at a turn boundary.
     ///
-    /// MUST run on the agent thread. The drain itself is a bounded
-    /// critical section under the queue mutex; dispatch happens
-    /// outside the lock so handlers can publish UiEvents back via
-    /// EventQueue without re-entering the request side.
+    /// Drain → dispatch is split so handlers can publish UiEvents
+    /// back via EventQueue (and in future may take longer than the
+    /// drain critical section allows).
     fn processAgentRequests(self: *Interactive) void {
         var buf: [16]AgentRequest = undefined;
         while (true) {
@@ -1361,9 +1437,7 @@ pub const Interactive = struct {
             if (n == 0) return;
             for (buf[0..n]) |*req| {
                 switch (req.*) {
-                    .resume_session => {
-                        std.log.warn("zi-wub.14: resume_session request received but no consumer (zi-wub.15)", .{});
-                    },
+                    .resume_session => |r| self.handleResumeSession(r.path),
                     .set_model => {
                         std.log.warn("zi-wub.14: set_model request received but no consumer (zi-wub.16)", .{});
                     },
@@ -1371,6 +1445,72 @@ pub const Interactive = struct {
                 req.deinit(self.msg_allocator);
             }
         }
+    }
+
+    /// Agent-thread handler for `AgentRequest.resume_session`.
+    /// Loads the session via `openSession` (agent_arena allocated),
+    /// projects messages into `ResumedEntry` display values cloned
+    /// into `msg_allocator` (doctrine R3), and publishes either
+    /// `.session_resumed` or `.session_resume_failed` back to the TUI.
+    ///
+    /// Transcript rebuild stays on the TUI thread — this handler
+    /// does NOT touch `self.transcript`. That's .15's whole point.
+    fn handleResumeSession(self: *Interactive, path: []const u8) void {
+        const loaded = coding_agent_mod.openSession(self.allocator, path) catch {
+            const msg = self.msg_allocator.dupe(u8, "failed to load session") catch return;
+            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
+            return;
+        };
+
+        // Agent-thread state mutations (doctrine: session_store +
+        // ca.agent.state are agent-owned). Safe here — we're on the
+        // agent thread and no stream is in flight.
+        self.ca.session_store = loaded.store;
+        self.ca.agent.loadMessages(loaded.messages);
+
+        // Project messages into a display list, cloned into
+        // msg_allocator so the TUI can free them independently of
+        // agent_arena. Text-only for .15 (matches pre-.15 parity);
+        // zi-wub.24 extends this to tool calls + results.
+        var entries = std.ArrayListUnmanaged(ResumedEntry).empty;
+        defer entries.deinit(self.msg_allocator);
+
+        for (loaded.messages) |msg| {
+            switch (msg) {
+                .user => |u| switch (u.content) {
+                    .text => |t| {
+                        const cloned = self.msg_allocator.dupe(u8, t) catch continue;
+                        entries.append(self.msg_allocator, .{ .user_text = cloned }) catch {
+                            self.msg_allocator.free(cloned);
+                        };
+                    },
+                    else => {},
+                },
+                .assistant => |a| {
+                    for (a.content) |block| {
+                        switch (block) {
+                            .text => |tc| {
+                                const cloned = self.msg_allocator.dupe(u8, tc.text) catch continue;
+                                entries.append(self.msg_allocator, .{ .assistant_text = cloned }) catch {
+                                    self.msg_allocator.free(cloned);
+                                };
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const owned_entries = entries.toOwnedSlice(self.msg_allocator) catch {
+            // toOwnedSlice failed — free what we gathered and report.
+            for (entries.items) |*e| e.deinit(self.msg_allocator);
+            const msg = self.msg_allocator.dupe(u8, "out of memory building resume view") catch return;
+            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
+            return;
+        };
+        self.event_queue.push(.{ .session_resumed = .{ .entries = owned_entries } });
     }
 
     /// Agent event callback — runs on the AGENT THREAD.
