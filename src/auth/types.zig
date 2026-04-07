@@ -33,8 +33,18 @@ pub const AuthCredential = union(enum) {
 /// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:33
 pub const AuthStorageData = std.StringHashMap(AuthCredential);
 
+const log = std.log.scoped(.auth_storage);
+
 /// Parse auth.json content into AuthStorageData.
 /// Returns an owned hashmap — caller must call `deinitAuthStorageData`.
+///
+/// Resilience (zi-kfg): the OUTER `std.json.parseFromSlice` is the
+/// only operation that can fail this whole function — if the file
+/// is malformed JSON, there's nothing to recover. But once we have
+/// a parsed object, individual entry failures (missing fields,
+/// wrong types, bad UTF-8 in values) are LOGGED AND SKIPPED rather
+/// than aborting the whole map. One bricked entry must not take
+/// down every other credential. zi-m7q taught us this the hard way.
 pub fn parseAuthJson(allocator: std.mem.Allocator, json_content: []const u8) !AuthStorageData {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_content, .{});
     defer parsed.deinit();
@@ -47,57 +57,112 @@ pub fn parseAuthJson(allocator: std.mem.Allocator, json_content: []const u8) !Au
 
     var it = root.object.iterator();
     while (it.next()) |entry| {
-        const provider_id = try allocator.dupe(u8, entry.key_ptr.*);
-        errdefer allocator.free(provider_id);
+        const credential = parseEntry(allocator, entry.value_ptr.*) catch |err| {
+            log.warn("auth.json: skipping malformed entry '{s}': {s}", .{ entry.key_ptr.*, @errorName(err) });
+            continue;
+        };
 
-        const obj = entry.value_ptr.*;
-        if (obj != .object) return error.UnexpectedToken;
-
-        const type_val = obj.object.get("type") orelse return error.MissingField;
-        if (type_val != .string) return error.UnexpectedToken;
-        const type_str = type_val.string;
-
-        const credential = if (std.mem.eql(u8, type_str, "api_key")) blk: {
-            const key_val = obj.object.get("key") orelse return error.MissingField;
-            if (key_val != .string) return error.UnexpectedToken;
-            break :blk AuthCredential{ .api_key = .{
-                .key = try allocator.dupe(u8, key_val.string),
-            } };
-        } else if (std.mem.eql(u8, type_str, "oauth")) blk: {
-            const refresh_val = obj.object.get("refresh") orelse return error.MissingField;
-            const access_val = obj.object.get("access") orelse return error.MissingField;
-            const expires_val = obj.object.get("expires") orelse return error.MissingField;
-            if (refresh_val != .string) return error.UnexpectedToken;
-            if (access_val != .string) return error.UnexpectedToken;
-            if (expires_val != .integer) return error.UnexpectedToken;
-
-            var extras = std.json.ObjectMap.init(allocator);
-            var obj_it = obj.object.iterator();
-            while (obj_it.next()) |field| {
-                const k = field.key_ptr.*;
-                if (std.mem.eql(u8, k, "type") or
-                    std.mem.eql(u8, k, "refresh") or
-                    std.mem.eql(u8, k, "access") or
-                    std.mem.eql(u8, k, "expires"))
-                    continue;
-                const duped_key = try allocator.dupe(u8, k);
-                errdefer allocator.free(duped_key);
-                const cloned_val = try json_util.cloneJsonValue(allocator, field.value_ptr.*);
-                try extras.put(duped_key, cloned_val);
-            }
-
-            break :blk AuthCredential{ .oauth = .{
-                .refresh = try allocator.dupe(u8, refresh_val.string),
-                .access = try allocator.dupe(u8, access_val.string),
-                .expires = expires_val.integer,
-                .extras = extras,
-            } };
-        } else return error.UnexpectedToken;
-
-        try data.put(provider_id, credential);
+        const provider_id = allocator.dupe(u8, entry.key_ptr.*) catch |err| {
+            // OOM cleaning up the entry we just built — free it then
+            // propagate. Out-of-memory is the one error we don't try
+            // to swallow because the caller's error path needs to know.
+            freeOneCredential(allocator, credential);
+            return err;
+        };
+        data.put(provider_id, credential) catch |err| {
+            allocator.free(provider_id);
+            freeOneCredential(allocator, credential);
+            return err;
+        };
     }
 
     return data;
+}
+
+/// Parse a single auth.json entry value (the object after the
+/// provider key). Errors here are recoverable — the caller will
+/// log + skip and continue with the rest of the map.
+fn parseEntry(allocator: std.mem.Allocator, obj: std.json.Value) !AuthCredential {
+    if (obj != .object) return error.UnexpectedToken;
+
+    const type_val = obj.object.get("type") orelse return error.MissingField;
+    if (type_val != .string) return error.UnexpectedToken;
+    const type_str = type_val.string;
+
+    if (std.mem.eql(u8, type_str, "api_key")) {
+        const key_val = obj.object.get("key") orelse return error.MissingField;
+        if (key_val != .string) return error.UnexpectedToken;
+        const key_dup = try allocator.dupe(u8, key_val.string);
+        return .{ .api_key = .{ .key = key_dup } };
+    }
+
+    if (std.mem.eql(u8, type_str, "oauth")) {
+        const refresh_val = obj.object.get("refresh") orelse return error.MissingField;
+        const access_val = obj.object.get("access") orelse return error.MissingField;
+        const expires_val = obj.object.get("expires") orelse return error.MissingField;
+        if (refresh_val != .string) return error.UnexpectedToken;
+        if (access_val != .string) return error.UnexpectedToken;
+        if (expires_val != .integer) return error.UnexpectedToken;
+
+        const refresh_dup = try allocator.dupe(u8, refresh_val.string);
+        errdefer allocator.free(refresh_dup);
+        const access_dup = try allocator.dupe(u8, access_val.string);
+        errdefer allocator.free(access_dup);
+
+        var extras = std.json.ObjectMap.init(allocator);
+        errdefer {
+            var eit = extras.iterator();
+            while (eit.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                json_util.freeJsonValue(allocator, e.value_ptr.*);
+            }
+            extras.deinit();
+        }
+
+        var obj_it = obj.object.iterator();
+        while (obj_it.next()) |field| {
+            const k = field.key_ptr.*;
+            if (std.mem.eql(u8, k, "type") or
+                std.mem.eql(u8, k, "refresh") or
+                std.mem.eql(u8, k, "access") or
+                std.mem.eql(u8, k, "expires"))
+                continue;
+            const duped_key = try allocator.dupe(u8, k);
+            errdefer allocator.free(duped_key);
+            const cloned_val = try json_util.cloneJsonValue(allocator, field.value_ptr.*);
+            try extras.put(duped_key, cloned_val);
+        }
+
+        return .{ .oauth = .{
+            .refresh = refresh_dup,
+            .access = access_dup,
+            .expires = expires_val.integer,
+            .extras = extras,
+        } };
+    }
+
+    return error.UnexpectedToken;
+}
+
+/// Free a single credential's owned strings. Mirrors the cleanup
+/// done by deinitAuthStorageData per-entry, factored out so the
+/// skip-bad-entry path can free a partially-built credential
+/// without nuking the whole map.
+fn freeOneCredential(allocator: std.mem.Allocator, cred: AuthCredential) void {
+    switch (cred) {
+        .api_key => |c| allocator.free(c.key),
+        .oauth => |c| {
+            allocator.free(c.refresh);
+            allocator.free(c.access);
+            var extras = c.extras;
+            var eit = extras.iterator();
+            while (eit.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                json_util.freeJsonValue(allocator, e.value_ptr.*);
+            }
+            extras.deinit();
+        },
+    }
 }
 
 /// Serialize AuthStorageData to JSON string matching pi-mono's format.
@@ -241,5 +306,38 @@ test "round-trip serialize then parse preserves data" {
     try std.testing.expectEqualStrings("rt-1", o.oauth.refresh);
     try std.testing.expectEqualStrings("at-2", o.oauth.access);
     try std.testing.expectEqual(@as(i64, 9999999), o.oauth.expires);
+}
+
+test "zi-kfg: malformed entries are skipped, valid entries survive" {
+    // Mixed file with one good entry sandwiched between two bad ones.
+    // Pre-fix, the first bad entry would abort the whole parse and
+    // the user would lose ALL credentials. Post-fix, parseAuthJson
+    // logs and skips the bad ones, returns a map with just "good".
+    const input =
+        \\{
+        \\  "missing-type": {
+        \\    "refresh": "rt",
+        \\    "access": "at",
+        \\    "expires": 1
+        \\  },
+        \\  "good": {
+        \\    "type": "api_key",
+        \\    "key": "sk-keep-me"
+        \\  },
+        \\  "wrong-type-on-key": {
+        \\    "type": "api_key",
+        \\    "key": 12345
+        \\  }
+        \\}
+    ;
+
+    var data = try parseAuthJson(std.testing.allocator, input);
+    defer deinitAuthStorageData(&data);
+
+    try std.testing.expectEqual(@as(u32, 1), data.count());
+    const good = data.get("good").?;
+    try std.testing.expectEqualStrings("sk-keep-me", good.api_key.key);
+    try std.testing.expect(data.get("missing-type") == null);
+    try std.testing.expect(data.get("wrong-type-on-key") == null);
 }
 
