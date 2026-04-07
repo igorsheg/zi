@@ -260,10 +260,13 @@ pub const ExtensionRunner = struct {
     /// pre-computed data.
     lua_owner_thread: std.atomic.Value(std.Thread.Id) = .{ .raw = 0 },
 
-    /// Phase 1 soft-trace counter (zi-wub.3). Counts wrong-thread
-    /// `assertOnLuaThread` calls so we can log without spamming.
-    /// Removed by zi-wub.21 once phase 2 flips the assert to fatal.
-    lua_wrong_thread_warn_count: std.atomic.Value(u32) = .{ .raw = 0 },
+    /// Phase 1 soft-trace state (zi-wub.3). Per-tid dedupe so each
+    /// distinct offending thread logs exactly once instead of
+    /// drowning the log in repeats from one busy thread. Removed by
+    /// zi-wub.21 once phase 2 flips the assert to fatal.
+    lua_wrong_thread_mutex: std.Thread.Mutex = .{},
+    lua_wrong_thread_seen: [16]std.Thread.Id = @splat(0),
+    lua_wrong_thread_seen_count: u8 = 0,
 
     /// Scratch arena for hook return values that the agent loop must
     /// hold across a tool-call iteration. The agent's hook signatures
@@ -330,7 +333,7 @@ pub const ExtensionRunner = struct {
     ///     owner via an atomic compare-and-swap.
     ///   - Subsequent calls from the same thread: no-op.
     ///   - Subsequent calls from a different thread: log a warning
-    ///     (rate-limited to ~32 messages per process) and CONTINUE.
+    ///     once per unique offending tid (capped at 16) and CONTINUE.
     ///     We deliberately do NOT panic yet because the first-touch
     ///     claim may have pinned the wrong owner — phase 2
     ///     (`bindLuaOwnerThread`, zi-wub.5/.6/.7) replaces the claim
@@ -355,16 +358,21 @@ pub const ExtensionRunner = struct {
         );
         const owner = prev orelse tid;
         if (owner != tid) {
-            // SOFT TRACE (zi-wub.3): log first ~32 violations and keep
-            // running so phase 1 audit can collect them all. Removed
-            // by zi-wub.21 once phase 2 lands the explicit bind.
-            const seen = self.lua_wrong_thread_warn_count.fetchAdd(1, .monotonic);
-            if (seen < 32) {
-                std.log.warn(
-                    "[zi-wub.3] lua_state touched from wrong thread: this={d} owner={d} (warn {d}/32)",
-                    .{ tid, owner, seen + 1 },
-                );
-            }
+            // SOFT TRACE (zi-wub.3): log once per unique offending
+            // tid so phase 1 audit can enumerate distinct violators
+            // without one busy thread drowning the log. Removed by
+            // zi-wub.21 once phase 2 lands the explicit bind.
+            self.lua_wrong_thread_mutex.lock();
+            defer self.lua_wrong_thread_mutex.unlock();
+            const seen_slice = self.lua_wrong_thread_seen[0..self.lua_wrong_thread_seen_count];
+            for (seen_slice) |s| if (s == tid) return;
+            if (self.lua_wrong_thread_seen_count >= self.lua_wrong_thread_seen.len) return;
+            self.lua_wrong_thread_seen[self.lua_wrong_thread_seen_count] = tid;
+            self.lua_wrong_thread_seen_count += 1;
+            std.log.warn(
+                "[zi-wub.3] lua_state touched from wrong thread: this={d} owner={d} (unique offender #{d})",
+                .{ tid, owner, self.lua_wrong_thread_seen_count },
+            );
         }
     }
 
