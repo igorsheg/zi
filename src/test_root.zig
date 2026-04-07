@@ -14,4 +14,5 @@ test {
     _ = @import("extensions/registries/root.zig");
     _ = @import("extensions/runner.zig");
     _ = @import("extensions/api.zig");
+    _ = @import("extensions/dispatch.zig");
 }
