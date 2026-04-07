@@ -55,6 +55,15 @@ pub const AutocompleteProvider = struct {
 };
 
 // --- SlashCommandProvider ---
+//
+// zi-wub.19: this provider runs on the TUI thread on every keystroke.
+// Today the registry it reads is TUI-owned and its `dynamic` arm is
+// empty (no extension registers a slash command yet), so the read is
+// structurally safe. When extension commands land, this provider must
+// NOT reach into `ExtensionRunner.command_registry` directly and must
+// NOT call into lua. Instead, swap `registry` for a TUI-owned
+// `*const CommandSnapshot` that the agent thread publishes after each
+// mutation. See .zi/design-notes/command-snapshot.md.
 
 const slash_commands_mod = @import("../slash_commands.zig");
 const CommandRegistry = slash_commands_mod.CommandRegistry;
