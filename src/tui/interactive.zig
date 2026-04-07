@@ -221,7 +221,7 @@ pub const Interactive = struct {
             .widget_below_container = container_mod.Container.init(allocator),
             .command_registry = CommandRegistry.init(allocator),
             .input = input_buffer_mod.InputBuffer.init(allocator),
-            .event_queue = EventQueue(UiEvent).init(allocator),
+            .event_queue = EventQueue(UiEvent).init(msg_allocator),
             .ca = ca,
             .auth_storage = auth_storage,
         };
