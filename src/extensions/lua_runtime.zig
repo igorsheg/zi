@@ -162,7 +162,195 @@ pub const LuaState = struct {
         const call_rc = c.lua_pcallk(self.L, 0, c.LUA_MULTRET, 0, 0, null);
         if (call_rc != c.LUA_OK) return mapCallError(self.L, call_rc);
     }
+
+    /// Compile a chunk and leave the resulting function on the top of
+    /// the stack. The caller decides what to do with it (call now,
+    /// store via `luaL_ref`, etc.). Used by the extension loader to
+    /// capture factories without invoking them, so the loader can
+    /// hand a fresh `zi` table to each one.
+    pub fn loadChunk(self: *LuaState, src: []const u8, chunk_name: [:0]const u8) LuaError!void {
+        const rc = c.luaL_loadbufferx(self.L, src.ptr, src.len, chunk_name.ptr, null);
+        if (rc != c.LUA_OK) return mapLoadError(self.L, rc);
+    }
+
+    /// Push a C function as a closure with one upvalue (a light
+    /// userdata pointer). The C function reads the pointer back via
+    /// `lua_upvalueindex(1)`. This is the canonical way to give a
+    /// stateless C function access to per-state context (in our case
+    /// the `ExtensionRunner` it should mutate).
+    ///
+    /// The closure is left on top of the stack — caller stores it
+    /// wherever they want (global, table field, etc.).
+    pub fn pushCClosureWithUserdata(
+        self: *LuaState,
+        func: c.lua_CFunction,
+        ud: *anyopaque,
+    ) void {
+        c.lua_pushlightuserdata(self.L, ud);
+        c.lua_pushcclosure(self.L, func, 1);
+    }
 };
+
+// =============================================================================
+// Lua → zig value extraction
+// =============================================================================
+
+pub const ConvertError = error{
+    OutOfMemory,
+    UnsupportedLuaType,
+    InvalidUtf8,
+};
+
+/// Read a Lua-stack value at the given (absolute or negative) index
+/// and produce an owned `std.json.Value`. Recursively walks tables.
+///
+/// Ownership: every string and every nested map/array is allocated
+/// from `allocator`. The returned value is COMPLETELY independent of
+/// the Lua state — the caller can collect it after the Lua stack
+/// unwinds, GCs, or the whole `lua_close` happens. This is the spec's
+/// §Ownership-and-Reload invariant: "Zig never stores pointers into
+/// Lua-managed memory."
+///
+/// Table ↔ JSON shape rule: a Lua table whose keys are exactly
+/// `1..#t` (a "sequence" in Lua parlance) becomes a JSON array.
+/// Anything else becomes an object with stringified keys. The
+/// detection uses `lua_rawlen` for the length and a single pass over
+/// the keys via `lua_next`. Mixed-shape tables (sparse arrays, or
+/// arrays with extra string keys) collapse to objects — JSON has no
+/// mixed shape, and this matches how pi-mono's TypeBox-driven
+/// schemas serialize today.
+pub fn luaValueToJson(
+    L: *c.lua_State,
+    index: c_int,
+    allocator: std.mem.Allocator,
+) ConvertError!std.json.Value {
+    // Normalize negative indices once so recursive calls don't drift
+    // when they push intermediate values onto the stack.
+    const abs_idx: c_int = if (index < 0) c.lua_gettop(L) + index + 1 else index;
+
+    return switch (c.lua_type(L, abs_idx)) {
+        c.LUA_TNIL, c.LUA_TNONE => .null,
+        c.LUA_TBOOLEAN => .{ .bool = c.lua_toboolean(L, abs_idx) != 0 },
+        c.LUA_TNUMBER => blk: {
+            if (c.lua_isinteger(L, abs_idx) != 0) {
+                break :blk .{ .integer = c.lua_tointegerx(L, abs_idx, null) };
+            }
+            break :blk .{ .float = c.lua_tonumberx(L, abs_idx, null) };
+        },
+        c.LUA_TSTRING => blk: {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, abs_idx, &len) orelse return error.InvalidUtf8;
+            const dup = try allocator.dupe(u8, ptr[0..len]);
+            break :blk .{ .string = dup };
+        },
+        c.LUA_TTABLE => luaTableToJson(L, abs_idx, allocator),
+        // Functions, userdata, threads — none are JSON-representable.
+        // Caller should special-case execute=function before reaching
+        // here (it gets stored as a luaL_ref, not a value).
+        else => error.UnsupportedLuaType,
+    };
+}
+
+fn luaTableToJson(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+) ConvertError!std.json.Value {
+    const seq_len = c.lua_rawlen(L, table_idx);
+    if (seq_len > 0 and isSequence(L, table_idx, seq_len)) {
+        var arr = std.json.Array.init(allocator);
+        errdefer freeJsonValue(allocator, .{ .array = arr });
+        try arr.ensureTotalCapacity(seq_len);
+
+        var i: c.lua_Integer = 1;
+        while (@as(usize, @intCast(i)) <= seq_len) : (i += 1) {
+            _ = c.lua_rawgeti(L, table_idx, i);
+            const elem = try luaValueToJson(L, -1, allocator);
+            c.lua_pop(L, 1);
+            try arr.append(elem);
+        }
+        return .{ .array = arr };
+    }
+
+    var obj = std.json.ObjectMap.init(allocator);
+    errdefer freeJsonValue(allocator, .{ .object = obj });
+
+    // Iterate via lua_next: push nil, then each call replaces the key
+    // with key+value. We pop the value after extracting, leaving the
+    // key for the next iteration.
+    c.lua_pushnil(L);
+    while (c.lua_next(L, table_idx) != 0) {
+        // Stack now: ... key value
+        // Stringify the key without coercing it on the actual stack
+        // (lua_tostring on a non-string key would mutate it and break
+        // lua_next's invariant). Use a sidecar push.
+        var key_buf: [64]u8 = undefined;
+        const key_str: []const u8 = switch (c.lua_type(L, -2)) {
+            c.LUA_TSTRING => blk: {
+                var len: usize = 0;
+                const ptr = c.lua_tolstring(L, -2, &len) orelse return error.InvalidUtf8;
+                break :blk ptr[0..len];
+            },
+            c.LUA_TNUMBER => blk: {
+                if (c.lua_isinteger(L, -2) != 0) {
+                    const n = c.lua_tointegerx(L, -2, null);
+                    break :blk std.fmt.bufPrint(&key_buf, "{d}", .{n}) catch return error.OutOfMemory;
+                }
+                const f = c.lua_tonumberx(L, -2, null);
+                break :blk std.fmt.bufPrint(&key_buf, "{d}", .{f}) catch return error.OutOfMemory;
+            },
+            else => return error.UnsupportedLuaType,
+        };
+
+        const key_dup = try allocator.dupe(u8, key_str);
+        errdefer allocator.free(key_dup);
+
+        const value = try luaValueToJson(L, -1, allocator);
+        try obj.put(key_dup, value);
+
+        c.lua_pop(L, 1); // pop value, keep key for next iteration
+    }
+
+    return .{ .object = obj };
+}
+
+fn isSequence(L: *c.lua_State, table_idx: c_int, expected_len: usize) bool {
+    // A Lua "sequence" has exactly the integer keys 1..n with no
+    // gaps. We confirm by counting how many integer keys in 1..n
+    // exist. Cheaper than walking every key for the common case.
+    var i: c.lua_Integer = 1;
+    while (@as(usize, @intCast(i)) <= expected_len) : (i += 1) {
+        const t = c.lua_rawgeti(L, table_idx, i);
+        c.lua_pop(L, 1);
+        if (t == c.LUA_TNIL) return false;
+    }
+    return true;
+}
+
+/// Free a `std.json.Value` previously produced by `luaValueToJson`.
+/// Local helper duplicated from `ai/json_util.zig` to keep the
+/// extensions package free of upward dependencies. Recursive walk
+/// over arrays and objects; scalars own only their string slice.
+pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .null, .bool, .integer, .float, .number_string => {},
+        .string => |s| allocator.free(s),
+        .array => |arr| {
+            var a = arr;
+            for (a.items) |v| freeJsonValue(allocator, v);
+            a.deinit();
+        },
+        .object => |obj| {
+            var o = obj;
+            var it = o.iterator();
+            while (it.next()) |kv| {
+                allocator.free(kv.key_ptr.*);
+                freeJsonValue(allocator, kv.value_ptr.*);
+            }
+            o.deinit();
+        },
+    }
+}
 
 // =============================================================================
 // Coroutines

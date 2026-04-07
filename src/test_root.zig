@@ -13,4 +13,5 @@ test {
     _ = @import("extensions/lua_runtime.zig");
     _ = @import("extensions/registries/root.zig");
     _ = @import("extensions/runner.zig");
+    _ = @import("extensions/api.zig");
 }
