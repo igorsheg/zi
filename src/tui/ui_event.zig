@@ -64,6 +64,13 @@ pub const UiEvent = union(enum) {
     },
 
     // --- login lifecycle ---
+    // zi-wub.17: login thread publishes progress/auth-url through the
+    // event queue instead of mutating status_text directly. Single-owner
+    // invariant restored for status_text — only the TUI thread writes.
+    login_progress: struct {
+        message: []u8,
+        kind: enum { info, auth_url },
+    },
     login_complete: struct {
         provider_id: []u8,
         success: bool,
@@ -136,6 +143,7 @@ pub const UiEvent = union(enum) {
                 allocator.free(t.tool_call_id);
                 if (t.result) |r| r.free(allocator);
             },
+            .login_progress => |l| allocator.free(l.message),
             .login_complete => |l| {
                 allocator.free(l.provider_id);
                 allocator.free(l.message);

@@ -637,6 +637,14 @@ pub const Interactive = struct {
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
+            .login_progress => |l| {
+                self.status_text.setContent(l.message);
+                self.status_text.fg = switch (l.kind) {
+                    .auth_url => self.theme.fg(.accent),
+                    .info => self.theme.fg(.muted),
+                };
+                self.tui.dirty = true;
+            },
             .login_complete => |l| {
                 if (self.login_thread) |t| t.join();
                 self.login_thread = null;
@@ -1330,6 +1338,13 @@ pub const Interactive = struct {
         }
     }
 
+    // zi-wub.17: login-thread callbacks. These run on the login
+    // thread, so they MUST NOT touch TUI-owned state (status_text,
+    // tui.dirty, etc). Instead they publish a `login_progress` event
+    // on `event_queue` with an msg_allocator-owned payload; the TUI
+    // thread consumes it from the normal drain loop. Single-owner
+    // invariant for status_text is restored — only the TUI thread
+    // writes it.
     fn onLoginAuth(url: []const u8, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
 
@@ -1341,16 +1356,14 @@ pub const Interactive = struct {
                 &.{ "xdg-open", url },
         }) catch {};
 
-        self.status_text.setContent("login: check your browser");
-        self.status_text.fg = self.theme.fg(.accent);
-        self.tui.dirty = true;
+        const msg = self.msg_allocator.dupe(u8, "login: check your browser") catch return;
+        self.event_queue.push(.{ .login_progress = .{ .message = msg, .kind = .auth_url } });
     }
 
     fn onLoginProgress(msg: []const u8, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.status_text.setContent(msg);
-        self.status_text.fg = self.theme.fg(.muted);
-        self.tui.dirty = true;
+        const owned = self.msg_allocator.dupe(u8, msg) catch return;
+        self.event_queue.push(.{ .login_progress = .{ .message = owned, .kind = .info } });
     }
 
     /// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y"
