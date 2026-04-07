@@ -119,10 +119,17 @@ pub const AuthStorage = struct {
             return;
         };
 
-        // Free old entry if present
+        // On collision, std.HashMap.fetchPut KEEPS the existing key
+        // and only replaces the value (verified against zig stdlib
+        // hash_map.zig:902-912 + 1099-1104). The map never adopts
+        // `key_duped` when found_existing == true, so we MUST free
+        // the fresh dup, NOT `old.key` — freeing old.key would
+        // dangle the live key still in the map and the next
+        // serialize would write whatever the GPA filled the freed
+        // bytes with (0xAA in Debug). zi-m7q.
         if (self.data.fetchPut(key_duped, cred_duped) catch null) |old| {
             freeCredential(self.allocator, old.value);
-            self.allocator.free(old.key);
+            self.allocator.free(key_duped);
         }
 
         self.persistProviderChange(provider, credential);
@@ -177,8 +184,10 @@ pub const AuthStorage = struct {
             return;
         };
 
+        // See zi-m7q note in `set()` — fetchPut keeps the existing
+        // key on collision; we MUST free the fresh dup, not old.key.
         if (self.runtime_overrides.fetchPut(key_duped, val_duped) catch null) |old| {
-            self.allocator.free(old.key);
+            self.allocator.free(key_duped);
             self.allocator.free(old.value);
         }
     }
@@ -385,11 +394,17 @@ pub const AuthStorage = struct {
         const key_dup = try self.allocator.dupe(u8, provider);
         errdefer self.allocator.free(key_dup);
 
+        // See zi-m7q note in `set()` — on collision the map keeps
+        // the existing key, so free `key_dup` (the fresh dup), NOT
+        // old.key. Freeing old.key dangles the live key still in
+        // the map; the next serializeAuthJson writes garbage and
+        // bricks parseAuthJson on the next reload. This path is
+        // hot because every expired-oauth getApiKey() lands here.
         if (self.data.fetchPut(key_dup, cloned) catch |e| {
             return e;
         }) |old| {
             freeCredential(self.allocator, old.value);
-            self.allocator.free(old.key);
+            self.allocator.free(key_dup);
         }
     }
 
@@ -576,4 +591,25 @@ test "hasAuth checks all tiers" {
 fn fallbackForTest(provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "fallback-provider")) return "fallback-key";
     return null;
+}
+
+test "zi-m7q: repeated set on same provider keeps key valid (no UAF on serialize)" {
+    // Regression: pre-fix, the second set() freed the live map key
+    // because std.HashMap.fetchPut keeps the existing key on
+    // collision. The next serializeAuthJson then wrote 0xAA bytes
+    // (debug undefined fill) and bricked auth.json on reload.
+    const allocator = std.testing.allocator;
+
+    var storage = try AuthStorage.inMemory(allocator, null);
+    defer storage.deinit();
+
+    storage.set("anthropic", .{ .api_key = .{ .key = "one" } });
+    storage.set("anthropic", .{ .api_key = .{ .key = "two" } });
+
+    const json = try types.serializeAuthJson(allocator, storage.getAll());
+    defer allocator.free(json);
+
+    // Pre-fix: this would be `"\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"`.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"two\"") != null);
 }
