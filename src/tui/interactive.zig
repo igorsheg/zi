@@ -274,7 +274,45 @@ pub const Interactive = struct {
             if (self.login_thread) |t| t.join();
             self.login_thread = null;
         }
-        if (self.agent_thread) |t| t.join();
+        // zi-wub.28: if a prompt is mid-flight, abort + join it
+        // before doing anything else. The next steps spawn a fresh
+        // drain_only worker that rebinds the lua owner; the runner
+        // contract requires the previous thread to be fully joined.
+        if (self.agent_thread) |t| {
+            if (self.is_streaming) self.ca.agent.abort();
+            t.join();
+            self.agent_thread = null;
+            self.is_streaming = false;
+        }
+
+        // zi-wub.28: shutdown the extension runner + lua_State on
+        // the agent thread. We:
+        //   1. drain + free any stale pending requests (a queued
+        //      /resume or /model whose result event will never be
+        //      consumed — quit semantics > best-effort delivery)
+        //   2. null transcript.lua_runner so any late refresh path
+        //      can't dereference a freed runner
+        //   3. push .shutdown, spawn one final drain_only worker,
+        //      join it. The worker binds owner, drains, calls
+        //      ca.shutdownExtensionsOnAgentThread() which nulls the
+        //      ext fields so the upcoming ca.deinit() skips them.
+        //
+        // Skipped entirely if there's no extension runner (tests,
+        // extensionless mode) — nothing to tear down on the agent
+        // thread, plain ca.deinit() handles it.
+        if (self.ca.extensionRunner() != null) {
+            var stale: [16]AgentRequest = undefined;
+            while (true) {
+                const n = self.request_queue.drainInto(&stale);
+                if (n == 0) break;
+                for (stale[0..n]) |*req| req.deinit(self.msg_allocator);
+            }
+            self.transcript.lua_runner = null;
+            self.request_queue.push(.{ .shutdown = {} });
+            const t = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch null;
+            if (t) |handle| handle.join();
+        }
+
         // drain and free any remaining events
         var drain_buf: [64]UiEvent = undefined;
         while (true) {
@@ -1449,6 +1487,19 @@ pub const Interactive = struct {
         };
         defer if (maybe_token) |t| self.ca.agent.unsubscribe(t);
 
+        // zi-wub.28: bind lua owner on the drain_only path too. The
+        // .15/.16 handlers don't touch lua, but `.shutdown` calls
+        // `lua_close` and we want this thread to be the bound owner
+        // when zi-wub.7 flips wrong-thread access to fatal. Safe
+        // because the previous agent_thread (if any) was joined
+        // before we were spawned (caller invariant — see deinit
+        // and the dispatch sites in handleSlashResume / setModel).
+        if (work == .drain_only) {
+            if (self.ca.extensionRunner()) |runner| {
+                runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+            }
+        }
+
         // zi-wub.14: drain pending TUI→agent requests at the turn
         // boundary, before issuing the stream. This is the "safe
         // point" the doctrine specifies — we are on the agent thread,
@@ -1487,6 +1538,13 @@ pub const Interactive = struct {
                 switch (req.*) {
                     .resume_session => |r| self.handleResumeSession(r.path),
                     .set_model => |s| self.handleSetModel(s.model),
+                    // zi-wub.28: terminal request. Tears down the
+                    // runner + lua_State on the agent thread (the
+                    // owner). After this returns, ca's extension
+                    // fields are nulled and `AgentSession.deinit`
+                    // (which still runs on the TUI thread for non-
+                    // extension teardown) will skip the lua blocks.
+                    .shutdown => self.ca.shutdownExtensionsOnAgentThread(),
                 }
                 req.deinit(self.msg_allocator);
             }

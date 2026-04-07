@@ -322,10 +322,42 @@ pub const AgentSession = struct {
         return self;
     }
 
+    /// Tear down the extension runner + lua_State on whichever thread
+    /// owns the lua_State. This MUST run on the agent thread (the
+    /// owner per zi-wub.5/.6) so `lua_close` happens on the bound
+    /// thread. Called by `Interactive.deinit` via the
+    /// `AgentRequest.shutdown` channel (zi-wub.28); after this runs,
+    /// `AgentSession.deinit` sees null fields and skips the blocks.
+    ///
+    /// Idempotent. Unsubscribes the extension bridge first so no
+    /// in-flight agent event can re-enter the runner mid-teardown.
+    pub fn shutdownExtensionsOnAgentThread(self: *AgentSession) void {
+        if (self._extension_subscription_token) |token| {
+            self.agent.unsubscribe(token);
+            self._extension_subscription_token = null;
+        }
+        if (self._extension_runner) |runner| {
+            runner.deinit();
+            self.allocator.destroy(runner);
+            self._extension_runner = null;
+        }
+        if (self._extension_lua_state) |state| {
+            state.deinit();
+            self.allocator.destroy(state);
+            self._extension_lua_state = null;
+        }
+    }
+
     pub fn deinit(self: *AgentSession) void {
         // Unsubscribe extension bridge FIRST so no agent event can
         // re-enter the runner mid-teardown. Then unsubscribe the
         // persistence listener.
+        // zi-wub.28: in interactive mode the extension teardown
+        // already ran on the agent thread via
+        // shutdownExtensionsOnAgentThread() — these blocks are no-ops
+        // because the fields are already null. Non-interactive callers
+        // (tests, print mode without ext) still get the same teardown
+        // here, on whatever thread owns lua (single-thread by default).
         if (self._extension_subscription_token) |token| {
             self.agent.unsubscribe(token);
             self._extension_subscription_token = null;
@@ -333,11 +365,6 @@ pub const AgentSession = struct {
         if (self._subscription_token) |token| {
             self.agent.unsubscribe(token);
         }
-        // Tear down the extension runner BEFORE the agent, so any
-        // session_shutdown observers can still see a live Agent.
-        // Order: runner.deinit drops registries (handler refs are
-        // integers — safe), THEN lua_state.deinit calls lua_close
-        // which actually reclaims those refs.
         if (self._extension_runner) |runner| {
             runner.deinit();
             self.allocator.destroy(runner);

@@ -20,9 +20,11 @@ const ai_protocol = @import("../ai/protocol.zig");
 ///   - resume_session : consumed by zi-wub.15 (/resume)
 ///   - set_model      : consumed by zi-wub.16 (/model)
 ///
-/// `shutdown` is intentionally NOT defined yet. It belongs with the
-/// zi-wub.7 unblock work (clean lua_close ordering on exit) and will
-/// be added when that bead is unblocked.
+/// `shutdown` (zi-wub.28) is the terminal request: pushed by
+/// `Interactive.deinit` so the agent thread itself tears down the
+/// extension runner and lua_State on the thread that owns them.
+/// This unblocks zi-wub.7 (flipping wrong-thread lua access to
+/// fatal) by ensuring `lua_close` no longer runs on the TUI thread.
 ///
 /// Allocator rule (doctrine R3): every payload slice carried by an
 /// AgentRequest MUST be allocated from the thread-safe `msg_allocator`,
@@ -31,11 +33,13 @@ const ai_protocol = @import("../ai/protocol.zig");
 pub const AgentRequest = union(enum) {
     resume_session: struct { path: []const u8 },
     set_model: struct { model: ai_protocol.Model },
+    shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .resume_session => |r| allocator.free(r.path),
             .set_model => {},
+            .shutdown => {},
         }
     }
 };
