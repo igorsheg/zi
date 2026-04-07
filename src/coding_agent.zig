@@ -10,6 +10,7 @@ const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const extension_api = @import("extensions/api.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
+const extension_loader = @import("extensions/loader.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -212,6 +213,30 @@ pub const AgentSession = struct {
             extension_api.installZiTable(state_ptr, runner_ptr);
             ext_state = state_ptr;
             ext_runner = runner_ptr;
+
+            // Discover + execute .lua files from explicit > user >
+            // project paths. Every file runs as a flat script against
+            // the shared state; registrations land in the runner's
+            // registries. Per-extension errors are logged and skipped.
+            const discovered: []extension_loader.LoadedExtension = extension_loader.discover(.{
+                .allocator = allocator,
+                .cwd = options.cwd,
+            }) catch |err| disc_blk: {
+                std.log.scoped(.extensions).warn(
+                    "extension discovery failed: {s}",
+                    .{@errorName(err)},
+                );
+                break :disc_blk &.{};
+            };
+            defer if (discovered.len > 0) extension_loader.freeExtensions(allocator, discovered);
+
+            if (discovered.len > 0) {
+                const stats = extension_loader.loadAll(allocator, state_ptr, discovered);
+                std.log.scoped(.extensions).info(
+                    "extensions: {d} loaded, {d} failed of {d} discovered",
+                    .{ stats.loaded, stats.failed, stats.attempted },
+                );
+            }
         }
 
         const self = AgentSession{

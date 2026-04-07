@@ -1,7 +1,14 @@
 const std = @import("std");
 const storage = @import("../storage.zig");
+const lua_runtime = @import("lua_runtime.zig");
 
 const log = std.log.scoped(.extensions);
+
+/// Max extension file size. 1 MiB is absurdly generous for a Lua
+/// script; anything larger is almost certainly a mistake (binary
+/// in the wrong dir, runaway generator). Capping here keeps the
+/// read path bounded without needing streaming.
+const MAX_EXTENSION_SIZE: usize = 1024 * 1024;
 
 /// Source of an extension file.
 pub const ExtensionSource = enum { explicit, user, project, builtin };
@@ -198,7 +205,79 @@ fn addExtension(
     });
 }
 
+// ── Factory execution ───────────────────────────────────────────────
+//
+// v1 model: an extension is a flat Lua script that calls `zi.register_tool`
+// and `zi.on` at top level. We read each file and execute it via
+// `LuaState.doString` against the shared state. No factory wrapping yet
+// (pi-mono uses `factory(zi)` closures; we skip that until v2 needs
+// per-extension sandboxing).
+//
+// Ordering matches `discover` output: explicit → user → project. The
+// tool/command registries are first-registered-wins, so a user override
+// of a project tool arrives at registration BEFORE the project version
+// and silently drops it. Event handlers are additive and run in
+// registration order.
+
+pub const LoadStats = struct {
+    attempted: u32 = 0,
+    loaded: u32 = 0,
+    failed: u32 = 0,
+};
+
+/// Read each discovered extension file and execute it against `state`.
+/// Per-file read or Lua errors are logged and skipped — one broken
+/// extension does not prevent the others from loading. Returns a small
+/// stat bundle for the caller to log.
+///
+/// Caller must have already installed `zi.*` on the state (via
+/// `extensions/api.zig:installZiTable`) before calling this.
+pub fn loadAll(
+    allocator: std.mem.Allocator,
+    state: *lua_runtime.LuaState,
+    list: []const LoadedExtension,
+) LoadStats {
+    var stats: LoadStats = .{};
+    for (list) |ext| {
+        stats.attempted += 1;
+        loadOne(allocator, state, ext) catch |err| {
+            log.warn("extension load failed: {s} ({s}): {s}", .{
+                ext.id,
+                ext.path,
+                @errorName(err),
+            });
+            stats.failed += 1;
+            continue;
+        };
+        stats.loaded += 1;
+        log.debug("extension loaded: {s} [{s}]", .{ ext.id, @tagName(ext.source) });
+    }
+    return stats;
+}
+
+fn loadOne(
+    allocator: std.mem.Allocator,
+    state: *lua_runtime.LuaState,
+    ext: LoadedExtension,
+) !void {
+    // Read source from disk.
+    const file = try std.fs.openFileAbsolute(ext.path, .{});
+    defer file.close();
+    const src = try file.readToEndAlloc(allocator, MAX_EXTENSION_SIZE);
+    defer allocator.free(src);
+
+    // Lua chunk names are null-terminated C strings. Dupe-Z with the
+    // extension id so runtime errors reference a meaningful source.
+    const chunk_name = try allocator.dupeZ(u8, ext.id);
+    defer allocator.free(chunk_name);
+
+    try state.doString(src, chunk_name);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
+
+const api = @import("api.zig");
+const runner_mod = @import("runner.zig");
 
 test "discover finds foo.lua and bar/init.lua in a temp dir" {
     const allocator = std.testing.allocator;
@@ -210,12 +289,12 @@ test "discover finds foo.lua and bar/init.lua in a temp dir" {
     var ext_dir = try tmp.dir.openDir("extensions", .{});
 
     // foo.lua (single-file extension)
-    try ext_dir.writeFile("foo.lua", "-- foo extension");
+    try ext_dir.writeFile(.{ .sub_path = "foo.lua", .data = "-- foo extension" });
 
     // bar/init.lua (directory extension)
     try ext_dir.makeDir("bar");
     var bar_dir = try ext_dir.openDir("bar", .{});
-    try bar_dir.writeFile("init.lua", "-- bar extension");
+    try bar_dir.writeFile(.{ .sub_path = "init.lua", .data = "-- bar extension" });
 
     // Get absolute path to the extensions dir
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
@@ -283,10 +362,10 @@ test "explicit paths come first in result order" {
     // Create user extensions dir with one extension
     try tmp.dir.makeDir("extensions");
     var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.writeFile("user_ext.lua", "-- user");
+    try ext_dir.writeFile(.{ .sub_path = "user_ext.lua", .data = "-- user" });
 
     // Create explicit extension file
-    try tmp.dir.writeFile("explicit_ext.lua", "-- explicit");
+    try tmp.dir.writeFile(.{ .sub_path = "explicit_ext.lua", .data = "-- explicit" });
 
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
@@ -310,4 +389,85 @@ test "explicit paths come first in result order" {
     try std.testing.expectEqual(ExtensionSource.explicit, exts[0].source);
     try std.testing.expectEqualStrings("user_ext", exts[1].id);
     try std.testing.expectEqual(ExtensionSource.user, exts[1].source);
+}
+
+test "loadAll executes discovered .lua files and registrations land" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.writeFile(.{
+        .sub_path = "hello.lua",
+        .data =
+        \\_loaded = true
+        \\zi.on("message_end", function(e, ctx) end)
+        ,
+    });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const exts = try discover(.{
+        .allocator = allocator,
+        .cwd = "/nonexistent",
+        .agent_dir_override = tmp_path,
+    });
+    defer freeExtensions(allocator, exts);
+    try std.testing.expectEqual(@as(usize, 1), exts.len);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.attempted);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expectEqual(@as(u32, 0), stats.failed);
+
+    // The script set a global and registered a handler — verify both.
+    try state.doString("assert(_loaded == true)", "verify");
+    try std.testing.expectEqual(@as(usize, 1), runner.event_registry.handlers(.message_end).len);
+}
+
+test "loadAll continues after a broken extension" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.writeFile(.{ .sub_path = "broken.lua", .data = "this is not valid lua !!!" });
+    try ext_dir.writeFile(.{ .sub_path = "good.lua", .data = "_good = 42" });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const exts = try discover(.{
+        .allocator = allocator,
+        .cwd = "/nonexistent",
+        .agent_dir_override = tmp_path,
+    });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, exts);
+    try std.testing.expectEqual(@as(u32, 2), stats.attempted);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expectEqual(@as(u32, 1), stats.failed);
+
+    // Good extension still ran despite broken sibling.
+    try state.doString("assert(_good == 42)", "verify");
 }
