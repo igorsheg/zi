@@ -260,6 +260,11 @@ pub const ExtensionRunner = struct {
     /// pre-computed data.
     lua_owner_thread: std.atomic.Value(std.Thread.Id) = .{ .raw = 0 },
 
+    /// Phase 1 soft-trace counter (zi-wub.3). Counts wrong-thread
+    /// `assertOnLuaThread` calls so we can log without spamming.
+    /// Removed by zi-wub.21 once phase 2 flips the assert to fatal.
+    lua_wrong_thread_warn_count: std.atomic.Value(u32) = .{ .raw = 0 },
+
     /// Scratch arena for hook return values that the agent loop must
     /// hold across a tool-call iteration. The agent's hook signatures
     /// take no allocator, so the bridge needs a place to put owned
@@ -320,16 +325,17 @@ pub const ExtensionRunner = struct {
     /// (lua_tool.execute, event_bridge dispatch, render hook
     /// precompute, etc.) before any Lua C API call.
     ///
-    /// Behavior:
+    /// Behavior (phase 1 — soft tracing, zi-wub.3):
     ///   - First call ever: claims the current thread as the
-    ///     owner via an atomic compare-and-swap. All future calls
-    ///     must come from this same thread.
+    ///     owner via an atomic compare-and-swap.
     ///   - Subsequent calls from the same thread: no-op.
-    ///   - Subsequent calls from a different thread: `@panic`
-    ///     with the offending thread id and the owning thread
-    ///     id. This is intentional — silently allowing the call
-    ///     would corrupt Lua's GC and crash deep inside libC
-    ///     with no breadcrumb trail.
+    ///   - Subsequent calls from a different thread: log a warning
+    ///     (rate-limited to ~32 messages per process) and CONTINUE.
+    ///     We deliberately do NOT panic yet because the first-touch
+    ///     claim may have pinned the wrong owner — phase 2
+    ///     (`bindLuaOwnerThread`, zi-wub.5/.6/.7) replaces the claim
+    ///     with an explicit bind from the agent thread, and only
+    ///     then is it safe to flip this to fatal.
     ///
     /// Why an assertion instead of a mutex: see the doc comment
     /// on `lua_owner_thread`. The short version: locking would
@@ -349,12 +355,16 @@ pub const ExtensionRunner = struct {
         );
         const owner = prev orelse tid;
         if (owner != tid) {
-            std.debug.panic(
-                "lua_state accessed from wrong thread: this={d} owner={d}. " ++
-                    "All Lua entry points must run on the agent thread. " ++
-                    "TUI thread should read from runner.pending_renders instead.",
-                .{ tid, owner },
-            );
+            // SOFT TRACE (zi-wub.3): log first ~32 violations and keep
+            // running so phase 1 audit can collect them all. Removed
+            // by zi-wub.21 once phase 2 lands the explicit bind.
+            const seen = self.lua_wrong_thread_warn_count.fetchAdd(1, .monotonic);
+            if (seen < 32) {
+                std.log.warn(
+                    "[zi-wub.3] lua_state touched from wrong thread: this={d} owner={d} (warn {d}/32)",
+                    .{ tid, owner, seen + 1 },
+                );
+            }
         }
     }
 

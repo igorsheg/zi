@@ -116,6 +116,14 @@ fn EventQueue(comptime T: type) type {
 /// with domain-specific state (editor, transcript, agent, containers).
 pub const Interactive = struct {
     allocator: std.mem.Allocator,
+    /// Thread-safe GPA-backed allocator for cross-thread message
+    /// payloads and queue backing storage (zi-wub.8). Used by phase 3
+    /// migrations (.9 EventQueue backing, .10 convertAgentEvent
+    /// clones, .14 AgentRequest queue, .17 login callbacks). NOT the
+    /// same as `allocator` (which is the shared arena) — this one
+    /// wraps the root GPA directly so cross-thread free paths work.
+    /// See .zi/design-notes/threading-doctrine.md R2/R3.
+    msg_allocator: std.mem.Allocator,
     tui: TUI,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
 
@@ -185,6 +193,7 @@ pub const Interactive = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        msg_allocator: std.mem.Allocator,
         ca: *AgentSession,
         resolver: ToolRendererResolver,
         cwd: []const u8,
@@ -194,6 +203,7 @@ pub const Interactive = struct {
 
         var self: Interactive = .{
             .allocator = allocator,
+            .msg_allocator = msg_allocator,
             .tui = try TUI.init(allocator),
             .theme = theme,
             .editor = editor_mod.Editor.init(allocator),

@@ -34,6 +34,16 @@ pub fn main() !void {
     var ts_alloc: std.heap.ThreadSafeAllocator = .{ .child_allocator = arena.allocator() };
     const allocator = ts_alloc.allocator();
 
+    // zi-wub.8: dedicated thread-safe GPA for cross-thread message
+    // payloads and queue backing storage (EventQueue, AgentRequest
+    // queue, convertAgentEvent clones, login callbacks). Wraps the
+    // ROOT GPA directly — NOT the arena — so producer/consumer pairs
+    // can free individually and we don't pin growing payloads in the
+    // arena's lifetime. See .zi/design-notes/threading-doctrine.md
+    // (R2, R3) for why this is the foundation of phase 3.
+    var ts_msg: std.heap.ThreadSafeAllocator = .{ .child_allocator = gpa.allocator() };
+    const msg_allocator = ts_msg.allocator();
+
     var print_mode = false;
     var show_help = false;
     var show_version = false;
@@ -359,7 +369,7 @@ pub fn main() !void {
             .{ .tool_name = "Bash", .renderer = bash_renderer.renderer },
         };
         const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
-        var interactive = try interactive_mod.Interactive.init(allocator, &ca, resolver, cwd_buf, &auth_storage);
+        var interactive = try interactive_mod.Interactive.init(allocator, msg_allocator, &ca, resolver, cwd_buf, &auth_storage);
         defer interactive.deinit();
 
         if (needs_auth) {
