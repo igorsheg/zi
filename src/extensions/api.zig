@@ -45,6 +45,7 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
+const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
@@ -63,6 +64,10 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     // zi.register_tool
     state.pushCClosureWithUserdata(ziRegisterTool, runner);
     c.lua_setfield(L, -2, "register_tool");
+
+    // zi.on
+    state.pushCClosureWithUserdata(ziOn, runner);
+    c.lua_setfield(L, -2, "on");
 
     // Install as a global named "zi".
     c.lua_setglobal(L, "zi");
@@ -229,6 +234,99 @@ fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ExtensionToo
     if (tool.prompt_snippet) |s| allocator.free(s);
     freeStringArray(allocator, tool.prompt_guidelines);
     lua_runtime.freeJsonValue(allocator, tool.parameters);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// zi.on
+// ─────────────────────────────────────────────────────────────────────────
+
+fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+
+    // arg 1: event name (string)
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+        return luaError(L, "zi.on: expected event name as first argument");
+    }
+    var name_len: usize = 0;
+    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return luaError(L, "zi.on: invalid event name");
+    const event_name = name_ptr[0..name_len];
+
+    const kind = parseEventKind(event_name) orelse {
+        // Build the error message on the Lua stack so the runner's
+        // allocator stays out of the error path. lua_pushfstring is
+        // the canonical way and Lua-internal-allocator-friendly.
+        _ = c.lua_pushfstring(L, "zi.on: unknown event '%s'", name_ptr);
+        _ = c.lua_error(L);
+        return 0;
+    };
+
+    // arg 2: handler (function)
+    if (c.lua_type(L, 2) != c.LUA_TFUNCTION) {
+        return luaError(L, "zi.on: expected handler function as second argument");
+    }
+
+    // Capture the handler via luaL_ref. We need it on top of the
+    // stack first, so duplicate arg 2 with lua_pushvalue. luaL_ref
+    // pops what's on top.
+    c.lua_pushvalue(L, 2);
+    const handler_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+    if (handler_ref == c.LUA_REFNIL or handler_ref == c.LUA_NOREF) {
+        return luaError(L, "zi.on: failed to capture handler reference");
+    }
+
+    runner.event_registry.subscribe(kind, .{
+        .lua_ref = handler_ref,
+        // Same source-id placeholder as register_tool — the loader
+        // will overwrite this with an extension path once factory
+        // invocation lands. Borrowed string literal, no allocation.
+        .source_id = "lua",
+    }) catch {
+        // OOM during subscribe: release the handler ref so the Lua
+        // GC can reclaim it, then surface as a Lua error.
+        c.luaL_unref(L, c.LUA_REGISTRYINDEX, handler_ref);
+        return luaError(L, "zi.on: subscribe failed");
+    };
+
+    return 0;
+}
+
+/// Map a Lua-side event name (the same string the spec uses in
+/// `zi.on("name", ...)` examples) to an `EventKind` enum value.
+/// Returns null on unknown names — the caller raises a Lua error
+/// with the offending string in the message.
+///
+/// Spec source: docs/extensions.md §Event Hooks lines 137-170.
+/// We support the v1-checked subset; v2 events get added here as
+/// their dispatch points come online (D4 grows the table when it
+/// hooks new event sources).
+fn parseEventKind(name: []const u8) ?event_registry.EventKind {
+    const Pair = struct { name: []const u8, kind: event_registry.EventKind };
+    const table = [_]Pair{
+        // lifecycle
+        .{ .name = "agent_start", .kind = .agent_start },
+        .{ .name = "agent_end", .kind = .agent_end },
+        .{ .name = "turn_start", .kind = .turn_start },
+        .{ .name = "turn_end", .kind = .turn_end },
+        .{ .name = "message_start", .kind = .message_start },
+        .{ .name = "message_update", .kind = .message_update },
+        .{ .name = "message_end", .kind = .message_end },
+        // tool
+        .{ .name = "tool_execution_start", .kind = .tool_execution_start },
+        .{ .name = "tool_execution_update", .kind = .tool_execution_update },
+        .{ .name = "tool_execution_end", .kind = .tool_execution_end },
+        .{ .name = "tool_call", .kind = .tool_call },
+        .{ .name = "tool_result", .kind = .tool_result },
+        // session
+        .{ .name = "session_start", .kind = .session_start },
+        .{ .name = "session_shutdown", .kind = .session_shutdown },
+        // meta
+        .{ .name = "model_select", .kind = .model_select },
+    };
+    for (table) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p.kind;
+    }
+    return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -442,6 +540,74 @@ test "zi.register_tool first-registered-wins drops later duplicates" {
         "first registration",
         runner.tool_registry.get("task").?.description,
     );
+}
+
+test "zi.on subscribes a Lua handler to the right event chain" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.on("message_end", function(event, ctx) end)
+        \\zi.on("tool_call", function(event, ctx) end)
+        \\zi.on("tool_call", function(event, ctx) end)
+    , "test_subscribe");
+
+    // message_end has 1 handler, tool_call has 2, total 3.
+    try testing.expectEqual(@as(usize, 3), runner.event_registry.count());
+
+    const tc = runner.event_registry.handlers(.tool_call);
+    try testing.expectEqual(@as(usize, 2), tc.len);
+    try testing.expect(tc[0].lua_ref != tc[1].lua_ref);
+
+    const me = runner.event_registry.handlers(.message_end);
+    try testing.expectEqual(@as(usize, 1), me.len);
+    try testing.expect(me[0].lua_ref != c.LUA_REFNIL);
+}
+
+test "zi.on rejects unknown event names with a Lua-catchable error" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\local ok, err = pcall(function()
+        \\  zi.on("not_a_real_event", function() end)
+        \\end)
+        \\assert(not ok, "expected error")
+        \\assert(string.find(err, "not_a_real_event") ~= nil,
+        \\  "error should mention the bad name, got: " .. tostring(err))
+    , "test_unknown_event");
+
+    try testing.expectEqual(@as(usize, 0), runner.event_registry.count());
+}
+
+test "zi.on rejects non-function handler" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\local ok, err = pcall(function()
+        \\  zi.on("message_end", "not a function")
+        \\end)
+        \\assert(not ok)
+        \\assert(string.find(err, "function") ~= nil)
+    , "test_bad_handler");
+
+    try testing.expectEqual(@as(usize, 0), runner.event_registry.count());
 }
 
 test "zi.register_tool surfaces validation errors as Lua errors" {
