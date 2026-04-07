@@ -7,11 +7,9 @@ const system_prompt_mod = @import("system_prompt.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const storage = @import("storage.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
-// Force the event bridge into the main compilation graph so `zig
-// build` validates it. Nothing in coding_agent.zig calls into it
-// yet — D5 wiring (subscribe runner to agent events) lands as a
-// follow-up commit; this import keeps the bridge compiled today.
-const _force_compile_bridge = @import("extensions/event_bridge.zig");
+const lua_runtime = @import("extensions/lua_runtime.zig");
+const extension_api = @import("extensions/api.zig");
+const event_bridge = @import("extensions/event_bridge.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -50,6 +48,19 @@ pub const AgentSession = struct {
     /// the agent so any final event observers can still fire against
     /// a live session.
     _extension_runner: ?*ExtensionRunner = null,
+
+    /// Owned Lua state, paired 1:1 with `_extension_runner`. The
+    /// runner BORROWS this — see `extensions/runner.zig` field doc.
+    /// AgentSession owns the lifetime so the SDK bootstrap order
+    /// (state → runner → install zi.* → attach) lines up with the
+    /// teardown order (unsubscribe → runner.deinit → state.deinit).
+    /// Both fields are nil when Lua init fails; the agent still runs.
+    _extension_lua_state: ?*lua_runtime.LuaState = null,
+
+    /// Subscription token for the extension event bridge. Separate
+    /// from `_subscription_token` (session persistence) so the two
+    /// can be torn down independently.
+    _extension_subscription_token: ?SubscriptionToken = null,
 
     /// Owned built-in provider bundle. Set when the sdk factory created
     /// the registry on the caller's behalf (the common path); null when
@@ -176,6 +187,33 @@ pub const AgentSession = struct {
             .get_api_key = get_api_key_hook,
         });
 
+        // Construct the extension runtime: heap-allocated LuaState +
+        // ExtensionRunner, install the `zi.*` global, attach state to
+        // runner. On any failure we log and leave both null — the agent
+        // remains fully functional, just without extensions. This
+        // matches the @panic-on-OOM convention used elsewhere in this
+        // function for true fatal allocs while keeping extension setup
+        // optional.
+        var ext_state: ?*lua_runtime.LuaState = null;
+        var ext_runner: ?*ExtensionRunner = null;
+        ext_setup: {
+            const state_ptr = allocator.create(lua_runtime.LuaState) catch break :ext_setup;
+            state_ptr.* = lua_runtime.LuaState.init(allocator) catch {
+                allocator.destroy(state_ptr);
+                break :ext_setup;
+            };
+            const runner_ptr = allocator.create(ExtensionRunner) catch {
+                state_ptr.deinit();
+                allocator.destroy(state_ptr);
+                break :ext_setup;
+            };
+            runner_ptr.* = ExtensionRunner.init(allocator, 0);
+            runner_ptr.attachLuaState(state_ptr);
+            extension_api.installZiTable(state_ptr, runner_ptr);
+            ext_state = state_ptr;
+            ext_runner = runner_ptr;
+        }
+
         const self = AgentSession{
             .agent = a,
             .session_store = store,
@@ -186,6 +224,8 @@ pub const AgentSession = struct {
             ._stream_closure = closure,
             .auth_storage = options.auth_storage,
             ._owned_provider_bundle = owned_bundle,
+            ._extension_runner = ext_runner,
+            ._extension_lua_state = ext_state,
         };
 
         // Subscribe for session persistence: write message_end entries.
@@ -197,16 +237,30 @@ pub const AgentSession = struct {
     }
 
     pub fn deinit(self: *AgentSession) void {
+        // Unsubscribe extension bridge FIRST so no agent event can
+        // re-enter the runner mid-teardown. Then unsubscribe the
+        // persistence listener.
+        if (self._extension_subscription_token) |token| {
+            self.agent.unsubscribe(token);
+            self._extension_subscription_token = null;
+        }
         if (self._subscription_token) |token| {
             self.agent.unsubscribe(token);
         }
         // Tear down the extension runner BEFORE the agent, so any
         // session_shutdown observers can still see a live Agent.
-        // v1: no-op when null; A3+ wires real construction.
+        // Order: runner.deinit drops registries (handler refs are
+        // integers — safe), THEN lua_state.deinit calls lua_close
+        // which actually reclaims those refs.
         if (self._extension_runner) |runner| {
             runner.deinit();
             self.allocator.destroy(runner);
             self._extension_runner = null;
+        }
+        if (self._extension_lua_state) |state| {
+            state.deinit();
+            self.allocator.destroy(state);
+            self._extension_lua_state = null;
         }
         self.allocator.destroy(self._stream_closure);
         self.agent.deinit();
@@ -222,8 +276,20 @@ pub const AgentSession = struct {
     /// Subscribe the session persistence listener.
     /// Must be called after self is pinned (not moved).
     fn wireSubscription(self: *AgentSession) void {
-        if (self._subscription_token != null) return;
-        self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
+        if (self._subscription_token == null) {
+            self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
+        }
+        // Wire the extension event bridge once the session is pinned.
+        // The runner pointer is heap-allocated and stable for the
+        // session lifetime; agent.subscribe stores the ctx ptr.
+        if (self._extension_subscription_token == null) {
+            if (self._extension_runner) |runner| {
+                self._extension_subscription_token = self.agent.subscribe(
+                    &event_bridge.agentEventSink,
+                    @ptrCast(runner),
+                );
+            }
+        }
     }
 
     /// Run a new prompt. Wires session persistence, then delegates to Agent.prompt.
