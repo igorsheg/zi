@@ -250,11 +250,20 @@ fn streamAssistantResponse(
 
     // Resolve API key dynamically (pi-mono agent-loop.ts:264-265)
     // JS `||` treats empty string as falsy, so we must check len > 0.
+    //
+    // zi-wub.27: dupe into the loop arena immediately. The slice
+    // returned by the hook is BORROWED from AuthStorage's internal
+    // map; AuthStorage.set() from the login thread can reallocate
+    // or free that slice during the upcoming stream call. The
+    // stream call can take many seconds, well long enough for a
+    // login to land mid-flight. Owning the copy on `aa` removes
+    // the lifetime hazard at the cost of one alloc per turn.
     if (config.get_api_key) |hook| {
         const provider_str = json_util.providerToString(config.model.provider);
         const resolved_key = hook.call(provider_str);
         if (resolved_key != null and resolved_key.?.len > 0) {
-            stream_options.base.api_key = resolved_key;
+            const owned = aa.dupe(u8, resolved_key.?) catch resolved_key.?;
+            stream_options.base.api_key = owned;
         }
     }
 

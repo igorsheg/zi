@@ -18,6 +18,30 @@ pub const AuthStorage = struct {
     runtime_overrides: std.StringHashMap([]const u8),
     fallback_resolver: ?*const fn (provider: []const u8) ?[]const u8 = null,
     load_error: bool = false,
+    /// In-process mutex protecting `data`, `runtime_overrides`,
+    /// `fallback_resolver`, and `load_error` (zi-wub.27).
+    ///
+    /// AuthStorage is touched from at least three threads in zi:
+    ///   - main/TUI thread: startup hasAuth, model picker filtering
+    ///   - login worker thread: set() after OAuth completes
+    ///   - agent thread: getApiKey() via the get_api_key_hook
+    ///
+    /// The backend has its own cross-process file lock, but the
+    /// in-memory map needed an in-process equivalent — without it,
+    /// login set() racing agent getApiKey() can cause torn reads
+    /// or freed-slice access.
+    ///
+    /// Held through the entire public method including any OAuth
+    /// network exchange in `refreshOAuthLocked` (a few seconds
+    /// worst case). Concurrency cost is acceptable because login
+    /// and refresh are both rare events; the common path is
+    /// uncontended cmpxchg-fast.
+    ///
+    /// Internal helpers (refreshOAuthLocked, installRefreshedCredential,
+    /// persistInsideLock, persistProviderChange) MUST NOT acquire
+    /// the mutex themselves — they run inside an already-locked
+    /// public method. std.Thread.Mutex is non-recursive.
+    mutex: std.Thread.Mutex = .{},
 
     /// Create a file-backed AuthStorage, loading from disk.
     /// pi-mono source: auth-storage.ts:195-197
@@ -34,7 +58,7 @@ pub const AuthStorage = struct {
             .allocator = allocator,
             .runtime_overrides = std.StringHashMap([]const u8).init(allocator),
         };
-        self.reload();
+        self.reloadLocked();
         return self;
     }
 
@@ -56,7 +80,7 @@ pub const AuthStorage = struct {
             .allocator = allocator,
             .runtime_overrides = std.StringHashMap([]const u8).init(allocator),
         };
-        self.reload();
+        self.reloadLocked();
         return self;
     }
 
@@ -80,6 +104,15 @@ pub const AuthStorage = struct {
     /// Reload credentials from backend.
     /// pi-mono source: auth-storage.ts:247-260
     pub fn reload(self: *AuthStorage) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.reloadLocked();
+    }
+
+    /// Mutex-free reload, called from `reload()` (which acquires)
+    /// and from `create`/`inMemory` (which don't need to acquire
+    /// because the storage isn't shared yet).
+    fn reloadLocked(self: *AuthStorage) void {
         const content = self.backend.readContent(self.allocator);
         defer if (content) |c| self.allocator.free(c);
 
@@ -103,14 +136,27 @@ pub const AuthStorage = struct {
     }
 
     /// Get credential for a provider.
+    ///
+    /// SLICE LIFETIME: the returned credential's strings are
+    /// borrowed from `self.data` and only valid until the next
+    /// mutation (set/remove/reload/getApiKey-with-refresh). Callers
+    /// that need to hold the value across a critical section MUST
+    /// dupe immediately. The mutex protects this call from racing,
+    /// but the slice itself is not refcounted.
+    ///
     /// pi-mono source: auth-storage.ts:286-288
-    pub fn get(self: *const AuthStorage, provider: []const u8) ?types.AuthCredential {
+    pub fn get(self: *AuthStorage, provider: []const u8) ?types.AuthCredential {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.data.get(provider);
     }
 
     /// Set credential for a provider. Updates in-memory and persists.
     /// pi-mono source: auth-storage.ts:293-296
     pub fn set(self: *AuthStorage, provider: []const u8, credential: types.AuthCredential) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Update in-memory — need to dupe key and credential values
         const key_duped = self.allocator.dupe(u8, provider) catch return;
 
@@ -138,6 +184,9 @@ pub const AuthStorage = struct {
     /// Remove credential for a provider.
     /// pi-mono source: auth-storage.ts:301-304
     pub fn remove(self: *AuthStorage, provider: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.data.fetchRemove(provider)) |old| {
             freeCredential(self.allocator, old.value);
             self.allocator.free(old.key);
@@ -147,13 +196,18 @@ pub const AuthStorage = struct {
 
     /// Check if credentials exist for a provider in storage.
     /// pi-mono source: auth-storage.ts:316-318
-    pub fn has(self: *const AuthStorage, provider: []const u8) bool {
+    pub fn has(self: *AuthStorage, provider: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.data.get(provider) != null;
     }
 
     /// List all provider IDs with credentials. Caller owns returned slice and strings.
     /// pi-mono source: auth-storage.ts:309-311
-    pub fn list(self: *const AuthStorage, allocator: std.mem.Allocator) ![][]const u8 {
+    pub fn list(self: *AuthStorage, allocator: std.mem.Allocator) ![][]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const count = self.data.count();
         if (count == 0) return &.{};
 
@@ -170,6 +224,13 @@ pub const AuthStorage = struct {
     }
 
     /// Return reference to the full data map.
+    ///
+    /// CALLER CONTRACT: this returns a borrowed pointer; callers
+    /// must not iterate it while another thread might mutate
+    /// AuthStorage. Used by serializeAuthJson under the in-process
+    /// mutex (e.g. inside set's persist path) and by tests where
+    /// the storage is single-threaded.
+    ///
     /// pi-mono source: auth-storage.ts:335-337
     pub fn getAll(self: *const AuthStorage) *const types.AuthStorageData {
         return &self.data;
@@ -178,6 +239,9 @@ pub const AuthStorage = struct {
     /// Set a runtime API key override (not persisted). Used for CLI --api-key.
     /// pi-mono source: auth-storage.ts:213-215
     pub fn setRuntimeApiKey(self: *AuthStorage, provider: []const u8, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const key_duped = self.allocator.dupe(u8, provider) catch return;
         const val_duped = self.allocator.dupe(u8, key) catch {
             self.allocator.free(key_duped);
@@ -195,6 +259,9 @@ pub const AuthStorage = struct {
     /// Remove a runtime API key override.
     /// pi-mono source: auth-storage.ts:220-222
     pub fn removeRuntimeApiKey(self: *AuthStorage, provider: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.runtime_overrides.fetchRemove(provider)) |old| {
             self.allocator.free(old.key);
             self.allocator.free(old.value);
@@ -204,13 +271,18 @@ pub const AuthStorage = struct {
     /// Set fallback resolver for API keys not found via other tiers.
     /// pi-mono source: auth-storage.ts:228-230
     pub fn setFallbackResolver(self: *AuthStorage, resolver: *const fn (provider: []const u8) ?[]const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.fallback_resolver = resolver;
     }
 
     /// Check if any form of auth is configured for a provider.
     /// Does NOT auto-refresh OAuth tokens — just checks availability.
     /// pi-mono source: auth-storage.ts:324-330
-    pub fn hasAuth(self: *const AuthStorage, provider: []const u8) bool {
+    pub fn hasAuth(self: *AuthStorage, provider: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.runtime_overrides.get(provider) != null) return true;
         if (self.data.get(provider) != null) return true;
         if (ai.env_api_keys.getEnvApiKey(provider) != null) return true;
@@ -234,6 +306,9 @@ pub const AuthStorage = struct {
     ///
     /// pi-mono source: auth-storage.ts:424-485
     pub fn getApiKey(self: *AuthStorage, provider: []const u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // 1. Runtime override
         if (self.runtime_overrides.get(provider)) |key| return key;
 
