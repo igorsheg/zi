@@ -323,6 +323,28 @@ pub const ExtensionRunner = struct {
         self.lua_state = state;
     }
 
+    /// Explicitly declare which thread owns `lua_state` from this
+    /// point forward (zi-wub.5/.6). MUST be called from the new
+    /// owning thread, before that thread makes any other lua call.
+    /// Overrides any prior owner pinned by the first-touch claim in
+    /// `assertOnLuaThread` (the first-touch claim is the phase 1
+    /// fallback; explicit bind is the phase 2 truth).
+    ///
+    /// Idempotent for the same tid. Calling from a different tid is
+    /// a hard rebind — used by interactive mode where every prompt
+    /// spawns a fresh agent thread, so the owning tid changes per
+    /// prompt. The previous prompt's agent thread MUST be joined
+    /// before rebinding or you race against in-flight lua calls.
+    ///
+    /// Also resets the soft-trace seen-set so each rebind starts
+    /// with a clean slate of unique offenders.
+    pub fn bindLuaOwnerThread(self: *ExtensionRunner, tid: std.Thread.Id) void {
+        self.lua_owner_thread.store(tid, .release);
+        self.lua_wrong_thread_mutex.lock();
+        defer self.lua_wrong_thread_mutex.unlock();
+        self.lua_wrong_thread_seen_count = 0;
+    }
+
     /// Assert that the current thread is allowed to call into
     /// `lua_state`. Must be invoked at every Lua entry point
     /// (lua_tool.execute, event_bridge dispatch, render hook

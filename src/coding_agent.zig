@@ -380,6 +380,14 @@ pub const AgentSession = struct {
 
     /// Run a new prompt. Wires session persistence, then delegates to Agent.prompt.
     pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
+        // zi-wub.6: this thread is now the lua owner. Bind BEFORE
+        // wireSubscription because subscribe→agentEventSink calls
+        // assertOnLuaThread on the first event. Interactive mode
+        // spawns a fresh agent thread per prompt; the previous
+        // thread must already be joined (interactive does this).
+        if (self._extension_runner) |runner| {
+            runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+        }
         self.wireSubscription();
 
         const user_msg = protocol.AgentMessage{
@@ -397,6 +405,10 @@ pub const AgentSession = struct {
     /// If transcript ends with assistant (nothing to continue from),
     /// returns NeedsPrompt so the caller can provide one.
     pub fn continueSession(self: *AgentSession) !void {
+        // zi-wub.6: see `run()` for the bind rationale.
+        if (self._extension_runner) |runner| {
+            runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+        }
         self.wireSubscription();
         self.agent.@"continue"() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
