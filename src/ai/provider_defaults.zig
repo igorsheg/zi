@@ -21,6 +21,7 @@ const std = @import("std");
 const provider_mod = @import("provider.zig");
 const anthropic = @import("anthropic.zig");
 const openai_completions = @import("openai_completions.zig");
+const openai_responses = @import("openai_responses.zig");
 
 /// Heap-owned set of built-in providers + the registry they're
 /// registered into. One bundle per generation; deinit destroys
@@ -34,6 +35,7 @@ pub const Bundle = struct {
     // here, one register() call in `init`, one destroy in `deinit`.
     anthropic_prov: *anthropic.AnthropicProvider,
     openai_completions_prov: *openai_completions.OpenAICompletionsProvider,
+    openai_responses_prov: *openai_responses.OpenAIResponsesProvider,
 
     /// Allocate a fresh registry, populate it with every built-in
     /// provider, and return an owned bundle.
@@ -63,11 +65,20 @@ pub const Bundle = struct {
         oac.* = openai_completions.OpenAICompletionsProvider.init(allocator);
         try registry.register("openai-completions", oac.provider(), null);
 
+        // openai-responses: api.openai.com/v1/responses today. Phase 3c
+        // adds a second registration (openai-codex-responses) that reuses
+        // the same shared core with a ChatGPT-oauth auth factory.
+        const oar = try allocator.create(openai_responses.OpenAIResponsesProvider);
+        errdefer allocator.destroy(oar);
+        oar.* = openai_responses.OpenAIResponsesProvider.init(allocator);
+        try registry.register("openai-responses", oar.provider(), null);
+
         self.* = .{
             .allocator = allocator,
             .registry = registry,
             .anthropic_prov = anth,
             .openai_completions_prov = oac,
+            .openai_responses_prov = oar,
         };
         return self;
     }
@@ -79,6 +90,7 @@ pub const Bundle = struct {
         // currently have ordering dependencies on each other, but
         // keeping the discipline now means future providers that DO
         // (e.g. shared core wrappers) get correct teardown for free.
+        self.allocator.destroy(self.openai_responses_prov);
         self.allocator.destroy(self.openai_completions_prov);
         self.allocator.destroy(self.anthropic_prov);
         self.allocator.destroy(self);
