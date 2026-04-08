@@ -5,6 +5,7 @@ const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
+const json_value = @import("../json/value.zig");
 
 /// Anthropic Messages API provider implementation.
 /// Streams to `{model.base_url}/v1/messages` with SSE parsing.
@@ -369,94 +370,121 @@ const StopReason = enum {
 // SSE event handling
 // =================================================================
 
+/// Handle a single Anthropic SSE event. The `data` payload is parsed
+/// once via `std.json.parseFromSliceLeaky` into `state.scratch` and
+/// walked structurally with the typed accessors in `json.value`.
+///
+/// Lifetime contract:
+///   - `state.scratch` is reset before parse, so any prior tree
+///     (including the previous tool-arg parse from `parseToolArgs`)
+///     is dropped here. This is safe because everything we needed
+///     from the previous event was either copied into the turn arena
+///     (block buffers, cloned tc.arguments) or already consumed by
+///     the callback.
+///   - String/object fields read from the parsed value are slices
+///     into scratch memory. Anything that must survive past this
+///     function (or past a subsequent `state.scratch.reset` inside
+///     `parseToolArgs`) MUST be copied into `state.allocator` (the
+///     turn arena) before that point. We copy via `appendSlice` /
+///     `dupe`, never store raw scratch slices.
+///
+/// Errors during parse or shape mismatch are silently dropped — SSE
+/// is best-effort and the next event will reset and retry.
 fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
     const data = evt.data;
     if (data.len == 0) return;
 
-    const event_data_type = extractJsonField(data, "type") orelse return;
+    _ = state.scratch.reset(.retain_capacity);
+    const scratch = state.scratch.allocator();
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        scratch,
+        data,
+        .{},
+    ) catch return;
+    if (parsed != .object) return;
+    const obj = parsed.object;
 
-    if (std.mem.eql(u8, event_data_type, "message_start")) {
-        if (extractJsonInt(data, "input_tokens")) |n_val| state.partial.usage.input = n_val;
-        if (extractJsonInt(data, "output_tokens")) |n_val| state.partial.usage.output = n_val;
-    } else if (std.mem.eql(u8, event_data_type, "content_block_start")) {
-        if (extractJsonField(data, "content_block")) |block_json| {
-            const block_type = extractJsonField(block_json, "type") orelse "text";
-            const index = extractJsonInt(data, "index") orelse state.content_blocks.items.len;
+    const event_type = json_value.asString(obj.get("type")) orelse return;
 
-            if (std.mem.eql(u8, block_type, "text")) {
-                const block = ContentBlockState.init(.text, index);
-                state.content_blocks.append(state.allocator, block) catch return;
-                callback(.{ .text_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
-            } else if (std.mem.eql(u8, block_type, "thinking")) {
-                const block = ContentBlockState.init(.thinking, index);
-                state.content_blocks.append(state.allocator, block) catch return;
-                callback(.{ .thinking_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
-            } else if (std.mem.eql(u8, block_type, "tool_use")) {
-                var block = ContentBlockState.init(.tool_call, index);
-                // Dupe id/name immediately — SSE buffer gets overwritten on next read
-                const tool_id = state.allocator.dupe(u8, extractJsonField(block_json, "id") orelse "") catch "";
-                const tool_name = state.allocator.dupe(u8, extractJsonField(block_json, "name") orelse "") catch "";
-                block.tool_call = .{
-                    .id = tool_id,
-                    .name = tool_name,
-                    .arguments = .null,
-                    .thought_signature = null,
-                };
-                state.content_blocks.append(state.allocator, block) catch return;
-                callback(.{ .toolcall_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
+    if (std.mem.eql(u8, event_type, "message_start")) {
+        // Shape: { message: { usage: { input_tokens, output_tokens } } }
+        const message = json_value.asObject(obj.get("message")) orelse return;
+        const usage = json_value.asObject(message.get("usage")) orelse return;
+        if (json_value.asU64(usage.get("input_tokens"))) |n| state.partial.usage.input = n;
+        if (json_value.asU64(usage.get("output_tokens"))) |n| state.partial.usage.output = n;
+    } else if (std.mem.eql(u8, event_type, "content_block_start")) {
+        // Shape: { index, content_block: { type, id?, name?, ... } }
+        const block_json = json_value.asObject(obj.get("content_block")) orelse return;
+        const block_type = json_value.asString(block_json.get("type")) orelse "text";
+        const index = json_value.asU64(obj.get("index")) orelse state.content_blocks.items.len;
+
+        if (std.mem.eql(u8, block_type, "text")) {
+            const block = ContentBlockState.init(.text, index);
+            state.content_blocks.append(state.allocator, block) catch return;
+            callback(.{ .text_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
+        } else if (std.mem.eql(u8, block_type, "thinking")) {
+            const block = ContentBlockState.init(.thinking, index);
+            state.content_blocks.append(state.allocator, block) catch return;
+            callback(.{ .thinking_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
+        } else if (std.mem.eql(u8, block_type, "tool_use")) {
+            var block = ContentBlockState.init(.tool_call, index);
+            // id/name slices live in scratch — dupe into the turn
+            // arena before the next SSE event resets it.
+            const tool_id = state.allocator.dupe(u8, json_value.asString(block_json.get("id")) orelse "") catch "";
+            const tool_name = state.allocator.dupe(u8, json_value.asString(block_json.get("name")) orelse "") catch "";
+            block.tool_call = .{
+                .id = tool_id,
+                .name = tool_name,
+                .arguments = .null,
+                .thought_signature = null,
+            };
+            state.content_blocks.append(state.allocator, block) catch return;
+            callback(.{ .toolcall_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
+        }
+    } else if (std.mem.eql(u8, event_type, "content_block_delta")) {
+        // Shape: { index, delta: { type, text? | thinking? | partial_json? } }
+        const delta_obj = json_value.asObject(obj.get("delta")) orelse return;
+        const delta_type = json_value.asString(delta_obj.get("type")) orelse return;
+        const index = json_value.asU64(obj.get("index")) orelse return;
+        if (index >= state.content_blocks.items.len) return;
+        const block = &state.content_blocks.items[index];
+
+        if (std.mem.eql(u8, delta_type, "text_delta")) {
+            const text = json_value.asString(delta_obj.get("text")) orelse return;
+            // Append to the block buffer (turn arena), then re-slice
+            // into the buffer to get a turn-arena-owned delta payload.
+            // No extra dupe needed.
+            const old_len = block.text.items.len;
+            block.text.appendSlice(state.allocator, text) catch return;
+            const text_val = block.text.items[old_len..];
+            callback(.{ .text_delta = .{ .content_index = index, .delta = text_val, .partial = state.partial } }, callback_ctx);
+        } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
+            const thinking = json_value.asString(delta_obj.get("thinking")) orelse return;
+            const old_len = block.thinking.items.len;
+            block.thinking.appendSlice(state.allocator, thinking) catch return;
+            const thinking_val = block.thinking.items[old_len..];
+            callback(.{ .thinking_delta = .{ .content_index = index, .delta = thinking_val, .partial = state.partial } }, callback_ctx);
+        } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
+            const partial = json_value.asString(delta_obj.get("partial_json")) orelse return;
+            if (block.tool_call) |*tc| {
+                const old_len = block.text.items.len;
+                block.text.appendSlice(state.allocator, partial) catch return;
+                // parseToolArgs resets state.scratch internally —
+                // safe because `partial` is already copied into
+                // block.text and we no longer need scratch's parse
+                // tree.
+                tc.arguments = parseToolArgs(state, block.text.items);
+                const json_delta = block.text.items[old_len..];
+                // Refresh live partial.content so downstream
+                // subscribers see the in-progress tool_call with
+                // parsed partial args (pi-mono parity).
+                state.partial.content = buildLiveContent(state.allocator, state.content_blocks.items) catch state.partial.content;
+                callback(.{ .toolcall_delta = .{ .content_index = index, .delta = json_delta, .partial = state.partial } }, callback_ctx);
             }
         }
-    } else if (std.mem.eql(u8, event_data_type, "content_block_delta")) {
-        if (extractJsonField(data, "delta")) |delta_json| {
-            const delta_type = extractJsonField(delta_json, "type") orelse return;
-            const index = extractJsonInt(data, "index") orelse return;
-
-            if (std.mem.eql(u8, delta_type, "text_delta")) {
-                if (extractJsonString(delta_json, "text")) |text_raw| {
-                    const text_val = jsonUnescapeString(state.allocator, text_raw);
-                    if (index < state.content_blocks.items.len) {
-                        state.content_blocks.items[index].text.appendSlice(state.allocator, text_val) catch return;
-                        callback(.{ .text_delta = .{ .content_index = index, .delta = text_val, .partial = state.partial } }, callback_ctx);
-                    }
-                }
-            } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
-                if (extractJsonString(delta_json, "thinking")) |thinking_raw| {
-                    const thinking_val = jsonUnescapeString(state.allocator, thinking_raw);
-                    if (index < state.content_blocks.items.len) {
-                        state.content_blocks.items[index].thinking.appendSlice(state.allocator, thinking_val) catch return;
-                        callback(.{ .thinking_delta = .{ .content_index = index, .delta = thinking_val, .partial = state.partial } }, callback_ctx);
-                    }
-                }
-            } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
-                if (extractJsonString(delta_json, "partial_json")) |json_delta_raw| {
-                    const json_delta = jsonUnescapeString(state.allocator, json_delta_raw);
-                    if (index < state.content_blocks.items.len) {
-                        const block = &state.content_blocks.items[index];
-                        if (block.tool_call) |*tc| {
-                            block.text.appendSlice(state.allocator, json_delta) catch return;
-                            tc.arguments = parseToolArgs(state, block.text.items);
-                        }
-                        // Refresh live partial.content so downstream
-                        // subscribers (agent loop, TUI convertAgentEvent)
-                        // see the in-progress tool_call with parsed
-                        // partial args. pi-mono parity: its provider
-                        // updates the partial message object before
-                        // emitting deltas, so consumers can render
-                        // arguments as they stream.
-                        //
-                        // The returned slice borrows block.text/.thinking
-                        // contents directly (no dupe) — those buffers
-                        // live in the turn arena, so the slice is
-                        // valid for the entire turn. It gets overwritten
-                        // on the next content_block_delta.
-                        state.partial.content = buildLiveContent(state.allocator, state.content_blocks.items) catch state.partial.content;
-                        callback(.{ .toolcall_delta = .{ .content_index = index, .delta = json_delta, .partial = state.partial } }, callback_ctx);
-                    }
-                }
-            }
-        }
-    } else if (std.mem.eql(u8, event_data_type, "content_block_stop")) {
-        const index = extractJsonInt(data, "index") orelse return;
+    } else if (std.mem.eql(u8, event_type, "content_block_stop")) {
+        const index = json_value.asU64(obj.get("index")) orelse return;
         if (index >= state.content_blocks.items.len) return;
 
         const block = &state.content_blocks.items[index];
@@ -470,19 +498,18 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             .tool_call => {
                 if (block.tool_call) |tc| {
                     var final_tc = tc;
-                    // Final parse: buffer should now be complete, so
+                    // Final parse: buffer should be complete, so
                     // parseStreaming's strict-first fast path wins.
-                    // If the stream was truncated, partial fallback
-                    // still yields a usable object.
                     final_tc.arguments = parseToolArgs(state, block.text.items);
                     block.tool_call = final_tc;
                     callback(.{ .toolcall_end = .{ .content_index = index, .tool_call = final_tc, .partial = state.partial } }, callback_ctx);
                 }
             },
         }
-    } else if (std.mem.eql(u8, event_data_type, "message_delta")) {
-        if (extractJsonField(data, "delta")) |delta_json| {
-            if (extractJsonField(delta_json, "stop_reason")) |reason| {
+    } else if (std.mem.eql(u8, event_type, "message_delta")) {
+        // Shape: { delta: { stop_reason, stop_sequence }, usage: { output_tokens } }
+        if (json_value.asObject(obj.get("delta"))) |delta_obj| {
+            if (json_value.asString(delta_obj.get("stop_reason"))) |reason| {
                 if (std.mem.eql(u8, reason, "end_turn")) {
                     state.stop_reason = .end_turn;
                 } else if (std.mem.eql(u8, reason, "max_tokens")) {
@@ -492,13 +519,17 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
                 }
             }
         }
-        if (extractJsonInt(data, "input_tokens")) |n_val| state.partial.usage.input = n_val;
-        if (extractJsonInt(data, "output_tokens")) |n_val| state.partial.usage.output = n_val;
-    } else if (std.mem.eql(u8, event_data_type, "error")) {
-        if (extractJsonField(data, "error")) |err_json| {
-            const err_msg = extractJsonString(err_json, "message") orelse "unknown error";
-            emitErrorDirect(callback, callback_ctx, err_msg);
+        if (json_value.asObject(obj.get("usage"))) |usage| {
+            if (json_value.asU64(usage.get("input_tokens"))) |n| state.partial.usage.input = n;
+            if (json_value.asU64(usage.get("output_tokens"))) |n| state.partial.usage.output = n;
         }
+    } else if (std.mem.eql(u8, event_type, "error")) {
+        // Shape: { error: { type, message } }
+        const err_obj = json_value.asObject(obj.get("error")) orelse return;
+        const err_msg = json_value.asString(err_obj.get("message")) orelse "unknown error";
+        // err_msg lives in scratch; emitErrorDirect copies what it
+        // needs synchronously, so passing the scratch slice is safe.
+        emitErrorDirect(callback, callback_ctx, err_msg);
     }
 }
 
@@ -734,179 +765,6 @@ fn writeAnthropicImageBlock(jw: *std.json.Stringify, img: protocol.ImageContent)
     try jw.endObject();
 }
 
-// =================================================================
-// Simple JSON field extraction helpers
-// =================================================================
-
-/// Substring-based JSON field extractor.
-///
-/// HISTORY: the original version had two latent bugs that bit on
-/// `content_block_delta` events with `input_json_delta` payloads
-/// (Anthropic streaming tool args):
-///
-///   1. The `{`/`}` depth tracker for object values counted braces
-///      INSIDE string values, so any tool input whose chunk contained
-///      `{` or `}` would land at the wrong closing brace and return a
-///      truncated object. The Edit tool's args sometimes happened to
-///      have brace-bearing chunks; the Write tool's didn't, by luck.
-///   2. The escape detection for string values used `after[j-1] !=
-///      '\\\\'` which is wrong for the `\\\\\\"` case (escaped backslash
-///      followed by literal quote — the quote terminates the string but
-///      the check thought it was escaped).
-///
-/// Fixed: both depth trackers now skip over string contents using a
-/// proper backslash-aware string scanner. This is still a substring
-/// parser (we don't allocate a `std.json.Value` per event for speed),
-/// but it now correctly handles every well-formed JSON input we get
-/// from Anthropic.
-///
-/// FOLLOW-UP: the right long-term fix is to parse each SSE event's
-/// data with `std.json.parseFromSlice` once and walk the resulting
-/// `Value`. That's a larger refactor (~150 lines, 28 call sites) and
-/// is filed separately.
-fn extractJsonField(json: []const u8, field: []const u8) ?[]const u8 {
-    const pattern = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{field}) catch return null;
-    defer std.heap.page_allocator.free(pattern);
-
-    const idx = std.mem.indexOf(u8, json, pattern) orelse return null;
-    const after = json[idx + pattern.len ..];
-
-    var i: usize = 0;
-    while (i < after.len and (after[i] == ' ' or after[i] == '\t' or after[i] == '\n' or after[i] == '\r')) : (i += 1) {}
-    if (i < after.len and after[i] == ':') i += 1;
-    while (i < after.len and (after[i] == ' ' or after[i] == '\t' or after[i] == '\n' or after[i] == '\r')) : (i += 1) {}
-
-    if (i >= after.len) return null;
-
-    if (after[i] == '"') {
-        const start = i + 1;
-        const end = scanJsonStringEnd(after, start) orelse return after[start..];
-        return after[start..end];
-    } else if (after[i] == '{') {
-        const end = scanJsonContainerEnd(after, i, '{', '}') orelse return after[i..];
-        return after[i..end];
-    } else if (after[i] == '[') {
-        const end = scanJsonContainerEnd(after, i, '[', ']') orelse return after[i..];
-        return after[i..end];
-    } else {
-        const start = i;
-        var j = start;
-        while (j < after.len and after[j] != ',' and after[j] != '}' and after[j] != ']') : (j += 1) {}
-        return std.mem.trim(u8, after[start..j], " \t\n\r");
-    }
-}
-
-/// Walk a JSON string starting at `start` (one past the opening `"`),
-/// returning the index of the closing `"`. Handles backslash escapes
-/// correctly: a `\\` escapes the next byte unconditionally, so `\\"`
-/// is two literal bytes (`\` then `"`) and `\\\\"` is `\` then `\` then
-/// terminator. Returns null if no terminator found.
-fn scanJsonStringEnd(s: []const u8, start: usize) ?usize {
-    var j = start;
-    while (j < s.len) {
-        if (s[j] == '\\') {
-            // Skip the escape AND the escaped byte. This is the only
-            // way to be correct without tracking the escape state.
-            j += 2;
-            continue;
-        }
-        if (s[j] == '"') return j;
-        j += 1;
-    }
-    return null;
-}
-
-/// Walk a JSON container (`{...}` or `[...]`) starting at `start`
-/// (the opening byte), returning the index PAST the matching close.
-/// Skips over string contents so braces inside strings don't confuse
-/// the depth counter. Returns null if no matching close found.
-fn scanJsonContainerEnd(s: []const u8, start: usize, open: u8, close: u8) ?usize {
-    var depth: usize = 1;
-    var j = start + 1;
-    while (j < s.len) {
-        const c = s[j];
-        if (c == '"') {
-            // Skip the entire string — braces in here don't count.
-            const string_end = scanJsonStringEnd(s, j + 1) orelse return null;
-            j = string_end + 1;
-            continue;
-        }
-        if (c == open) depth += 1;
-        if (c == close) {
-            depth -= 1;
-            if (depth == 0) return j + 1;
-        }
-        j += 1;
-    }
-    return null;
-}
-
-fn extractJsonString(json: []const u8, field: []const u8) ?[]const u8 {
-    return extractJsonField(json, field);
-}
-
-/// Unescape a JSON string value extracted by extractJsonField.
-/// extractJsonField returns the raw content between quotes, with escape sequences intact.
-/// This function resolves: \" \\ \/ \n \r \t \b \f
-fn jsonUnescapeString(allocator: std.mem.Allocator, s: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, s, "\\") == null) return s;
-
-    var result: std.ArrayListUnmanaged(u8) = .empty;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (s[i] == '\\' and i + 1 < s.len) {
-            const next = s[i + 1];
-            switch (next) {
-                '"' => {
-                    result.append(allocator, '"') catch {};
-                    i += 2;
-                },
-                '\\' => {
-                    result.append(allocator, '\\') catch {};
-                    i += 2;
-                },
-                '/' => {
-                    result.append(allocator, '/') catch {};
-                    i += 2;
-                },
-                'n' => {
-                    result.append(allocator, '\n') catch {};
-                    i += 2;
-                },
-                'r' => {
-                    result.append(allocator, '\r') catch {};
-                    i += 2;
-                },
-                't' => {
-                    result.append(allocator, '\t') catch {};
-                    i += 2;
-                },
-                'b' => {
-                    result.append(allocator, 0x08) catch {};
-                    i += 2;
-                },
-                'f' => {
-                    result.append(allocator, 0x0C) catch {};
-                    i += 2;
-                },
-                else => {
-                    result.append(allocator, s[i]) catch {};
-                    i += 1;
-                },
-            }
-        } else {
-            result.append(allocator, s[i]) catch {};
-            i += 1;
-        }
-    }
-    return result.items;
-}
-
-fn extractJsonInt(json: []const u8, field: []const u8) ?u64 {
-    const val = extractJsonField(json, field) orelse return null;
-    return std.fmt.parseInt(u64, val, 10) catch null;
-}
-
 /// Parse a (possibly incomplete) tool-argument JSON buffer and
 /// return a std.json.Value owned by the turn arena.
 ///
@@ -1040,47 +898,25 @@ const testing = std.testing;
 
 // Regression test for the streaming bug where Anthropic input_json_delta
 // events with embedded `{` / `}` inside their `partial_json` string
-// payload broke the substring extractor's brace depth counter, causing
-// truncated extractions and lost tool arguments. The Edit tool's args
-// would silently end up empty {} → "missing 'path'" → infinite retry.
-//
-// Setup mirrors the actual SSE payload shape Anthropic emits:
-//   data: { type, index, delta: { type: "input_json_delta", partial_json: "<chunk>" } }
-test "extractJsonField: braces inside string values do not break depth tracking" {
-    // The partial_json STRING value contains `{`, `}`, `\"` — all of
-    // which previously confused the depth tracker.
+// payload broke the old substring extractor's brace depth counter,
+// causing truncated extractions and lost tool arguments. The Edit
+// tool's args would silently end up empty {} → "missing 'path'" →
+// infinite retry. The fix was to parse SSE data via std.json instead
+// of substring scanning; this test pins that behavior.
+test "SSE parse: braces inside string values survive a real Edit-tool payload" {
     const data =
         \\{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}"}}
     ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
-    const delta_json = extractJsonField(data, "delta") orelse return error.NoDelta;
-    // The extracted delta object must contain BOTH the type AND
-    // partial_json fields. Pre-fix it would truncate at the first `}`
-    // inside partial_json's string value.
-    try testing.expect(std.mem.indexOf(u8, delta_json, "input_json_delta") != null);
-    try testing.expect(std.mem.indexOf(u8, delta_json, "partial_json") != null);
-
-    const partial = extractJsonString(delta_json, "partial_json") orelse return error.NoPartial;
-    // The string value still has its escapes intact (caller unescapes
-    // separately) but should be the FULL value, not a prefix.
-    try testing.expect(std.mem.endsWith(u8, partial, "\\\"a {b} c\\\"}"));
-}
-
-test "scanJsonStringEnd: handles escaped backslash followed by quote" {
-    // Sequence: " \ \ "  →  the second quote terminates the string
-    // because the preceding \ is itself escaped by the \ before it.
-    const s = "\\\\\""; // literal: \ \ "
-    // Walk from index 0 (just past an imaginary opening quote).
-    const end = scanJsonStringEnd(s, 0) orelse return error.NoEnd;
-    try testing.expectEqual(@as(usize, 2), end);
-}
-
-test "scanJsonContainerEnd: skips braces inside strings" {
-    const s = "{\"k\":\"v}}}\"}";
-    //         0          1          2
-    //         0123456789 0123456789 01
-    // The 3 closing `}` inside the string must NOT terminate the
-    // outer object. Only the final `}` at index 11 should.
-    const end = scanJsonContainerEnd(s, 0, '{', '}') orelse return error.NoEnd;
-    try testing.expectEqual(@as(usize, s.len), end);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{});
+    try testing.expect(parsed == .object);
+    const delta_obj = json_value.asObject(parsed.object.get("delta")).?;
+    try testing.expectEqualStrings("input_json_delta", json_value.asString(delta_obj.get("type")).?);
+    const partial = json_value.asString(delta_obj.get("partial_json")).?;
+    // After std.json's escape decoding, the embedded braces are
+    // literal characters in the result — no truncation, no lost
+    // closing brace.
+    try testing.expectEqualStrings("{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}", partial);
 }
