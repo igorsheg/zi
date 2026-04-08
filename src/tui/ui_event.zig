@@ -110,6 +110,12 @@ pub const UiEvent = union(enum) {
     // tool calls and results for full parity with pi-mono.
     session_resumed: struct {
         entries: []ResumedEntry,
+        /// Optional warning from `restoreModelFromSession` when the
+        /// saved model could not be brought back verbatim (missing
+        /// from the catalog or lost auth). Owned by the event —
+        /// freed in `deinit`. Rendered after the transcript rebuild
+        /// so it survives the "session resumed" status update.
+        restore_warning: ?[]u8 = null,
     },
     session_resume_failed: struct {
         message: []u8,
@@ -157,6 +163,7 @@ pub const UiEvent = union(enum) {
             .session_resumed => |s| {
                 for (s.entries) |*e| e.deinit(allocator);
                 allocator.free(s.entries);
+                if (s.restore_warning) |w| allocator.free(w);
             },
             .session_resume_failed => |f| allocator.free(f.message),
             .model_switched => |m| allocator.free(m.id),

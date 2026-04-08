@@ -42,6 +42,10 @@ pub const AgentSession = struct {
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
+    /// Borrowed ModelRegistry — lifetime owned by caller (main.zig in
+    /// the interactive path). Used by the TUI to bind `[]const Model`
+    /// at init, and by `/resume` for `restoreModelFromSession`.
+    model_registry: ?*ai.model_registry.ModelRegistry = null,
 
     /// Owned ExtensionRunner — current generation. Populated by the
     /// sdk factory in Phase A3+; nil in v1 bootstraps until the runner
@@ -97,6 +101,10 @@ pub const AgentSession = struct {
         registry: ?*ai.provider.Registry = null,
         event_handler: ?EventHandler = null,
         auth_storage: ?*auth_storage_mod.AuthStorage = null,
+        /// Borrowed, caller-owned. Session holds it for the TUI to
+        /// read via `getAll()` and for future resolve calls. Phase 2:
+        /// main.zig constructs the registry before this init.
+        model_registry: ?*ai.model_registry.ModelRegistry = null,
         /// Seed with existing messages for --continue.
         initial_messages: []const protocol.AgentMessage = &.{},
         /// Pre-built session store (from SessionStore.open for --continue).
@@ -315,6 +323,7 @@ pub const AgentSession = struct {
             ._subscription_token = null,
             ._stream_closure = closure,
             .auth_storage = options.auth_storage,
+            .model_registry = options.model_registry,
             ._owned_provider_bundle = owned_bundle,
             ._extension_runner = ext_runner,
             ._extension_lua_state = ext_state,

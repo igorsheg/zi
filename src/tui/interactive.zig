@@ -57,8 +57,8 @@ const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
 const auth_storage_mod = @import("../auth/storage.zig");
 const oauth_mod = @import("../auth/oauth.zig");
-const ai_models = @import("../ai/models.zig");
 const ai_protocol = @import("../ai/protocol.zig");
+const ai_resolve = @import("../ai/resolve.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -178,6 +178,11 @@ pub const Interactive = struct {
 
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
+    /// Borrowed slice of the session's ModelRegistry. Bound at init
+    /// from `ca.model_registry.getAll()`. Lifetime: AgentSession
+    /// outlives Interactive, and the registry is immutable for the
+    /// session lifetime, so the slice is stable.
+    model_catalog: []const ai_protocol.Model = &.{},
     model_picker: ListPicker = undefined,
     model_picker_items: [256]SelectItem = undefined,
     model_picker_search_texts: [256][]const u8 = undefined,
@@ -247,6 +252,7 @@ pub const Interactive = struct {
             .request_queue = RequestQueue.init(msg_allocator),
             .ca = ca,
             .auth_storage = auth_storage,
+            .model_catalog = if (ca.model_registry) |mr| mr.getAll() else &.{},
         };
         // Wire the extension runner into the transcript so
         // tool_execution_end can dispatch Lua render_result hooks
@@ -743,8 +749,18 @@ pub const Interactive = struct {
                     }
                 }
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                self.status_text.setContent("session resumed");
-                self.status_text.fg = self.theme.fg(.success);
+                // Prefer the restore warning over the generic
+                // "session resumed" banner when a fallback happened
+                // — users need to see why their saved model isn't
+                // the one they're about to talk to. Otherwise default
+                // to the success banner.
+                if (r.restore_warning) |w| {
+                    self.status_text.setContent(w);
+                    self.status_text.fg = self.theme.fg(.warning);
+                } else {
+                    self.status_text.setContent("session resumed");
+                    self.status_text.fg = self.theme.fg(.success);
+                }
                 self.tui.dirty = true;
             },
             .session_resume_failed => |f| {
@@ -1100,7 +1116,31 @@ pub const Interactive = struct {
     // ── Model picker (/model) ───────────────────────────────────
 
     fn switchModelDirect(self: *Interactive, pattern: []const u8) void {
-        const m = ai_models.getModelById(pattern) orelse ai_models.findModel(pattern) orelse {
+        // `/model <pattern>` goes through the same resolver as the
+        // CLI flag so users get identical semantics: canonical
+        // provider/id, inferred-provider-from-slash, alias-vs-dated
+        // preference, and fuzzy id/name matching. pi-mono parity.
+        const registry = self.ca.model_registry orelse {
+            self.status_text.setContent("model registry unavailable");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+
+        // Scratch arena for resolver output — resolver owns warning/
+        // err strings and we display them inline, then drop them.
+        var scratch = std.heap.ArenaAllocator.init(self.msg_allocator);
+        defer scratch.deinit();
+        const result = ai_resolve.resolveCliModel(.{
+            .cli_model = pattern,
+            .registry = registry,
+            .allocator = scratch.allocator(),
+        });
+        if (result.err) |e| {
+            self.status_text.setContent(e);
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        }
+        const m = result.model orelse {
             self.status_text.setContent("model not found");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
@@ -1121,7 +1161,7 @@ pub const Interactive = struct {
 
     fn showModelPicker(self: *Interactive) void {
         self.freeModelPickerSearchTexts();
-        const all = ai_models.getAllModels();
+        const all = self.model_catalog;
         var count: usize = 0;
 
         for (all) |m| {
@@ -1580,6 +1620,36 @@ pub const Interactive = struct {
         self.ca.session_store = loaded.store;
         self.ca.agent.loadMessages(loaded.messages);
 
+        // pi-mono parity: if the session recorded a last model,
+        // route it through `restoreModelFromSession`. Falls back to
+        // the current model / first authed model when the saved one
+        // disappeared or lost auth. `restore_warning`, when set,
+        // rides along with `.session_resumed` so it survives the
+        // transcript-rebuild status update on the TUI side.
+        //
+        // pi-mono source: model-resolver.ts:559-628
+        var restore_warning: ?[]u8 = null;
+        if (loaded.model) |saved| {
+            if (self.ca.model_registry) |registry| {
+                const restore = ai_resolve.restoreModelFromSession(.{
+                    .saved_provider = saved.provider,
+                    .saved_model_id = saved.model_id,
+                    .current_model = self.ca.agent.state.model,
+                    .registry = registry,
+                    .allocator = self.msg_allocator,
+                }) catch ai_resolve.RestoreResult{ .model = null, .fallback_message = null };
+                if (restore.model) |m| {
+                    self.ca.agent.state.model = m;
+                }
+                if (restore.fallback_message) |msg| {
+                    // `restoreModelFromSession` allocates via
+                    // msg_allocator above; take ownership directly.
+                    // `UiEvent.deinit` frees with the same allocator.
+                    restore_warning = msg;
+                }
+            }
+        }
+
         // Project messages into a display list, cloned into
         // msg_allocator so the TUI can free them independently of
         // agent_arena. Text-only for .15 (matches pre-.15 parity);
@@ -1622,7 +1692,10 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
-        self.event_queue.push(.{ .session_resumed = .{ .entries = owned_entries } });
+        self.event_queue.push(.{ .session_resumed = .{
+            .entries = owned_entries,
+            .restore_warning = restore_warning,
+        } });
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).

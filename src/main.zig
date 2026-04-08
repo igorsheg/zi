@@ -185,7 +185,28 @@ pub fn main() !void {
             }
         }
 
-        const model = resolveModel(model_id, &settings, &auth_storage) orelse {
+        var model_registry = ai.model_registry.ModelRegistry.init(
+            allocator,
+            &auth_storage,
+            &.{},
+        ) catch {
+            try stderr.writeAll("error: could not build model registry\n");
+            std.process.exit(1);
+        };
+
+        const print_init = ai.resolve.findInitialModel(.{
+            .cli_provider = null,
+            .cli_model = model_id,
+            .is_continuing = is_continue,
+            .default_provider = settings.getDefaultProvider(),
+            .default_model_id = settings.getDefaultModel(),
+            .registry = &model_registry,
+            .allocator = allocator,
+        }) catch {
+            try stderr.writeAll("error: model resolution failed\n");
+            std.process.exit(1);
+        };
+        const model = print_init.model orelse {
             try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
             try stderr.writeAll("use --list-models to see available models\n");
             std.process.exit(1);
@@ -315,38 +336,68 @@ pub fn main() !void {
             unreachable;
         };
 
-        // Try to resolve model, but don't exit if none found
-        const model = resolveModel(model_id, &settings, &auth_storage);
-        var api_key: []const u8 = "";
-        var needs_auth = false;
-
-        if (model) |m| {
-            if (std.meta.eql(m.api, .anthropic_messages)) {
-                const provider_str = ai.json_util.providerToString(m.provider);
-                if (api_key_arg) |cli_key| {
-                    auth_storage.setRuntimeApiKey(provider_str, cli_key);
-                }
-                api_key = auth_storage.getApiKey(provider_str) orelse "";
-                if (api_key.len == 0) needs_auth = true;
-            } else {
-                needs_auth = true;
-            }
-        } else {
-            needs_auth = true;
-        }
-
-        const effective_model = model orelse ai.models.findModel("claude-sonnet-4") orelse ai.protocol.Model{
-            .id = "claude-sonnet-4-20250514",
-            .name = "Claude Sonnet 4",
-            .api = .anthropic_messages,
-            .provider = .anthropic,
-            .base_url = "https://api.anthropic.com",
-            .reasoning = false,
-            .input = &.{.text},
-            .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
-            .context_window = 200000,
-            .max_tokens = 16384,
+        // Session-owned ModelRegistry. Main owns the lifetime;
+        // AgentSession holds a borrowed pointer. Phase 2: custom
+        // models are always empty — phase 5 wires settings.
+        var model_registry = ai.model_registry.ModelRegistry.init(
+            allocator,
+            &auth_storage,
+            &.{},
+        ) catch {
+            try stderr.writeAll("error: could not build model registry\n");
+            std.process.exit(1);
         };
+
+        // Resolve initial model via pi-mono's findInitialModel ladder.
+        // pi-mono source: model-resolver.ts:474-554
+        const default_thinking: ?ai.protocol.ThinkingLevel = blk: {
+            const lvl = settings.getDefaultThinkingLevel() orelse break :blk null;
+            break :blk switch (lvl) {
+                .off => null,
+                .minimal => .minimal,
+                .low => .low,
+                .medium => .medium,
+                .high => .high,
+                .xhigh => .xhigh,
+            };
+        };
+        const init_result = ai.resolve.findInitialModel(.{
+            .cli_provider = null, // zi has no --provider flag yet
+            .cli_model = model_id,
+            .scoped_models = &.{},
+            .is_continuing = false,
+            .default_provider = settings.getDefaultProvider(),
+            .default_model_id = settings.getDefaultModel(),
+            .default_thinking_level = default_thinking,
+            .registry = &model_registry,
+            .allocator = allocator,
+        }) catch {
+            try stderr.writeAll("error: model resolution failed\n");
+            std.process.exit(1);
+        };
+
+        const effective_model = init_result.model orelse {
+            if (init_result.fallback_message) |msg| {
+                stderr.writeAll("error: ") catch {};
+                stderr.writeAll(msg) catch {};
+                stderr.writeAll("\n") catch {};
+            } else {
+                try stderr.writeAll(
+                    "no model available — configure auth via /login or pass --api-key, then --model.\n",
+                );
+            }
+            std.process.exit(1);
+        };
+
+        // Stage CLI api key under the effective model's provider so
+        // the stream closure sees it on the first request.
+        if (api_key_arg) |cli_key| {
+            const provider_str = ai.json_util.providerToString(effective_model.provider);
+            auth_storage.setRuntimeApiKey(provider_str, cli_key);
+        }
+        const effective_provider_str = ai.json_util.providerToString(effective_model.provider);
+        const api_key: []const u8 = auth_storage.getApiKey(effective_provider_str) orelse "";
+        const needs_auth = api_key.len == 0;
 
         // Provider registry is owned by AgentSession via Bundle.
         var ca = try sdk.createAgentSession(allocator, .{
@@ -355,6 +406,7 @@ pub fn main() !void {
             .cwd = cwd_buf,
             .max_tokens = 4096,
             .auth_storage = &auth_storage,
+            .model_registry = &model_registry,
         });
         defer ca.deinit();
 
@@ -435,69 +487,4 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-/// Resolve model matching pi-mono's findInitialModel priority:
-/// 1. --model CLI flag (exact or fuzzy match)
-/// 2. settings.json defaultProvider + defaultModel
-/// 3. first authed provider's default model (from defaultModelPerProvider)
-/// 4. first model in catalog where auth is available
-/// pi-mono: model-resolver.ts:474-554
-fn resolveModel(
-    cli_model: ?[]const u8,
-    settings: *settings_mod.manager.SettingsManager,
-    auth_storage: *auth.storage.AuthStorage,
-) ?ai.protocol.Model {
-    // 1. CLI flag
-    if (cli_model) |id| {
-        return ai.models.getModelById(id) orelse ai.models.findModel(id);
-    }
 
-    // 2. Settings default
-    if (settings.getDefaultModel()) |mid| {
-        if (ai.models.getModelById(mid) orelse ai.models.findModel(mid)) |m| {
-            return m;
-        }
-    }
-
-    // 3. Default model per provider, for providers with auth
-    for (default_models_per_provider) |entry| {
-        if (auth_storage.hasAuth(entry.provider)) {
-            if (ai.models.getModelById(entry.model_id)) |m| return m;
-        }
-    }
-
-    // 4. First model in catalog where auth exists
-    for (ai.models.getAllModels()) |m| {
-        const provider_str = ai.json_util.providerToString(m.provider);
-        if (auth_storage.hasAuth(provider_str)) return m;
-    }
-
-    return null;
-}
-
-/// pi-mono: model-resolver.ts:14-38
-const ProviderDefault = struct { provider: []const u8, model_id: []const u8 };
-const default_models_per_provider = [_]ProviderDefault{
-    .{ .provider = "anthropic", .model_id = "claude-sonnet-4-20250514" },
-    .{ .provider = "openai", .model_id = "gpt-5.4" },
-    .{ .provider = "google", .model_id = "gemini-2.5-pro" },
-    .{ .provider = "amazon-bedrock", .model_id = "us.anthropic.claude-opus-4-6-v1" },
-    .{ .provider = "google-gemini-cli", .model_id = "gemini-2.5-pro" },
-    .{ .provider = "google-antigravity", .model_id = "gemini-3.1-pro-high" },
-    .{ .provider = "google-vertex", .model_id = "gemini-3-pro-preview" },
-    .{ .provider = "openai-codex", .model_id = "gpt-5.4" },
-    .{ .provider = "azure-openai-responses", .model_id = "gpt-5.2" },
-    .{ .provider = "github-copilot", .model_id = "gpt-4o" },
-    .{ .provider = "xai", .model_id = "grok-4-fast-non-reasoning" },
-    .{ .provider = "groq", .model_id = "openai/gpt-oss-120b" },
-    .{ .provider = "cerebras", .model_id = "zai-glm-4.7" },
-    .{ .provider = "openrouter", .model_id = "openai/gpt-5.1-codex" },
-    .{ .provider = "vercel-ai-gateway", .model_id = "anthropic/claude-opus-4-6" },
-    .{ .provider = "zai", .model_id = "glm-5" },
-    .{ .provider = "mistral", .model_id = "devstral-medium-latest" },
-    .{ .provider = "minimax", .model_id = "MiniMax-M2.7" },
-    .{ .provider = "minimax-cn", .model_id = "MiniMax-M2.7" },
-    .{ .provider = "huggingface", .model_id = "moonshotai/Kimi-K2.5" },
-    .{ .provider = "opencode", .model_id = "claude-opus-4-6" },
-    .{ .provider = "opencode-go", .model_id = "kimi-k2.5" },
-    .{ .provider = "kimi-coding", .model_id = "kimi-k2-thinking" },
-};
