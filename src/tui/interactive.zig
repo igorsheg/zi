@@ -640,7 +640,10 @@ pub const Interactive = struct {
                 const renderer = self.resolver.resolve(t.tool_name);
                 self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
                 self.transcript.toolSetArgs(t.tool_call_id, t.args);
-                self.transcript.toolSetArgsComplete(t.tool_call_id);
+                // Only freeze args once the stream terminates the
+                // block. Intermediate deltas keep args mutable so the
+                // next parse can overwrite them and re-render.
+                if (t.is_complete) self.transcript.toolSetArgsComplete(t.tool_call_id);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
@@ -1670,6 +1673,29 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
                     }
                     return null;
                 },
+                .toolcall_delta => |tc| {
+                    // Mid-stream tool-call progress. `partial.content`
+                    // is refreshed by anthropic.zig before each delta
+                    // callback, so the in-progress tool_call is at
+                    // `partial.content[content_index]`. Args are the
+                    // incrementally parsed partial JSON — the TUI
+                    // renders them without marking them complete.
+                    if (tc.content_index >= tc.partial.content.len) return null;
+                    const block = tc.partial.content[tc.content_index];
+                    if (block != .tool_call) return null;
+                    const call = block.tool_call;
+                    const id = allocator.dupe(u8, call.id) catch return null;
+                    errdefer allocator.free(id);
+                    const name = allocator.dupe(u8, call.name) catch return null;
+                    errdefer allocator.free(name);
+                    const args = json_util.cloneJsonValue(allocator, call.arguments) catch return null;
+                    return .{ .tool_call_streaming = .{
+                        .tool_call_id = id,
+                        .tool_name = name,
+                        .args = args,
+                        .is_complete = false,
+                    } };
+                },
                 .toolcall_end => |tc| {
                     const id = allocator.dupe(u8, tc.tool_call.id) catch return null;
                     errdefer allocator.free(id);
@@ -1680,6 +1706,7 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
                         .tool_call_id = id,
                         .tool_name = name,
                         .args = args,
+                        .is_complete = true,
                     } };
                 },
                 else => return null,

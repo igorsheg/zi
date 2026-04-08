@@ -34,10 +34,16 @@ pub const UiEvent = union(enum) {
     error_message: struct { message: []u8 },
 
     // --- tool call streaming (from assistant message content, before execution) ---
+    // Emitted both for in-progress deltas (`is_complete = false`) and
+    // the final toolcall_end (`is_complete = true`). The transcript
+    // only marks args as "complete" (which freezes the renderer cache)
+    // on the terminal event; intermediate events keep args mutable so
+    // incremental parses can overwrite them as the model types.
     tool_call_streaming: struct {
         tool_call_id: []u8,
         tool_name: []u8,
         args: std.json.Value,
+        is_complete: bool,
     },
 
     // --- assistant message finalization ---
