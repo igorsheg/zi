@@ -10,6 +10,7 @@ pub const provider_defaults = @import("provider_defaults.zig");
 pub const defaults = @import("defaults.zig");
 pub const model_registry = @import("model_registry.zig");
 pub const resolve = @import("resolve.zig");
+pub const openai_completions = @import("openai_completions.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

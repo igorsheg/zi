@@ -212,15 +212,11 @@ pub fn main() !void {
             std.process.exit(1);
         };
 
-        if (!std.meta.eql(model.api, .anthropic_messages)) {
-            try stderr.writeAll("error: only anthropic models supported currently. model '");
-            try stderr.writeAll(model.id);
-            try stderr.writeAll("' uses api '");
-            try stderr.writeAll(ai.provider.apiToString(model.api));
-            try stderr.writeAll("'\n");
-            std.process.exit(1);
-        }
-
+        // Phase 3: any registered provider works. Bundle.init
+        // registers anthropic-messages and openai-completions; the
+        // stream closure looks up the model's api in the registry
+        // and fails cleanly if the api isn't registered yet
+        // (openai-responses / openai-codex-responses land in 3b/3c).
         const provider_str = ai.json_util.providerToString(model.provider);
         if (api_key_arg) |cli_key| {
             auth_storage.setRuntimeApiKey(provider_str, cli_key);
