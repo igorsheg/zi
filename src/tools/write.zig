@@ -1,15 +1,14 @@
 //! Write tool — create or overwrite a file with mkdir-p semantics.
 //!
-//! pi-mono parity: ports `create-file.ts`. Skipped (deferred):
-//! - per-path mutex (zi tool execution is currently single-thread per session)
-//! - file-tracker change record for undo_edit
-//!
-//! These can land later without changing the tool surface — both attach
-//! at execute time, no schema impact.
+//! pi-mono parity: ports `create-file.ts`. Carries over the per-path
+//! mutex from the ts override via `lock_registry`: two concurrent
+//! writes to the same canonicalized path serialize. Deferred:
+//! - file-tracker change record for undo_edit (undo tool not yet ported)
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
 const util = @import("util.zig");
+const lock_registry = @import("../agent/lock_registry.zig");
 
 const SCHEMA =
     \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path of the file to be created (must be absolute, not relative)."},"content":{"type":"string","description":"The content for the file."}},"required":["path","content"]}
@@ -54,6 +53,12 @@ fn execute(
     const resolved = util.resolvePath(allocator, path, ctx.cwd) catch
         return util.errorResult(allocator, "write tool: failed to resolve path");
     defer allocator.free(resolved);
+
+    // Per-path mutex: serialize concurrent writes to the same
+    // canonicalized file. Mirrors ts override `create-file.ts`.
+    const lock_entry = lock_registry.global().acquirePath(allocator, resolved) catch
+        return util.errorResult(allocator, "write tool: failed to acquire file lock");
+    defer lock_registry.global().release(lock_entry);
 
     // Detect new vs overwrite for the result message.
     var is_new = false;

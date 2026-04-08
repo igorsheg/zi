@@ -14,13 +14,19 @@
 //! - CRLF preservation: detect file's line ending, normalize to LF for
 //!   matching, restore on write.
 //!
+//! Per-path mutex via `lock_registry`: two concurrent edits targeting
+//! the same canonicalized file serialize, mirroring the ts override's
+//! `withFileLock` on a `realpathSync.native` key. The lock spans the
+//! full read-modify-write window.
+//!
 //! Skipped (deferred): BOM preservation (rare in practice for files we
-//! edit), per-path mutex, file-tracker hookup for undo_edit.
+//! edit), file-tracker hookup for undo_edit.
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
 const util = @import("util.zig");
 const diff_mod = @import("../lib/diff.zig");
+const lock_registry = @import("../agent/lock_registry.zig");
 
 const SCHEMA =
     \\{"type":"object","properties":{
@@ -87,6 +93,12 @@ fn execute(
     const resolved = util.resolvePath(allocator, path, ctx.cwd) catch
         return util.errorResult(allocator, "edit tool: failed to resolve path");
     defer allocator.free(resolved);
+
+    // Per-path mutex over the whole read→apply→write window.
+    // Mirrors ts override `edit-file.ts`.
+    const lock_entry = lock_registry.global().acquirePath(allocator, resolved) catch
+        return util.errorResult(allocator, "edit tool: failed to acquire file lock");
+    defer lock_registry.global().release(lock_entry);
 
     // Build the EditBlock list from either single-mode args or `edits`.
     var edits: std.ArrayList(EditBlock) = .empty;
