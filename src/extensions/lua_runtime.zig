@@ -418,29 +418,11 @@ pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
 }
 
 /// Free a `std.json.Value` previously produced by `luaValueToJson`.
-/// Local helper duplicated from `ai/json_util.zig` to keep the
-/// extensions package free of upward dependencies. Recursive walk
-/// over arrays and objects; scalars own only their string slice.
-pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float, .number_string => {},
-        .string => |s| allocator.free(s),
-        .array => |arr| {
-            var a = arr;
-            for (a.items) |v| freeJsonValue(allocator, v);
-            a.deinit();
-        },
-        .object => |obj| {
-            var o = obj;
-            var it = o.iterator();
-            while (it.next()) |kv| {
-                allocator.free(kv.key_ptr.*);
-                freeJsonValue(allocator, kv.value_ptr.*);
-            }
-            o.deinit();
-        },
-    }
-}
+/// Re-exported from `src/json/value.zig` — the extensions package
+/// can safely depend on the generic json module (no upward deps).
+/// Consumers historically imported this from `lua_runtime`; the
+/// re-export preserves their call sites.
+pub const freeJsonValue = @import("../json/value.zig").freeJsonValue;
 
 // =============================================================================
 // Coroutines

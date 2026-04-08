@@ -181,34 +181,12 @@ pub const ToolRegistry = struct {
         if (entry.prompt_snippet) |s| a.free(s);
         for (entry.prompt_guidelines) |g| a.free(g);
         if (entry.prompt_guidelines.len > 0) a.free(entry.prompt_guidelines);
-        freeJsonValue(a, entry.parameters);
+        json_value.freeJsonValue(a, entry.parameters);
         // `source` strings are borrowed by contract — do not free.
     }
-
-    /// Local mini-deinit for std.json.Value. We can't depend on
-    /// ai/json_util.zig from src/extensions/ without dragging in the
-    /// whole AI module graph; this is a minimal recursive walk.
-    fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-        switch (value) {
-            .null, .bool, .integer, .float, .number_string => {},
-            .string => |s| allocator.free(s),
-            .array => |arr| {
-                var a = arr;
-                for (a.items) |v| freeJsonValue(allocator, v);
-                a.deinit();
-            },
-            .object => |obj| {
-                var o = obj;
-                var it = o.iterator();
-                while (it.next()) |kv| {
-                    allocator.free(kv.key_ptr.*);
-                    freeJsonValue(allocator, kv.value_ptr.*);
-                }
-                o.deinit();
-            },
-        }
-    }
 };
+
+const json_value = @import("../../json/value.zig");
 
 // =============================================================================
 // Tests
