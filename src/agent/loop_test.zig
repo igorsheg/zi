@@ -1544,3 +1544,127 @@ test "afterToolCall: overrides content and isError in emitted result" {
     try std.testing.expect(end_is_error);
     try std.testing.expect(end_has_overridden_content);
 }
+
+// ── loop continuation after tool error ──────────────────────────────────
+//
+// Regression test for an observed bug where the user reported the agent
+// loop "stopping" after a tool returned is_error=true. The loop SHOULD
+// stream a follow-up assistant response so the model can read the error
+// message and self-correct (or surface a graceful failure to the user).
+//
+// This test mocks two provider responses:
+//   1. assistant with a single tool call
+//   2. assistant with text "ok, giving up"
+//
+// The execution sequence we expect:
+//   - loop streams response 1 → tool call
+//   - loop executes the tool → execute returns is_error=true
+//   - loop streams response 2 (THIS is the assertion under test)
+//   - loop ends cleanly because response 2 has no tool calls
+//
+// If the loop incorrectly stops after the error tool result, we'll see
+// only one assistant message in `new_messages` and the second mocked
+// response will be unconsumed.
+test "loop continues after tool returns is_error=true" {
+    const allocator = std.testing.allocator;
+    var loop_arena = std.heap.ArenaAllocator.init(allocator);
+    defer loop_arena.deinit();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    // Response 1: tool call
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("erroring", "tc-err-1", .null),
+    };
+    const tc_msg = faux.fauxAssistantMessage(allocator, &tc_content, .toolUse);
+    defer allocator.free(tc_msg.content);
+
+    // Response 2: text only — proves the loop made a second provider call
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxText("ok, giving up"),
+    };
+    const text_msg = faux.fauxAssistantMessage(allocator, &text_content, .stop);
+    defer allocator.free(text_msg.content);
+
+    fp.setResponses(&.{ tc_msg, text_msg });
+
+    // Tool that always returns is_error=true with a descriptive message,
+    // matching the shape `util.errorResult` produces in the real built-ins.
+    const erroringExecFn = struct {
+        fn func(
+            _: ?*anyopaque,
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            _: std.json.Value,
+            _: AbortSignal,
+            _: ?protocol.AgentToolUpdateCallback,
+            _: ?*anyopaque,
+        ) protocol.AgentToolResult {
+            const content = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+                return .{ .content = &.{}, .is_error = true };
+            content[0] = .{ .text = .{ .text = "synthetic tool error: missing argument" } };
+            return .{ .content = content, .is_error = true };
+        }
+    }.func;
+
+    const erroring_tool = protocol.AgentTool{
+        .name = "erroring",
+        .description = "always errors",
+        .label = "Erroring",
+        .parameters = .null,
+        .execute = erroringExecFn,
+    };
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+
+    const user_msg = makeUserMessage("call the erroring tool");
+    const prompts = [_]protocol.AgentMessage{user_msg};
+    const tools = [_]protocol.AgentTool{erroring_tool};
+    const context = protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &tools,
+    };
+    var config = makeConfig(&fp);
+    _ = &config;
+
+    loop.runAgentLoop(
+        loop_arena.allocator(),
+        &prompts,
+        context,
+        config,
+        EventCollector.sink,
+        &collector,
+        AbortSignal.none,
+    );
+
+    // Count assistant message_end events. We expect TWO: one for the
+    // tool-call response, one for the follow-up text. If the loop
+    // erroneously bails after the tool error, we'd see only one.
+    var assistant_message_ends: usize = 0;
+    var saw_giving_up_text = false;
+    for (collector.events.items) |e| {
+        switch (e) {
+            .message_end => |me| switch (me.message) {
+                .assistant => {
+                    assistant_message_ends += 1;
+                },
+                else => {},
+            },
+            .message_update => |mu| switch (mu.assistant_message_event) {
+                .text_delta => |td| {
+                    if (std.mem.indexOf(u8, td.delta, "giving up") != null) {
+                        saw_giving_up_text = true;
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), assistant_message_ends);
+    try std.testing.expect(saw_giving_up_text);
+}

@@ -359,12 +359,18 @@ pub fn main() !void {
         defer ca.deinit();
 
         const tool_display = @import("tui/tool_display.zig");
-        const bash_renderer = @import("tui/renderers/bash.zig");
+        const builtin_renderers = @import("tui/renderers/builtins.zig");
         // Static built-in entries. The resolver hands these out when
         // no Lua render hook claims the tool name. Lua-registered
         // tools hook in via the composed resolver inside Interactive.
         const static_entries: []const tool_display.Registration = &.{
-            .{ .tool_name = "Bash", .renderer = bash_renderer.renderer },
+            .{ .tool_name = "Bash", .renderer = builtin_renderers.bash_renderer },
+            .{ .tool_name = "read", .renderer = builtin_renderers.read_renderer },
+            .{ .tool_name = "write", .renderer = builtin_renderers.write_renderer },
+            .{ .tool_name = "edit", .renderer = builtin_renderers.edit_renderer },
+            .{ .tool_name = "grep", .renderer = builtin_renderers.grep_renderer },
+            .{ .tool_name = "find", .renderer = builtin_renderers.find_renderer },
+            .{ .tool_name = "ls", .renderer = builtin_renderers.ls_renderer },
         };
         const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
         // zi-wub.11: TUI thread owns its own arena. Single-thread,

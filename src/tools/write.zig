@@ -1,0 +1,86 @@
+//! Write tool — create or overwrite a file with mkdir-p semantics.
+//!
+//! pi-mono parity: ports `create-file.ts`. Skipped (deferred):
+//! - per-path mutex (zi tool execution is currently single-thread per session)
+//! - file-tracker change record for undo_edit
+//!
+//! These can land later without changing the tool surface — both attach
+//! at execute time, no schema impact.
+
+const std = @import("std");
+const protocol = @import("../agent/protocol.zig");
+const util = @import("util.zig");
+
+const SCHEMA =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path of the file to be created (must be absolute, not relative)."},"content":{"type":"string","description":"The content for the file."}},"required":["path","content"]}
+;
+
+const DESCRIPTION =
+    "Create or overwrite a file in the workspace.\n\n" ++
+    "Use this tool to create a **new file** that does not yet exist.\n\n" ++
+    "For **existing files**, prefer the edit tool instead — even for extensive changes. " ++
+    "Only use this tool to overwrite an existing file when you are replacing nearly all " ++
+    "of its content AND the file is small (under ~250 lines).\n\n" ++
+    "Automatically creates parent directories if they don't exist.";
+
+pub fn makeTool(ctx: *util.BuiltinCtx) protocol.AgentTool {
+    return .{
+        .name = "write",
+        .description = DESCRIPTION,
+        .label = "Write",
+        .parameters = util.parseSchema(SCHEMA),
+        .ctx = @ptrCast(ctx),
+        .execute = &execute,
+    };
+}
+
+fn execute(
+    raw_ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    args: std.json.Value,
+    _: protocol.AbortSignal,
+    _: ?protocol.AgentToolUpdateCallback,
+    _: ?*anyopaque,
+) protocol.AgentToolResult {
+    const ctx: *util.BuiltinCtx = @ptrCast(@alignCast(raw_ctx orelse
+        return util.errorResult(allocator, "write tool: missing context")));
+
+    const path = util.getString(args, "path") orelse
+        return util.errorResult(allocator, "write tool: missing 'path' argument");
+    const content = util.getString(args, "content") orelse
+        return util.errorResult(allocator, "write tool: missing 'content' argument");
+
+    const resolved = util.resolvePath(allocator, path, ctx.cwd) catch
+        return util.errorResult(allocator, "write tool: failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Detect new vs overwrite for the result message.
+    var is_new = false;
+    std.fs.cwd().access(resolved, .{}) catch {
+        is_new = true;
+    };
+
+    // mkdir -p on the parent directory.
+    if (std.fs.path.dirname(resolved)) |parent| {
+        std.fs.cwd().makePath(parent) catch |err|
+            return util.errorf(allocator, "write tool: failed to create parent dir: {s}", .{@errorName(err)});
+    }
+
+    const file = std.fs.cwd().createFile(resolved, .{ .truncate = true }) catch |err|
+        return util.errorf(allocator, "write tool: failed to create file: {s}", .{@errorName(err)});
+    defer file.close();
+    file.writeAll(content) catch |err|
+        return util.errorf(allocator, "write tool: failed to write: {s}", .{@errorName(err)});
+
+    var line_count: usize = 1;
+    for (content) |c| { if (c == '\n') line_count += 1; }
+
+    const verb = if (is_new) "created" else "overwrote";
+    const msg = std.fmt.allocPrint(allocator, "{s} {s} ({d} lines)", .{
+        verb,
+        std.fs.path.basename(resolved),
+        line_count,
+    }) catch return util.errorResult(allocator, "write tool: alloc failed");
+    return util.textResult(allocator, msg);
+}

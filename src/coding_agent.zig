@@ -3,6 +3,7 @@ const ai = @import("ai/root.zig");
 const agent_mod = @import("agent/root.zig");
 const session_mod = @import("session/root.zig");
 const bash_tool = @import("tools/bash.zig");
+const builtin_tools_mod = @import("tools/builtins.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const storage = @import("storage.zig");
@@ -106,10 +107,15 @@ pub const AgentSession = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) AgentSession {
+        // Default built-ins: bash + read/write/edit/grep/find/ls.
+        // The bundle owns a per-session BuiltinCtx (cwd) that every
+        // tool ctx pointer references; we leak it for the session
+        // lifetime — same allocator we'd otherwise free at deinit, and
+        // tool ctx is borrowed by the agent loop.
         const builtin_tools = options.tools orelse blk: {
-            const t = allocator.alloc(protocol.AgentTool, 1) catch break :blk @as([]const protocol.AgentTool, &.{});
-            t[0] = bash_tool.makeTool();
-            break :blk @as([]const protocol.AgentTool, t);
+            const bundle = builtin_tools_mod.build(allocator, options.cwd) catch
+                break :blk @as([]const protocol.AgentTool, &.{});
+            break :blk @as([]const protocol.AgentTool, bundle.tools);
         };
 
         // Fallback path when no store was pre-built by the sdk factory.

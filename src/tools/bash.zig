@@ -81,6 +81,7 @@ fn execute(
 
     return .{
         .content = text_content,
+        .is_error = is_error,
     };
 }
 
