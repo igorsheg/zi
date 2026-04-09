@@ -155,14 +155,7 @@ fn buildCodexRequestJson(
 
     try jw.beginObject();
 
-    try jw.objectField("model");
-    try jw.write(model.id);
-
-    try jw.objectField("stream");
-    try jw.write(true);
-
-    try jw.objectField("store");
-    try jw.write(false);
+    try core.writeBaseFields(&jw, model);
 
     // System prompt as top-level `instructions` (NOT in input)
     if (context.system_prompt) |sys| {
@@ -194,21 +187,7 @@ fn buildCodexRequestJson(
     try jw.write(true);
 
     if (context.tools) |tools| {
-        try jw.objectField("tools");
-        try jw.beginArray();
-        for (tools) |tool| {
-            try jw.beginObject();
-            try jw.objectField("type");
-            try jw.write("function");
-            try jw.objectField("name");
-            try jw.write(tool.name);
-            try jw.objectField("description");
-            try jw.write(tool.description);
-            try jw.objectField("parameters");
-            try jw.write(tool.parameters);
-            try jw.endObject();
-        }
-        try jw.endArray();
+        try core.writeTools(&jw, tools, false);
     }
 
     if (model.reasoning) {

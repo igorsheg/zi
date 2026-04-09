@@ -116,7 +116,7 @@ pub fn streamCore(
     defer payload_buf.deinit(allocator);
     const build_fn = core.build_request orelse &buildRequestJson;
     build_fn(allocator, &payload_buf, model, context, core.reasoning_effort, core.reasoning_summary) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, "failed to build request: {s}", .{@errorName(err)});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)});
         return;
     };
 
@@ -126,19 +126,19 @@ pub fn streamCore(
             error.NoApiKey => "no API key provided",
             error.BufferTooSmall => "API key too long for auth buffer",
         };
-        emitError(allocator, callback, callback_ctx, model, "{s}", .{msg});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "{s}", .{msg});
         return;
     };
 
     const base = core.base_url orelse model.base_url;
     const uri_str = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, core.path }) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, "failed to build URI: {s}", .{@errorName(err)});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to build URI: {s}", .{@errorName(err)});
         return;
     };
     defer allocator.free(uri_str);
 
     const uri = std.Uri.parse(uri_str) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, "failed to parse URI: {s}", .{@errorName(err)});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to parse URI: {s}", .{@errorName(err)});
         return;
     };
 
@@ -173,25 +173,25 @@ pub fn streamCore(
             .accept_encoding = .{ .override = "identity" },
         },
     }) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, "failed to open connection: {s}", .{@errorName(err)});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to open connection: {s}", .{@errorName(err)});
         return;
     };
     defer req.deinit();
 
     const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, "failed to allocate body: {s}", .{@errorName(err)});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to allocate body: {s}", .{@errorName(err)});
         return;
     };
     defer allocator.free(body_copy);
 
     req.sendBodyComplete(body_copy) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, "failed to send body: {s}", .{@errorName(err)});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to send body: {s}", .{@errorName(err)});
         return;
     };
 
     var redirect_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, "request failed: {s}", .{@errorName(err)});
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "request failed: {s}", .{@errorName(err)});
         return;
     };
 
@@ -207,7 +207,7 @@ pub fn streamCore(
             @memcpy(err_body_buf[n_read..][0..data.len], data);
             n_read += data.len;
         }
-        emitError(allocator, callback, callback_ctx, model, "HTTP {d}: {s}", .{ @intFromEnum(status), err_body_buf[0..n_read] });
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "HTTP {d}: {s}", .{ @intFromEnum(status), err_body_buf[0..n_read] });
         return;
     }
 
@@ -229,8 +229,7 @@ pub fn streamCore(
     }
 
     const reader = response.reader(&transfer_buf);
-    processStream(allocator, reader, model, abort_flag, callback, callback_ctx);
-    _ = core.provider_label;
+    processStream(allocator, reader, model, abort_flag, core.provider_label, callback, callback_ctx);
 }
 
 const WatchdogCtx = struct {
@@ -337,6 +336,7 @@ pub fn processStream(
     reader: anytype,
     model: protocol.Model,
     abort_flag: AbortSignal,
+    provider_label: []const u8,
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
 ) void {
@@ -364,7 +364,7 @@ pub fn processStream(
                 state.partial.stop_reason = .aborted;
                 break;
             }
-            emitError(allocator, callback, callback_ctx, model, "stream read error: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model, provider_label, "stream read error: {s}", .{@errorName(err)});
             return;
         };
         var line = line_with_nl;
@@ -771,10 +771,12 @@ fn emitError(
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
     model: protocol.Model,
+    provider_label: []const u8,
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    const msg = std.fmt.allocPrint(allocator, fmt, args) catch "openai-responses error";
+    const inner = std.fmt.allocPrint(allocator, fmt, args) catch "error";
+    const msg = std.fmt.allocPrint(allocator, "{s}: {s}", .{ provider_label, inner }) catch provider_label;
     const err_msg: protocol.AssistantMessage = .{
         .content = &.{},
         .api = model.api,
@@ -799,6 +801,39 @@ fn emitError(
 // Request body builder
 // =============================================================================
 
+pub fn writeBaseFields(jw: *std.json.Stringify, model: protocol.Model) !void {
+    try jw.objectField("model");
+    try jw.write(model.id);
+
+    try jw.objectField("stream");
+    try jw.write(true);
+
+    try jw.objectField("store");
+    try jw.write(false);
+}
+
+pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, include_strict: bool) !void {
+    try jw.objectField("tools");
+    try jw.beginArray();
+    for (tools) |tool| {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write("function");
+        try jw.objectField("name");
+        try jw.write(tool.name);
+        try jw.objectField("description");
+        try jw.write(tool.description);
+        try jw.objectField("parameters");
+        try jw.write(tool.parameters);
+        if (include_strict) {
+            try jw.objectField("strict");
+            try jw.write(false);
+        }
+        try jw.endObject();
+    }
+    try jw.endArray();
+}
+
 pub fn buildRequestJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -813,14 +848,7 @@ pub fn buildRequestJson(
 
     try jw.beginObject();
 
-    try jw.objectField("model");
-    try jw.write(model.id);
-
-    try jw.objectField("stream");
-    try jw.write(true);
-
-    try jw.objectField("store");
-    try jw.write(false);
+    try writeBaseFields(&jw, model);
 
     try jw.objectField("input");
     try jw.beginArray();
@@ -828,23 +856,7 @@ pub fn buildRequestJson(
     try jw.endArray();
 
     if (context.tools) |tools| {
-        try jw.objectField("tools");
-        try jw.beginArray();
-        for (tools) |tool| {
-            try jw.beginObject();
-            try jw.objectField("type");
-            try jw.write("function");
-            try jw.objectField("name");
-            try jw.write(tool.name);
-            try jw.objectField("description");
-            try jw.write(tool.description);
-            try jw.objectField("parameters");
-            try jw.write(tool.parameters);
-            try jw.objectField("strict");
-            try jw.write(false);
-            try jw.endObject();
-        }
-        try jw.endArray();
+        try writeTools(&jw, tools, true);
     }
 
     if (model.reasoning) {
@@ -1202,7 +1214,7 @@ fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestC
         }
     };
     var r = Reader{ .s = &stream };
-    processStream(arena, &r, test_model, AbortSignal.none, TestCollector.cb, collector);
+    processStream(arena, &r, test_model, AbortSignal.none, "openai-responses", TestCollector.cb, collector);
 }
 
 test "processStream maps reasoning summary deltas to a thinking block" {
