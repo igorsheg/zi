@@ -107,6 +107,8 @@ pub const AgentSession = struct {
         model_registry: ?*ai.model_registry.ModelRegistry = null,
         /// Seed with existing messages for --continue.
         initial_messages: []const protocol.AgentMessage = &.{},
+        /// Initial thinking level (from findInitialModel).
+        thinking_level: ?protocol.ThinkingLevel = null,
         /// Pre-built session store (from SessionStore.open for --continue).
         /// If null, a new session is created for `cwd`.
         session_store: ?SessionStore = null,
@@ -341,6 +343,7 @@ pub const AgentSession = struct {
                 .model = options.model,
                 .tools = filtered_tools,
                 .messages = options.initial_messages,
+                .thinking_level = options.thinking_level orelse .off,
             },
             .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
             .stream_fn = stream_hook,

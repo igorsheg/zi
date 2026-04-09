@@ -397,6 +397,7 @@ pub fn main() !void {
             .max_tokens = 4096,
             .auth_storage = &auth_storage,
             .model_registry = &model_registry,
+            .thinking_level = aiToAgentThinking(init_result.thinking_level),
         });
         defer ca.deinit();
 
@@ -475,6 +476,16 @@ const JsonHandler = struct {
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+fn aiToAgentThinking(level: ai.protocol.ThinkingLevel) agent.protocol.ThinkingLevel {
+    return switch (level) {
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
 }
 
 const TEXT_ONLY: []const ai.protocol.Model.InputType = &.{.text};
