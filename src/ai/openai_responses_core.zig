@@ -49,6 +49,7 @@ const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const partial_json = @import("../json/partial.zig");
 const AbortSignal = @import("../abort_signal.zig").AbortSignal;
+const AbortGuard = @import("../abort_guard.zig").AbortGuard;
 
 // =============================================================================
 // Public surface
@@ -178,6 +179,11 @@ pub fn streamCore(
     };
     defer req.deinit();
 
+    var abort_guard = AbortGuard.start(options.signal, .{
+        .shutdown_fd = if (req.connection) |conn| conn.stream_reader.getStream().handle else null,
+    });
+    defer abort_guard.stop();
+
     const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to allocate body: {s}", .{@errorName(err)});
         return;
@@ -211,42 +217,11 @@ pub fn streamCore(
         return;
     }
 
-    const abort_flag = options.signal;
-    const socket_fd: ?std.posix.fd_t = if (req.connection) |conn|
-        conn.stream_reader.getStream().handle
-    else
-        null;
-
-    var watchdog_done = std.atomic.Value(bool).init(false);
-    var watchdog_thread: ?std.Thread = null;
-    if (!abort_flag.isNone() and socket_fd != null) {
-        const wd_ctx = WatchdogCtx{ .signal = abort_flag, .socket_fd = socket_fd.?, .done = &watchdog_done };
-        watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{wd_ctx}) catch null;
-    }
-    defer {
-        watchdog_done.store(true, .release);
-        if (watchdog_thread) |t| t.join();
-    }
 
     const reader = response.reader(&transfer_buf);
-    processStream(allocator, reader, model, abort_flag, core.provider_label, callback, callback_ctx);
+    processStream(allocator, reader, model, options.signal, core.provider_label, callback, callback_ctx);
 }
 
-const WatchdogCtx = struct {
-    signal: AbortSignal,
-    socket_fd: std.posix.fd_t,
-    done: *std.atomic.Value(bool),
-};
-
-fn abortWatchdog(ctx: WatchdogCtx) void {
-    while (!ctx.done.load(.acquire)) {
-        if (ctx.signal.isAborted()) {
-            std.posix.shutdown(ctx.socket_fd, .both) catch {};
-            return;
-        }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-}
 
 // =============================================================================
 // Pure SSE processor

@@ -60,6 +60,7 @@ const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
 const AbortSignal = @import("../abort_signal.zig").AbortSignal;
+const AbortGuard = @import("../abort_guard.zig").AbortGuard;
 const env_api_keys = @import("env_api_keys.zig");
 
 pub const OpenAICompletionsProvider = struct {
@@ -195,6 +196,11 @@ pub const OpenAICompletionsProvider = struct {
         };
         defer req.deinit();
 
+        var abort_guard = AbortGuard.start(options.signal, .{
+            .shutdown_fd = if (req.connection) |conn| conn.stream_reader.getStream().handle else null,
+        });
+        defer abort_guard.stop();
+
         const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
             emitError(allocator, callback, callback_ctx, model, "failed to allocate body: {s}", .{@errorName(err)});
             return;
@@ -229,28 +235,9 @@ pub const OpenAICompletionsProvider = struct {
             return;
         }
 
-        // Hand the reader to the pure processor. Cancellation is
-        // wired the same way anthropic.zig wires it: a watchdog
-        // shuts down the socket on abort.
-        const abort_flag = options.signal;
-        const socket_fd: ?std.posix.fd_t = if (req.connection) |conn|
-            conn.stream_reader.getStream().handle
-        else
-            null;
-
-        var watchdog_done = std.atomic.Value(bool).init(false);
-        var watchdog_thread: ?std.Thread = null;
-        if (!abort_flag.isNone() and socket_fd != null) {
-            const wd_ctx = WatchdogCtx{ .signal = abort_flag, .socket_fd = socket_fd.?, .done = &watchdog_done };
-            watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{wd_ctx}) catch null;
-        }
-        defer {
-            watchdog_done.store(true, .release);
-            if (watchdog_thread) |t| t.join();
-        }
 
         const reader = response.reader(&transfer_buf);
-        processStream(allocator, reader, model, abort_flag, callback, callback_ctx);
+        processStream(allocator, reader, model, options.signal, callback, callback_ctx);
     }
 };
 
@@ -1104,23 +1091,6 @@ fn emitError(
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
 }
 
-// ── abort watchdog (mirrors anthropic.zig) ──────────────────────────
-
-const WatchdogCtx = struct {
-    signal: AbortSignal,
-    socket_fd: std.posix.fd_t,
-    done: *std.atomic.Value(bool),
-};
-
-fn abortWatchdog(ctx: WatchdogCtx) void {
-    while (!ctx.done.load(.acquire)) {
-        if (ctx.signal.isAborted()) {
-            std.posix.shutdown(ctx.socket_fd, .both) catch {};
-            return;
-        }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-}
 
 // ── tests ───────────────────────────────────────────────────────────
 

@@ -1,4 +1,5 @@
 const AbortSignal = @import("../abort_signal.zig").AbortSignal;
+const AbortGuard = @import("../abort_guard.zig").AbortGuard;
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const sse = @import("sse.zig");
@@ -150,6 +151,11 @@ pub const AnthropicProvider = struct {
         };
         defer req.deinit();
 
+        var abort_guard = AbortGuard.start(options.signal, .{
+            .shutdown_fd = if (req.connection) |conn| conn.stream_reader.getStream().handle else null,
+        });
+        defer abort_guard.stop();
+
         // sendBodyComplete needs mutable slice
         const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
             emitError(allocator, callback, callback_ctx, "failed to allocate body: {s}", .{@errorName(err)});
@@ -224,31 +230,6 @@ pub const AnthropicProvider = struct {
             state.content_blocks.deinit(allocator);
         }
 
-        // Abort: the signal is a typed AbortSignal. When set, we need to break
-        // out of the blocking read. Since zig's chunked HTTP parser is NOT
-        // retry-safe (SO_RCVTIMEO corrupts parser state), we close the
-        // socket from a watchdog thread. This causes the blocking read to
-        // fail with an error, which we catch and classify as aborted.
-        const abort_flag = options.signal;
-        const socket_fd: ?std.posix.fd_t = if (req.connection) |conn|
-            conn.stream_reader.getStream().handle
-        else
-            null;
-
-        // Spawn abort watchdog: polls the abort flag every 100ms,
-        // shuts down the socket when abort is requested.
-        var watchdog_done = std.atomic.Value(bool).init(false);
-        var watchdog_thread: ?std.Thread = null;
-        if (!abort_flag.isNone() and socket_fd != null) {
-            const wd_ctx = WatchdogCtx{ .signal = abort_flag, .socket_fd = socket_fd.?, .done = &watchdog_done };
-            watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{wd_ctx}) catch null;
-        }
-        defer {
-            // Signal watchdog to exit and wait for it BEFORE req.deinit()
-            // closes the socket fd.
-            watchdog_done.store(true, .release);
-            if (watchdog_thread) |t| t.join();
-        }
 
         // Emit start event
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
@@ -267,7 +248,7 @@ pub const AnthropicProvider = struct {
                 },
                 else => {
                     // Check if this was caused by abort
-                    if (abort_flag.isAborted()) {
+                    if (options.signal.isAborted()) {
                         state.partial.stop_reason = .aborted;
                         break;
                     }                    emitError(allocator, callback, callback_ctx, "stream read error: {s}", .{@errorName(err)});
@@ -955,33 +936,6 @@ fn emitError(allocator: std.mem.Allocator, callback: ai_provider.EventCallback, 
     emitErrorDirect(callback, ctx, msg);
 }
 
-const WatchdogCtx = struct {
-    signal: AbortSignal,
-    socket_fd: std.posix.fd_t,
-    /// Set to true when the stream ends normally so the watchdog exits.
-    /// Accessed atomically across threads.
-    done: *std.atomic.Value(bool),
-};
-
-/// Watchdog thread: polls abort flag every 100ms. When set, shuts down
-/// the socket to unblock any blocking read on the SSE reader thread.
-/// Uses shutdown() instead of close() to avoid double-close with req.deinit().
-fn abortWatchdog(ctx: WatchdogCtx) void {
-    while (true) {
-        // Check done FIRST (acquire fence ensures we see the main thread's write)
-        if (ctx.done.load(.acquire)) return;
-        if (ctx.signal.isAborted()) break;
-        std.Thread.sleep(100_000_000); // 100ms
-    }
-    // Double-check done after seeing abort — the stream may have
-    // finished between the abort check and now.
-    if (ctx.done.load(.acquire)) return;
-    // Shutdown the socket (not close) to unblock reads.
-    // shutdown() makes the fd return 0/error on reads but keeps it valid
-    // for req.deinit() to close later.
-    const SHUT_RDWR = 2;
-    _ = std.posix.system.shutdown(ctx.socket_fd, SHUT_RDWR);
-}
 fn emitErrorDirect(callback: ai_provider.EventCallback, ctx: ?*anyopaque, msg: []const u8) void {
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = .{
         .content = &.{},

@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
+const AbortGuard = @import("../abort_guard.zig").AbortGuard;
 
 /// Bash tool — executes shell commands via /bin/sh -c.
 /// pi-mono equivalent: packages/coding-agent/src/core/tools/bash/
@@ -56,16 +57,7 @@ fn execute(
         ) catch "failed to execute command");
     };
 
-    var watchdog_done = std.atomic.Value(bool).init(false);
-    var watchdog_thread: ?std.Thread = null;
-    if (!signal.isNone()) {
-        const ctx = WatchdogCtx{
-            .signal = signal.flag,
-            .child_id = child.id,
-            .done = &watchdog_done,
-        };
-        watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{ctx}) catch null;
-    }
+    var guard = AbortGuard.start(signal, .{ .kill_pid = child.id });
 
     var stderr_result: ?[]u8 = null;
     var stderr_thread: ?std.Thread = null;
@@ -80,8 +72,7 @@ fn execute(
 
     if (stderr_thread) |t| t.join();
 
-    watchdog_done.store(true, .release);
-    if (watchdog_thread) |t| t.join();
+    guard.stop();
 
     const term = child.wait() catch null;
 
@@ -127,28 +118,6 @@ fn execute(
 
 fn readStderr(stderr_file: std.fs.File, alloc: std.mem.Allocator, result: *?[]u8) void {
     result.* = stderr_file.readToEndAlloc(alloc, max_output_bytes) catch null;
-}
-
-const WatchdogCtx = struct {
-    signal: *const std.atomic.Value(bool),
-    child_id: std.process.Child.Id,
-    done: *std.atomic.Value(bool),
-};
-
-fn abortWatchdog(ctx: WatchdogCtx) void {
-    while (true) {
-        if (ctx.done.load(.acquire)) return;
-        if (ctx.signal.load(.acquire)) break;
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-    if (ctx.done.load(.acquire)) return;
-
-    // Kill the child first — this causes its stdout to hit EOF,
-    // unblocking the parent's readToEndAlloc. close() on a pipe fd
-    // is racy (double-close hazard with the reader thread), but
-    // SIGKILL is safe and sufficient: the child dies, its pipe
-    // endpoints close, and the blocking read returns.
-    std.posix.kill(ctx.child_id, std.posix.SIG.KILL) catch {};
 }
 
 fn extractCommand(args: std.json.Value) ?[]const u8 {
