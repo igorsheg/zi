@@ -184,9 +184,9 @@ pub const Interactive = struct {
     /// session lifetime, so the slice is stable.
     model_catalog: []const ai_protocol.Model = &.{},
     model_picker: ListPicker = undefined,
-    model_picker_items: [256]SelectItem = undefined,
-    model_picker_search_texts: [256][]const u8 = undefined,
-    model_picker_models: [256]ai_protocol.Model = undefined,
+    model_picker_items: [512]SelectItem = undefined,
+    model_picker_search_texts: [512][]const u8 = undefined,
+    model_picker_models: [512]ai_protocol.Model = undefined,
     model_picker_count: usize = 0,
     model_picker_handle: ?tui_mod.OverlayHandle = null,
 
@@ -1190,7 +1190,6 @@ pub const Interactive = struct {
             self.status_text.fg = self.theme.fg(.muted);
             return;
         }
-
         self.model_picker = ListPicker.init(self.theme);
         self.model_picker.title = "Select model";
         self.model_picker.list.max_visible = 12;
