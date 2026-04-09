@@ -529,8 +529,8 @@ const TEXT_ONLY: []const ai.protocol.Model.InputType = &.{.text};
 const TEXT_IMAGE: []const ai.protocol.Model.InputType = &.{ .text, .image };
 
 /// Convert settings CustomModel entries to protocol.Model for ModelRegistry.
-/// Validates api (must be known built-in) and provider (must NOT shadow built-in).
-/// Skips invalid entries with a log warning.
+/// Validation (known api, no provider shadowing, non-empty fields, unique ids)
+/// is handled by ModelRegistry.init — this is a thin format adapter.
 fn convertCustomModels(
     allocator: std.mem.Allocator,
     customs: ?[]const settings_mod.types.CustomModel,
@@ -539,40 +539,12 @@ fn convertCustomModels(
     if (items.len == 0) return &.{};
 
     var result = try allocator.alloc(ai.protocol.Model, items.len);
-    var count: usize = 0;
-
-    const log = std.log.scoped(.settings);
     for (items, 0..) |cm, i| {
-        // Validate api: must be known built-in, not .custom
-        const api = ai.json_util.parseApi(cm.api);
-        switch (api) {
-            .custom => {
-                log.warn("settings.models[{d}]: unknown api '{s}', skipping", .{ i, cm.api });
-                continue;
-            },
-            else => {},
-        }
-
-        // Validate provider: must NOT be a known built-in (shadowing)
-        const provider = ai.json_util.parseProvider(cm.provider);
-        switch (provider) {
-            .custom => {}, // good — it's a new custom provider name
-            else => {
-                log.warn("settings.models[{d}]: provider '{s}' shadows a built-in, skipping", .{ i, cm.provider });
-                continue;
-            },
-        }
-
-        if (cm.id.len == 0 or cm.base_url.len == 0) {
-            log.warn("settings.models[{d}]: empty id or baseUrl, skipping", .{i});
-            continue;
-        }
-
-        result[count] = .{
+        result[i] = .{
             .id = cm.id,
             .name = cm.name,
-            .api = api,
-            .provider = provider,
+            .api = ai.json_util.parseApi(cm.api),
+            .provider = ai.json_util.parseProvider(cm.provider),
             .base_url = cm.base_url,
             .reasoning = cm.reasoning,
             .input = if (cm.input_has_image) TEXT_IMAGE else TEXT_ONLY,
@@ -585,8 +557,7 @@ fn convertCustomModels(
             .context_window = cm.context_window,
             .max_tokens = cm.max_tokens,
         };
-        count += 1;
     }
 
-    return result[0..count];
+    return result;
 }

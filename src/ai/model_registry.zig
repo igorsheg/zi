@@ -124,6 +124,63 @@ test "find by provider+id matches anthropic claude-opus-4-6" {
     try std.testing.expect(std.meta.eql(m.provider, protocol.Provider.anthropic));
 }
 
+test "init deep-owns custom model strings and validates" {
+    const alloc = std.testing.allocator;
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+
+    // Valid custom model.
+    const valid: protocol.Model = .{
+        .id = "my-model",
+        .name = "My Model",
+        .api = .openai_completions,
+        .provider = .{ .custom = "my-provider" },
+        .base_url = "https://example.com",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 4096,
+    };
+    // Invalid: shadows built-in provider.
+    const shadowing: protocol.Model = .{
+        .id = "shadow-model",
+        .name = "Shadow",
+        .api = .openai_completions,
+        .provider = .anthropic,
+        .base_url = "https://example.com",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 4096,
+    };
+    // Invalid: unknown api.
+    const unknown_api: protocol.Model = .{
+        .id = "bad-api-model",
+        .name = "Bad API",
+        .api = .{ .custom = "unknown-api" },
+        .provider = .{ .custom = "some-provider" },
+        .base_url = "https://example.com",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 4096,
+    };
+
+    const customs: []const protocol.Model = &.{ valid, shadowing, unknown_api };
+    var reg = try ModelRegistry.init(alloc, &auth, customs);
+    defer reg.deinit();
+
+    // Only the valid model should be added (shadowing + unknown_api rejected).
+    try std.testing.expectEqual(generated.models.len + 1, reg.getAll().len);
+    const custom = reg.getAll()[generated.models.len];
+    try std.testing.expectEqualStrings("my-model", custom.id);
+    // Verify deep ownership: custom.id ptr differs from source.
+    try std.testing.expect(custom.id.ptr != valid.id.ptr);
+}
+
 test "hasConfiguredAuth delegates to AuthStorage.hasAuth" {
     const alloc = std.testing.allocator;
     var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
