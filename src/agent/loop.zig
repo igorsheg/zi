@@ -98,6 +98,9 @@ fn runLoop(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
+    const trace = openTraceFile();
+    defer if (trace) |f| f.close();
+
     var first_turn = true;
 
     // Convert AgentTools to LLM Tools once
@@ -129,6 +132,7 @@ fn runLoop(
         while (has_more_tool_calls or pending_messages.len > 0) {
             // Check abort before each turn (catches abort during tool execution)
             if (isAborted(signal)) {
+                traceWrite(trace, "EXIT: abort before turn\n", .{});
                 event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
                 return;
             }
@@ -151,14 +155,24 @@ fn runLoop(
             }
 
             // Stream assistant response
+            traceWrite(trace, "STREAM: start model={s}\n", .{config.model.id});
             const assistant_msg = streamAssistantResponse(allocator, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
+                traceWrite(trace, "EXIT: stream returned null (no final message)\n", .{});
                 event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
                 return;
             };
 
             new_messages.append(allocator, .{ .assistant = assistant_msg }) catch {};
+            traceWrite(trace, "STREAM: done stop_reason={s} content_blocks={d}\n", .{
+                @tagName(assistant_msg.stop_reason),
+                assistant_msg.content.len,
+            });
 
             if (assistant_msg.stop_reason == .@"error" or assistant_msg.stop_reason == .aborted) {
+                traceWrite(trace, "EXIT: stop_reason={s} error={s}\n", .{
+                    @tagName(assistant_msg.stop_reason),
+                    assistant_msg.error_message orelse "(none)",
+                });
                 event_sink(.{ .turn_end = .{
                     .message = .{ .assistant = assistant_msg },
                     .tool_results = &.{},
@@ -176,13 +190,16 @@ fn runLoop(
                 }
             }
             has_more_tool_calls = tool_call_count > 0;
+            traceWrite(trace, "TOOLS: count={d} has_more={}\n", .{ tool_call_count, has_more_tool_calls });
 
             var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
             if (has_more_tool_calls) {
                 executeToolCalls(allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
+                traceWrite(trace, "TOOLS: executed results={d}\n", .{tool_results.items.len});
 
                 // Abort during tool execution — emit turn_end before agent_end
                 if (isAborted(signal)) {
+                    traceWrite(trace, "EXIT: abort during tool execution\n", .{});
                     event_sink(.{ .turn_end = .{
                         .message = .{ .assistant = assistant_msg },
                         .tool_results = tool_results.items,
@@ -202,6 +219,7 @@ fn runLoop(
                 hook.call(allocator)
             else
                 @as([]const protocol.AgentMessage, &.{});
+            traceWrite(trace, "STEERING: pending={d}\n", .{pending_messages.len});
         }
 
         // Agent would stop here. Check for follow-up messages.
@@ -210,6 +228,7 @@ fn runLoop(
         else
             @as([]const protocol.AgentMessage, &.{});
 
+        traceWrite(trace, "FOLLOW_UP: count={d}\n", .{follow_ups.len});
         if (follow_ups.len > 0) {
             pending_messages = follow_ups;
             continue :outer;
@@ -218,6 +237,7 @@ fn runLoop(
         break;
     }
 
+    traceWrite(trace, "EXIT: normal (no more tool calls, no follow-ups)\n", .{});
     event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
 }
 
@@ -572,6 +592,25 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
 
 fn isAborted(signal: AbortSignal) bool {
     return signal.isAborted();
+}
+
+// ── trace file (ZI_LOOP_TRACE) ──────────────────────────────────────
+
+fn openTraceFile() ?std.fs.File {
+    const path = std.posix.getenv("ZI_LOOP_TRACE") orelse return null;
+    if (path.len == 0) return null;
+    return std.fs.cwd().createFile(path, .{
+        .read = false,
+        .truncate = false,
+    }) catch return null;
+}
+
+fn traceWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+    const file = f orelse return;
+    file.seekFromEnd(0) catch {};
+    var buf: [4096]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    file.writeAll(slice) catch {};
 }
 /// Bridge between provider events and agent events.
 /// Translates AssistantMessageEvent → AgentEvent.
