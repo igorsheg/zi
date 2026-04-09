@@ -181,8 +181,12 @@ fn runLoop(
             if (has_more_tool_calls) {
                 executeToolCalls(allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
 
-                // Abort during tool execution — exit without emitting turn_end
+                // Abort during tool execution — emit turn_end before agent_end
                 if (isAborted(signal)) {
+                    event_sink(.{ .turn_end = .{
+                        .message = .{ .assistant = assistant_msg },
+                        .tool_results = tool_results.items,
+                    } }, event_ctx);
                     event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
                     return;
                 }
@@ -301,6 +305,26 @@ const UpdateBridge = struct {
     }
 };
 
+/// Emit a synthetic tool_execution_end for a tool that was started but not
+/// finished due to abort. Ensures balanced start/end lifecycle events.
+fn emitAbortedToolEnd(
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+    tc: ai.protocol.ToolCall,
+    aa: std.mem.Allocator,
+) void {
+    const err_content = aa.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
+    if (err_content.len > 0) {
+        err_content[0] = .{ .text = .{ .text = "aborted" } };
+    }
+    event_sink(.{ .tool_execution_end = .{
+        .tool_call_id = tc.id,
+        .tool_name = tc.name,
+        .result = .{ .content = err_content, .is_error = true },
+        .is_error = true,
+    } }, event_ctx);
+}
+
 /// Execute tool calls sequentially using the 3-phase pipeline:
 ///   prepareToolCall → executePreparedToolCall → finalizeExecutedToolCall
 /// Matches pi-mono's agent-loop.ts:350-388 (sequential) calling 458-595 (phases).
@@ -317,10 +341,12 @@ fn executeToolCalls(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
+    var started_current = false;
+    var current_tc: ?ai.protocol.ToolCall = null;
     for (assistant_msg.content) |block| {
         switch (block) {
             .tool_call => |tc| {
-                // Check abort between tool calls
+                // Check abort between tool calls — previous tool already got its end event
                 if (isAborted(signal)) return;
 
                 // --- Phase 1: prepareToolCall (pi-mono agent-loop.ts:472-522) ---
@@ -330,11 +356,15 @@ fn executeToolCalls(
                     .tool_name = tc.name,
                     .args = tc.arguments,
                 } }, event_ctx);
+                current_tc = tc;
+                started_current = true;
 
                 const tool = findTool(tools, tc.name);
                 if (tool == null) {
                     const err_msg = std.fmt.allocPrint(aa, "Tool {s} not found", .{tc.name}) catch "Tool not found";
                     emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                    started_current = false;
+                    current_tc = null;
                     continue;
                 }
 
@@ -366,6 +396,8 @@ fn executeToolCalls(
                         if (before_result.block) {
                             const reason = before_result.reason orelse "Tool execution was blocked";
                             emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, reason, event_sink, event_ctx);
+                            started_current = false;
+                            current_tc = null;
                             continue;
                         }
                         if (before_result.args) |replacement| {
@@ -394,8 +426,11 @@ fn executeToolCalls(
                     @ptrCast(&update_bridge),
                 );
 
-                // Abort after tool execution — don't emit result or persist
-                if (isAborted(signal)) return;
+                // Abort after tool execution — emit synthetic end before returning
+                if (isAborted(signal)) {
+                    if (started_current) emitAbortedToolEnd(event_sink, event_ctx, current_tc.?, aa);
+                    return;
+                }
 
                 // --- Phase 3: finalizeExecutedToolCall (pi-mono agent-loop.ts:561-595) ---
 
@@ -423,7 +458,10 @@ fn executeToolCalls(
                     }
                 }
 
-                if (isAborted(signal)) return;
+                if (isAborted(signal)) {
+                    if (started_current) emitAbortedToolEnd(event_sink, event_ctx, current_tc.?, aa);
+                    return;
+                }
 
                 // Build final AgentToolResult and ToolResultMessage
                 const final_agent_result = protocol.AgentToolResult{
@@ -450,6 +488,8 @@ fn executeToolCalls(
                 };
 
                 emitToolResult(event_sink, event_ctx, tc, tool_result_msg, final_is_error, final_agent_result);
+                started_current = false;
+                current_tc = null;
                 ctx_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
                 new_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
                 tool_results.append(aa, tool_result_msg) catch {};

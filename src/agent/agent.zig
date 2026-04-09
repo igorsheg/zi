@@ -101,7 +101,7 @@ pub const Agent = struct {
     tool_execution: protocol.ToolExecutionMode,
     get_api_key: ?protocol.GetApiKeyHook,
 
-    is_running: bool,
+    is_running: std.atomic.Value(bool),
     abort_requested: std.atomic.Value(bool),
 
     /// Owned messages list — grows via processEvents on message_end.
@@ -163,7 +163,7 @@ pub const Agent = struct {
             .max_retry_delay_ms = options.max_retry_delay_ms,
             .tool_execution = options.tool_execution,
             .get_api_key = options.get_api_key,
-            .is_running = false,
+            .is_running = std.atomic.Value(bool).init(false),
             .abort_requested = std.atomic.Value(bool).init(false),
             .messages = messages,
             .pending_tool_call_ids = .empty,
@@ -228,7 +228,7 @@ pub const Agent = struct {
 
     /// Set the abort flag. The loop checks this between turns.
     pub fn abort(self: *Agent) void {
-        if (self.is_running) {
+        if (self.is_running.load(.acquire)) {
             self.abort_requested.store(true, .release);
         }
     }
@@ -264,7 +264,7 @@ pub const Agent = struct {
     /// Returns error.AlreadyProcessing if a run is already active.
     /// pi-mono source: packages/agent/src/agent.ts:312-320
     pub fn prompt(self: *Agent, messages_in: []const protocol.AgentMessage) !void {
-        if (self.is_running) return error.AlreadyProcessing;
+        if (self.is_running.load(.acquire)) return error.AlreadyProcessing;
         self.runWithLifecycle(messages_in, false, false);
     }
 
@@ -272,7 +272,7 @@ pub const Agent = struct {
     /// If the last message is assistant, drains steering then follow-up queues first.
     /// pi-mono source: packages/agent/src/agent.ts:323-350
     pub fn @"continue"(self: *Agent) !void {
-        if (self.is_running) return error.AlreadyProcessing;
+        if (self.is_running.load(.acquire)) return error.AlreadyProcessing;
         if (self.messages.items.len == 0) return error.NoMessages;
 
         const last = self.messages.items[self.messages.items.len - 1];
@@ -306,14 +306,14 @@ pub const Agent = struct {
     /// Run the loop with proper lifecycle management.
     /// pi-mono source: packages/agent/src/agent.ts:434-457
     fn runWithLifecycle(self: *Agent, prompt_messages: ?[]const protocol.AgentMessage, is_continue: bool, skip_initial_steering_poll: bool) void {
-        self.is_running = true;
+        self.is_running.store(true, .release);
         self.state.is_streaming = true;
         self.state.streaming_message = null;
         self.state.error_message = null;
         self.abort_requested.store(false, .release);
 
         defer {
-            self.is_running = false;
+            self.is_running.store(false, .release);
             self.state.is_streaming = false;
             self.state.streaming_message = null;
             self.pending_tool_call_ids.clearRetainingCapacity();
