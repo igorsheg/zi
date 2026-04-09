@@ -36,9 +36,6 @@
 //!   - cache_control insertion for anthropic-via-openrouter
 //!   - cross-provider tool-call-id normalization (pipe-stripped /
 //!     truncated ids from openai-codex / opencode)
-//!   - reasoning_effort plumbing through StreamOptions (anthropic
-//!     also doesn't honor reasoning level today; phase 3b adds the
-//!     plumbing once gpt-5.4 needs it)
 //!
 //! ## Architecture
 //!
@@ -94,7 +91,7 @@ pub const OpenAICompletionsProvider = struct {
         callback_ctx: ?*anyopaque,
     ) void {
         const self: *OpenAICompletionsProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options, callback, callback_ctx);
+        self.streamImpl(allocator, model, context, options, null, callback, callback_ctx);
     }
 
     fn streamSimpleImplWrapper(
@@ -107,11 +104,7 @@ pub const OpenAICompletionsProvider = struct {
         callback_ctx: ?*anyopaque,
     ) void {
         const self: *OpenAICompletionsProvider = @ptrCast(@alignCast(ptr));
-        // Phase 3a: drop reasoning level on the floor — anthropic
-        // does the same. Phase 3b will plumb it via the payload
-        // builder once gpt-5.4 lands.
-        self.streamImpl(allocator, model, context, options.base, callback, callback_ctx);
-    }
+        self.streamImpl(allocator, model, context, options.base, protocol.clampReasoning(options.reasoning, model), callback, callback_ctx);    }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
         return "openai-completions";
@@ -127,6 +120,7 @@ pub const OpenAICompletionsProvider = struct {
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
+        reasoning: ?protocol.ThinkingLevel,
         callback: ai_provider.EventCallback,
         callback_ctx: ?*anyopaque,
     ) void {
@@ -135,7 +129,7 @@ pub const OpenAICompletionsProvider = struct {
         // Build payload.
         var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer payload_buf.deinit(allocator);
-        buildRequestJson(allocator, &payload_buf, model, context) catch |err| {
+        buildRequestJson(allocator, &payload_buf, model, context, reasoning) catch |err| {
             emitError(allocator, callback, callback_ctx, model, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
@@ -809,6 +803,19 @@ fn mapFinishReason(reason: []const u8) protocol.StopReason {
 
 // ── payload builder ─────────────────────────────────────────────────
 
+/// Map a pi-ai thinking-level string through an optional provider-specific
+/// effort map. Falls through to the original string when the map is null or
+/// the level has no override. (pi-mono: openai-completions.ts mapReasoningEffort)
+fn mapReasoningEffort(effort: []const u8, map: ?protocol.OpenAICompletionsCompat.ReasoningEffortMap) []const u8 {
+    const m = map orelse return effort;
+    if (std.mem.eql(u8, effort, "minimal")) return m.minimal orelse effort;
+    if (std.mem.eql(u8, effort, "low")) return m.low orelse effort;
+    if (std.mem.eql(u8, effort, "medium")) return m.medium orelse effort;
+    if (std.mem.eql(u8, effort, "high")) return m.high orelse effort;
+    if (std.mem.eql(u8, effort, "xhigh")) return m.xhigh orelse effort;
+    return effort;
+}
+
 /// Build the JSON request body for chat/completions. Writes into
 /// `out`, which must be empty on entry. Mirrors pi-mono's
 /// `buildParams` + `convertMessages` for the openrouter compat path.
@@ -817,6 +824,7 @@ fn buildRequestJson(
     out: *std.ArrayListUnmanaged(u8),
     model: protocol.Model,
     context: protocol.Context,
+    reasoning: ?protocol.ThinkingLevel,
 ) !void {
     var allocating: std.io.Writer.Allocating = .init(allocator);
     defer allocating.deinit();
@@ -860,6 +868,50 @@ fn buildRequestJson(
             try jw.endObject();
         }
         try jw.endArray();
+    }
+
+    // reasoning_effort for reasoning models (pi-mono: openai-completions.ts:410-428)
+    if (model.reasoning) {
+        if (reasoning) |level| {
+            const effort_str = protocol.thinkingLevelToString(level);
+            if (model.compat) |compat_union| {
+                switch (compat_union) {
+                    .openai_completions => |compat| {
+                        if (compat.thinking_format) |fmt| {
+                            if (fmt == .openrouter) {
+                                try jw.objectField("reasoning");
+                                try jw.beginObject();
+                                try jw.objectField("effort");
+                                try jw.write(mapReasoningEffort(effort_str, compat.reasoning_effort_map));
+                                try jw.endObject();
+                            }
+                        } else if (compat.supports_reasoning_effort orelse false) {
+                            try jw.objectField("reasoning_effort");
+                            try jw.write(mapReasoningEffort(effort_str, compat.reasoning_effort_map));
+                        }
+                    },
+                    else => {},
+                }
+            }
+        } else {
+            // OpenRouter: no reasoning level → send effort: "none" (pi-mono:423-424)
+            if (model.compat) |compat_union| {
+                switch (compat_union) {
+                    .openai_completions => |compat| {
+                        if (compat.thinking_format) |fmt| {
+                            if (fmt == .openrouter) {
+                                try jw.objectField("reasoning");
+                                try jw.beginObject();
+                                try jw.objectField("effort");
+                                try jw.write("none");
+                                try jw.endObject();
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 
     try jw.endObject();

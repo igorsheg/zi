@@ -91,7 +91,36 @@ pub const OpenAICodexProvider = struct {
         callback: ai_provider.EventCallback,
         callback_ctx: ?*anyopaque,
     ) void {
-        streamWrap(ptr, allocator, model, context, options.base, callback, callback_ctx);
+        _ = ptr;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+
+        var extra_hdrs: [3]protocol.Header = undefined;
+        var n_hdrs: usize = 0;
+        if (options.base.api_key) |key| {
+            if (extractAccountId(scratch.allocator(), key)) |id| {
+                extra_hdrs[n_hdrs] = .{ .key = "chatgpt-account-id", .value = id };
+                n_hdrs += 1;
+            }
+        }
+        extra_hdrs[n_hdrs] = .{ .key = "originator", .value = "zi" };
+        n_hdrs += 1;
+        extra_hdrs[n_hdrs] = .{ .key = "OpenAI-Beta", .value = "responses=experimental" };
+        n_hdrs += 1;
+
+        const clamped = protocol.clampReasoning(options.reasoning, model);
+        const effort: ?[]const u8 = if (clamped) |l| protocol.thinkingLevelToString(l) else null;
+
+        core.streamCore(allocator, model, context, options.base, .{
+            .base_url = if (model.base_url.len > 0) null else "https://chatgpt.com/backend-api",
+            .path = "/codex/responses",
+            .auth = .{ .build = buildBearerAuth },
+            .extra_headers = extra_hdrs[0..n_hdrs],
+            .provider_label = "openai-codex-responses",
+            .build_request = &buildCodexRequestJson,
+            .reasoning_effort = effort,
+            .reasoning_summary = if (effort != null) "auto" else null,
+        }, callback, callback_ctx);
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -117,6 +146,8 @@ fn buildCodexRequestJson(
     out: *std.ArrayListUnmanaged(u8),
     model: protocol.Model,
     context: protocol.Context,
+    reasoning_effort: ?[]const u8,
+    reasoning_summary: ?[]const u8,
 ) anyerror!void {
     var allocating: std.io.Writer.Allocating = .init(allocator);
     defer allocating.deinit();
@@ -184,9 +215,9 @@ fn buildCodexRequestJson(
         try jw.objectField("reasoning");
         try jw.beginObject();
         try jw.objectField("effort");
-        try jw.write("low");
+        try jw.write(reasoning_effort orelse "low");
         try jw.objectField("summary");
-        try jw.write("auto");
+        try jw.write(reasoning_summary orelse "auto");
         try jw.endObject();
     }
 

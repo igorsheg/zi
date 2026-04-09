@@ -53,6 +53,36 @@ pub const ThinkingLevel = enum {
     xhigh,
 };
 
+/// Check if a model supports "xhigh" reasoning effort.
+/// pi-mono: models.ts:55
+pub fn supportsXhigh(model: Model) bool {
+    const id = model.id;
+    if (std.mem.indexOf(u8, id, "gpt-5.2") != null) return true;
+    if (std.mem.indexOf(u8, id, "gpt-5.3") != null) return true;
+    if (std.mem.indexOf(u8, id, "gpt-5.4") != null) return true;
+    if (std.mem.indexOf(u8, id, "opus-4-6") != null) return true;
+    if (std.mem.indexOf(u8, id, "opus-4.6") != null) return true;
+    return false;
+}
+
+/// Clamp xhigh → high for models that don't support it.
+/// pi-mono: simple-options.ts:18-20
+pub fn clampReasoning(level: ?ThinkingLevel, model: Model) ?ThinkingLevel {
+    const l = level orelse return null;
+    if (l == .xhigh and !supportsXhigh(model)) return .high;
+    return l;
+}
+
+pub fn thinkingLevelToString(level: ThinkingLevel) []const u8 {
+    return switch (level) {
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
+}
+
 /// Token budgets for each thinking level (token-based providers only)
 pub const ThinkingBudgets = struct {
     minimal: ?u64 = null,

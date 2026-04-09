@@ -81,6 +81,11 @@ pub const CoreOptions = struct {
     extra_headers: []const protocol.Header = &.{},
     /// Provider label for diagnostics in error messages.
     provider_label: []const u8 = "openai-responses",
+    /// Reasoning effort string (e.g. "low", "medium", "high").
+    /// Null means the caller didn't set a level — provider defaults apply.
+    reasoning_effort: ?[]const u8 = null,
+    /// Reasoning summary preference (e.g. "auto", "concise", "detailed").
+    reasoning_summary: ?[]const u8 = null,
     /// Custom request body builder. When non-null, replaces the
     /// default `buildRequestJson`. Codex uses this to emit
     /// `instructions` + codex-specific fields.
@@ -89,6 +94,8 @@ pub const CoreOptions = struct {
         out: *std.ArrayListUnmanaged(u8),
         model: protocol.Model,
         context: protocol.Context,
+        reasoning_effort: ?[]const u8,
+        reasoning_summary: ?[]const u8,
     ) anyerror!void = null,
 };
 
@@ -108,7 +115,7 @@ pub fn streamCore(
     var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer payload_buf.deinit(allocator);
     const build_fn = core.build_request orelse &buildRequestJson;
-    build_fn(allocator, &payload_buf, model, context) catch |err| {
+    build_fn(allocator, &payload_buf, model, context, core.reasoning_effort, core.reasoning_summary) catch |err| {
         emitError(allocator, callback, callback_ctx, model, "failed to build request: {s}", .{@errorName(err)});
         return;
     };
@@ -797,6 +804,8 @@ pub fn buildRequestJson(
     out: *std.ArrayListUnmanaged(u8),
     model: protocol.Model,
     context: protocol.Context,
+    reasoning_effort: ?[]const u8,
+    reasoning_summary: ?[]const u8,
 ) !void {
     var allocating: std.io.Writer.Allocating = .init(allocator);
     defer allocating.deinit();
@@ -839,16 +848,28 @@ pub fn buildRequestJson(
     }
 
     if (model.reasoning) {
-        // pi-mono parity: without `reasoning_effort` / `reasoning_summary`
-        // plumbed through StreamOptions, the default is `effort: "none"`
-        // (matches pi-mono's `openai-responses.ts:224`). The dedicated
-        // follow-up will wire StreamOptions.reasoning → effort/summary and
-        // turn on `include: ["reasoning.encrypted_content"]`.
-        try jw.objectField("reasoning");
-        try jw.beginObject();
-        try jw.objectField("effort");
-        try jw.write("none");
-        try jw.endObject();
+        if (reasoning_effort) |effort| {
+            // pi-mono: openai-responses.ts:216-224
+            try jw.objectField("reasoning");
+            try jw.beginObject();
+            try jw.objectField("effort");
+            try jw.write(effort);
+            try jw.objectField("summary");
+            try jw.write(reasoning_summary orelse "auto");
+            try jw.endObject();
+            try jw.objectField("include");
+            try jw.beginArray();
+            try jw.write("reasoning.encrypted_content");
+            try jw.endArray();
+        } else {
+            // No reasoning requested — send effort: "none"
+            // pi-mono: openai-responses.ts:224
+            try jw.objectField("reasoning");
+            try jw.beginObject();
+            try jw.objectField("effort");
+            try jw.write("none");
+            try jw.endObject();
+        }
     }
 
     try jw.endObject();

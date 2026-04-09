@@ -64,10 +64,16 @@ pub const OpenAIResponsesProvider = struct {
         callback: ai_provider.EventCallback,
         callback_ctx: ?*anyopaque,
     ) void {
-        // Phase 3b: reasoning level dropped on the floor, same as
-        // anthropic + openai_completions. Dedicated follow-up will plumb
-        // reasoning → effort/summary through StreamOptions.
-        streamWrap(ptr, allocator, model, context, options.base, callback, callback_ctx);
+        _ = ptr;
+        const clamped = protocol.clampReasoning(options.reasoning, model);
+        const effort: ?[]const u8 = if (clamped) |l| protocol.thinkingLevelToString(l) else null;
+        core.streamCore(allocator, model, context, options.base, .{
+            .path = "/v1/responses",
+            .auth = .{ .build = buildBearerAuth },
+            .provider_label = "openai-responses",
+            .reasoning_effort = effort,
+            .reasoning_summary = if (effort != null) "auto" else null,
+        }, callback, callback_ctx);
     }
 
     fn getName(_: *anyopaque) []const u8 {

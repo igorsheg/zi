@@ -35,12 +35,12 @@ pub const AnthropicProvider = struct {
 
     fn streamImplWrapper(ptr: *anyopaque, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options, callback, callback_ctx);
+        self.streamImpl(allocator, model, context, options, null, null, callback, callback_ctx);
     }
 
     fn streamSimpleImplWrapper(ptr: *anyopaque, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.SimpleStreamOptions, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options.base, callback, callback_ctx);
+        self.streamImpl(allocator, model, context, options.base, protocol.clampReasoning(options.reasoning, model), options.thinking_budgets, callback, callback_ctx);
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
@@ -53,7 +53,7 @@ pub const AnthropicProvider = struct {
     // Main streaming implementation
     // =================================================================
 
-    fn streamImpl(self: *AnthropicProvider, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
+    fn streamImpl(self: *AnthropicProvider, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
         _ = self;
 
         // Build request payload
@@ -61,7 +61,7 @@ pub const AnthropicProvider = struct {
         defer payload_buf.deinit(allocator);
 
         const is_oauth_token = if (options.api_key) |k| std.mem.indexOf(u8, k, "sk-ant-oat") != null else false;
-        buildRequestJson(allocator, &payload_buf, model, context, options, is_oauth_token) catch |err| {
+        buildRequestJson(allocator, &payload_buf, model, context, options, is_oauth_token, reasoning, thinking_budgets) catch |err| {
             emitError(allocator, callback, callback_ctx, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
@@ -557,19 +557,86 @@ fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockS
     return content;
 }
 
+/// pi-mono: anthropic.ts:446-454
+fn supportsAdaptiveThinking(model_id: []const u8) bool {
+    if (std.mem.indexOf(u8, model_id, "opus-4-6") != null) return true;
+    if (std.mem.indexOf(u8, model_id, "opus-4.6") != null) return true;
+    if (std.mem.indexOf(u8, model_id, "sonnet-4-6") != null) return true;
+    if (std.mem.indexOf(u8, model_id, "sonnet-4.6") != null) return true;
+    return false;
+}
+
+/// pi-mono: anthropic.ts:460-474
+fn mapThinkingLevelToEffort(level: protocol.ThinkingLevel, model_id: []const u8) []const u8 {
+    return switch (level) {
+        .minimal, .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => if (std.mem.indexOf(u8, model_id, "opus-4-6") != null or
+            std.mem.indexOf(u8, model_id, "opus-4.6") != null) "max" else "high",
+    };
+}
+
+/// pi-mono: simple-options.ts:22-46
+fn adjustMaxTokensForThinking(
+    base_max_tokens: u64,
+    model_max_tokens: u64,
+    level: protocol.ThinkingLevel,
+    custom_budgets: ?protocol.ThinkingBudgets,
+) struct { max_tokens: u64, thinking_budget: u64 } {
+    const default_budgets = .{
+        .minimal = @as(u64, 1024),
+        .low = @as(u64, 2048),
+        .medium = @as(u64, 8192),
+        .high = @as(u64, 16384),
+    };
+
+    const thinking_budget_raw: u64 = switch (level) {
+        .minimal => if (custom_budgets) |b| b.minimal orelse default_budgets.minimal else default_budgets.minimal,
+        .low => if (custom_budgets) |b| b.low orelse default_budgets.low else default_budgets.low,
+        .medium => if (custom_budgets) |b| b.medium orelse default_budgets.medium else default_budgets.medium,
+        .high, .xhigh => if (custom_budgets) |b| b.high orelse default_budgets.high else default_budgets.high,
+    };
+
+    const min_output_tokens: u64 = 1024;
+    const max_tokens = @min(base_max_tokens + thinking_budget_raw, model_max_tokens);
+    const thinking_budget = if (max_tokens <= thinking_budget_raw)
+        if (max_tokens > min_output_tokens) max_tokens - min_output_tokens else 0
+    else
+        thinking_budget_raw;
+
+    return .{ .max_tokens = max_tokens, .thinking_budget = thinking_budget };
+}
+
 // =================================================================
 // JSON request building — uses std.json.Stringify
 // =================================================================
 
-fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool) !void {
+fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets) !void {
     var out = std.io.Writer.Allocating.fromArrayList(allocator, buf);
     var jw: std.json.Stringify = .{ .writer = &out.writer };
 
     try jw.beginObject();
     try jw.objectField("model");
     try jw.write(model.id);
+    const effective_max_tokens = blk: {
+        if (model.reasoning) {
+            if (reasoning) |level| {
+                if (!supportsAdaptiveThinking(model.id)) {
+                    const adjusted = adjustMaxTokensForThinking(
+                        options.max_tokens orelse model.max_tokens,
+                        model.max_tokens,
+                        level,
+                        thinking_budgets,
+                    );
+                    break :blk adjusted.max_tokens;
+                }
+            }
+        }
+        break :blk options.max_tokens orelse model.max_tokens;
+    };
     try jw.objectField("max_tokens");
-    try jw.write(options.max_tokens orelse model.max_tokens);
+    try jw.write(effective_max_tokens);
     try jw.objectField("stream");
     try jw.write(true);
 
@@ -621,9 +688,50 @@ fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
         }
     }
 
+    // Temperature is incompatible with extended thinking
     if (options.temperature) |temp| {
-        try jw.objectField("temperature");
-        try jw.print("{d}", .{temp});
+        if (reasoning == null) {
+            try jw.objectField("temperature");
+            try jw.print("{d}", .{temp});
+        }
+    }
+
+    // Thinking configuration — pi-mono: anthropic.ts:659-677
+    if (model.reasoning) {
+        if (reasoning) |level| {
+            if (supportsAdaptiveThinking(model.id)) {
+                try jw.objectField("thinking");
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("adaptive");
+                try jw.endObject();
+                try jw.objectField("output_config");
+                try jw.beginObject();
+                try jw.objectField("effort");
+                try jw.write(mapThinkingLevelToEffort(level, model.id));
+                try jw.endObject();
+            } else {
+                const adjusted = adjustMaxTokensForThinking(
+                    options.max_tokens orelse model.max_tokens,
+                    model.max_tokens,
+                    level,
+                    thinking_budgets,
+                );
+                try jw.objectField("thinking");
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("enabled");
+                try jw.objectField("budget_tokens");
+                try jw.write(adjusted.thinking_budget);
+                try jw.endObject();
+            }
+        } else {
+            try jw.objectField("thinking");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("disabled");
+            try jw.endObject();
+        }
     }
 
     try jw.endObject();
