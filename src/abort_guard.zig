@@ -15,8 +15,13 @@ const AbortSignal = @import("abort_signal.zig").AbortSignal;
 ///   defer guard.stop();
 ///   // ... blocking I/O ...
 pub const AbortGuard = struct {
-    done: std.atomic.Value(bool),
+    /// Heap-allocated so the pointer survives return-by-value from start().
+    /// The watchdog thread holds a pointer to this; if it lived inline in
+    /// the struct, returning from start() would copy the struct and leave
+    /// the watchdog with a dangling pointer to the old stack frame.
+    shared_done: *std.atomic.Value(bool),
     thread: ?std.Thread,
+    allocator: std.mem.Allocator,
 
     pub const Actions = struct {
         shutdown_fd: ?std.posix.fd_t = null,
@@ -27,29 +32,34 @@ pub const AbortGuard = struct {
     /// or both actions are null.
     pub fn start(signal: AbortSignal, actions: Actions) AbortGuard {
         if (signal.isNone() or (actions.shutdown_fd == null and actions.kill_pid == null)) {
-            return .{ .done = std.atomic.Value(bool).init(false), .thread = null };
+            return .{ .shared_done = &noop_done, .thread = null, .allocator = std.heap.page_allocator };
         }
-        var guard = AbortGuard{
-            .done = std.atomic.Value(bool).init(false),
-            .thread = null,
+        const done = std.heap.page_allocator.create(std.atomic.Value(bool)) catch {
+            return .{ .shared_done = &noop_done, .thread = null, .allocator = std.heap.page_allocator };
         };
+        done.* = std.atomic.Value(bool).init(false);
         const ctx = WatchdogCtx{
             .signal = signal.flag,
-            .done = &guard.done,
+            .done = done,
             .shutdown_fd = actions.shutdown_fd,
             .kill_pid = actions.kill_pid,
         };
-        guard.thread = std.Thread.spawn(.{}, watchdog, .{ctx}) catch null;
-        return guard;
+        const thread = std.Thread.spawn(.{}, watchdog, .{ctx}) catch null;
+        return .{ .shared_done = done, .thread = thread, .allocator = std.heap.page_allocator };
     }
 
     /// Signal the watchdog to exit and join it. Must be called before
     /// closing/deiniting the guarded resource (socket, child process).
     pub fn stop(self: *AbortGuard) void {
-        self.done.store(true, .release);
+        self.shared_done.store(true, .release);
         if (self.thread) |t| t.join();
         self.thread = null;
+        if (self.shared_done != &noop_done) {
+            self.allocator.destroy(self.shared_done);
+        }
     }
+
+    var noop_done = std.atomic.Value(bool).init(true);
 
     const WatchdogCtx = struct {
         signal: *const std.atomic.Value(bool),
@@ -64,19 +74,13 @@ pub const AbortGuard = struct {
             if (ctx.signal.load(.acquire)) break;
             std.Thread.sleep(100 * std.time.ns_per_ms);
         }
-        // Re-check done — the main thread may have finished naturally
-        // between our last poll and the abort observation.
         if (ctx.done.load(.acquire)) return;
 
         if (ctx.shutdown_fd) |fd| {
-            // shutdown() keeps the fd valid for the owner's close/deinit,
-            // but unblocks any pending reads with an error.
             const SHUT_RDWR = 2;
             _ = std.posix.system.shutdown(fd, SHUT_RDWR);
         }
         if (ctx.kill_pid) |pid| {
-            // Raw posix.kill, NOT Child.kill — the latter reaps via
-            // waitpid internally, which would race the caller's wait().
             std.posix.kill(pid, std.posix.SIG.KILL) catch {};
         }
     }
