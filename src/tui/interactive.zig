@@ -1169,7 +1169,6 @@ pub const Interactive = struct {
 
         for (all) |m| {
             if (count >= self.model_picker_items.len) break;
-             if (m.api != .anthropic_messages and m.api != .openai_responses and m.api != .openai_codex_responses and m.api != .openai_completions) continue;
             const provider_str = json_util.providerToString(m.provider);
             if (!self.auth_storage.hasAuth(provider_str)) continue;
 

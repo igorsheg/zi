@@ -122,8 +122,28 @@ pub fn main() !void {
     }
 
     if (list_models) {
-        const all = ai.models.getAllModels();
-        for (all) |m| {
+        // Build a registry so custom models from settings are included.
+        var list_auth = auth.storage.AuthStorage.create(allocator, null) catch {
+            try stderr.writeAll("warning: could not load auth storage\n");
+            unreachable;
+        };
+        _ = &list_auth;
+        const list_cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch "/unknown";
+        var list_settings = settings_mod.manager.SettingsManager.create(allocator, list_cwd, null) catch {
+            try stderr.writeAll("warning: could not load settings\n");
+            unreachable;
+        };
+        _ = &list_settings;
+        const list_custom = convertCustomModels(allocator, list_settings.getModels()) catch &.{};
+        var list_registry = ai.model_registry.ModelRegistry.init(
+            allocator,
+            &list_auth,
+            list_custom,
+        ) catch {
+            try stderr.writeAll("error: could not build model registry\n");
+            std.process.exit(1);
+        };
+        for (list_registry.getAll()) |m| {
             stdout.writeAll(ai.provider.apiToString(m.api)) catch {};
             stdout.writeAll("\t") catch {};
             stdout.writeAll(m.id) catch {};
@@ -160,6 +180,7 @@ pub fn main() !void {
         // Load session BEFORE model resolution (pi-mono sdk.ts:194-218)
         var initial_messages: []const agent.protocol.AgentMessage = &.{};
         var session_store: ?coding_agent.SessionStore = null;
+        var saved_session_model: ?@import("session/context.zig").SessionContext.ModelInfo = null;
         if (continue_path) |path| {
             const loaded = coding_agent.openSession(allocator, path) catch |err| {
                 try stderr.writeAll("error: could not load session: ");
@@ -175,12 +196,7 @@ pub fn main() !void {
                 std.process.exit(1);
             }
 
-            // Try session's model first (pi-mono sdk.ts:203-218)
-            if (loaded.model) |session_model| {
-                if (model_id == null) {
-                    model_id = session_model.model_id;
-                }
-            }
+            saved_session_model = loaded.model;
         }
 
         const custom_models = convertCustomModels(allocator, settings.getModels()) catch &.{};
@@ -193,22 +209,43 @@ pub fn main() !void {
             std.process.exit(1);
         };
 
-        const print_init = ai.resolve.findInitialModel(.{
-            .cli_provider = null,
-            .cli_model = model_id,
-            .is_continuing = is_continue,
-            .default_provider = settings.getDefaultProvider(),
-            .default_model_id = settings.getDefaultModel(),
-            .registry = &model_registry,
-            .allocator = allocator,
-        }) catch {
-            try stderr.writeAll("error: model resolution failed\n");
-            std.process.exit(1);
-        };
-        const model = print_init.model orelse {
-            try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
-            try stderr.writeAll("use --list-models to see available models\n");
-            std.process.exit(1);
+        // When resuming a session, use restoreModelFromSession to
+        // preserve the saved provider (not just model_id). This
+        // prevents misresolution when the same id exists under
+        // multiple providers (e.g. openai vs openai_codex).
+        // Only used when the user hasn't overridden via --model.
+        var restored_model: ?ai.protocol.Model = null;
+        if (model_id == null) {
+            if (saved_session_model) |saved| {
+                const restore = ai.resolve.restoreModelFromSession(.{
+                    .saved_provider = saved.provider,
+                    .saved_model_id = saved.model_id,
+                    .current_model = null,
+                    .registry = &model_registry,
+                    .allocator = allocator,
+                }) catch ai.resolve.RestoreResult{ .model = null, .fallback_message = null };
+                restored_model = restore.model;
+            }
+        }
+
+        const model = restored_model orelse blk: {
+            const print_init = ai.resolve.findInitialModel(.{
+                .cli_provider = null,
+                .cli_model = model_id,
+                .is_continuing = is_continue,
+                .default_provider = settings.getDefaultProvider(),
+                .default_model_id = settings.getDefaultModel(),
+                .registry = &model_registry,
+                .allocator = allocator,
+            }) catch {
+                try stderr.writeAll("error: model resolution failed\n");
+                std.process.exit(1);
+            };
+            break :blk print_init.model orelse {
+                try stderr.writeAll("error: no model found. run `pi login` or set an API key env var.\n");
+                try stderr.writeAll("use --list-models to see available models\n");
+                std.process.exit(1);
+            };
         };
 
         // Phase 3: any registered provider works. Bundle.init
