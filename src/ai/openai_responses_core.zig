@@ -81,6 +81,15 @@ pub const CoreOptions = struct {
     extra_headers: []const protocol.Header = &.{},
     /// Provider label for diagnostics in error messages.
     provider_label: []const u8 = "openai-responses",
+    /// Custom request body builder. When non-null, replaces the
+    /// default `buildRequestJson`. Codex uses this to emit
+    /// `instructions` + codex-specific fields.
+    build_request: ?*const fn (
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        model: protocol.Model,
+        context: protocol.Context,
+    ) anyerror!void = null,
 };
 
 // =============================================================================
@@ -98,7 +107,8 @@ pub fn streamCore(
 ) void {
     var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer payload_buf.deinit(allocator);
-    buildRequestJson(allocator, &payload_buf, model, context) catch |err| {
+    const build_fn = core.build_request orelse &buildRequestJson;
+    build_fn(allocator, &payload_buf, model, context) catch |err| {
         emitError(allocator, callback, callback_ctx, model, "failed to build request: {s}", .{@errorName(err)});
         return;
     };
@@ -619,7 +629,10 @@ fn handleEvent(
     }
 
     // ── terminal: usage + stop reason ──────────────────────────────
-    if (std.mem.eql(u8, t, "response.completed")) {
+    if (std.mem.eql(u8, t, "response.completed") or
+        std.mem.eql(u8, t, "response.done") or
+        std.mem.eql(u8, t, "response.incomplete"))
+    {
         const resp = root.object.get("response") orelse return;
         if (resp != .object) return;
         if (resp.object.get("id")) |id| if (id == .string and id.string.len > 0) {
@@ -842,19 +855,31 @@ pub fn buildRequestJson(
     try out.appendSlice(allocator, allocating.written());
 }
 
-fn writeInput(
+pub fn writeInput(
     allocator: std.mem.Allocator,
     jw: *std.json.Stringify,
     model: protocol.Model,
     context: protocol.Context,
 ) !void {
-    if (context.system_prompt) |sys| {
-        try jw.beginObject();
-        try jw.objectField("role");
-        try jw.write(if (model.reasoning) "developer" else "system");
-        try jw.objectField("content");
-        try jw.write(sys);
-        try jw.endObject();
+    writeInputOpts(allocator, jw, model, context, true) catch |err| return err;
+}
+
+pub fn writeInputOpts(
+    allocator: std.mem.Allocator,
+    jw: *std.json.Stringify,
+    model: protocol.Model,
+    context: protocol.Context,
+    include_system_prompt: bool,
+) !void {
+    if (include_system_prompt) {
+        if (context.system_prompt) |sys| {
+            try jw.beginObject();
+            try jw.objectField("role");
+            try jw.write(if (model.reasoning) "developer" else "system");
+            try jw.objectField("content");
+            try jw.write(sys);
+            try jw.endObject();
+        }
     }
 
     var msg_index: usize = 0;

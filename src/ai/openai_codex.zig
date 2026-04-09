@@ -78,6 +78,7 @@ pub const OpenAICodexProvider = struct {
             .auth = .{ .build = buildBearerAuth },
             .extra_headers = extra_hdrs[0..n_hdrs],
             .provider_label = "openai-codex-responses",
+            .build_request = &buildCodexRequestJson,
         }, callback, callback_ctx);
     }
 
@@ -99,6 +100,99 @@ pub const OpenAICodexProvider = struct {
 
     fn deinitImpl(_: *anyopaque) void {}
 };
+
+/// Codex-specific request body builder. Passed to `CoreOptions.build_request`
+/// so the shared core uses it instead of `buildRequestJson`.
+///
+/// pi-mono: openai-codex-responses.ts:296-334
+///
+/// Key differences from the standard responses body:
+///   - `instructions` is a top-level field (system prompt excluded from `input`)
+///   - `text.verbosity: "medium"`
+///   - `include: ["reasoning.encrypted_content"]`
+///   - `tool_choice: "auto"`, `parallel_tool_calls: true`
+///   - reasoning defaults to `effort: "low"`, `summary: "auto"`
+fn buildCodexRequestJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    model: protocol.Model,
+    context: protocol.Context,
+) anyerror!void {
+    var allocating: std.io.Writer.Allocating = .init(allocator);
+    defer allocating.deinit();
+    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+
+    try jw.beginObject();
+
+    try jw.objectField("model");
+    try jw.write(model.id);
+
+    try jw.objectField("stream");
+    try jw.write(true);
+
+    try jw.objectField("store");
+    try jw.write(false);
+
+    // System prompt as top-level `instructions` (NOT in input)
+    if (context.system_prompt) |sys| {
+        try jw.objectField("instructions");
+        try jw.write(sys);
+    }
+
+    // Messages WITHOUT system prompt
+    try jw.objectField("input");
+    try jw.beginArray();
+    try core.writeInputOpts(allocator, &jw, model, context, false);
+    try jw.endArray();
+
+    try jw.objectField("text");
+    try jw.beginObject();
+    try jw.objectField("verbosity");
+    try jw.write("medium");
+    try jw.endObject();
+
+    try jw.objectField("include");
+    try jw.beginArray();
+    try jw.write("reasoning.encrypted_content");
+    try jw.endArray();
+
+    try jw.objectField("tool_choice");
+    try jw.write("auto");
+
+    try jw.objectField("parallel_tool_calls");
+    try jw.write(true);
+
+    if (context.tools) |tools| {
+        try jw.objectField("tools");
+        try jw.beginArray();
+        for (tools) |tool| {
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("function");
+            try jw.objectField("name");
+            try jw.write(tool.name);
+            try jw.objectField("description");
+            try jw.write(tool.description);
+            try jw.objectField("parameters");
+            try jw.write(tool.parameters);
+            try jw.endObject();
+        }
+        try jw.endArray();
+    }
+
+    if (model.reasoning) {
+        try jw.objectField("reasoning");
+        try jw.beginObject();
+        try jw.objectField("effort");
+        try jw.write("low");
+        try jw.objectField("summary");
+        try jw.write("auto");
+        try jw.endObject();
+    }
+
+    try jw.endObject();
+    try out.appendSlice(allocator, allocating.written());
+}
 
 /// Extract chatgpt_account_id from a JWT access token.
 /// pi-mono: openai-codex-responses.ts:282-287
