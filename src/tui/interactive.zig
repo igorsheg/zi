@@ -1166,7 +1166,7 @@ pub const Interactive = struct {
 
         for (all) |m| {
             if (count >= self.model_picker_items.len) break;
-            if (m.api != .anthropic_messages) continue;
+             if (m.api != .anthropic_messages and m.api != .openai_responses and m.api != .openai_codex_responses and m.api != .openai_completions) continue;
             const provider_str = json_util.providerToString(m.provider);
             if (!self.auth_storage.hasAuth(provider_str)) continue;
 
@@ -1399,8 +1399,12 @@ pub const Interactive = struct {
                 self.msg_allocator.free(cred.refresh);
                 self.msg_allocator.free(cred.access);
                 var extras = cred.extras;
+                var eit = extras.iterator();
+                while (eit.next()) |e| {
+                    self.msg_allocator.free(e.key_ptr.*);
+                    json_util.freeJsonValue(self.msg_allocator, e.value_ptr.*);
+                }
                 extras.deinit();
-
                 self.event_queue.push(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = true,
