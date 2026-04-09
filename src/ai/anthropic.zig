@@ -646,7 +646,25 @@ fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
 
     try jw.objectField("messages");
     try jw.beginArray();
-    for (context.messages) |msg| {
+    var i: usize = 0;
+    while (i < context.messages.len) : (i += 1) {
+        const msg = context.messages[i];
+        if (msg == .tool_result) {
+            try jw.beginObject();
+            try jw.objectField("role");
+            try jw.write("user");
+            try jw.objectField("content");
+            try jw.beginArray();
+
+            try writeToolResultBlock(&jw, msg.tool_result);
+            while (i + 1 < context.messages.len and context.messages[i + 1] == .tool_result) : (i += 1) {
+                try writeToolResultBlock(&jw, context.messages[i + 1].tool_result);
+            }
+
+            try jw.endArray();
+            try jw.endObject();
+            continue;
+        }
         try writeMessageJson(&jw, msg);
     }
     try jw.endArray();
@@ -806,34 +824,38 @@ fn writeMessageJson(jw: *std.json.Stringify, msg: protocol.Message) !void {
             try jw.write("user");
             try jw.objectField("content");
             try jw.beginArray();
-            try jw.beginObject();
-            try jw.objectField("type");
-            try jw.write("tool_result");
-            try jw.objectField("tool_use_id");
-            try jw.write(tr.tool_call_id);
-            try jw.objectField("content");
-            try jw.beginArray();
-            for (tr.content) |content_block| {
-                switch (content_block) {
-                    .text => |t| {
-                        try jw.beginObject();
-                        try jw.objectField("type");
-                        try jw.write("text");
-                        try jw.objectField("text");
-                        try jw.write(t.text);
-                        try jw.endObject();
-                    },
-                    .image => |img| try writeAnthropicImageBlock(jw, img),
-                }
-            }
-            try jw.endArray();
-            if (tr.is_error) {
-                try jw.objectField("is_error");
-                try jw.write(true);
-            }
-            try jw.endObject();
+            try writeToolResultBlock(jw, tr);
             try jw.endArray();
         },
+    }
+    try jw.endObject();
+}
+
+fn writeToolResultBlock(jw: *std.json.Stringify, tr: protocol.ToolResultMessage) !void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("tool_result");
+    try jw.objectField("tool_use_id");
+    try jw.write(tr.tool_call_id);
+    try jw.objectField("content");
+    try jw.beginArray();
+    for (tr.content) |content_block| {
+        switch (content_block) {
+            .text => |t| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("text");
+                try jw.objectField("text");
+                try jw.write(t.text);
+                try jw.endObject();
+            },
+            .image => |img| try writeAnthropicImageBlock(jw, img),
+        }
+    }
+    try jw.endArray();
+    if (tr.is_error) {
+        try jw.objectField("is_error");
+        try jw.write(true);
     }
     try jw.endObject();
 }
