@@ -183,10 +183,11 @@ pub fn main() !void {
             }
         }
 
+        const custom_models = convertCustomModels(allocator, settings.getModels()) catch &.{};
         var model_registry = ai.model_registry.ModelRegistry.init(
             allocator,
             &auth_storage,
-            &.{},
+            custom_models,
         ) catch {
             try stderr.writeAll("error: could not build model registry\n");
             std.process.exit(1);
@@ -326,12 +327,12 @@ pub fn main() !void {
         };
 
         // Session-owned ModelRegistry. Main owns the lifetime;
-        // AgentSession holds a borrowed pointer. Phase 2: custom
-        // models are always empty — phase 5 wires settings.
+        // AgentSession holds a borrowed pointer.
+        const custom_models_interactive = convertCustomModels(allocator, settings.getModels()) catch &.{};
         var model_registry = ai.model_registry.ModelRegistry.init(
             allocator,
             &auth_storage,
-            &.{},
+            custom_models_interactive,
         ) catch {
             try stderr.writeAll("error: could not build model registry\n");
             std.process.exit(1);
@@ -476,4 +477,68 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+const TEXT_ONLY: []const ai.protocol.Model.InputType = &.{.text};
+const TEXT_IMAGE: []const ai.protocol.Model.InputType = &.{ .text, .image };
 
+/// Convert settings CustomModel entries to protocol.Model for ModelRegistry.
+/// Validates api (must be known built-in) and provider (must NOT shadow built-in).
+/// Skips invalid entries with a log warning.
+fn convertCustomModels(
+    allocator: std.mem.Allocator,
+    customs: ?[]const settings_mod.types.CustomModel,
+) ![]const ai.protocol.Model {
+    const items = customs orelse return &.{};
+    if (items.len == 0) return &.{};
+
+    var result = try allocator.alloc(ai.protocol.Model, items.len);
+    var count: usize = 0;
+
+    const log = std.log.scoped(.settings);
+    for (items, 0..) |cm, i| {
+        // Validate api: must be known built-in, not .custom
+        const api = ai.json_util.parseApi(cm.api);
+        switch (api) {
+            .custom => {
+                log.warn("settings.models[{d}]: unknown api '{s}', skipping", .{ i, cm.api });
+                continue;
+            },
+            else => {},
+        }
+
+        // Validate provider: must NOT be a known built-in (shadowing)
+        const provider = ai.json_util.parseProvider(cm.provider);
+        switch (provider) {
+            .custom => {}, // good — it's a new custom provider name
+            else => {
+                log.warn("settings.models[{d}]: provider '{s}' shadows a built-in, skipping", .{ i, cm.provider });
+                continue;
+            },
+        }
+
+        if (cm.id.len == 0 or cm.base_url.len == 0) {
+            log.warn("settings.models[{d}]: empty id or baseUrl, skipping", .{i});
+            continue;
+        }
+
+        result[count] = .{
+            .id = cm.id,
+            .name = cm.name,
+            .api = api,
+            .provider = provider,
+            .base_url = cm.base_url,
+            .reasoning = cm.reasoning,
+            .input = if (cm.input_has_image) TEXT_IMAGE else TEXT_ONLY,
+            .cost = .{
+                .input = cm.cost_input,
+                .output = cm.cost_output,
+                .cache_read = cm.cost_cache_read,
+                .cache_write = cm.cost_cache_write,
+            },
+            .context_window = cm.context_window,
+            .max_tokens = cm.max_tokens,
+        };
+        count += 1;
+    }
+
+    return result[0..count];
+}

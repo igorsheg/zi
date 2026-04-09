@@ -149,6 +149,11 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
         settings.packages = try parsePackages(arena, v);
     }
 
+    // ── custom models ──
+    if (obj.get("models")) |v| {
+        settings.models = try parseCustomModels(arena, v);
+    }
+
     return .{ .settings = settings, .parsed = parsed };
 }
 
@@ -298,6 +303,78 @@ fn parsePackages(arena: std.mem.Allocator, v: Value) !?[]const types.PackageSour
     return result[0..idx];
 }
 
+/// Parse the `models` array from settings JSON into CustomModel entries.
+/// All string data borrows from the parsed JSON tree (arena-owned).
+/// Skips entries with missing required fields (id, api, provider, baseUrl).
+fn parseCustomModels(arena: std.mem.Allocator, v: Value) !?[]const types.CustomModel {
+    if (v != .array) return null;
+    const items = v.array.items;
+    if (items.len == 0) return null;
+
+    var result_buf = try arena.alloc(types.CustomModel, items.len);
+    var count: usize = 0;
+
+    for (items) |item| {
+        if (item != .object) continue;
+        const obj = &item.object;
+
+        // Required string fields
+        const id = if (obj.get("id")) |val| (if (val == .string) val.string else null) else null;
+        const api = if (obj.get("api")) |val| (if (val == .string) val.string else null) else null;
+        const provider = if (obj.get("provider")) |val| (if (val == .string) val.string else null) else null;
+        const base_url = if (obj.get("baseUrl")) |val| (if (val == .string) val.string else null) else null;
+
+        if (id == null or api == null or provider == null or base_url == null) continue;
+
+        var model: types.CustomModel = .{
+            .id = id.?,
+            .name = if (obj.get("name")) |val| (if (val == .string) val.string else id.?) else id.?,
+            .api = api.?,
+            .provider = provider.?,
+            .base_url = base_url.?,
+        };
+
+        // Optional fields
+        if (obj.get("reasoning")) |val| {
+            if (val == .bool) model.reasoning = val.bool;
+        }
+        if (obj.get("inputHasImage")) |val| {
+            if (val == .bool) model.input_has_image = val.bool;
+        }
+        if (obj.get("contextWindow")) |val| {
+            if (val == .integer) model.context_window = @intCast(val.integer);
+        }
+        if (obj.get("maxTokens")) |val| {
+            if (val == .integer) model.max_tokens = @intCast(val.integer);
+        }
+
+        // Nested cost object
+        if (obj.get("cost")) |cost_val| {
+            if (cost_val == .object) {
+                const cost_obj = &cost_val.object;
+                if (cost_obj.get("input")) |ci| model.cost_input = jsonToFloat(ci);
+                if (cost_obj.get("output")) |co| model.cost_output = jsonToFloat(co);
+                if (cost_obj.get("cacheRead")) |cr| model.cost_cache_read = jsonToFloat(cr);
+                if (cost_obj.get("cacheWrite")) |cw| model.cost_cache_write = jsonToFloat(cw);
+            }
+        }
+
+        result_buf[count] = model;
+        count += 1;
+    }
+
+    if (count == 0) return null;
+    return result_buf[0..count];
+}
+
+fn jsonToFloat(v: Value) f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => 0,
+    };
+}
+
 // ─── Deep Merge ─────────────────────────────────────────────────────
 
 /// Deep merge: overrides take precedence over base.
@@ -338,6 +415,7 @@ pub fn deepMergeSettings(base: types.Settings, overrides: types.Settings) types.
     if (overrides.prompts) |v| result.prompts = v;
     if (overrides.themes_paths) |v| result.themes_paths = v;
     if (overrides.enabled_models) |v| result.enabled_models = v;
+    if (overrides.models) |v| result.models = v;
 
     // ── nested structs: merge sub-fields ──
     if (overrides.compaction) |ov| {
@@ -700,6 +778,52 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         }
         try jw.endArray();
     }
+
+    // ── custom models ──
+    if (settings.models) |models| {
+        try jw.objectField("models");
+        try jw.beginArray();
+        for (models) |m| {
+            try jw.beginObject();
+            try jw.objectField("id");
+            try jw.write(m.id);
+            try jw.objectField("name");
+            try jw.write(m.name);
+            try jw.objectField("api");
+            try jw.write(m.api);
+            try jw.objectField("provider");
+            try jw.write(m.provider);
+            try jw.objectField("baseUrl");
+            try jw.write(m.base_url);
+            if (m.reasoning) {
+                try jw.objectField("reasoning");
+                try jw.write(true);
+            }
+            if (m.input_has_image) {
+                try jw.objectField("inputHasImage");
+                try jw.write(true);
+            }
+            if (m.cost_input != 0 or m.cost_output != 0 or m.cost_cache_read != 0 or m.cost_cache_write != 0) {
+                try jw.objectField("cost");
+                try jw.beginObject();
+                try jw.objectField("input");
+                try jw.write(m.cost_input);
+                try jw.objectField("output");
+                try jw.write(m.cost_output);
+                try jw.objectField("cacheRead");
+                try jw.write(m.cost_cache_read);
+                try jw.objectField("cacheWrite");
+                try jw.write(m.cost_cache_write);
+                try jw.endObject();
+            }
+            try jw.objectField("contextWindow");
+            try jw.write(m.context_window);
+            try jw.objectField("maxTokens");
+            try jw.write(m.max_tokens);
+            try jw.endObject();
+        }
+        try jw.endArray();
+    }
 }
 
 fn writeStringArray(jw: *Stringify, arr: []const []const u8) !void {
@@ -847,6 +971,34 @@ pub fn applyTypedFieldToRaw(
                             try arr.append(.{ .object = pkg_obj });
                         },
                     }
+                }
+                try object.put(key, .{ .array = arr });
+            }
+        },
+
+        .models => {
+            if (settings.models) |models| {
+                var arr = try std.json.Array.initCapacity(allocator, models.len);
+                for (models) |m| {
+                    var obj = ObjectMap.init(allocator);
+                    try obj.put("id", .{ .string = m.id });
+                    try obj.put("name", .{ .string = m.name });
+                    try obj.put("api", .{ .string = m.api });
+                    try obj.put("provider", .{ .string = m.provider });
+                    try obj.put("baseUrl", .{ .string = m.base_url });
+                    if (m.reasoning) try obj.put("reasoning", .{ .bool = true });
+                    if (m.input_has_image) try obj.put("inputHasImage", .{ .bool = true });
+                    try obj.put("contextWindow", .{ .integer = @intCast(m.context_window) });
+                    try obj.put("maxTokens", .{ .integer = @intCast(m.max_tokens) });
+                    if (m.cost_input != 0 or m.cost_output != 0 or m.cost_cache_read != 0 or m.cost_cache_write != 0) {
+                        var cost = ObjectMap.init(allocator);
+                        try cost.put("input", .{ .float = m.cost_input });
+                        try cost.put("output", .{ .float = m.cost_output });
+                        try cost.put("cacheRead", .{ .float = m.cost_cache_read });
+                        try cost.put("cacheWrite", .{ .float = m.cost_cache_write });
+                        try obj.put("cost", .{ .object = cost });
+                    }
+                    try arr.append(.{ .object = obj });
                 }
                 try object.put(key, .{ .array = arr });
             }

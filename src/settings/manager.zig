@@ -254,6 +254,10 @@ pub const SettingsManager = struct {
         return self.settings.session_dir;
     }
 
+    pub fn getModels(self: *const SettingsManager) ?[]const types.CustomModel {
+        return self.settings.models;
+    }
+
     pub fn getDefaultProvider(self: *const SettingsManager) ?[]const u8 {
         return self.settings.default_provider;
     }

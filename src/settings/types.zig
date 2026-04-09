@@ -111,6 +111,27 @@ pub const PackageSource = union(enum) {
     filtered: PackageSourceFilter,
 };
 
+
+/// User-defined model entry from settings.json `models[]`.
+/// All string fields borrow from the parsed JSON arena.
+/// Validated and converted to `protocol.Model` at session init.
+/// pi-mono: settings-manager.ts:100 (models array in settings)
+pub const CustomModel = struct {
+    id: []const u8,
+    name: []const u8,
+    api: []const u8,
+    provider: []const u8,
+    base_url: []const u8,
+    reasoning: bool = false,
+    input_has_image: bool = false,
+    cost_input: f64 = 0,
+    cost_output: f64 = 0,
+    cost_cache_read: f64 = 0,
+    cost_cache_write: f64 = 0,
+    context_window: u64 = 4096,
+    max_tokens: u64 = 4096,
+};
+
 // ── main Settings struct ───────────────────────────────────────────────
 
 /// All user-configurable settings. Every field is optional.
@@ -150,6 +171,7 @@ pub const Settings = struct {
     show_hardware_cursor: ?bool = null,
     markdown: ?MarkdownSettings = null,
     session_dir: ?[]const u8 = null,
+    models: ?[]const CustomModel = null,
 };
 
 // ── resolved settings (with defaults applied) ──────────────────────────
@@ -219,6 +241,7 @@ pub const SettingsField = enum {
     show_hardware_cursor,
     markdown,
     session_dir,
+    models,
 };
 
 // ── string conversion helpers (camelCase wire format) ──────────────────
@@ -369,5 +392,6 @@ pub fn settingsFieldToJsonKey(field: SettingsField) []const u8 {
         .show_hardware_cursor => "showHardwareCursor",
         .markdown => "markdown",
         .session_dir => "sessionDir",
+        .models => "models",
     };
 }
