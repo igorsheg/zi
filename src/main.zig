@@ -8,8 +8,6 @@ const sdk = @import("sdk.zig");
 const agent_json = @import("agent/json.zig");
 const interactive_mod = @import("tui/interactive.zig");
 const terminal_mod = @import("tui/terminal.zig");
-const bash_tool = @import("tools/bash.zig");
-const protocol = agent.protocol;
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
 pub const panic = terminal_mod.panic;
@@ -251,28 +249,23 @@ pub fn main() !void {
                 append_system_prompt = asp;
             }
         }
-        // Resolve --tools filter: comma-separated tool names -> filtered tool slice
-        var tools_opt: ?[]const protocol.AgentTool = null;
+        // Resolve --tools allowlist: comma-separated tool names →
+        // strict whitelist applied inside AgentSession.init AFTER the
+        // builtin + Lua-extension tool merge. Passing the list through
+        // (rather than pre-filtering the builtin slice here) lets the
+        // filter also drop extension-registered tools like Task —
+        // critical for preventing Task-in-Task subagent recursion
+        // when a child zi is spawned with `--tools bash,read`.
+        var allowlist_opt: ?[]const []const u8 = null;
         if (tools_filter) |filter_str| {
-            const all_tools: []const protocol.AgentTool = &.{bash_tool.makeTool()};
-            var filtered: std.ArrayListUnmanaged(protocol.AgentTool) = .empty;
-
-            var filter_iter = std.mem.splitScalar(u8, filter_str, ',');
-            while (filter_iter.next()) |name| {
+            var list: std.ArrayListUnmanaged([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, filter_str, ',');
+            while (it.next()) |name| {
                 const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
                 if (trimmed.len == 0) continue;
-                for (all_tools) |tool| {
-                    if (std.ascii.eqlIgnoreCase(trimmed, tool.name) or std.ascii.eqlIgnoreCase(trimmed, tool.label)) {
-                        filtered.append(allocator, tool) catch {};
-                        break;
-                    }
-                }
+                list.append(allocator, trimmed) catch {};
             }
-            if (filtered.items.len > 0) {
-                tools_opt = filtered.items;
-            } else {
-                tools_opt = &.{};
-            }
+            allowlist_opt = list.items;
         }
 
         var json_handler = JsonHandler{};
@@ -293,7 +286,7 @@ pub fn main() !void {
             .session_store = session_store,
             .no_session = no_session,
             .append_system_prompt = append_system_prompt,
-            .tools = tools_opt,
+            .tool_allowlist = allowlist_opt,
         });
         defer ca.deinit();
 

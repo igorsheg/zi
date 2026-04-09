@@ -112,6 +112,20 @@ pub const AgentSession = struct {
         session_store: ?SessionStore = null,
         no_session: bool = false,
         append_system_prompt: ?[]const u8 = null,
+        /// Strict tool allowlist. When non-null, the final merged
+        /// tool set (builtins + Lua extensions) is filtered to only
+        /// tools whose `name` or `label` matches an entry in this
+        /// list (case-insensitive). Empty slice → zero tools.
+        /// Null → no filtering (default).
+        ///
+        /// Mirrors pi-mono's `--tools` CLI contract: the flag is a
+        /// hard whitelist the parent binary enforces, so subagents
+        /// (Task) that spawn children with `--tools bash,read` get
+        /// EXACTLY those tools — not those plus whatever extensions
+        /// the child process happens to discover. Without this,
+        /// Task-in-Task spawns recurse because the child re-registers
+        /// Task from `~/.zi/agent/extensions/task.lua`.
+        tool_allowlist: ?[]const []const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) AgentSession {
@@ -258,9 +272,31 @@ pub const AgentSession = struct {
             break :build_blk merged[0..n];
         } else builtin_tools;
 
+        // Apply strict `--tools` allowlist. Runs AFTER builtin + Lua
+        // extension merge so it filters BOTH sources uniformly —
+        // otherwise extensions like Task slip past the filter and
+        // `zi --tools bash` still spawns Task, breaking the subagent
+        // tool contract (see issue zi-1ry).
+        const filtered_tools: []const protocol.AgentTool = if (options.tool_allowlist) |allow| blk_f: {
+            const filtered = allocator.alloc(protocol.AgentTool, tools.len) catch break :blk_f tools;
+            var fi: usize = 0;
+            for (tools) |t| {
+                for (allow) |want| {
+                    const w = std.mem.trim(u8, want, &std.ascii.whitespace);
+                    if (w.len == 0) continue;
+                    if (std.ascii.eqlIgnoreCase(w, t.name) or std.ascii.eqlIgnoreCase(w, t.label)) {
+                        filtered[fi] = t;
+                        fi += 1;
+                        break;
+                    }
+                }
+            }
+            break :blk_f filtered[0..fi];
+        } else tools;
+
         const tool_name_slice: []const []const u8 = blk: {
-            const tn = allocator.alloc([]const u8, tools.len) catch break :blk &.{};
-            for (tools, 0..) |t, i| tn[i] = t.name;
+            const tn = allocator.alloc([]const u8, filtered_tools.len) catch break :blk &.{};
+            for (filtered_tools, 0..) |t, i| tn[i] = t.name;
             break :blk tn;
         };
 
@@ -303,7 +339,7 @@ pub const AgentSession = struct {
             .initial_state = .{
                 .system_prompt = sys_prompt,
                 .model = options.model,
-                .tools = tools,
+                .tools = filtered_tools,
                 .messages = options.initial_messages,
             },
             .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
@@ -318,7 +354,7 @@ pub const AgentSession = struct {
             .agent = a,
             .session_store = store,
             .allocator = allocator,
-            .tools = tools,
+            .tools = filtered_tools,
             .event_handler = options.event_handler,
             ._subscription_token = null,
             ._stream_closure = closure,
@@ -842,6 +878,55 @@ const EventCollector = struct {
         return deltas.items;
     }
 };
+
+fn stubExec(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: protocol.AbortSignal,
+    _: ?protocol.AgentToolUpdateCallback,
+    _: ?*anyopaque,
+) protocol.AgentToolResult {
+    return .{ .content = &.{}, .is_error = false };
+}
+
+// zi-1ry: `tool_allowlist` is a strict whitelist. Applied AFTER the
+// builtin + Lua-extension merge, it drops anything not explicitly
+// named — critical to prevent Task-in-Task subagent recursion when
+// a child zi is spawned with `--tools bash,read`.
+test "AgentSession: tool_allowlist filters merged tool set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const seeded = [_]protocol.AgentTool{
+        bash_tool.makeTool(),
+        .{ .name = "Task", .label = "Task", .description = "x", .parameters = std.json.Value{ .null = {} }, .execute = &stubExec },
+        .{ .name = "read", .label = "Read", .description = "x", .parameters = std.json.Value{ .null = {} }, .execute = &stubExec },
+    };
+
+    var fp = faux.FauxProvider.init(allocator);
+    _ = &fp;
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    const allow = [_][]const u8{ "bash", "read" };
+    var ca = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "k",
+        .cwd = "/tmp/zi-test",
+        .registry = &registry,
+        .tools = &seeded,
+        .tool_allowlist = &allow,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    try testing.expectEqual(@as(usize, 2), ca.tools.len);
+    try testing.expectEqualStrings("bash", ca.tools[0].name);
+    try testing.expectEqualStrings("read", ca.tools[1].name);
+}
 
 // pi-mono test-harness.test.ts: "simple text response"
 test "AgentSession: simple text response" {
