@@ -916,6 +916,9 @@ fn buildLiveContent(allocator: std.mem.Allocator, blocks: []const ContentBlockSt
 // =================================================================
 
 fn emitError(allocator: std.mem.Allocator, callback: ai_provider.EventCallback, ctx: ?*anyopaque, comptime fmt: []const u8, args: anytype) void {
+    // Allocate but do NOT free — the caller (StreamBridge) stores the
+    // error message in final_message, which outlives this function.
+    // The arena allocator used by the loop will free it.
     const msg = std.fmt.allocPrint(allocator, fmt, args) catch {
         callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = .{
             .content = &.{},
@@ -932,7 +935,6 @@ fn emitError(allocator: std.mem.Allocator, callback: ai_provider.EventCallback, 
         } } }, ctx);
         return;
     };
-    defer allocator.free(msg);
     emitErrorDirect(callback, ctx, msg);
 }
 
