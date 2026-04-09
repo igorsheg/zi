@@ -265,6 +265,7 @@ pub const Interactive = struct {
         self.loader.spinner_fg = theme.fg(.accent);
         self.loader.message_fg = theme.fg(.muted);
         self.status_data.model_id = ca.agent.state.model.id;
+        self.status_data.thinking_level = agentThinkingLabel(ca.agent.state.thinking_level);
         self.editor.cwd = cwd;
         // NOTE: status_data pointer and active_editor are bound in run() where
         // self is at its final address. Binding here would capture a pointer to
@@ -700,6 +701,7 @@ pub const Interactive = struct {
                     self.status_text.setContent(l.message);
                     self.status_text.fg = self.theme.fg(.success);
                     self.status_data.model_id = self.ca.agent.state.model.id;
+                    self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
                 } else {
                     self.status_text.setContent(l.message);
                     self.status_text.fg = self.theme.fg(.@"error");
@@ -774,6 +776,7 @@ pub const Interactive = struct {
                 // updated ca.agent.state.model, so reading it here
                 // is safe (the catalog slice is static, no race).
                 self.status_data.model_id = self.ca.agent.state.model.id;
+                self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
                 var buf: [80]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
                 self.status_text.setContent(msg);
@@ -1841,4 +1844,15 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
         },
         .agent_end, .agent_start, .turn_start, .turn_end => return null,
     }
+}
+
+fn agentThinkingLabel(level: agent_protocol.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "",
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
 }

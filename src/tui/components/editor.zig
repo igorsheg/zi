@@ -545,9 +545,22 @@ pub const Editor = struct {
         const sd = self.status_data orelse return null;
         if (sd.model_id.len == 0) return null;
 
-        const copy_len = @min(sd.model_id.len, buf.len);
-        @memcpy(buf[0..copy_len], sd.model_id[0..copy_len]);
-        return buf[0..copy_len];
+        var pos: usize = 0;
+        const id_len = @min(sd.model_id.len, buf.len);
+        @memcpy(buf[0..id_len], sd.model_id[0..id_len]);
+        pos = id_len;
+
+        if (sd.thinking_level.len > 0 and pos + 3 + sd.thinking_level.len < buf.len) {
+            buf[pos] = ' ';
+            buf[pos + 1] = '(';
+            pos += 2;
+            @memcpy(buf[pos..][0..sd.thinking_level.len], sd.thinking_level);
+            pos += sd.thinking_level.len;
+            buf[pos] = ')';
+            pos += 1;
+        }
+
+        return buf[0..pos];
     }
 
     // --- Internal helpers ---

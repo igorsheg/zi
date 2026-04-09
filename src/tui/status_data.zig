@@ -11,6 +11,8 @@ const std = @import("std");
 pub const StatusData = struct {
     /// Current model identifier (borrowed from agent state).
     model_id: []const u8 = "",
+    /// Current thinking level label (e.g. "medium", "high"). Empty = off.
+    thinking_level: []const u8 = "",
     /// Estimated context window usage (tokens consumed / total).
     /// null = unknown (e.g., before first LLM response).
     context_tokens: ?u32 = null,
