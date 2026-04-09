@@ -39,6 +39,7 @@ pub const AgentSession = struct {
     allocator: std.mem.Allocator,
     tools: []const protocol.AgentTool,
     event_handler: ?EventHandler,
+    event_listeners: std.ArrayList(EventHandler),
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
@@ -80,6 +81,10 @@ pub const AgentSession = struct {
     pub const EventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque = null,
+    };
+
+    pub const EventSubscriptionToken = struct {
+        index: usize,
     };
 
     pub const Options = struct {
@@ -359,6 +364,7 @@ pub const AgentSession = struct {
             .allocator = allocator,
             .tools = filtered_tools,
             .event_handler = options.event_handler,
+            .event_listeners = .empty,
             ._subscription_token = null,
             ._stream_closure = closure,
             .auth_storage = options.auth_storage,
@@ -430,6 +436,7 @@ pub const AgentSession = struct {
             self._extension_lua_state = null;
         }
         self.allocator.destroy(self._stream_closure);
+        self.event_listeners.deinit(self.allocator);
         self.agent.deinit();
         // Provider bundle goes last — the agent's stream closure may
         // still hold references into the registry until agent.deinit
@@ -437,6 +444,22 @@ pub const AgentSession = struct {
         if (self._owned_provider_bundle) |bundle| {
             bundle.deinit();
             self._owned_provider_bundle = null;
+        }
+    }
+
+    pub fn subscribeEvents(
+        self: *AgentSession,
+        func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque,
+    ) EventSubscriptionToken {
+        const index = self.event_listeners.items.len;
+        self.event_listeners.append(self.allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
+        return .{ .index = index };
+    }
+
+    pub fn unsubscribeEvents(self: *AgentSession, token: EventSubscriptionToken) void {
+        if (token.index < self.event_listeners.items.len) {
+            _ = self.event_listeners.orderedRemove(token.index);
         }
     }
 
@@ -497,6 +520,48 @@ pub const AgentSession = struct {
         };
     }
 
+    pub fn completeUserText(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+        system_prompt: ?[]const u8,
+        prompt_text: []const u8,
+        max_tokens: u64,
+    ) ![]u8 {
+        const provider = self._stream_closure.registry.get(ai.provider.apiToString(self.agent.state.model.api)) orelse return error.ProviderUnavailable;
+
+        const user_messages = [_]ai.protocol.Message{.{ .user = .{
+            .content = .{ .text = prompt_text },
+            .timestamp = std.time.milliTimestamp(),
+        } }};
+        const context = ai.protocol.Context{
+            .system_prompt = system_prompt,
+            .messages = &user_messages,
+        };
+
+        var collector = CompletionCollector{ .allocator = allocator };
+        provider.streamSimple(
+            allocator,
+            self.agent.state.model,
+            context,
+            .{
+                .base = .{
+                    .api_key = self._stream_closure.resolveApiKey(self.agent.state.model),
+                    .max_tokens = max_tokens,
+                },
+                .reasoning = if (self.agent.state.model.reasoning) .high else null,
+            },
+            &CompletionCollector.callback,
+            @ptrCast(&collector),
+        );
+
+        if (collector.error_message) |msg| {
+            defer allocator.free(msg);
+            std.log.scoped(.coding_agent).warn("completion failed: {s}", .{msg});
+            return error.ProviderCompletionFailed;
+        }
+        return collector.text orelse error.MissingCompletionText;
+    }
+
     /// Get session file path (valid after first flush).
     pub fn getSessionFile(self: *const AgentSession) []const u8 {
         return self.session_store.sessionFile();
@@ -521,6 +586,9 @@ pub const AgentSession = struct {
 
         // Forward to external handler first
         if (self.event_handler) |handler| {
+            handler.func(event, handler.ctx);
+        }
+        for (self.event_listeners.items) |handler| {
             handler.func(event, handler.ctx);
         }
 
@@ -586,6 +654,39 @@ pub const AgentSession = struct {
                 }
             }
             return self.api_key;
+        }
+    };
+
+    const CompletionCollector = struct {
+        allocator: std.mem.Allocator,
+        text: ?[]u8 = null,
+        error_message: ?[]u8 = null,
+
+        fn callback(event: ai.protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
+            const self: *CompletionCollector = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .done => |done| {
+                    self.text = collectText(self.allocator, done.message) catch null;
+                },
+                .@"error" => |err| {
+                    if (err.@"error".error_message) |msg| {
+                        self.error_message = self.allocator.dupe(u8, msg) catch null;
+                    } else {
+                        self.error_message = self.allocator.dupe(u8, "provider error") catch null;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn collectText(allocator: std.mem.Allocator, msg: ai.protocol.AssistantMessage) ![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            for (msg.content) |block| switch (block) {
+                .text => |t| try out.appendSlice(allocator, t.text),
+                else => {},
+            };
+            return out.toOwnedSlice(allocator);
         }
     };
 };

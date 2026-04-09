@@ -88,26 +88,32 @@ pub const SessionStore = struct {
     // ── Append methods (delegate to writer) ──────────────────────
 
     pub fn appendMessage(self: *SessionStore, msg: agent_mod.protocol.AgentMessage) void {
+        self.invalidateCache();
         self.writer.appendMessage(msg);
     }
 
     pub fn appendThinkingLevelChange(self: *SessionStore, level: []const u8) void {
+        self.invalidateCache();
         self.writer.appendThinkingLevelChange(level);
     }
 
     pub fn appendModelChange(self: *SessionStore, provider: []const u8, model_id: []const u8) void {
+        self.invalidateCache();
         self.writer.appendModelChange(provider, model_id);
     }
 
     pub fn appendCompaction(self: *SessionStore, summary: []const u8, first_kept_entry_id: []const u8, tokens_before: u64) void {
+        self.invalidateCache();
         self.writer.appendCompaction(summary, first_kept_entry_id, tokens_before);
     }
 
     pub fn appendBranchSummary(self: *SessionStore, from_id: []const u8, summary: []const u8) void {
+        self.invalidateCache();
         self.writer.appendBranchSummary(from_id, summary);
     }
 
     pub fn appendSessionInfo(self: *SessionStore, name: ?[]const u8) void {
+        self.invalidateCache();
         self.writer.appendSessionInfo(name);
     }
 
@@ -124,6 +130,19 @@ pub const SessionStore = struct {
         self.cached_entries = data.entries;
         self.cached_header = data.header;
         return context_mod.buildSessionContext(self.allocator, data.entries, leaf_id);
+    }
+
+    pub fn readEntries(self: *SessionStore) ![]proto.SessionEntry {
+        if (self.cached_entries) |entries| return entries;
+        const data = try reader_mod.readSessionFile(self.allocator, self.writer.session_file);
+        self.cached_entries = data.entries;
+        self.cached_header = data.header;
+        return data.entries;
+    }
+
+    fn invalidateCache(self: *SessionStore) void {
+        self.cached_entries = null;
+        self.cached_header = null;
     }
 };
 

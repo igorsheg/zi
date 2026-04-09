@@ -34,6 +34,13 @@ const extension_runner_mod = @import("extensions/runner.zig");
 
 pub const AgentSession = coding_agent.AgentSession;
 pub const SessionStore = coding_agent.SessionStore;
+pub const SessionController = @import("session_controller.zig").SessionController;
+pub const SessionEvent = @import("session_controller.zig").SessionEvent;
+pub const SessionPhase = @import("session_controller.zig").Phase;
+pub const RetryPolicy = @import("session_controller.zig").RetryPolicy;
+pub const CompactionPolicy = @import("session_controller.zig").CompactionPolicy;
+pub const CompactionExecutor = @import("session_controller.zig").CompactionExecutor;
+pub const SessionCompactionResult = @import("session_controller.zig").CompactionResult;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 
 /// Options forwarded to `AgentSession.init`. Re-exported so callers

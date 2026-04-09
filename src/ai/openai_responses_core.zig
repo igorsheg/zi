@@ -213,15 +213,14 @@ pub fn streamCore(
             @memcpy(err_body_buf[n_read..][0..data.len], data);
             n_read += data.len;
         }
-        emitError(allocator, callback, callback_ctx, model, core.provider_label, "HTTP {d}: {s}", .{ @intFromEnum(status), err_body_buf[0..n_read] });
+        const detail = formatHttpErrorDetail(allocator, status, err_body_buf[0..n_read]) catch "request failed";
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "{s}", .{detail});
         return;
     }
-
 
     const reader = response.reader(&transfer_buf);
     processStream(allocator, reader, model, options.signal, core.provider_label, callback, callback_ctx);
 }
-
 
 // =============================================================================
 // Pure SSE processor
@@ -741,7 +740,7 @@ fn mapResponseStatus(status: []const u8) protocol.StopReason {
     return .stop;
 }
 
-fn emitError(
+pub fn emitError(
     allocator: std.mem.Allocator,
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
@@ -1072,6 +1071,43 @@ fn writeAssistantMessage(
     };
 }
 
+fn formatHttpErrorDetail(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) ![]const u8 {
+    const status_code = @intFromEnum(status);
+    const reason = status.phrase() orelse "";
+    const trimmed = std.mem.trim(u8, body, &std.ascii.whitespace);
+    if (trimmed.len == 0) {
+        if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s} (empty body)", .{ status_code, reason });
+        return std.fmt.allocPrint(allocator, "HTTP {d} (empty body)", .{status_code});
+    }
+
+    if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
+        defer parsed.deinit();
+        if (extractJsonErrorMessage(parsed.value)) |message| {
+            if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s}: {s}", .{ status_code, reason, message });
+            return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status_code, message });
+        }
+    } else |_| {}
+
+    if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s}: {s}", .{ status_code, reason, trimmed });
+    return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status_code, trimmed });
+}
+
+fn extractJsonErrorMessage(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    if (value.object.get("error")) |err| {
+        switch (err) {
+            .string => |s| return s,
+            .object => {
+                if (err.object.get("message")) |msg| if (msg == .string and msg.string.len > 0) return msg.string;
+                if (err.object.get("code")) |code| if (code == .string and code.string.len > 0) return code.string;
+            },
+            else => {},
+        }
+    }
+    if (value.object.get("message")) |msg| if (msg == .string and msg.string.len > 0) return msg.string;
+    return null;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1294,7 +1330,7 @@ test "buildRequestJson emits store:false, input[], and reasoning:none for reason
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    try buildRequestJson(alloc, &out, test_model, ctx);
+    try buildRequestJson(alloc, &out, test_model, ctx, null, null);
 
     try testing.expect(std.mem.indexOf(u8, out.items, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"store\":false") != null);

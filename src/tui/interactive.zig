@@ -36,12 +36,18 @@ const SessionStore = session_store_mod.SessionStore;
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
+const session_controller_mod = @import("../session_controller.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
 const AgentRequest = agent_mod.AgentRequest;
 const RequestQueue = agent_mod.RequestQueue;
 const ResumedEntry = ui_event_mod.ResumedEntry;
 const agent_protocol = agent_mod.protocol;
+const SessionController = session_controller_mod.SessionController;
+const RetryPolicy = session_controller_mod.RetryPolicy;
+const CompactionPolicy = session_controller_mod.CompactionPolicy;
+const CompactionExecutor = session_controller_mod.CompactionExecutor;
+const SessionEvent = session_controller_mod.SessionEvent;
 
 /// Discriminates what a spawned agent worker thread is doing.
 /// `prompt` is the classic path (subscribe + ca.run); `drain_only`
@@ -156,6 +162,10 @@ pub const Interactive = struct {
     status_data: StatusData,
     loader: Loader = .{},
     loader_active: bool = false,
+    retry_active: bool = false,
+    retry_waiting: bool = false,
+    retry_attempt: u32 = 0,
+    retry_max_attempts: u32 = 0,
 
     // ── Container slots (pi-mono parity) ──────────────────────────
     header_container: container_mod.Container,
@@ -207,6 +217,8 @@ pub const Interactive = struct {
     /// pushes to it yet. Backed by `msg_allocator` per doctrine R3.
     request_queue: RequestQueue,
     ca: *AgentSession,
+    session_controller: SessionController,
+    session_event_token: ?SessionController.SubscriptionToken = null,
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
@@ -225,6 +237,9 @@ pub const Interactive = struct {
         resolver: ToolRendererResolver,
         cwd: []const u8,
         auth_storage: *auth_storage_mod.AuthStorage,
+        retry_policy: RetryPolicy,
+        compaction_policy: CompactionPolicy,
+        compaction_executor: ?CompactionExecutor,
     ) !Interactive {
         const theme = &theme_mod.Theme.dark;
 
@@ -251,6 +266,11 @@ pub const Interactive = struct {
             .event_queue = EventQueue(UiEvent).init(msg_allocator),
             .request_queue = RequestQueue.init(msg_allocator),
             .ca = ca,
+            .session_controller = SessionController.init(allocator, ca, .{
+                .retry_policy = retry_policy,
+                .compaction_policy = compaction_policy,
+                .compaction_executor = compaction_executor,
+            }),
             .auth_storage = auth_storage,
             .model_catalog = if (ca.model_registry) |mr| mr.getAll() else &.{},
         };
@@ -320,6 +340,12 @@ pub const Interactive = struct {
             if (t) |handle| handle.join();
         }
 
+        if (self.session_event_token) |token| {
+            self.session_controller.unsubscribe(token);
+            self.session_event_token = null;
+        }
+        self.session_controller.deinit();
+
         // drain and free any remaining events
         var drain_buf: [64]UiEvent = undefined;
         while (true) {
@@ -362,6 +388,8 @@ pub const Interactive = struct {
 
         self.editor.on_submit = &onEditorSubmit;
         self.editor.on_submit_ctx = @ptrCast(self);
+        self.session_controller.wire();
+        self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
         // Bind pointers now that self is at its stable address (not a stack copy).
         self.editor.status_data = &self.status_data;
@@ -511,6 +539,10 @@ pub const Interactive = struct {
 
         // App-level keybindings — no overlay active
         if (key.code == .escape) {
+            if (self.retry_waiting) {
+                self.session_controller.abortRetry();
+                return;
+            }
             if (self.is_streaming) {
                 self.ca.agent.abort();
                 self.status_text.setContent("aborted");
@@ -525,6 +557,10 @@ pub const Interactive = struct {
         if (key.code == .char and key.char != null and key.char.? == 'c' and key.ctrl) {
             if (self.login_thread != null) {
                 self.login_cancelled.store(true, .release);
+                return;
+            }
+            if (self.retry_waiting) {
+                self.session_controller.abortRetry();
                 return;
             }
             if (self.is_streaming) {
@@ -625,7 +661,6 @@ pub const Interactive = struct {
         }
     }
 
-
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {
             .text_delta => |d| {
@@ -708,23 +743,53 @@ pub const Interactive = struct {
                 }
                 self.tui.dirty = true;
             },
-            .agent_finished => {
-                self.is_streaming = false;
-                if (self.agent_thread) |t| t.join();
-                self.agent_thread = null;
-                self.hideLoader();
-                self.status_text.setContent("");
-                self.tui.setFocus(self.active_editor.component());
+            .retry_start => |r| {
+                self.retry_active = true;
+                self.retry_waiting = true;
+                self.retry_attempt = r.attempt;
+                self.retry_max_attempts = r.max_attempts;
+                self.showRetryLoader(r.attempt, r.max_attempts, r.delay_ms, true);
                 self.tui.dirty = true;
             },
-            .agent_error => {
+            .retry_wait_finished => {
+                self.retry_waiting = false;
+                if (self.retry_active) {
+                    self.showRetryLoader(self.retry_attempt, self.retry_max_attempts, 0, false);
+                }
+                self.tui.dirty = true;
+            },
+            .retry_end => |r| {
+                self.retry_active = false;
+                self.retry_waiting = false;
+                self.retry_attempt = 0;
+                self.retry_max_attempts = 0;
+                self.hideLoader();
+                if (!r.success) {
+                    var buf: [160]u8 = undefined;
+                    const msg = std.fmt.bufPrint(
+                        &buf,
+                        "retry failed after {d} attempt{s}: {s}",
+                        .{ r.attempt, if (r.attempt == 1) "" else "s", r.final_error orelse "unknown error" },
+                    ) catch (r.final_error orelse "retry failed");
+                    self.status_text.setContent(msg);
+                    self.status_text.fg = self.theme.fg(.@"error");
+                }
+                self.tui.dirty = true;
+            },
+            .prompt_worker_finished => |p| {
                 self.is_streaming = false;
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.hideLoader();
-                self.status_text.setContent("error occurred");
-                self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.setFocus(self.active_editor.component());
+                switch (p.outcome) {
+                    .success => self.status_text.setContent(""),
+                    .assistant_error, .aborted => {},
+                }
+                if (p.internal_error) |msg| {
+                    self.status_text.setContent(msg);
+                    self.status_text.fg = self.theme.fg(.@"error");
+                }
                 self.tui.dirty = true;
             },
             .request_worker_finished => {
@@ -733,7 +798,7 @@ pub const Interactive = struct {
                 // focus here, the individual request handlers
                 // (.session_resumed / .session_resume_failed) owned
                 // that UI state already. See oracle note on why this
-                // is separate from .agent_finished.
+                // is separate from prompt cleanup.
                 if (self.agent_thread) |t| t.join();
                 self.agent_thread = null;
                 self.hideLoader();
@@ -802,8 +867,29 @@ pub const Interactive = struct {
         return if (h > fixed_total) h - fixed_total else 0;
     }
 
-
     fn showLoader(self: *Interactive, message: []const u8) void {
+        self.loader.spinner_fg = self.theme.fg(.accent);
+        self.loader.message_fg = self.theme.fg(.muted);
+        self.loader.setMessage(message);
+        self.loader.start();
+        self.loader_active = true;
+        self.status_container.clear();
+        self.status_container.addChild(self.loader.component());
+    }
+
+    fn showRetryLoader(self: *Interactive, attempt: u32, max_attempts: u32, delay_ms: u64, cancellable: bool) void {
+        var buf: [128]u8 = undefined;
+        const delay_seconds = @divTrunc(delay_ms + 500, 1000);
+        const message = if (cancellable)
+            std.fmt.bufPrint(
+                &buf,
+                "Retrying ({d}/{d}) in {d}s... (Esc to cancel)",
+                .{ attempt, max_attempts, delay_seconds },
+            ) catch "Retrying..."
+        else
+            std.fmt.bufPrint(&buf, "Retrying ({d}/{d})...", .{ attempt, max_attempts }) catch "Retrying...";
+        self.loader.spinner_fg = self.theme.fg(.warning);
+        self.loader.message_fg = self.theme.fg(.muted);
         self.loader.setMessage(message);
         self.loader.start();
         self.loader_active = true;
@@ -1281,7 +1367,6 @@ pub const Interactive = struct {
         };
     }
 
-
     // ── Login picker (/login) ───────────────────────────────────
 
     fn showLoginPicker(self: *Interactive) void {
@@ -1410,21 +1495,21 @@ pub const Interactive = struct {
                     .provider_id = provider_id,
                     .success = true,
                     .message = self.msg_allocator.dupe(u8, "logged in") catch return,
-                }});
+                } });
             },
             .cancelled => {
                 self.event_queue.push(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = false,
                     .message = self.msg_allocator.dupe(u8, "login cancelled") catch return,
-                }});
+                } });
             },
             .err => |msg| {
                 self.event_queue.push(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = false,
                     .message = self.msg_allocator.dupe(u8, msg) catch return,
-                }});
+                } });
             },
         }
     }
@@ -1521,8 +1606,8 @@ pub const Interactive = struct {
     /// rather than adding a second thread fn.
     ///
     /// Completion events are mode-aware:
-    ///   - prompt     → `.agent_finished` (classic cleanup: hide
-    ///                  loader, clear status, restore focus)
+    ///   - prompt     → `.prompt_worker_finished` (cleanup after the
+    ///                  controller finishes the full prompt lifecycle)
     ///   - drain_only → `.request_worker_finished` (join only; the
     ///                  individual request handlers publish their
     ///                  own success/failure events, so the TUI
@@ -1532,13 +1617,6 @@ pub const Interactive = struct {
             .prompt => |p| self.msg_allocator.free(p),
             .drain_only => {},
         };
-
-        // Subscribe only for prompts — drain_only work doesn't stream.
-        const maybe_token: ?agent_mod.SubscriptionToken = switch (work) {
-            .prompt => self.ca.agent.subscribe(&agentEventCallback, @ptrCast(self)),
-            .drain_only => null,
-        };
-        defer if (maybe_token) |t| self.ca.agent.unsubscribe(t);
 
         // zi-wub.28: bind lua owner on the drain_only path too. The
         // .15/.16 handlers don't touch lua, but `.shutdown` calls
@@ -1553,24 +1631,30 @@ pub const Interactive = struct {
             }
         }
 
-        // zi-wub.14: drain pending TUI→agent requests at the turn
-        // boundary, before issuing the stream. This is the "safe
-        // point" the doctrine specifies — we are on the agent thread,
-        // owner of lua_state and ca.agent.state, and not yet inside
-        // a stream. Mid-stream draining is explicitly out of scope
-        // (R5: no event loop in this epic).
-        //
-        // For drain_only work this IS the whole job. For prompt work
-        // it lets a queued /resume or /model take effect before the
-        // next stream starts.
-        self.processAgentRequests();
-
         switch (work) {
             .prompt => |p| {
-                self.ca.run(p) catch {};
-                self.event_queue.push(.{ .agent_finished = {} });
+                // zi-wub.14: drain pending TUI→agent requests at the turn
+                // boundary, before issuing the stream. This is the "safe
+                // point" the doctrine specifies — we are on the agent thread,
+                // owner of lua_state and ca.agent.state, and not yet inside
+                // a stream. Mid-stream draining is explicitly out of scope
+                // (R5: no event loop in this epic).
+                self.processAgentRequests();
+
+                const outcome = self.session_controller.runPrompt(p) catch |err| {
+                    const err_msg = self.msg_allocator.dupe(u8, @errorName(err)) catch null;
+                    self.event_queue.push(.{ .prompt_worker_finished = .{
+                        .outcome = .assistant_error,
+                        .internal_error = err_msg,
+                    } });
+                    return;
+                };
+                self.event_queue.push(.{ .prompt_worker_finished = .{ .outcome = outcome } });
             },
             .drain_only => {
+                self.session_controller.beginRequestDrain();
+                self.processAgentRequests();
+                self.session_controller.finishRequestDrain();
                 self.event_queue.push(.{ .request_worker_finished = {} });
             },
         }
@@ -1718,12 +1802,41 @@ pub const Interactive = struct {
         self.event_queue.push(.{ .model_switched = .{ .id = id_copy } });
     }
 
-    /// Agent event callback — runs on the AGENT THREAD.
-    /// Deep-copies event data into a UiEvent before pushing to the queue.
-    fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
+    /// Session event callback — runs on the AGENT THREAD.
+    fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        const ui_event = convertAgentEvent(event, self.msg_allocator) orelse return;
-        self.event_queue.push(ui_event);
+        switch (event) {
+            .agent_event => |agent_event| {
+                const ui_event = convertAgentEvent(agent_event, self.msg_allocator) orelse return;
+                self.event_queue.push(ui_event);
+            },
+            .phase_changed => |pc| {
+                if (pc.from == .waiting_to_retry and pc.to == .running_continue) {
+                    self.event_queue.push(.retry_wait_finished);
+                }
+            },
+            .retry_start => |r| {
+                const err_msg = self.msg_allocator.dupe(u8, r.error_message) catch return;
+                self.event_queue.push(.{ .retry_start = .{
+                    .attempt = r.attempt,
+                    .max_attempts = r.max_attempts,
+                    .delay_ms = r.delay_ms,
+                    .error_message = err_msg,
+                } });
+            },
+            .retry_end => |r| {
+                const final_error = if (r.final_error) |msg|
+                    (self.msg_allocator.dupe(u8, msg) catch null)
+                else
+                    null;
+                self.event_queue.push(.{ .retry_end = .{
+                    .success = r.success,
+                    .attempt = r.attempt,
+                    .final_error = final_error,
+                } });
+            },
+            .compaction_start, .compaction_end => {},
+        }
     }
 };
 

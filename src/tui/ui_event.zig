@@ -1,7 +1,9 @@
 const std = @import("std");
 const json_util = @import("../ai/json_util.zig");
 const agent_protocol = @import("../agent/root.zig").protocol;
+const session_controller_mod = @import("../session_controller.zig");
 const AgentToolResult = agent_protocol.AgentToolResult;
+const RunOutcome = session_controller_mod.RunOutcome;
 
 /// TUI-owned event type. All fields are deep-copied and owned by the
 /// main thread. The agent thread converts AgentEvent → UiEvent before
@@ -83,9 +85,25 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    // --- agent lifecycle ---
-    agent_finished: void,
-    agent_error: void,
+    // --- retry lifecycle ---
+    retry_start: struct {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error_message: []u8,
+    },
+    retry_wait_finished: void,
+    retry_end: struct {
+        success: bool,
+        attempt: u32,
+        final_error: ?[]u8 = null,
+    },
+
+    // --- prompt lifecycle ---
+    prompt_worker_finished: struct {
+        outcome: RunOutcome,
+        internal_error: ?[]u8 = null,
+    },
 
     // --- request-worker lifecycle (zi-wub.15) ---
     // Emitted by a drain-only agent worker thread after it finishes
@@ -160,6 +178,10 @@ pub const UiEvent = union(enum) {
                 allocator.free(l.provider_id);
                 allocator.free(l.message);
             },
+            .retry_start => |r| allocator.free(r.error_message),
+            .retry_end => |r| {
+                if (r.final_error) |msg| allocator.free(msg);
+            },
             .session_resumed => |s| {
                 for (s.entries) |*e| e.deinit(allocator);
                 allocator.free(s.entries);
@@ -167,9 +189,10 @@ pub const UiEvent = union(enum) {
             },
             .session_resume_failed => |f| allocator.free(f.message),
             .model_switched => |m| allocator.free(m.id),
-            .message_start_assistant, .message_start_user,
-            .agent_finished, .agent_error, .request_worker_finished,
-            => {},
+            .prompt_worker_finished => |p| {
+                if (p.internal_error) |msg| allocator.free(msg);
+            },
+            .message_start_assistant, .message_start_user, .retry_wait_finished, .request_worker_finished => {},
         }
     }
 };

@@ -12,7 +12,7 @@
 //! `AuthStorage.getApiKey("openai-codex")` which auto-refreshes expired
 //! OAuth tokens. Extracts `chatgpt_account_id` from the JWT access
 //! token and sends it as the `chatgpt-account-id` request header.
-//! Also sends `originator: zi` and `OpenAI-Beta: responses=experimental`.
+//! Also sends `originator: pi` and `OpenAI-Beta: responses=experimental`.
 //!
 //! Intentionally NOT ported:
 //!   - websocket transport (`responses_websockets=2026-02-06` beta)
@@ -20,6 +20,7 @@
 //!     clamping (tracked as zi-imj)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const ai_provider = @import("provider.zig");
 const core = @import("openai_responses_core.zig");
@@ -57,20 +58,10 @@ pub const OpenAICodexProvider = struct {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
-        var extra_hdrs: [3]protocol.Header = undefined;
-        var n_hdrs: usize = 0;
-
-        // Extract chatgpt_account_id from access token JWT
-        if (options.api_key) |key| {
-            if (extractAccountId(scratch.allocator(), key)) |id| {
-                extra_hdrs[n_hdrs] = .{ .key = "chatgpt-account-id", .value = id };
-                n_hdrs += 1;
-            }
-        }
-        extra_hdrs[n_hdrs] = .{ .key = "originator", .value = "zi" };
-        n_hdrs += 1;
-        extra_hdrs[n_hdrs] = .{ .key = "OpenAI-Beta", .value = "responses=experimental" };
-        n_hdrs += 1;
+        var extra_hdrs: [5]protocol.Header = undefined;
+        const account_id = requireAccountId(allocator, model, options.api_key, callback, callback_ctx) orelse return;
+        const user_agent = buildUserAgent(scratch.allocator()) catch "pi (zig)";
+        const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent);
 
         core.streamCore(allocator, model, context, options, .{
             .base_url = if (model.base_url.len > 0) null else "https://chatgpt.com/backend-api",
@@ -95,18 +86,10 @@ pub const OpenAICodexProvider = struct {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
-        var extra_hdrs: [3]protocol.Header = undefined;
-        var n_hdrs: usize = 0;
-        if (options.base.api_key) |key| {
-            if (extractAccountId(scratch.allocator(), key)) |id| {
-                extra_hdrs[n_hdrs] = .{ .key = "chatgpt-account-id", .value = id };
-                n_hdrs += 1;
-            }
-        }
-        extra_hdrs[n_hdrs] = .{ .key = "originator", .value = "zi" };
-        n_hdrs += 1;
-        extra_hdrs[n_hdrs] = .{ .key = "OpenAI-Beta", .value = "responses=experimental" };
-        n_hdrs += 1;
+        var extra_hdrs: [5]protocol.Header = undefined;
+        const account_id = requireAccountId(allocator, model, options.base.api_key, callback, callback_ctx) orelse return;
+        const user_agent = buildUserAgent(scratch.allocator()) catch "pi (zig)";
+        const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent);
 
         const clamped = protocol.clampReasoning(options.reasoning, model);
         const effort: ?[]const u8 = if (clamped) |l| protocol.thinkingLevelToString(l) else null;
@@ -206,31 +189,99 @@ fn buildCodexRequestJson(
 
 /// Extract chatgpt_account_id from a JWT access token.
 /// pi-mono: openai-codex-responses.ts:282-287
-fn extractAccountId(arena: std.mem.Allocator, token: []const u8) ?[]const u8 {
-    // JWT = header.payload.signature
+fn extractAccountId(arena: std.mem.Allocator, token: []const u8) ![]const u8 {
     var parts = std.mem.splitScalar(u8, token, '.');
-    _ = parts.next() orelse return null;
-    const payload_b64 = parts.next() orelse return null;
+    _ = parts.next() orelse return error.InvalidAccessToken;
+    const payload_b64 = parts.next() orelse return error.InvalidAccessToken;
 
-    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload_b64) catch return null;
-    const decoded = arena.alloc(u8, decoded_len) catch return null;
-    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload_b64) catch return null;
+    const decoded_len = try std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload_b64);
+    const decoded = try arena.alloc(u8, decoded_len);
+    try std.base64.url_safe_no_pad.Decoder.decode(decoded, payload_b64);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, decoded, .{}) catch return null;
-    if (parsed.value != .object) return null;
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, decoded, .{});
+    if (parsed.value != .object) return error.InvalidAccessToken;
 
-    const auth_claim = parsed.value.object.get("https://api.openai.com/auth") orelse return null;
-    if (auth_claim != .object) return null;
-    const id_val = auth_claim.object.get("chatgpt_account_id") orelse return null;
-    if (id_val != .string or id_val.string.len == 0) return null;
+    const auth_claim = parsed.value.object.get("https://api.openai.com/auth") orelse return error.MissingAccountId;
+    if (auth_claim != .object) return error.MissingAccountId;
+    const id_val = auth_claim.object.get("chatgpt_account_id") orelse return error.MissingAccountId;
+    if (id_val != .string or id_val.string.len == 0) return error.MissingAccountId;
 
-    return id_val.string; // arena-owned, outlives streamCore call
+    return id_val.string;
+}
+
+fn requireAccountId(
+    allocator: std.mem.Allocator,
+    model: protocol.Model,
+    api_key: ?[]const u8,
+    callback: ai_provider.EventCallback,
+    callback_ctx: ?*anyopaque,
+) ?[]const u8 {
+    const key = api_key orelse {
+        core.emitError(allocator, callback, callback_ctx, model, "openai-codex-responses", "no API key provided", .{});
+        return null;
+    };
+    const account_id = extractAccountId(allocator, key) catch |err| {
+        const msg = switch (err) {
+            error.MissingAccountId => "failed to extract accountId from token: no account ID in token",
+            else => "failed to extract accountId from token",
+        };
+        core.emitError(allocator, callback, callback_ctx, model, "openai-codex-responses", "{s}", .{msg});
+        return null;
+    };
+    return account_id;
+}
+
+fn fillCodexHeaders(buf: *[5]protocol.Header, account_id: []const u8, user_agent: []const u8) usize {
+    buf[0] = .{ .key = "chatgpt-account-id", .value = account_id };
+    buf[1] = .{ .key = "originator", .value = "pi" };
+    buf[2] = .{ .key = "user-agent", .value = user_agent };
+    buf[3] = .{ .key = "OpenAI-Beta", .value = "responses=experimental" };
+    buf[4] = .{ .key = "accept", .value = "text/event-stream" };
+    return 5;
+}
+
+fn buildUserAgent(allocator: std.mem.Allocator) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "pi ({s} {s}; {s})",
+        .{ @tagName(builtin.os.tag), osRelease(), @tagName(builtin.cpu.arch) },
+    );
+}
+
+fn osRelease() []const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "darwin",
+        else => @tagName(builtin.os.tag),
+    };
 }
 
 /// Bearer auth factory. Reads the access token from `StreamOptions.api_key`;
 /// phase 4 will populate that field from `AuthStorage` oauth credentials
 /// (PKCE access_token, refreshed on expiry). If absent, return `NoApiKey`
 /// so `streamCore` emits a clean error event instead of a silent no-op.
+const testing = std.testing;
+
+test "extractAccountId returns the chatgpt account claim from oauth tokens" {
+    const allocator = testing.allocator;
+    const token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
+    const account_id = try extractAccountId(allocator, token);
+    try testing.expectEqualStrings("acct_123", account_id);
+}
+
+test "fillCodexHeaders matches the codex-required header set" {
+    var headers: [5]protocol.Header = undefined;
+    const count = fillCodexHeaders(&headers, "acct_123", "pi (darwin darwin; aarch64)");
+    try testing.expectEqual(@as(usize, 5), count);
+    try testing.expectEqualStrings("chatgpt-account-id", headers[0].key);
+    try testing.expectEqualStrings("acct_123", headers[0].value);
+    try testing.expectEqualStrings("originator", headers[1].key);
+    try testing.expectEqualStrings("pi", headers[1].value);
+    try testing.expectEqualStrings("user-agent", headers[2].key);
+    try testing.expectEqualStrings("OpenAI-Beta", headers[3].key);
+    try testing.expectEqualStrings("accept", headers[4].key);
+    try testing.expectEqualStrings("text/event-stream", headers[4].value);
+}
+
 fn buildBearerAuth(
     _: ?*anyopaque,
     buf: []u8,

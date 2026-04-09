@@ -459,7 +459,30 @@ pub fn main() !void {
         // cross-thread requests use ca's shared allocator (until .12).
         var tui_arena = std.heap.ArenaAllocator.init(gpa.allocator());
         defer tui_arena.deinit();
-        var interactive = try interactive_mod.Interactive.init(tui_arena.allocator(), msg_allocator, &ca, resolver, cwd_buf, &auth_storage);
+        const retry_settings = settings.getRetrySettings();
+        const compaction_settings = settings.getCompactionSettings();
+        const compactor = @import("session/compactor.zig");
+        const compaction_executor = compactor.createExecutor(&ca);
+        var interactive = try interactive_mod.Interactive.init(
+            tui_arena.allocator(),
+            msg_allocator,
+            &ca,
+            resolver,
+            cwd_buf,
+            &auth_storage,
+            .{
+                .enabled = retry_settings.enabled,
+                .max_retries = @intCast(@max(retry_settings.max_retries, 0)),
+                .base_delay_ms = @intCast(@max(retry_settings.base_delay_ms, 0)),
+                .max_delay_ms = @intCast(@max(retry_settings.max_delay_ms, 0)),
+            },
+            .{
+                .enabled = compaction_settings.enabled,
+                .reserve_tokens = @intCast(@max(compaction_settings.reserve_tokens, 0)),
+                .keep_recent_tokens = @intCast(@max(compaction_settings.keep_recent_tokens, 0)),
+            },
+            compaction_executor,
+        );
         defer interactive.deinit();
 
         if (needs_auth) {
