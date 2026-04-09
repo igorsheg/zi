@@ -22,6 +22,7 @@ const provider_mod = @import("provider.zig");
 const anthropic = @import("anthropic.zig");
 const openai_completions = @import("openai_completions.zig");
 const openai_responses = @import("openai_responses.zig");
+const openai_codex = @import("openai_codex.zig");
 
 /// Heap-owned set of built-in providers + the registry they're
 /// registered into. One bundle per generation; deinit destroys
@@ -36,6 +37,7 @@ pub const Bundle = struct {
     anthropic_prov: *anthropic.AnthropicProvider,
     openai_completions_prov: *openai_completions.OpenAICompletionsProvider,
     openai_responses_prov: *openai_responses.OpenAIResponsesProvider,
+    openai_codex_prov: *openai_codex.OpenAICodexProvider,
 
     /// Allocate a fresh registry, populate it with every built-in
     /// provider, and return an owned bundle.
@@ -73,12 +75,22 @@ pub const Bundle = struct {
         oar.* = openai_responses.OpenAIResponsesProvider.init(allocator);
         try registry.register("openai-responses", oar.provider(), null);
 
+        // openai-codex-responses: ChatGPT backend endpoint, shares the
+        // responses SSE core with a different base URL + path. Auth is
+        // bearer-via-api_key today; phase 4 plumbs oauth access tokens
+        // from AuthStorage into StreamOptions.api_key.
+        const ocx = try allocator.create(openai_codex.OpenAICodexProvider);
+        errdefer allocator.destroy(ocx);
+        ocx.* = openai_codex.OpenAICodexProvider.init(allocator);
+        try registry.register("openai-codex-responses", ocx.provider(), null);
+
         self.* = .{
             .allocator = allocator,
             .registry = registry,
             .anthropic_prov = anth,
             .openai_completions_prov = oac,
             .openai_responses_prov = oar,
+            .openai_codex_prov = ocx,
         };
         return self;
     }
@@ -90,6 +102,7 @@ pub const Bundle = struct {
         // currently have ordering dependencies on each other, but
         // keeping the discipline now means future providers that DO
         // (e.g. shared core wrappers) get correct teardown for free.
+        self.allocator.destroy(self.openai_codex_prov);
         self.allocator.destroy(self.openai_responses_prov);
         self.allocator.destroy(self.openai_completions_prov);
         self.allocator.destroy(self.anthropic_prov);
