@@ -278,11 +278,11 @@ pub const SettingsManager = struct {
         self.save();
     }
 
-    pub fn setDefaultModelAndProvider(self: *SettingsManager, model: []const u8, provider: []const u8) void {
-        self.global_settings.default_model = model;
+    pub fn setDefaultModelAndProvider(self: *SettingsManager, provider: []const u8, model: []const u8) void {
         self.global_settings.default_provider = provider;
-        self.markModified(.default_model, null);
+        self.global_settings.default_model = model;
         self.markModified(.default_provider, null);
+        self.markModified(.default_model, null);
         self.save();
     }
 
@@ -776,6 +776,18 @@ test "set persists and reload recovers the value" {
     try std.testing.expectEqualStrings("claude-sonnet-4", mgr.getDefaultModel().?);
 
     mgr.reload();
+    try std.testing.expectEqualStrings("claude-sonnet-4", mgr.getDefaultModel().?);
+}
+
+test "setDefaultModelAndProvider writes provider and model in matching fields" {
+    const allocator = std.testing.allocator;
+
+    var mgr = try SettingsManager.inMemory(allocator, null);
+    defer mgr.deinit();
+
+    mgr.setDefaultModelAndProvider("anthropic", "claude-sonnet-4");
+
+    try std.testing.expectEqualStrings("anthropic", mgr.getDefaultProvider().?);
     try std.testing.expectEqualStrings("claude-sonnet-4", mgr.getDefaultModel().?);
 }
 

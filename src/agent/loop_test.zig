@@ -1255,7 +1255,7 @@ test "prepareArguments: rewrites args before execution receives them" {
     var prep_state = PrepState{};
 
     const prepFn = struct {
-        fn func(args: std.json.Value) std.json.Value {
+        fn func(_: std.mem.Allocator, args: std.json.Value) !std.json.Value {
             // Rewrite flat {oldText, newText} → {edits: [{oldText, newText}]}
             // We just return a sentinel object to prove prepare_arguments ran
             _ = args;

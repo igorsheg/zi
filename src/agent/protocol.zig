@@ -233,8 +233,9 @@ pub const AgentTool = struct {
     parameters: std.json.Value,
     /// Opaque context pointer for tool state (cwd, config, etc).
     ctx: ?*anyopaque = null,
-    /// Optional compatibility shim for raw tool-call arguments before schema validation.
-    prepare_arguments: ?*const fn (args: std.json.Value) std.json.Value = null,
+    /// Optional compatibility shim for raw tool-call arguments before hooks and execution.
+    /// Returned JSON must either alias `args` or be allocated from the supplied allocator.
+    prepare_arguments: ?*const fn (allocator: std.mem.Allocator, args: std.json.Value) anyerror!std.json.Value = null,
     execute: *const fn (
         ctx: ?*anyopaque,
         allocator: std.mem.Allocator,
@@ -344,7 +345,6 @@ pub const AfterToolCallHook = struct {
         return self.func(context, signal, self.ctx);
     }
 };
-
 
 /// Hook: transforms the raw provider request payload before HTTP send.
 ///

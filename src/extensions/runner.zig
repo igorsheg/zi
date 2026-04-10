@@ -5,7 +5,7 @@ const abort_signal = @import("../abort_signal.zig");
 const agent_protocol = @import("../agent/protocol.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
-/// 
+///
 /// Why: Extensions may cache pointers or references into the runner (e.g., tool
 /// registries, handler lists). When a reload occurs, the old runner is destroyed
 /// and a new one created with a higher generation number. Consumers that cache
@@ -16,17 +16,17 @@ const agent_protocol = @import("../agent/protocol.zig");
 pub const Generation = u64;
 
 /// Two-phase runtime lifecycle: stub → bound.
-/// 
+///
 /// Extensions register during the "load" phase, where action methods like
 /// send_message would fail. The runtime starts as `.stub` and transitions to
 /// `.bound` only after AgentSession is fully constructed and can provide the
 /// concrete implementations. This prevents extensions from calling into
 /// session-dependent APIs during registration, when session state is incomplete.
-/// 
+///
 /// The `.bound` variant carries opaque pointers (`*anyopaque`) to avoid circular
 /// imports in D1. Real types (AgentSession, ExtensionUIContext, etc.) get wired
 /// in later phases once the module dependency graph stabilizes.
-/// 
+///
 /// ExtensionCommandContext seam exists from day one (per the spec's v2
 /// preparation), but v1 leaves `command_actions` null. This preserves the
 /// bind-time contract without requiring D2 refactors.
@@ -108,7 +108,7 @@ pub const ExtensionRunner = struct {
     /// Runtime state — starts as stub, transitions to bound once.
     runtime: ExtensionRuntime,
 
-    /// Tool registry — maps tool name → ExtensionTool. First-
+    /// Tool registry — maps tool name → ToolDefinition. First-
     /// registered-wins; populated during load, consumed by
     /// AgentSession to build the active tool list. Owns every
     /// entry's strings and JSON schema for the runner generation.

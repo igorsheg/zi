@@ -143,9 +143,11 @@ pub const UiEvent = union(enum) {
 
     // --- /model outcomes (zi-wub.16) ---
     // Published by the agent thread after processing a set_model
-    // AgentRequest. The model id is owned (cloned into msg_allocator)
-    // so the TUI can display it without reaching back into agent state.
+    // AgentRequest. Provider + model id are owned (cloned into
+    // msg_allocator) so the TUI can both render status and persist
+    // the new default without reaching back into agent state.
     model_switched: struct {
+        provider: []u8,
         id: []u8,
     },
 
@@ -190,7 +192,10 @@ pub const UiEvent = union(enum) {
                 if (s.restore_warning) |w| allocator.free(w);
             },
             .session_resume_failed => |f| allocator.free(f.message),
-            .model_switched => |m| allocator.free(m.id),
+            .model_switched => |m| {
+                allocator.free(m.provider);
+                allocator.free(m.id);
+            },
             .prompt_worker_finished => |p| {
                 if (p.internal_error) |msg| allocator.free(msg);
             },

@@ -18,6 +18,7 @@ const protocol = @import("../agent/protocol.zig");
 
 pub const BuiltinCtx = struct {
     cwd: []const u8,
+    session_id: []const u8 = "",
 };
 
 /// Parse a JSON schema string at startup. Leaks into page_allocator —

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
+const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 
 const MAX_LINES: usize = 500;
@@ -29,19 +30,21 @@ const DESCRIPTION =
     "- By default, this tool returns the first 500 lines. To read more, call it multiple times with different read_ranges.\n" ++
     "- Use the Grep tool to find specific content in large files or files with long lines.\n" ++
     "- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.\n" ++
-    "- The contents are returned with each line prefixed by its line number.\n" ++
+    "- The contents are returned with each line prefixed by its line number. For example, if a file has contents \"abc\\n\", you will receive \"1: abc\\n\". For directories, entries are returned one per line (without line numbers) with a trailing \"/\" for subdirectories.\n" ++
     "- This tool can read images (such as PNG, JPEG, and GIF files) and present them to the model visually.\n" ++
     "- When possible, call this tool in parallel for all files you will want to read.\n" ++
-    "      - Avoid tiny repeated slices (e.g., 50-line chunks). If you need more context from the same file, read a larger range or the full default window instead.";
+    "      - Avoid tiny repeated slices (e.g., 50‑line chunks). If you need more context from the same file, read a larger range or the full default window instead.";
 
-pub fn makeTool(ctx: *util.BuiltinCtx) protocol.AgentTool {
+pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
     return .{
         .name = "read",
         .description = DESCRIPTION,
         .label = "Read",
         .parameters = util.parseSchema(SCHEMA),
-        .ctx = @ptrCast(ctx),
-        .execute = &execute,
+        .prompt_snippet = "Read file contents",
+        .prompt_guidelines = &.{"Use read to examine files instead of cat or sed."},
+        .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },
+        .source = .{ .kind = "builtin", .id = "read" },
     };
 }
 

@@ -4,6 +4,8 @@ const agent_mod = @import("agent/root.zig");
 const session_mod = @import("session/root.zig");
 const bash_tool = @import("tools/bash.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
+const tool_def = @import("tools/definition.zig");
+const builtin_util = @import("tools/util.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const storage = @import("storage.zig");
@@ -98,7 +100,7 @@ pub const AgentSession = struct {
         system_prompt: ?[]const u8 = null,
         context_files: []const system_prompt_mod.ContextFile = &.{},
         max_tokens: ?u64 = 4096,
-        tools: ?[]const protocol.AgentTool = null,
+        tools: ?[]const tool_def.ToolDefinition = null,
         /// Optional pre-built provider registry. When null, the sdk
         /// factory creates one via `ai.provider_defaults.Bundle` and
         /// the session takes ownership. Tests typically pass their own
@@ -136,17 +138,6 @@ pub const AgentSession = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) AgentSession {
-        // Default built-ins: bash + read/write/edit/grep/find/ls.
-        // The bundle owns a per-session BuiltinCtx (cwd) that every
-        // tool ctx pointer references; we leak it for the session
-        // lifetime — same allocator we'd otherwise free at deinit, and
-        // tool ctx is borrowed by the agent loop.
-        const builtin_tools = options.tools orelse blk: {
-            const bundle = builtin_tools_mod.build(allocator, options.cwd) catch
-                break :blk @as([]const protocol.AgentTool, &.{});
-            break :blk @as([]const protocol.AgentTool, bundle.tools);
-        };
-
         // Fallback path when no store was pre-built by the sdk factory.
         // The preferred entry point is `sdk.createAgentSession`, which
         // runs `resolveSessionDir` up front (v2 hook point). Direct
@@ -157,6 +148,17 @@ pub const AgentSession = struct {
         else blk: {
             const default_dir = storage.getSessionDirForCwd(allocator, options.cwd, null) catch @panic("OOM");
             break :blk SessionStore.create(allocator, default_dir, options.cwd);
+        };
+
+        // Default built-ins: bash + read/write/edit/grep/find/ls.
+        // The bundle owns a per-session BuiltinCtx (cwd + session id)
+        // that every tool ctx pointer references for the session
+        // lifetime.
+        const builtin_definitions = options.tools orelse blk: {
+            var bundle = builtin_tools_mod.build(allocator, options.cwd) catch
+                break :blk @as([]const tool_def.ToolDefinition, &.{});
+            bundle.ctx.session_id = store.sessionId();
+            break :blk @as([]const tool_def.ToolDefinition, bundle.definitions);
         };
 
         // Resolve the provider registry. The preferred path: sdk passes
@@ -252,42 +254,24 @@ pub const AgentSession = struct {
             }
         }
 
-        // Merge builtin + Lua-registered tools. Each Lua tool wraps
-        // the registry entry's handler ref via `lua_tool.buildAgentTool`.
-        // Lifetime of the lua AgentTools is bounded by the runner
-        // generation — the borrowed strings (name/desc/parameters)
-        // are runner-owned and the per-tool LuaToolCtx is allocated
-        // from the session allocator.
-        const tools: []const protocol.AgentTool = if (ext_runner) |r| build_blk: {
-            const lua_count = r.tool_registry.count();
-            if (lua_count == 0) break :build_blk builtin_tools;
-            const merged = allocator.alloc(protocol.AgentTool, builtin_tools.len + lua_count) catch
-                break :build_blk builtin_tools;
-            @memcpy(merged[0..builtin_tools.len], builtin_tools);
-            var n: usize = builtin_tools.len;
+        const definitions: []const tool_def.ToolDefinition = if (ext_runner) |r| build_blk: {
+            const ext_count = r.tool_registry.count();
+            if (ext_count == 0) break :build_blk builtin_definitions;
+            const merged = allocator.alloc(tool_def.ToolDefinition, builtin_definitions.len + ext_count) catch
+                break :build_blk builtin_definitions;
+            @memcpy(merged[0..builtin_definitions.len], builtin_definitions);
+            var n: usize = builtin_definitions.len;
             for (r.tool_registry.items()) |entry| {
-                const at = lua_tool_mod.buildAgentTool(allocator, r, entry) catch |err| {
-                    std.log.scoped(.extensions).warn(
-                        "failed to build agent tool for {s}: {s}",
-                        .{ entry.name, @errorName(err) },
-                    );
-                    continue;
-                };
-                merged[n] = at;
+                merged[n] = entry;
                 n += 1;
             }
             break :build_blk merged[0..n];
-        } else builtin_tools;
+        } else builtin_definitions;
 
-        // Apply strict `--tools` allowlist. Runs AFTER builtin + Lua
-        // extension merge so it filters BOTH sources uniformly —
-        // otherwise extensions like Task slip past the filter and
-        // `zi --tools bash` still spawns Task, breaking the subagent
-        // tool contract (see issue zi-1ry).
-        const filtered_tools: []const protocol.AgentTool = if (options.tool_allowlist) |allow| blk_f: {
-            const filtered = allocator.alloc(protocol.AgentTool, tools.len) catch break :blk_f tools;
+        const filtered_definitions: []const tool_def.ToolDefinition = if (options.tool_allowlist) |allow| blk_f: {
+            const filtered = allocator.alloc(tool_def.ToolDefinition, definitions.len) catch break :blk_f definitions;
             var fi: usize = 0;
-            for (tools) |t| {
+            for (definitions) |t| {
                 for (allow) |want| {
                     const w = std.mem.trim(u8, want, &std.ascii.whitespace);
                     if (w.len == 0) continue;
@@ -299,13 +283,34 @@ pub const AgentSession = struct {
                 }
             }
             break :blk_f filtered[0..fi];
-        } else tools;
+        } else definitions;
 
-        const tool_name_slice: []const []const u8 = blk: {
-            const tn = allocator.alloc([]const u8, filtered_tools.len) catch break :blk &.{};
-            for (filtered_tools, 0..) |t, i| tn[i] = t.name;
-            break :blk tn;
+        const filtered_tools: []const protocol.AgentTool = blk: {
+            const out = allocator.alloc(protocol.AgentTool, filtered_definitions.len) catch break :blk &.{};
+            var n: usize = 0;
+            for (filtered_definitions) |def| {
+                const tool = switch (def.impl) {
+                    .builtin => tool_def.toAgentTool(def),
+                    .lua => if (ext_runner) |r|
+                        lua_tool_mod.buildAgentTool(allocator, r, def) catch |err| {
+                            std.log.scoped(.extensions).warn(
+                                "failed to build agent tool for {s}: {s}",
+                                .{ def.name, @errorName(err) },
+                            );
+                            continue;
+                        }
+                    else
+                        continue,
+                };
+                out[n] = tool;
+                n += 1;
+            }
+            break :blk out[0..n];
         };
+
+        const tool_name_slice = toolNameSlice(allocator, filtered_definitions) catch &.{};
+        const tool_snippets = collectToolSnippets(allocator, filtered_definitions) catch &.{};
+        const prompt_guidelines = collectGuidelines(allocator, filtered_definitions) catch &.{};
 
         const sys_prompt = blk: {
             if (options.system_prompt) |custom| {
@@ -314,12 +319,16 @@ pub const AgentSession = struct {
                     .cwd = options.cwd,
                     .context_files = options.context_files,
                     .tool_names = tool_name_slice,
+                    .tool_snippets = tool_snippets,
+                    .guidelines = prompt_guidelines,
                     .append_system_prompt = options.append_system_prompt,
                 }) catch custom;
             }
             break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
                 .cwd = options.cwd,
                 .tool_names = tool_name_slice,
+                .tool_snippets = tool_snippets,
+                .guidelines = prompt_guidelines,
                 .context_files = options.context_files,
                 .append_system_prompt = options.append_system_prompt,
             }) catch "You are a helpful coding assistant.";
@@ -380,6 +389,58 @@ pub const AgentSession = struct {
         // We'll wire this up in run/continueSession instead.
 
         return self;
+    }
+
+    fn toolNameSlice(
+        allocator: std.mem.Allocator,
+        defs: []const tool_def.ToolDefinition,
+    ) ![]const []const u8 {
+        const names = try allocator.alloc([]const u8, defs.len);
+        for (defs, 0..) |def, i| names[i] = def.name;
+        return names;
+    }
+
+    fn collectToolSnippets(
+        allocator: std.mem.Allocator,
+        defs: []const tool_def.ToolDefinition,
+    ) ![]const system_prompt_mod.ToolSnippet {
+        var count: usize = 0;
+        for (defs) |def| {
+            if (def.prompt_snippet != null) count += 1;
+        }
+        const snippets = try allocator.alloc(system_prompt_mod.ToolSnippet, count);
+        var i: usize = 0;
+        for (defs) |def| {
+            const snippet = def.prompt_snippet orelse continue;
+            snippets[i] = .{ .name = def.name, .snippet = snippet };
+            i += 1;
+        }
+        return snippets;
+    }
+
+    fn collectGuidelines(
+        allocator: std.mem.Allocator,
+        defs: []const tool_def.ToolDefinition,
+    ) ![]const []const u8 {
+        var total: usize = 0;
+        for (defs) |def| total += def.prompt_guidelines.len;
+        const guidelines = try allocator.alloc([]const u8, total);
+        var i: usize = 0;
+        for (defs) |def| {
+            for (def.prompt_guidelines) |guideline| {
+                var dup = false;
+                for (guidelines[0..i]) |existing| {
+                    if (std.mem.eql(u8, existing, guideline)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                guidelines[i] = guideline;
+                i += 1;
+            }
+        }
+        return guidelines[0..i];
     }
 
     /// Tear down the extension runner + lua_State on whichever thread
@@ -995,6 +1056,17 @@ fn stubExec(
     return .{ .content = &.{}, .is_error = false };
 }
 
+fn testToolDefinition(name: []const u8, label: []const u8) tool_def.ToolDefinition {
+    return .{
+        .name = name,
+        .label = label,
+        .description = "x",
+        .parameters = std.json.Value{ .null = {} },
+        .impl = .{ .builtin = .{ .execute = &stubExec } },
+        .source = .{ .kind = "test", .id = name },
+    };
+}
+
 // zi-1ry: `tool_allowlist` is a strict whitelist. Applied AFTER the
 // builtin + Lua-extension merge, it drops anything not explicitly
 // named — critical to prevent Task-in-Task subagent recursion when
@@ -1004,10 +1076,10 @@ test "AgentSession: tool_allowlist filters merged tool set" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const seeded = [_]protocol.AgentTool{
-        bash_tool.makeTool(),
-        .{ .name = "Task", .label = "Task", .description = "x", .parameters = std.json.Value{ .null = {} }, .execute = &stubExec },
-        .{ .name = "read", .label = "Read", .description = "x", .parameters = std.json.Value{ .null = {} }, .execute = &stubExec },
+    const seeded = [_]tool_def.ToolDefinition{
+        bash_tool.definition(&(builtin_util.BuiltinCtx{ .cwd = "/tmp/zi-test" })),
+        testToolDefinition("Task", "Task"),
+        testToolDefinition("read", "Read"),
     };
 
     var fp = faux.FauxProvider.init(allocator);
@@ -1233,20 +1305,21 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     try registry.register("faux", fp.provider(), null);
 
     // Simple echo tool
-    const echo_tool = protocol.AgentTool{
+    const echo_tool = tool_def.ToolDefinition{
         .name = "echo",
         .description = "echo",
         .label = "echo",
         .parameters = .null,
-        .execute = &struct {
+        .impl = .{ .builtin = .{ .execute = &struct {
             fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: protocol.AbortSignal, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
                 const c = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch return .{ .content = &.{} };
                 c[0] = .{ .text = .{ .text = "echoed" } };
                 return .{ .content = c };
             }
-        }.exec,
+        }.exec } },
+        .source = .{ .kind = "test", .id = "echo" },
     };
-    const tools = [_]protocol.AgentTool{echo_tool};
+    const tools = [_]tool_def.ToolDefinition{echo_tool};
 
     var collector = EventCollector.init(allocator);
     var ca = AgentSession.init(allocator, .{

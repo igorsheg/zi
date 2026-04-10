@@ -20,80 +20,13 @@
 //! and Reload §Invariants.
 
 const std = @import("std");
+const definition = @import("../../tools/definition.zig");
 
-/// Tool execution backing. Two flavors share the same registry slot
-/// because the spec calls for "built-in tools register through the
-/// same mechanism as extension tools, just with zig function pointers
-/// instead of Lua coroutines" (docs §Architecture decision 3).
-///
-/// `builtin` is an opaque pointer to an `agent.protocol.AgentTool` —
-/// kept untyped here to avoid an extensions → agent dependency loop
-/// while D2 is in flight. Real wiring lands once the registries are
-/// hooked into AgentSession; the cast site will document the type.
-///
-/// `lua` carries a `c_int` reference returned by `luaL_ref` against
-/// the runner's Lua state. Resolving it back to a callable lives in
-/// the dispatch path (D4 / E1) — the registry stores it raw.
-pub const ToolImpl = union(enum) {
-    builtin: *anyopaque,
-    lua: c_int,
-};
+pub const BuiltinImpl = definition.BuiltinImpl;
+pub const ToolImpl = definition.ToolImpl;
+pub const RegistrationSource = definition.RegistrationSource;
 
-/// Provenance of a registration. Used for diagnostics ("tool X
-/// already registered by Y") and, eventually, for `unregisterBySource`
-/// during /reload of a single extension. The string is borrowed from
-/// the loader and is expected to live as long as the registry.
-pub const RegistrationSource = struct {
-    /// One of "explicit", "user", "project", "builtin".
-    kind: []const u8,
-    /// Human-readable identifier — usually the extension's file path
-    /// or built-in tool name. Borrowed; the loader keeps it alive
-    /// for the registry's lifetime.
-    id: []const u8,
-};
-
-/// Full tool definition as registered through `zi.register_tool` (or
-/// the equivalent zig path for built-ins).
-///
-/// Ownership: every owned slice / std.json.Value here is allocated
-/// with the runner's allocator. The registry deinit walks every entry
-/// and frees them. Lua-side garbage collection cannot reach into
-/// these fields — they live in zig memory only.
-pub const ExtensionTool = struct {
-    /// Stable identifier. Used as the registry key AND the wire name
-    /// the LLM sees in tool_use blocks. Owned.
-    name: []const u8,
-    /// Display label for UIs. Owned. Defaults to `name` when omitted.
-    label: []const u8,
-    /// Long-form description for the system prompt. Owned.
-    description: []const u8,
-    /// JSON schema for the tool's parameters. Owned (deep-cloned from
-    /// the Lua table at registration time).
-    parameters: std.json.Value,
-    /// Optional snippet appended to the system prompt to teach the
-    /// LLM when to use this tool. Owned.
-    prompt_snippet: ?[]const u8 = null,
-    /// Optional list of usage guidelines woven into the system prompt.
-    /// Each entry is owned.
-    prompt_guidelines: []const []const u8 = &.{},
-    /// Execution backend.
-    impl: ToolImpl,
-    /// Where this registration came from. Borrowed.
-    source: RegistrationSource,
-
-    /// Optional Lua function ref (`luaL_ref` slot) for the
-    /// tool's result renderer. When present, the TUI calls it at
-    /// `tool_execution_end` time to produce structured render spans
-    /// for the transcript (see extensions/lua_renderer.zig).
-    ///
-    /// `null` → no custom result rendering; the transcript falls
-    /// back to its default text-wrap formatter.
-    ///
-    /// Lifetime: released when the Lua state closes during runner
-    /// teardown (all refs get GC'd wholesale), so we don't track
-    /// it individually here.
-    render_result_ref: ?c_int = null,
-};
+pub const ToolDefinition = definition.ToolDefinition;
 
 /// First-registered-wins map.
 ///
@@ -109,7 +42,7 @@ pub const ToolRegistry = struct {
     index: std.StringHashMapUnmanaged(usize) = .empty,
     /// Insertion-ordered storage. Index stability is required by the
     /// `index` map, so this list never shrinks except on `deinit`.
-    entries: std.ArrayListUnmanaged(ExtensionTool) = .empty,
+    entries: std.ArrayListUnmanaged(ToolDefinition) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ToolRegistry {
         return .{ .allocator = allocator };
@@ -141,7 +74,7 @@ pub const ToolRegistry = struct {
     /// On accept the registry takes ownership of every owned field
     /// in `tool` — caller MUST NOT free them. On drop the caller
     /// retains ownership and is responsible for freeing.
-    pub fn register(self: *ToolRegistry, tool: ExtensionTool) !bool {
+    pub fn register(self: *ToolRegistry, tool: ToolDefinition) !bool {
         if (self.index.get(tool.name) != null) return false;
 
         const idx = self.entries.items.len;
@@ -157,7 +90,7 @@ pub const ToolRegistry = struct {
 
     /// Look up a tool by name. Returned pointer is stable until
     /// `deinit` (entries are append-only within a generation).
-    pub fn get(self: *const ToolRegistry, name: []const u8) ?*const ExtensionTool {
+    pub fn get(self: *const ToolRegistry, name: []const u8) ?*const ToolDefinition {
         const idx = self.index.get(name) orelse return null;
         return &self.entries.items[idx];
     }
@@ -169,11 +102,11 @@ pub const ToolRegistry = struct {
 
     /// Iterate in registration order — the order matters for system
     /// prompt assembly and `--list-tools` UX.
-    pub fn items(self: *const ToolRegistry) []const ExtensionTool {
+    pub fn items(self: *const ToolRegistry) []const ToolDefinition {
         return self.entries.items;
     }
 
-    fn freeEntry(self: *ToolRegistry, entry: *ExtensionTool) void {
+    fn freeEntry(self: *ToolRegistry, entry: *ToolDefinition) void {
         const a = self.allocator;
         a.free(entry.name);
         a.free(entry.label);
@@ -194,7 +127,7 @@ const json_value = @import("../../json/value.zig");
 
 const testing = std.testing;
 
-fn dummyTool(allocator: std.mem.Allocator, name: []const u8, source_kind: []const u8) !ExtensionTool {
+fn dummyTool(allocator: std.mem.Allocator, name: []const u8, source_kind: []const u8) !ToolDefinition {
     return .{
         .name = try allocator.dupe(u8, name),
         .label = try allocator.dupe(u8, name),

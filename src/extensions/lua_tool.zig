@@ -41,12 +41,12 @@ const AgentToolResult = agent_protocol.AgentToolResult;
 pub const LuaToolCtx = struct {
     runner: *runner_mod.ExtensionRunner,
     lua_ref: c_int,
-    /// Borrowed from `ExtensionTool.name` in the runner's tool
+    /// Borrowed from `ToolDefinition.name` in the runner's tool
     /// registry. Lifetime matches the runner generation.
     name: []const u8,
 };
 
-/// Build an `AgentTool` from a registered ExtensionTool.
+/// Build an `AgentTool` from a registered ToolDefinition.
 ///
 /// Borrows: `name`, `description`, `label`, `parameters` come from
 /// the registry entry, which the runner already owns. The returned
@@ -57,7 +57,7 @@ pub const LuaToolCtx = struct {
 pub fn buildAgentTool(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
-    ext_tool: tool_registry.ExtensionTool,
+    ext_tool: tool_registry.ToolDefinition,
 ) !agent_protocol.AgentTool {
     const lua_ref = switch (ext_tool.impl) {
         .lua => |r| r,

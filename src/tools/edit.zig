@@ -24,9 +24,11 @@
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
+const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const diff_mod = @import("../lib/diff.zig");
 const lock_registry = @import("../agent/lock_registry.zig");
+const json_value = @import("../json/value.zig");
 
 const SCHEMA =
     \\{"type":"object","properties":{
@@ -49,14 +51,21 @@ const DESCRIPTION =
     "In `edits` mode, each edit is matched against the original file. Edits must not overlap.\n\n" ++
     "When changing an existing file, use this tool. Only use the write tool for files that do not exist yet.";
 
-pub fn makeTool(ctx: *util.BuiltinCtx) protocol.AgentTool {
+pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
     return .{
         .name = "edit",
         .description = DESCRIPTION,
-        .label = "Edit",
+        .label = "Edit File",
         .parameters = util.parseSchema(SCHEMA),
-        .ctx = @ptrCast(ctx),
-        .execute = &execute,
+        .prompt_snippet = "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+        .prompt_guidelines = &.{
+            "Use edit for precise changes (edits[].old_str must match exactly)",
+            "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
+            "Each edits[].old_str is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+            "Keep edits[].old_str as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+        },
+        .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .prepare_arguments = &prepareArguments, .execute = &execute } },
+        .source = .{ .kind = "builtin", .id = "edit" },
     };
 }
 
@@ -74,6 +83,42 @@ const MatchedEdit = struct {
     replace_str: []const u8,
     search_str: []const u8,
 };
+
+fn prepareArguments(allocator: std.mem.Allocator, args: std.json.Value) !std.json.Value {
+    const obj = switch (args) {
+        .object => |o| o,
+        else => return args,
+    };
+
+    const old_str = util.getString(args, "old_str") orelse return args;
+    const new_str = util.getString(args, "new_str") orelse return args;
+    const top_level_replace_all = util.getBool(args, "replace_all");
+
+    var normalized = try json_value.cloneJsonValue(allocator, args);
+    var normalized_obj = &normalized.object;
+
+    var edits_array = if (normalized_obj.get("edits")) |value| switch (value) {
+        .array => |arr| arr,
+        else => return normalized,
+    } else std.json.Array.init(allocator);
+
+    var folded_edit = std.json.ObjectMap.init(allocator);
+    errdefer folded_edit.deinit();
+    try folded_edit.put(try allocator.dupe(u8, "old_str"), .{ .string = try allocator.dupe(u8, old_str) });
+    try folded_edit.put(try allocator.dupe(u8, "new_str"), .{ .string = try allocator.dupe(u8, new_str) });
+    if (top_level_replace_all) |replace_all| {
+        try folded_edit.put(try allocator.dupe(u8, "replace_all"), .{ .bool = replace_all });
+    }
+    try edits_array.append(.{ .object = folded_edit });
+
+    try normalized_obj.put(try allocator.dupe(u8, "edits"), .{ .array = edits_array });
+    _ = normalized_obj.swapRemove("old_str");
+    _ = normalized_obj.swapRemove("new_str");
+    _ = normalized_obj.swapRemove("replace_all");
+
+    _ = obj;
+    return normalized;
+}
 
 fn execute(
     raw_ctx: ?*anyopaque,
@@ -109,12 +154,6 @@ fn execute(
         else => return util.errorResult(allocator, "edit tool: bad args"),
     };
     const has_edits_array = if (obj.get("edits")) |v| v == .array else false;
-    const has_old_str = obj.get("old_str") != null;
-    const has_new_str = obj.get("new_str") != null;
-
-    if (has_edits_array and (has_old_str or has_new_str)) {
-        return util.errorResult(allocator, "use either old_str/new_str or edits, not both.");
-    }
 
     if (has_edits_array) {
         const arr = obj.get("edits").?.array;
@@ -132,15 +171,8 @@ fn execute(
                 .replace_all = ra,
             }) catch return util.errorResult(allocator, "alloc failed");
         }
-    } else if (has_old_str and has_new_str) {
-        const ra = util.getBool(args, "replace_all") orelse false;
-        edits.append(allocator, .{
-            .old_str = normalizeToLfDup(allocator, util.getString(args, "old_str").?) catch return util.errorResult(allocator, "alloc failed"),
-            .new_str = normalizeToLfDup(allocator, util.getString(args, "new_str").?) catch return util.errorResult(allocator, "alloc failed"),
-            .replace_all = ra,
-        }) catch return util.errorResult(allocator, "alloc failed");
     } else {
-        return util.errorResult(allocator, "provide either old_str/new_str, or a non-empty edits array.");
+        return util.errorResult(allocator, "edit tool: input must be canonicalized to a non-empty edits array before execution.");
     }
     // Free the per-edit allocs at the end.
     defer for (edits.items) |e| {
@@ -272,7 +304,9 @@ fn normalizeToLfDup(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 fn restoreCrlf(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var nl_count: usize = 0;
-    for (s) |c| { if (c == '\n') nl_count += 1; }
+    for (s) |c| {
+        if (c == '\n') nl_count += 1;
+    }
     var out = try allocator.alloc(u8, s.len + nl_count);
     var n: usize = 0;
     for (s) |c| {
@@ -758,4 +792,66 @@ fn previewLine(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     buf[cap + 1] = '.';
     buf[cap + 2] = '.';
     return buf;
+}
+
+test "prepareArguments folds top-level single edit into canonical edits array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        \\{"path":"file.txt","old_str":"before","new_str":"after","replace_all":true}
+    ,
+        .{},
+    );
+
+    const prepared = try prepareArguments(std.testing.allocator, input);
+    defer json_value.freeJsonValue(std.testing.allocator, prepared);
+
+    try std.testing.expectEqualStrings("file.txt", prepared.object.get("path").?.string);
+    try std.testing.expect(prepared.object.get("old_str") == null);
+    try std.testing.expect(prepared.object.get("new_str") == null);
+    try std.testing.expect(prepared.object.get("replace_all") == null);
+    const edits = prepared.object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), edits.len);
+    try std.testing.expectEqualStrings("before", edits[0].object.get("old_str").?.string);
+    try std.testing.expectEqualStrings("after", edits[0].object.get("new_str").?.string);
+    try std.testing.expectEqual(true, edits[0].object.get("replace_all").?.bool);
+}
+
+test "prepareArguments appends top-level single edit to existing edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        \\{"path":"file.txt","edits":[{"old_str":"a","new_str":"b"}],"old_str":"c","new_str":"d"}
+    ,
+        .{},
+    );
+
+    const prepared = try prepareArguments(std.testing.allocator, input);
+    defer json_value.freeJsonValue(std.testing.allocator, prepared);
+
+    const edits = prepared.object.get("edits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+    try std.testing.expectEqualStrings("a", edits[0].object.get("old_str").?.string);
+    try std.testing.expectEqualStrings("b", edits[0].object.get("new_str").?.string);
+    try std.testing.expectEqualStrings("c", edits[1].object.get("old_str").?.string);
+    try std.testing.expectEqualStrings("d", edits[1].object.get("new_str").?.string);
+}
+
+test "prepareArguments leaves non-canonical input unchanged when it cannot fold a single edit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        \\{"path":"file.txt","old_str":"before"}
+    ,
+        .{},
+    );
+
+    const prepared = try prepareArguments(std.testing.allocator, input);
+    try std.testing.expect(prepared == input);
 }

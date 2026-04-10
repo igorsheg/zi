@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
+const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 
 const DEFAULT_LIMIT: usize = 500;
@@ -29,14 +30,15 @@ const DESCRIPTION =
     "- `**/*test*` — Files with \"test\" in their name\n" ++
     "- `**/*.{js,ts}` — JavaScript and TypeScript files\n";
 
-pub fn makeTool(ctx: *util.BuiltinCtx) protocol.AgentTool {
+pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
     return .{
         .name = "find",
         .description = DESCRIPTION,
-        .label = "Find",
+        .label = "Find Files",
         .parameters = util.parseSchema(SCHEMA),
-        .ctx = @ptrCast(ctx),
-        .execute = &execute,
+        .prompt_snippet = "Find files by glob pattern (respects .gitignore)",
+        .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },
+        .source = .{ .kind = "builtin", .id = "find" },
     };
 }
 
@@ -59,12 +61,12 @@ fn execute(
     const offset: usize = if (offset_i < 0) 0 else @intCast(offset_i);
 
     const argv = [_][]const u8{
-        "rg",          "--files",
-        "--hidden",    "--color=never",
-        "--sortr",     "modified",
-        "--glob",      "!.git",
-        "--glob",      "!.jj",
-        "--glob",      pattern,
+        "rg",       "--files",
+        "--hidden", "--color=never",
+        "--sortr",  "modified",
+        "--glob",   "!.git",
+        "--glob",   "!.jj",
+        "--glob",   pattern,
         ctx.cwd,
     };
 

@@ -470,6 +470,7 @@ pub fn main() !void {
             resolver,
             cwd_buf,
             &auth_storage,
+            &settings,
             .{
                 .enabled = retry_settings.enabled,
                 .max_retries = @intCast(@max(retry_settings.max_retries, 0)),

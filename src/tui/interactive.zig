@@ -63,6 +63,7 @@ const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
 const auth_storage_mod = @import("../auth/storage.zig");
 const oauth_mod = @import("../auth/oauth.zig");
+const settings_manager_mod = @import("../settings/manager.zig");
 const ai_protocol = @import("../ai/protocol.zig");
 const ai_resolve = @import("../ai/resolve.zig");
 
@@ -188,6 +189,7 @@ pub const Interactive = struct {
 
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
+    settings_manager: *settings_manager_mod.SettingsManager,
     /// Borrowed slice of the session's ModelRegistry. Bound at init
     /// from `ca.model_registry.getAll()`. Lifetime: AgentSession
     /// outlives Interactive, and the registry is immutable for the
@@ -237,6 +239,7 @@ pub const Interactive = struct {
         resolver: ToolRendererResolver,
         cwd: []const u8,
         auth_storage: *auth_storage_mod.AuthStorage,
+        settings_manager: *settings_manager_mod.SettingsManager,
         retry_policy: RetryPolicy,
         compaction_policy: CompactionPolicy,
         compaction_executor: ?CompactionExecutor,
@@ -272,6 +275,7 @@ pub const Interactive = struct {
                 .compaction_executor = compaction_executor,
             }),
             .auth_storage = auth_storage,
+            .settings_manager = settings_manager,
             .model_catalog = if (ca.model_registry) |mr| mr.getAll() else &.{},
         };
         // Wire the extension runner into the transcript so
@@ -839,6 +843,7 @@ pub const Interactive = struct {
                 // is safe (the catalog slice is static, no race).
                 self.status_data.model_id = self.ca.agent.state.model.id;
                 self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
+                self.settings_manager.setDefaultModelAndProvider(m.provider, m.id);
                 var buf: [80]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
                 self.status_text.setContent(msg);
@@ -1787,16 +1792,20 @@ pub const Interactive = struct {
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
     /// Mutates ca.agent.state.model and appends a model_change entry
     /// to the session store — both agent-owned per the doctrine.
-    /// Publishes `.model_switched` with an msg_allocator-cloned id
-    /// so the TUI can update status_data without reaching back into
-    /// agent state.
+    /// Publishes `.model_switched` with msg_allocator-cloned
+    /// provider/id so the TUI can update status_data and persist the
+    /// new default without reaching back into agent state.
     fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
         self.ca.agent.state.model = m;
         const provider_str = json_util.providerToString(m.provider);
         self.ca.session_store.appendModelChange(provider_str, m.id);
 
-        const id_copy = self.msg_allocator.dupe(u8, m.id) catch return;
-        self.event_queue.push(.{ .model_switched = .{ .id = id_copy } });
+        const provider_copy = self.msg_allocator.dupe(u8, provider_str) catch return;
+        const id_copy = self.msg_allocator.dupe(u8, m.id) catch {
+            self.msg_allocator.free(provider_copy);
+            return;
+        };
+        self.event_queue.push(.{ .model_switched = .{ .provider = provider_copy, .id = id_copy } });
     }
 
     /// Session event callback — runs on the AGENT THREAD.

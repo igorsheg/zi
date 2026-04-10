@@ -390,9 +390,15 @@ fn executeToolCalls(
 
                 const t = tool.?;
 
-                // prepare_arguments: optional arg transform before execution
+                // prepare_arguments: optional arg transform before hooks and execution
                 const prepared_args = if (t.prepare_arguments) |prep_fn|
-                    prep_fn(tc.arguments)
+                    prep_fn(aa, tc.arguments) catch |err| {
+                        const err_msg = std.fmt.allocPrint(aa, "Tool {s} argument preparation failed: {s}", .{ tc.name, @errorName(err) }) catch "Tool argument preparation failed";
+                        emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                        started_current = false;
+                        current_tc = null;
+                        continue;
+                    }
                 else
                     tc.arguments;
 
@@ -671,4 +677,3 @@ const StreamBridge = struct {
         };
     }
 };
-

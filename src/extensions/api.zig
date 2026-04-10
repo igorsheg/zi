@@ -30,7 +30,7 @@
 //!
 //!   3. The `execute` Lua function is captured via `luaL_ref` so the
 //!      Lua GC can't reap the closure between registration and the
-//!      first invocation. The ref is stored in `ExtensionTool.impl.lua`
+//!      first invocation. The ref is stored in `ToolDefinition.impl.lua`
 //!      as a raw `c_int` and released when the runner closes its
 //!      Lua state at deinit (closing the state collects every ref).
 //!
@@ -91,7 +91,7 @@ fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return luaError(L, "register_tool: expected a table argument");
     }
 
-    // Build the ExtensionTool incrementally so each errdefer in the
+    // Build the ToolDefinition incrementally so each errdefer in the
     // builder reverses exactly the allocations made before the
     // failure point. On success, ownership transfers wholesale into
     // the registry.
@@ -160,8 +160,8 @@ const BuildError = error{
     InvalidUtf8,
 };
 
-/// Walk the Lua table at stack index 1 and produce an
-/// `ExtensionTool` whose owned fields all live in the runner's
+/// Walk the Lua table at stack index 1 and produce a
+/// `ToolDefinition` whose owned fields all live in the runner's
 /// allocator. On any error every allocation made so far is freed.
 ///
 /// Stack discipline: leaves the stack at the same height as on
@@ -171,7 +171,7 @@ const BuildError = error{
 fn buildExtensionTool(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,
-) BuildError!tool_registry.ExtensionTool {
+) BuildError!tool_registry.ToolDefinition {
     const a = runner.allocator;
 
     const name = try requireString(L, 1, "name", a, error.MissingName, error.InvalidName);
@@ -259,7 +259,7 @@ fn buildExtensionTool(
 /// Free every owned field of a partially-built tool. Used by the
 /// rejection path (`!accepted`) and by registry-insert OOM. Mirrors
 /// `ToolRegistry.freeEntry` minus the registry-managed bookkeeping.
-fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ExtensionTool) void {
+fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
     allocator.free(tool.name);
     allocator.free(tool.label);
     allocator.free(tool.description);

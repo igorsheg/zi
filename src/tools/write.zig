@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
+const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const lock_registry = @import("../agent/lock_registry.zig");
 
@@ -22,14 +23,16 @@ const DESCRIPTION =
     "of its content AND the file is small (under ~250 lines).\n\n" ++
     "Automatically creates parent directories if they don't exist.";
 
-pub fn makeTool(ctx: *util.BuiltinCtx) protocol.AgentTool {
+pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
     return .{
         .name = "write",
         .description = DESCRIPTION,
-        .label = "Write",
+        .label = "Create File",
         .parameters = util.parseSchema(SCHEMA),
-        .ctx = @ptrCast(ctx),
-        .execute = &execute,
+        .prompt_snippet = "Create or overwrite files",
+        .prompt_guidelines = &.{"Use write only for new files or complete rewrites."},
+        .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },
+        .source = .{ .kind = "builtin", .id = "write" },
     };
 }
 
@@ -79,7 +82,9 @@ fn execute(
         return util.errorf(allocator, "write tool: failed to write: {s}", .{@errorName(err)});
 
     var line_count: usize = 1;
-    for (content) |c| { if (c == '\n') line_count += 1; }
+    for (content) |c| {
+        if (c == '\n') line_count += 1;
+    }
 
     const verb = if (is_new) "created" else "overwrote";
     const msg = std.fmt.allocPrint(allocator, "{s} {s} ({d} lines)", .{

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
+const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 
 const SCHEMA =
@@ -13,14 +14,15 @@ const SCHEMA =
 const DESCRIPTION =
     "List directory contents. Prefer using the read tool instead — it handles both files and directories.";
 
-pub fn makeTool(ctx: *util.BuiltinCtx) protocol.AgentTool {
+pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
     return .{
         .name = "ls",
         .description = DESCRIPTION,
-        .label = "Ls",
+        .label = "List Directory",
         .parameters = util.parseSchema(SCHEMA),
-        .ctx = @ptrCast(ctx),
-        .execute = &execute,
+        .prompt_snippet = "List directory contents",
+        .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },
+        .source = .{ .kind = "builtin", .id = "ls" },
     };
 }
 

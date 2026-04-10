@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
+const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 
 /// Hard cap on matches we ever return to the model. Both collection
@@ -40,14 +41,15 @@ const DESCRIPTION =
     "- Use 'path' or 'glob' to narrow searches; run multiple focused calls rather than one broad search\n" ++
     "- Uses Rust-style regex (escape `{` and `}`); use `literal: true` for literal text search\n";
 
-pub fn makeTool(ctx: *util.BuiltinCtx) protocol.AgentTool {
+pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
     return .{
         .name = "grep",
         .description = DESCRIPTION,
         .label = "Grep",
         .parameters = util.parseSchema(SCHEMA),
-        .ctx = @ptrCast(ctx),
-        .execute = &execute,
+        .prompt_snippet = "Search file contents for patterns (respects .gitignore)",
+        .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },
+        .source = .{ .kind = "builtin", .id = "grep" },
     };
 }
 
