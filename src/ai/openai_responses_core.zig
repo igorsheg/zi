@@ -98,6 +98,7 @@ pub const CoreOptions = struct {
         context: protocol.Context,
         reasoning_effort: ?[]const u8,
         reasoning_summary: ?[]const u8,
+        session_id: ?[]const u8,
     ) anyerror!void = null,
 };
 
@@ -117,7 +118,7 @@ pub fn streamCore(
     var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer payload_buf.deinit(allocator);
     const build_fn = core.build_request orelse &buildRequestJson;
-    build_fn(allocator, &payload_buf, model, context, core.reasoning_effort, core.reasoning_summary) catch |err| {
+    build_fn(allocator, &payload_buf, model, context, core.reasoning_effort, core.reasoning_summary, options.session_id) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)});
         return;
     };
@@ -835,7 +836,9 @@ pub fn buildRequestJson(
     context: protocol.Context,
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
+    session_id: ?[]const u8,
 ) !void {
+    _ = session_id;
     var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
@@ -1464,7 +1467,7 @@ test "buildRequestJson emits store:false, input[], and reasoning:none for reason
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    try buildRequestJson(alloc, &out, test_model, ctx, null, null);
+    try buildRequestJson(alloc, &out, test_model, ctx, null, null, null);
 
     try testing.expect(std.mem.indexOf(u8, out.items, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"store\":false") != null);

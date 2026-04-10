@@ -16,8 +16,7 @@
 //!
 //! Intentionally NOT ported:
 //!   - websocket transport (`responses_websockets=2026-02-06` beta)
-//!   - `prompt_cache_key` / `parallel_tool_calls` / reasoning effort
-//!     clamping (tracked as zi-imj)
+//!   - reasoning effort clamping (tracked as zi-imj)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -58,10 +57,10 @@ pub const OpenAICodexProvider = struct {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
-        var extra_hdrs: [5]protocol.Header = undefined;
+        var extra_hdrs: [6]protocol.Header = undefined;
         const account_id = requireAccountId(allocator, model, options.api_key, callback, callback_ctx) orelse return;
         const user_agent = buildUserAgent(scratch.allocator()) catch "pi (zig)";
-        const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent);
+        const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent, options.session_id);
 
         core.streamCore(allocator, model, context, options, .{
             .base_url = if (model.base_url.len > 0) null else "https://chatgpt.com/backend-api",
@@ -86,10 +85,10 @@ pub const OpenAICodexProvider = struct {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
-        var extra_hdrs: [5]protocol.Header = undefined;
+        var extra_hdrs: [6]protocol.Header = undefined;
         const account_id = requireAccountId(allocator, model, options.base.api_key, callback, callback_ctx) orelse return;
         const user_agent = buildUserAgent(scratch.allocator()) catch "pi (zig)";
-        const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent);
+        const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent, options.base.session_id);
 
         const clamped = protocol.clampReasoning(options.reasoning, model);
         const effort: ?[]const u8 = if (clamped) |l| protocol.thinkingLevelToString(l) else null;
@@ -131,6 +130,7 @@ fn buildCodexRequestJson(
     context: protocol.Context,
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
+    session_id: ?[]const u8,
 ) anyerror!void {
     var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
@@ -161,6 +161,11 @@ fn buildCodexRequestJson(
     try jw.beginArray();
     try jw.write("reasoning.encrypted_content");
     try jw.endArray();
+
+    if (session_id) |sid| {
+        try jw.objectField("prompt_cache_key");
+        try jw.write(sid);
+    }
 
     try jw.objectField("tool_choice");
     try jw.write("auto");
@@ -230,12 +235,16 @@ fn requireAccountId(
     return account_id;
 }
 
-fn fillCodexHeaders(buf: *[5]protocol.Header, account_id: []const u8, user_agent: []const u8) usize {
+fn fillCodexHeaders(buf: *[6]protocol.Header, account_id: []const u8, user_agent: []const u8, session_id: ?[]const u8) usize {
     buf[0] = .{ .key = "chatgpt-account-id", .value = account_id };
     buf[1] = .{ .key = "originator", .value = "pi" };
     buf[2] = .{ .key = "user-agent", .value = user_agent };
     buf[3] = .{ .key = "OpenAI-Beta", .value = "responses=experimental" };
     buf[4] = .{ .key = "accept", .value = "text/event-stream" };
+    if (session_id) |sid| {
+        buf[5] = .{ .key = "session_id", .value = sid };
+        return 6;
+    }
     return 5;
 }
 
@@ -268,9 +277,9 @@ test "extractAccountId returns the chatgpt account claim from oauth tokens" {
 }
 
 test "fillCodexHeaders matches the codex-required header set" {
-    var headers: [5]protocol.Header = undefined;
-    const count = fillCodexHeaders(&headers, "acct_123", "pi (darwin darwin; aarch64)");
-    try testing.expectEqual(@as(usize, 5), count);
+    var headers: [6]protocol.Header = undefined;
+    const count = fillCodexHeaders(&headers, "acct_123", "pi (darwin darwin; aarch64)", "session-abc");
+    try testing.expectEqual(@as(usize, 6), count);
     try testing.expectEqualStrings("chatgpt-account-id", headers[0].key);
     try testing.expectEqualStrings("acct_123", headers[0].value);
     try testing.expectEqualStrings("originator", headers[1].key);
@@ -279,6 +288,31 @@ test "fillCodexHeaders matches the codex-required header set" {
     try testing.expectEqualStrings("OpenAI-Beta", headers[3].key);
     try testing.expectEqualStrings("accept", headers[4].key);
     try testing.expectEqualStrings("text/event-stream", headers[4].value);
+    try testing.expectEqualStrings("session_id", headers[5].key);
+    try testing.expectEqualStrings("session-abc", headers[5].value);
+}
+
+test "buildCodexRequestJson includes prompt_cache_key when session_id is set" {
+    const alloc = testing.allocator;
+    const model = protocol.Model{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
+    const ctx = protocol.Context{ .messages = &.{msg} };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try buildCodexRequestJson(alloc, &out, model, ctx, null, null, "session-abc");
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_key\":\"session-abc\"") != null);
 }
 
 fn buildBearerAuth(
