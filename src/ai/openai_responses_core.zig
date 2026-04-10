@@ -47,6 +47,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
+const provider_failure = @import("provider_failure.zig");
 const partial_json = @import("../json/partial.zig");
 const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 const AbortGuard = @import("../abort_guard.zig").AbortGuard;
@@ -213,8 +214,11 @@ pub fn streamCore(
             @memcpy(err_body_buf[n_read..][0..data.len], data);
             n_read += data.len;
         }
-        const detail = formatHttpErrorDetail(allocator, status, err_body_buf[0..n_read]) catch "request failed";
-        emitError(allocator, callback, callback_ctx, model, core.provider_label, "{s}", .{detail});
+        const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
+            emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+            return;
+        };
+        emitFailure(allocator, callback, callback_ctx, model, core.provider_label, normalized.failure, normalized.display_message);
         return;
     }
 
@@ -750,7 +754,20 @@ pub fn emitError(
     args: anytype,
 ) void {
     const inner = std.fmt.allocPrint(allocator, fmt, args) catch "error";
-    const msg = std.fmt.allocPrint(allocator, "{s}: {s}", .{ provider_label, inner }) catch provider_label;
+    const normalized = provider_failure.formatTransportFailure(allocator, inner) catch null;
+    emitFailure(allocator, callback, callback_ctx, model, provider_label, if (normalized) |n| n.failure else null, inner);
+}
+
+pub fn emitFailure(
+    allocator: std.mem.Allocator,
+    callback: ai_provider.EventCallback,
+    callback_ctx: ?*anyopaque,
+    model: protocol.Model,
+    provider_label: []const u8,
+    failure: ?protocol.NormalizedFailure,
+    message: []const u8,
+) void {
+    const msg = std.fmt.allocPrint(allocator, "{s}: {s}", .{ provider_label, message }) catch provider_label;
     const err_msg: protocol.AssistantMessage = .{
         .content = &.{},
         .api = model.api,
@@ -766,6 +783,7 @@ pub fn emitError(
         },
         .stop_reason = .@"error",
         .error_message = msg,
+        .failure = failure,
         .timestamp = std.time.milliTimestamp(),
     };
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
@@ -938,7 +956,7 @@ pub fn writeInputOpts(
                 try jw.endArray();
                 try jw.endObject();
             },
-            .assistant => |a| try writeAssistantMessage(allocator, jw, a, msg_index),
+            .assistant => |a| try writeAssistantMessage(allocator, jw, model, a, msg_index),
             .tool_result => |tr| {
                 var concat: std.ArrayListUnmanaged(u8) = .empty;
                 defer concat.deinit(allocator);
@@ -971,6 +989,7 @@ pub fn writeInputOpts(
 fn writeAssistantMessage(
     allocator: std.mem.Allocator,
     jw: *std.json.Stringify,
+    target_model: protocol.Model,
     a: protocol.AssistantMessage,
     msg_index: usize,
 ) !void {
@@ -1041,22 +1060,25 @@ fn writeAssistantMessage(
             try jw.endObject();
         },
         .tool_call => |tcall| {
-            // id may be "call_xxx|fc_yyy".
-            var call_id: []const u8 = tcall.id;
-            var item_id: ?[]const u8 = null;
-            if (std.mem.indexOfScalar(u8, tcall.id, '|')) |i| {
-                call_id = tcall.id[0..i];
-                item_id = tcall.id[i + 1 ..];
-            }
+            var normalized = try normalizeResponsesToolCallId(allocator, target_model, a, tcall.id);
+            defer normalized.deinit(allocator);
+            const is_different_model = !std.mem.eql(u8, a.model, target_model.id) and
+                providersEqual(a.provider, target_model.provider) and
+                apisEqual(a.api, target_model.api);
+            const include_item_id = if (normalized.item_id) |iid|
+                !(is_different_model and std.mem.startsWith(u8, iid, "fc_"))
+            else
+                false;
+
             try jw.beginObject();
             try jw.objectField("type");
             try jw.write("function_call");
-            if (item_id) |iid| {
+            if (include_item_id) {
                 try jw.objectField("id");
-                try jw.write(iid);
+                try jw.write(normalized.item_id.?);
             }
             try jw.objectField("call_id");
-            try jw.write(call_id);
+            try jw.write(normalized.call_id);
             try jw.objectField("name");
             try jw.write(tcall.name);
             try jw.objectField("arguments");
@@ -1069,6 +1091,82 @@ fn writeAssistantMessage(
             try jw.endObject();
         },
     };
+}
+
+const NormalizedToolCallId = struct {
+    call_id: []const u8,
+    item_id: ?[]const u8,
+
+    fn deinit(self: *NormalizedToolCallId, allocator: std.mem.Allocator) void {
+        allocator.free(self.call_id);
+        if (self.item_id) |item_id| allocator.free(item_id);
+    }
+};
+
+fn normalizeResponsesToolCallId(
+    allocator: std.mem.Allocator,
+    target_model: protocol.Model,
+    source: protocol.AssistantMessage,
+    id: []const u8,
+) !NormalizedToolCallId {
+    if (!targetUsesResponsesToolCallNormalization(target_model.provider)) {
+        return .{ .call_id = try normalizeIdPart(allocator, id), .item_id = null };
+    }
+    if (std.mem.indexOfScalar(u8, id, '|')) |sep| {
+        const call_id = try normalizeIdPart(allocator, id[0..sep]);
+        const item_part = id[sep + 1 ..];
+        var item_id = if (!providersEqual(source.provider, target_model.provider) or !apisEqual(source.api, target_model.api))
+            try buildForeignResponsesItemId(allocator, item_part)
+        else
+            try normalizeIdPart(allocator, item_part);
+        if (!std.mem.startsWith(u8, item_id, "fc_")) {
+            const prefixed = try std.fmt.allocPrint(allocator, "fc_{s}", .{item_id});
+            allocator.free(item_id);
+            item_id = try normalizeIdPart(allocator, prefixed);
+            allocator.free(prefixed);
+        }
+        return .{ .call_id = call_id, .item_id = item_id };
+    }
+    return .{ .call_id = try normalizeIdPart(allocator, id), .item_id = null };
+}
+
+fn targetUsesResponsesToolCallNormalization(provider: protocol.Provider) bool {
+    return switch (provider) {
+        .openai, .openai_codex, .opencode, .opencode_go => true,
+        else => false,
+    };
+}
+
+fn normalizeIdPart(allocator: std.mem.Allocator, part: []const u8) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    for (part) |c| {
+        const normalized = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => c,
+            else => '_',
+        };
+        try out.append(allocator, normalized);
+        if (out.items.len >= 64) break;
+    }
+    while (out.items.len > 0 and out.items[out.items.len - 1] == '_') {
+        _ = out.pop();
+    }
+    return if (out.items.len == 0) allocator.dupe(u8, "id") else out.toOwnedSlice(allocator);
+}
+
+fn buildForeignResponsesItemId(allocator: std.mem.Allocator, item_id: []const u8) ![]const u8 {
+    const hash = std.hash.Wyhash.hash(0, item_id);
+    const raw = try std.fmt.allocPrint(allocator, "fc_{x}", .{hash});
+    defer allocator.free(raw);
+    return normalizeIdPart(allocator, raw);
+}
+
+fn providersEqual(a: protocol.Provider, b: protocol.Provider) bool {
+    return std.meta.eql(a, b);
+}
+
+fn apisEqual(a: protocol.Api, b: protocol.Api) bool {
+    return std.meta.eql(a, b);
 }
 
 fn formatHttpErrorDetail(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) ![]const u8 {
@@ -1313,6 +1411,41 @@ test "processStream concatenates function_call argument chunks and overrides sto
     try testing.expectEqualStrings("{\"cmd\":\"echo hi\"}", col.tool_args.items);
     // Stop reason must override to toolUse when tool calls are present.
     try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.toolUse, col.done_reason.?);
+}
+
+test "normalizeResponsesToolCallId rewrites foreign tool call ids for codex-compatible targets" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_message = protocol.AssistantMessage{
+        .content = &.{},
+        .api = .openai_completions,
+        .provider = .openrouter,
+        .model = "openai/gpt-test",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .toolUse,
+        .timestamp = 0,
+    };
+    const target_model = protocol.Model{
+        .id = "gpt-5.4",
+        .name = "codex",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 1024,
+    };
+
+    var normalized = try normalizeResponsesToolCallId(alloc, target_model, source_message, "call:weird|item with spaces and punctuation!!!");
+    defer normalized.deinit(alloc);
+
+    try testing.expectEqualStrings("call_weird", normalized.call_id);
+    try testing.expect(normalized.item_id != null);
+    try testing.expect(std.mem.startsWith(u8, normalized.item_id.?, "fc_"));
 }
 
 test "buildRequestJson emits store:false, input[], and reasoning:none for reasoning model" {

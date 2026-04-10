@@ -246,6 +246,24 @@ pub const UserMessage = struct {
     };
 };
 
+pub const NormalizedFailure = struct {
+    kind: Kind,
+    http_status: ?u16 = null,
+    provider_code: ?[]const u8 = null,
+    provider_type: ?[]const u8 = null,
+    retry_after_ms: ?u64 = null,
+
+    pub const Kind = enum {
+        aborted,
+        context_overflow,
+        rate_limited,
+        transient,
+        auth,
+        invalid_request,
+        fatal,
+    };
+};
+
 /// Assistant message
 pub const AssistantMessage = struct {
     content: []const AssistantContentBlock,
@@ -257,6 +275,7 @@ pub const AssistantMessage = struct {
     usage: Usage,
     stop_reason: StopReason,
     error_message: ?[]const u8 = null,
+    failure: ?NormalizedFailure = null,
     /// Unix timestamp in milliseconds
     timestamp: i64,
 

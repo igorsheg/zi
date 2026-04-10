@@ -226,6 +226,10 @@ pub fn writeAssistantMessage(jw: *Stringify, msg: ai.protocol.AssistantMessage) 
         try jw.objectField("errorMessage");
         try jw.write(em);
     }
+    if (msg.failure) |failure| {
+        try jw.objectField("failure");
+        try writeNormalizedFailure(jw, failure);
+    }
 
     try jw.objectField("timestamp");
     try jw.write(msg.timestamp);
@@ -599,7 +603,57 @@ fn parseAssistantMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
         },
         .stop_reason = json_util.parseStopReason(obj.get("stopReason").?.string),
         .error_message = if (obj.get("errorMessage")) |v| try allocator.dupe(u8, v.string) else null,
+        .failure = if (obj.get("failure")) |v| try parseNormalizedFailure(allocator, v.object) else null,
         .timestamp = @intCast(obj.get("timestamp").?.integer),
+    };
+}
+
+fn writeNormalizedFailure(jw: *Stringify, failure: ai.protocol.NormalizedFailure) !void {
+    try jw.beginObject();
+    try jw.objectField("kind");
+    try jw.write(@tagName(failure.kind));
+    if (failure.http_status) |status| {
+        try jw.objectField("httpStatus");
+        try jw.write(status);
+    }
+    if (failure.provider_code) |code| {
+        try jw.objectField("providerCode");
+        try jw.write(code);
+    }
+    if (failure.provider_type) |provider_type| {
+        try jw.objectField("providerType");
+        try jw.write(provider_type);
+    }
+    if (failure.retry_after_ms) |retry_after_ms| {
+        try jw.objectField("retryAfterMs");
+        try jw.write(retry_after_ms);
+    }
+    try jw.endObject();
+}
+
+fn parseNormalizedFailure(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !ai.protocol.NormalizedFailure {
+    const kind_str = obj.get("kind").?.string;
+    const kind: ai.protocol.NormalizedFailure.Kind = if (std.mem.eql(u8, kind_str, "aborted"))
+        .aborted
+    else if (std.mem.eql(u8, kind_str, "context_overflow"))
+        .context_overflow
+    else if (std.mem.eql(u8, kind_str, "rate_limited"))
+        .rate_limited
+    else if (std.mem.eql(u8, kind_str, "transient"))
+        .transient
+    else if (std.mem.eql(u8, kind_str, "auth"))
+        .auth
+    else if (std.mem.eql(u8, kind_str, "invalid_request"))
+        .invalid_request
+    else
+        .fatal;
+
+    return .{
+        .kind = kind,
+        .http_status = if (obj.get("httpStatus")) |v| @intCast(v.integer) else null,
+        .provider_code = if (obj.get("providerCode")) |v| try allocator.dupe(u8, v.string) else null,
+        .provider_type = if (obj.get("providerType")) |v| try allocator.dupe(u8, v.string) else null,
+        .retry_after_ms = if (obj.get("retryAfterMs")) |v| @intCast(v.integer) else null,
     };
 }
 
@@ -794,6 +848,55 @@ test "compaction entry wire format" {
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"firstKeptEntryId\":\"aa000000\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"tokensBefore\":50000") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"fromHook\":true") != null);
+}
+
+test "assistant message round-trips normalized failure metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const entry = proto.SessionEntry{
+        .id = "ad000001",
+        .parent_id = null,
+        .timestamp = "2025-06-01T00:00:00.000Z",
+        .entry = .{ .message = .{ .message = .{ .assistant = .{
+            .content = &.{},
+            .api = .openai_responses,
+            .provider = .openai,
+            .model = "gpt-test",
+            .usage = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total_tokens = 0,
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+            },
+            .stop_reason = .@"error",
+            .error_message = "HTTP 429 Too Many Requests: rate limit exceeded",
+            .failure = .{
+                .kind = .rate_limited,
+                .http_status = 429,
+                .provider_code = "rate_limit_exceeded",
+                .provider_type = "invalid_request_error",
+            },
+            .timestamp = 1,
+        } } } },
+    };
+
+    const json_str = try serializeEntry(allocator, entry);
+    defer allocator.free(json_str);
+    const parsed = try parseEntry(allocator, json_str);
+    switch (parsed.entry) {
+        .message => |m| switch (m.message) {
+            .assistant => |assistant| {
+                try std.testing.expectEqual(ai.protocol.NormalizedFailure.Kind.rate_limited, assistant.failure.?.kind);
+                try std.testing.expectEqual(@as(?u16, 429), assistant.failure.?.http_status);
+                try std.testing.expectEqualStrings("rate_limit_exceeded", assistant.failure.?.provider_code.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "session write-read-buildContext round-trip" {

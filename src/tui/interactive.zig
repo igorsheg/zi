@@ -695,7 +695,7 @@ pub const Interactive = struct {
                     self.status_text.fg = self.theme.fg(.@"error");
                     self.tui.dirty = true;
                 } else if (m.error_message) |msg| {
-                    self.status_text.setContent(msg);
+                    self.status_text.setContent(userFacingFailureMessage(m.failure_kind, msg));
                     self.status_text.fg = self.theme.fg(.@"error");
                     self.tui.dirty = true;
                 }
@@ -1840,6 +1840,32 @@ pub const Interactive = struct {
     }
 };
 
+fn userFacingFailureMessage(
+    failure_kind: ?ai_protocol.NormalizedFailure.Kind,
+    raw_message: []const u8,
+) []const u8 {
+    return switch (failure_kind orelse return raw_message) {
+        .auth => "authentication failed. run /login or refresh your credentials.",
+        .context_overflow => "context window exceeded. compact the session or switch to a larger-context model.",
+        .invalid_request => if (containsCI(raw_message, "content_filter"))
+            "request blocked by the provider safety filter. try rephrasing and try again."
+        else
+            raw_message,
+        else => raw_message,
+    };
+}
+
+fn containsCI(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 /// Convert an AgentEvent to a TUI-owned UiEvent with deep-copied data.
 /// Runs on the agent thread. Returns null for events the TUI doesn't need.
 fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
@@ -1946,6 +1972,7 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
                         return .{ .message_end_assistant = .{
                             .is_aborted = am.stop_reason == .aborted,
                             .error_message = err_msg,
+                            .failure_kind = if (am.failure) |failure| failure.kind else null,
                         } };
                     }
                     return null;

@@ -4,6 +4,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
+const provider_failure = @import("provider_failure.zig");
 const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
@@ -63,23 +64,23 @@ pub const AnthropicProvider = struct {
 
         const is_oauth_token = if (options.api_key) |k| std.mem.indexOf(u8, k, "sk-ant-oat") != null else false;
         buildRequestJson(allocator, &payload_buf, model, context, options, is_oauth_token, reasoning, thinking_budgets) catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to build request: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
 
         const api_key = options.api_key orelse {
-            emitError(allocator, callback, callback_ctx, "no API key provided", .{});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "no API key provided", .{});
             return;
         };
 
         const uri_str = std.fmt.allocPrint(allocator, "{s}/v1/messages", .{model.base_url}) catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to build URI: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to build URI: {s}", .{@errorName(err)});
             return;
         };
         defer allocator.free(uri_str);
 
         const uri = std.Uri.parse(uri_str) catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to parse URI: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to parse URI: {s}", .{@errorName(err)});
             return;
         };
 
@@ -94,7 +95,6 @@ pub const AnthropicProvider = struct {
         extra_headers_buf[n_extra] = .{ .name = "anthropic-version", .value = "2023-06-01" };
         n_extra += 1;
 
-
         // OAuth tokens (sk-ant-oat*) use Bearer auth + claude-code identity headers.
         // API keys use x-api-key header.
         const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
@@ -103,7 +103,7 @@ pub const AnthropicProvider = struct {
         var auth_buf: [4096]u8 = undefined;
         if (is_oauth) {
             const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
-                emitError(allocator, callback, callback_ctx, "API key too long for auth buffer", .{});
+                emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "API key too long for auth buffer", .{});
                 return;
             };
             extra_headers_buf[n_extra] = .{ .name = "authorization", .value = auth_value };
@@ -146,7 +146,7 @@ pub const AnthropicProvider = struct {
                 .accept_encoding = .{ .override = "identity" },
             },
         }) catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to open connection: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to open connection: {s}", .{@errorName(err)});
             return;
         };
         defer req.deinit();
@@ -158,19 +158,19 @@ pub const AnthropicProvider = struct {
 
         // sendBodyComplete needs mutable slice
         const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to allocate body: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to allocate body: {s}", .{@errorName(err)});
             return;
         };
         defer allocator.free(body_copy);
 
         req.sendBodyComplete(body_copy) catch |err| {
-            emitError(allocator, callback, callback_ctx, "failed to send body: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to send body: {s}", .{@errorName(err)});
             return;
         };
 
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |err| {
-            emitError(allocator, callback, callback_ctx, "request failed: {s}", .{@errorName(err)});
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "request failed: {s}", .{@errorName(err)});
             return;
         };
 
@@ -187,7 +187,11 @@ pub const AnthropicProvider = struct {
                 @memcpy(err_body_buf[n_read..][0..data.len], data);
                 n_read += data.len;
             }
-            emitError(allocator, callback, callback_ctx, "HTTP {d}: {s}", .{ @intFromEnum(status), err_body_buf[0..n_read] });
+            const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
+                emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+                return;
+            };
+            emitFailure(allocator, callback, callback_ctx, model.api, model.provider, model.id, normalized.failure, normalized.display_message);
             return;
         }
 
@@ -230,7 +234,6 @@ pub const AnthropicProvider = struct {
             state.content_blocks.deinit(allocator);
         }
 
-
         // Emit start event
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
@@ -251,7 +254,8 @@ pub const AnthropicProvider = struct {
                     if (options.signal.isAborted()) {
                         state.partial.stop_reason = .aborted;
                         break;
-                    }                    emitError(allocator, callback, callback_ctx, "stream read error: {s}", .{@errorName(err)});
+                    }
+                    emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)});
                     return;
                 },
             };
@@ -507,10 +511,14 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
     } else if (std.mem.eql(u8, event_type, "error")) {
         // Shape: { error: { type, message } }
         const err_obj = json_value.asObject(obj.get("error")) orelse return;
+        const err_type = json_value.asString(err_obj.get("type"));
         const err_msg = json_value.asString(err_obj.get("message")) orelse "unknown error";
-        // err_msg lives in scratch; emitErrorDirect copies what it
-        // needs synchronously, so passing the scratch slice is safe.
-        emitErrorDirect(callback, callback_ctx, err_msg);
+        const failure_kind = provider_failure.classifyProviderFailure(err_type, null, err_msg);
+        const failure: protocol.NormalizedFailure = .{
+            .kind = failure_kind,
+            .provider_type = if (err_type) |t| state.allocator.dupe(u8, t) catch null else null,
+        };
+        emitFailure(state.allocator, callback, callback_ctx, state.partial.api, state.partial.provider, state.partial.model, failure, err_msg);
     }
 }
 
@@ -937,41 +945,47 @@ fn buildLiveContent(allocator: std.mem.Allocator, blocks: []const ContentBlockSt
 // Error handling
 // =================================================================
 
-fn emitError(allocator: std.mem.Allocator, callback: ai_provider.EventCallback, ctx: ?*anyopaque, comptime fmt: []const u8, args: anytype) void {
-    // Allocate but do NOT free — the caller (StreamBridge) stores the
-    // error message in final_message, which outlives this function.
-    // The arena allocator used by the loop will free it.
-    const msg = std.fmt.allocPrint(allocator, fmt, args) catch {
-        callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = .{
-            .content = &.{},
-            .api = .anthropic_messages,
-            .provider = .anthropic,
-            .model = "unknown",
-            .usage = .{
-                .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0,
-                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-            },
-            .stop_reason = .@"error",
-            .error_message = "failed to format error",
-            .timestamp = std.time.milliTimestamp(),
-        } } }, ctx);
-        return;
-    };
-    emitErrorDirect(callback, ctx, msg);
+fn emitError(
+    allocator: std.mem.Allocator,
+    callback: ai_provider.EventCallback,
+    ctx: ?*anyopaque,
+    api: protocol.Api,
+    provider: protocol.Provider,
+    model_id: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    const inner = std.fmt.allocPrint(allocator, fmt, args) catch "anthropic error";
+    emitFailure(allocator, callback, ctx, api, provider, model_id, .{ .kind = provider_failure.classifyTransportFailure(inner) }, inner);
 }
 
-fn emitErrorDirect(callback: ai_provider.EventCallback, ctx: ?*anyopaque, msg: []const u8) void {
+fn emitFailure(
+    allocator: std.mem.Allocator,
+    callback: ai_provider.EventCallback,
+    ctx: ?*anyopaque,
+    api: protocol.Api,
+    provider: protocol.Provider,
+    model_id: []const u8,
+    failure: ?protocol.NormalizedFailure,
+    message: []const u8,
+) void {
+    const owned_message = allocator.dupe(u8, message) catch "failed to copy error";
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = .{
         .content = &.{},
-        .api = .anthropic_messages,
-        .provider = .anthropic,
-        .model = "unknown",
+        .api = api,
+        .provider = provider,
+        .model = model_id,
         .usage = .{
-            .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0,
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
             .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
         },
         .stop_reason = .@"error",
-        .error_message = msg,
+        .error_message = owned_message,
+        .failure = failure,
         .timestamp = std.time.milliTimestamp(),
     } } }, ctx);
 }

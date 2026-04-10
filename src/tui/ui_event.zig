@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const agent_protocol = @import("../agent/root.zig").protocol;
 const session_controller_mod = @import("../session_controller.zig");
@@ -52,6 +53,7 @@ pub const UiEvent = union(enum) {
     message_end_assistant: struct {
         is_aborted: bool,
         error_message: ?[]u8,
+        failure_kind: ?ai.protocol.NormalizedFailure.Kind = null,
     },
 
     // --- tool execution lifecycle ---

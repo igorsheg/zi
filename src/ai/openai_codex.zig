@@ -217,7 +217,7 @@ fn requireAccountId(
     callback_ctx: ?*anyopaque,
 ) ?[]const u8 {
     const key = api_key orelse {
-        core.emitError(allocator, callback, callback_ctx, model, "openai-codex-responses", "no API key provided", .{});
+        core.emitFailure(allocator, callback, callback_ctx, model, "openai-codex-responses", .{ .kind = .auth }, "no API key provided");
         return null;
     };
     const account_id = extractAccountId(allocator, key) catch |err| {
@@ -225,7 +225,7 @@ fn requireAccountId(
             error.MissingAccountId => "failed to extract accountId from token: no account ID in token",
             else => "failed to extract accountId from token",
         };
-        core.emitError(allocator, callback, callback_ctx, model, "openai-codex-responses", "{s}", .{msg});
+        core.emitFailure(allocator, callback, callback_ctx, model, "openai-codex-responses", .{ .kind = .auth }, msg);
         return null;
     };
     return account_id;

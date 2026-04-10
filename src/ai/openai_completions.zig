@@ -56,6 +56,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
+const provider_failure = @import("provider_failure.zig");
 const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
@@ -105,7 +106,8 @@ pub const OpenAICompletionsProvider = struct {
         callback_ctx: ?*anyopaque,
     ) void {
         const self: *OpenAICompletionsProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options.base, protocol.clampReasoning(options.reasoning, model), callback, callback_ctx);    }
+        self.streamImpl(allocator, model, context, options.base, protocol.clampReasoning(options.reasoning, model), callback, callback_ctx);
+    }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
         return "openai-completions";
@@ -231,10 +233,13 @@ pub const OpenAICompletionsProvider = struct {
                 @memcpy(err_body_buf[n_read..][0..data.len], data);
                 n_read += data.len;
             }
-            emitError(allocator, callback, callback_ctx, model, "HTTP {d}: {s}", .{ @intFromEnum(status), err_body_buf[0..n_read] });
+            const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
+                emitError(allocator, callback, callback_ctx, model, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+                return;
+            };
+            emitFailure(callback, callback_ctx, model, normalized.failure, normalized.display_message);
             return;
         }
-
 
         const reader = response.reader(&transfer_buf);
         processStream(allocator, reader, model, options.signal, callback, callback_ctx);
@@ -432,6 +437,13 @@ fn handleSseEvent(
         if (usage_val == .object) parseUsage(usage_val, &state.partial);
     }
 
+    if (root.object.get("error")) |err_val| {
+        if (err_val == .object) {
+            try applyProviderError(allocator, &state.partial, err_val.object);
+        }
+        return;
+    }
+
     const choices_val = root.object.get("choices") orelse return;
     if (choices_val != .array or choices_val.array.items.len == 0) return;
     const choice = choices_val.array.items[0];
@@ -449,6 +461,10 @@ fn handleSseEvent(
     if (choice.object.get("finish_reason")) |fr| {
         if (fr == .string) {
             state.partial.stop_reason = mapFinishReason(fr.string);
+            state.partial.failure = mapFinishReasonFailure(fr.string);
+            if (state.partial.stop_reason == .@"error") {
+                state.partial.error_message = try std.fmt.allocPrint(allocator, "Provider finish_reason: {s}", .{fr.string});
+            }
         }
     }
 
@@ -788,6 +804,67 @@ fn mapFinishReason(reason: []const u8) protocol.StopReason {
     return .@"error";
 }
 
+fn mapFinishReasonFailure(reason: []const u8) ?protocol.NormalizedFailure {
+    if (std.mem.eql(u8, reason, "network_error")) return .{ .kind = .transient };
+    if (std.mem.eql(u8, reason, "content_filter")) return .{ .kind = .invalid_request };
+    if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "end") or std.mem.eql(u8, reason, "length") or std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function_call")) {
+        return null;
+    }
+    return .{ .kind = .fatal };
+}
+
+fn applyProviderError(
+    allocator: std.mem.Allocator,
+    partial: *protocol.AssistantMessage,
+    err_obj: std.json.ObjectMap,
+) error{OutOfMemory}!void {
+    const provider_type = if (err_obj.get("type")) |v| if (v == .string and v.string.len > 0) try allocator.dupe(u8, v.string) else null else null;
+    const provider_code = if (err_obj.get("code")) |v| try dupErrorCode(allocator, v) else null;
+    const message = if (err_obj.get("message")) |v| if (v == .string and v.string.len > 0) v.string else "unknown provider error" else "unknown provider error";
+    const detail = if (err_obj.get("metadata")) |metadata| try formatProviderMetadataRaw(allocator, metadata) else null;
+    const combined_message = if (detail) |detail_text|
+        try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ message, detail_text })
+    else
+        try allocator.dupe(u8, message);
+
+    partial.stop_reason = .@"error";
+    partial.error_message = combined_message;
+    partial.failure = .{
+        .kind = provider_failure.classifyProviderFailure(provider_type, provider_code, combined_message),
+        .provider_type = provider_type,
+        .provider_code = provider_code,
+    };
+}
+
+fn dupErrorCode(allocator: std.mem.Allocator, value: std.json.Value) error{OutOfMemory}!?[]const u8 {
+    return switch (value) {
+        .string => |s| if (s.len > 0) try allocator.dupe(u8, s) else null,
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        else => null,
+    };
+}
+
+fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: std.json.Value) error{OutOfMemory}!?[]const u8 {
+    if (metadata != .object) return null;
+    const raw = metadata.object.get("raw") orelse return null;
+    return switch (raw) {
+        .string => |s| if (s.len > 0) try allocator.dupe(u8, s) else null,
+        else => blk: {
+            var out: std.io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
+            jw.write(raw) catch return error.OutOfMemory;
+            const rendered = try out.toOwnedSlice();
+            if (rendered.len == 0 or std.mem.eql(u8, rendered, "null")) {
+                allocator.free(rendered);
+                break :blk null;
+            }
+            break :blk rendered;
+        },
+    };
+}
+
 // ── payload builder ─────────────────────────────────────────────────
 
 /// Map a pi-ai thinking-level string through an optional provider-specific
@@ -1071,6 +1148,17 @@ fn emitError(
     args: anytype,
 ) void {
     const msg = std.fmt.allocPrint(allocator, fmt, args) catch "openai-completions error";
+    const normalized = provider_failure.formatTransportFailure(allocator, msg) catch null;
+    emitFailure(callback, callback_ctx, model, if (normalized) |n| n.failure else null, msg);
+}
+
+fn emitFailure(
+    callback: ai_provider.EventCallback,
+    callback_ctx: ?*anyopaque,
+    model: protocol.Model,
+    failure: ?protocol.NormalizedFailure,
+    message: []const u8,
+) void {
     const err_msg: protocol.AssistantMessage = .{
         .content = &.{},
         .api = model.api,
@@ -1085,12 +1173,12 @@ fn emitError(
             .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
         },
         .stop_reason = .@"error",
-        .error_message = msg,
+        .error_message = message,
+        .failure = failure,
         .timestamp = std.time.milliTimestamp(),
     };
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
 }
-
 
 // ── tests ───────────────────────────────────────────────────────────
 
@@ -1102,6 +1190,9 @@ const TestCollector = struct {
     final_args: std.ArrayListUnmanaged(u8) = .empty,
     final_tool_id: []const u8 = "",
     final_tool_name: []const u8 = "",
+    final_error_message: ?[]const u8 = null,
+    final_failure_kind: ?protocol.NormalizedFailure.Kind = null,
+    final_provider_type: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     const EventKind = enum { start, text_start, text_delta, text_end, toolcall_start, toolcall_delta, toolcall_end, done, err, thinking_start, thinking_delta, thinking_end };
@@ -1136,7 +1227,12 @@ const TestCollector = struct {
             .thinking_delta => self.events.append(self.allocator, .thinking_delta) catch {},
             .thinking_end => self.events.append(self.allocator, .thinking_end) catch {},
             .done => self.events.append(self.allocator, .done) catch {},
-            .@"error" => self.events.append(self.allocator, .err) catch {},
+            .@"error" => |e| {
+                self.events.append(self.allocator, .err) catch {};
+                self.final_error_message = e.@"error".error_message;
+                self.final_failure_kind = if (e.@"error".failure) |f| f.kind else null;
+                self.final_provider_type = if (e.@"error".failure) |f| f.provider_type else null;
+            },
         }
     }
 };
@@ -1242,6 +1338,44 @@ test "processStream concatenates split tool-call argument chunks" {
     try testing.expectEqualStrings("{\"cmd\":\"echo hi\"}", col.final_args.items);
 }
 
+test "processStream normalizes openrouter error events carried in a 200 stream" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var col = TestCollector{ .allocator = testing.allocator };
+    defer col.deinit();
+
+    const sse_bytes =
+        "data: {\"id\":\"chat-err\",\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\",\"metadata\":{\"raw\":\"provider overload\"}}}\n\n" ++
+        "data: [DONE]\n\n";
+
+    runProcess(alloc, sse_bytes, &col);
+
+    try testing.expectEqual(TestCollector.EventKind.err, col.events.items[col.events.items.len - 1]);
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.rate_limited, col.final_failure_kind.?);
+    try testing.expectEqualStrings("Rate limit exceeded\nprovider overload", col.final_error_message.?);
+}
+
+test "processStream maps network_error finish_reason to transient failure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var col = TestCollector{ .allocator = testing.allocator };
+    defer col.deinit();
+
+    const sse_bytes =
+        "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"network_error\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    runProcess(alloc, sse_bytes, &col);
+
+    try testing.expectEqual(TestCollector.EventKind.err, col.events.items[col.events.items.len - 1]);
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, col.final_failure_kind.?);
+    try testing.expectEqualStrings("Provider finish_reason: network_error", col.final_error_message.?);
+}
+
 test "buildRequestJson emits stream:true and message round-trip" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1257,7 +1391,7 @@ test "buildRequestJson emits stream:true and message round-trip" {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    try buildRequestJson(alloc, &out, test_model, ctx);
+    try buildRequestJson(alloc, &out, test_model, ctx, null);
 
     // Spot-check key fields. Full schema validation lives in the
     // smoke test against a real openrouter response.

@@ -307,7 +307,7 @@ pub const SessionController = struct {
             );
             switch (classification.class) {
                 .retryable_transient => {
-                    if (!self.beginRetry(assistant.error_message orelse classification.error_message orelse "unknown error")) {
+                    if (!self.beginRetry(classification.error_message orelse assistant.error_message orelse "unknown error")) {
                         return outcome;
                     }
 
