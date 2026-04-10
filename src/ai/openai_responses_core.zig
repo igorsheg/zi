@@ -445,6 +445,7 @@ fn handleEvent(
             if (item.object.get("arguments")) |a| if (a == .string and a.string.len > 0) {
                 try it.tool_args_partial.appendSlice(allocator, a.string);
             };
+            try ensureToolCompositeId(allocator, it);
             try updatePartialContent(allocator, state);
             callback(.{ .toolcall_start = .{ .content_index = idx, .partial = state.partial } }, callback_ctx);
         }
@@ -590,13 +591,7 @@ fn handleEvent(
             // outlives the per-delta scratch arena.
             const final_args = partial_json.parseStreaming(allocator, st.tool_args_partial.items) catch .null;
             st.tool_args_parsed = final_args;
-            // pi-mono builds id as `${call_id}|${item.id}`. Both halves
-            // already live in the turn arena.
-            st.tool_composite_id = std.fmt.allocPrint(
-                allocator,
-                "{s}|{s}",
-                .{ st.tool_call_id, st.tool_item_id },
-            ) catch st.tool_call_id;
+            try ensureToolCompositeId(allocator, st);
             try updatePartialContent(allocator, state);
             const tc: protocol.ToolCall = .{
                 .id = st.tool_composite_id,
@@ -658,6 +653,13 @@ fn updatePartialContent(allocator: std.mem.Allocator, state: *StreamState) Handl
     const buf = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, state.items.items.len);
     for (state.items.items, 0..) |*it, i| buf[i] = renderItem(it);
     state.partial.content = buf;
+}
+
+fn ensureToolCompositeId(allocator: std.mem.Allocator, it: *ItemState) !void {
+    if (it.kind != .function_call) return;
+    if (it.tool_composite_id.len > 0) return;
+    if (it.tool_call_id.len == 0 or it.tool_item_id.len == 0) return;
+    it.tool_composite_id = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ it.tool_call_id, it.tool_item_id });
 }
 
 fn renderItem(it: *const ItemState) protocol.AssistantMessage.AssistantContentBlock {
