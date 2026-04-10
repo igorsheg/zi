@@ -18,7 +18,7 @@ pub const Footer = struct {
         const h = region.height;
         if (w == 0 or h == 0) return;
 
-        const hints = "esc abort \xC2\xB7 ctrl+c quit \xC2\xB7 ctrl+o expand tools";
+        const hints = "esc abort \xC2\xB7 ctrl+c quit \xC2\xB7 ctrl+o expand tools \xC2\xB7 ctrl+t thinking";
         _ = region.writeStr(0, 0, hints, self.theme.fg(.dim), Color.default, .{});
     }
 

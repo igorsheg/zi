@@ -327,7 +327,9 @@ pub fn writeTextBlock(jw: *Stringify, tc: ai.protocol.TextContent) !void {
     try jw.objectField("type");
     try jw.write("text");
     try jw.objectField("text");
-    try jw.write(tc.text);
+    const sanitized = try json_util.utf8LossyAlloc(std.heap.page_allocator, tc.text);
+    defer std.heap.page_allocator.free(sanitized);
+    try jw.write(sanitized);
     if (tc.text_signature) |sig| {
         try jw.objectField("textSignature");
         try jw.write(sig);
@@ -927,6 +929,32 @@ test "serializeEntry works when caller allocator is an arena" {
     const line = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     try std.testing.expect(std.mem.indexOf(u8, line, long_tool_call_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, line, long_tool_name) != null);
+}
+
+test "tool-result text serializes invalid utf-8 as a json string" {
+    const allocator = std.testing.allocator;
+    var tool_content = [_]ai.protocol.ToolResultMessage.ContentBlock{
+        .{ .text = .{ .text = "bad\xaa\xfftail" } },
+    };
+    const entry = proto.SessionEntry{
+        .id = "utf80001",
+        .parent_id = null,
+        .timestamp = "2025-01-01T00:00:00.000Z",
+        .entry = .{ .message = .{ .message = .{ .tool_result = .{
+            .tool_call_id = "toolu_bad",
+            .tool_name = "bash",
+            .content = &tool_content,
+            .is_error = false,
+            .timestamp = 1700000002000,
+        } } } },
+    };
+
+    const line = try json_write.toOwnedSlice(allocator, entry, writeEntry);
+    defer allocator.free(line);
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"text\":\"bad") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "tail\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"text\":[") == null);
 }
 
 test "session write-read-buildContext round-trip" {

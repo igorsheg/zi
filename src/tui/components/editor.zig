@@ -4,6 +4,7 @@ const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
 const keys_mod = @import("../keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
+const word_wrap_mod = @import("../word_wrap.zig");
 const box_chrome = @import("../box_chrome.zig");
 const status_data_mod = @import("../status_data.zig");
 const autocomplete_mod = @import("../autocomplete.zig");
@@ -34,6 +35,7 @@ pub const Editor = struct {
     scroll_x: u32 = 0,
     scroll_y: u32 = 0,
     max_visible_lines: u32 = 10,
+    last_content_width: u32 = 80,
     prompt: []const u8 = "> ",
     on_submit: ?*const fn (text: []const u8, ctx: ?*anyopaque) void = null,
     on_submit_ctx: ?*anyopaque = null,
@@ -381,8 +383,11 @@ pub const Editor = struct {
         const h = region.height;
         if (w == 0 or h < 3) return;
 
-        const lc = self.lineCount();
-        const editor_h: u32 = @min(@min(lc, self.max_visible_lines) + 2, h);
+        self.last_content_width = w;
+        self.ensureCursorVisible();
+
+        const wrapped_line_count = self.wrappedLineCountForWidth(w);
+        const editor_h: u32 = @min(@min(wrapped_line_count, self.max_visible_lines) + 2, h);
 
         // Top border with rounded corners and inline status
         {
@@ -401,44 +406,36 @@ pub const Editor = struct {
 
         // Content between borders
         const content = region.sub(0, 1, w, editor_h - 2);
-        const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
-        const continuation = "  ";
-        const items = self.buf.items;
+        const wrapped_lines = self.buildWrappedLines(w, self.allocator) catch return;
+        defer self.allocator.free(wrapped_lines);
 
-        // Draw left border on all content rows
+        // Draw content rows
         {
             const chrome_style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
             var row: u32 = 0;
             while (row < content.height) : (row += 1) {
+                content.fill(0, row, content.width, 1, .{
+                    .grapheme = .{ .codepoint = ' ' },
+                    .fg = Color.default,
+                    .bg = Color.default,
+                });
                 _ = box_chrome.drawClosedContentPrefix(content, row, chrome_style);
             }
         }
 
-        var line_idx: u32 = 0;
-        var line_start: u32 = 0;
         var visible_row: u32 = 0;
-
-        while (visible_row < content.height) {
-            var line_end: u32 = line_start;
-            while (line_end < items.len and items[line_end] != '\n') : (line_end += 1) {}
-
-            if (line_idx >= self.scroll_y) {
-                const line_text = items[line_start..line_end];
-                if (line_idx == 0) {
-                    _ = content.writeStr(1, visible_row, self.prompt, self.prompt_fg, Color.default, .{});
-                } else {
-                    _ = content.writeStr(1, visible_row, continuation, self.prompt_fg, Color.default, .{});
-                }
-
-                if (line_text.len > 0) {
-                    _ = content.writeStr(prompt_width + 1, visible_row, line_text, self.text_fg, Color.default, .{});
-                }
-                visible_row += 1;
+        var wrapped_idx: usize = self.scroll_y;
+        while (visible_row < content.height and wrapped_idx < wrapped_lines.len) : ({
+            visible_row += 1;
+            wrapped_idx += 1;
+        }) {
+            const line = wrapped_lines[wrapped_idx];
+            const prefix = if (line.kind == .prompt) self.prompt else "  ";
+            _ = content.writeStr(1, visible_row, prefix, self.prompt_fg, Color.default, .{});
+            const line_text = self.buf.items[line.start..line.end];
+            if (line_text.len > 0) {
+                _ = content.writeStr(line.text_x, visible_row, line_text, self.text_fg, Color.default, .{});
             }
-
-            line_idx += 1;
-            if (line_end >= items.len) break;
-            line_start = line_end + 1;
         }
 
         // Autocomplete picker below bottom border
@@ -451,8 +448,9 @@ pub const Editor = struct {
     }
 
     pub fn measure(self: *Editor, width: u32) Measurement {
-        const lc = self.lineCount();
-        const box_height = @min(lc, self.max_visible_lines) + 2;
+        self.last_content_width = if (width == 0) 1 else width;
+        const wrapped_line_count = self.wrappedLineCountForWidth(self.last_content_width);
+        const box_height = @min(wrapped_line_count, self.max_visible_lines) + 2;
 
         var picker_height: u32 = 0;
         if (self.autocomplete_active and self.autocomplete_list.items.len > 0) {
@@ -467,13 +465,16 @@ pub const Editor = struct {
 
     pub fn cursorState(self: *Editor) ?CursorState {
         if (!self.focused) return null;
-        const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
-        const cur_line = self.cursorLine();
-        if (cur_line < self.scroll_y) return null;
-        const visual_y = cur_line - self.scroll_y;
+
+        const wrapped_lines = self.buildWrappedLines(self.last_content_width, self.allocator) catch return null;
+        defer self.allocator.free(wrapped_lines);
+
+        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return null;
+        if (cursor.visual_row < self.scroll_y) return null;
+
         return .{
-            .x = prompt_width + self.cursor_col + 1,
-            .y = visual_y + 1,
+            .x = cursor.x,
+            .y = (cursor.visual_row - self.scroll_y) + 1,
             .style = .bar,
         };
     }
@@ -565,6 +566,132 @@ pub const Editor = struct {
 
     // --- Internal helpers ---
 
+    const WrappedLineKind = enum {
+        prompt,
+        continuation,
+    };
+
+    const WrappedLine = struct {
+        start: u32,
+        end: u32,
+        kind: WrappedLineKind,
+        text_x: u32,
+    };
+
+    const CursorVisualPosition = struct {
+        visual_row: u32,
+        x: u32,
+    };
+
+    fn buildWrappedLines(self: *const Editor, total_width: u32, allocator: std.mem.Allocator) ![]WrappedLine {
+        var lines: std.ArrayListUnmanaged(WrappedLine) = .{};
+        errdefer lines.deinit(allocator);
+
+        const items = self.buf.items;
+        const continuation = "  ";
+        const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
+        const continuation_width: u32 = @intCast(grapheme_mod.strWidth(continuation));
+        const first_text_width = if (total_width > prompt_width + 1) total_width - prompt_width - 1 else 1;
+        const continuation_text_width = if (total_width > continuation_width + 1) total_width - continuation_width - 1 else 1;
+
+        var logical_line_idx: u32 = 0;
+        var line_start: usize = 0;
+        while (true) {
+            const line_end = std.mem.indexOfScalarPos(u8, items, line_start, '\n') orelse items.len;
+            const line_text = items[line_start..line_end];
+
+            if (logical_line_idx == 0) {
+                try self.appendWrappedSlices(&lines, line_text, @intCast(line_start), .prompt, 1 + prompt_width, first_text_width, continuation_text_width, allocator);
+            } else {
+                try self.appendWrappedSlices(&lines, line_text, @intCast(line_start), .continuation, 1 + continuation_width, continuation_text_width, continuation_text_width, allocator);
+            }
+
+            logical_line_idx += 1;
+            if (line_end >= items.len) break;
+            line_start = line_end + 1;
+        }
+
+        if (lines.items.len == 0) {
+            try lines.append(allocator, .{ .start = 0, .end = 0, .kind = .prompt, .text_x = 1 + prompt_width });
+        }
+
+        return try lines.toOwnedSlice(allocator);
+    }
+
+    fn appendWrappedSlices(
+        self: *const Editor,
+        out: *std.ArrayListUnmanaged(WrappedLine),
+        line_text: []const u8,
+        base_start: u32,
+        first_kind: WrappedLineKind,
+        first_text_x: u32,
+        first_width: u32,
+        continuation_width: u32,
+        allocator: std.mem.Allocator,
+    ) !void {
+        _ = self;
+        const continuation = "  ";
+        const continuation_prefix_width: u32 = @intCast(grapheme_mod.strWidth(continuation));
+        const continuation_text_x = 1 + continuation_prefix_width;
+        const continuation_max_width = if (continuation_width == 0) @as(u32, 1) else continuation_width;
+
+        var remaining = line_text;
+        var remaining_base = base_start;
+        var current_kind = first_kind;
+        var current_text_x = first_text_x;
+        var current_width = if (first_width == 0) @as(u32, 1) else first_width;
+
+        while (true) {
+            const wrapped = try word_wrap_mod.wordWrap(remaining, @intCast(current_width), allocator);
+            defer allocator.free(wrapped);
+
+            if (wrapped.len == 0) break;
+            const first = wrapped[0];
+            try out.append(allocator, .{
+                .start = remaining_base + @as(u32, @intCast(first.start)),
+                .end = remaining_base + @as(u32, @intCast(first.end)),
+                .kind = current_kind,
+                .text_x = current_text_x,
+            });
+
+            if (wrapped.len == 1) break;
+
+            remaining_base += @as(u32, @intCast(wrapped[1].start));
+            remaining = remaining[wrapped[1].start..];
+            current_kind = .continuation;
+            current_text_x = continuation_text_x;
+            current_width = continuation_max_width;
+        }
+    }
+
+    fn wrappedLineCountForWidth(self: *const Editor, total_width: u32) u32 {
+        const wrapped_lines = self.buildWrappedLines(total_width, self.allocator) catch return self.lineCount();
+        defer self.allocator.free(wrapped_lines);
+        return @intCast(wrapped_lines.len);
+    }
+
+    fn findCursorVisualPosition(self: *const Editor, wrapped_lines: []const WrappedLine) ?CursorVisualPosition {
+        if (wrapped_lines.len == 0) return .{ .visual_row = 0, .x = 1 };
+
+        var idx: usize = 0;
+        while (idx < wrapped_lines.len) : (idx += 1) {
+            const line = wrapped_lines[idx];
+            const next_start = if (idx + 1 < wrapped_lines.len) wrapped_lines[idx + 1].start else line.end;
+            if (self.cursor_byte >= line.start and self.cursor_byte <= line.end) {
+                const col: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[line.start..self.cursor_byte]));
+                return .{ .visual_row = @intCast(idx), .x = line.text_x + col };
+            }
+            if (self.cursor_byte > line.end and self.cursor_byte < next_start) {
+                const col: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[line.start..line.end]));
+                return .{ .visual_row = @intCast(idx), .x = line.text_x + col };
+            }
+        }
+
+        const last = wrapped_lines[wrapped_lines.len - 1];
+        const col: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[last.start..last.end]));
+        return .{ .visual_row = @intCast(wrapped_lines.len - 1), .x = last.text_x + col };
+    }
+
     fn insertNewline(self: *Editor) void {
         self.buf.insertSlice(self.allocator, self.cursor_byte, "\n") catch return;
         self.cursor_byte += 1;
@@ -649,11 +776,14 @@ pub const Editor = struct {
     }
 
     fn ensureCursorVisible(self: *Editor) void {
-        const cur_line = self.cursorLine();
-        if (cur_line < self.scroll_y) {
-            self.scroll_y = cur_line;
-        } else if (cur_line >= self.scroll_y + self.max_visible_lines) {
-            self.scroll_y = cur_line - self.max_visible_lines + 1;
+        const wrapped_lines = self.buildWrappedLines(self.last_content_width, self.allocator) catch return;
+        defer self.allocator.free(wrapped_lines);
+
+        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return;
+        if (cursor.visual_row < self.scroll_y) {
+            self.scroll_y = cursor.visual_row;
+        } else if (cursor.visual_row >= self.scroll_y + self.max_visible_lines) {
+            self.scroll_y = cursor.visual_row - self.max_visible_lines + 1;
         }
     }
 
@@ -671,7 +801,6 @@ pub const Editor = struct {
         return @intCast(i);
     }
 };
-
 
 // --- Tests ---
 
@@ -718,7 +847,6 @@ test "Editor renders prompt and text to buffer" {
     try std.testing.expectEqual(@as(u21, 'x'), buf.get(3, 1).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, 0x2570), buf.get(0, 2).grapheme.codepoint);
 }
-
 
 test "editor render after backspace clears deleted char from buffer" {
     var editor = Editor.init(std.testing.allocator);
@@ -799,6 +927,41 @@ test "Editor up/down navigation moves between lines" {
     _ = editor.handleInput(.{ .code = .down });
     try std.testing.expectEqual(@as(u32, 2), editor.cursorLine());
     try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
+}
+
+test "Editor wraps long content when rendering" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    editor.setText("hello world");
+
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 10, 4);
+    defer buf.deinit();
+    editor.render(buf.region());
+
+    try std.testing.expectEqual(@as(u21, '>'), buf.get(1, 1).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'h'), buf.get(3, 1).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'w'), buf.get(3, 2).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u32, 4), editor.measure(10).preferred_height);
+
+    const cs = editor.cursorState().?;
+    try std.testing.expectEqual(@as(u32, 8), cs.x);
+    try std.testing.expectEqual(@as(u32, 2), cs.y);
+}
+
+test "Editor scrolls wrapped cursor into view" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    editor.max_visible_lines = 2;
+    editor.setText("one two three four");
+
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 9, 4);
+    defer buf.deinit();
+    editor.render(buf.region());
+
+    try std.testing.expectEqual(@as(u32, 2), editor.scroll_y);
+    const cs = editor.cursorState().?;
+    try std.testing.expectEqual(@as(u32, 7), cs.x);
+    try std.testing.expectEqual(@as(u32, 2), cs.y);
 }
 
 test "slash command autocomplete end-to-end" {

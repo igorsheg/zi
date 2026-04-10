@@ -13,14 +13,29 @@ const RunOutcome = session_controller_mod.RunOutcome;
 /// Projection of a session message into a form the transcript can
 /// rebuild from without borrowing agent-owned AgentMessage data.
 /// Extended by zi-wub.24 to cover tool calls + results.
+pub const ResumedAssistantBlock = union(enum) {
+    text: []u8,
+    thinking: []u8,
+
+    pub fn deinit(self: *ResumedAssistantBlock, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .text => |s| allocator.free(s),
+            .thinking => |s| allocator.free(s),
+        }
+    }
+};
+
 pub const ResumedEntry = union(enum) {
     user_text: []u8,
-    assistant_text: []u8,
+    assistant_message: []ResumedAssistantBlock,
 
     pub fn deinit(self: *ResumedEntry, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .user_text => |s| allocator.free(s),
-            .assistant_text => |s| allocator.free(s),
+            .assistant_message => |blocks| {
+                for (blocks) |*block| block.deinit(allocator);
+                allocator.free(blocks);
+            },
         }
     }
 };
@@ -31,7 +46,14 @@ pub const UiEvent = union(enum) {
     message_start_user: void,
 
     // --- streaming content ---
-    text_delta: struct { delta: []u8 },
+    assistant_text_delta: struct {
+        content_index: usize,
+        delta: []u8,
+    },
+    assistant_thinking_delta: struct {
+        content_index: usize,
+        delta: []u8,
+    },
 
     // --- errors ---
     error_message: struct { message: []u8 },
@@ -124,10 +146,9 @@ pub const UiEvent = union(enum) {
     //
     // Payload shape is intentionally a display projection, NOT the
     // full AgentMessage list — AgentMessage ownership stays on the
-    // agent thread (doctrine R3). The shape is extensible: today
-    // only `user_text` and `assistant_text` are populated, matching
-    // pre-.15 rebuild fidelity. zi-wub.24 will extend it to carry
-    // tool calls and results for full parity with pi-mono.
+    // agent thread (doctrine R3). The payload carries user text plus
+    // assistant content blocks (text/thinking) so resume rebuild can
+    // preserve the same semantics as live rendering.
     session_resumed: struct {
         entries: []ResumedEntry,
         /// Optional warning from `restoreModelFromSession` when the
@@ -157,7 +178,8 @@ pub const UiEvent = union(enum) {
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .text_delta => |d| allocator.free(d.delta),
+            .assistant_text_delta => |d| allocator.free(d.delta),
+            .assistant_thinking_delta => |d| allocator.free(d.delta),
             .error_message => |e| allocator.free(e.message),
             .tool_call_streaming => |t| {
                 allocator.free(t.tool_call_id);
@@ -213,7 +235,8 @@ pub const UiEvent = union(enum) {
 const testing = std.testing;
 
 test "UiEvent deinit frees owned fields" {
-    var ev = UiEvent{ .text_delta = .{
+    var ev = UiEvent{ .assistant_text_delta = .{
+        .content_index = 0,
         .delta = try testing.allocator.dupe(u8, "hello"),
     } };
     ev.deinit(testing.allocator);

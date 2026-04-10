@@ -45,6 +45,7 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const json_util = @import("json_util.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const provider_failure = @import("provider_failure.zig");
@@ -1070,7 +1071,9 @@ fn writeToolResultMessage(
     if (concat.items.len == 0) {
         try jw.write("(empty tool result)");
     } else {
-        try jw.write(concat.items);
+        const sanitized = try json_util.utf8LossyAlloc(allocator, concat.items);
+        defer allocator.free(sanitized);
+        try jw.write(sanitized);
     }
     try jw.endObject();
 }
@@ -1805,6 +1808,62 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
 
     try testing.expect(std.mem.indexOf(u8, out.items, "No result provided") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "should not replay") == null);
+}
+
+test "writeInputOpts serializes invalid tool-result utf-8 as output text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var foreign_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer foreign_args.object.deinit();
+
+    const assistant = protocol.AssistantMessage{
+        .content = &.{.{ .tool_call = .{
+            .id = "call:bad|item bad!!!",
+            .name = "bash",
+            .arguments = foreign_args,
+        } }},
+        .api = .openai_completions,
+        .provider = .openrouter,
+        .model = "openai/gpt-test",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .toolUse,
+        .timestamp = 0,
+    };
+    const tool_result: protocol.ToolResultMessage = .{
+        .tool_call_id = "call:bad|item bad!!!",
+        .tool_name = "bash",
+        .content = &.{.{ .text = .{ .text = "bad\xaa\xfftail" } }},
+        .details = null,
+        .is_error = false,
+        .timestamp = 0,
+    };
+    const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = assistant }, .{ .tool_result = tool_result } } };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    try jw.beginArray();
+    try writeInputOpts(alloc, &jw, test_model, ctx, false);
+    try jw.endArray();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, allocating.written(), .{});
+    defer parsed.deinit();
+
+    var found = false;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const kind = item.object.get("type") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "function_call_output")) continue;
+        const output = item.object.get("output") orelse continue;
+        try testing.expect(output == .string);
+        try testing.expect(std.mem.indexOf(u8, output.string, "tail") != null);
+        found = true;
+        break;
+    }
+    try testing.expect(found);
 }
 
 test "writeInputOpts omits commentary text for codex tool-use assistant replay" {

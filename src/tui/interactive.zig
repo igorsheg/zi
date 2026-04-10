@@ -41,6 +41,7 @@ const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
 const AgentRequest = agent_mod.AgentRequest;
 const RequestQueue = agent_mod.RequestQueue;
+const ResumedAssistantBlock = ui_event_mod.ResumedAssistantBlock;
 const ResumedEntry = ui_event_mod.ResumedEntry;
 const agent_protocol = agent_mod.protocol;
 const SessionController = session_controller_mod.SessionController;
@@ -226,6 +227,7 @@ pub const Interactive = struct {
     is_streaming: bool = false,
     last_ctrl_c_ns: i128 = 0,
     tool_output_expanded: bool = false,
+    hide_thinking_block: bool = false,
     greeter_dismissed: bool = false,
     /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
     input: input_buffer_mod.InputBuffer,
@@ -292,6 +294,8 @@ pub const Interactive = struct {
         self.status_data.model_id = ca.agent.state.model.id;
         self.status_data.thinking_level = agentThinkingLabel(ca.agent.state.thinking_level);
         self.editor.cwd = cwd;
+        self.hide_thinking_block = settings_manager.getHideThinkingBlock();
+        self.transcript.setHideThinkingBlock(self.hide_thinking_block);
         // NOTE: status_data pointer and active_editor are bound in run() where
         // self is at its final address. Binding here would capture a pointer to
         // the local `self` that becomes dangling after the by-value return.
@@ -605,6 +609,15 @@ pub const Interactive = struct {
             return;
         }
 
+        // ctrl+t — toggle thinking block visibility
+        if (key.code == .char and key.char != null and key.char.? == 't' and key.ctrl) {
+            self.hide_thinking_block = !self.hide_thinking_block;
+            self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
+            self.transcript.setHideThinkingBlock(self.hide_thinking_block);
+            self.tui.dirty = true;
+            return;
+        }
+
         // scroll: page up/down, shift+up/down
         if (self.handleScroll(key)) return;
 
@@ -671,8 +684,13 @@ pub const Interactive = struct {
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {
-            .text_delta => |d| {
-                self.transcript.appendText(d.delta);
+            .assistant_text_delta => |d| {
+                self.transcript.appendText(d.content_index, d.delta);
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.tui.dirty = true;
+            },
+            .assistant_thinking_delta => |d| {
+                self.transcript.appendThinking(d.content_index, d.delta);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
@@ -814,9 +832,14 @@ pub const Interactive = struct {
                 for (r.entries) |entry| {
                     switch (entry) {
                         .user_text => |t| self.transcript.addUserMessage(t),
-                        .assistant_text => |t| {
+                        .assistant_message => |blocks| {
                             self.transcript.beginAssistantMessage();
-                            self.transcript.appendText(t);
+                            for (blocks, 0..) |block, idx| {
+                                switch (block) {
+                                    .text => |t| self.transcript.appendText(idx, t),
+                                    .thinking => |t| self.transcript.appendThinking(idx, t),
+                                }
+                            }
                         },
                     }
                 }
@@ -1763,8 +1786,8 @@ pub const Interactive = struct {
 
         // Project messages into a display list, cloned into
         // msg_allocator so the TUI can free them independently of
-        // agent_arena. Text-only for .15 (matches pre-.15 parity);
-        // zi-wub.24 extends this to tool calls + results.
+        // agent_arena. Preserve assistant text + thinking block order
+        // so resume rebuild matches live TUI semantics.
         var entries = std.ArrayListUnmanaged(ResumedEntry).empty;
         defer entries.deinit(self.msg_allocator);
 
@@ -1780,16 +1803,34 @@ pub const Interactive = struct {
                     else => {},
                 },
                 .assistant => |a| {
+                    var blocks = std.ArrayListUnmanaged(ResumedAssistantBlock).empty;
+                    defer blocks.deinit(self.msg_allocator);
                     for (a.content) |block| {
                         switch (block) {
                             .text => |tc| {
                                 const cloned = self.msg_allocator.dupe(u8, tc.text) catch continue;
-                                entries.append(self.msg_allocator, .{ .assistant_text = cloned }) catch {
+                                blocks.append(self.msg_allocator, .{ .text = cloned }) catch {
+                                    self.msg_allocator.free(cloned);
+                                };
+                            },
+                            .thinking => |th| {
+                                const cloned = self.msg_allocator.dupe(u8, th.thinking) catch continue;
+                                blocks.append(self.msg_allocator, .{ .thinking = cloned }) catch {
                                     self.msg_allocator.free(cloned);
                                 };
                             },
                             else => {},
                         }
+                    }
+                    if (blocks.items.len > 0) {
+                        const owned_blocks = blocks.toOwnedSlice(self.msg_allocator) catch {
+                            for (blocks.items) |*block| block.deinit(self.msg_allocator);
+                            continue;
+                        };
+                        entries.append(self.msg_allocator, .{ .assistant_message = owned_blocks }) catch {
+                            for (owned_blocks) |*block| block.deinit(self.msg_allocator);
+                            self.msg_allocator.free(owned_blocks);
+                        };
                     }
                 },
                 else => {},
@@ -1919,7 +1960,17 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
             switch (mu.assistant_message_event) {
                 .text_delta => |d| {
                     const delta = allocator.dupe(u8, d.delta) catch return null;
-                    return .{ .text_delta = .{ .delta = delta } };
+                    return .{ .assistant_text_delta = .{
+                        .content_index = d.content_index,
+                        .delta = delta,
+                    } };
+                },
+                .thinking_delta => |d| {
+                    const delta = allocator.dupe(u8, d.delta) catch return null;
+                    return .{ .assistant_thinking_delta = .{
+                        .content_index = d.content_index,
+                        .delta = delta,
+                    } };
                 },
                 .@"error" => |e| {
                     if (e.@"error".error_message) |msg| {

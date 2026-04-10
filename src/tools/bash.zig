@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
+const json_util = @import("../ai/json_util.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const AbortGuard = @import("../abort_guard.zig").AbortGuard;
@@ -285,8 +286,20 @@ test "TimeoutGuard.stop does not wait for the full timeout after process exit" {
     try testing.expect(elapsed_ns < 500 * std.time.ns_per_ms);
 }
 
+test "oneText sanitizes invalid utf-8" {
+    const allocator = std.testing.allocator;
+    const blocks = oneText(allocator, "bad\xaa\xfftail");
+    defer {
+        allocator.free(blocks[0].text.text);
+        allocator.free(blocks);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings("bad��tail", blocks[0].text.text);
+}
+
 fn oneText(allocator: std.mem.Allocator, text: []const u8) []agent.protocol.AgentToolResult.ContentBlock {
-    const owned = allocator.dupe(u8, text) catch text;
+    const owned = json_util.utf8LossyAlloc(allocator, text) catch allocator.dupe(u8, text) catch text;
     const blocks = allocator.alloc(agent.protocol.AgentToolResult.ContentBlock, 1) catch return &.{};
     blocks[0] = .{ .text = .{ .text = owned } };
     return blocks;

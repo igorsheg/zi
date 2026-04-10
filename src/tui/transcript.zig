@@ -4,6 +4,7 @@ const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const grapheme = @import("grapheme.zig");
 const markdown_mod = @import("components/markdown.zig");
+const assistant_message_mod = @import("components/assistant_message.zig");
 const tool_display_mod = @import("tool_display.zig");
 const agent_protocol = @import("../agent/root.zig").protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
@@ -25,7 +26,7 @@ const Color = cell_mod.Color;
 /// use tags for: bg fill (tool), spacer (user_message), scroll merge (assistant).
 pub const ItemKind = enum {
     generic,
-    assistant_text,
+    assistant_message,
     user_message,
     tool_execution,
 };
@@ -417,6 +418,12 @@ fn deinitMarkdown(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(md);
 }
 
+fn deinitAssistantMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(ctx));
+    am.deinit();
+    allocator.destroy(am);
+}
+
 // ── Transcript ────────────────────────────────────────────────────
 
 /// Scrollable conversation transcript with generic item storage.
@@ -424,7 +431,7 @@ fn deinitMarkdown(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 /// Items are Components with optional metadata (kind, tool_call_id).
 /// The transcript handles:
 /// - Appending items in event order
-/// - Streaming text merge (current_text_idx for assistant text deltas)
+/// - Streaming assistant message merge (current_assistant_idx for content deltas)
 /// - Tool update routing by tool_call_id (O(1) HashMap lookup)
 /// - Measuring total height for scroll calculations
 /// - Rendering visible items into a Region given a scroll offset
@@ -435,11 +442,12 @@ pub const Transcript = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
     /// Fast lookup: tool_call_id → item index for routing updates.
     pending_tools: std.StringHashMapUnmanaged(usize) = .{},
-    /// Current assistant text item being appended to (index into items).
-    current_text_idx: ?usize = null,
+    /// Current assistant message item being appended to (index into items).
+    current_assistant_idx: ?usize = null,
 
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    hide_thinking_block: bool = false,
     scroll_offset: u32 = 0,
     /// Cached from last render() call, used by clampScroll().
     last_render_width: u32 = 80,
@@ -464,7 +472,7 @@ pub const Transcript = struct {
 
     /// Append an arbitrary component to the transcript.
     pub fn addComponent(self: *Transcript, comp: Component) void {
-        self.current_text_idx = null;
+        self.current_assistant_idx = null;
         self.items.append(self.allocator, .{ .component = comp }) catch return;
     }
 
@@ -488,12 +496,12 @@ pub const Transcript = struct {
                         entry.value_ptr.* -= 1;
                     }
                 }
-                // Fix up current_text_idx
-                if (self.current_text_idx) |idx| {
+                // Fix up current_assistant_idx
+                if (self.current_assistant_idx) |idx| {
                     if (idx == i) {
-                        self.current_text_idx = null;
+                        self.current_assistant_idx = null;
                     } else if (idx > i) {
-                        self.current_text_idx = idx - 1;
+                        self.current_assistant_idx = idx - 1;
                     }
                 }
                 // Clamp scroll_offset so content doesn't render blank
@@ -509,7 +517,7 @@ pub const Transcript = struct {
         for (self.items.items) |*item| item.deinit(self.allocator);
         self.items.items.len = 0;
         self.pending_tools.clearRetainingCapacity();
-        self.current_text_idx = null;
+        self.current_assistant_idx = null;
         self.scroll_offset = 0;
     }
 
@@ -517,33 +525,58 @@ pub const Transcript = struct {
 
     /// Start a new assistant message.
     pub fn beginAssistantMessage(self: *Transcript) void {
-        self.current_text_idx = null;
+        self.current_assistant_idx = null;
+    }
+
+    fn createAssistantMessage(self: *Transcript) ?*assistant_message_mod.AssistantMessage {
+        const am = self.allocator.create(assistant_message_mod.AssistantMessage) catch return null;
+        am.* = assistant_message_mod.AssistantMessage.init(self.allocator);
+        am.theme = self.theme;
+        am.hide_thinking_block = self.hide_thinking_block;
+        self.items.append(self.allocator, .{
+            .component = am.component(),
+            .kind = .assistant_message,
+            .extra_height = 1,
+            .deinit_ctx = @ptrCast(am),
+            .deinit_fn = deinitAssistantMessage,
+        }) catch {
+            am.deinit();
+            self.allocator.destroy(am);
+            return null;
+        };
+        self.current_assistant_idx = self.items.items.len - 1;
+        return am;
+    }
+
+    fn currentAssistant(self: *Transcript) ?*assistant_message_mod.AssistantMessage {
+        const idx = self.current_assistant_idx orelse return null;
+        if (idx >= self.items.items.len) return null;
+        const item = &self.items.items[idx];
+        if (item.kind != .assistant_message) return null;
+        return @ptrCast(@alignCast(item.deinit_ctx.?));
     }
 
     /// Append streaming text content to the current assistant message.
-    pub fn appendText(self: *Transcript, delta: []const u8) void {
-        if (self.current_text_idx) |idx| {
-            // Reach into the markdown component to append
-            const item = &self.items.items[idx];
-            const md: *markdown_mod.Markdown = @ptrCast(@alignCast(item.component.ptr));
-            md.appendContent(delta);
-        } else {
-            const md = self.allocator.create(markdown_mod.Markdown) catch return;
-            md.* = markdown_mod.Markdown.init(self.allocator);
-            md.padding_x = 1;
-            md.appendContent(delta);
-            self.items.append(self.allocator, .{
-                .component = md.component(),
-                .kind = .assistant_text,
-                .extra_height = 1, // spacer before assistant text (pi-mono: Spacer(1))
-                .deinit_ctx = @ptrCast(md),
-                .deinit_fn = deinitMarkdown,
-            }) catch {
-                md.deinit();
-                self.allocator.destroy(md);
-                return;
-            };
-            self.current_text_idx = self.items.items.len - 1;
+    pub fn appendText(self: *Transcript, content_index: usize, delta: []const u8) void {
+        var am = self.currentAssistant();
+        if (am == null) am = self.createAssistantMessage();
+        if (am) |assistant| assistant.appendText(content_index, delta);
+    }
+
+    /// Append streaming thinking content to the current assistant message.
+    pub fn appendThinking(self: *Transcript, content_index: usize, delta: []const u8) void {
+        var am = self.currentAssistant();
+        if (am == null) am = self.createAssistantMessage();
+        if (am) |assistant| assistant.appendThinking(content_index, delta);
+    }
+
+    pub fn setHideThinkingBlock(self: *Transcript, hide: bool) void {
+        self.hide_thinking_block = hide;
+        for (self.items.items) |*item| {
+            if (item.kind == .assistant_message) {
+                const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
+                am.setHideThinkingBlock(hide);
+            }
         }
     }
 
@@ -556,7 +589,7 @@ pub const Transcript = struct {
     ) void {
         if (self.pending_tools.contains(tool_call_id)) return;
 
-        self.current_text_idx = null;
+        self.current_assistant_idx = null;
 
         const id = self.allocator.dupe(u8, tool_call_id) catch return;
         const name = self.allocator.dupe(u8, tool_name) catch {
@@ -673,7 +706,7 @@ pub const Transcript = struct {
 
     /// Add a user message bubble.
     pub fn addUserMessage(self: *Transcript, text: []const u8) void {
-        self.current_text_idx = null;
+        self.current_assistant_idx = null;
 
         const md = self.allocator.create(markdown_mod.Markdown) catch return;
         md.* = markdown_mod.Markdown.init(self.allocator);
@@ -812,25 +845,23 @@ pub const Transcript = struct {
                     md.scroll_offset = saved;
                 }
             },
-            .assistant_text => {
-                // Assistant text: extra_height=1 spacer before content
-                const md: *markdown_mod.Markdown = @ptrCast(@alignCast(item.deinit_ctx.?));
-                const saved = md.scroll_offset;
+            .assistant_message => {
+                // Assistant message: extra_height=1 spacer before content
+                const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
+                const saved = am.scroll_offset;
                 const row_skip = skipped;
                 if (item.extra_height > 0 and row_skip < item.extra_height) {
-                    // Spacer still visible
                     const spacer_visible = item.extra_height - row_skip;
                     if (visible_h > spacer_visible) {
-                        const md_region = row_region.sub(0, spacer_visible, w, visible_h - spacer_visible);
-                        md.scroll_offset = 0;
-                        md.render(md_region);
+                        const am_region = row_region.sub(0, spacer_visible, w, visible_h - spacer_visible);
+                        am.scroll_offset = 0;
+                        am.render(am_region);
                     }
                 } else {
-                    // Spacer scrolled past
-                    md.scroll_offset = row_skip -| item.extra_height;
-                    md.render(row_region);
+                    am.scroll_offset = row_skip -| item.extra_height;
+                    am.render(row_region);
                 }
-                md.scroll_offset = saved;
+                am.scroll_offset = saved;
             },
             .generic => {
                 // Generic: just render the component
@@ -855,7 +886,7 @@ test "Transcript renders assistant text and tool execution in order" {
     defer transcript.deinit();
 
     transcript.beginAssistantMessage();
-    transcript.appendText("hello from assistant");
+    transcript.appendText(0, "hello from assistant");
 
     transcript.addToolExecution("tool-1", "bash", .{});
     transcript.toolSetArgs("tool-1", .null);
@@ -926,7 +957,7 @@ test "Transcript clearAll removes all items and resets state" {
     defer transcript.deinit();
 
     transcript.beginAssistantMessage();
-    transcript.appendText("hello");
+    transcript.appendText(0, "hello");
     transcript.addUserMessage("user msg");
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
@@ -934,6 +965,6 @@ test "Transcript clearAll removes all items and resets state" {
     transcript.clearAll();
 
     try testing.expectEqual(@as(usize, 0), transcript.items.items.len);
-    try testing.expectEqual(@as(?usize, null), transcript.current_text_idx);
+    try testing.expectEqual(@as(?usize, null), transcript.current_assistant_idx);
     try testing.expectEqual(@as(u32, 0), transcript.scroll_offset);
 }
