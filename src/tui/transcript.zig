@@ -678,6 +678,9 @@ pub const Transcript = struct {
         const md = self.allocator.create(markdown_mod.Markdown) catch return;
         md.* = markdown_mod.Markdown.init(self.allocator);
         md.padding_x = 1;
+        // User messages render as filled bubbles, so they need a little
+        // internal vertical padding to read as intentional chrome rather
+        // than a background paint bug.
         md.padding_y = 1;
         md.bg = self.theme.bg(.user_message_bg);
         md.fg = self.theme.fg(.user_message_text);

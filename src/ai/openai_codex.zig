@@ -177,11 +177,11 @@ fn buildCodexRequestJson(
         try core.writeTools(&jw, tools, false);
     }
 
-    if (model.reasoning) {
+    if (model.reasoning and reasoning_effort != null) {
         try jw.objectField("reasoning");
         try jw.beginObject();
         try jw.objectField("effort");
-        try jw.write(reasoning_effort orelse "low");
+        try jw.write(reasoning_effort.?);
         try jw.objectField("summary");
         try jw.write(reasoning_summary orelse "auto");
         try jw.endObject();
@@ -313,6 +313,29 @@ test "buildCodexRequestJson includes prompt_cache_key when session_id is set" {
 
     try buildCodexRequestJson(alloc, &out, model, ctx, null, null, "session-abc");
     try testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_key\":\"session-abc\"") != null);
+}
+
+test "buildCodexRequestJson omits reasoning when no reasoning effort is requested" {
+    const alloc = testing.allocator;
+    const model = protocol.Model{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
+    const ctx = protocol.Context{ .messages = &.{msg} };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try buildCodexRequestJson(alloc, &out, model, ctx, null, null, null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning\"") == null);
 }
 
 fn buildBearerAuth(

@@ -911,82 +911,241 @@ pub fn writeInputOpts(
         }
     }
 
+    var tool_id_map: std.ArrayListUnmanaged(ToolCallIdMapping) = .empty;
+    defer {
+        for (tool_id_map.items) |mapping| mapping.deinit(allocator);
+        tool_id_map.deinit(allocator);
+    }
+
+    var pending_tool_calls: std.ArrayListUnmanaged(PendingToolCall) = .empty;
+    defer {
+        for (pending_tool_calls.items) |pending| pending.deinit(allocator);
+        pending_tool_calls.deinit(allocator);
+    }
+
+    var existing_tool_result_ids: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (existing_tool_result_ids.items) |id| allocator.free(id);
+        existing_tool_result_ids.deinit(allocator);
+    }
+
     var msg_index: usize = 0;
     for (context.messages) |msg| {
         defer msg_index += 1;
         switch (msg) {
             .user => |u| {
-                try jw.beginObject();
-                try jw.objectField("role");
-                try jw.write("user");
-                try jw.objectField("content");
-                try jw.beginArray();
-                switch (u.content) {
-                    .text => |text| {
-                        try jw.beginObject();
-                        try jw.objectField("type");
-                        try jw.write("input_text");
-                        try jw.objectField("text");
-                        try jw.write(text);
-                        try jw.endObject();
-                    },
-                    .blocks => |blocks| for (blocks) |b| switch (b) {
-                        .text => |tc| {
-                            try jw.beginObject();
-                            try jw.objectField("type");
-                            try jw.write("input_text");
-                            try jw.objectField("text");
-                            try jw.write(tc.text);
-                            try jw.endObject();
-                        },
-                        .image => |ic| {
-                            try jw.beginObject();
-                            try jw.objectField("type");
-                            try jw.write("input_image");
-                            try jw.objectField("detail");
-                            try jw.write("auto");
-                            try jw.objectField("image_url");
-                            const url = try std.fmt.allocPrint(
-                                allocator,
-                                "data:{s};base64,{s}",
-                                .{ ic.mime_type, ic.data },
-                            );
-                            defer allocator.free(url);
-                            try jw.write(url);
-                            try jw.endObject();
-                        },
-                    },
-                }
-                try jw.endArray();
-                try jw.endObject();
+                try flushPendingSyntheticToolResults(allocator, jw, &pending_tool_calls, existing_tool_result_ids.items, &tool_id_map);
+                for (existing_tool_result_ids.items) |id| allocator.free(id);
+                existing_tool_result_ids.clearRetainingCapacity();
+                try writeUserMessage(allocator, jw, u);
             },
-            .assistant => |a| try writeAssistantMessage(allocator, jw, model, a, msg_index),
-            .tool_result => |tr| {
-                var concat: std.ArrayListUnmanaged(u8) = .empty;
-                defer concat.deinit(allocator);
-                for (tr.content) |cb| switch (cb) {
-                    .text => |text| try concat.appendSlice(allocator, text.text),
-                    .image => {}, // phase 3b: image-bearing tool results skipped
+            .assistant => |a| {
+                try flushPendingSyntheticToolResults(allocator, jw, &pending_tool_calls, existing_tool_result_ids.items, &tool_id_map);
+                for (existing_tool_result_ids.items) |id| allocator.free(id);
+                existing_tool_result_ids.clearRetainingCapacity();
+
+                if (a.stop_reason == .@"error" or a.stop_reason == .aborted) continue;
+
+                try writeAssistantMessage(allocator, jw, model, a, msg_index, &tool_id_map);
+
+                for (pending_tool_calls.items) |pending| pending.deinit(allocator);
+                pending_tool_calls.clearRetainingCapacity();
+                for (a.content) |block| switch (block) {
+                    .tool_call => |tcall| {
+                        try pending_tool_calls.append(allocator, .{
+                            .id = try getMappedToolCallId(allocator, tool_id_map.items, tcall.id),
+                            .name = try allocator.dupe(u8, tcall.name),
+                        });
+                    },
+                    else => {},
                 };
-                try jw.beginObject();
-                try jw.objectField("type");
-                try jw.write("function_call_output");
-                try jw.objectField("call_id");
-                // Strip `|fc_xxx` suffix if present — pi-mono does the same.
-                const call_id = if (std.mem.indexOfScalar(u8, tr.tool_call_id, '|')) |i|
-                    tr.tool_call_id[0..i]
-                else
-                    tr.tool_call_id;
-                try jw.write(call_id);
-                try jw.objectField("output");
-                if (concat.items.len == 0) {
-                    try jw.write("(empty tool result)");
-                } else {
-                    try jw.write(concat.items);
-                }
-                try jw.endObject();
+            },
+            .tool_result => |tr| {
+                const mapped_tool_call_id = try getMappedToolCallId(allocator, tool_id_map.items, tr.tool_call_id);
+                try existing_tool_result_ids.append(allocator, mapped_tool_call_id);
+                try writeToolResultMessage(allocator, jw, tr, mapped_tool_call_id);
             },
         }
+    }
+}
+
+const ToolCallIdMapping = struct {
+    original_id: []const u8,
+    mapped_id: []const u8,
+
+    fn deinit(self: ToolCallIdMapping, allocator: std.mem.Allocator) void {
+        allocator.free(self.original_id);
+        allocator.free(self.mapped_id);
+    }
+};
+
+const PendingToolCall = struct {
+    id: []const u8,
+    name: []const u8,
+
+    fn deinit(self: PendingToolCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+    }
+};
+
+fn writeUserMessage(
+    allocator: std.mem.Allocator,
+    jw: *std.json.Stringify,
+    u: protocol.UserMessage,
+) !void {
+    try jw.beginObject();
+    try jw.objectField("role");
+    try jw.write("user");
+    try jw.objectField("content");
+    try jw.beginArray();
+    switch (u.content) {
+        .text => |text| {
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("input_text");
+            try jw.objectField("text");
+            try jw.write(text);
+            try jw.endObject();
+        },
+        .blocks => |blocks| for (blocks) |b| switch (b) {
+            .text => |tc| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("input_text");
+                try jw.objectField("text");
+                try jw.write(tc.text);
+                try jw.endObject();
+            },
+            .image => |ic| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("input_image");
+                try jw.objectField("detail");
+                try jw.write("auto");
+                try jw.objectField("image_url");
+                const url = try std.fmt.allocPrint(
+                    allocator,
+                    "data:{s};base64,{s}",
+                    .{ ic.mime_type, ic.data },
+                );
+                defer allocator.free(url);
+                try jw.write(url);
+                try jw.endObject();
+            },
+        },
+    }
+    try jw.endArray();
+    try jw.endObject();
+}
+
+fn writeToolResultMessage(
+    allocator: std.mem.Allocator,
+    jw: *std.json.Stringify,
+    tr: protocol.ToolResultMessage,
+    mapped_tool_call_id: []const u8,
+) !void {
+    var concat: std.ArrayListUnmanaged(u8) = .empty;
+    defer concat.deinit(allocator);
+    var saw_text = false;
+    for (tr.content) |cb| switch (cb) {
+        .text => |text| {
+            if (saw_text) try concat.appendSlice(allocator, "\n");
+            try concat.appendSlice(allocator, text.text);
+            saw_text = true;
+        },
+        .image => {},
+    };
+
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("function_call_output");
+    try jw.objectField("call_id");
+    const call_id = if (std.mem.indexOfScalar(u8, mapped_tool_call_id, '|')) |i|
+        mapped_tool_call_id[0..i]
+    else
+        mapped_tool_call_id;
+    try jw.write(call_id);
+    try jw.objectField("output");
+    if (concat.items.len == 0) {
+        try jw.write("(empty tool result)");
+    } else {
+        try jw.write(concat.items);
+    }
+    try jw.endObject();
+}
+
+fn getMappedToolCallId(
+    allocator: std.mem.Allocator,
+    mappings: []const ToolCallIdMapping,
+    tool_call_id: []const u8,
+) ![]const u8 {
+    for (mappings) |mapping| {
+        if (std.mem.eql(u8, mapping.original_id, tool_call_id)) {
+            return allocator.dupe(u8, mapping.mapped_id);
+        }
+    }
+    return allocator.dupe(u8, tool_call_id);
+}
+
+fn recordToolCallIdMapping(
+    allocator: std.mem.Allocator,
+    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
+    original_id: []const u8,
+    normalized: NormalizedToolCallId,
+) !void {
+    var mapped = std.ArrayListUnmanaged(u8).empty;
+    defer mapped.deinit(allocator);
+    try mapped.appendSlice(allocator, normalized.call_id);
+    if (normalized.item_id) |item_id| {
+        try mapped.append(allocator, '|');
+        try mapped.appendSlice(allocator, item_id);
+    }
+    const mapped_id = try mapped.toOwnedSlice(allocator);
+    errdefer allocator.free(mapped_id);
+
+    for (tool_id_map.items) |*mapping| {
+        if (std.mem.eql(u8, mapping.original_id, original_id)) {
+            allocator.free(mapping.mapped_id);
+            mapping.mapped_id = mapped_id;
+            return;
+        }
+    }
+
+    try tool_id_map.append(allocator, .{
+        .original_id = try allocator.dupe(u8, original_id),
+        .mapped_id = mapped_id,
+    });
+}
+
+fn flushPendingSyntheticToolResults(
+    allocator: std.mem.Allocator,
+    jw: *std.json.Stringify,
+    pending_tool_calls: *std.ArrayListUnmanaged(PendingToolCall),
+    existing_tool_result_ids: []const []const u8,
+    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
+) !void {
+    for (pending_tool_calls.items) |pending| {
+        var found = false;
+        for (existing_tool_result_ids) |existing| {
+            if (std.mem.eql(u8, existing, pending.id)) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+
+        const synthetic: protocol.ToolResultMessage = .{
+            .tool_call_id = pending.id,
+            .tool_name = pending.name,
+            .content = &.{.{ .text = .{ .text = "No result provided" } }},
+            .details = null,
+            .is_error = true,
+            .timestamp = std.time.milliTimestamp(),
+        };
+        const mapped_id = try getMappedToolCallId(allocator, tool_id_map.items, pending.id);
+        defer allocator.free(mapped_id);
+        try writeToolResultMessage(allocator, jw, synthetic, mapped_id);
     }
 }
 
@@ -996,6 +1155,7 @@ fn writeAssistantMessage(
     target_model: protocol.Model,
     a: protocol.AssistantMessage,
     msg_index: usize,
+    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
 ) !void {
     for (a.content) |b| switch (b) {
         .thinking => |th| {
@@ -1013,15 +1173,14 @@ fn writeAssistantMessage(
         .text => |tc| {
             // Derive id + phase from text_signature (TextSignatureV1 JSON),
             // falling back to `msg_<index>` when absent. pi-mono parity:
-            // responses API requires a stable id on assistant messages.
-            // phase extraction from text_signature is deferred: the
-            // parser arena would free the phase string before we write
-            // it, and we don't need phase for phase-3b turn-tracking.
-            // TextSignatureV1.phase round-trip is scoped to a dedicated
-            // follow-up when multi-phase prompting lands.
+            // responses API requires a stable id on assistant messages and
+            // codex follow-ups expect the phase to round-trip too.
             var msg_id: []const u8 = "";
             var msg_id_alloc: ?[]const u8 = null;
+            var msg_phase: ?[]const u8 = null;
+            var msg_phase_alloc: ?[]const u8 = null;
             defer if (msg_id_alloc) |p| allocator.free(p);
+            defer if (msg_phase_alloc) |p| allocator.free(p);
             if (tc.text_signature) |sig| {
                 if (sig.len > 0 and sig[0] == '{') {
                     if (std.json.parseFromSlice(std.json.Value, allocator, sig, .{})) |parsed| {
@@ -1030,6 +1189,10 @@ fn writeAssistantMessage(
                             if (parsed.value.object.get("id")) |id| if (id == .string) {
                                 msg_id_alloc = allocator.dupe(u8, id.string) catch null;
                                 if (msg_id_alloc) |m| msg_id = m;
+                            };
+                            if (parsed.value.object.get("phase")) |phase| if (phase == .string) {
+                                msg_phase_alloc = allocator.dupe(u8, phase.string) catch null;
+                                if (msg_phase_alloc) |p| msg_phase = p;
                             };
                         }
                     } else |_| {}
@@ -1040,6 +1203,11 @@ fn writeAssistantMessage(
                 msg_id_alloc = fallback;
                 msg_id = fallback;
             }
+            if (a.stop_reason == .toolUse and target_model.api == .openai_codex_responses) {
+                if (msg_phase) |phase| {
+                    if (std.mem.eql(u8, phase, "commentary")) continue;
+                }
+            }
             try jw.beginObject();
             try jw.objectField("type");
             try jw.write("message");
@@ -1049,6 +1217,10 @@ fn writeAssistantMessage(
             try jw.write("completed");
             try jw.objectField("id");
             try jw.write(msg_id);
+            if (msg_phase) |phase| {
+                try jw.objectField("phase");
+                try jw.write(phase);
+            }
             try jw.objectField("content");
             try jw.beginArray();
             try jw.beginObject();
@@ -1066,6 +1238,7 @@ fn writeAssistantMessage(
         .tool_call => |tcall| {
             var normalized = try normalizeResponsesToolCallId(allocator, target_model, a, tcall.id);
             defer normalized.deinit(allocator);
+            try recordToolCallIdMapping(allocator, tool_id_map, tcall.id, normalized);
             const is_different_model = !std.mem.eql(u8, a.model, target_model.id) and
                 providersEqual(a.provider, target_model.provider) and
                 apisEqual(a.api, target_model.api);
@@ -1113,10 +1286,19 @@ fn normalizeResponsesToolCallId(
     source: protocol.AssistantMessage,
     id: []const u8,
 ) !NormalizedToolCallId {
+    const same_model = providersEqual(source.provider, target_model.provider) and
+        apisEqual(source.api, target_model.api) and
+        std.mem.eql(u8, source.model, target_model.id);
     if (!targetUsesResponsesToolCallNormalization(target_model.provider)) {
         return .{ .call_id = try normalizeIdPart(allocator, id), .item_id = null };
     }
     if (std.mem.indexOfScalar(u8, id, '|')) |sep| {
+        if (same_model) {
+            return .{
+                .call_id = try allocator.dupe(u8, id[0..sep]),
+                .item_id = try allocator.dupe(u8, id[sep + 1 ..]),
+            };
+        }
         const call_id = try normalizeIdPart(allocator, id[0..sep]);
         const item_part = id[sep + 1 ..];
         var item_id = if (!providersEqual(source.provider, target_model.provider) or !apisEqual(source.api, target_model.api))
@@ -1130,6 +1312,9 @@ fn normalizeResponsesToolCallId(
             allocator.free(prefixed);
         }
         return .{ .call_id = call_id, .item_id = item_id };
+    }
+    if (same_model) {
+        return .{ .call_id = try allocator.dupe(u8, id), .item_id = null };
     }
     return .{ .call_id = try normalizeIdPart(allocator, id), .item_id = null };
 }
@@ -1475,4 +1660,194 @@ test "buildRequestJson emits store:false, input[], and reasoning:none for reason
     try testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"input_text\"") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning\"") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"effort\":\"none\"") != null);
+}
+
+test "writeInputOpts preserves same-model tool call ids" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var same_model_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer same_model_args.object.deinit();
+
+    const assistant = protocol.AssistantMessage{
+        .content = &.{.{ .tool_call = .{
+            .id = "call:raw|fc_raw",
+            .name = "bash",
+            .arguments = same_model_args,
+        } }},
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .model = "gpt-5.4",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .toolUse,
+        .timestamp = 0,
+    };
+    const ctx: protocol.Context = .{ .messages = &.{.{ .assistant = assistant }} };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    try jw.beginArray();
+    try writeInputOpts(alloc, &jw, protocol.Model{
+        .id = "gpt-5.4",
+        .name = "codex",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 1024,
+    }, ctx, false);
+    try jw.endArray();
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"call_id\":\"call:raw\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"fc_raw\"") != null);
+}
+
+test "writeInputOpts remaps foreign tool result ids to the replayed function call id" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var foreign_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer foreign_args.object.deinit();
+
+    const assistant = protocol.AssistantMessage{
+        .content = &.{.{ .tool_call = .{
+            .id = "call:bad|item bad!!!",
+            .name = "bash",
+            .arguments = foreign_args,
+        } }},
+        .api = .openai_completions,
+        .provider = .openrouter,
+        .model = "openai/gpt-test",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .toolUse,
+        .timestamp = 0,
+    };
+    const tool_result: protocol.ToolResultMessage = .{
+        .tool_call_id = "call:bad|item bad!!!",
+        .tool_name = "bash",
+        .content = &.{.{ .text = .{ .text = "ok" } }},
+        .details = null,
+        .is_error = false,
+        .timestamp = 0,
+    };
+    const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = assistant }, .{ .tool_result = tool_result } } };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    try jw.beginArray();
+    try writeInputOpts(alloc, &jw, test_model, ctx, false);
+    try jw.endArray();
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"call_id\":\"call_bad\"") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.items, "\"call_id\":\"call_bad\""));
+}
+
+test "writeInputOpts inserts synthetic tool result and skips errored assistants" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var synthetic_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer synthetic_args.object.deinit();
+
+    const tool_calling_assistant = protocol.AssistantMessage{
+        .content = &.{.{ .tool_call = .{
+            .id = "call_1|fc_1",
+            .name = "bash",
+            .arguments = synthetic_args,
+        } }},
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .model = "gpt-5.4",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .toolUse,
+        .timestamp = 0,
+    };
+    const errored_assistant = protocol.AssistantMessage{
+        .content = &.{.{ .text = .{ .text = "should not replay" } }},
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .model = "gpt-5.4",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .@"error",
+        .timestamp = 0,
+    };
+    const user = protocol.UserMessage{ .content = .{ .text = "next" }, .timestamp = 0 };
+    const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = tool_calling_assistant }, .{ .assistant = errored_assistant }, .{ .user = user } } };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    try jw.beginArray();
+    try writeInputOpts(alloc, &jw, protocol.Model{
+        .id = "gpt-5.4",
+        .name = "codex",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 1024,
+    }, ctx, false);
+    try jw.endArray();
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "No result provided") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "should not replay") == null);
+}
+
+test "writeInputOpts omits commentary text for codex tool-use assistant replay" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var commentary_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer commentary_args.object.deinit();
+
+    const assistant = protocol.AssistantMessage{
+        .content = &.{
+            .{ .text = .{ .text = "Doing another small stack", .text_signature = "{\"v\":1,\"id\":\"msg_commentary\",\"phase\":\"commentary\"}" } },
+            .{ .tool_call = .{ .id = "call_1|fc_1", .name = "read", .arguments = commentary_args } },
+        },
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .model = "gpt-5.4",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .toolUse,
+        .timestamp = 0,
+    };
+    const ctx: protocol.Context = .{ .messages = &.{.{ .assistant = assistant }} };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    try jw.beginArray();
+    try writeInputOpts(alloc, &jw, protocol.Model{
+        .id = "gpt-5.4",
+        .name = "codex",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 1024,
+    }, ctx, false);
+    try jw.endArray();
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "msg_commentary") == null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"function_call\"") != null);
 }
