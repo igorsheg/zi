@@ -678,17 +678,7 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .message_start_user => {},
-            .tool_call_streaming => |t| {
-                const renderer = self.resolver.resolve(t.tool_name);
-                self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
-                self.transcript.toolSetArgs(t.tool_call_id, t.args);
-                // Only freeze args once the stream terminates the
-                // block. Intermediate deltas keep args mutable so the
-                // next parse can overwrite them and re-render.
-                if (t.is_complete) self.transcript.toolSetArgsComplete(t.tool_call_id);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                self.tui.dirty = true;
-            },
+            .tool_call_streaming => {},
             .message_end_assistant => |m| {
                 if (m.is_aborted) {
                     self.status_text.setContent(m.error_message orelse "aborted");
