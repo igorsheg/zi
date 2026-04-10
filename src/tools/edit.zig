@@ -190,6 +190,9 @@ fn execute(
     }
 
     for (edits.items, 0..) |e, i| {
+        if (e.old_str.len == 0) {
+            return util.errorf(allocator, "edits[{d}].old_str must not be empty.", .{i});
+        }
         if (std.mem.eql(u8, e.old_str, e.new_str)) {
             return util.errorf(allocator, "edits[{d}].old_str and new_str are identical. no changes needed.", .{i});
         }
@@ -198,8 +201,12 @@ fn execute(
         }
     }
 
+    const io_path = lock_registry.canonicalizePath(allocator, resolved) catch
+        allocator.dupe(u8, resolved) catch return util.errorResult(allocator, "alloc failed");
+    defer allocator.free(io_path);
+
     // Read file.
-    const file = std.fs.cwd().openFile(resolved, .{}) catch |err| {
+    const file = std.fs.cwd().openFile(io_path, .{}) catch |err| {
         if (err == error.FileNotFound)
             return util.errorf(allocator, "file not found: {s}", .{resolved});
         return util.errorf(allocator, "edit tool: open failed: {s}", .{@errorName(err)});
@@ -247,13 +254,8 @@ fn execute(
         allocator.dupe(u8, new_content) catch return util.errorResult(allocator, "alloc failed");
     defer allocator.free(final_bytes);
 
-    {
-        const out = std.fs.cwd().createFile(resolved, .{ .truncate = true }) catch
-            return util.errorResult(allocator, "edit tool: write failed");
-        defer out.close();
-        out.writeAll(final_bytes) catch
-            return util.errorResult(allocator, "edit tool: write failed");
-    }
+    atomicWriteFile(io_path, final_bytes, stat.mode) catch
+        return util.errorResult(allocator, "edit tool: write failed");
 
     // Build a real Myers-based unified diff. `FileDiff` borrows from
     // `base` and `new_content`, so we serialize to owned text before
@@ -320,6 +322,17 @@ fn restoreCrlf(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         }
     }
     return out[0..n];
+}
+
+fn atomicWriteFile(path: []const u8, bytes: []const u8, mode: std.fs.File.Mode) !void {
+    var write_buffer: [4096]u8 = undefined;
+    var atomic_file = try std.fs.cwd().atomicFile(path, .{ .mode = mode, .write_buffer = &write_buffer });
+    defer atomic_file.deinit();
+
+    try atomic_file.file_writer.interface.writeAll(bytes);
+    try atomic_file.flush();
+    try atomic_file.file_writer.file.sync();
+    try atomic_file.renameIntoPlace();
 }
 
 // ── tier-3 fuzzy normalization ──────────────────────────────────────
@@ -478,78 +491,186 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return n;
 }
 
-const Strategy = struct {
-    base: []const u8, // borrowed (either content or fuzzy version)
-    base_owned: bool, // true if `base` was allocated by this call
-    search: []const u8, // borrowed/allocated; freed by caller via free_search
-    free_search: bool,
-    replace: []const u8,
-    free_replace: bool,
-    index: usize,
-    match_len: usize,
+const SearchStats = struct {
+    first_index: usize,
+    occurrences: usize,
 };
 
-fn findStrategy(
-    allocator: std.mem.Allocator,
-    content: []const u8,
+const PreparedEdit = struct {
+    edit_index: usize,
+    match_index: usize,
+    match_len: usize,
+    occurrences: usize,
+    search_str: []const u8,
+    replace_str: []const u8,
+};
+
+const CachedEdit = struct {
+    edit_index: usize,
     old_str: []const u8,
     new_str: []const u8,
-) !?Strategy {
-    // Tier 1: exact.
-    if (std.mem.indexOf(u8, content, old_str)) |idx| {
-        return Strategy{
-            .base = content,
-            .base_owned = false,
-            .search = old_str,
-            .free_search = false,
-            .replace = new_str,
-            .free_replace = false,
-            .index = idx,
-            .match_len = old_str.len,
+    unescaped_old: ?[]const u8 = null,
+    unescaped_new: ?[]const u8 = null,
+    fuzzy_old: ?[]const u8 = null,
+
+    fn deinit(self: *CachedEdit, allocator: std.mem.Allocator) void {
+        if (self.unescaped_old) |s| allocator.free(s);
+        if (self.unescaped_new) |s| allocator.free(s);
+        if (self.fuzzy_old) |s| allocator.free(s);
+    }
+};
+
+const MatchMode = enum { no_fuzzy, fuzzy_base };
+
+fn findSearchStats(haystack: []const u8, needle: []const u8) ?SearchStats {
+    if (needle.len == 0) return .{ .first_index = 0, .occurrences = 0 };
+    if (needle.len > haystack.len) return null;
+
+    var first: ?usize = null;
+    var occurrences: usize = 0;
+    var start: usize = 0;
+    while (start <= haystack.len - needle.len) {
+        const idx = std.mem.indexOfPos(u8, haystack, start, needle) orelse break;
+        if (first == null) first = idx;
+        occurrences += 1;
+        start = idx + needle.len;
+    }
+
+    return if (first) |idx| .{ .first_index = idx, .occurrences = occurrences } else null;
+}
+
+fn needsUnescape(s: []const u8) bool {
+    return std.mem.indexOfScalar(u8, s, '\\') != null;
+}
+
+fn cachedUnescapedOld(allocator: std.mem.Allocator, cache: *CachedEdit) !?[]const u8 {
+    if (!needsUnescape(cache.old_str)) return null;
+    if (cache.unescaped_old == null) {
+        const unescaped = try unescapeStrDup(allocator, cache.old_str);
+        if (std.mem.eql(u8, unescaped, cache.old_str)) {
+            allocator.free(unescaped);
+            return null;
+        }
+        cache.unescaped_old = unescaped;
+    }
+    return cache.unescaped_old;
+}
+
+fn cachedUnescapedNew(allocator: std.mem.Allocator, cache: *CachedEdit) ![]const u8 {
+    if (cache.unescaped_new) |s| return s;
+    const unescaped = try unescapeStrDup(allocator, cache.new_str);
+    cache.unescaped_new = unescaped;
+    return unescaped;
+}
+
+fn cachedFuzzyOld(allocator: std.mem.Allocator, cache: *CachedEdit) ![]const u8 {
+    if (cache.fuzzy_old) |s| return s;
+    const fuzzy = try fuzzyNormalize(allocator, cache.old_str);
+    cache.fuzzy_old = fuzzy;
+    return fuzzy;
+}
+
+fn prepareMatch(
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    cache: *CachedEdit,
+    mode: MatchMode,
+) !?PreparedEdit {
+    if (findSearchStats(base, cache.old_str)) |stats| {
+        return .{
+            .edit_index = cache.edit_index,
+            .match_index = stats.first_index,
+            .match_len = cache.old_str.len,
+            .occurrences = stats.occurrences,
+            .search_str = cache.old_str,
+            .replace_str = cache.new_str,
         };
     }
-    // Tier 2: unescape.
-    const u_old = try unescapeStrDup(allocator, old_str);
-    if (!std.mem.eql(u8, u_old, old_str)) {
-        if (std.mem.indexOf(u8, content, u_old)) |idx| {
-            const u_new = try unescapeStrDup(allocator, new_str);
-            return Strategy{
-                .base = content,
-                .base_owned = false,
-                .search = u_old,
-                .free_search = true,
-                .replace = u_new,
-                .free_replace = true,
-                .index = idx,
-                .match_len = u_old.len,
+
+    if (try cachedUnescapedOld(allocator, cache)) |unescaped_old| {
+        if (findSearchStats(base, unescaped_old)) |stats| {
+            return .{
+                .edit_index = cache.edit_index,
+                .match_index = stats.first_index,
+                .match_len = unescaped_old.len,
+                .occurrences = stats.occurrences,
+                .search_str = unescaped_old,
+                .replace_str = try cachedUnescapedNew(allocator, cache),
             };
         }
     }
-    allocator.free(u_old);
-    // Tier 3: fuzzy.
-    const fuzzy_content = try fuzzyNormalize(allocator, content);
-    const fuzzy_old = try fuzzyNormalize(allocator, old_str);
-    if (std.mem.indexOf(u8, fuzzy_content, fuzzy_old)) |idx| {
-        return Strategy{
-            .base = fuzzy_content,
-            .base_owned = true,
-            .search = fuzzy_old,
-            .free_search = true,
-            .replace = new_str,
-            .free_replace = false,
-            .index = idx,
-            .match_len = fuzzy_old.len,
-        };
+
+    if (mode == .fuzzy_base) {
+        const fuzzy_old = try cachedFuzzyOld(allocator, cache);
+        if (findSearchStats(base, fuzzy_old)) |stats| {
+            return .{
+                .edit_index = cache.edit_index,
+                .match_index = stats.first_index,
+                .match_len = fuzzy_old.len,
+                .occurrences = stats.occurrences,
+                .search_str = fuzzy_old,
+                .replace_str = cache.new_str,
+            };
+        }
     }
-    allocator.free(fuzzy_content);
-    allocator.free(fuzzy_old);
+
     return null;
 }
 
-fn freeStrategy(allocator: std.mem.Allocator, s: Strategy) void {
-    if (s.base_owned) allocator.free(s.base);
-    if (s.free_search) allocator.free(s.search);
-    if (s.free_replace) allocator.free(s.replace);
+fn rewriteOnce(
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    matches: []const MatchedEdit,
+) EditError![]u8 {
+    var final_len = base.len;
+    for (matches) |m| {
+        final_len = final_len - m.match_len + m.replace_str.len;
+    }
+
+    var out = allocator.alloc(u8, final_len) catch return error.OutOfMemory;
+    var src_index: usize = 0;
+    var dst_index: usize = 0;
+
+    for (matches) |m| {
+        const unchanged = base[src_index..m.match_index];
+        @memcpy(out[dst_index..][0..unchanged.len], unchanged);
+        dst_index += unchanged.len;
+
+        @memcpy(out[dst_index..][0..m.replace_str.len], m.replace_str);
+        dst_index += m.replace_str.len;
+        src_index = m.match_index + m.match_len;
+    }
+
+    const tail = base[src_index..];
+    @memcpy(out[dst_index..][0..tail.len], tail);
+    return out;
+}
+
+fn rewriteReplaceAll(
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    match: MatchedEdit,
+) EditError![]u8 {
+    if (match.occurrences == 0) return allocator.dupe(u8, base) catch return error.OutOfMemory;
+
+    const final_len = base.len - (match.match_len * match.occurrences) + (match.replace_str.len * match.occurrences);
+    var out = allocator.alloc(u8, final_len) catch return error.OutOfMemory;
+
+    var src_index: usize = 0;
+    var dst_index: usize = 0;
+    while (std.mem.indexOfPos(u8, base, src_index, match.search_str)) |idx| {
+        const unchanged = base[src_index..idx];
+        @memcpy(out[dst_index..][0..unchanged.len], unchanged);
+        dst_index += unchanged.len;
+
+        @memcpy(out[dst_index..][0..match.replace_str.len], match.replace_str);
+        dst_index += match.replace_str.len;
+        src_index = idx + match.match_len;
+    }
+
+    const tail = base[src_index..];
+    @memcpy(out[dst_index..][0..tail.len], tail);
+    return out;
 }
 
 fn applyEdits(
@@ -558,19 +679,18 @@ fn applyEdits(
     edits: []const EditBlock,
     failure_out: *?EditFailure,
 ) EditError!ApplyResult {
-    // First pass: detect strategy per edit. If any edit needs fuzzy,
-    // we re-run all edits against the fuzzy-normalized base. This
-    // mirrors the TS implementation.
+    var caches = try allocator.alloc(CachedEdit, edits.len);
+    defer allocator.free(caches);
+    for (edits, 0..) |e, idx| {
+        caches[idx] = .{ .edit_index = idx, .old_str = e.old_str, .new_str = e.new_str };
+    }
+    defer for (caches) |*cache| cache.deinit(allocator);
+
     var any_fuzzy = false;
-    {
-        var i: usize = 0;
-        while (i < edits.len) : (i += 1) {
-            const s = (try findStrategy(allocator, content, edits[i].old_str, edits[i].new_str)) orelse {
-                failure_out.* = .{ .edit_index = i, .kind = .not_found };
-                return error.NotFound;
-            };
-            defer freeStrategy(allocator, s);
-            if (s.base_owned) any_fuzzy = true;
+    for (caches) |*cache| {
+        if (try prepareMatch(allocator, content, cache, .no_fuzzy) == null) {
+            any_fuzzy = true;
+            break;
         }
     }
 
@@ -581,102 +701,51 @@ fn applyEdits(
     const base_owned = any_fuzzy;
     errdefer if (base_owned) allocator.free(base);
 
-    // Match each edit against `base`, collecting strategies that
-    // we'll apply right-to-left after sorting + overlap-checking.
     var matches: std.ArrayList(MatchedEdit) = .empty;
     defer matches.deinit(allocator);
-    var owned_strings: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (owned_strings.items) |s| allocator.free(s);
-        owned_strings.deinit(allocator);
-    }
+    try matches.ensureTotalCapacity(allocator, edits.len);
 
-    for (edits, 0..) |e, idx| {
-        const s = (try findStrategy(allocator, base, e.old_str, e.new_str)) orelse {
-            failure_out.* = .{ .edit_index = idx, .kind = .not_found };
+    for (caches) |*cache| {
+        const prepared = (try prepareMatch(allocator, base, cache, if (any_fuzzy) .fuzzy_base else .no_fuzzy)) orelse {
+            failure_out.* = .{ .edit_index = cache.edit_index, .kind = .not_found };
             return error.NotFound;
         };
-        // Carry the slice; freeStrategy at end-of-fn would invalidate.
-        if (s.base_owned) allocator.free(s.base);
-        if (s.free_search) try owned_strings.append(allocator, s.search);
-        if (s.free_replace) try owned_strings.append(allocator, s.replace);
-
-        const occ = countOccurrences(base, s.search);
-        if (!e.replace_all and occ > 1) {
-            failure_out.* = .{ .edit_index = idx, .kind = .ambiguous, .occurrences = occ };
+        if (!edits[cache.edit_index].replace_all and prepared.occurrences > 1) {
+            failure_out.* = .{ .edit_index = cache.edit_index, .kind = .ambiguous, .occurrences = prepared.occurrences };
             return error.Ambiguous;
         }
-        try matches.append(allocator, .{
-            .edit_index = idx,
-            .match_index = s.index,
-            .match_len = s.match_len,
-            .occurrences = occ,
-            .replace_str = s.replace,
-            .search_str = s.search,
+        matches.appendAssumeCapacity(.{
+            .edit_index = prepared.edit_index,
+            .match_index = prepared.match_index,
+            .match_len = prepared.match_len,
+            .occurrences = prepared.occurrences,
+            .replace_str = prepared.replace_str,
+            .search_str = prepared.search_str,
         });
     }
 
-    // Sort by match_index ascending.
+    if (matches.items.len == 1 and edits[matches.items[0].edit_index].replace_all) {
+        const new_content = try rewriteReplaceAll(allocator, base, matches.items[0]);
+        return .{ .base = base, .new_content = new_content };
+    }
+
     std.mem.sort(MatchedEdit, matches.items, {}, struct {
         fn lt(_: void, a: MatchedEdit, b: MatchedEdit) bool {
             return a.match_index < b.match_index;
         }
     }.lt);
 
-    // Overlap detection.
     var i: usize = 1;
     while (i < matches.items.len) : (i += 1) {
         const prev = matches.items[i - 1];
         const cur = matches.items[i];
-        const prev_end = if (edits[prev.edit_index].replace_all)
-            std.math.maxInt(usize)
-        else
-            prev.match_index + prev.match_len;
-        if (prev_end > cur.match_index) {
+        if (prev.match_index + prev.match_len > cur.match_index) {
             failure_out.* = .{ .edit_index = cur.edit_index, .kind = .overlap };
             return error.Overlap;
         }
     }
 
-    // Apply right-to-left into a fresh buffer.
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    out.appendSlice(allocator, base) catch return error.OutOfMemory;
-
-    var j: usize = matches.items.len;
-    while (j > 0) {
-        j -= 1;
-        const m = matches.items[j];
-        if (edits[m.edit_index].replace_all) {
-            // Whole-string replace_all on `out`.
-            const before = out.toOwnedSlice(allocator) catch return error.OutOfMemory;
-            defer allocator.free(before);
-            const replaced = std.mem.replaceOwned(u8, allocator, before, m.search_str, m.replace_str) catch
-                return error.OutOfMemory;
-            out = .empty;
-            out.appendSlice(allocator, replaced) catch {
-                allocator.free(replaced);
-                return error.OutOfMemory;
-            };
-            allocator.free(replaced);
-        } else {
-            // Single replacement at m.match_index.
-            const new_total = out.items.len - m.match_len + m.replace_str.len;
-            var buf = allocator.alloc(u8, new_total) catch return error.OutOfMemory;
-            @memcpy(buf[0..m.match_index], out.items[0..m.match_index]);
-            @memcpy(buf[m.match_index..][0..m.replace_str.len], m.replace_str);
-            const tail_src = m.match_index + m.match_len;
-            @memcpy(buf[m.match_index + m.replace_str.len ..], out.items[tail_src..]);
-            out.clearRetainingCapacity();
-            out.appendSlice(allocator, buf) catch {
-                allocator.free(buf);
-                return error.OutOfMemory;
-            };
-            allocator.free(buf);
-        }
-    }
-
-    const new_content = out.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    const new_content = try rewriteOnce(allocator, base, matches.items);
     return .{ .base = base, .new_content = new_content };
 }
 
