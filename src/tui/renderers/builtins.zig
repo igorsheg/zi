@@ -484,7 +484,13 @@ fn measureBoxed(ctx: *const ToolRenderContext, mode: ParseMode, collapsed_excerp
     var visible: u32 = 0;
     var gaps: u32 = 0;
     for (window.items) |item| switch (item) {
-        .span => |span| visible += span.end - span.start,
+        .span => |span| {
+            // Be defensive here: excerpt windows should always satisfy
+            // end >= start, but if a malformed span slips through during
+            // teardown/recovery we still don't want the UI thread to die
+            // on an overflow trap.
+            visible += span.end -| span.start;
+        },
         .gap => gaps += 1,
     };
     var h = box_chrome.measureHeight(visible, gaps);

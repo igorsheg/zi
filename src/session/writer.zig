@@ -227,14 +227,16 @@ pub const SessionWriter = struct {
         const file = std.fs.createFileAbsolute(self.session_file, .{}) catch return;
         defer file.close();
 
+        var buf: [4096]u8 = undefined;
+        var fw = file.writer(&buf);
         for (self.buffered_entries.items) |fe| {
-            const line = switch (fe) {
-                .header => |h| json.serializeHeader(self.allocator, h) catch continue,
-                .entry => |e| json.serializeEntry(self.allocator, e) catch continue,
-            };
-            file.writeAll(line) catch {};
-            file.writeAll("\n") catch {};
+            switch (fe) {
+                .header => |h| json.writeHeader(&fw.interface, h) catch continue,
+                .entry => |e| json.writeEntry(&fw.interface, e) catch continue,
+            }
+            fw.interface.writeAll("\n") catch {};
         }
+        fw.end() catch {};
         self.flushed = true;
         self.buffered_entries.clearRetainingCapacity();
     }
@@ -242,12 +244,14 @@ pub const SessionWriter = struct {
     /// Append a single entry to the already-flushed file.
     fn appendToFile(self: *SessionWriter, entry: proto.SessionEntry) !void {
         if (!self.persist) return;
-        const line = try json.serializeEntry(self.allocator, entry);
         const file = try std.fs.openFileAbsolute(self.session_file, .{ .mode = .read_write });
         defer file.close();
         try file.seekFromEnd(0);
-        try file.writeAll(line);
-        try file.writeAll("\n");
+        var buf: [4096]u8 = undefined;
+        var fw = file.writerStreaming(&buf);
+        try json.writeEntry(&fw.interface, entry);
+        try fw.interface.writeAll("\n");
+        try fw.end();
     }
 
     /// Generate a unique 8-char hex ID, collision-checked.

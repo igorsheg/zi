@@ -222,16 +222,13 @@ pub const ListPicker = struct {
         const query = self.query_buf[0..self.query_len];
 
         if (query.len == 0) {
-            // No filter — show all items (fuzzyFilter handles alphabetical sort)
-            var texts: [MAX_ITEMS][]const u8 = undefined;
+            // No filter — preserve caller order. Some pickers pre-sort items
+            // intentionally (for example /resume wants most-recent-first), and
+            // empty-query fuzzy sorting would scramble that ordering.
             for (0..count) |i| {
-                texts[i] = self.getSearchText(i);
+                self.filtered_buf[i] = self.all_items[i];
             }
-            const n = fuzzy_mod.fuzzyFilter("", texts[0..count], &self.match_indices);
-            for (0..n) |i| {
-                self.filtered_buf[i] = self.all_items[self.match_indices[i]];
-            }
-            self.filtered_count = n;
+            self.filtered_count = count;
         } else {
             var texts: [MAX_ITEMS][]const u8 = undefined;
             for (0..count) |i| {

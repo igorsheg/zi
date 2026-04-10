@@ -12,6 +12,10 @@ pub const SessionInfo = struct {
     session_id: []const u8,
     cwd: []const u8,
     timestamp: []const u8,
+    /// File mtime in ns-like stat units. Used for picker ordering so
+    /// recently active sessions appear first, even if they were
+    /// created long ago.
+    modified_at: i128 = 0,
     /// First user message text (preview/summary). Truncated to ~200 chars.
     first_message: []const u8,
     /// Number of message entries.
@@ -242,21 +246,27 @@ pub fn listSessions(allocator: std.mem.Allocator, cwd: []const u8) ![]SessionInf
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
 
         const full_path = try std.fs.path.join(allocator, &.{ session_dir, entry.name });
+        const stat = dir.statFile(entry.name) catch {
+            allocator.free(full_path);
+            continue;
+        };
 
         if (scanSessionFile(allocator, full_path)) |info| {
-            try results.append(allocator, info);
+            var session = info;
+            session.modified_at = stat.mtime;
+            try results.append(allocator, session);
         } else {
             allocator.free(full_path);
         }
     }
 
-    // Sort by timestamp descending (most recent first)
+    // Sort by file mtime descending (most recent activity first).
     const items = results.items;
     for (1..items.len) |i| {
         const key = items[i];
         var j: usize = i;
         while (j > 0) {
-            if (std.mem.lessThan(u8, items[j - 1].timestamp, key.timestamp)) {
+            if (items[j - 1].modified_at < key.modified_at) {
                 items[j] = items[j - 1];
                 j -= 1;
             } else break;

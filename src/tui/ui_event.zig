@@ -150,6 +150,9 @@ pub const UiEvent = union(enum) {
         provider: []u8,
         id: []u8,
     },
+    model_switch_failed: struct {
+        message: []u8,
+    },
 
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
@@ -196,6 +199,7 @@ pub const UiEvent = union(enum) {
                 allocator.free(m.provider);
                 allocator.free(m.id);
             },
+            .model_switch_failed => |m| allocator.free(m.message),
             .prompt_worker_finished => |p| {
                 if (p.internal_error) |msg| allocator.free(msg);
             },

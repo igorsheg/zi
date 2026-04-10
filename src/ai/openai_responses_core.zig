@@ -836,8 +836,7 @@ pub fn buildRequestJson(
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
 ) !void {
-    var allocating: std.io.Writer.Allocating = .init(allocator);
-    defer allocating.deinit();
+    var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
@@ -879,7 +878,7 @@ pub fn buildRequestJson(
     }
 
     try jw.endObject();
-    try out.appendSlice(allocator, allocating.written());
+    out.* = allocating.toArrayList();
 }
 
 pub fn writeInput(

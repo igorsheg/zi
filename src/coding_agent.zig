@@ -89,6 +89,16 @@ pub const AgentSession = struct {
         index: usize,
     };
 
+    pub const ModelSwitchResult = union(enum) {
+        success: struct {
+            model: ai.protocol.Model,
+            thinking_level: protocol.ThinkingLevel,
+            thinking_level_changed: bool,
+        },
+        no_auth: ai.protocol.Model,
+        registry_unavailable: void,
+    };
+
     pub const Options = struct {
         model: ai.protocol.Model,
         /// Static API key fallback. Used only when no `auth_storage` is
@@ -467,6 +477,52 @@ pub const AgentSession = struct {
             self.allocator.destroy(state);
             self._extension_lua_state = null;
         }
+    }
+
+    /// Canonical session-owned model switch. Owns validation,
+    /// in-memory state mutation, session persistence, and thinking-
+    /// level reclamp for the new model's capabilities.
+    pub fn trySetModel(self: *AgentSession, model: ai.protocol.Model) ModelSwitchResult {
+        const registry = self.model_registry orelse return .registry_unavailable;
+        if (!registry.hasConfiguredAuth(model)) {
+            return .{ .no_auth = model };
+        }
+
+        const previous_thinking = self.agent.state.thinking_level;
+        const next_thinking = clampThinkingLevelForModel(previous_thinking, model);
+        const thinking_changed = next_thinking != previous_thinking;
+
+        self.agent.state.model = model;
+        self.agent.state.thinking_level = next_thinking;
+        const provider_str = ai.json_util.providerToString(model.provider);
+        self.session_store.appendModelChange(provider_str, model.id);
+        if (thinking_changed) {
+            self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(next_thinking));
+        }
+        return .{ .success = .{
+            .model = model,
+            .thinking_level = next_thinking,
+            .thinking_level_changed = thinking_changed,
+        } };
+    }
+
+    fn clampThinkingLevelForModel(level: protocol.ThinkingLevel, model: ai.protocol.Model) protocol.ThinkingLevel {
+        if (!model.reasoning) return .off;
+        return switch (level) {
+            .xhigh => if (ai.protocol.supportsXhigh(model)) .xhigh else .high,
+            else => level,
+        };
+    }
+
+    fn agentThinkingLevelToString(level: protocol.ThinkingLevel) []const u8 {
+        return switch (level) {
+            .off => "off",
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "xhigh",
+        };
     }
 
     pub fn deinit(self: *AgentSession) void {
@@ -849,6 +905,120 @@ pub fn openSession(
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "trySetModel updates session state and appends model change when auth exists" {
+    const alloc = testing.allocator;
+
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    auth.setRuntimeApiKey("anthropic", "test-key");
+
+    var model_registry = try ai.model_registry.ModelRegistry.init(alloc, &auth, &.{});
+    defer model_registry.deinit();
+
+    var fp = faux.FauxProvider.init(alloc);
+    var registry = ai.provider.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    const target = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    var ca = try AgentSession.init(alloc, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = &registry,
+        .auth_storage = &auth,
+        .model_registry = &model_registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    const result = ca.trySetModel(target);
+    try testing.expect(result == .success);
+    try testing.expectEqualStrings(target.id, result.success.model.id);
+    try testing.expectEqual(.off, result.success.thinking_level);
+    try testing.expect(!result.success.thinking_level_changed);
+    try testing.expectEqualStrings(target.id, ca.agent.state.model.id);
+    try testing.expectEqual(@as(usize, 1), ca.session_store.writer.buffered_entries.items.len);
+    const entry = ca.session_store.writer.buffered_entries.items[0].entry;
+    try testing.expect(entry != null);
+    try testing.expect(entry.?.entry == .model_change);
+    try testing.expectEqualStrings("anthropic", entry.?.entry.model_change.provider);
+    try testing.expectEqualStrings(target.id, entry.?.entry.model_change.model_id);
+}
+
+test "trySetModel reclamps xhigh to high and persists thinking change when target lacks xhigh" {
+    const alloc = testing.allocator;
+
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    auth.setRuntimeApiKey("anthropic", "test-key");
+
+    var model_registry = try ai.model_registry.ModelRegistry.init(alloc, &auth, &.{});
+    defer model_registry.deinit();
+
+    var fp = faux.FauxProvider.init(alloc);
+    var registry = ai.provider.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    const target = model_registry.find(.anthropic, "claude-sonnet-4-20250514") orelse return error.MissingCatalogEntry;
+    var ca = try AgentSession.init(alloc, .{
+        .model = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry,
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = &registry,
+        .auth_storage = &auth,
+        .model_registry = &model_registry,
+        .thinking_level = .xhigh,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    const result = ca.trySetModel(target);
+    try testing.expect(result == .success);
+    try testing.expectEqual(.high, result.success.thinking_level);
+    try testing.expect(result.success.thinking_level_changed);
+    try testing.expectEqual(.high, ca.agent.state.thinking_level);
+    try testing.expectEqual(@as(usize, 2), ca.session_store.writer.buffered_entries.items.len);
+    const thinking_entry = ca.session_store.writer.buffered_entries.items[1].entry;
+    try testing.expect(thinking_entry != null);
+    try testing.expect(thinking_entry.?.entry == .thinking_level_change);
+    try testing.expectEqualStrings("high", thinking_entry.?.entry.thinking_level_change.thinking_level);
+}
+
+test "trySetModel rejects unauthed model without mutating state or session" {
+    const alloc = testing.allocator;
+
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+
+    var model_registry = try ai.model_registry.ModelRegistry.init(alloc, &auth, &.{});
+    defer model_registry.deinit();
+
+    var fp = faux.FauxProvider.init(alloc);
+    var registry = ai.provider.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    const initial = faux.fauxModel();
+    const blocked = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    var ca = try AgentSession.init(alloc, .{
+        .model = initial,
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .registry = &registry,
+        .auth_storage = &auth,
+        .model_registry = &model_registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    const result = ca.trySetModel(blocked);
+    try testing.expect(result == .no_auth);
+    try testing.expectEqualStrings(initial.id, ca.agent.state.model.id);
+    try testing.expectEqual(@as(usize, 0), ca.session_store.writer.buffered_entries.items.len);
+}
 
 test "convertToLlm passes through user/assistant/tool_result" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

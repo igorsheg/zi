@@ -836,6 +836,11 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
+            .model_switch_failed => |m| {
+                self.status_text.setContent(m.message);
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+            },
             .model_switched => |m| {
                 // status_data.model_id is a borrow into the live
                 // model in agent state — agent thread already
@@ -1790,22 +1795,34 @@ pub const Interactive = struct {
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
-    /// Mutates ca.agent.state.model and appends a model_change entry
-    /// to the session store — both agent-owned per the doctrine.
-    /// Publishes `.model_switched` with msg_allocator-cloned
-    /// provider/id so the TUI can update status_data and persist the
-    /// new default without reaching back into agent state.
+    /// Delegates the canonical validation + mutation path to
+    /// `AgentSession.trySetModel`, then translates the typed outcome
+    /// into a TUI-owned event payload.
     fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
-        self.ca.agent.state.model = m;
-        const provider_str = json_util.providerToString(m.provider);
-        self.ca.session_store.appendModelChange(provider_str, m.id);
-
-        const provider_copy = self.msg_allocator.dupe(u8, provider_str) catch return;
-        const id_copy = self.msg_allocator.dupe(u8, m.id) catch {
-            self.msg_allocator.free(provider_copy);
-            return;
-        };
-        self.event_queue.push(.{ .model_switched = .{ .provider = provider_copy, .id = id_copy } });
+        switch (self.ca.trySetModel(m)) {
+            .success => |switched| {
+                const provider_str = json_util.providerToString(switched.model.provider);
+                const provider_copy = self.msg_allocator.dupe(u8, provider_str) catch return;
+                const id_copy = self.msg_allocator.dupe(u8, switched.model.id) catch {
+                    self.msg_allocator.free(provider_copy);
+                    return;
+                };
+                self.event_queue.push(.{ .model_switched = .{ .provider = provider_copy, .id = id_copy } });
+            },
+            .no_auth => |blocked| {
+                const provider_str = json_util.providerToString(blocked.provider);
+                const msg = std.fmt.allocPrint(
+                    self.msg_allocator,
+                    "No API key for {s}/{s}",
+                    .{ provider_str, blocked.id },
+                ) catch return;
+                self.event_queue.push(.{ .model_switch_failed = .{ .message = msg } });
+            },
+            .registry_unavailable => {
+                const msg = self.msg_allocator.dupe(u8, "model registry unavailable") catch return;
+                self.event_queue.push(.{ .model_switch_failed = .{ .message = msg } });
+            },
+        }
     }
 
     /// Session event callback — runs on the AGENT THREAD.

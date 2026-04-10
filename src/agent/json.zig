@@ -7,15 +7,11 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const session_json = @import("../session/json.zig");
 const ai = @import("../ai/root.zig");
-const json_util = ai.json_util;
 
 const Stringify = std.json.Stringify;
-const Writer = std.io.Writer;
 
-pub fn serializeAgentEvent(allocator: std.mem.Allocator, event: protocol.AgentEvent) ![]const u8 {
-    var out: Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var jw: Stringify = .{ .writer = &out.writer };
+pub fn writeAgentEvent(writer: *std.io.Writer, event: protocol.AgentEvent) !void {
+    var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();
 
@@ -109,7 +105,6 @@ pub fn serializeAgentEvent(allocator: std.mem.Allocator, event: protocol.AgentEv
     }
 
     try jw.endObject();
-    return out.toOwnedSlice();
 }
 
 fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessageEvent) !void {

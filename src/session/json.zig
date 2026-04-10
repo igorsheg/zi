@@ -3,16 +3,14 @@ const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const json_util = ai.json_util;
+const json_write = @import("../json/write.zig");
 
 const Stringify = std.json.Stringify;
-const Writer = std.io.Writer;
 
 // ─── Serialization ──────────────────────────────────────────────────
 
-pub fn serializeHeader(allocator: std.mem.Allocator, header: proto.SessionHeader) ![]const u8 {
-    var out: Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var jw: Stringify = .{ .writer = &out.writer };
+pub fn writeHeader(writer: *std.io.Writer, header: proto.SessionHeader) !void {
+    var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();
     try jw.objectField("type");
@@ -30,14 +28,10 @@ pub fn serializeHeader(allocator: std.mem.Allocator, header: proto.SessionHeader
         try jw.write(ps);
     }
     try jw.endObject();
-
-    return out.toOwnedSlice();
 }
 
-pub fn serializeEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) ![]const u8 {
-    var out: Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var jw: Stringify = .{ .writer = &out.writer };
+pub fn writeEntry(writer: *std.io.Writer, entry: proto.SessionEntry) !void {
+    var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();
 
@@ -147,7 +141,6 @@ pub fn serializeEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) !
     }
 
     try jw.endObject();
-    return out.toOwnedSlice();
 }
 
 // ─── Message writers ────────────────────────────────────────────────
@@ -746,7 +739,7 @@ test "header round-trip" {
         .version = 3,
         .parent_session = null,
     };
-    const json_str = try serializeHeader(allocator, header);
+    const json_str = try json_write.toOwnedSlice(allocator, header, writeHeader);
     defer allocator.free(json_str);
 
     const parsed = try parseFileEntry(allocator, json_str);
@@ -771,7 +764,7 @@ test "header with parentSession" {
         .cwd = "/tmp",
         .parent_session = "parent-uuid",
     };
-    const json_str = try serializeHeader(allocator, header);
+    const json_str = try json_write.toOwnedSlice(allocator, header, writeHeader);
     defer allocator.free(json_str);
 
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"parentSession\":\"parent-uuid\"") != null);
@@ -800,7 +793,7 @@ test "message entry round-trip with user message" {
             } },
         } },
     };
-    const json_str = try serializeEntry(allocator, entry);
+    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     defer allocator.free(json_str);
 
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"type\":\"message\"") != null);
@@ -821,7 +814,7 @@ test "model_change entry wire format" {
             .model_id = "claude-sonnet-4-5",
         } },
     };
-    const json_str = try serializeEntry(allocator, entry);
+    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     defer allocator.free(json_str);
 
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"type\":\"model_change\"") != null);
@@ -842,7 +835,7 @@ test "compaction entry wire format" {
             .from_hook = true,
         } },
     };
-    const json_str = try serializeEntry(allocator, entry);
+    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     defer allocator.free(json_str);
 
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"firstKeptEntryId\":\"aa000000\"") != null);
@@ -883,7 +876,7 @@ test "assistant message round-trips normalized failure metadata" {
         } } } },
     };
 
-    const json_str = try serializeEntry(allocator, entry);
+    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     defer allocator.free(json_str);
     const parsed = try parseEntry(allocator, json_str);
     switch (parsed.entry) {
@@ -897,6 +890,43 @@ test "assistant message round-trips normalized failure metadata" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "serializeEntry works when caller allocator is an arena" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const long_tool_call_id = try std.fmt.allocPrint(allocator, "call_{s}|fc_{s}", .{
+        "0123456789abcdef0123456789abcdef0123456789abcdef",
+        "fedcba9876543210fedcba9876543210fedcba9876543210",
+    });
+    const long_tool_name = try std.fmt.allocPrint(allocator, "tool-{s}", .{"abcdefghijklmnopqrstuvwxyz0123456789"});
+    const long_text = try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}", .{
+        "first line with enough text to force JSON writer growth",
+        "second line with enough text to force JSON writer growth again",
+        "third line with enough text to keep realloc pressure on the scratch buffer",
+    });
+
+    var tool_content = [_]ai.protocol.ToolResultMessage.ContentBlock{
+        .{ .text = .{ .text = long_text } },
+    };
+    const entry = proto.SessionEntry{
+        .id = "arena000",
+        .parent_id = null,
+        .timestamp = "2025-01-01T00:00:00.000Z",
+        .entry = .{ .message = .{ .message = .{ .tool_result = .{
+            .tool_call_id = long_tool_call_id,
+            .tool_name = long_tool_name,
+            .content = &tool_content,
+            .is_error = false,
+            .timestamp = 1700000002000,
+        } } } },
+    };
+
+    const line = try json_write.toOwnedSlice(allocator, entry, writeEntry);
+    try std.testing.expect(std.mem.indexOf(u8, line, long_tool_call_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, long_tool_name) != null);
 }
 
 test "session write-read-buildContext round-trip" {
@@ -958,7 +988,7 @@ test "session write-read-buildContext round-trip" {
             .timestamp = "2025-01-01T00:00:00.000Z",
             .entry = .{ .message = .{ .message = ed.msg } },
         };
-        json_lines[i] = try serializeEntry(allocator, entry);
+        json_lines[i] = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     }
     defer for (&json_lines) |jl| allocator.free(jl);
 

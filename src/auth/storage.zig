@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const shared_storage = @import("../storage.zig");
+const json_write = @import("../json/write.zig");
 const types = @import("types.zig");
 const file_backend = @import("file_backend.zig");
 const resolve_config_value = @import("resolve_config_value.zig");
@@ -69,7 +70,7 @@ pub const AuthStorage = struct {
         var backend: file_backend.Backend = .{ .memory = @import("../storage.zig").MemoryFile.init(allocator) };
 
         if (initial_data) |d| {
-            const json = try types.serializeAuthJson(allocator, d);
+            const json = try json_write.toOwnedSlice(allocator, d, types.writeAuthJson);
             defer allocator.free(json);
             try backend.writeContent(json);
         }
@@ -488,7 +489,7 @@ pub const AuthStorage = struct {
     /// step that `persistProviderChange` does. Used by the refresh
     /// path which needs the read+exchange+write to be atomic.
     fn persistInsideLock(self: *AuthStorage, arena_alloc: std.mem.Allocator) !void {
-        const json = try types.serializeAuthJson(arena_alloc, &self.data);
+        const json = try json_write.toOwnedSlice(arena_alloc, &self.data, types.writeAuthJson);
         try self.backend.writeContent(json);
     }
 
@@ -526,7 +527,7 @@ pub const AuthStorage = struct {
         }
 
         // Serialize and write
-        const json = types.serializeAuthJson(arena_alloc, &current_data) catch return;
+        const json = json_write.toOwnedSlice(arena_alloc, &current_data, types.writeAuthJson) catch return;
         self.backend.writeContent(json) catch return;
     }
 
@@ -681,7 +682,7 @@ test "zi-m7q: repeated set on same provider keeps key valid (no UAF on serialize
     storage.set("anthropic", .{ .api_key = .{ .key = "one" } });
     storage.set("anthropic", .{ .api_key = .{ .key = "two" } });
 
-    const json = try types.serializeAuthJson(allocator, storage.getAll());
+    const json = try json_write.toOwnedSlice(allocator, storage.getAll(), types.writeAuthJson);
     defer allocator.free(json);
 
     // Pre-fix: this would be `"\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"`.

@@ -245,12 +245,45 @@ const TimeoutGuard = struct {
     var noop_done = std.atomic.Value(bool).init(false);
 
     fn watchdog(timeout_secs: u64, pid: std.process.Child.Id, done: *std.atomic.Value(bool), did_timeout: *std.atomic.Value(bool)) void {
-        std.Thread.sleep(timeout_secs * std.time.ns_per_s);
+        const deadline_ns = timeout_secs * std.time.ns_per_s;
+        var elapsed_ns: u64 = 0;
+        const poll_ns = 100 * std.time.ns_per_ms;
+
+        while (elapsed_ns < deadline_ns) {
+            if (done.load(.acquire)) return;
+            const remaining_ns = deadline_ns - elapsed_ns;
+            const sleep_ns = @min(poll_ns, remaining_ns);
+            std.Thread.sleep(sleep_ns);
+            elapsed_ns += sleep_ns;
+        }
+
         if (done.load(.acquire)) return;
         did_timeout.store(true, .release);
         std.posix.kill(pid, std.posix.SIG.KILL) catch {};
     }
 };
+
+test "TimeoutGuard.stop does not wait for the full timeout after process exit" {
+    const testing = std.testing;
+
+    var child = std.process.Child.init(&.{ "/bin/sh", "-c", "exit 0" }, testing.allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    var guard = TimeoutGuard.start(2, child.id);
+
+    _ = try child.wait();
+    try testing.expect(!guard.did_timeout.load(.acquire));
+    guard.markExited();
+
+    const start_ns = std.time.nanoTimestamp();
+    guard.stop();
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+
+    try testing.expect(elapsed_ns < 500 * std.time.ns_per_ms);
+}
 
 fn oneText(allocator: std.mem.Allocator, text: []const u8) []agent.protocol.AgentToolResult.ContentBlock {
     const owned = allocator.dupe(u8, text) catch text;

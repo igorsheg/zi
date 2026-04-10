@@ -1,5 +1,6 @@
 const std = @import("std");
 const json_util = @import("../ai/json_util.zig");
+const json_write = @import("../json/write.zig");
 
 /// API key credential — stored as `{"type": "api_key", "key": "..."}` in auth.json.
 /// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:22-25
@@ -165,15 +166,11 @@ fn freeOneCredential(allocator: std.mem.Allocator, cred: AuthCredential) void {
     }
 }
 
-/// Serialize AuthStorageData to JSON string matching pi-mono's format.
+/// Write AuthStorageData as JSON matching pi-mono's format.
 /// Produces `JSON.stringify(data, null, 2)` output — 2-space indent.
-/// Caller owns the returned string.
-pub fn serializeAuthJson(allocator: std.mem.Allocator, data: *const AuthStorageData) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-
+pub fn writeAuthJson(writer: *std.io.Writer, data: *const AuthStorageData) !void {
     var jw: std.json.Stringify = .{
-        .writer = &out.writer,
+        .writer = writer,
         .options = .{ .whitespace = .indent_2 },
     };
 
@@ -213,9 +210,6 @@ pub fn serializeAuthJson(allocator: std.mem.Allocator, data: *const AuthStorageD
     }
 
     try jw.endObject();
-    try out.writer.flush();
-
-    return try allocator.dupe(u8, out.written());
 }
 
 /// Free all allocations owned by an AuthStorageData map.
@@ -293,7 +287,7 @@ test "round-trip serialize then parse preserves data" {
         .extras = std.json.ObjectMap.init(std.testing.allocator),
     } });
 
-    const json = try serializeAuthJson(std.testing.allocator, &data);
+    const json = try json_write.toOwnedSlice(std.testing.allocator, &data, writeAuthJson);
     defer std.testing.allocator.free(json);
 
     var parsed = try parseAuthJson(std.testing.allocator, json);

@@ -525,13 +525,11 @@ const PrintHandler = struct {
 /// JSON handler: serializes each AgentEvent as a JSONL line to stdout.
 const JsonHandler = struct {
     fn callback(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {
-        const serialized = agent_json.serializeAgentEvent(
-            std.heap.page_allocator,
-            event,
-        ) catch return;
-        defer std.heap.page_allocator.free(serialized);
-        stdout.writeAll(serialized) catch {};
-        stdout.writeAll("\n") catch {};
+        var buf: [4096]u8 = undefined;
+        var w = stdout.writerStreaming(&buf);
+        agent_json.writeAgentEvent(&w.interface, event) catch return;
+        w.interface.writeAll("\n") catch {};
+        w.end() catch {};
     }
 };
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const json_write = @import("../json/write.zig");
 
 const Stringify = std.json.Stringify;
 const Writer = std.Io.Writer;
@@ -507,18 +508,14 @@ pub fn serializeSettingsObject(allocator: std.mem.Allocator, object: ObjectMap) 
     );
 }
 
-/// Serialize typed Settings to a pretty-printed JSON string.
+/// Write typed Settings as pretty-printed JSON.
 /// Only writes non-null fields.
-pub fn serializeSettings(allocator: std.mem.Allocator, settings: *const types.Settings) ![]const u8 {
-    var out: Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var jw: Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .indent_2 } };
+pub fn writeSettings(writer: *std.Io.Writer, settings: *const types.Settings) !void {
+    var jw: Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
 
     try jw.beginObject();
     try writeSettingsFields(&jw, settings);
     try jw.endObject();
-
-    return out.toOwnedSlice();
 }
 
 fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
@@ -1173,7 +1170,7 @@ test "parseSettingsJson round-trips all field categories" {
     try testing.expectEqual(types.SteeringMode.one_at_a_time, s.steering_mode.?);
     try testing.expectEqual(types.FollowUpMode.all, s.follow_up_mode.?);
 
-    const json_out = try serializeSettings(allocator, &s);
+    const json_out = try json_write.toOwnedSlice(allocator, &s, writeSettings);
     defer allocator.free(json_out);
 
     var rt = try parseSettingsJson(allocator, json_out);

@@ -132,8 +132,7 @@ fn buildCodexRequestJson(
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
 ) anyerror!void {
-    var allocating: std.io.Writer.Allocating = .init(allocator);
-    defer allocating.deinit();
+    var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
@@ -184,7 +183,7 @@ fn buildCodexRequestJson(
     }
 
     try jw.endObject();
-    try out.appendSlice(allocator, allocating.written());
+    out.* = allocating.toArrayList();
 }
 
 /// Extract chatgpt_account_id from a JWT access token.

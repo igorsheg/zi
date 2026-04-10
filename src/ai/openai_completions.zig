@@ -890,8 +890,7 @@ fn buildRequestJson(
     context: protocol.Context,
     reasoning: ?protocol.ThinkingLevel,
 ) !void {
-    var allocating: std.io.Writer.Allocating = .init(allocator);
-    defer allocating.deinit();
+    var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
@@ -979,8 +978,7 @@ fn buildRequestJson(
     }
 
     try jw.endObject();
-
-    try out.appendSlice(allocator, allocating.written());
+    out.* = allocating.toArrayList();
 }
 
 fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protocol.Context) !void {

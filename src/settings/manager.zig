@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const json = @import("json.zig");
+const json_write = @import("../json/write.zig");
 const storage_mod = @import("storage.zig");
 const file_storage = @import("file_storage.zig");
 
@@ -50,8 +51,7 @@ pub const SettingsManager = struct {
         var mem = try allocator.create(storage_mod.InMemorySettingsStorage);
         mem.* = storage_mod.InMemorySettingsStorage.init(allocator);
         if (initial) |s| {
-            const json_str = try json.serializeSettings(allocator, &s);
-            mem.global = json_str;
+            mem.global = try json_write.toOwnedSlice(allocator, &s, json.writeSettings);
         }
         return fromStorageInternal(allocator, mem.asStorage(), true);
     }
