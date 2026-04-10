@@ -7,7 +7,7 @@ const terminal_mod = @import("terminal.zig");
 const keys_mod = @import("keys.zig");
 const component_mod = @import("component.zig");
 const text_mod = @import("components/text.zig");
-const header_mod = @import("components/header.zig");
+const greeter_mod = @import("components/greeter.zig");
 const footer_mod = @import("components/footer.zig");
 const editor_mod = @import("components/editor.zig");
 const loader_mod = @import("components/loader.zig");
@@ -156,7 +156,7 @@ pub const Interactive = struct {
     /// Initialized in init() after self.editor is set up.
     active_editor: EditorInterface = undefined,
     status_text: text_mod.Text,
-    header: header_mod.Header,
+    greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
     resolver: ToolRendererResolver,
@@ -226,6 +226,7 @@ pub const Interactive = struct {
     is_streaming: bool = false,
     last_ctrl_c_ns: i128 = 0,
     tool_output_expanded: bool = false,
+    greeter_dismissed: bool = false,
     /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
     input: input_buffer_mod.InputBuffer,
     /// Kitty protocol negotiation: deadline (ns timestamp) for query response.
@@ -253,7 +254,7 @@ pub const Interactive = struct {
             .theme = theme,
             .editor = editor_mod.Editor.init(allocator),
             .status_text = text_mod.Text.init(allocator),
-            .header = .{ .theme = theme, .version = "0.1.0" },
+            .greeter = .{ .theme = theme, .version = "0.1.0" },
             .footer = .{ .theme = theme },
             .transcript = Transcript.init(allocator),
             .resolver = resolver,
@@ -406,7 +407,7 @@ pub const Interactive = struct {
         self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
 
         // Populate container slots with their initial children.
-        self.header_container.addChild(self.header.component());
+        self.refreshGreeterVisibility();
         self.status_container.addChild(self.status_text.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
@@ -423,7 +424,6 @@ pub const Interactive = struct {
         self.tui.root.addChild(self.widget_above_container.component()); // [4] widgetAboveContainer
         self.tui.root.addChild(self.editor_container.component()); // [5] editorContainer
         self.tui.root.addChild(self.widget_below_container.component()); // [6] widgetBelowContainer
-        self.tui.root.addChild(self.footer.component()); // [7] footer (direct, no wrapper)
         self.tui.root.flex_child_index = 1; // transcript is flex
         self.tui.root.focused_child_index = 5; // editorContainer for cursor y-offset
 
@@ -502,6 +502,7 @@ pub const Interactive = struct {
         // Bare \n = newline insertion (some terminals send this for shift+enter)
         if (seq.len == 1 and seq[0] == '\n') {
             self.active_editor.insertText("\n");
+            self.refreshGreeterVisibility();
             self.tui.dirty = true;
             return;
         }
@@ -517,6 +518,7 @@ pub const Interactive = struct {
     fn onInputPaste(content: []const u8, raw_ctx: *anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(raw_ctx));
         self.active_editor.insertText(content);
+        self.refreshGreeterVisibility();
         self.tui.dirty = true;
     }
 
@@ -581,6 +583,7 @@ pub const Interactive = struct {
                 return;
             }
             self.active_editor.clear();
+            self.refreshGreeterVisibility();
             self.last_ctrl_c_ns = now;
             self.tui.dirty = true;
             return;
@@ -607,6 +610,7 @@ pub const Interactive = struct {
 
         // Route to focused component via TUI
         if (self.tui.handleInput(key)) {
+            self.refreshGreeterVisibility();
             self.tui.dirty = true;
         }
     }
@@ -874,6 +878,16 @@ pub const Interactive = struct {
         return if (h > fixed_total) h - fixed_total else 0;
     }
 
+    fn refreshGreeterVisibility(self: *Interactive) void {
+        if (!self.greeter_dismissed and self.active_editor.getText().len > 0) {
+            self.greeter_dismissed = true;
+        }
+        self.widget_above_container.clear();
+        if (!self.greeter_dismissed) {
+            self.widget_above_container.addChild(self.greeter.component());
+        }
+    }
+
     fn showLoader(self: *Interactive, message: []const u8) void {
         self.loader.spinner_fg = self.theme.fg(.accent);
         self.loader.message_fg = self.theme.fg(.muted);
@@ -968,6 +982,7 @@ pub const Interactive = struct {
         const prompt_copy = self.msg_allocator.dupe(u8, text) catch return;
 
         self.active_editor.clear();
+        self.refreshGreeterVisibility();
         self.is_streaming = true;
         self.tui.setFocus(null); // defocus editor during streaming
         self.showLoader("Working...");
@@ -1001,6 +1016,7 @@ pub const Interactive = struct {
         const cmd = self.command_registry.findCommand(name) orelse return false;
 
         self.active_editor.clear();
+        self.refreshGreeterVisibility();
         self.tui.dirty = true;
 
         // Built-in commands with Interactive access
@@ -1065,14 +1081,13 @@ pub const Interactive = struct {
     // Generic presets live in overlay.zig (OverlayPresets).
 
     fn bottomPanelOptions(self: *Interactive) overlay_mod.OverlayOptions {
-        // Reserve space for footer (1 row) + header (1 row)
-        const header_h: u32 = 1;
-        const footer_h = self.footer.measure(self.tui.width()).preferred_height;
+        const width = self.tui.width();
+        const header_h = self.header_container.measure(width).preferred_height;
         return .{
             .anchor = .bottom_left,
             .width_percent = 100,
             .max_height_percent = 40,
-            .margin_bottom = footer_h,
+            .margin_bottom = 0,
             .margin_top = header_h,
         };
     }
