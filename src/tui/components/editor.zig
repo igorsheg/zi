@@ -647,9 +647,14 @@ pub const Editor = struct {
 
             if (wrapped.len == 0) break;
             const first = wrapped[0];
+            const raw_end: usize = if (wrapped.len > 1) wrapped[1].start else remaining.len;
             try out.append(allocator, .{
                 .start = remaining_base + @as(u32, @intCast(first.start)),
-                .end = remaining_base + @as(u32, @intCast(first.end)),
+                // Preserve editor whitespace exactly. wordWrap trims trailing
+                // whitespace and strips leading whitespace on continuation
+                // lines for display components; editor must keep those bytes
+                // visible and cursor-addressable.
+                .end = remaining_base + @as(u32, @intCast(raw_end)),
                 .kind = current_kind,
                 .text_x = current_text_x,
             });
@@ -946,6 +951,26 @@ test "Editor wraps long content when rendering" {
     const cs = editor.cursorState().?;
     try std.testing.expectEqual(@as(u32, 8), cs.x);
     try std.testing.expectEqual(@as(u32, 2), cs.y);
+}
+
+test "Editor preserves trailing spaces in render and cursor position" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
+    _ = editor.handleInput(.{ .code = .char, .char = ' ' });
+    try std.testing.expectEqualStrings("a ", editor.getText());
+
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 3);
+    defer buf.deinit();
+    editor.render(buf.region());
+
+    try std.testing.expectEqual(@as(u21, 'a'), buf.get(3, 1).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), buf.get(4, 1).grapheme.codepoint);
+
+    const cs = editor.cursorState().?;
+    try std.testing.expectEqual(@as(u32, 5), cs.x);
+    try std.testing.expectEqual(@as(u32, 1), cs.y);
 }
 
 test "Editor scrolls wrapped cursor into view" {

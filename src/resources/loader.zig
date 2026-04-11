@@ -107,16 +107,12 @@ pub const ResourceLoader = struct {
         return self.themes;
     }
 
-    pub fn getAgentsFiles(self: *const ResourceLoader) types.LoadedAgentsFiles {
-        return .{ .agents_files = self.agents_files };
-    }
-
-    pub fn getSystemPrompt(self: *const ResourceLoader) ?[]const u8 {
-        return self.system_prompt;
-    }
-
-    pub fn getAppendSystemPrompt(self: *const ResourceLoader) []const []const u8 {
-        return self.append_system_prompt;
+    pub fn getPromptInputs(self: *const ResourceLoader) types.LoadedPromptInputs {
+        return .{
+            .system_prompt = self.system_prompt,
+            .append_system_prompt = self.append_system_prompt,
+            .agents_files = self.agents_files,
+        };
     }
 
     pub fn extendResources(self: *ResourceLoader, paths: types.ResourceExtensionPaths) !void {
@@ -638,12 +634,13 @@ test "resource loader resolves prompt inputs and discovers agents files" {
     });
     defer loader.deinit();
 
-    try std.testing.expectEqualStrings("literal prompt", loader.getSystemPrompt().?);
-    try std.testing.expectEqual(@as(usize, 1), loader.getAppendSystemPrompt().len);
-    try std.testing.expectEqualStrings("append from file", loader.getAppendSystemPrompt()[0]);
+    const prompt_inputs = loader.getPromptInputs();
+    try std.testing.expectEqualStrings("literal prompt", prompt_inputs.system_prompt.?);
+    try std.testing.expectEqual(@as(usize, 1), prompt_inputs.append_system_prompt.len);
+    try std.testing.expectEqualStrings("append from file", prompt_inputs.append_system_prompt[0]);
     try std.testing.expectEqual(@as(usize, 2), loader.getSkills().skills.len);
 
-    const agents_files = loader.getAgentsFiles().agents_files;
+    const agents_files = prompt_inputs.agents_files;
     try std.testing.expect(agents_files.len >= 3);
 
     var saw_global = false;

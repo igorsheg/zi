@@ -1,31 +1,19 @@
 //! Composition-root factory for AgentSession.
 //!
-//! Why this module exists, even though v1 is a thin wrapper:
+//! This is the canonical bootstrap path used by print/json/interactive
+//! modes. `main.zig` resolves mode-specific concerns (auth, settings,
+//! model choice), then hands session construction to this module.
 //!
-//! Phase A of the extension system reorganizes the bootstrap path so
-//! that creating a session is a single call into a well-known seam,
-//! not a pile of inline wiring in `main.zig`. Today the factory already
-//! owns session-store and ResourceLoader bootstrap. In subsequent phases
-//! it grows to own the pieces that main.zig must not know about:
+//! `createAgentSession(...)` owns the shared bootstrap wiring that
+//! should not be duplicated at top-level callsites:
+//! - resolve the on-disk session directory
+//! - create/open the SessionStore when needed
+//! - construct the ResourceLoader as the single owner of loaded
+//!   extensions, prompt inputs, skills, and future resource kinds
+//! - inject that loader into AgentSession
 //!
-//!   - A3: construct and own the ExtensionRunner (discovered extensions,
-//!         registered tools, stub runtime) and thread it into the session.
-//!   - A4: forward-declared runner ref pattern — the Agent's stream_fn,
-//!         transform_context, and on_payload closures capture a mutable
-//!         ref to the runner populated here, mirroring pi-mono's
-//!         `extensionRunnerRef: { current?: ExtensionRunner }` dance.
-//!   - A5: `resolveSessionDir(cwd)` pre-step runs BEFORE the session
-//!         store is created, so v2's `session_directory` event can hook
-//!         in without moving store ownership.
-//!   - Phase D: bindRuntime(runner, session, ui?) happens here once the
-//!         session is alive; provider_queue flushes; session_start fires.
-//!
-//! Keeping this factory in place — even when it's trivial — means every
-//! downstream consumer (print mode, json mode, interactive mode) already
-//! goes through the one door where that wiring will eventually land.
-//! No retrofit into `main.zig` later.
-//!
-//! See docs/extensions.md § Architecture and § Lifecycle.
+//! Keeping this wiring here gives the application one composition root
+//! instead of scattered ad hoc setup in `main.zig` and `coding_agent.zig`.
 
 const std = @import("std");
 const ai = @import("ai/root.zig");
@@ -35,7 +23,6 @@ const storage = @import("storage.zig");
 const resources = @import("resources/root.zig");
 const tool_def = @import("tools/definition.zig");
 const auth_storage_mod = @import("auth/storage.zig");
-const extension_runner_mod = @import("extensions/runner.zig");
 
 pub const AgentSession = coding_agent.AgentSession;
 pub const SessionStore = coding_agent.SessionStore;
@@ -46,7 +33,6 @@ pub const RetryPolicy = @import("session_controller.zig").RetryPolicy;
 pub const CompactionPolicy = @import("session_controller.zig").CompactionPolicy;
 pub const CompactionExecutor = @import("session_controller.zig").CompactionExecutor;
 pub const SessionCompactionResult = @import("session_controller.zig").CompactionResult;
-pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 
 pub const CreateOptions = struct {
     model: ai.protocol.Model,
@@ -54,7 +40,9 @@ pub const CreateOptions = struct {
     /// attached or its lookup returns empty.
     api_key: []const u8 = "",
     cwd: []const u8,
+    /// ResourceLoader bootstrap input: custom system-prompt source.
     system_prompt: ?[]const u8 = null,
+    /// ResourceLoader bootstrap input: injected AGENTS/CLAUDE-style files.
     context_files: []const resources.types.AgentsFile = &.{},
     max_tokens: ?u64 = 4096,
     tools: ?[]const tool_def.ToolDefinition = null,
@@ -66,28 +54,14 @@ pub const CreateOptions = struct {
     thinking_level: ?agent_mod.protocol.ThinkingLevel = null,
     session_store: ?SessionStore = null,
     no_session: bool = false,
+    /// ResourceLoader bootstrap input: append-system-prompt source.
     append_system_prompt: ?[]const u8 = null,
     tool_allowlist: ?[]const []const u8 = null,
 };
 
-/// Resolve the on-disk directory for a session's files. Runs BEFORE
-/// `SessionStore.create` so v2's `session_directory` extension event
-/// has a chance to override the default.
-///
-/// v1: `runner_ref` is accepted but unused — the function always
-/// returns `storage.getSessionDirForCwd(cwd)`. v2 will check
-/// `runner_ref.current` and, if present, emit the `session_directory`
-/// event into the runner and return the extension's override.
-///
-/// Caller owns the returned slice.
-///
-/// See docs/extensions.md § Session Directory Resolution.
-pub fn resolveSessionDir(
-    allocator: std.mem.Allocator,
-    cwd: []const u8,
-    runner_ref: ?*ExtensionRunnerRef,
-) ![]const u8 {
-    _ = runner_ref; // v1: no hook wiring yet.
+/// Resolve the on-disk directory for a session's files before the
+/// SessionStore is created. Caller owns the returned slice.
+pub fn resolveSessionDir(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     return storage.getSessionDirForCwd(allocator, cwd, null);
 }
 
@@ -96,8 +70,8 @@ pub fn resolveSessionDir(
 /// owns auth/settings/model resolution because those have mode-specific
 /// error handling (print mode exits, interactive mode surfaces a prompt).
 ///
-/// Bootstrap order (v1):
-///   1. resolveSessionDir(cwd, null) — v2 hook point
+/// Bootstrap order:
+///   1. resolveSessionDir(cwd)
 ///   2. SessionStore.create(session_dir, cwd) — if no store was passed in
 ///   3. ResourceLoader.init(...) — canonical resource owner for the session
 ///   4. AgentSession.init(...) — consumes the injected loader dependency
@@ -113,7 +87,7 @@ pub fn createAgentSession(
     // A store passed in by the caller (e.g. from --continue via
     // SessionStore.open) wins — we never overwrite it.
     if (session_store == null and !options.no_session) {
-        const session_dir = try resolveSessionDir(allocator, options.cwd, null);
+        const session_dir = try resolveSessionDir(allocator, options.cwd);
         session_store = SessionStore.create(allocator, session_dir, options.cwd);
     }
 

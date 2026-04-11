@@ -9,12 +9,17 @@ pub const ToolSnippet = struct {
 };
 
 pub const Options = struct {
+    /// Loader-resolved custom system prompt, if present.
     custom_prompt: ?[]const u8 = null,
     tool_names: []const []const u8 = &.{},
     tool_snippets: []const ToolSnippet = &.{},
     guidelines: []const []const u8 = &.{},
+    /// Pre-formatted skills section, built from loader-owned skills.
+    skills_section: ?[]const u8 = null,
+    /// Loader-resolved append-system-prompt content.
     append_system_prompt: []const []const u8 = &.{},
     cwd: []const u8 = ".",
+    /// Loader-resolved AGENTS/CLAUDE-style project context files.
     context_files: []const ContextFile = &.{},
 };
 
@@ -36,6 +41,10 @@ fn normalizeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
 
 /// Build the system prompt matching pi-mono's system-prompt.ts:28-168.
 ///
+/// This is a pure builder over already-resolved inputs. Discovery/loading of
+/// custom prompts, append prompts, and AGENTS/CLAUDE context files belongs to
+/// `src/resources/loader.zig`, not to prompt-building callsites.
+///
 /// If `custom_prompt` is set, it replaces the default identity/tools/guidelines
 /// section but still appends context files, date, and cwd.
 /// Otherwise builds the full default prompt with identity, tools, guidelines,
@@ -53,6 +62,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
 
     if (options.custom_prompt) |custom| {
         try w.writeAll(custom);
+        try writeSkillsSection(w, options.skills_section);
         try writeAppendSystemPrompt(w, options.append_system_prompt);
         try writeContextFiles(w, options.context_files);
         try w.print("\nCurrent date: {s}", .{date});
@@ -121,6 +131,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
         try w.print("- {s}\n", .{g});
     }
 
+    try writeSkillsSection(w, options.skills_section);
     try writeAppendSystemPrompt(w, options.append_system_prompt);
 
     try writeContextFiles(w, options.context_files);
@@ -143,6 +154,12 @@ fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, item, needle)) return true;
     }
     return false;
+}
+
+fn writeSkillsSection(w: *std.Io.Writer, section: ?[]const u8) !void {
+    const value = section orelse return;
+    if (value.len == 0) return;
+    try w.writeAll(value);
 }
 
 fn writeAppendSystemPrompt(w: *std.Io.Writer, prompts: []const []const u8) !void {
@@ -219,6 +236,15 @@ test "tool guidelines adapt to available tools" {
     });
     defer std.testing.allocator.free(bash_grep);
     try std.testing.expect(std.mem.indexOf(u8, bash_grep, "Prefer grep/find/ls tools over bash") != null);
+}
+
+test "skills section is appended when provided" {
+    const result = try buildSystemPrompt(std.testing.allocator, .{
+        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
+    });
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "caveman") != null);
 }
 
 test "context files appended in default prompt" {

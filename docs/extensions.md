@@ -1,6 +1,6 @@
 # zi Extension System — Spec
 
-> **Status**: Design — not yet implemented.
+> **Status**: Partial implementation. Core extension/resource bootstrap is landed; some hooks and runtime actions remain future work.
 > **Layer**: L4 (extensions) sitting between L3 (agent session) and L5 (composition root).
 > **Language**: Lua 5.4 embedded in the zig binary.
 > **Source of inspiration**: pi-mono's extension system (`.references/pi-mono/packages/coding-agent/src/core/extensions/`).
@@ -28,10 +28,10 @@
   │     interactive additionally binds UIContext into ExtensionRunner    │
   ├──────────────────────────────────────────────────────────────────────┤
   │ L5  SDK (src/sdk.zig) — createAgentSession() factory                │
-  │     constructs AgentSession, wires Agent closures → ExtensionRunner  │
-  │     via forward-declared mutable ref                                 │
+  │     resolves session dir, creates SessionStore + ResourceLoader,     │
+  │     then injects them into AgentSession                              │
   ├──────────────────────────────────────────────────────────────────────┤
-  │ L4  AGENT SESSION (src/agent_session.zig)                           │
+  │ L4  AGENT SESSION (src/coding_agent.zig)                            │
   │     owns: Agent, SessionStore, ResourceLoader, ExtensionRunner       │
   │     owns: tool registry (base + extension-registered)                │
   │     handles: session lifecycle, reload, compaction, tool activation │
@@ -575,7 +575,7 @@ Each call to `reload()` produces a new `ExtensionRunner` **generation**. Generat
 
 ## Session Directory Resolution
 
-The `session_directory` event (v2) lets extensions override where session files are stored. It must fire BEFORE `SessionStore` is created. To preserve this seam without refactoring bootstrap later, zi's session path resolution is factored out of `SessionStore.create()` into a separate step that can be intercepted later:
+The `session_directory` event (v2) lets extensions override where session files are stored. It must fire BEFORE `SessionStore` is created. zi already keeps session path resolution as a separate bootstrap step in `src/sdk.zig`; the current implementation resolves the default path there:
 
 ```
   (current flow, no extension override)          (v2 flow, with hook)
@@ -586,9 +586,7 @@ The `session_directory` event (v2) lets extensions override where session files 
   3. SessionStore.create(session_dir)             3. SessionStore.create(session_dir)
 ```
 
-In v1, `resolveSessionDir` just returns the default. In v2, the ExtensionRunner hooks into it between step 1 and 2 without changing the bootstrap signature.
-
-**Required refactor in Phase A**: Move session directory resolution out of `SessionWriter.init()` into a pre-step that happens before `AgentSession` construction. The resolved path is passed to `SessionStore.create(allocator, session_dir, cwd)`.
+Today, `resolveSessionDir` just returns the default `~/.zi/agent/sessions/<cwd>` path. If the v2 hook lands later, it should extend that sdk bootstrap step rather than reintroduce ad hoc session-path logic at callsites.
 
 ---
 
@@ -689,8 +687,8 @@ zi already has `transform_context`. No change needed; Phase D wires `context` ev
 
 ```
   src/
-    sdk.zig                  — createAgentSession() factory
-    agent_session.zig        — renamed from coding_agent.zig, owns ExtensionRunner
+    sdk.zig                  — createAgentSession() composition root
+    coding_agent.zig         — AgentSession, owns ExtensionRunner
     extensions/
       root.zig               — module exports
       runner.zig             — ExtensionRunner, event dispatch
@@ -708,7 +706,7 @@ zi already has `transform_context`. No change needed; Phase D wires `context` ev
         read.lua
         ...
     resources/
-      loader.zig             — ResourceLoader for .lua, .md, themes, skills
+      loader.zig             — ResourceLoader, canonical owner of loaded resources
     tools/
       (unchanged — zig implementations for built-in tools)
 ```

@@ -8,6 +8,7 @@ const tool_def = @import("tools/definition.zig");
 const builtin_util = @import("tools/util.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const resources = @import("resources/root.zig");
+const skills = @import("skills/root.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const storage = @import("storage.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
@@ -197,6 +198,8 @@ pub const AgentSession = struct {
         };
 
         var resource_loader = options.resource_loader;
+        const prompt_inputs = resource_loader.getPromptInputs();
+        const loaded_extensions = resource_loader.getExtensions();
 
         // Construct the extension runtime BEFORE building the tools
         // list so Lua-registered tools can join the agent's tool set.
@@ -247,8 +250,7 @@ pub const AgentSession = struct {
             }
             state_ptr.setPackagePath(dirs_buf[0..dirs_n]) catch {};
 
-            const discovered = resource_loader.getExtensions().extensions;
-            if (discovered.len > 0) {
+            if (loaded_extensions.extensions.len > 0) {
                 const stats = resource_loader.loadExtensionsInto(state_ptr);
                 std.log.scoped(.extensions).info(
                     "extensions: {d} loaded, {d} failed of {d} discovered",
@@ -314,17 +316,23 @@ pub const AgentSession = struct {
         const tool_name_slice = toolNameSlice(allocator, filtered_definitions) catch &.{};
         const tool_snippets = collectToolSnippets(allocator, filtered_definitions) catch &.{};
         const prompt_guidelines = collectGuidelines(allocator, filtered_definitions) catch &.{};
+        const skills_section: ?[]const u8 = if (hasToolNamed(filtered_definitions, "read"))
+            skills.format.formatSkillsForPrompt(allocator, resource_loader.getSkills().skills) catch null
+        else
+            null;
+        defer if (skills_section) |section| allocator.free(section);
 
         const sys_prompt = blk: {
-            if (resource_loader.getSystemPrompt()) |custom| {
+            if (prompt_inputs.system_prompt) |custom| {
                 break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
                     .custom_prompt = custom,
                     .cwd = options.cwd,
-                    .context_files = resource_loader.getAgentsFiles().agents_files,
+                    .context_files = prompt_inputs.agents_files,
                     .tool_names = tool_name_slice,
                     .tool_snippets = tool_snippets,
                     .guidelines = prompt_guidelines,
-                    .append_system_prompt = resource_loader.getAppendSystemPrompt(),
+                    .skills_section = skills_section,
+                    .append_system_prompt = prompt_inputs.append_system_prompt,
                 }) catch custom;
             }
             break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
@@ -332,8 +340,9 @@ pub const AgentSession = struct {
                 .tool_names = tool_name_slice,
                 .tool_snippets = tool_snippets,
                 .guidelines = prompt_guidelines,
-                .context_files = resource_loader.getAgentsFiles().agents_files,
-                .append_system_prompt = resource_loader.getAppendSystemPrompt(),
+                .skills_section = skills_section,
+                .context_files = prompt_inputs.agents_files,
+                .append_system_prompt = prompt_inputs.append_system_prompt,
             }) catch "You are a helpful coding assistant.";
         };
 
@@ -420,6 +429,13 @@ pub const AgentSession = struct {
             i += 1;
         }
         return snippets;
+    }
+
+    fn hasToolNamed(defs: []const tool_def.ToolDefinition, wanted: []const u8) bool {
+        for (defs) |def| {
+            if (std.mem.eql(u8, def.name, wanted)) return true;
+        }
+        return false;
     }
 
     fn collectGuidelines(

@@ -131,7 +131,9 @@ fn parseResult(
     // parseDiffResult; plain/numbered preallocate against the raw line
     // count (no extra entries injected, only drops are possible).
     var line_count: usize = 1;
-    for (raw) |c| { if (c == '\n') line_count += 1; }
+    for (raw) |c| {
+        if (c == '\n') line_count += 1;
+    }
 
     if (mode == .diff) {
         return parseDiffResult(ctx.allocator, raw_full, raw, line_count, notice) catch {
@@ -528,7 +530,7 @@ const READ_COLLAPSED = [_]excerpt_mod.Excerpt{
     .{ .focus = .head, .context = 3 },
     .{ .focus = .tail, .context = 5 },
 };
-const TAIL_5 = [_]excerpt_mod.Excerpt{ .{ .focus = .tail, .context = 5 } };
+const TAIL_5 = [_]excerpt_mod.Excerpt{.{ .focus = .tail, .context = 5 }};
 const HEAD_TAIL_SHORT = [_]excerpt_mod.Excerpt{
     .{ .focus = .head, .context = 3 },
     .{ .focus = .tail, .context = 5 },
@@ -540,11 +542,27 @@ const DIFF_COLLAPSED = [_]excerpt_mod.Excerpt{
 
 // ── Read ────────────────────────────────────────────────────────────
 
+fn skillNameFromReadPath(path: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, path, "/SKILL.md")) return null;
+    const dir = std.fs.path.dirname(path) orelse return null;
+    const name = std.fs.path.basename(dir);
+    if (name.len == 0) return null;
+    return name;
+}
+
 fn readCall(ctx: *const ToolRenderContext) void {
     var buf: [1024]u8 = undefined;
     const path = argString(ctx.args, "path") orelse "...";
     const short = shortPath(&buf, path);
     var detail_buf: [1100]u8 = undefined;
+    if (skillNameFromReadPath(path)) |skill_name| {
+        const detail = if (rangeFromArgs(ctx.args)) |r|
+            std.fmt.bufPrint(&detail_buf, "{s}:{d}-{d}", .{ skill_name, r[0], r[1] }) catch skill_name
+        else
+            skill_name;
+        renderTitle(ctx, "Skill", detail);
+        return;
+    }
     const detail = if (rangeFromArgs(ctx.args)) |r|
         std.fmt.bufPrint(&detail_buf, "{s}:{d}-{d}", .{ short, r[0], r[1] }) catch short
     else
@@ -590,6 +608,16 @@ pub const read_renderer = ToolRenderer{
     .render_result = readResult,
     .measure_result = readMeasure,
 };
+
+const testing = std.testing;
+
+test "skillNameFromReadPath extracts skill name from canonical skill file path" {
+    try testing.expectEqualStrings("caveman", skillNameFromReadPath("/Users/igors/.zi/agent/skills/caveman/SKILL.md").?);
+}
+
+test "skillNameFromReadPath ignores ordinary read paths" {
+    try testing.expect(skillNameFromReadPath("/tmp/notes.md") == null);
+}
 
 // ── Write ───────────────────────────────────────────────────────────
 

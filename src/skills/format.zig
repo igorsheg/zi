@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 
-pub fn formatSkillsForPrompt(allocator: std.mem.Allocator, skills: []const types.Skill) ![]const u8 {
+pub fn formatSkillsForPrompt(allocator: std.mem.Allocator, skills: anytype) ![]const u8 {
     var visible_count: usize = 0;
     for (skills) |skill| {
         if (!skill.disable_model_invocation) visible_count += 1;

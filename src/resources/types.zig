@@ -141,6 +141,12 @@ pub const LoadedAgentsFiles = struct {
     agents_files: []const AgentsFile = &.{},
 };
 
+pub const LoadedPromptInputs = struct {
+    system_prompt: ?[]const u8 = null,
+    append_system_prompt: []const []const u8 = &.{},
+    agents_files: []const AgentsFile = &.{},
+};
+
 test {
     std.testing.refAllDecls(@This());
 }
