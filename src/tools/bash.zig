@@ -299,7 +299,9 @@ test "oneText sanitizes invalid utf-8" {
 }
 
 fn oneText(allocator: std.mem.Allocator, text: []const u8) []agent.protocol.AgentToolResult.ContentBlock {
-    const owned = json_util.utf8LossyAlloc(allocator, text) catch allocator.dupe(u8, text) catch text;
+    const owned = json_util.utf8LossyAlloc(allocator, text) catch allocator.dupe(u8, text) catch return &.{};
+    errdefer allocator.free(owned);
+
     const blocks = allocator.alloc(agent.protocol.AgentToolResult.ContentBlock, 1) catch return &.{};
     blocks[0] = .{ .text = .{ .text = owned } };
     return blocks;

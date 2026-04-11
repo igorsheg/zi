@@ -131,6 +131,7 @@ pub fn run(allocator: std.mem.Allocator, options: args.RunOptions) !void {
         .cwd = cwd_buf,
         .max_tokens = 4096,
         .auth_storage = &auth_storage,
+        .settings_manager = &settings,
         .event_handler = event_handler,
         .initial_messages = initial_messages,
         .session_store = session_store,

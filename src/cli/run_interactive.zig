@@ -76,6 +76,7 @@ pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
         .cwd = cwd_buf,
         .max_tokens = 4096,
         .auth_storage = &auth_storage,
+        .settings_manager = &settings,
         .model_registry = &model_registry,
         .thinking_level = common.aiToAgentThinking(init_result.thinking_level),
     });

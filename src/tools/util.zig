@@ -35,21 +35,25 @@ pub fn parseSchema(comptime schema: []const u8) std.json.Value {
     return parsed.value;
 }
 
+fn singleTextResult(allocator: std.mem.Allocator, text: []const u8, is_error: bool) protocol.AgentToolResult {
+    const owned_text = allocator.dupe(u8, text) catch return .{ .content = &.{}, .is_error = is_error };
+    errdefer allocator.free(owned_text);
+
+    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+        return .{ .content = &.{}, .is_error = is_error };
+    blocks[0] = .{ .text = .{ .text = owned_text } };
+    return .{ .content = blocks, .is_error = is_error };
+}
+
 /// Build a single text content block result. Caller owns the allocation.
 pub fn textResult(allocator: std.mem.Allocator, text: []const u8) protocol.AgentToolResult {
-    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
-        return .{ .content = &.{} };
-    blocks[0] = .{ .text = .{ .text = text } };
-    return .{ .content = blocks };
+    return singleTextResult(allocator, text, false);
 }
 
 /// Build an error result with a single text block. Convenience for the
 /// `return errorResult(...)` pattern.
 pub fn errorResult(allocator: std.mem.Allocator, text: []const u8) protocol.AgentToolResult {
-    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
-        return .{ .content = &.{}, .is_error = true };
-    blocks[0] = .{ .text = .{ .text = text } };
-    return .{ .content = blocks, .is_error = true };
+    return singleTextResult(allocator, text, true);
 }
 
 /// Format an error result via fmt.allocPrint. Falls back to a static
@@ -198,4 +202,30 @@ pub fn appendHeadTail(
         if (i > 0) try out.writeAll("\n");
         try out.writeAll(line);
     }
+}
+
+test "textResult owns copied text" {
+    const allocator = std.testing.allocator;
+    const literal = "hello world";
+
+    const result = textResult(allocator, literal);
+    defer result.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expectEqualStrings(literal, result.content[0].text.text);
+    try std.testing.expect(result.content[0].text.text.ptr != literal.ptr);
+    try std.testing.expect(!result.is_error);
+}
+
+test "errorResult owns copied text" {
+    const allocator = std.testing.allocator;
+    const literal = "boom";
+
+    const result = errorResult(allocator, literal);
+    defer result.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expectEqualStrings(literal, result.content[0].text.text);
+    try std.testing.expect(result.content[0].text.text.ptr != literal.ptr);
+    try std.testing.expect(result.is_error);
 }

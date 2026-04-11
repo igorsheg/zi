@@ -70,7 +70,6 @@ const SettingsAction = enum {
 const auth_storage_mod = @import("../auth/storage.zig");
 const oauth_mod = @import("../auth/oauth.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
-const settings_types_mod = @import("../settings/types.zig");
 const ai_protocol = @import("../ai/protocol.zig");
 const ai_resolve = @import("../ai/resolve.zig");
 const memory_debug = @import("../debug/tracked_allocator.zig");
@@ -881,7 +880,6 @@ pub const Interactive = struct {
                 // is safe (the catalog slice is static, no race).
                 self.status_data.model_id = self.ca.agent.state.model.id;
                 self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
-                self.settings_manager.setDefaultModelAndProvider(m.provider, m.id);
                 var buf: [80]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
                 self.status_text.setContent(msg);
@@ -890,7 +888,6 @@ pub const Interactive = struct {
             },
             .thinking_level_changed => |t| {
                 self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
-                self.settings_manager.setDefaultThinkingLevel(agentThinkingToDefault(self.ca.agent.state.thinking_level));
                 var buf: [96]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{t.level}) catch "thinking level updated";
                 self.status_text.setContent(msg);
@@ -2317,17 +2314,6 @@ fn agentThinkingValue(level: agent_protocol.ThinkingLevel) []const u8 {
         .medium => "medium",
         .high => "high",
         .xhigh => "xhigh",
-    };
-}
-
-fn agentThinkingToDefault(level: agent_protocol.ThinkingLevel) settings_types_mod.DefaultThinkingLevel {
-    return switch (level) {
-        .off => .off,
-        .minimal => .minimal,
-        .low => .low,
-        .medium => .medium,
-        .high => .high,
-        .xhigh => .xhigh,
     };
 }
 

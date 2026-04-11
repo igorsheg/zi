@@ -23,6 +23,7 @@ const storage = @import("storage.zig");
 const resources = @import("resources/root.zig");
 const tool_def = @import("tools/definition.zig");
 const auth_storage_mod = @import("auth/storage.zig");
+const settings_manager_mod = @import("settings/manager.zig");
 
 pub const AgentSession = coding_agent.AgentSession;
 pub const SessionStore = coding_agent.SessionStore;
@@ -49,6 +50,7 @@ pub const CreateOptions = struct {
     registry: ?*ai.provider.Registry = null,
     event_handler: ?AgentSession.EventHandler = null,
     auth_storage: ?*auth_storage_mod.AuthStorage = null,
+    settings_manager: ?*settings_manager_mod.SettingsManager = null,
     model_registry: ?*ai.model_registry.ModelRegistry = null,
     initial_messages: []const agent_mod.protocol.AgentMessage = &.{},
     thinking_level: ?agent_mod.protocol.ThinkingLevel = null,
@@ -109,6 +111,7 @@ pub fn createAgentSession(
         .registry = options.registry,
         .event_handler = options.event_handler,
         .auth_storage = options.auth_storage,
+        .settings_manager = options.settings_manager,
         .model_registry = options.model_registry,
         .initial_messages = options.initial_messages,
         .thinking_level = options.thinking_level,

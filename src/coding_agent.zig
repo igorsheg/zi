@@ -10,6 +10,8 @@ const system_prompt_mod = @import("system_prompt.zig");
 const resources = @import("resources/root.zig");
 const skills = @import("skills/root.zig");
 const auth_storage_mod = @import("auth/storage.zig");
+const settings_manager_mod = @import("settings/manager.zig");
+const settings_types_mod = @import("settings/types.zig");
 const storage = @import("storage.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
@@ -46,6 +48,7 @@ pub const AgentSession = struct {
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
+    settings_manager: ?*settings_manager_mod.SettingsManager = null,
     resource_loader: resources.ResourceLoader,
     /// Borrowed ModelRegistry — lifetime owned by caller (main.zig in
     /// the interactive path). Used by the TUI to bind `[]const Model`
@@ -127,6 +130,7 @@ pub const AgentSession = struct {
         registry: ?*ai.provider.Registry = null,
         event_handler: ?EventHandler = null,
         auth_storage: ?*auth_storage_mod.AuthStorage = null,
+        settings_manager: ?*settings_manager_mod.SettingsManager = null,
         /// Borrowed, caller-owned. Session holds it for the TUI to
         /// read via `getAll()` and for future resolve calls. Phase 2:
         /// main.zig constructs the registry before this init.
@@ -395,6 +399,7 @@ pub const AgentSession = struct {
             ._subscription_token = null,
             ._stream_closure = closure,
             .auth_storage = options.auth_storage,
+            .settings_manager = options.settings_manager,
             .resource_loader = resource_loader,
             .model_registry = options.model_registry,
             ._owned_provider_bundle = owned_bundle,
@@ -512,6 +517,10 @@ pub const AgentSession = struct {
         self.agent.state.thinking_level = next_thinking;
         const provider_str = ai.json_util.providerToString(model.provider);
         self.session_store.appendModelChange(provider_str, model.id);
+        if (self.settings_manager) |settings| {
+            settings.setDefaultModelAndProvider(provider_str, model.id);
+            persistDefaultThinkingLevel(settings, model, next_thinking);
+        }
         if (thinking_changed) {
             self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(next_thinking));
         }
@@ -528,6 +537,9 @@ pub const AgentSession = struct {
         self.agent.state.thinking_level = effective;
         if (changed) {
             self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(effective));
+            if (self.settings_manager) |settings| {
+                persistDefaultThinkingLevel(settings, self.agent.state.model, effective);
+            }
         }
         return .{ .level = effective, .changed = changed };
     }
@@ -558,6 +570,27 @@ pub const AgentSession = struct {
             .high => "high",
             .xhigh => "xhigh",
         };
+    }
+
+    fn agentThinkingLevelToDefault(level: protocol.ThinkingLevel) settings_types_mod.DefaultThinkingLevel {
+        return switch (level) {
+            .off => .off,
+            .minimal => .minimal,
+            .low => .low,
+            .medium => .medium,
+            .high => .high,
+            .xhigh => .xhigh,
+        };
+    }
+
+    fn persistDefaultThinkingLevel(
+        settings: *settings_manager_mod.SettingsManager,
+        model: ai.protocol.Model,
+        level: protocol.ThinkingLevel,
+    ) void {
+        if (model.reasoning or level != .off) {
+            settings.setDefaultThinkingLevel(agentThinkingLevelToDefault(level));
+        }
     }
 
     pub fn deinit(self: *AgentSession) void {
@@ -986,7 +1019,7 @@ test "trySetModel updates session state and appends model change when auth exist
     try registry.register("faux", fp.provider(), null);
 
     const target = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    var ca = try AgentSession.init(alloc, .{
+    var ca = AgentSession.init(alloc, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1028,7 +1061,7 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
     try registry.register("faux", fp.provider(), null);
 
     const target = model_registry.find(.anthropic, "claude-sonnet-4-20250514") orelse return error.MissingCatalogEntry;
-    var ca = try AgentSession.init(alloc, .{
+    var ca = AgentSession.init(alloc, .{
         .model = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry,
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1053,6 +1086,83 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
     try testing.expectEqualStrings("high", thinking_entry.?.entry.thinking_level_change.thinking_level);
 }
 
+test "trySetModel persists defaults through settings manager" {
+    const alloc = testing.allocator;
+
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    auth.setRuntimeApiKey("anthropic", "test-key");
+
+    var settings = try settings_manager_mod.SettingsManager.inMemory(alloc, null);
+    defer settings.deinit();
+
+    var model_registry = try ai.model_registry.ModelRegistry.init(alloc, &auth, &.{});
+    defer model_registry.deinit();
+
+    var fp = faux.FauxProvider.init(alloc);
+    var registry = ai.provider.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    const target = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    var ca = AgentSession.init(alloc, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(alloc, "/tmp/zi-test"),
+        .registry = &registry,
+        .auth_storage = &auth,
+        .settings_manager = &settings,
+        .model_registry = &model_registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    const result = ca.trySetModel(target);
+    try testing.expect(result == .success);
+    try testing.expectEqualStrings("anthropic", settings.getDefaultProvider().?);
+    try testing.expectEqualStrings(target.id, settings.getDefaultModel().?);
+    try testing.expectEqual(settings_types_mod.DefaultThinkingLevel.off, settings.getDefaultThinkingLevel().?);
+}
+
+test "trySetThinkingLevel persists default through settings manager" {
+    const alloc = testing.allocator;
+
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    auth.setRuntimeApiKey("anthropic", "test-key");
+
+    var settings = try settings_manager_mod.SettingsManager.inMemory(alloc, null);
+    defer settings.deinit();
+
+    var model_registry = try ai.model_registry.ModelRegistry.init(alloc, &auth, &.{});
+    defer model_registry.deinit();
+
+    var fp = faux.FauxProvider.init(alloc);
+    var registry = ai.provider.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    const initial = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    var ca = AgentSession.init(alloc, .{
+        .model = initial,
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(alloc, "/tmp/zi-test"),
+        .registry = &registry,
+        .auth_storage = &auth,
+        .settings_manager = &settings,
+        .model_registry = &model_registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    const result = ca.trySetThinkingLevel(.high);
+    try testing.expect(result.changed);
+    try testing.expectEqual(.high, result.level);
+    try testing.expectEqual(settings_types_mod.DefaultThinkingLevel.high, settings.getDefaultThinkingLevel().?);
+}
+
 test "trySetModel rejects unauthed model without mutating state or session" {
     const alloc = testing.allocator;
 
@@ -1069,7 +1179,7 @@ test "trySetModel rejects unauthed model without mutating state or session" {
 
     const initial = faux.fauxModel();
     const blocked = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    var ca = try AgentSession.init(alloc, .{
+    var ca = AgentSession.init(alloc, .{
         .model = initial,
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",

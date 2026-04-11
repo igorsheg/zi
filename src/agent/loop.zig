@@ -342,14 +342,10 @@ fn emitAbortedToolEnd(
     tc: ai.protocol.ToolCall,
     aa: std.mem.Allocator,
 ) void {
-    const err_content = aa.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
-    if (err_content.len > 0) {
-        err_content[0] = .{ .text = .{ .text = "aborted" } };
-    }
     event_sink(.{ .tool_execution_end = .{
         .tool_call_id = tc.id,
         .tool_name = tc.name,
-        .result = .{ .content = err_content, .is_error = true },
+        .result = makeAgentToolTextResult(aa, "aborted", true),
         .is_error = true,
     } }, event_ctx);
 }
@@ -548,11 +544,7 @@ fn emitImmediateError(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    const err_content_buf = turn_allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
-    if (err_content_buf.len > 0) {
-        err_content_buf[0] = .{ .text = .{ .text = msg } };
-    }
-    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true, .details = .{ .object = std.json.ObjectMap.init(turn_allocator) } };
+    const err_tool_result = makeAgentToolTextResult(turn_allocator, msg, true);
     const err_result = makeErrorToolResult(run_allocator, tc.id, tc.name, msg);
     emitToolResult(event_sink, event_ctx, tc, err_result, true, err_tool_result);
     ctx_messages.append(run_allocator, .{ .tool_result = err_result }) catch {};
@@ -649,7 +641,27 @@ fn cloneToolResultMessage(allocator: std.mem.Allocator, msg: ai.protocol.ToolRes
     return result;
 }
 
+fn makeAgentToolTextResult(allocator: std.mem.Allocator, text: []const u8, is_error: bool) protocol.AgentToolResult {
+    const owned_text = allocator.dupe(u8, text) catch return .{ .content = &.{}, .is_error = is_error };
+    errdefer allocator.free(owned_text);
+
+    const content = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+        return .{ .content = &.{}, .is_error = is_error };
+    content[0] = .{ .text = .{ .text = owned_text } };
+    return .{ .content = content, .is_error = is_error };
+}
+
 fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, msg: []const u8) ai.protocol.ToolResultMessage {
+    const owned_text = allocator.dupe(u8, msg) catch return .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .content = &.{},
+        .details = .{ .object = std.json.ObjectMap.init(allocator) },
+        .is_error = true,
+        .timestamp = std.time.milliTimestamp(),
+    };
+    errdefer allocator.free(owned_text);
+
     const content = allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, 1) catch return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
@@ -658,7 +670,7 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .is_error = true,
         .timestamp = std.time.milliTimestamp(),
     };
-    content[0] = .{ .text = .{ .text = msg } };
+    content[0] = .{ .text = .{ .text = owned_text } };
     return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
@@ -671,6 +683,37 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
 
 fn isAborted(signal: AbortSignal) bool {
     return signal.isAborted();
+}
+
+test "makeAgentToolTextResult owns copied text" {
+    const allocator = std.testing.allocator;
+    const literal = "aborted";
+
+    const result = makeAgentToolTextResult(allocator, literal, true);
+    defer result.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expectEqualStrings(literal, result.content[0].text.text);
+    try std.testing.expect(result.content[0].text.text.ptr != literal.ptr);
+    try std.testing.expect(result.is_error);
+}
+
+test "makeErrorToolResult owns copied text" {
+    const allocator = std.testing.allocator;
+    const literal = "tool failure";
+
+    const result = makeErrorToolResult(allocator, "tc-1", "echo", literal);
+    defer {
+        allocator.free(result.content[0].text.text);
+        allocator.free(result.content);
+        var details = result.details.?.object;
+        details.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expectEqualStrings(literal, result.content[0].text.text);
+    try std.testing.expect(result.content[0].text.text.ptr != literal.ptr);
+    try std.testing.expect(result.is_error);
 }
 
 // ── trace file (ZI_LOOP_TRACE) ──────────────────────────────────────
