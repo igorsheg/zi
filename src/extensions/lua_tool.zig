@@ -28,6 +28,9 @@ const tool_registry = @import("registries/tool_registry.zig");
 const agent_protocol = @import("../agent/protocol.zig");
 const abort_signal_mod = @import("../abort_signal.zig");
 const lua_renderer = @import("lua_renderer.zig");
+const api = @import("api.zig");
+const spawn_mod = @import("../spawn/spawn.zig");
+const spawn_types = @import("../spawn/types.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_tool);
@@ -211,18 +214,90 @@ fn runHandler(
     _ = c.lua_pushlstring(co.L, runner.cwd.ptr, runner.cwd.len);
     c.lua_setfield(co.L, -2, "cwd");
 
-    const r = try co.resumeWith(2);
-    switch (r.status) {
-        .yielded => return error.UnexpectedYield,
-        .ok, .finished => {},
+    while (true) {
+        const r = try co.resumeWith(2);
+        switch (r.status) {
+            .yielded => {
+                try serviceYieldedToolCoroutine(allocator, runner, state, &co, r.nresults);
+                continue;
+            },
+            .ok, .finished => {
+                if (r.nresults == 0) return emptyResult();
+
+                const top = c.lua_gettop(co.L);
+                defer c.lua_settop(co.L, top - r.nresults);
+                return parseReturn(allocator, co.L, top);
+            },
+        }
+    }
+}
+
+fn serviceYieldedToolCoroutine(
+    allocator: std.mem.Allocator,
+    runner: *runner_mod.ExtensionRunner,
+    state: *lua_runtime.LuaState,
+    co: *lua_runtime.Coroutine,
+    nresults: c_int,
+) !void {
+    _ = state;
+    if (nresults > 0) c.lua_pop(co.L, nresults);
+
+    var req = runner.current_spawn_request orelse return error.UnexpectedYield;
+    defer {
+        if (req.callbacks_ref != c.LUA_NOREF) c.luaL_unref(req.source_L, c.LUA_REGISTRYINDEX, req.callbacks_ref);
+        req.deinit(runner.allocator);
+        runner.current_spawn_request = null;
     }
 
-    if (r.nresults == 0) return emptyResult();
+    var trampoline_ctx = api.TrampolineCtx{
+        .L = co.L,
+        .callbacks_ref = req.callbacks_ref,
+    };
 
-    const top = c.lua_gettop(co.L);
-    defer c.lua_settop(co.L, top - r.nresults);
+    const cfg = spawn_types.SpawnConfig{
+        .allocator = runner.allocator,
+        .cwd = req.cwd,
+        .task = req.task,
+        .model = req.model,
+        .tools = req.tools,
+        .append_system_prompt = req.append_system_prompt,
+        .signal = if (runner.current_signal) |s| s.flag else null,
+        .on_event = if (req.callbacks_ref != c.LUA_NOREF) &api.eventTrampoline else null,
+        .on_event_ctx = if (req.callbacks_ref != c.LUA_NOREF) @ptrCast(&trampoline_ctx) else null,
+    };
 
-    return parseReturn(allocator, co.L, top);
+    var spawn_result = spawn_mod.ziSpawn(cfg);
+    defer spawn_result.deinit(runner.allocator);
+
+    runner.current_spawn_result = .{ .result = try spawnResultToToolResult(allocator, spawn_result) };
+}
+
+fn spawnResultToToolResult(allocator: std.mem.Allocator, spawn_result: spawn_types.SpawnResult) !AgentToolResult {
+    const text = spawn_result.text() orelse "";
+    var result = try textResult(allocator, text, spawn_result.exit_code != 0);
+
+    var out = std.json.ObjectMap.init(allocator);
+    errdefer {
+        const v: std.json.Value = .{ .object = out };
+        lua_runtime.freeJsonValue(allocator, v);
+    }
+
+    if (spawn_result.model) |m| try out.put(try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, m) });
+    if (spawn_result.stop_reason) |sr| try out.put(try allocator.dupe(u8, "stop_reason"), .{ .string = try allocator.dupe(u8, sr) });
+    if (spawn_result.error_message) |em| try out.put(try allocator.dupe(u8, "error_message"), .{ .string = try allocator.dupe(u8, em) });
+
+    var usage = std.json.ObjectMap.init(allocator);
+    try usage.put(try allocator.dupe(u8, "input"), .{ .integer = @intCast(spawn_result.usage.input) });
+    try usage.put(try allocator.dupe(u8, "output"), .{ .integer = @intCast(spawn_result.usage.output) });
+    try usage.put(try allocator.dupe(u8, "cache_read"), .{ .integer = @intCast(spawn_result.usage.cache_read) });
+    try usage.put(try allocator.dupe(u8, "cache_write"), .{ .integer = @intCast(spawn_result.usage.cache_write) });
+    try usage.put(try allocator.dupe(u8, "total_tokens"), .{ .integer = @intCast(spawn_result.usage.context_tokens) });
+    try usage.put(try allocator.dupe(u8, "cost"), .{ .float = spawn_result.usage.cost });
+    try usage.put(try allocator.dupe(u8, "turns"), .{ .integer = @intCast(spawn_result.usage.turns) });
+    try out.put(try allocator.dupe(u8, "usage"), .{ .object = usage });
+
+    result.details = .{ .object = out };
+    return result;
 }
 
 // =============================================================================
@@ -444,7 +519,6 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
 // =============================================================================
 
 const testing = std.testing;
-const api = @import("api.zig");
 
 test "lua tool returning a string produces a single text content block" {
     var state = try lua_runtime.LuaState.init(testing.allocator);

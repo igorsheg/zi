@@ -251,7 +251,8 @@ pub const AgentSession = struct {
             state_ptr.setPackagePath(dirs_buf[0..dirs_n]) catch {};
 
             if (loaded_extensions.extensions.len > 0) {
-                const stats = resource_loader.loadExtensionsInto(state_ptr);
+                runner_ptr.bindLuaOwnerThread(std.Thread.getCurrentId());
+                const stats = resource_loader.loadExtensionsInto(state_ptr, runner_ptr);
                 std.log.scoped(.extensions).info(
                     "extensions: {d} loaded, {d} failed of {d} discovered",
                     .{ stats.loaded, stats.failed, stats.attempted },

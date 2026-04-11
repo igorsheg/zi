@@ -498,7 +498,7 @@ pub const Coroutine = struct {
 // Error helpers
 // =============================================================================
 
-fn mapLoadError(L: *c.lua_State, rc: c_int) LuaError {
+pub fn mapLoadError(L: *c.lua_State, rc: c_int) LuaError {
     consumeErrorMessage(L);
     return switch (rc) {
         c.LUA_ERRSYNTAX => error.LuaSyntax,
@@ -507,7 +507,7 @@ fn mapLoadError(L: *c.lua_State, rc: c_int) LuaError {
     };
 }
 
-fn mapCallError(L: *c.lua_State, rc: c_int) LuaError {
+pub fn mapCallError(L: *c.lua_State, rc: c_int) LuaError {
     consumeErrorMessage(L);
     return switch (rc) {
         c.LUA_ERRRUN => error.LuaRuntime,

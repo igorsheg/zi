@@ -99,6 +99,40 @@ pub const PendingRender = struct {
     deinit: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+pub const SpawnRequest = struct {
+    task: []const u8,
+    model: ?[]const u8 = null,
+    tools: ?[]const u8 = null,
+    append_system_prompt: ?[]const u8 = null,
+    cwd: []const u8,
+    callbacks_ref: c_int = lua_runtime.c.LUA_NOREF,
+    source_L: *lua_runtime.c.lua_State,
+    continuation_ctx: lua_runtime.c.lua_KContext = 0,
+
+    pub fn deinit(self: *SpawnRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.task);
+        if (self.model) |v| allocator.free(v);
+        if (self.tools) |v| allocator.free(v);
+        if (self.append_system_prompt) |v| allocator.free(v);
+        allocator.free(self.cwd);
+        self.* = undefined;
+    }
+};
+
+pub const SpawnOutcome = struct {
+    result: agent_protocol.AgentToolResult,
+};
+
+pub const ExtensionLoadSource = struct {
+    kind: []const u8,
+    id: []const u8,
+    path: []const u8,
+};
+
+pub const LoadContext = struct {
+    source: ExtensionLoadSource,
+};
+
 pub const ExtensionRunner = struct {
     allocator: std.mem.Allocator,
 
@@ -193,6 +227,20 @@ pub const ExtensionRunner = struct {
     /// alongside `current_tool_call_id` so render dispatch can
     /// look up `tool_registry.get(name)` for the render hook ref.
     current_tool_name: ?[]const u8 = null,
+
+    /// Minimal scheduler state for one in-flight yieldable host call.
+    ///
+    /// Phase zi-0br / smallest zi-5w4 slice: only Lua tool execution may
+    /// suspend, and only via `zi.spawn`. Event handlers and spawn `on={...}`
+    /// callbacks still run non-yieldably. Because the agent thread is the sole
+    /// owner of `lua_state` and drives exactly one coroutine at a time, runner-
+    /// scoped state is enough for now. Later scheduler work (`zi-ilc`) can grow
+    /// this into a richer per-coroutine task table without changing the tool
+    /// execution contract landed here.
+    current_spawn_request: ?SpawnRequest = null,
+    current_spawn_result: ?SpawnOutcome = null,
+
+    load_context: ?LoadContext = null,
 
     /// Cross-thread inbox for precomputed render spans, keyed by
     /// `tool_call_id`.
@@ -331,6 +379,18 @@ pub const ExtensionRunner = struct {
     ///
     pub fn bindLuaOwnerThread(self: *ExtensionRunner, tid: std.Thread.Id) void {
         self.lua_owner_thread.store(tid, .release);
+    }
+
+    pub fn beginLoadContext(self: *ExtensionRunner, source: ExtensionLoadSource) void {
+        self.load_context = .{ .source = source };
+    }
+
+    pub fn endLoadContext(self: *ExtensionRunner) void {
+        self.load_context = null;
+    }
+
+    pub fn currentLoadSource(self: *const ExtensionRunner) ?ExtensionLoadSource {
+        return if (self.load_context) |ctx| ctx.source else null;
     }
 
     /// Assert that the current thread is allowed to call into

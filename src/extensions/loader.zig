@@ -1,6 +1,7 @@
 const std = @import("std");
 const storage = @import("../storage.zig");
 const lua_runtime = @import("lua_runtime.zig");
+const runner_mod = @import("runner.zig");
 
 const log = std.log.scoped(.extensions);
 
@@ -207,11 +208,11 @@ fn addExtension(
 
 // ── Factory execution ───────────────────────────────────────────────
 //
-// v1 model: an extension is a flat Lua script that calls `zi.register_tool`
-// and `zi.on` at top level. We read each file and execute it via
-// `LuaState.doString` against the shared state. No factory wrapping yet
-// (pi-mono uses `factory(zi)` closures; we skip that until v2 needs
-// per-extension sandboxing).
+// v1 model matches the spec: an extension chunk returns a factory
+// function and the host calls `factory(zi)` against the shared Lua
+// state. Extensions are NOT sandboxed — they share one state — but
+// registrations are attributed to the extension currently being loaded
+// via the runner's temporary load context.
 //
 // Ordering matches `discover` output: explicit → user → project. The
 // tool/command registries are first-registered-wins, so a user override
@@ -235,12 +236,13 @@ pub const LoadStats = struct {
 pub fn loadAll(
     allocator: std.mem.Allocator,
     state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
     list: []const LoadedExtension,
 ) LoadStats {
     var stats: LoadStats = .{};
     for (list) |ext| {
         stats.attempted += 1;
-        loadOne(allocator, state, ext) catch |err| {
+        loadOne(allocator, state, runner, ext) catch |err| {
             log.warn("extension load failed: {s} ({s}): {s}", .{
                 ext.id,
                 ext.path,
@@ -258,26 +260,64 @@ pub fn loadAll(
 fn loadOne(
     allocator: std.mem.Allocator,
     state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
     ext: LoadedExtension,
 ) !void {
-    // Read source from disk.
     const file = try std.fs.openFileAbsolute(ext.path, .{});
     defer file.close();
     const src = try file.readToEndAlloc(allocator, MAX_EXTENSION_SIZE);
     defer allocator.free(src);
 
-    // Lua chunk names are null-terminated C strings. Dupe-Z with the
-    // extension id so runtime errors reference a meaningful source.
-    const chunk_name = try allocator.dupeZ(u8, ext.id);
+    const chunk_name_buf = try std.fmt.allocPrint(allocator, "@{s}", .{ext.path});
+    defer allocator.free(chunk_name_buf);
+    const chunk_name = try allocator.dupeZ(u8, chunk_name_buf);
     defer allocator.free(chunk_name);
 
-    try state.doString(src, chunk_name);
+    runner.assertOnLuaThread();
+
+    // Step 1: execute the chunk itself. Spec-shaped extensions return
+    // a factory function from top level.
+    try state.loadChunk(src, chunk_name);
+    const chunk_call_rc = lua_runtime.c.lua_pcallk(state.L, 0, 1, 0, 0, null);
+    if (chunk_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, chunk_call_rc);
+    errdefer lua_runtime.c.lua_pop(state.L, 1);
+
+    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+        return error.ExtensionFactoryExpectedFunction;
+    }
+
+    // Step 2: call the returned factory with the shared `zi` table.
+    const load_source: runner_mod.ExtensionLoadSource = .{
+        .kind = sourceKindString(ext.source),
+        .id = ext.id,
+        .path = ext.path,
+    };
+
+    _ = lua_runtime.c.lua_getglobal(state.L, "zi");
+    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TTABLE) {
+        lua_runtime.c.lua_pop(state.L, 2);
+        return error.LuaRuntime;
+    }
+
+    runner.beginLoadContext(load_source);
+    defer runner.endLoadContext();
+
+    const factory_call_rc = lua_runtime.c.lua_pcallk(state.L, 1, 0, 0, 0, null);
+    if (factory_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, factory_call_rc);
+}
+
+fn sourceKindString(source: ExtensionSource) []const u8 {
+    return switch (source) {
+        .explicit => "explicit",
+        .user => "user",
+        .project => "project",
+        .builtin => "builtin",
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
 
 const api = @import("api.zig");
-const runner_mod = @import("runner.zig");
 
 test "discover finds foo.lua and bar/init.lua in a temp dir" {
     const allocator = std.testing.allocator;
@@ -398,13 +438,12 @@ test "loadAll executes discovered .lua files and registrations land" {
 
     try tmp.dir.makeDir("extensions");
     var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.writeFile(.{
-        .sub_path = "hello.lua",
-        .data =
-        \\_loaded = true
-        \\zi.on("message_end", function(e, ctx) end)
-        ,
-    });
+    const hello_src =
+        "return function(zi)\n" ++
+        "  _loaded = true\n" ++
+        "  zi.on(\"message_end\", function(e, ctx) end)\n" ++
+        "end\n";
+    try ext_dir.writeFile(.{ .sub_path = "hello.lua", .data = hello_src });
 
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
@@ -425,14 +464,15 @@ test "loadAll executes discovered .lua files and registrations land" {
     runner.attachLuaState(&state);
     api.installZiTable(&state, &runner);
 
-    const stats = loadAll(allocator, &state, exts);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    const stats = loadAll(allocator, &state, &runner, exts);
     try std.testing.expectEqual(@as(u32, 1), stats.attempted);
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
     try std.testing.expectEqual(@as(u32, 0), stats.failed);
 
-    // The script set a global and registered a handler — verify both.
     try state.doString("assert(_loaded == true)", "verify");
     try std.testing.expectEqual(@as(usize, 1), runner.event_registry.handlers(.message_end).len);
+    try std.testing.expectEqualStrings(exts[0].path, runner.event_registry.handlers(.message_end)[0].source_id);
 }
 
 test "loadAll continues after a broken extension" {
@@ -443,7 +483,7 @@ test "loadAll continues after a broken extension" {
     try tmp.dir.makeDir("extensions");
     var ext_dir = try tmp.dir.openDir("extensions", .{});
     try ext_dir.writeFile(.{ .sub_path = "broken.lua", .data = "this is not valid lua !!!" });
-    try ext_dir.writeFile(.{ .sub_path = "good.lua", .data = "_good = 42" });
+    try ext_dir.writeFile(.{ .sub_path = "good.lua", .data = "return function(zi) _good = 42 end" });
 
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
@@ -463,11 +503,61 @@ test "loadAll continues after a broken extension" {
     runner.attachLuaState(&state);
     api.installZiTable(&state, &runner);
 
-    const stats = loadAll(allocator, &state, exts);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    const stats = loadAll(allocator, &state, &runner, exts);
     try std.testing.expectEqual(@as(u32, 2), stats.attempted);
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
     try std.testing.expectEqual(@as(u32, 1), stats.failed);
 
     // Good extension still ran despite broken sibling.
     try state.doString("assert(_good == 42)", "verify");
+}
+
+test "loadAll calls factory with zi and stamps source provenance" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    const prov_src =
+        "return function(zi)\n" ++
+        "  zi.register_tool({\n" ++
+        "    name = \"demo\",\n" ++
+        "    description = \"demo tool\",\n" ++
+        "    parameters = { type = \"object\", properties = {} },\n" ++
+        "    execute = function(params, ctx)\n" ++
+        "      return { ok = true }\n" ++
+        "    end,\n" ++
+        "  })\n" ++
+        "  zi.on(\"message_end\", function() end)\n" ++
+        "end\n";
+    try ext_dir.writeFile(.{ .sub_path = "provenance.lua", .data = prov_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const exts = try discover(.{
+        .allocator = allocator,
+        .cwd = "/nonexistent",
+        .agent_dir_override = tmp_path,
+    });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    const tool = runner.tool_registry.get("demo").?;
+    try std.testing.expectEqualStrings("user", tool.source.kind);
+    try std.testing.expectEqualStrings(exts[0].path, tool.source.id);
+    try std.testing.expectEqualStrings(exts[0].path, runner.event_registry.handlers(.message_end)[0].source_id);
 }

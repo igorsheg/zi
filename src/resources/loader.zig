@@ -1,6 +1,7 @@
 const std = @import("std");
 const storage = @import("../storage.zig");
 const extension_loader = @import("../extensions/loader.zig");
+const extension_runner = @import("../extensions/runner.zig");
 const lua_runtime = @import("../extensions/lua_runtime.zig");
 const skills = @import("../skills/root.zig");
 const types = @import("types.zig");
@@ -89,10 +90,10 @@ pub const ResourceLoader = struct {
         return self.extensions;
     }
 
-    pub fn loadExtensionsInto(self: *const ResourceLoader, state: *lua_runtime.LuaState) extension_loader.LoadStats {
+    pub fn loadExtensionsInto(self: *const ResourceLoader, state: *lua_runtime.LuaState, runner: *extension_runner.ExtensionRunner) extension_loader.LoadStats {
         const entries = self.allocExtensionLoaderEntries() catch return .{};
         defer self.allocator.free(entries);
-        return extension_loader.loadAll(self.allocator, state, entries);
+        return extension_loader.loadAll(self.allocator, state, runner, entries);
     }
 
     pub fn getSkills(self: *const ResourceLoader) types.LoadedSkills {

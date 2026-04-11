@@ -46,6 +46,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
+const agent_protocol = @import("../agent/protocol.zig");
 const spawn_mod = @import("../spawn/spawn.zig");
 const spawn_types = @import("../spawn/types.zig");
 
@@ -248,10 +249,7 @@ fn buildExtensionTool(
         .prompt_snippet = prompt_snippet,
         .prompt_guidelines = prompt_guidelines,
         .impl = .{ .lua = execute_ref },
-        // For E1 every Lua-registered tool reports its source as
-        // "lua". The loader will overwrite this with a meaningful
-        // path identifier in C2-era plumbing.
-        .source = .{ .kind = "lua", .id = "lua" },
+        .source = currentRegistrationSource(runner),
         .render_result_ref = render_result_ref,
     };
 }
@@ -309,10 +307,7 @@ fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
     runner.event_registry.subscribe(kind, .{
         .lua_ref = handler_ref,
-        // Same source-id placeholder as register_tool — the loader
-        // will overwrite this with an extension path once factory
-        // invocation lands. Borrowed string literal, no allocation.
-        .source_id = "lua",
+        .source_id = currentEventSourceId(runner),
     }) catch {
         // OOM during subscribe: release the handler ref so the Lua
         // GC can reclaim it, then surface as a Lua error.
@@ -417,45 +412,41 @@ fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
-    // All real work happens in `ziSpawnInner` so its `defer`s
-    // (arena teardown, callbacks unref, result deinit) actually
-    // unwind on the error path. `luaL_error` is a longjmp and
-    // does NOT trigger zig defers — calling it from inside the
-    // arena scope would leak. Instead, the inner function returns
-    // a ZiSpawnError + a pre-formatted message slice we pass to
-    // `luaL_error` after every defer has run.
     var err_buf: [256]u8 = undefined;
-    const err_msg = ziSpawnInner(L, runner, &err_buf) catch |err| switch (err) {
-        error.NeedLuaError => err_buf[0..std.mem.indexOfScalar(u8, &err_buf, 0).?],
-    };
-    if (err_msg) |msg| {
-        // Push message as a Lua string and longjmp out. Defers
-        // already ran during the catch unwind.
+    const req = buildSpawnRequest(L, runner, &err_buf) catch {
+        const msg = err_buf[0..std.mem.indexOfScalar(u8, &err_buf, 0).?];
         _ = c.lua_pushlstring(L, msg.ptr, msg.len);
         _ = c.lua_error(L);
         return 0;
-    }
+    } orelse return 0;
+
+    runner.current_spawn_request = req;
+    return c.lua_yieldk(L, 0, req.continuation_ctx, ziSpawnContinue);
+}
+
+fn ziSpawnContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) callconv(.c) c_int {
+    _ = status;
+    _ = ctx;
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+    const outcome = runner.current_spawn_result orelse return luaError(L, "zi.spawn: missing resume result");
+    defer runner.current_spawn_result = null;
+
+    pushToolResultAsSpawnResult(L, outcome.result);
     return 1;
 }
 
 const ZiSpawnError = error{NeedLuaError};
 
-/// Inner ziSpawn body. Returns:
-///   - `null`           → success, result already pushed onto L
-///   - `error.NeedLuaError` → caller should longjmp; the error
-///                         message has been written into `err_buf`
-///                         as a NUL-terminated string.
-fn ziSpawnInner(
+fn buildSpawnRequest(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,
     err_buf: *[256]u8,
-) ZiSpawnError!?[]const u8 {
+) ZiSpawnError!?runner_mod.SpawnRequest {
     if (c.lua_type(L, 1) != c.LUA_TTABLE) {
         return writeErr(err_buf, "zi.spawn: expected opts table as first argument");
     }
 
-    // Call-scoped arena. Reset on every return path because we
-    // OWN the function — no longjmps escape past us.
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -475,10 +466,6 @@ fn ziSpawnInner(
     const cwd_opt = readOptionalSpawnString(L, 1, "cwd", aa) catch
         return writeErr(err_buf, "zi.spawn: 'cwd' must be a string");
 
-    // Validate `on` table shape BEFORE taking a ref. Each value
-    // must be a function; keys must be strings. The loop pops only
-    // values (lua_next contract: leave the key on top for the next
-    // iteration).
     _ = c.lua_getfield(L, 1, "on");
     const on_type = c.lua_type(L, -1);
     var callbacks_ref: c_int = c.LUA_NOREF;
@@ -488,54 +475,36 @@ fn ziSpawnInner(
         c.lua_pushnil(L);
         while (c.lua_next(L, -2) != 0) {
             if (c.lua_type(L, -2) != c.LUA_TSTRING) {
-                c.lua_pop(L, 3); // value, key, on-table
+                c.lua_pop(L, 3);
                 return writeErr(err_buf, "zi.spawn: 'on' keys must be event-name strings");
             }
             if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
-                c.lua_pop(L, 3); // value, key, on-table
+                c.lua_pop(L, 3);
                 return writeErr(err_buf, "zi.spawn: 'on' values must be functions");
             }
-            c.lua_pop(L, 1); // pop value; key stays for next iter
+            c.lua_pop(L, 1);
         }
-        // Validation passed; pin the table by ref.
         callbacks_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
     } else {
         c.lua_pop(L, 1);
         return writeErr(err_buf, "zi.spawn: 'on' must be a table");
     }
-    // Once the ref is taken, ensure it's released even if zig
-    // returns an error from this point onward.
-    defer if (callbacks_ref != c.LUA_NOREF) {
-        c.luaL_unref(L, c.LUA_REGISTRYINDEX, callbacks_ref);
-    };
 
-    var trampoline_ctx = TrampolineCtx{
-        .L = L,
+    return .{
+        .task = runner.allocator.dupe(u8, task) catch return writeErr(err_buf, "zi.spawn: out of memory"),
+        .model = if (model) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
+        .tools = if (tools) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
+        .append_system_prompt = if (system_append) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
+        .cwd = runner.allocator.dupe(u8, cwd_opt orelse ".") catch return writeErr(err_buf, "zi.spawn: out of memory"),
         .callbacks_ref = callbacks_ref,
+        .source_L = L,
+        .continuation_ctx = 0,
     };
-
-    const cfg = spawn_types.SpawnConfig{
-        .allocator = runner.allocator,
-        .cwd = cwd_opt orelse ".",
-        .task = task,
-        .model = model,
-        .tools = tools,
-        .append_system_prompt = system_append,
-        .signal = if (runner.current_signal) |s| s.flag else null,
-        .on_event = if (callbacks_ref != c.LUA_NOREF) &eventTrampoline else null,
-        .on_event_ctx = if (callbacks_ref != c.LUA_NOREF) @ptrCast(&trampoline_ctx) else null,
-    };
-
-    var result = spawn_mod.ziSpawn(cfg);
-    defer result.deinit(runner.allocator);
-
-    pushSpawnResult(L, result);
-    return null;
 }
 
-/// Write a NUL-terminated error message into `err_buf` and return
-/// the `NeedLuaError` sentinel. Truncates silently if the message
-/// is longer than the buffer (none of our messages are).
+// Event handlers and `on={...}` callbacks still run non-yieldably in this
+// phase. They are invoked with `lua_pcallk` on the tool coroutine itself; a
+// callback that tries to yield still trips Lua's cross-C-call boundary error.
 fn writeErr(err_buf: *[256]u8, msg: []const u8) ZiSpawnError {
     const n = @min(msg.len, err_buf.len - 1);
     @memcpy(err_buf[0..n], msg[0..n]);
@@ -585,7 +554,7 @@ fn readOptionalSpawnString(
     };
 }
 
-const TrampolineCtx = struct {
+pub const TrampolineCtx = struct {
     L: *c.lua_State,
     callbacks_ref: c_int,
 };
@@ -598,7 +567,7 @@ const TrampolineCtx = struct {
 /// break the read loop. The synchronously-converted JSON value
 /// becomes an independent Lua table via `pushJsonValue`, so the
 /// caller's `parsed.deinit()` after this returns is safe.
-fn eventTrampoline(
+pub fn eventTrampoline(
     kind: []const u8,
     event: std.json.Value,
     ctx: ?*anyopaque,
@@ -639,6 +608,53 @@ fn eventTrampoline(
         c.lua_pop(L, 1); // error
     }
     c.lua_pop(L, 1); // callbacks table
+}
+
+pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.AgentToolResult) void {
+    c.lua_createtable(L, 0, 8);
+
+    c.lua_pushinteger(L, if (result.is_error) 1 else 0);
+    c.lua_setfield(L, -2, "exit_code");
+
+    if (result.details == .object) {
+        const obj = result.details.object;
+        if (obj.get("stop_reason")) |v| if (v == .string) {
+            _ = c.lua_pushlstring(L, v.string.ptr, v.string.len);
+            c.lua_setfield(L, -2, "stop_reason");
+        };
+        if (obj.get("model")) |v| if (v == .string) {
+            _ = c.lua_pushlstring(L, v.string.ptr, v.string.len);
+            c.lua_setfield(L, -2, "model");
+        };
+        if (obj.get("usage")) |usage| {
+            lua_runtime.pushJsonValue(L, usage) catch c.lua_createtable(L, 0, 0);
+            c.lua_setfield(L, -2, "usage");
+        } else {
+            c.lua_createtable(L, 0, 0);
+            c.lua_setfield(L, -2, "usage");
+        }
+    } else {
+        c.lua_createtable(L, 0, 0);
+        c.lua_setfield(L, -2, "usage");
+    }
+
+    var text: []const u8 = "";
+    for (result.content) |block| {
+        switch (block) {
+            .text => |tb| {
+                if (text.len == 0) text = tb.text;
+            },
+            else => {},
+        }
+    }
+    _ = c.lua_pushlstring(L, text.ptr, text.len);
+    c.lua_setfield(L, -2, "output");
+    _ = c.lua_pushlstring(L, text.ptr, text.len);
+    c.lua_setfield(L, -2, "final_text");
+    _ = c.lua_pushlstring(L, "".ptr, 0);
+    c.lua_setfield(L, -2, "stderr");
+    c.lua_pushboolean(L, if (result.is_error) 1 else 0);
+    c.lua_setfield(L, -2, "cancelled");
 }
 
 fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
@@ -685,6 +701,12 @@ fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
     c.lua_setfield(L, -2, "usage");
 }
 
+fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, idx, &len) orelse return &.{};
+    return ptr[0..len];
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
@@ -692,6 +714,16 @@ fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
     const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
     return @ptrCast(@alignCast(ud.?));
+}
+
+fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_registry.RegistrationSource {
+    const source = runner.currentLoadSource() orelse return .{ .kind = "lua", .id = "lua" };
+    return .{ .kind = source.kind, .id = source.path };
+}
+
+fn currentEventSourceId(runner: *const runner_mod.ExtensionRunner) []const u8 {
+    const source = runner.currentLoadSource() orelse return "lua";
+    return source.path;
 }
 
 /// Push an error message onto the Lua stack and longjmp out of the
@@ -1104,4 +1136,51 @@ test "zi.register_tool surfaces validation errors as Lua errors" {
     , "test_missing_execute");
 
     try testing.expectEqual(@as(usize, 0), runner.tool_registry.count());
+}
+
+test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    installZiTable(&state, &runner);
+    runner.attachLuaState(&state);
+
+    var co = try lua_runtime.Coroutine.init(&state);
+    defer co.deinit();
+
+    try state.doString(
+        \\function run_spawn()
+        \\  return zi.spawn({ task = "demo", cwd = "." })
+        \\end
+    , "spawn_yield_test");
+
+    _ = c.lua_getglobal(co.L, "run_spawn");
+    const first = try co.resumeWith(0);
+    try testing.expectEqual(lua_runtime.Coroutine.Status.yielded, first.status);
+    try testing.expect(runner.current_spawn_request != null);
+
+    const blocks = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
+    const text = try testing.allocator.dupe(u8, "child output");
+    blocks[0] = .{ .text = .{ .text = text } };
+    var usage = std.json.ObjectMap.init(testing.allocator);
+    try usage.put(try testing.allocator.dupe(u8, "input"), .{ .integer = 1 });
+    var details = std.json.ObjectMap.init(testing.allocator);
+    try details.put(try testing.allocator.dupe(u8, "usage"), .{ .object = usage });
+    runner.current_spawn_result = .{ .result = .{ .content = blocks, .is_error = false, .details = .{ .object = details } } };
+    defer {
+        const res = runner.current_spawn_result.?.result;
+        for (res.content) |b| switch (b) { .text => |tb| testing.allocator.free(tb.text), else => {} };
+        testing.allocator.free(res.content);
+        lua_runtime.freeJsonValue(testing.allocator, res.details);
+    }
+
+    c.lua_pushlightuserdata(co.L, &runner);
+    c.lua_pushcclosure(co.L, ziSpawnContinue, 1);
+    const second = try co.resumeWith(0);
+    try testing.expectEqual(lua_runtime.Coroutine.Status.finished, second.status);
+    _ = c.lua_getfield(co.L, -1, "output");
+    try testing.expectEqualStrings("child output", lstring(co.L, -1));
+    c.lua_pop(co.L, 1);
 }
