@@ -403,7 +403,7 @@ pub fn main() !void {
         // no Lua render hook claims the tool name. Lua-registered
         // tools hook in via the composed resolver inside Interactive.
         const static_entries: []const tool_display.Registration = &.{
-            .{ .tool_name = "Bash", .renderer = builtin_renderers.bash_renderer },
+            .{ .tool_name = "bash", .renderer = builtin_renderers.bash_renderer },
             .{ .tool_name = "read", .renderer = builtin_renderers.read_renderer },
             .{ .tool_name = "write", .renderer = builtin_renderers.write_renderer },
             .{ .tool_name = "edit", .renderer = builtin_renderers.edit_renderer },

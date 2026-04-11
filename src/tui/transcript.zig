@@ -184,10 +184,9 @@ const TranscriptLayout = struct {
     }
 
     fn appendItem(self: *TranscriptLayout) !void {
-        const new_count = self.items.items.len + 1;
-        try self.heights.resize(new_count);
-        errdefer self.heights.resize(self.items.items.len) catch {};
         try self.items.append(self.allocator, .{});
+        errdefer self.items.items.len -= 1;
+        try self.heights.rebuild(self.items.items);
         self.dirty_count += 1;
     }
 
@@ -225,12 +224,21 @@ const TranscriptLayout = struct {
         self.remeasureAll(ctx, width, measure_fn);
     }
 
-    fn remeasureItem(self: *TranscriptLayout, index: usize, ctx: *anyopaque, width: u32, measure_fn: *const fn (ctx: *anyopaque, index: usize, width: u32) u32) void {
+    fn captureAnchor(self: *const TranscriptLayout) ?FirstVisible {
+        if (self.follow_bottom) return null;
+        return self.findFirstVisible();
+    }
+
+    fn restoreAnchor(self: *TranscriptLayout, anchor: ?FirstVisible) void {
+        const first = anchor orelse return;
+        if (first.index >= self.items.items.len) return;
+        const item_h = self.itemHeight(first.index);
+        const max_skip = if (item_h > 0) item_h - 1 else 0;
+        self.viewport_offset = self.prefixHeightBefore(first.index) + @min(first.skip_rows, max_skip);
+    }
+
+    fn remeasureItemNoAnchor(self: *TranscriptLayout, index: usize, ctx: *anyopaque, width: u32, measure_fn: *const fn (ctx: *anyopaque, index: usize, width: u32) u32) void {
         if (index >= self.items.items.len) return;
-        if (self.layout_width != width) {
-            self.layout_width = width;
-            self.invalidateAll();
-        }
 
         const item = &self.items.items[index];
         const old_height = item.cached_height;
@@ -244,12 +252,26 @@ const TranscriptLayout = struct {
         self.heights.set(index, old_height, new_height);
     }
 
+    fn remeasureItem(self: *TranscriptLayout, index: usize, ctx: *anyopaque, width: u32, measure_fn: *const fn (ctx: *anyopaque, index: usize, width: u32) u32) void {
+        if (index >= self.items.items.len) return;
+        if (self.layout_width != width) {
+            self.layout_width = width;
+            self.invalidateAll();
+        }
+
+        const anchor = self.captureAnchor();
+        self.remeasureItemNoAnchor(index, ctx, width, measure_fn);
+        self.restoreAnchor(anchor);
+    }
+
     fn remeasureAll(self: *TranscriptLayout, ctx: *anyopaque, width: u32, measure_fn: *const fn (ctx: *anyopaque, index: usize, width: u32) u32) void {
+        const anchor = self.captureAnchor();
         self.layout_width = width;
         var idx: usize = 0;
         while (idx < self.items.items.len) : (idx += 1) {
-            self.remeasureItem(idx, ctx, width, measure_fn);
+            self.remeasureItemNoAnchor(idx, ctx, width, measure_fn);
         }
+        self.restoreAnchor(anchor);
     }
 
     fn itemHeight(self: *const TranscriptLayout, index: usize) u32 {
@@ -616,9 +638,7 @@ pub const ToolExecution = struct {
             const remaining = lines.len - max_preview;
             var hint_buf: [64]u8 = undefined;
             const hint = std.fmt.bufPrint(&hint_buf, "... ({d} more lines)", .{remaining}) catch "...";
-            if (skip_rows == max_preview) {
-                _ = region.writeStr(0, row, hint, self.theme.fg(.dim), Color.default, .{});
-            }
+            _ = region.writeStr(0, row, hint, self.theme.fg(.dim), Color.default, .{});
         }
     }
 
@@ -1289,6 +1309,255 @@ pub const Transcript = struct {
 
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
+const agent_root = @import("../agent/root.zig");
+const agent_loop = @import("../agent/loop.zig");
+const ai_root = @import("../ai/root.zig");
+const faux = @import("../ai/faux.zig");
+const builtin_renderers = @import("renderers/builtins.zig");
+
+fn makeUserMessage(text: []const u8) agent_protocol.AgentMessage {
+    return .{ .user = .{
+        .content = .{ .text = text },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+}
+
+fn fauxStreamFn(
+    ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    model: ai_root.protocol.Model,
+    context: ai_root.protocol.Context,
+    options: ai_root.protocol.SimpleStreamOptions,
+    callback: ai_root.provider.EventCallback,
+    callback_ctx: ?*anyopaque,
+) void {
+    const fp: *faux.FauxProvider = @ptrCast(@alignCast(ctx.?));
+    const prov = fp.provider();
+    prov.streamSimple(allocator, model, context, options, callback, callback_ctx);
+}
+
+fn makeLoopConfig(fp: *faux.FauxProvider) agent_protocol.AgentLoopConfig {
+    return .{
+        .model = faux.fauxModel(),
+        .stream = .{ .func = fauxStreamFn, .ctx = @ptrCast(fp) },
+        .convert_to_llm = .{ .func = agent_root.defaultConvertToLlm },
+    };
+}
+
+fn makeCommandArgs(allocator: std.mem.Allocator, command: []const u8) !std.json.Value {
+    var obj = std.json.ObjectMap.init(allocator);
+    try obj.put("command", .{ .string = command });
+    return .{ .object = obj };
+}
+
+fn bashTallExecute(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: agent_protocol.AbortSignal,
+    _: ?agent_protocol.AgentToolUpdateCallback,
+    _: ?*anyopaque,
+) agent_protocol.AgentToolResult {
+    const content = allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1) catch {
+        return .{ .content = &.{}, .is_error = true };
+    };
+    content[0] = .{ .text = .{ .text = "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha" } };
+    return .{ .content = content };
+}
+
+const TranscriptLoopHarness = struct {
+    transcript: Transcript,
+    resolver: tool_display_mod.ToolRendererResolver,
+
+    fn init(allocator: std.mem.Allocator, resolver: tool_display_mod.ToolRendererResolver) TranscriptLoopHarness {
+        return .{
+            .transcript = Transcript.init(allocator),
+            .resolver = resolver,
+        };
+    }
+
+    fn deinit(self: *TranscriptLoopHarness) void {
+        self.transcript.deinit();
+    }
+
+    fn sink(event: agent_protocol.AgentEvent, ctx: ?*anyopaque) void {
+        const self: *TranscriptLoopHarness = @ptrCast(@alignCast(ctx.?));
+        self.apply(event);
+    }
+
+    fn apply(self: *TranscriptLoopHarness, event: agent_protocol.AgentEvent) void {
+        switch (event) {
+            .message_start => |ms| switch (ms.message) {
+                .assistant => self.transcript.beginAssistantMessage(),
+                else => {},
+            },
+            .message_update => |mu| switch (mu.assistant_message_event) {
+                .text_delta => |d| self.transcript.appendText(d.content_index, d.delta),
+                .thinking_delta => |d| self.transcript.appendThinking(d.content_index, d.delta),
+                .toolcall_delta => |tc| {
+                    if (tc.content_index >= tc.partial.content.len) return;
+                    const block = tc.partial.content[tc.content_index];
+                    if (block != .tool_call) return;
+                    const call = block.tool_call;
+                    const renderer = self.resolver.resolve(call.name);
+                    self.transcript.addToolExecution(call.id, call.name, renderer);
+                    self.transcript.toolSetArgs(call.id, call.arguments);
+                },
+                .toolcall_end => |tc| {
+                    const renderer = self.resolver.resolve(tc.tool_call.name);
+                    self.transcript.addToolExecution(tc.tool_call.id, tc.tool_call.name, renderer);
+                    self.transcript.toolSetArgs(tc.tool_call.id, tc.tool_call.arguments);
+                    self.transcript.toolSetArgsComplete(tc.tool_call.id);
+                },
+                else => {},
+            },
+            .tool_execution_start => |te| {
+                const renderer = self.resolver.resolve(te.tool_name);
+                self.transcript.addToolExecution(te.tool_call_id, te.tool_name, renderer);
+                self.transcript.toolSetArgs(te.tool_call_id, te.args);
+                self.transcript.toolMarkExecutionStarted(te.tool_call_id);
+            },
+            .tool_execution_update => |te| {
+                self.transcript.toolSetPartialResult(te.tool_call_id, te.partial_result, if (te.partial_result) |r| r.is_error else false);
+            },
+            .tool_execution_end => |te| {
+                self.transcript.toolSetFinalResult(te.tool_call_id, te.result, te.is_error);
+            },
+            else => {},
+        }
+    }
+};
+
+fn expectAsciiAt(buf: *const Buffer, x: u32, y: u32, ch: u8) !void {
+    try testing.expectEqual(@as(u21, ch), buf.get(x, y).grapheme.codepoint);
+}
+
+test "Transcript faux loop keeps scrolled assistant visible across width reflow after builtin bash tool" {
+    var response_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer response_arena.deinit();
+    const response_alloc = response_arena.allocator();
+
+    var fp = faux.FauxProvider.init(response_alloc);
+    defer fp.deinit();
+
+    const call_args = try makeCommandArgs(response_alloc, "printf '%s\\n' alpha");
+    const tool_call_content = [_]ai_root.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("bash", "tc-1", call_args),
+    };
+    const tail_content = [_]ai_root.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxText("done"),
+    };
+    fp.setResponses(&.{
+        faux.fauxAssistantMessage(response_alloc, &tool_call_content, .toolUse),
+        faux.fauxAssistantMessage(response_alloc, &tail_content, .stop),
+    });
+
+    const bash_tool = agent_protocol.AgentTool{
+        .name = "bash",
+        .description = "bash",
+        .label = "Bash",
+        .parameters = .null,
+        .execute = bashTallExecute,
+    };
+    const tools = [_]agent_protocol.AgentTool{bash_tool};
+    const prompts = [_]agent_protocol.AgentMessage{makeUserMessage("run bash")};
+    const context = agent_protocol.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &tools,
+    };
+
+    const static_entries: []const tool_display_mod.Registration = &.{
+        .{ .tool_name = "bash", .renderer = builtin_renderers.bash_renderer },
+    };
+    var harness = TranscriptLoopHarness.init(testing.allocator, tool_display_mod.ToolRendererResolver.fromStatic(&static_entries));
+    defer harness.deinit();
+
+    var loop_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer loop_arena.deinit();
+    const config = makeLoopConfig(&fp);
+    agent_loop.runAgentLoop(
+        loop_arena.allocator(),
+        testing.allocator,
+        &prompts,
+        context,
+        config,
+        TranscriptLoopHarness.sink,
+        @ptrCast(&harness),
+        .none,
+    );
+
+    const FixedLines = struct {
+        lines: []const []const u8,
+
+        pub fn render(self: *@This(), region: Region) void {
+            var row: u32 = 0;
+            while (row < region.height and row < self.lines.len) : (row += 1) {
+                _ = region.writeStr(0, row, self.lines[row], Color.default, Color.default, .{});
+            }
+        }
+
+        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
+            const h: u32 = @intCast(self.lines.len);
+            return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
+        }
+
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    const WidthSensitive = struct {
+        pub fn render(_: *@This(), region: Region) void {
+            const rows: u32 = if (region.width >= 40) 1 else 5;
+            var row: u32 = 0;
+            while (row < region.height and row < rows) : (row += 1) {
+                _ = region.writeStr(0, row, "grow", Color.default, Color.default, .{});
+            }
+        }
+
+        pub fn measure(_: *@This(), width: u32) component_mod.Measurement {
+            const h: u32 = if (width >= 40) 1 else 5;
+            return .{ .min_height = 1, .preferred_height = h };
+        }
+
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var grow = WidthSensitive{};
+    harness.transcript.addComponent(grow.component());
+
+    var fixed = FixedLines{ .lines = &.{ "anchor 1", "anchor 2", "anchor 3", "anchor 4", "anchor 5", "anchor 6" } };
+    harness.transcript.addComponent(fixed.component());
+
+    const wide_total = harness.transcript.totalHeight(80);
+    try testing.expectEqual(@as(usize, 4), harness.transcript.items.items.len);
+    try testing.expectEqual(@as(u32, 16), wide_total);
+    try testing.expectEqualStrings("tc-1", harness.transcript.items.items[0].tool_call_id.?);
+
+    harness.transcript.scrollToBottom(80, 2);
+    harness.transcript.scrollBy(80, 2, -4);
+
+    var before = try Buffer.init(testing.allocator, 80, 2);
+    defer before.deinit();
+    harness.transcript.render(before.region());
+    try expectAsciiAt(&before, 0, 0, 'a');
+    try expectAsciiAt(&before, 7, 0, '1');
+    try expectAsciiAt(&before, 0, 1, 'a');
+    try expectAsciiAt(&before, 7, 1, '2');
+
+    var after = try Buffer.init(testing.allocator, 24, 2);
+    defer after.deinit();
+    harness.transcript.render(after.region());
+    try testing.expect(harness.transcript.totalHeight(24) > wide_total);
+    try expectAsciiAt(&after, 0, 0, 'a');
+    try expectAsciiAt(&after, 7, 0, '1');
+    try expectAsciiAt(&after, 0, 1, 'a');
+    try expectAsciiAt(&after, 7, 1, '2');
+}
 
 test "Transcript renders assistant text and tool execution in order" {
     var transcript = Transcript.init(testing.allocator);
@@ -1351,6 +1620,69 @@ test "Transcript scrolls through tool output without repeating the first rows" {
     try testing.expectEqual(@as(u21, '2'), buf.get(5, 0).grapheme.codepoint);
     try testing.expectEqual(@as(u21, 'l'), buf.get(1, 1).grapheme.codepoint);
     try testing.expectEqual(@as(u21, '3'), buf.get(5, 1).grapheme.codepoint);
+}
+
+test "Transcript preserves visible anchor when earlier items grow" {
+    const Box = struct {
+        height: u32,
+        ch: u21,
+
+        pub fn render(self: *@This(), region: Region) void {
+            const rows = @min(region.height, self.height);
+            var row: u32 = 0;
+            while (row < rows) : (row += 1) {
+                region.set(0, row, .{ .grapheme = .{ .codepoint = self.ch } });
+            }
+        }
+
+        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
+            return .{ .min_height = if (self.height > 0) 1 else 0, .preferred_height = self.height };
+        }
+
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var first = Box{ .height = 3, .ch = 'A' };
+    var second = Box{ .height = 3, .ch = 'B' };
+    transcript.addComponent(first.component());
+    transcript.addComponent(second.component());
+    transcript.scrollBy(10, 2, 3);
+
+    var before = try Buffer.init(testing.allocator, 10, 2);
+    defer before.deinit();
+    transcript.render(before.region());
+    try testing.expectEqual(@as(u21, 'B'), before.get(0, 0).grapheme.codepoint);
+
+    first.height = 5;
+    transcript.noteItemMutated(0);
+
+    var after = try Buffer.init(testing.allocator, 10, 2);
+    defer after.deinit();
+    transcript.render(after.region());
+    try testing.expectEqual(@as(u21, 'B'), after.get(0, 0).grapheme.codepoint);
+}
+
+test "ToolExecution collapsed fallback renders the overflow hint row" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    transcript.addToolExecution("tool-1", "unknown", .{});
+
+    var content = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "line1\nline2\nline3\nline4\nline5\nline6" } },
+    };
+    transcript.toolSetFinalResult("tool-1", .{ .content = &content, .is_error = false }, false);
+
+    var buf = try Buffer.init(testing.allocator, 20, 10);
+    defer buf.deinit();
+    transcript.render(buf.region());
+
+    try testing.expectEqual(@as(u21, '.'), buf.get(1, 8).grapheme.codepoint);
 }
 
 test "Transcript removeComponent removes item by identity and fixes indices" {

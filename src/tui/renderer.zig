@@ -8,19 +8,30 @@ const Buffer = buffer_mod.Buffer;
 const Region = buffer_mod.Region;
 
 pub const Renderer = struct {
+    allocator: std.mem.Allocator,
     current: Buffer,
     next: Buffer,
-    frame_arena: std.heap.ArenaAllocator,
+    output: std.ArrayListUnmanaged(u8) = .empty,
     fd: std.posix.fd_t,
     width: u32,
     height: u32,
     force_redraw: bool,
 
     pub fn init(allocator: std.mem.Allocator, fd: std.posix.fd_t, width: u32, height: u32) !Renderer {
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer output.deinit(allocator);
+        try output.ensureTotalCapacity(allocator, @as(usize, width) * @as(usize, height) * 4);
+
+        var current = try Buffer.init(allocator, width, height);
+        errdefer current.deinit();
+        var next = try Buffer.init(allocator, width, height);
+        errdefer next.deinit();
+
         return .{
-            .current = try Buffer.init(allocator, width, height),
-            .next = try Buffer.init(allocator, width, height),
-            .frame_arena = std.heap.ArenaAllocator.init(allocator),
+            .allocator = allocator,
+            .current = current,
+            .next = next,
+            .output = output,
             .fd = fd,
             .width = width,
             .height = height,
@@ -31,7 +42,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         self.current.deinit();
         self.next.deinit();
-        self.frame_arena.deinit();
+        self.output.deinit(self.allocator);
     }
 
     pub fn begin(self: *Renderer) Region {
@@ -40,52 +51,62 @@ pub const Renderer = struct {
     }
 
     pub fn end(self: *Renderer) !void {
-        _ = self.frame_arena.reset(.retain_capacity);
-        const frame_allocator = self.frame_arena.allocator();
-        var output: std.ArrayList(u8) = .empty;
+        self.output.clearRetainingCapacity();
 
-        appendStr(&output, frame_allocator, "\x1b[?2026h");
+        appendStr(self, "\x1b[?2026h");
 
         var last_fg: ?Color = null;
         var last_bg: ?Color = null;
         var last_attrs: ?Attributes = null;
 
+        const row_width: usize = @intCast(self.width);
         for (0..self.height) |y_usize| {
             const y: u32 = @intCast(y_usize);
-            for (0..self.width) |x_usize| {
-                const x: u32 = @intCast(x_usize);
-                const curr = self.current.get(x, y);
-                const next_cell = self.next.get(x, y);
+            const row_start = y_usize * row_width;
+            const current_row = self.current.cells[row_start .. row_start + row_width];
+            const next_row = self.next.cells[row_start .. row_start + row_width];
 
+            var x_usize: usize = 0;
+            while (x_usize < row_width) : (x_usize += 1) {
+                const curr = current_row[x_usize];
+                const next_cell = next_row[x_usize];
                 if (!self.force_redraw and curr.eql(next_cell)) continue;
 
-                appendCursorPos(&output, frame_allocator, x, y);
+                appendCursorPos(self, @intCast(x_usize), y);
 
-                if (last_fg == null or !last_fg.?.eql(next_cell.fg)) {
-                    appendFgColor(&output, frame_allocator, next_cell.fg);
-                    last_fg = next_cell.fg;
+                while (x_usize < row_width) : (x_usize += 1) {
+                    const run_curr = current_row[x_usize];
+                    const run_next = next_row[x_usize];
+                    if (!self.force_redraw and run_curr.eql(run_next)) break;
+
+                    if (last_fg == null or !last_fg.?.eql(run_next.fg)) {
+                        appendFgColor(self, run_next.fg);
+                        last_fg = run_next.fg;
+                    }
+
+                    if (last_bg == null or !last_bg.?.eql(run_next.bg)) {
+                        appendBgColor(self, run_next.bg);
+                        last_bg = run_next.bg;
+                    }
+
+                    if (last_attrs == null or !last_attrs.?.eql(run_next.attrs)) {
+                        appendAttrs(self, run_next.attrs);
+                        last_attrs = run_next.attrs;
+                    }
+
+                    if (run_next.width != 0) {
+                        appendGrapheme(self, run_next.grapheme, &self.next.grapheme_pool);
+                    }
                 }
 
-                if (last_bg == null or !last_bg.?.eql(next_cell.bg)) {
-                    appendBgColor(&output, frame_allocator, next_cell.bg);
-                    last_bg = next_cell.bg;
-                }
-
-                if (last_attrs == null or !last_attrs.?.eql(next_cell.attrs)) {
-                    appendAttrs(&output, frame_allocator, next_cell.attrs);
-                    last_attrs = next_cell.attrs;
-                }
-
-                if (next_cell.width == 0) continue;
-
-                appendGrapheme(&output, frame_allocator, next_cell.grapheme, &self.next.grapheme_pool);
+                if (x_usize == row_width) break;
             }
         }
 
-        appendStr(&output, frame_allocator, "\x1b[0m");
-        appendStr(&output, frame_allocator, "\x1b[?2026l");
+        appendStr(self, "\x1b[0m");
+        appendStr(self, "\x1b[?2026l");
 
-        writeAll(self.fd, output.items);
+        writeAll(self.fd, self.output.items);
 
         std.mem.swap(Buffer, &self.current, &self.next);
         self.force_redraw = false;
@@ -104,58 +125,58 @@ pub const Renderer = struct {
     }
 };
 
-fn appendStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) void {
-    out.appendSlice(alloc, s) catch return;
+fn appendStr(self: *Renderer, s: []const u8) void {
+    self.output.appendSlice(self.allocator, s) catch return;
 }
 
-fn appendCursorPos(out: *std.ArrayList(u8), alloc: std.mem.Allocator, x: u32, y: u32) void {
+fn appendCursorPos(self: *Renderer, x: u32, y: u32) void {
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch return;
-    out.appendSlice(alloc, s) catch return;
+    self.output.appendSlice(self.allocator, s) catch return;
 }
 
-fn appendFgColor(out: *std.ArrayList(u8), alloc: std.mem.Allocator, fg: Color) void {
+fn appendFgColor(self: *Renderer, fg: Color) void {
     if (fg.is_default) {
-        appendStr(out, alloc, "\x1b[39m");
+        appendStr(self, "\x1b[39m");
     } else {
         var buf: [24]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "\x1b[38;2;{d};{d};{d}m", .{ fg.r, fg.g, fg.b }) catch return;
-        out.appendSlice(alloc, s) catch return;
+        self.output.appendSlice(self.allocator, s) catch return;
     }
 }
 
-fn appendBgColor(out: *std.ArrayList(u8), alloc: std.mem.Allocator, bg: Color) void {
+fn appendBgColor(self: *Renderer, bg: Color) void {
     if (bg.is_default) {
-        appendStr(out, alloc, "\x1b[49m");
+        appendStr(self, "\x1b[49m");
     } else {
         var buf: [24]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "\x1b[48;2;{d};{d};{d}m", .{ bg.r, bg.g, bg.b }) catch return;
-        out.appendSlice(alloc, s) catch return;
+        self.output.appendSlice(self.allocator, s) catch return;
     }
 }
 
-fn appendAttrs(out: *std.ArrayList(u8), alloc: std.mem.Allocator, attrs: Attributes) void {
-    appendStr(out, alloc, "\x1b[22;23;24;25;27;28;29m");
-    if (attrs.bold) appendStr(out, alloc, "\x1b[1m");
-    if (attrs.dim) appendStr(out, alloc, "\x1b[2m");
-    if (attrs.italic) appendStr(out, alloc, "\x1b[3m");
-    if (attrs.underline) appendStr(out, alloc, "\x1b[4m");
-    if (attrs.blink) appendStr(out, alloc, "\x1b[5m");
-    if (attrs.inverse) appendStr(out, alloc, "\x1b[7m");
-    if (attrs.hidden) appendStr(out, alloc, "\x1b[8m");
-    if (attrs.strikethrough) appendStr(out, alloc, "\x1b[9m");
+fn appendAttrs(self: *Renderer, attrs: Attributes) void {
+    appendStr(self, "\x1b[22;23;24;25;27;28;29m");
+    if (attrs.bold) appendStr(self, "\x1b[1m");
+    if (attrs.dim) appendStr(self, "\x1b[2m");
+    if (attrs.italic) appendStr(self, "\x1b[3m");
+    if (attrs.underline) appendStr(self, "\x1b[4m");
+    if (attrs.blink) appendStr(self, "\x1b[5m");
+    if (attrs.inverse) appendStr(self, "\x1b[7m");
+    if (attrs.hidden) appendStr(self, "\x1b[8m");
+    if (attrs.strikethrough) appendStr(self, "\x1b[9m");
 }
 
-fn appendGrapheme(out: *std.ArrayList(u8), alloc: std.mem.Allocator, grapheme: cell_mod.Grapheme, pool: *const buffer_mod.GraphemePool) void {
+fn appendGrapheme(self: *Renderer, grapheme: cell_mod.Grapheme, pool: *const buffer_mod.GraphemePool) void {
     switch (grapheme) {
         .codepoint => |cp| {
             var buf: [4]u8 = undefined;
             const len = std.unicode.utf8Encode(cp, &buf) catch return;
-            out.appendSlice(alloc, buf[0..len]) catch return;
+            self.output.appendSlice(self.allocator, buf[0..len]) catch return;
         },
         .pooled => |id| {
             const bytes = pool.get(id);
-            out.appendSlice(alloc, bytes) catch return;
+            self.output.appendSlice(self.allocator, bytes) catch return;
         },
     }
 }
@@ -168,6 +189,16 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
             else => return,
         };
     }
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, needle)) |idx| {
+        count += 1;
+        start = idx + needle.len;
+    }
+    return count;
 }
 
 test "Renderer init and deinit" {
@@ -209,6 +240,56 @@ test "Renderer diff produces output for changed cells" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026l") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "A") != null);
+}
+
+test "Renderer emits one cursor move for a contiguous changed run" {
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+    defer std.posix.close(pipe[1]);
+
+    var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
+    defer r.deinit();
+
+    const reg = r.begin();
+    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
+    reg.set(1, 0, Cell{ .grapheme = .{ .codepoint = 'B' } });
+    try r.end();
+
+    var read_buf: [4096]u8 = undefined;
+    const n = try std.posix.read(pipe[0], &read_buf);
+    const output = read_buf[0..n];
+
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(output, "\x1b[1;1H"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(output, "\x1b[1;2H"));
+}
+
+test "Renderer emits separate cursor moves for separated changed runs" {
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+    defer std.posix.close(pipe[1]);
+
+    var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
+    defer r.deinit();
+
+    {
+        const reg = r.begin();
+        try r.end();
+        var drain_buf: [4096]u8 = undefined;
+        _ = try std.posix.read(pipe[0], &drain_buf);
+        _ = reg;
+    }
+
+    const reg = r.begin();
+    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
+    reg.set(2, 0, Cell{ .grapheme = .{ .codepoint = 'B' } });
+    try r.end();
+
+    var read_buf: [4096]u8 = undefined;
+    const n = try std.posix.read(pipe[0], &read_buf);
+    const output = read_buf[0..n];
+
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(output, "\x1b[1;1H"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(output, "\x1b[1;3H"));
 }
 
 test "Renderer skips unchanged cells" {
