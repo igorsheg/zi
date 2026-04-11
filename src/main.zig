@@ -277,16 +277,7 @@ pub fn main() !void {
         // canonical `ai.provider_defaults.Bundle`. main.zig no longer
         // hand-registers providers per mode.
 
-        // Resolve --append-system-prompt: file path -> read contents, else treat as literal text
-        var append_system_prompt: ?[]const u8 = null;
-        if (append_system_prompt_arg) |asp| {
-            if (std.fs.cwd().openFile(asp, .{})) |file| {
-                defer file.close();
-                append_system_prompt = file.readToEndAlloc(allocator, 1024 * 1024) catch null;
-            } else |_| {
-                append_system_prompt = asp;
-            }
-        }
+        const append_system_prompt = append_system_prompt_arg;
         // Resolve --tools allowlist: comma-separated tool names →
         // strict whitelist applied inside AgentSession.init AFTER the
         // builtin + Lua-extension tool merge. Passing the list through

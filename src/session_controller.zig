@@ -3,6 +3,7 @@ const coding_agent = @import("coding_agent.zig");
 const agent_mod = @import("agent/root.zig");
 const ai = @import("ai/root.zig");
 const json_util = @import("ai/json_util.zig");
+const resources = @import("resources/root.zig");
 const classifier = @import("session_error_classifier.zig");
 
 const AgentSession = coding_agent.AgentSession;
@@ -508,10 +509,12 @@ fn createTestAgentSession(
     allocator: std.mem.Allocator,
     registry: *ai.provider.Registry,
 ) AgentSession {
+    const resource_loader = resources.ResourceLoader.init(allocator, .{ .cwd = "/tmp/zi-test" }) catch @panic("OOM");
     return AgentSession.init(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = resource_loader,
         .registry = registry,
         .tools = &.{},
         .no_session = true,

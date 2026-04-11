@@ -4,9 +4,9 @@
 //!
 //! Phase A of the extension system reorganizes the bootstrap path so
 //! that creating a session is a single call into a well-known seam,
-//! not a pile of inline wiring in `main.zig`. Today the factory just
-//! forwards to `AgentSession.init`. In subsequent phases it grows to
-//! own the pieces that main.zig must not know about:
+//! not a pile of inline wiring in `main.zig`. Today the factory already
+//! owns session-store and ResourceLoader bootstrap. In subsequent phases
+//! it grows to own the pieces that main.zig must not know about:
 //!
 //!   - A3: construct and own the ExtensionRunner (discovered extensions,
 //!         registered tools, stub runtime) and thread it into the session.
@@ -28,8 +28,13 @@
 //! See docs/extensions.md § Architecture and § Lifecycle.
 
 const std = @import("std");
+const ai = @import("ai/root.zig");
+const agent_mod = @import("agent/root.zig");
 const coding_agent = @import("coding_agent.zig");
 const storage = @import("storage.zig");
+const resources = @import("resources/root.zig");
+const tool_def = @import("tools/definition.zig");
+const auth_storage_mod = @import("auth/storage.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 
 pub const AgentSession = coding_agent.AgentSession;
@@ -43,9 +48,27 @@ pub const CompactionExecutor = @import("session_controller.zig").CompactionExecu
 pub const SessionCompactionResult = @import("session_controller.zig").CompactionResult;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 
-/// Options forwarded to `AgentSession.init`. Re-exported so callers
-/// only need to import `sdk.zig`, not `coding_agent.zig`.
-pub const CreateOptions = AgentSession.Options;
+pub const CreateOptions = struct {
+    model: ai.protocol.Model,
+    /// Static API key fallback. Used only when no `auth_storage` is
+    /// attached or its lookup returns empty.
+    api_key: []const u8 = "",
+    cwd: []const u8,
+    system_prompt: ?[]const u8 = null,
+    context_files: []const resources.types.AgentsFile = &.{},
+    max_tokens: ?u64 = 4096,
+    tools: ?[]const tool_def.ToolDefinition = null,
+    registry: ?*ai.provider.Registry = null,
+    event_handler: ?AgentSession.EventHandler = null,
+    auth_storage: ?*auth_storage_mod.AuthStorage = null,
+    model_registry: ?*ai.model_registry.ModelRegistry = null,
+    initial_messages: []const agent_mod.protocol.AgentMessage = &.{},
+    thinking_level: ?agent_mod.protocol.ThinkingLevel = null,
+    session_store: ?SessionStore = null,
+    no_session: bool = false,
+    append_system_prompt: ?[]const u8 = null,
+    tool_allowlist: ?[]const []const u8 = null,
+};
 
 /// Resolve the on-disk directory for a session's files. Runs BEFORE
 /// `SessionStore.create` so v2's `session_directory` extension event
@@ -76,23 +99,47 @@ pub fn resolveSessionDir(
 /// Bootstrap order (v1):
 ///   1. resolveSessionDir(cwd, null) — v2 hook point
 ///   2. SessionStore.create(session_dir, cwd) — if no store was passed in
-///   3. AgentSession.init(...) — wires Agent + SessionStore + tools
+///   3. ResourceLoader.init(...) — canonical resource owner for the session
+///   4. AgentSession.init(...) — consumes the injected loader dependency
 ///
 /// Returned session is owned by the caller — `defer session.deinit()`.
 pub fn createAgentSession(
     allocator: std.mem.Allocator,
     options: CreateOptions,
 ) !AgentSession {
-    var opts = options;
+    var session_store = options.session_store;
 
     // Pre-build the session store using the resolved directory.
     // A store passed in by the caller (e.g. from --continue via
     // SessionStore.open) wins — we never overwrite it.
-    if (opts.session_store == null and !opts.no_session) {
-        const session_dir = try resolveSessionDir(allocator, opts.cwd, null);
-        opts.session_store = SessionStore.create(allocator, session_dir, opts.cwd);
+    if (session_store == null and !options.no_session) {
+        const session_dir = try resolveSessionDir(allocator, options.cwd, null);
+        session_store = SessionStore.create(allocator, session_dir, options.cwd);
     }
 
+    const resource_loader = try resources.ResourceLoader.init(allocator, .{
+        .cwd = options.cwd,
+        .system_prompt = options.system_prompt,
+        .append_system_prompt = options.append_system_prompt,
+        .injected_agents_files = options.context_files,
+    });
+
     // A3+ will construct and attach the ExtensionRunner here.
-    return AgentSession.init(allocator, opts);
+    return AgentSession.init(allocator, .{
+        .model = options.model,
+        .api_key = options.api_key,
+        .cwd = options.cwd,
+        .resource_loader = resource_loader,
+        .max_tokens = options.max_tokens,
+        .tools = options.tools,
+        .registry = options.registry,
+        .event_handler = options.event_handler,
+        .auth_storage = options.auth_storage,
+        .model_registry = options.model_registry,
+        .initial_messages = options.initial_messages,
+        .thinking_level = options.thinking_level,
+        .session_store = session_store,
+        .no_session = options.no_session,
+        .tool_allowlist = options.tool_allowlist,
+    });
 }

@@ -6,6 +6,15 @@ pub const SseEvent = struct {
     data: []const u8,
 };
 
+pub const EventHandler = struct {
+    func: *const fn (event: SseEvent, ctx: ?*anyopaque) anyerror!void,
+    ctx: ?*anyopaque = null,
+
+    pub fn call(self: EventHandler, event: SseEvent) anyerror!void {
+        return self.func(event, self.ctx);
+    }
+};
+
 /// Line-oriented SSE parser following W3C Server-Sent Events spec (§9.2).
 /// Zero-allocation: all slices in emitted events point into internal buffers
 /// and are valid until the next call to feedLine() or reset().
@@ -125,20 +134,27 @@ pub const SseParser = struct {
     }
 };
 
-/// Feed a reader line-by-line into the parser, calling callback for each event.
-/// This is the main integration point: connect an HTTP response reader to SSE parsing.
+/// Feed a reader into the parser with chunked reads, calling the handler for
+/// each completed event. This avoids per-line reader capacity limits.
 pub fn streamEvents(
+    allocator: std.mem.Allocator,
     reader: anytype,
     parser: *SseParser,
-    line_buf: []u8,
-    callback: anytype,
+    chunk_size: usize,
+    handler: EventHandler,
 ) !void {
+    var pending: std.ArrayListUnmanaged(u8) = .empty;
+    defer pending.deinit(allocator);
+
+    const effective_chunk_size = if (chunk_size == 0) 4096 else chunk_size;
+
     while (true) {
-        const line = reader.readUntilDelimiter(line_buf, '\n') catch |err| switch (err) {
+        const chunk = reader.take(effective_chunk_size) catch |err| switch (err) {
             error.EndOfStream => {
+                try flushPendingLines(parser, &pending, handler, true);
                 if (parser.has_data or parser.event_len > 0) {
                     if (parser.feedLine("")) |evt| {
-                        callback(evt);
+                        try handler.call(evt);
                     }
                 }
                 return;
@@ -146,11 +162,55 @@ pub fn streamEvents(
             else => return err,
         };
 
-        const trimmed = std.mem.trimRight(u8, line, "\r");
-        if (parser.feedLine(trimmed)) |evt| {
-            callback(evt);
+        if (chunk.len == 0) {
+            try flushPendingLines(parser, &pending, handler, true);
+            if (parser.has_data or parser.event_len > 0) {
+                if (parser.feedLine("")) |evt| {
+                    try handler.call(evt);
+                }
+            }
+            return;
         }
+
+        try pending.appendSlice(allocator, chunk);
+        try flushPendingLines(parser, &pending, handler, false);
     }
+}
+
+fn flushPendingLines(
+    parser: *SseParser,
+    pending: *std.ArrayListUnmanaged(u8),
+    handler: EventHandler,
+    flush_tail: bool,
+) !void {
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, pending.items, start, '\n')) |newline_idx| {
+        var line = pending.items[start..newline_idx];
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (parser.feedLine(line)) |evt| {
+            try handler.call(evt);
+        }
+        start = newline_idx + 1;
+    }
+
+    if (flush_tail and start < pending.items.len) {
+        var tail = pending.items[start..];
+        if (tail.len > 0 and tail[tail.len - 1] == '\r') tail = tail[0 .. tail.len - 1];
+        if (parser.feedLine(tail)) |evt| {
+            try handler.call(evt);
+        }
+        start = pending.items.len;
+    }
+
+    if (start == 0) return;
+    if (start >= pending.items.len) {
+        pending.clearRetainingCapacity();
+        return;
+    }
+
+    const remaining = pending.items.len - start;
+    std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[start..]);
+    pending.items.len = remaining;
 }
 
 // =============================================================================
@@ -274,26 +334,77 @@ test "data truncation when exceeding buffer" {
 test "streamEvents feeds reader into parser" {
     const input = "event: test\ndata: hello\n\nevent: done\ndata: bye\n\n";
     var stream = std.io.fixedBufferStream(input);
-    var reader = stream.reader();
+    const Reader = struct {
+        s: *std.io.FixedBufferStream([]const u8),
+
+        fn take(self: *@This(), max_bytes: usize) ![]const u8 {
+            const remaining = self.s.buffer.len - self.s.pos;
+            if (remaining == 0) return error.EndOfStream;
+            const n = @min(max_bytes, remaining);
+            const start = self.s.pos;
+            self.s.pos += n;
+            return self.s.buffer[start .. start + n];
+        }
+    };
+    var reader = Reader{ .s = &stream };
 
     var parser = SseParser{};
     var count: usize = 0;
 
     const Ctx = struct {
-        fn cb(evt: SseEvent) void {
+        count: *usize,
+
+        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
             _ = evt;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count.* += 1;
         }
     };
-    _ = Ctx;
 
-    // Use a simpler approach: collect events manually
-    var line_buf: [4096]u8 = undefined;
-    while (true) {
-        const line = reader.readUntilDelimiter(&line_buf, '\n') catch break;
-        const trimmed = std.mem.trimRight(u8, line, "\r");
-        if (parser.feedLine(trimmed)) |_| {
-            count += 1;
-        }
-    }
+    var ctx = Ctx{ .count = &count };
+    try streamEvents(std.testing.allocator, &reader, &parser, 8, .{
+        .func = &Ctx.cb,
+        .ctx = @ptrCast(&ctx),
+    });
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "streamEvents handles lines longer than chunk size" {
+    const long_json = "{\"type\":\"response.output_text.delta\",\"delta\":\"" ++ ("x" ** 20000) ++ "\"}";
+    const input = "data: " ++ long_json ++ "\n\n";
+    var stream = std.io.fixedBufferStream(input);
+    const Reader = struct {
+        s: *std.io.FixedBufferStream([]const u8),
+
+        fn take(self: *@This(), max_bytes: usize) ![]const u8 {
+            const remaining = self.s.buffer.len - self.s.pos;
+            if (remaining == 0) return error.EndOfStream;
+            const n = @min(max_bytes, remaining);
+            const start = self.s.pos;
+            self.s.pos += n;
+            return self.s.buffer[start .. start + n];
+        }
+    };
+    var reader = Reader{ .s = &stream };
+    var parser = SseParser{};
+
+    const Ctx = struct {
+        seen: bool = false,
+        data_len: usize = 0,
+
+        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = true;
+            self.data_len = evt.data.len;
+        }
+    };
+
+    var ctx = Ctx{};
+    try streamEvents(std.testing.allocator, &reader, &parser, 64, .{
+        .func = &Ctx.cb,
+        .ctx = @ptrCast(&ctx),
+    });
+
+    try std.testing.expect(ctx.seen);
+    try std.testing.expectEqual(long_json.len, ctx.data_len);
 }

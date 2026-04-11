@@ -1,9 +1,7 @@
 const std = @import("std");
+const resource_types = @import("resources/types.zig");
 
-pub const ContextFile = struct {
-    path: []const u8,
-    content: []const u8,
-};
+pub const ContextFile = resource_types.AgentsFile;
 
 pub const ToolSnippet = struct {
     name: []const u8,
@@ -15,7 +13,7 @@ pub const Options = struct {
     tool_names: []const []const u8 = &.{},
     tool_snippets: []const ToolSnippet = &.{},
     guidelines: []const []const u8 = &.{},
-    append_system_prompt: ?[]const u8 = null,
+    append_system_prompt: []const []const u8 = &.{},
     cwd: []const u8 = ".",
     context_files: []const ContextFile = &.{},
 };
@@ -55,10 +53,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
 
     if (options.custom_prompt) |custom| {
         try w.writeAll(custom);
-        if (options.append_system_prompt) |append| {
-            try w.writeAll("\n\n");
-            try w.writeAll(append);
-        }
+        try writeAppendSystemPrompt(w, options.append_system_prompt);
         try writeContextFiles(w, options.context_files);
         try w.print("\nCurrent date: {s}", .{date});
         try w.print("\nCurrent working directory: {s}", .{cwd});
@@ -126,10 +121,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
         try w.print("- {s}\n", .{g});
     }
 
-    if (options.append_system_prompt) |append| {
-        try w.writeAll("\n\n");
-        try w.writeAll(append);
-    }
+    try writeAppendSystemPrompt(w, options.append_system_prompt);
 
     try writeContextFiles(w, options.context_files);
 
@@ -151,6 +143,14 @@ fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, item, needle)) return true;
     }
     return false;
+}
+
+fn writeAppendSystemPrompt(w: *std.Io.Writer, prompts: []const []const u8) !void {
+    if (prompts.len == 0) return;
+    for (prompts) |prompt| {
+        try w.writeAll("\n\n");
+        try w.writeAll(prompt);
+    }
 }
 
 fn writeContextFiles(w: *std.Io.Writer, files: []const ContextFile) !void {

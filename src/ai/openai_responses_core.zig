@@ -330,30 +330,38 @@ pub fn processStream(
 
     var parser = sse.SseParser{};
 
-    while (true) {
-        const line_with_nl = reader.takeDelimiterInclusive('\n') catch |err| {
-            if (err == error.EndOfStream) {
-                if (parser.has_data or parser.event_len > 0) {
-                    if (parser.feedLine("")) |evt| {
-                        handleEvent(allocator, &state, &scratch_arena, evt, callback, callback_ctx) catch {};
-                    }
-                }
-                break;
-            }
-            if (abort_flag.isAborted()) {
-                state.partial.stop_reason = .aborted;
-                break;
-            }
+    const StreamCtx = struct {
+        allocator: std.mem.Allocator,
+        state: *StreamState,
+        scratch: *std.heap.ArenaAllocator,
+        callback: ai_provider.EventCallback,
+        callback_ctx: ?*anyopaque,
+
+        fn onEvent(evt: sse.SseEvent, ctx: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try handleEvent(self.allocator, self.state, self.scratch, evt, self.callback, self.callback_ctx);
+        }
+    };
+
+    var stream_ctx = StreamCtx{
+        .allocator = allocator,
+        .state = &state,
+        .scratch = &scratch_arena,
+        .callback = callback,
+        .callback_ctx = callback_ctx,
+    };
+
+    sse.streamEvents(allocator, reader, &parser, 4096, .{
+        .func = &StreamCtx.onEvent,
+        .ctx = @ptrCast(&stream_ctx),
+    }) catch |err| {
+        if (abort_flag.isAborted()) {
+            state.partial.stop_reason = .aborted;
+        } else {
             emitError(allocator, callback, callback_ctx, model, provider_label, "stream read error: {s}", .{@errorName(err)});
             return;
-        };
-        var line = line_with_nl;
-        if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (parser.feedLine(line)) |evt| {
-            handleEvent(allocator, &state, &scratch_arena, evt, callback, callback_ctx) catch break;
         }
-    }
+    };
 
     state.partial.content = buildFinalContent(allocator, state.items.items) catch &.{};
 

@@ -197,7 +197,7 @@ pub const AnthropicProvider = struct {
 
         // Parse SSE stream line by line
         var parser = sse.SseParser{};
-        var reader = response.reader(&transfer_buf);
+        const reader = response.reader(&transfer_buf);
 
         // Per-delta scratch arena for partial-JSON reparses.
         // See StreamState.scratch for rationale.
@@ -237,37 +237,36 @@ pub const AnthropicProvider = struct {
         // Emit start event
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
-        // Process SSE events line by line.
+        // Process SSE events with chunked reads so long lines don't depend on
+        // the HTTP reader's internal buffer size.
+        const StreamCtx = struct {
+            state: *StreamState,
+            callback: ai_provider.EventCallback,
+            callback_ctx: ?*anyopaque,
 
-        while (true) {
-            const line_with_nl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
-                error.EndOfStream => {
-                    if (parser.has_data or parser.event_len > 0) {
-                        if (parser.feedLine("")) |evt| {
-                            handleSseEvent(evt, &state, callback, callback_ctx);
-                        }
-                    }
-                    break;
-                },
-                else => {
-                    // Check if this was caused by abort
-                    if (options.signal.isAborted()) {
-                        state.partial.stop_reason = .aborted;
-                        break;
-                    }
-                    emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)});
-                    return;
-                },
-            };
-
-            // Strip trailing \n and \r
-            var line = line_with_nl;
-            if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            if (parser.feedLine(line)) |evt| {
-                handleSseEvent(evt, &state, callback, callback_ctx);
+            fn onEvent(evt: sse.SseEvent, ctx: ?*anyopaque) anyerror!void {
+                const stream_self: *@This() = @ptrCast(@alignCast(ctx));
+                handleSseEvent(evt, stream_self.state, stream_self.callback, stream_self.callback_ctx);
             }
-        }
+        };
+
+        var stream_ctx = StreamCtx{
+            .state = &state,
+            .callback = callback,
+            .callback_ctx = callback_ctx,
+        };
+
+        sse.streamEvents(allocator, reader, &parser, 4096, .{
+            .func = &StreamCtx.onEvent,
+            .ctx = @ptrCast(&stream_ctx),
+        }) catch |err| {
+            if (options.signal.isAborted()) {
+                state.partial.stop_reason = .aborted;
+            } else {
+                emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)});
+                return;
+            }
+        };
 
         // Build final content blocks from accumulated streaming state.
         // Allocations go through the caller's allocator (arena) so they survive

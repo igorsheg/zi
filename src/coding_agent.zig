@@ -7,13 +7,13 @@ const builtin_tools_mod = @import("tools/builtins.zig");
 const tool_def = @import("tools/definition.zig");
 const builtin_util = @import("tools/util.zig");
 const system_prompt_mod = @import("system_prompt.zig");
+const resources = @import("resources/root.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const storage = @import("storage.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const extension_api = @import("extensions/api.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
-const extension_loader = @import("extensions/loader.zig");
 const lua_tool_mod = @import("extensions/lua_tool.zig");
 
 const protocol = agent_mod.protocol;
@@ -45,6 +45,7 @@ pub const AgentSession = struct {
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
+    resource_loader: resources.ResourceLoader,
     /// Borrowed ModelRegistry — lifetime owned by caller (main.zig in
     /// the interactive path). Used by the TUI to bind `[]const Model`
     /// at init, and by `/resume` for `restoreModelFromSession`.
@@ -107,8 +108,10 @@ pub const AgentSession = struct {
         /// flows are picked up live by the stream closure.
         api_key: []const u8 = "",
         cwd: []const u8,
-        system_prompt: ?[]const u8 = null,
-        context_files: []const system_prompt_mod.ContextFile = &.{},
+        /// Canonical loaded resource state, constructed by the
+        /// composition root (`sdk.createAgentSession`) and transferred
+        /// into the session as an owned dependency.
+        resource_loader: resources.ResourceLoader,
         max_tokens: ?u64 = 4096,
         tools: ?[]const tool_def.ToolDefinition = null,
         /// Optional pre-built provider registry. When null, the sdk
@@ -130,7 +133,6 @@ pub const AgentSession = struct {
         /// If null, a new session is created for `cwd`.
         session_store: ?SessionStore = null,
         no_session: bool = false,
-        append_system_prompt: ?[]const u8 = null,
         /// Strict tool allowlist. When non-null, the final merged
         /// tool set (builtins + Lua extensions) is filtered to only
         /// tools whose `name` or `label` matches an entry in this
@@ -194,6 +196,8 @@ pub const AgentSession = struct {
             .ctx = @ptrCast(closure),
         };
 
+        var resource_loader = options.resource_loader;
+
         // Construct the extension runtime BEFORE building the tools
         // list so Lua-registered tools can join the agent's tool set.
         // Failures here are non-fatal: ext_state/ext_runner stay null,
@@ -243,20 +247,9 @@ pub const AgentSession = struct {
             }
             state_ptr.setPackagePath(dirs_buf[0..dirs_n]) catch {};
 
-            const discovered: []extension_loader.LoadedExtension = extension_loader.discover(.{
-                .allocator = allocator,
-                .cwd = options.cwd,
-            }) catch |err| disc_blk: {
-                std.log.scoped(.extensions).warn(
-                    "extension discovery failed: {s}",
-                    .{@errorName(err)},
-                );
-                break :disc_blk &.{};
-            };
-            defer if (discovered.len > 0) extension_loader.freeExtensions(allocator, discovered);
-
+            const discovered = resource_loader.getExtensions().extensions;
             if (discovered.len > 0) {
-                const stats = extension_loader.loadAll(allocator, state_ptr, discovered);
+                const stats = resource_loader.loadExtensionsInto(state_ptr);
                 std.log.scoped(.extensions).info(
                     "extensions: {d} loaded, {d} failed of {d} discovered",
                     .{ stats.loaded, stats.failed, stats.attempted },
@@ -323,15 +316,15 @@ pub const AgentSession = struct {
         const prompt_guidelines = collectGuidelines(allocator, filtered_definitions) catch &.{};
 
         const sys_prompt = blk: {
-            if (options.system_prompt) |custom| {
+            if (resource_loader.getSystemPrompt()) |custom| {
                 break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
                     .custom_prompt = custom,
                     .cwd = options.cwd,
-                    .context_files = options.context_files,
+                    .context_files = resource_loader.getAgentsFiles().agents_files,
                     .tool_names = tool_name_slice,
                     .tool_snippets = tool_snippets,
                     .guidelines = prompt_guidelines,
-                    .append_system_prompt = options.append_system_prompt,
+                    .append_system_prompt = resource_loader.getAppendSystemPrompt(),
                 }) catch custom;
             }
             break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
@@ -339,8 +332,8 @@ pub const AgentSession = struct {
                 .tool_names = tool_name_slice,
                 .tool_snippets = tool_snippets,
                 .guidelines = prompt_guidelines,
-                .context_files = options.context_files,
-                .append_system_prompt = options.append_system_prompt,
+                .context_files = resource_loader.getAgentsFiles().agents_files,
+                .append_system_prompt = resource_loader.getAppendSystemPrompt(),
             }) catch "You are a helpful coding assistant.";
         };
 
@@ -387,6 +380,7 @@ pub const AgentSession = struct {
             ._subscription_token = null,
             ._stream_closure = closure,
             .auth_storage = options.auth_storage,
+            .resource_loader = resource_loader,
             .model_registry = options.model_registry,
             ._owned_provider_bundle = owned_bundle,
             ._extension_runner = ext_runner,
@@ -555,6 +549,7 @@ pub const AgentSession = struct {
         self.allocator.destroy(self._stream_closure);
         self.event_listeners.deinit(self.allocator);
         self.agent.deinit();
+        self.resource_loader.deinit();
         // Provider bundle goes last — the agent's stream closure may
         // still hold references into the registry until agent.deinit
         // returns. Destroying earlier is a use-after-free risk.
@@ -926,6 +921,7 @@ test "trySetModel updates session state and appends model change when auth exist
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(alloc, "/tmp/zi-test"),
         .registry = &registry,
         .auth_storage = &auth,
         .model_registry = &model_registry,
@@ -967,6 +963,7 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
         .model = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry,
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(alloc, "/tmp/zi-test"),
         .registry = &registry,
         .auth_storage = &auth,
         .model_registry = &model_registry,
@@ -1007,6 +1004,7 @@ test "trySetModel rejects unauthed model without mutating state or session" {
         .model = initial,
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(alloc, "/tmp/zi-test"),
         .registry = &registry,
         .auth_storage = &auth,
         .model_registry = &model_registry,
@@ -1159,6 +1157,10 @@ test "convertToLlm handles mixed message types in order" {
 
 const faux = ai.faux;
 
+fn createTestResourceLoader(allocator: std.mem.Allocator, cwd: []const u8) resources.ResourceLoader {
+    return resources.ResourceLoader.init(allocator, .{ .cwd = cwd }) catch @panic("OOM");
+}
+
 /// Test helper: create a AgentSession wired to a faux provider.
 fn createTestAgentSession(
     allocator: std.mem.Allocator,
@@ -1170,6 +1172,7 @@ fn createTestAgentSession(
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
         .registry = registry,
         .tools = &.{},
         .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(collector) },
@@ -1262,6 +1265,7 @@ test "AgentSession: tool_allowlist filters merged tool set" {
         .model = faux.fauxModel(),
         .api_key = "k",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
         .registry = &registry,
         .tools = &seeded,
         .tool_allowlist = &allow,
@@ -1496,6 +1500,7 @@ test "AgentSession: tool call triggers execution and second LLM call" {
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
         .registry = &registry,
         .tools = &tools,
         .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },
@@ -1543,6 +1548,7 @@ test "AgentSession: continue sends restored context to provider" {
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
         .registry = &reg1,
         .tools = &.{},
         .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&col1) },
@@ -1578,6 +1584,7 @@ test "AgentSession: continue sends restored context to provider" {
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
         .registry = &reg2,
         .tools = &.{},
         .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&col2) },
@@ -1626,6 +1633,7 @@ test "AgentSession: compaction_summary converted to user message for provider" {
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
         .registry = &registry,
         .tools = &.{},
         .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },

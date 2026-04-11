@@ -8,6 +8,8 @@ test {
     _ = @import("session/root.zig");
     _ = @import("coding_agent.zig");
     _ = @import("system_prompt.zig");
+    _ = @import("resources/root.zig");
+    _ = @import("skills/root.zig");
     _ = @import("tui/root.zig");
     _ = @import("slash_commands.zig");
     _ = @import("spawn/root.zig");

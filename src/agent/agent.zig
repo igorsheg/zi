@@ -4,6 +4,7 @@ const protocol = @import("protocol.zig");
 const loop_mod = @import("loop.zig");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
+const testing = std.testing;
 
 /// Queue mode for pending message queues.
 /// pi-mono source: packages/agent/src/agent.ts:55
@@ -249,12 +250,21 @@ pub const Agent = struct {
     }
 
     /// Replace all messages (e.g., after loading a resumed session).
-    /// Resets the arena and repopulates from the given slice.
+    /// Accepts slices that may alias the agent's current arena-backed transcript.
     pub fn loadMessages(self: *Agent, new_messages: []const protocol.AgentMessage) void {
+        var staging_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer staging_arena.deinit();
+        const staging_alloc = staging_arena.allocator();
+
+        var staged: std.ArrayList(protocol.AgentMessage) = .empty;
+        for (new_messages) |m| {
+            staged.append(staging_alloc, dupeAgentMessage(staging_alloc, m)) catch {};
+        }
+
         _ = self.message_arena.reset(.retain_capacity);
         self.messages = .empty;
         const aa = self.message_arena.allocator();
-        for (new_messages) |m| {
+        for (staged.items) |m| {
             self.messages.append(aa, dupeAgentMessage(aa, m)) catch {};
         }
         self.state.messages = self.messages.items;
@@ -494,7 +504,10 @@ fn dupeAgentMessage(alloc: std.mem.Allocator, msg: protocol.AgentMessage) protoc
         } },
         .custom => |c| .{ .custom = .{
             .custom_type = alloc.dupe(u8, c.custom_type) catch c.custom_type,
-            .content = switch (c.content) { .text => |t| .{ .text = alloc.dupe(u8, t) catch t }, .blocks => |b| .{ .blocks = dupeUserBlocks(alloc, b) } },
+            .content = switch (c.content) {
+                .text => |t| .{ .text = alloc.dupe(u8, t) catch t },
+                .blocks => |b| .{ .blocks = dupeUserBlocks(alloc, b) },
+            },
             .display = c.display,
             .details = cloneOptionalJson(alloc, c.details),
             .timestamp = c.timestamp,
@@ -627,4 +640,50 @@ fn unreachableStreamFn(
     _: ?*anyopaque,
 ) void {
     @panic("Agent: no stream function configured");
+}
+
+test "loadMessages accepts state-backed subslices" {
+    const initial_messages = [_]protocol.AgentMessage{
+        .{ .user = .{
+            .content = .{ .text = "hello" },
+            .timestamp = 1,
+        } },
+        .{ .assistant = .{
+            .content = &.{},
+            .api = .openai_responses,
+            .provider = .openai,
+            .model = "gpt-test",
+            .usage = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total_tokens = 0,
+                .cost = .{
+                    .input = 0,
+                    .output = 0,
+                    .cache_read = 0,
+                    .cache_write = 0,
+                    .total = 0,
+                },
+            },
+            .stop_reason = .@"error",
+            .error_message = "retry me",
+            .timestamp = 2,
+        } },
+    };
+
+    var agent = Agent.init(testing.allocator, .{
+        .initial_state = .{
+            .messages = &initial_messages,
+        },
+    });
+    defer agent.deinit();
+
+    const kept = agent.state.messages[0 .. agent.state.messages.len - 1];
+    agent.loadMessages(kept);
+
+    try testing.expectEqual(@as(usize, 1), agent.state.messages.len);
+    try testing.expect(agent.state.messages[0] == .user);
+    try testing.expectEqualStrings("hello", agent.state.messages[0].user.content.text);
 }
