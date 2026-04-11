@@ -101,6 +101,11 @@ pub const AgentSession = struct {
         registry_unavailable: void,
     };
 
+    pub const ThinkingLevelChangeResult = struct {
+        level: protocol.ThinkingLevel,
+        changed: bool,
+    };
+
     pub const Options = struct {
         model: ai.protocol.Model,
         /// Static API key fallback. Used only when no `auth_storage` is
@@ -517,6 +522,25 @@ pub const AgentSession = struct {
         } };
     }
 
+    pub fn trySetThinkingLevel(self: *AgentSession, level: protocol.ThinkingLevel) ThinkingLevelChangeResult {
+        const effective = clampThinkingLevelForModel(level, self.agent.state.model);
+        const changed = effective != self.agent.state.thinking_level;
+        self.agent.state.thinking_level = effective;
+        if (changed) {
+            self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(effective));
+        }
+        return .{ .level = effective, .changed = changed };
+    }
+
+    pub fn getAvailableThinkingLevelsForModel(model: ai.protocol.Model) []const protocol.ThinkingLevel {
+        return if (!model.reasoning)
+            &.{.off}
+        else if (ai.protocol.supportsXhigh(model))
+            &.{ .off, .minimal, .low, .medium, .high, .xhigh }
+        else
+            &.{ .off, .minimal, .low, .medium, .high };
+    }
+
     fn clampThinkingLevelForModel(level: protocol.ThinkingLevel, model: ai.protocol.Model) protocol.ThinkingLevel {
         if (!model.reasoning) return .off;
         return switch (level) {
@@ -892,23 +916,50 @@ pub fn convertToLlm(
     return result.items;
 }
 
+pub const OpenSessionResult = struct {
+    allocator: std.mem.Allocator,
+    store: ?SessionStore,
+    context_arena: std.heap.ArenaAllocator,
+    messages: []protocol.AgentMessage,
+    model: ?session_mod.context.SessionContext.ModelInfo,
+    thinking_level: []const u8,
+
+    pub fn deinit(self: *OpenSessionResult) void {
+        self.context_arena.deinit();
+        if (self.store) |*store| {
+            store.deinit();
+            self.store = null;
+        }
+    }
+
+    pub fn takeStore(self: *OpenSessionResult) SessionStore {
+        const store = self.store orelse @panic("OpenSessionResult.takeStore called twice");
+        self.store = null;
+        return store;
+    }
+};
+
 /// Open a session file and build context for --continue.
-/// Returns a SessionStore (ready for appending) and the resolved context.
+/// Returns an owned result that carries both the SessionStore (ready for
+/// appending) and the resolved context. Callers must either `deinit()` the
+/// result or `takeStore()` before deinit when transferring store ownership.
 ///
 /// pi-mono: SessionManager.buildSessionContext → Agent.state.messages = existingSession.messages
 pub fn openSession(
     allocator: std.mem.Allocator,
     session_path: []const u8,
-) !struct {
-    store: SessionStore,
-    messages: []protocol.AgentMessage,
-    model: ?session_mod.context.SessionContext.ModelInfo,
-    thinking_level: []const u8,
-} {
+) !OpenSessionResult {
     var store = try SessionStore.open(allocator, session_path);
-    const ctx = try store.buildContext(null);
+    errdefer store.deinit();
+
+    var context_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer context_arena.deinit();
+
+    const ctx = try session_mod.context.buildSessionContext(context_arena.allocator(), store.cached_entries.?, null);
     return .{
+        .allocator = allocator,
         .store = store,
+        .context_arena = context_arena,
         .messages = ctx.messages,
         .model = ctx.model,
         .thinking_level = ctx.thinking_level,
@@ -1448,7 +1499,8 @@ test "AgentSession: session persistence round-trip" {
     const session_file = ca.getSessionFile();
 
     // Read back the session file
-    const loaded = try openSession(allocator, session_file);
+    var loaded = try openSession(allocator, session_file);
+    defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
     // First message: user
@@ -1578,7 +1630,8 @@ test "AgentSession: continue sends restored context to provider" {
     const session_file = ca1.getSessionFile();
 
     // Phase 2: load the session and continue with a new user message
-    const loaded = try openSession(allocator, session_file);
+    var loaded = try openSession(allocator, session_file);
+    defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
     var fp2 = faux.FauxProvider.init(allocator);
@@ -1607,7 +1660,7 @@ test "AgentSession: continue sends restored context to provider" {
         .tools = &.{},
         .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&col2) },
         .initial_messages = all_messages.items,
-        .session_store = loaded.store,
+        .session_store = loaded.takeStore(),
     });
     defer ca2.deinit();
 

@@ -35,20 +35,22 @@ pub fn run(allocator: std.mem.Allocator, options: args.RunOptions) !void {
     var initial_messages: []const agent.protocol.AgentMessage = &.{};
     var session_store: ?coding_agent.SessionStore = null;
     var saved_session_model: ?@import("../session/context.zig").SessionContext.ModelInfo = null;
+    var loaded_session: ?coding_agent.OpenSessionResult = null;
+    defer if (loaded_session) |*loaded| loaded.deinit();
     if (options.continue_path) |path| {
-        const loaded = coding_agent.openSession(allocator, path) catch |err| {
+        loaded_session = coding_agent.openSession(allocator, path) catch |err| {
             try stderr.writeAll("error: could not load session: ");
             try stderr.writeAll(@errorName(err));
             try stderr.writeAll("\n");
             std.process.exit(1);
         };
-        initial_messages = loaded.messages;
-        session_store = loaded.store;
+        initial_messages = loaded_session.?.messages;
         if (initial_messages.len == 0) {
             try stderr.writeAll("error: session file has no messages\n");
             std.process.exit(1);
         }
-        saved_session_model = loaded.model;
+        session_store = loaded_session.?.takeStore();
+        saved_session_model = loaded_session.?.model;
     }
 
     const custom_models = common.convertCustomModels(allocator, settings.getModels()) catch &.{};

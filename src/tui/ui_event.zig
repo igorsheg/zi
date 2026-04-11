@@ -175,6 +175,14 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
+    // --- /settings thinking-level outcomes ---
+    thinking_level_changed: struct {
+        level: []u8,
+    },
+    thinking_level_change_failed: struct {
+        message: []u8,
+    },
+
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -222,6 +230,8 @@ pub const UiEvent = union(enum) {
                 allocator.free(m.id);
             },
             .model_switch_failed => |m| allocator.free(m.message),
+            .thinking_level_changed => |t| allocator.free(t.level),
+            .thinking_level_change_failed => |t| allocator.free(t.message),
             .prompt_worker_finished => |p| {
                 if (p.internal_error) |msg| allocator.free(msg);
             },

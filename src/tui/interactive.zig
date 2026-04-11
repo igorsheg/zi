@@ -63,9 +63,14 @@ const AgentWork = union(enum) {
 };
 const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
+const SettingsAction = enum {
+    open_thinking,
+    toggle_hide_thinking,
+};
 const auth_storage_mod = @import("../auth/storage.zig");
 const oauth_mod = @import("../auth/oauth.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
+const settings_types_mod = @import("../settings/types.zig");
 const ai_protocol = @import("../ai/protocol.zig");
 const ai_resolve = @import("../ai/resolve.zig");
 const memory_debug = @import("../debug/tracked_allocator.zig");
@@ -205,6 +210,18 @@ pub const Interactive = struct {
     model_picker_models: [512]ai_protocol.Model = undefined,
     model_picker_count: usize = 0,
     model_picker_handle: ?tui_mod.OverlayHandle = null,
+
+    // ── Settings pickers (/settings) ───────────────────────────────
+    settings_picker: ListPicker = undefined,
+    settings_picker_items: [16]SelectItem = undefined,
+    settings_picker_actions: [16]SettingsAction = undefined,
+    settings_picker_count: usize = 0,
+    settings_picker_handle: ?tui_mod.OverlayHandle = null,
+    thinking_picker: ListPicker = undefined,
+    thinking_picker_items: [8]SelectItem = undefined,
+    thinking_picker_levels: [8]agent_protocol.ThinkingLevel = undefined,
+    thinking_picker_count: usize = 0,
+    thinking_picker_handle: ?tui_mod.OverlayHandle = null,
 
     // ── Login state (/login) ────────────────────────────────────────
     login_picker: ListPicker = undefined,
@@ -871,6 +888,20 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
             },
+            .thinking_level_changed => |t| {
+                self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
+                self.settings_manager.setDefaultThinkingLevel(agentThinkingToDefault(self.ca.agent.state.thinking_level));
+                var buf: [96]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{t.level}) catch "thinking level updated";
+                self.status_text.setContent(msg);
+                self.status_text.fg = self.theme.fg(.success);
+                self.tui.dirty = true;
+            },
+            .thinking_level_change_failed => |t| {
+                self.status_text.setContent(t.message);
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+            },
         }
     }
 
@@ -1061,6 +1092,10 @@ pub const Interactive = struct {
                 } else {
                     self.showLoginPicker();
                 }
+                return true;
+            }
+            if (std.mem.eql(u8, name, "settings")) {
+                self.showSettingsPicker();
                 return true;
             }
             if (std.mem.eql(u8, name, "mem")) {
@@ -1435,6 +1470,164 @@ pub const Interactive = struct {
         };
     }
 
+    // ── Settings picker (/settings) ─────────────────────────────
+
+    fn showSettingsPicker(self: *Interactive) void {
+        var count: usize = 0;
+
+        self.settings_picker_items[count] = .{
+            .value = "thinking",
+            .label = "Thinking level",
+            .description = currentThinkingSettingsDescription(self),
+        };
+        self.settings_picker_actions[count] = .open_thinking;
+        count += 1;
+
+        self.settings_picker_items[count] = .{
+            .value = "hide-thinking",
+            .label = "Hide thinking",
+            .description = if (self.hide_thinking_block) "On" else "Off",
+        };
+        self.settings_picker_actions[count] = .toggle_hide_thinking;
+        count += 1;
+
+        self.settings_picker_count = count;
+        self.settings_picker = ListPicker.init(self.theme);
+        self.settings_picker.title = "Settings";
+        self.settings_picker.list.max_visible = 10;
+        self.settings_picker.list.setItems(self.settings_picker_items[0..count]);
+        self.settings_picker.on_select = &onSettingsSelected;
+        self.settings_picker.on_cancel = &onSettingsPickerCancel;
+        self.settings_picker.callback_ctx = @ptrCast(self);
+
+        self.settings_picker_handle = self.tui.showOverlay(
+            self.settings_picker.component(),
+            self.bottomPanelOptions(),
+        );
+    }
+
+    fn onSettingsSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        var action: ?SettingsAction = null;
+        for (0..self.settings_picker_count) |i| {
+            if (std.mem.eql(u8, self.settings_picker_items[i].value, item.value)) {
+                action = self.settings_picker_actions[i];
+                break;
+            }
+        }
+
+        if (self.settings_picker_handle) |h| {
+            h.hide();
+            self.settings_picker_handle = null;
+        }
+
+        switch (action orelse return) {
+            .open_thinking => self.showThinkingLevelPicker(),
+            .toggle_hide_thinking => {
+                self.hide_thinking_block = !self.hide_thinking_block;
+                self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
+                self.transcript.setHideThinkingBlock(self.hide_thinking_block);
+                self.status_text.setContent(if (self.hide_thinking_block) "thinking hidden" else "thinking shown");
+                self.status_text.fg = self.theme.fg(.success);
+                self.tui.dirty = true;
+            },
+        }
+    }
+
+    fn onSettingsPickerCancel(ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.settings_picker_handle) |h| {
+            h.hide();
+            self.settings_picker_handle = null;
+        }
+    }
+
+    fn showThinkingLevelPicker(self: *Interactive) void {
+        const available = coding_agent_mod.AgentSession.getAvailableThinkingLevelsForModel(self.ca.agent.state.model);
+        const count = @min(available.len, self.thinking_picker_items.len);
+        for (0..count) |i| {
+            const level = available[i];
+            self.thinking_picker_levels[i] = level;
+            self.thinking_picker_items[i] = .{
+                .value = agentThinkingValue(level),
+                .label = agentThinkingValue(level),
+                .description = thinkingDescription(level),
+            };
+        }
+        self.thinking_picker_count = count;
+        self.thinking_picker = ListPicker.init(self.theme);
+        self.thinking_picker.title = "Thinking level";
+        self.thinking_picker.list.max_visible = 8;
+        self.thinking_picker.list.setItems(self.thinking_picker_items[0..count]);
+        self.thinking_picker.on_select = &onThinkingLevelSelected;
+        self.thinking_picker.on_cancel = &onThinkingLevelPickerCancel;
+        self.thinking_picker.callback_ctx = @ptrCast(self);
+
+        const current = self.ca.agent.state.thinking_level;
+        for (0..count) |i| {
+            if (self.thinking_picker_levels[i] == current) {
+                self.thinking_picker.list.selected_index = @intCast(i);
+                break;
+            }
+        }
+
+        self.thinking_picker_handle = self.tui.showOverlay(
+            self.thinking_picker.component(),
+            self.bottomPanelOptions(),
+        );
+    }
+
+    fn onThinkingLevelSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        var selected: ?agent_protocol.ThinkingLevel = null;
+        for (0..self.thinking_picker_count) |i| {
+            if (std.mem.eql(u8, self.thinking_picker_items[i].value, item.value)) {
+                selected = self.thinking_picker_levels[i];
+                break;
+            }
+        }
+
+        if (self.thinking_picker_handle) |h| {
+            h.hide();
+            self.thinking_picker_handle = null;
+        }
+
+        if (selected) |level| {
+            self.applyThinkingLevelChange(level);
+        }
+    }
+
+    fn onThinkingLevelPickerCancel(ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.thinking_picker_handle) |h| {
+            h.hide();
+            self.thinking_picker_handle = null;
+        }
+    }
+
+    fn applyThinkingLevelChange(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
+        if (self.is_streaming or self.agent_thread != null) {
+            self.status_text.setContent("cannot change thinking level while agent is running");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        }
+
+        self.request_queue.push(.{ .set_thinking_level = .{ .level = level } });
+        self.showLoader("Updating thinking level...");
+        self.tui.dirty = true;
+
+        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
+            self.hideLoader();
+            self.status_text.setContent("failed to spawn thinking-level worker");
+            self.status_text.fg = self.theme.fg(.@"error");
+            var drain_buf: [4]AgentRequest = undefined;
+            const n = self.request_queue.drainInto(&drain_buf);
+            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
+            return;
+        };
+    }
+
     // ── Login picker (/login) ───────────────────────────────────
 
     fn showLoginPicker(self: *Interactive) void {
@@ -1743,6 +1936,7 @@ pub const Interactive = struct {
                 switch (req.*) {
                     .resume_session => |r| self.handleResumeSession(r.path),
                     .set_model => |s| self.handleSetModel(s.model),
+                    .set_thinking_level => |s| self.handleSetThinkingLevel(s.level),
                     // zi-wub.28: terminal request. Tears down the
                     // runner + lua_State on the agent thread (the
                     // owner). After this returns, ca's extension
@@ -1765,16 +1959,18 @@ pub const Interactive = struct {
     /// Transcript rebuild stays on the TUI thread — this handler
     /// does NOT touch `self.transcript`. That's .15's whole point.
     fn handleResumeSession(self: *Interactive, path: []const u8) void {
-        const loaded = coding_agent_mod.openSession(self.allocator, path) catch {
+        var loaded = coding_agent_mod.openSession(self.ca.allocator, path) catch {
             const msg = self.msg_allocator.dupe(u8, "failed to load session") catch return;
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
+        defer loaded.deinit();
 
         // Agent-thread state mutations (doctrine: session_store +
         // ca.agent.state are agent-owned). Safe here — we're on the
         // agent thread and no stream is in flight.
-        self.ca.session_store = loaded.store;
+        self.ca.session_store.deinit();
+        self.ca.session_store = loaded.takeStore();
         self.ca.agent.loadMessages(loaded.messages);
 
         // pi-mono parity: if the session recorded a last model,
@@ -1902,6 +2098,12 @@ pub const Interactive = struct {
                 self.event_queue.push(.{ .model_switch_failed = .{ .message = msg } });
             },
         }
+    }
+
+    fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
+        const result = self.ca.trySetThinkingLevel(level);
+        const level_copy = self.msg_allocator.dupe(u8, agentThinkingValue(result.level)) catch return;
+        self.event_queue.push(.{ .thinking_level_changed = .{ .level = level_copy } });
     }
 
     /// Session event callback — runs on the AGENT THREAD.
@@ -2104,5 +2306,43 @@ fn agentThinkingLabel(level: agent_protocol.ThinkingLevel) []const u8 {
         .medium => "medium",
         .high => "high",
         .xhigh => "xhigh",
+    };
+}
+
+fn agentThinkingValue(level: agent_protocol.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "off",
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
+}
+
+fn agentThinkingToDefault(level: agent_protocol.ThinkingLevel) settings_types_mod.DefaultThinkingLevel {
+    return switch (level) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+}
+
+fn currentThinkingSettingsDescription(self: *const Interactive) []const u8 {
+    if (!self.ca.agent.state.model.reasoning) return "Current model does not support thinking";
+    return agentThinkingValue(self.ca.agent.state.thinking_level);
+}
+
+fn thinkingDescription(level: agent_protocol.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "No reasoning",
+        .minimal => "Very brief reasoning (~1k tokens)",
+        .low => "Light reasoning (~2k tokens)",
+        .medium => "Moderate reasoning (~8k tokens)",
+        .high => "Deep reasoning (~16k tokens)",
+        .xhigh => "Maximum reasoning (~32k tokens)",
     };
 }

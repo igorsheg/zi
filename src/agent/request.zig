@@ -33,12 +33,14 @@ const ai_protocol = @import("../ai/protocol.zig");
 pub const AgentRequest = union(enum) {
     resume_session: struct { path: []const u8 },
     set_model: struct { model: ai_protocol.Model },
+    set_thinking_level: struct { level: @import("protocol.zig").ThinkingLevel },
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .resume_session => |r| allocator.free(r.path),
             .set_model => {},
+            .set_thinking_level => {},
             .shutdown => {},
         }
     }
