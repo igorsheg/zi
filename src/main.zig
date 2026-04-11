@@ -8,6 +8,8 @@ const sdk = @import("sdk.zig");
 const agent_json = @import("agent/json.zig");
 const interactive_mod = @import("tui/interactive.zig");
 const terminal_mod = @import("tui/terminal.zig");
+const memory_debug = @import("debug/tracked_allocator.zig");
+const cli = @import("cli/root.zig");
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
 pub const panic = terminal_mod.panic;
@@ -19,6 +21,15 @@ pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
 
+    var root_tracker = memory_debug.TrackedAllocator.init("root", gpa.allocator(), gpa.allocator());
+    defer root_tracker.deinit();
+    var agent_backing_tracker = memory_debug.TrackedAllocator.init("agent_backing", root_tracker.allocator(), root_tracker.allocator());
+    defer agent_backing_tracker.deinit();
+    var tui_backing_tracker = memory_debug.TrackedAllocator.init("tui_backing", root_tracker.allocator(), root_tracker.allocator());
+    defer tui_backing_tracker.deinit();
+    var msg_backing_tracker = memory_debug.TrackedAllocator.init("msg_backing", root_tracker.allocator(), root_tracker.allocator());
+    defer msg_backing_tracker.deinit();
+
     // zi-wub.12: dedicated arena owned by the agent thread. Single
     // owner during steady state — TUI thread only touches it during
     // pre-spawn init (auth, settings, ca creation) and post-join
@@ -26,7 +37,7 @@ pub fn main() !void {
     // payloads route through msg_allocator (zi-wub.9/.10) and the
     // TUI thread allocates from its own tui_arena (zi-wub.11), so
     // the ThreadSafeAllocator band-aid (.13) is no longer needed.
-    var agent_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    var agent_arena = std.heap.ArenaAllocator.init(agent_backing_tracker.allocator());
     defer agent_arena.deinit();
     const allocator = agent_arena.allocator();
 
@@ -37,91 +48,47 @@ pub fn main() !void {
     // can free individually and we don't pin growing payloads in the
     // arena's lifetime. See .zi/design-notes/threading-doctrine.md
     // (R2, R3) for why this is the foundation of phase 3.
-    var ts_msg: std.heap.ThreadSafeAllocator = .{ .child_allocator = gpa.allocator() };
+    var ts_msg: std.heap.ThreadSafeAllocator = .{ .child_allocator = msg_backing_tracker.allocator() };
     const msg_allocator = ts_msg.allocator();
 
-    var print_mode = false;
-    var show_help = false;
-    var show_version = false;
-    var api_key_arg: ?[]const u8 = null;
-    var model_id: ?[]const u8 = null;
-    var list_models = false;
-    var prompt_text: ?[]const u8 = null;
-    var continue_path: ?[]const u8 = null;
-    var mode: enum { text, json } = .text;
-    var no_session = false;
-    var tools_filter: ?[]const u8 = null;
-    var append_system_prompt_arg: ?[]const u8 = null;
+    var raw_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer raw_args.deinit(allocator);
 
-    var args = std.process.args();
-    _ = args.next();
-    while (args.next()) |arg| {
-        if (eql(arg, "-p") or eql(arg, "--print")) {
-            print_mode = true;
-        } else if (eql(arg, "-h") or eql(arg, "--help")) {
-            show_help = true;
-        } else if (eql(arg, "-v") or eql(arg, "--version")) {
-            show_version = true;
-        } else if (eql(arg, "--api-key")) {
-            api_key_arg = args.next();
-        } else if (eql(arg, "--model")) {
-            if (args.next()) |m| model_id = m;
-        } else if (eql(arg, "--list-models")) {
-            list_models = true;
-        } else if (eql(arg, "--continue")) {
-            continue_path = args.next();
-        } else if (eql(arg, "--mode")) {
-            if (args.next()) |m| {
-                if (eql(m, "json")) {
-                    mode = .json;
-                } else if (eql(m, "text")) {
-                    mode = .text;
-                } else {
-                    try stderr.writeAll("error: unknown mode '");
-                    try stderr.writeAll(m);
-                    try stderr.writeAll("'. use 'json' or 'text'\n");
-                    std.process.exit(1);
-                }
-            }
-        } else if (eql(arg, "--no-session")) {
-            no_session = true;
-        } else if (eql(arg, "--tools")) {
-            tools_filter = args.next();
-        } else if (eql(arg, "--append-system-prompt")) {
-            append_system_prompt_arg = args.next();
-        } else if (arg.len > 0 and arg[0] != '-') {
-            prompt_text = arg;
-        }
+    var process_args = std.process.args();
+    _ = process_args.next();
+    while (process_args.next()) |arg| {
+        try raw_args.append(allocator, arg);
     }
 
-    if (show_version) {
-        try stdout.writeAll("zi v0.0.1\n");
-        return;
-    }
-    if (show_help) {
-        try stdout.writeAll(
-            \\zi — AI coding agent
-            \\
-            \\Usage: zi [options] [message]
-            \\
-            \\Options:
-            \\  -p, --print           Non-interactive mode
-            \\  --model <id>          Model ID or pattern (default: from settings or claude-sonnet-4)
-            \\  --api-key <key>       API key override (also reads ~/.zi/agent/auth.json)
-            \\  --continue <path>     Continue from a session file
-            \\  --mode <text|json>    Output mode (default: text)
-            \\  --no-session          Disable session persistence
-            \\  --tools <filter>      Comma-separated list of allowed tools
-            \\  --append-system-prompt <text|path>  Append to system prompt (literal text or file path)
-            \\  --list-models         List available models
-            \\  -h, --help            Show help
-            \\  -v, --version         Show version
-            \\
-        );
-        return;
-    }
+    const parsed = cli.args.parse(raw_args.items);
+    const command = switch (parsed) {
+        .ok => |cmd| cmd,
+        .err => |diag| {
+            var err_buf: [1024]u8 = undefined;
+            var err_writer = stderr.writer(&err_buf);
+            try cli.help.writeDiagnostic(&err_writer.interface, diag);
+            try err_writer.end();
+            std.process.exit(1);
+        },
+    };
 
-    if (list_models) {
+    const run_options = switch (command) {
+        .version => {
+            try stdout.writeAll("zi v0.0.1\n");
+            return;
+        },
+        .help => {
+            var out_buf: [2048]u8 = undefined;
+            var out_writer = stdout.writer(&out_buf);
+            try cli.help.writeGeneralHelp(&out_writer.interface);
+            try out_writer.end();
+            return;
+        },
+        .list_models => null,
+        .run => |run| run,
+    };
+
+    if (command == .list_models) {
         // Build a registry so custom models from settings are included.
         var list_auth = auth.storage.AuthStorage.create(allocator, null) catch {
             try stderr.writeAll("warning: could not load auth storage\n");
@@ -154,11 +121,12 @@ pub fn main() !void {
         return;
     }
 
-    const has_prompt = print_mode or mode == .json or prompt_text != null;
-    const is_continue = continue_path != null;
+    const run = run_options orelse unreachable;
+    const has_prompt = run.print_mode or run.mode == .json or run.prompt_text != null;
+    const is_continue = run.continue_path != null;
 
     if (has_prompt or is_continue) {
-        const prompt = if (is_continue) null else (prompt_text orelse {
+        const prompt = if (is_continue) null else (run.prompt_text orelse {
             try stderr.writeAll("error: no prompt provided\n");
             std.process.exit(1);
         });
@@ -181,7 +149,7 @@ pub fn main() !void {
         var initial_messages: []const agent.protocol.AgentMessage = &.{};
         var session_store: ?coding_agent.SessionStore = null;
         var saved_session_model: ?@import("session/context.zig").SessionContext.ModelInfo = null;
-        if (continue_path) |path| {
+        if (run.continue_path) |path| {
             const loaded = coding_agent.openSession(allocator, path) catch |err| {
                 try stderr.writeAll("error: could not load session: ");
                 const err_name = @errorName(err);
@@ -215,7 +183,7 @@ pub fn main() !void {
         // multiple providers (e.g. openai vs openai_codex).
         // Only used when the user hasn't overridden via --model.
         var restored_model: ?ai.protocol.Model = null;
-        if (model_id == null) {
+        if (run.model_id == null) {
             if (saved_session_model) |saved| {
                 const restore = ai.resolve.restoreModelFromSession(.{
                     .saved_provider = saved.provider,
@@ -231,7 +199,7 @@ pub fn main() !void {
         const model = restored_model orelse blk: {
             const print_init = ai.resolve.findInitialModel(.{
                 .cli_provider = null,
-                .cli_model = model_id,
+                .cli_model = run.model_id,
                 .is_continuing = is_continue,
                 .default_provider = settings.getDefaultProvider(),
                 .default_model_id = settings.getDefaultModel(),
@@ -254,7 +222,7 @@ pub fn main() !void {
         // and fails cleanly if the api isn't registered yet
         // (openai-responses / openai-codex-responses land in 3b/3c).
         const provider_str = ai.json_util.providerToString(model.provider);
-        if (api_key_arg) |cli_key| {
+        if (run.api_key) |cli_key| {
             auth_storage.setRuntimeApiKey(provider_str, cli_key);
         }
         const key = auth_storage.getApiKey(provider_str) orelse {
@@ -277,7 +245,7 @@ pub fn main() !void {
         // canonical `ai.provider_defaults.Bundle`. main.zig no longer
         // hand-registers providers per mode.
 
-        const append_system_prompt = append_system_prompt_arg;
+        const append_system_prompt = run.append_system_prompt;
         // Resolve --tools allowlist: comma-separated tool names →
         // strict whitelist applied inside AgentSession.init AFTER the
         // builtin + Lua-extension tool merge. Passing the list through
@@ -286,7 +254,7 @@ pub fn main() !void {
         // critical for preventing Task-in-Task subagent recursion
         // when a child zi is spawned with `--tools bash,read`.
         var allowlist_opt: ?[]const []const u8 = null;
-        if (tools_filter) |filter_str| {
+        if (run.tools_filter) |filter_str| {
             var list: std.ArrayListUnmanaged([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, filter_str, ',');
             while (it.next()) |name| {
@@ -299,7 +267,7 @@ pub fn main() !void {
 
         var json_handler = JsonHandler{};
         var print_handler = PrintHandler{};
-        const event_handler: coding_agent.AgentSession.EventHandler = if (mode == .json)
+        const event_handler: coding_agent.AgentSession.EventHandler = if (run.mode == .json)
             .{ .func = &JsonHandler.callback, .ctx = @ptrCast(&json_handler) }
         else
             .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) };
@@ -313,7 +281,7 @@ pub fn main() !void {
             .event_handler = event_handler,
             .initial_messages = initial_messages,
             .session_store = session_store,
-            .no_session = no_session,
+            .no_session = run.no_session,
             .append_system_prompt = append_system_prompt,
             .tool_allowlist = allowlist_opt,
         });
@@ -381,7 +349,7 @@ pub fn main() !void {
         };
         const init_result = ai.resolve.findInitialModel(.{
             .cli_provider = null, // zi has no --provider flag yet
-            .cli_model = model_id,
+            .cli_model = run.model_id,
             .scoped_models = &.{},
             .is_continuing = false,
             .default_provider = settings.getDefaultProvider(),
@@ -409,7 +377,7 @@ pub fn main() !void {
 
         // Stage CLI api key under the effective model's provider so
         // the stream closure sees it on the first request.
-        if (api_key_arg) |cli_key| {
+        if (run.api_key) |cli_key| {
             const provider_str = ai.json_util.providerToString(effective_model.provider);
             auth_storage.setRuntimeApiKey(provider_str, cli_key);
         }
@@ -444,20 +412,25 @@ pub fn main() !void {
             .{ .tool_name = "ls", .renderer = builtin_renderers.ls_renderer },
         };
         const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
-        // zi-wub.11: TUI thread owns its own arena. Single-thread,
-        // no ThreadSafeAllocator wrap — all consumers live on the
-        // TUI thread. Cross-thread payloads use msg_allocator;
-        // cross-thread requests use ca's shared allocator (until .12).
-        var tui_arena = std.heap.ArenaAllocator.init(gpa.allocator());
-        defer tui_arena.deinit();
+        // TUI durable state now allocates from the tracked
+        // `tui_backing_tracker` allocator inside Interactive. Per-frame
+        // scratch lives in Renderer/Editor-owned arenas on the TUI
+        // thread; cross-thread payloads still use msg_allocator.
         const retry_settings = settings.getRetrySettings();
         const compaction_settings = settings.getCompactionSettings();
         const compactor = @import("session/compactor.zig");
         const compaction_executor = compactor.createExecutor(&ca);
+        const memory_diagnostics = memory_debug.Diagnostics{
+            .root = &root_tracker,
+            .agent = &agent_backing_tracker,
+            .tui = &tui_backing_tracker,
+            .msg = &msg_backing_tracker,
+        };
         var interactive = try interactive_mod.Interactive.init(
-            tui_arena.allocator(),
+            tui_backing_tracker.allocator(),
             msg_allocator,
             &ca,
+            &memory_diagnostics,
             resolver,
             cwd_buf,
             &auth_storage,

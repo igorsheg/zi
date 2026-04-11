@@ -33,6 +33,7 @@ const ListPicker = list_picker_mod.ListPicker;
 const SelectItem = select_list_mod.SelectItem;
 const session_store_mod = @import("../session/store.zig");
 const SessionStore = session_store_mod.SessionStore;
+const storage = @import("../storage.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -67,6 +68,7 @@ const oauth_mod = @import("../auth/oauth.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
 const ai_protocol = @import("../ai/protocol.zig");
 const ai_resolve = @import("../ai/resolve.zig");
+const memory_debug = @import("../debug/tracked_allocator.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -121,7 +123,8 @@ fn EventQueue(comptime T: type) type {
             if (count == 0) return 0;
             @memcpy(out[0..count], self.items.items[0..count]);
             if (count < self.items.items.len) {
-                std.mem.copyForwards(T, self.items.items[0..], self.items.items[count..]);
+                const remaining = self.items.items.len - count;
+                std.mem.copyForwards(T, self.items.items[0..remaining], self.items.items[count .. count + remaining]);
             }
             self.items.items.len -= count;
             return count;
@@ -220,6 +223,7 @@ pub const Interactive = struct {
     /// pushes to it yet. Backed by `msg_allocator` per doctrine R3.
     request_queue: RequestQueue,
     ca: *AgentSession,
+    memory_diagnostics: *const memory_debug.Diagnostics,
     session_controller: SessionController,
     session_event_token: ?SessionController.SubscriptionToken = null,
     agent_thread: ?std.Thread = null,
@@ -239,6 +243,7 @@ pub const Interactive = struct {
         allocator: std.mem.Allocator,
         msg_allocator: std.mem.Allocator,
         ca: *AgentSession,
+        memory_diagnostics: *const memory_debug.Diagnostics,
         resolver: ToolRendererResolver,
         cwd: []const u8,
         auth_storage: *auth_storage_mod.AuthStorage,
@@ -247,32 +252,35 @@ pub const Interactive = struct {
         compaction_policy: CompactionPolicy,
         compaction_executor: ?CompactionExecutor,
     ) !Interactive {
+        _ = allocator;
         const theme = &theme_mod.Theme.dark;
+        const state_allocator = memory_diagnostics.tui.allocator();
 
         var self: Interactive = .{
-            .allocator = allocator,
+            .allocator = state_allocator,
             .msg_allocator = msg_allocator,
-            .tui = try TUI.init(allocator),
+            .tui = try TUI.init(state_allocator),
             .theme = theme,
-            .editor = editor_mod.Editor.init(allocator),
-            .status_text = text_mod.Text.init(allocator),
+            .editor = editor_mod.Editor.init(state_allocator),
+            .status_text = text_mod.Text.init(state_allocator),
             .greeter = .{ .theme = theme, .version = "0.1.0" },
             .footer = .{ .theme = theme },
-            .transcript = Transcript.init(allocator),
+            .transcript = Transcript.init(state_allocator),
             .resolver = resolver,
-            .status_data = StatusData.init(allocator),
-            .header_container = container_mod.Container.init(allocator),
-            .pending_container = container_mod.Container.init(allocator),
-            .status_container = container_mod.Container.init(allocator),
-            .widget_above_container = container_mod.Container.init(allocator),
-            .editor_container = container_mod.Container.init(allocator),
-            .widget_below_container = container_mod.Container.init(allocator),
-            .command_registry = CommandRegistry.init(allocator),
-            .input = input_buffer_mod.InputBuffer.init(allocator),
+            .status_data = StatusData.init(state_allocator),
+            .header_container = container_mod.Container.init(state_allocator),
+            .pending_container = container_mod.Container.init(state_allocator),
+            .status_container = container_mod.Container.init(state_allocator),
+            .widget_above_container = container_mod.Container.init(state_allocator),
+            .editor_container = container_mod.Container.init(state_allocator),
+            .widget_below_container = container_mod.Container.init(state_allocator),
+            .command_registry = CommandRegistry.init(state_allocator),
+            .input = input_buffer_mod.InputBuffer.init(state_allocator),
             .event_queue = EventQueue(UiEvent).init(msg_allocator),
             .request_queue = RequestQueue.init(msg_allocator),
             .ca = ca,
-            .session_controller = SessionController.init(allocator, ca, .{
+            .memory_diagnostics = memory_diagnostics,
+            .session_controller = SessionController.init(state_allocator, ca, .{
                 .retry_policy = retry_policy,
                 .compaction_policy = compaction_policy,
                 .compaction_executor = compaction_executor,
@@ -644,11 +652,7 @@ pub const Interactive = struct {
 
         if (delta) |d| {
             const w = self.tui.width();
-            const total = self.transcript.totalHeight(w);
-            const max_scroll: u32 = if (total > output_h) total - output_h else 0;
-            const current: i64 = @intCast(self.transcript.scroll_offset);
-            const new_val = @max(0, @min(current + d, @as(i64, @intCast(max_scroll))));
-            self.transcript.scroll_offset = @intCast(new_val);
+            self.transcript.scrollBy(w, output_h, d);
             self.tui.dirty = true;
             return true;
         }
@@ -659,23 +663,14 @@ pub const Interactive = struct {
         switch (event.button) {
             .scroll_up => {
                 const w = self.tui.width();
-                const total = self.transcript.totalHeight(w);
                 const output_h = self.outputHeight();
-                _ = total;
-                _ = output_h;
-                if (self.transcript.scroll_offset >= 3) {
-                    self.transcript.scroll_offset -= 3;
-                } else {
-                    self.transcript.scroll_offset = 0;
-                }
+                self.transcript.scrollBy(w, output_h, -3);
                 self.tui.dirty = true;
             },
             .scroll_down => {
                 const w = self.tui.width();
-                const total = self.transcript.totalHeight(w);
                 const output_h = self.outputHeight();
-                const max_scroll: u32 = if (total > output_h) total - output_h else 0;
-                self.transcript.scroll_offset = @min(self.transcript.scroll_offset + 3, max_scroll);
+                self.transcript.scrollBy(w, output_h, 3);
                 self.tui.dirty = true;
             },
             else => {},
@@ -686,12 +681,10 @@ pub const Interactive = struct {
         switch (ev.*) {
             .assistant_text_delta => |d| {
                 self.transcript.appendText(d.content_index, d.delta);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .assistant_thinking_delta => |d| {
                 self.transcript.appendThinking(d.content_index, d.delta);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .error_message => |e| {
@@ -709,7 +702,6 @@ pub const Interactive = struct {
                 self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
                 self.transcript.toolSetArgs(t.tool_call_id, t.args);
                 if (t.is_complete) self.transcript.toolSetArgsComplete(t.tool_call_id);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .message_end_assistant => |m| {
@@ -730,17 +722,14 @@ pub const Interactive = struct {
                 self.transcript.toolMarkExecutionStarted(t.tool_call_id);
                 self.status_text.setContent(t.tool_name);
                 self.status_text.fg = self.theme.fg(.accent);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .tool_update => |t| {
                 self.transcript.toolSetPartialResult(t.tool_call_id, t.result, t.is_error);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .tool_end => |t| {
                 self.transcript.toolSetFinalResult(t.tool_call_id, t.result, t.is_error);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .login_progress => |l| {
@@ -1051,6 +1040,7 @@ pub const Interactive = struct {
             if (std.mem.eql(u8, name, "clear") or std.mem.eql(u8, name, "new")) {
                 self.transcript.clearAll();
                 self.status_text.setContent("");
+                self.tui.dirty = true;
                 return true;
             }
             if (std.mem.eql(u8, name, "resume")) {
@@ -1071,6 +1061,10 @@ pub const Interactive = struct {
                 } else {
                     self.showLoginPicker();
                 }
+                return true;
+            }
+            if (std.mem.eql(u8, name, "mem")) {
+                self.writeMemoryDiagnostic();
                 return true;
             }
         }
@@ -1102,6 +1096,35 @@ pub const Interactive = struct {
     // ── App-level overlay presets ──────────────────────────────
     // These know about the Interactive layout (footer height, etc).
     // Generic presets live in overlay.zig (OverlayPresets).
+
+    fn writeMemoryDiagnostic(self: *Interactive) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        const path = self.memory_diagnostics.writeSnapshotFile(scratch, self.editor.cwd, null) catch {
+            self.status_text.setContent("failed to write memory diagnostics");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+
+        const agent_dir = storage.getAgentDir(scratch, null) catch null;
+        const relative_path = if (agent_dir) |dir|
+            if (std.mem.startsWith(u8, path, dir) and path.len > dir.len)
+                std.mem.trimLeft(u8, path[dir.len..], std.fs.path.sep_str)
+            else
+                null
+        else
+            null;
+
+        var status_buf: [256]u8 = undefined;
+        const msg = if (relative_path) |rel|
+            std.fmt.bufPrint(&status_buf, "wrote memory diagnostics: ~/.zi/agent/{s}", .{rel}) catch path
+        else
+            std.fmt.bufPrint(&status_buf, "wrote memory diagnostics: {s}", .{path}) catch path;
+        self.status_text.setContent(msg);
+        self.status_text.fg = self.theme.fg(.success);
+    }
 
     fn bottomPanelOptions(self: *Interactive) overlay_mod.OverlayOptions {
         const width = self.tui.width();

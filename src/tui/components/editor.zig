@@ -49,6 +49,7 @@ pub const Editor = struct {
     git_branch_buf: [128]u8 = undefined,
     git_branch_len: u8 = 0,
     allocator: std.mem.Allocator,
+    layout_arena: std.heap.ArenaAllocator,
     focused: bool = true,
 
     // ── Autocomplete ──────────────────────────────────────────────
@@ -63,11 +64,13 @@ pub const Editor = struct {
         return .{
             .buf = .empty,
             .allocator = allocator,
+            .layout_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *Editor) void {
         self.buf.deinit(self.allocator);
+        self.layout_arena.deinit();
     }
 
     pub fn getText(self: *const Editor) []const u8 {
@@ -406,8 +409,7 @@ pub const Editor = struct {
 
         // Content between borders
         const content = region.sub(0, 1, w, editor_h - 2);
-        const wrapped_lines = self.buildWrappedLines(w, self.allocator) catch return;
-        defer self.allocator.free(wrapped_lines);
+        const wrapped_lines = self.buildWrappedLinesScratch(w) catch return;
 
         // Draw content rows
         {
@@ -466,8 +468,7 @@ pub const Editor = struct {
     pub fn cursorState(self: *Editor) ?CursorState {
         if (!self.focused) return null;
 
-        const wrapped_lines = self.buildWrappedLines(self.last_content_width, self.allocator) catch return null;
-        defer self.allocator.free(wrapped_lines);
+        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return null;
 
         const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return null;
         if (cursor.visual_row < self.scroll_y) return null;
@@ -583,6 +584,11 @@ pub const Editor = struct {
         x: u32,
     };
 
+    fn buildWrappedLinesScratch(self: *Editor, total_width: u32) ![]WrappedLine {
+        _ = self.layout_arena.reset(.retain_capacity);
+        return self.buildWrappedLines(total_width, self.layout_arena.allocator());
+    }
+
     fn buildWrappedLines(self: *const Editor, total_width: u32, allocator: std.mem.Allocator) ![]WrappedLine {
         var lines: std.ArrayListUnmanaged(WrappedLine) = .{};
         errdefer lines.deinit(allocator);
@@ -669,9 +675,8 @@ pub const Editor = struct {
         }
     }
 
-    fn wrappedLineCountForWidth(self: *const Editor, total_width: u32) u32 {
-        const wrapped_lines = self.buildWrappedLines(total_width, self.allocator) catch return self.lineCount();
-        defer self.allocator.free(wrapped_lines);
+    fn wrappedLineCountForWidth(self: *Editor, total_width: u32) u32 {
+        const wrapped_lines = self.buildWrappedLinesScratch(total_width) catch return self.lineCount();
         return @intCast(wrapped_lines.len);
     }
 
@@ -781,8 +786,7 @@ pub const Editor = struct {
     }
 
     fn ensureCursorVisible(self: *Editor) void {
-        const wrapped_lines = self.buildWrappedLines(self.last_content_width, self.allocator) catch return;
-        defer self.allocator.free(wrapped_lines);
+        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return;
 
         const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return;
         if (cursor.visual_row < self.scroll_y) {

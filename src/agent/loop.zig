@@ -9,7 +9,8 @@ const json_util = @import("../ai/json_util.zig");
 ///
 /// Matches pi-mono's runAgentLoop (agent-loop.ts:95-118).
 pub fn runAgentLoop(
-    allocator: std.mem.Allocator,
+    run_allocator: std.mem.Allocator,
+    turn_allocator_parent: std.mem.Allocator,
     prompts: []const protocol.AgentMessage,
     context: protocol.AgentContext,
     config: protocol.AgentLoopConfig,
@@ -20,16 +21,16 @@ pub fn runAgentLoop(
     // newMessages tracks only messages created during this run
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (prompts) |p| {
-        new_messages.append(allocator, p) catch return;
+        new_messages.append(run_allocator, p) catch return;
     }
 
     // Working context = existing messages + prompts
     var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (context.messages) |m| {
-        ctx_messages.append(allocator, m) catch return;
+        ctx_messages.append(run_allocator, m) catch return;
     }
     for (prompts) |p| {
-        ctx_messages.append(allocator, p) catch return;
+        ctx_messages.append(run_allocator, p) catch return;
     }
 
     event_sink(.agent_start, event_ctx);
@@ -41,7 +42,7 @@ pub fn runAgentLoop(
         event_sink(.{ .message_end = .{ .message = p } }, event_ctx);
     }
 
-    runLoop(allocator, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
+    runLoop(run_allocator, turn_allocator_parent, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
 }
 
 /// Continue an agent loop from existing context without adding a new message.
@@ -54,7 +55,8 @@ pub const ContinueError = error{
 };
 
 pub fn runAgentLoopContinue(
-    allocator: std.mem.Allocator,
+    run_allocator: std.mem.Allocator,
+    turn_allocator_parent: std.mem.Allocator,
     context: protocol.AgentContext,
     config: protocol.AgentLoopConfig,
     event_sink: protocol.AgentEventSink,
@@ -73,7 +75,7 @@ pub fn runAgentLoopContinue(
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (context.messages) |m| {
-        ctx_messages.append(allocator, m) catch return;
+        ctx_messages.append(run_allocator, m) catch return;
     }
 
     event_sink(.agent_start, event_ctx);
@@ -81,7 +83,7 @@ pub fn runAgentLoopContinue(
 
     // No message_start/end for existing messages — that's the key difference from runAgentLoop
 
-    runLoop(allocator, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
+    runLoop(run_allocator, turn_allocator_parent, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
 }
 
 /// Main loop logic shared by runAgentLoop and runAgentLoopContinue.
@@ -89,7 +91,8 @@ pub fn runAgentLoopContinue(
 ///   outer loop: continues when follow-up messages arrive after agent would stop
 ///   inner loop: processes tool calls and steering messages
 fn runLoop(
-    allocator: std.mem.Allocator,
+    run_allocator: std.mem.Allocator,
+    turn_allocator_parent: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     context: protocol.AgentContext,
@@ -107,7 +110,7 @@ fn runLoop(
     var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .empty;
     if (context.tools) |tools| {
         for (tools) |t| {
-            llm_tools.append(allocator, .{
+            llm_tools.append(run_allocator, .{
                 .name = t.name,
                 .description = t.description,
                 .parameters = t.parameters,
@@ -120,7 +123,7 @@ fn runLoop(
     var pending_messages = if (config.skip_initial_steering_poll)
         @as([]const protocol.AgentMessage, &.{})
     else if (config.get_steering_messages) |hook|
-        hook.call(allocator)
+        hook.call(run_allocator)
     else
         @as([]const protocol.AgentMessage, &.{});
 
@@ -130,6 +133,10 @@ fn runLoop(
 
         // Inner loop: process tool calls and steering messages
         while (has_more_tool_calls or pending_messages.len > 0) {
+            var turn_arena = std.heap.ArenaAllocator.init(turn_allocator_parent);
+            defer turn_arena.deinit();
+            const turn_allocator = turn_arena.allocator();
+
             // Check abort before each turn (catches abort during tool execution)
             if (isAborted(signal)) {
                 traceWrite(trace, "EXIT: abort before turn\n", .{});
@@ -148,21 +155,21 @@ fn runLoop(
                 for (pending_messages) |msg| {
                     event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
                     event_sink(.{ .message_end = .{ .message = msg } }, event_ctx);
-                    ctx_messages.append(allocator, msg) catch {};
-                    new_messages.append(allocator, msg) catch {};
+                    ctx_messages.append(run_allocator, msg) catch {};
+                    new_messages.append(run_allocator, msg) catch {};
                 }
                 pending_messages = &.{};
             }
 
             // Stream assistant response
             traceWrite(trace, "STREAM: start model={s}\n", .{config.model.id});
-            const assistant_msg = streamAssistantResponse(allocator, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
+            const assistant_msg = streamAssistantResponse(run_allocator, turn_allocator, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
                 traceWrite(trace, "EXIT: stream returned null (no final message)\n", .{});
                 event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
                 return;
             };
 
-            new_messages.append(allocator, .{ .assistant = assistant_msg }) catch {};
+            new_messages.append(run_allocator, .{ .assistant = assistant_msg }) catch {};
             traceWrite(trace, "STREAM: done stop_reason={s} content_blocks={d}\n", .{
                 @tagName(assistant_msg.stop_reason),
                 assistant_msg.content.len,
@@ -194,7 +201,7 @@ fn runLoop(
 
             var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
             if (has_more_tool_calls) {
-                executeToolCalls(allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
+                executeToolCalls(run_allocator, turn_allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
                 traceWrite(trace, "TOOLS: executed results={d}\n", .{tool_results.items.len});
 
                 // Abort during tool execution — emit turn_end before agent_end
@@ -216,7 +223,7 @@ fn runLoop(
 
             // Poll steering messages after tool execution
             pending_messages = if (config.get_steering_messages) |hook|
-                hook.call(allocator)
+                hook.call(run_allocator)
             else
                 @as([]const protocol.AgentMessage, &.{});
             traceWrite(trace, "STEERING: pending={d}\n", .{pending_messages.len});
@@ -224,7 +231,7 @@ fn runLoop(
 
         // Agent would stop here. Check for follow-up messages.
         const follow_ups = if (config.get_follow_up_messages) |hook|
-            hook.call(allocator)
+            hook.call(run_allocator)
         else
             @as([]const protocol.AgentMessage, &.{});
 
@@ -245,7 +252,8 @@ fn runLoop(
 /// Applies transformContext → convertToLlm pipeline before calling the stream function.
 /// Matches pi-mono's streamAssistantResponse (agent-loop.ts:238-331).
 fn streamAssistantResponse(
-    aa: std.mem.Allocator,
+    run_allocator: std.mem.Allocator,
+    turn_allocator: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     config: protocol.AgentLoopConfig,
     signal: AbortSignal,
@@ -257,11 +265,11 @@ fn streamAssistantResponse(
     // Apply context transform if configured (AgentMessage[] → AgentMessage[])
     var messages: []const protocol.AgentMessage = ctx_messages.items;
     if (config.transform_context) |hook| {
-        messages = hook.call(aa, messages, signal);
+        messages = hook.call(turn_allocator, messages, signal);
     }
 
     // Convert to LLM messages (AgentMessage[] → Message[])
-    const llm_messages = config.convert_to_llm.call(aa, messages);
+    const llm_messages = config.convert_to_llm.call(turn_allocator, messages);
 
     const llm_context = ai.protocol.Context{
         .system_prompt = if (system_prompt.len > 0) system_prompt else null,
@@ -286,7 +294,7 @@ fn streamAssistantResponse(
         const provider_str = json_util.providerToString(config.model.provider);
         const resolved_key = hook.call(provider_str);
         if (resolved_key != null and resolved_key.?.len > 0) {
-            const owned = aa.dupe(u8, resolved_key.?) catch resolved_key.?;
+            const owned = turn_allocator.dupe(u8, resolved_key.?) catch resolved_key.?;
             stream_options.base.api_key = owned;
         }
     }
@@ -294,13 +302,14 @@ fn streamAssistantResponse(
     var bridge = StreamBridge{
         .sink = event_sink,
         .sink_ctx = event_ctx,
+        .owned_allocator = run_allocator,
     };
-    config.stream.call(aa, config.model, llm_context, stream_options, &StreamBridge.callback, @ptrCast(&bridge));
+    config.stream.call(turn_allocator, config.model, llm_context, stream_options, &StreamBridge.callback, @ptrCast(&bridge));
 
     const assistant_msg = bridge.final_message orelse return null;
 
     // Add to context (pi-mono: context.messages.push or replace last)
-    ctx_messages.append(aa, .{ .assistant = assistant_msg }) catch {};
+    ctx_messages.append(run_allocator, .{ .assistant = assistant_msg }) catch {};
 
     return assistant_msg;
 }
@@ -349,7 +358,8 @@ fn emitAbortedToolEnd(
 ///   prepareToolCall → executePreparedToolCall → finalizeExecutedToolCall
 /// Matches pi-mono's agent-loop.ts:350-388 (sequential) calling 458-595 (phases).
 fn executeToolCalls(
-    aa: std.mem.Allocator,
+    run_allocator: std.mem.Allocator,
+    turn_allocator: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
@@ -381,8 +391,8 @@ fn executeToolCalls(
 
                 const tool = findTool(tools, tc.name);
                 if (tool == null) {
-                    const err_msg = std.fmt.allocPrint(aa, "Tool {s} not found", .{tc.name}) catch "Tool not found";
-                    emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                    const err_msg = std.fmt.allocPrint(turn_allocator, "Tool {s} not found", .{tc.name}) catch "Tool not found";
+                    emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
                     started_current = false;
                     current_tc = null;
                     continue;
@@ -392,9 +402,9 @@ fn executeToolCalls(
 
                 // prepare_arguments: optional arg transform before hooks and execution
                 const prepared_args = if (t.prepare_arguments) |prep_fn|
-                    prep_fn(aa, tc.arguments) catch |err| {
-                        const err_msg = std.fmt.allocPrint(aa, "Tool {s} argument preparation failed: {s}", .{ tc.name, @errorName(err) }) catch "Tool argument preparation failed";
-                        emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                    prep_fn(turn_allocator, tc.arguments) catch |err| {
+                        const err_msg = std.fmt.allocPrint(turn_allocator, "Tool {s} argument preparation failed: {s}", .{ tc.name, @errorName(err) }) catch "Tool argument preparation failed";
+                        emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
                         started_current = false;
                         current_tc = null;
                         continue;
@@ -421,7 +431,7 @@ fn executeToolCalls(
                     if (hook.call(hook_ctx, signal)) |before_result| {
                         if (before_result.block) {
                             const reason = before_result.reason orelse "Tool execution was blocked";
-                            emitImmediateError(aa, ctx_messages, new_messages, tool_results, tc, reason, event_sink, event_ctx);
+                            emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, reason, event_sink, event_ctx);
                             started_current = false;
                             current_tc = null;
                             continue;
@@ -444,7 +454,7 @@ fn executeToolCalls(
 
                 const result = t.execute(
                     t.ctx,
-                    aa,
+                    turn_allocator,
                     tc.id,
                     effective_args,
                     signal,
@@ -454,7 +464,7 @@ fn executeToolCalls(
 
                 // Abort after tool execution — emit synthetic end before returning
                 if (isAborted(signal)) {
-                    if (started_current) emitAbortedToolEnd(event_sink, event_ctx, current_tc.?, aa);
+                    if (started_current) emitAbortedToolEnd(event_sink, event_ctx, current_tc.?, turn_allocator);
                     return;
                 }
 
@@ -485,7 +495,7 @@ fn executeToolCalls(
                 }
 
                 if (isAborted(signal)) {
-                    if (started_current) emitAbortedToolEnd(event_sink, event_ctx, current_tc.?, aa);
+                    if (started_current) emitAbortedToolEnd(event_sink, event_ctx, current_tc.?, turn_allocator);
                     return;
                 }
 
@@ -499,26 +509,26 @@ fn executeToolCalls(
                 var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .empty;
                 for (final_content) |cb| {
                     switch (cb) {
-                        .text => |txt| trm_content.append(aa, .{ .text = txt }) catch continue,
-                        .image => |img| trm_content.append(aa, .{ .image = img }) catch continue,
+                        .text => |txt| trm_content.append(turn_allocator, .{ .text = txt }) catch continue,
+                        .image => |img| trm_content.append(turn_allocator, .{ .image = img }) catch continue,
                     }
                 }
 
-                const tool_result_msg = ai.protocol.ToolResultMessage{
+                const tool_result_msg = cloneToolResultMessage(run_allocator, .{
                     .tool_call_id = tc.id,
                     .tool_name = tc.name,
                     .content = trm_content.items,
                     .details = final_details,
                     .is_error = final_is_error,
                     .timestamp = std.time.milliTimestamp(),
-                };
+                });
 
                 emitToolResult(event_sink, event_ctx, tc, tool_result_msg, final_is_error, final_agent_result);
                 started_current = false;
                 current_tc = null;
-                ctx_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
-                new_messages.append(aa, .{ .tool_result = tool_result_msg }) catch {};
-                tool_results.append(aa, tool_result_msg) catch {};
+                ctx_messages.append(run_allocator, .{ .tool_result = tool_result_msg }) catch {};
+                new_messages.append(run_allocator, .{ .tool_result = tool_result_msg }) catch {};
+                tool_results.append(run_allocator, tool_result_msg) catch {};
             },
             else => {},
         }
@@ -528,7 +538,8 @@ fn executeToolCalls(
 /// Emit an immediate error result for a tool call that failed during preparation.
 /// Covers: tool not found, beforeToolCall blocked, arg preparation failure.
 fn emitImmediateError(
-    aa: std.mem.Allocator,
+    run_allocator: std.mem.Allocator,
+    turn_allocator: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
@@ -537,16 +548,16 @@ fn emitImmediateError(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    const err_content_buf = aa.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
+    const err_content_buf = turn_allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch @as([]protocol.AgentToolResult.ContentBlock, &.{});
     if (err_content_buf.len > 0) {
         err_content_buf[0] = .{ .text = .{ .text = msg } };
     }
-    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true, .details = .{ .object = std.json.ObjectMap.init(aa) } };
-    const err_result = makeErrorToolResult(aa, tc.id, tc.name, msg);
+    const err_tool_result = protocol.AgentToolResult{ .content = err_content_buf, .is_error = true, .details = .{ .object = std.json.ObjectMap.init(turn_allocator) } };
+    const err_result = makeErrorToolResult(run_allocator, tc.id, tc.name, msg);
     emitToolResult(event_sink, event_ctx, tc, err_result, true, err_tool_result);
-    ctx_messages.append(aa, .{ .tool_result = err_result }) catch {};
-    new_messages.append(aa, .{ .tool_result = err_result }) catch {};
-    tool_results.append(aa, err_result) catch {};
+    ctx_messages.append(run_allocator, .{ .tool_result = err_result }) catch {};
+    new_messages.append(run_allocator, .{ .tool_result = err_result }) catch {};
+    tool_results.append(run_allocator, err_result) catch {};
 }
 
 fn emitToolResult(
@@ -574,6 +585,68 @@ fn findTool(tools: []const protocol.AgentTool, name: []const u8) ?protocol.Agent
         if (std.mem.eql(u8, t.name, name)) return t;
     }
     return null;
+}
+
+fn cloneJson(allocator: std.mem.Allocator, value: std.json.Value) std.json.Value {
+    return json_util.cloneJsonValue(allocator, value) catch value;
+}
+
+fn cloneOptionalJson(allocator: std.mem.Allocator, value: ?std.json.Value) ?std.json.Value {
+    const v = value orelse return null;
+    return json_util.cloneJsonValue(allocator, v) catch v;
+}
+
+fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: ai.protocol.AssistantMessage) ai.protocol.AssistantMessage {
+    const content = allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, msg.content.len) catch return msg;
+    for (msg.content, 0..) |block, i| {
+        content[i] = switch (block) {
+            .text => |t| .{ .text = .{
+                .text = allocator.dupe(u8, t.text) catch t.text,
+                .text_signature = if (t.text_signature) |s| allocator.dupe(u8, s) catch s else null,
+            } },
+            .thinking => |t| .{ .thinking = .{
+                .thinking = allocator.dupe(u8, t.thinking) catch t.thinking,
+                .thinking_signature = if (t.thinking_signature) |s| allocator.dupe(u8, s) catch s else null,
+                .redacted = t.redacted,
+            } },
+            .tool_call => |tc| .{ .tool_call = .{
+                .id = allocator.dupe(u8, tc.id) catch tc.id,
+                .name = allocator.dupe(u8, tc.name) catch tc.name,
+                .arguments = cloneJson(allocator, tc.arguments),
+                .thought_signature = if (tc.thought_signature) |s| allocator.dupe(u8, s) catch s else null,
+            } },
+        };
+    }
+    var result = msg;
+    result.content = content;
+    result.model = allocator.dupe(u8, msg.model) catch msg.model;
+    if (msg.api == .custom) result.api = .{ .custom = allocator.dupe(u8, msg.api.custom) catch msg.api.custom };
+    if (msg.provider == .custom) result.provider = .{ .custom = allocator.dupe(u8, msg.provider.custom) catch msg.provider.custom };
+    if (msg.error_message) |em| result.error_message = allocator.dupe(u8, em) catch em;
+    if (msg.response_id) |rid| result.response_id = allocator.dupe(u8, rid) catch rid;
+    return result;
+}
+
+fn cloneToolResultMessage(allocator: std.mem.Allocator, msg: ai.protocol.ToolResultMessage) ai.protocol.ToolResultMessage {
+    const content = allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, msg.content.len) catch return msg;
+    for (msg.content, 0..) |block, i| {
+        content[i] = switch (block) {
+            .text => |t| .{ .text = .{
+                .text = allocator.dupe(u8, t.text) catch t.text,
+                .text_signature = if (t.text_signature) |s| allocator.dupe(u8, s) catch s else null,
+            } },
+            .image => |img| .{ .image = .{
+                .data = allocator.dupe(u8, img.data) catch img.data,
+                .mime_type = allocator.dupe(u8, img.mime_type) catch img.mime_type,
+            } },
+        };
+    }
+    var result = msg;
+    result.content = content;
+    result.tool_call_id = allocator.dupe(u8, msg.tool_call_id) catch msg.tool_call_id;
+    result.tool_name = allocator.dupe(u8, msg.tool_name) catch msg.tool_name;
+    result.details = cloneOptionalJson(allocator, msg.details);
+    return result;
 }
 
 fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, msg: []const u8) ai.protocol.ToolResultMessage {
@@ -623,6 +696,7 @@ fn traceWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
 const StreamBridge = struct {
     sink: protocol.AgentEventSink,
     sink_ctx: ?*anyopaque,
+    owned_allocator: std.mem.Allocator,
     final_message: ?ai.protocol.AssistantMessage = null,
     added_partial: bool = false,
 
@@ -636,19 +710,21 @@ const StreamBridge = struct {
             },
 
             .done => |d| {
-                self.final_message = d.message;
+                const owned = cloneAssistantMessage(self.owned_allocator, d.message);
+                self.final_message = owned;
                 if (!self.added_partial) {
-                    self.sink(.{ .message_start = .{ .message = .{ .assistant = d.message } } }, self.sink_ctx);
+                    self.sink(.{ .message_start = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
                 }
-                self.sink(.{ .message_end = .{ .message = .{ .assistant = d.message } } }, self.sink_ctx);
+                self.sink(.{ .message_end = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
             },
 
             .@"error" => |e| {
-                self.final_message = e.@"error";
+                const owned = cloneAssistantMessage(self.owned_allocator, e.@"error");
+                self.final_message = owned;
                 if (!self.added_partial) {
-                    self.sink(.{ .message_start = .{ .message = .{ .assistant = e.@"error" } } }, self.sink_ctx);
+                    self.sink(.{ .message_start = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
                 }
-                self.sink(.{ .message_end = .{ .message = .{ .assistant = e.@"error" } } }, self.sink_ctx);
+                self.sink(.{ .message_end = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
             },
 
             else => |_| {

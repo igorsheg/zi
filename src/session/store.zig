@@ -27,6 +27,11 @@ pub const SessionInfo = struct {
 pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     writer: writer_mod.SessionWriter,
+    /// Cache backing arena for parsed session-file data. We keep parsed
+    /// header/entries in an owned arena so cache invalidation is a single
+    /// arena teardown instead of per-field frees against whatever allocator
+    /// the session was created with (often the long-lived agent arena).
+    cache_arena: ?std.heap.ArenaAllocator = null,
     /// Cached entries from last read (for buildContext). Null until open() or first read.
     cached_entries: ?[]proto.SessionEntry = null,
     cached_header: ?proto.SessionHeader = null,
@@ -54,7 +59,11 @@ pub const SessionStore = struct {
     /// Open an existing session file.
     /// Reads entries, seeds the writer for continuation.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SessionStore {
-        const data = try reader_mod.readSessionFile(allocator, path);
+        var cache_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer cache_arena.deinit();
+        const cache_alloc = cache_arena.allocator();
+
+        const data = try reader_mod.readSessionFile(cache_alloc, path);
         const header = data.header orelse return error.InvalidSessionFile;
 
         const leaf_id: ?[]const u8 = if (data.entries.len > 0)
@@ -67,12 +76,18 @@ pub const SessionStore = struct {
             .writer = writer_mod.SessionWriter.initContinue(
                 allocator,
                 try allocator.dupe(u8, path),
-                header.id,
-                leaf_id,
+                try allocator.dupe(u8, header.id),
+                if (leaf_id) |id| try allocator.dupe(u8, id) else null,
             ),
+            .cache_arena = cache_arena,
             .cached_entries = data.entries,
             .cached_header = header,
         };
+    }
+
+    pub fn deinit(self: *SessionStore) void {
+        self.clearCache();
+        self.writer.deinit();
     }
 
     // ── Accessors ────────────────────────────────────────────────
@@ -130,21 +145,36 @@ pub const SessionStore = struct {
         if (self.cached_entries) |entries| {
             return context_mod.buildSessionContext(self.allocator, entries, leaf_id);
         }
-        const data = try reader_mod.readSessionFile(self.allocator, self.writer.session_file);
-        self.cached_entries = data.entries;
-        self.cached_header = data.header;
+        const data = try self.readIntoCache();
         return context_mod.buildSessionContext(self.allocator, data.entries, leaf_id);
     }
 
     pub fn readEntries(self: *SessionStore) ![]proto.SessionEntry {
         if (self.cached_entries) |entries| return entries;
-        const data = try reader_mod.readSessionFile(self.allocator, self.writer.session_file);
-        self.cached_entries = data.entries;
-        self.cached_header = data.header;
+        const data = try self.readIntoCache();
         return data.entries;
     }
 
     fn invalidateCache(self: *SessionStore) void {
+        self.clearCache();
+    }
+
+    fn readIntoCache(self: *SessionStore) !reader_mod.SessionData {
+        var cache_arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer cache_arena.deinit();
+        const data = try reader_mod.readSessionFile(cache_arena.allocator(), self.writer.session_file);
+        self.clearCache();
+        self.cache_arena = cache_arena;
+        self.cached_entries = data.entries;
+        self.cached_header = data.header;
+        return data;
+    }
+
+    fn clearCache(self: *SessionStore) void {
+        if (self.cache_arena) |*arena| {
+            arena.deinit();
+            self.cache_arena = null;
+        }
         self.cached_entries = null;
         self.cached_header = null;
     }
@@ -410,4 +440,57 @@ fn truncatePreview(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
     }
 
     return buf[0..pos];
+}
+
+test "open duplicates writer session and leaf ids from cached session data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "session.jsonl",
+        .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
+            "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
+    });
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session.jsonl");
+    defer std.testing.allocator.free(path);
+
+    var store = try SessionStore.open(std.testing.allocator, path);
+    defer store.deinit();
+
+    try std.testing.expect(store.cached_header != null);
+    try std.testing.expect(store.cached_entries != null);
+    try std.testing.expect(store.writer.session_id.len > 0);
+    try std.testing.expect(store.writer.session_id.ptr != store.cached_header.?.id.ptr);
+    try std.testing.expect(store.writer.leaf_id != null);
+    try std.testing.expect(store.writer.leaf_id.?.ptr != store.cached_entries.?[0].id.ptr);
+
+    store.appendSessionInfo("name");
+    try std.testing.expect(store.cached_entries == null);
+    try std.testing.expect(store.cached_header == null);
+}
+
+test "cache invalidation works when store uses arena allocator" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "session.jsonl",
+        .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
+            "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
+    });
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session.jsonl");
+    defer std.testing.allocator.free(path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var store = try SessionStore.open(arena.allocator(), path);
+    defer store.deinit();
+
+    try std.testing.expect(store.cached_entries != null);
+    store.appendSessionInfo("name");
+    try std.testing.expect(store.cached_entries == null);
+    try std.testing.expect(store.cache_arena == null);
 }

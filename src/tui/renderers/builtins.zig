@@ -44,7 +44,8 @@ const Line = struct {
 const DiffStats = struct { added: u32 = 0, removed: u32 = 0 };
 
 const Parsed = struct {
-    raw: []u8,
+    owned_raw: []u8,
+    raw: []const u8,
     lines: []Line,
     /// Owned slab of formatted gutter strings (diff mode line numbers).
     /// Line.gutter slices into these; freed together in deinit.
@@ -59,7 +60,7 @@ const Parsed = struct {
         for (self.gutter_strs) |s| self.allocator.free(s);
         if (self.gutter_strs.len > 0) self.allocator.free(self.gutter_strs);
         self.allocator.free(self.lines);
-        self.allocator.free(self.raw);
+        self.allocator.free(self.owned_raw);
     }
 };
 
@@ -68,11 +69,17 @@ const Parsed = struct {
 fn collectText(ctx: *const ToolRenderContext) ?[]u8 {
     const result = ctx.result orelse return null;
     var total: usize = 0;
+    var text_blocks: usize = 0;
     for (result.content) |b| switch (b) {
-        .text => |t| total += t.text.len + 1,
+        .text => |t| {
+            total += t.text.len;
+            text_blocks += 1;
+        },
         .image => {},
     };
-    if (total == 0) return null;
+    if (text_blocks == 0) return null;
+    total += text_blocks - 1;
+
     const buf = ctx.allocator.alloc(u8, total) catch return null;
     var pos: usize = 0;
     for (result.content) |b| switch (b) {
@@ -86,7 +93,7 @@ fn collectText(ctx: *const ToolRenderContext) ?[]u8 {
         },
         .image => {},
     };
-    return buf[0..pos];
+    return buf;
 }
 
 const ParseMode = enum {
@@ -178,7 +185,8 @@ fn parseResult(
     }
 
     return .{
-        .raw = raw_full,
+        .owned_raw = raw_full,
+        .raw = raw,
         .lines = lines[0..idx],
         .notice = notice,
         .header = null,
@@ -310,7 +318,8 @@ fn parseDiffResult(
     const owned_lines = try lines_list.toOwnedSlice(allocator);
 
     return .{
-        .raw = raw_full,
+        .owned_raw = raw_full,
+        .raw = raw,
         .lines = owned_lines,
         .gutter_strs = owned_gutters,
         .notice = notice,

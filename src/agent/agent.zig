@@ -110,10 +110,12 @@ pub const Agent = struct {
     /// Pending tool call IDs tracked during execution.
     pending_tool_call_ids: std.ArrayList([]const u8),
 
-    /// Arena for all message content that outlives the loop.
-    /// Freed on reset() and deinit(). The loop allocates into this arena
-    /// so message content (text, content blocks) survives after the loop returns.
-    message_arena: std.heap.ArenaAllocator,
+    /// Arena for transcript/history that must survive across runs.
+    /// Replaced wholesale on reset/load/compaction so history memory can be reclaimed.
+    history_arena: std.heap.ArenaAllocator,
+    /// Arena for run-lifetime scratch that survives across turns within a single run.
+    /// Reset at run start/end. Per-turn scratch lives in loop-local arenas.
+    runtime_arena: std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
 
     pub const Options = struct {
@@ -135,8 +137,9 @@ pub const Agent = struct {
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Agent {
         const initial = options.initial_state orelse protocol.AgentState{};
-        var message_arena = std.heap.ArenaAllocator.init(allocator);
-        const aa = message_arena.allocator();
+        var history_arena = std.heap.ArenaAllocator.init(allocator);
+        const runtime_arena = std.heap.ArenaAllocator.init(allocator);
+        const aa = history_arena.allocator();
         var messages: std.ArrayList(protocol.AgentMessage) = .empty;
         for (initial.messages) |m| {
             messages.append(aa, dupeAgentMessage(aa, m)) catch {};
@@ -168,7 +171,8 @@ pub const Agent = struct {
             .abort_requested = std.atomic.Value(bool).init(false),
             .messages = messages,
             .pending_tool_call_ids = .empty,
-            .message_arena = message_arena,
+            .history_arena = history_arena,
+            .runtime_arena = runtime_arena,
             .allocator = allocator,
         };
     }
@@ -177,8 +181,8 @@ pub const Agent = struct {
         self.listeners.deinit(self.allocator);
         self.steering_queue.deinit();
         self.follow_up_queue.deinit();
-        // messages and pending_tool_call_ids are in message_arena — freed by arena deinit
-        self.message_arena.deinit();
+        self.runtime_arena.deinit();
+        self.history_arena.deinit();
     }
 
     /// Subscribe to agent lifecycle events. Returns a token for unsubscribing.
@@ -223,6 +227,20 @@ pub const Agent = struct {
         self.clearFollowUpQueue();
     }
 
+    fn resetHistoryArena(self: *Agent) void {
+        self.history_arena.deinit();
+        self.history_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.messages = .empty;
+        self.state.messages = &.{};
+    }
+
+    fn resetRuntimeArena(self: *Agent) void {
+        self.runtime_arena.deinit();
+        self.runtime_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.pending_tool_call_ids = .empty;
+        self.state.pending_tool_calls = &.{};
+    }
+
     pub fn hasQueuedMessages(self: *const Agent) bool {
         return self.steering_queue.hasItems() or self.follow_up_queue.hasItems();
     }
@@ -237,15 +255,11 @@ pub const Agent = struct {
     /// Clear transcript state, runtime state, and queued messages.
     /// pi-mono source: packages/agent/src/agent.ts:299-307
     pub fn reset(self: *Agent) void {
-        // Reset arena — frees all message content in O(1)
-        _ = self.message_arena.reset(.retain_capacity);
-        self.messages = .empty;
-        self.state.messages = &.{};
+        self.resetHistoryArena();
+        self.resetRuntimeArena();
         self.state.is_streaming = false;
         self.state.streaming_message = null;
-        self.state.pending_tool_calls = &.{};
         self.state.error_message = null;
-        self.pending_tool_call_ids = .empty;
         self.clearAllQueues();
     }
 
@@ -261,9 +275,8 @@ pub const Agent = struct {
             staged.append(staging_alloc, dupeAgentMessage(staging_alloc, m)) catch {};
         }
 
-        _ = self.message_arena.reset(.retain_capacity);
-        self.messages = .empty;
-        const aa = self.message_arena.allocator();
+        self.resetHistoryArena();
+        const aa = self.history_arena.allocator();
         for (staged.items) |m| {
             self.messages.append(aa, dupeAgentMessage(aa, m)) catch {};
         }
@@ -322,12 +335,15 @@ pub const Agent = struct {
         self.state.error_message = null;
         self.abort_requested.store(false, .release);
 
+        self.resetRuntimeArena();
+
         defer {
             self.is_running.store(false, .release);
             self.state.is_streaming = false;
             self.state.streaming_message = null;
-            self.pending_tool_call_ids.clearRetainingCapacity();
             self.state.pending_tool_calls = &.{};
+            self.pending_tool_call_ids = .empty;
+            self.resetRuntimeArena();
         }
 
         const config = self.createLoopConfig(skip_initial_steering_poll);
@@ -335,7 +351,8 @@ pub const Agent = struct {
 
         if (is_continue) {
             loop_mod.runAgentLoopContinue(
-                self.message_arena.allocator(),
+                self.runtime_arena.allocator(),
+                self.allocator,
                 context,
                 config,
                 processEventsSink,
@@ -344,7 +361,8 @@ pub const Agent = struct {
             ) catch {};
         } else {
             loop_mod.runAgentLoop(
-                self.message_arena.allocator(),
+                self.runtime_arena.allocator(),
+                self.allocator,
                 prompt_messages.?,
                 context,
                 config,
@@ -433,13 +451,15 @@ pub const Agent = struct {
             },
             .message_end => |payload| {
                 self.state.streaming_message = null;
-                const owned = dupeAgentMessage(self.message_arena.allocator(), payload.message);
-                self.messages.append(self.message_arena.allocator(), owned) catch {};
+                const owned = dupeAgentMessage(self.history_arena.allocator(), payload.message);
+                self.messages.append(self.history_arena.allocator(), owned) catch {};
                 self.state.messages = self.messages.items;
             },
             .tool_execution_start => |payload| {
-                self.pending_tool_call_ids.append(self.message_arena.allocator(), payload.tool_call_id) catch {};
-                self.state.pending_tool_calls = self.pending_tool_call_ids.items;
+                if (self.runtime_arena.allocator().dupe(u8, payload.tool_call_id)) |owned_id| {
+                    self.pending_tool_call_ids.append(self.runtime_arena.allocator(), owned_id) catch {};
+                    self.state.pending_tool_calls = self.pending_tool_call_ids.items;
+                } else |_| {}
             },
             .tool_execution_end => |payload| {
                 for (self.pending_tool_call_ids.items, 0..) |id, i| {
@@ -453,7 +473,7 @@ pub const Agent = struct {
             .turn_end => |payload| {
                 if (payload.message == .assistant) {
                     if (payload.message.assistant.error_message) |err_msg| {
-                        self.state.error_message = self.message_arena.allocator().dupe(u8, err_msg) catch err_msg;
+                        self.state.error_message = self.history_arena.allocator().dupe(u8, err_msg) catch err_msg;
                     }
                 }
             },
@@ -640,6 +660,32 @@ fn unreachableStreamFn(
     _: ?*anyopaque,
 ) void {
     @panic("Agent: no stream function configured");
+}
+
+test "tool_execution_start copies ids into runtime scratch" {
+    var agent = Agent.init(testing.allocator, .{});
+    defer agent.deinit();
+
+    var tool_call_id_buf = [_]u8{ 'a', 'b', 'c' };
+    agent.processEvent(.{ .tool_execution_start = .{
+        .tool_call_id = tool_call_id_buf[0..],
+        .tool_name = "read",
+        .args = .{ .object = std.json.ObjectMap.init(testing.allocator) },
+    } });
+
+    tool_call_id_buf[0] = 'z';
+
+    try testing.expectEqual(@as(usize, 1), agent.state.pending_tool_calls.len);
+    try testing.expectEqualStrings("abc", agent.state.pending_tool_calls[0]);
+
+    agent.processEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "abc",
+        .tool_name = "read",
+        .result = .{ .content = &.{}, .is_error = false },
+        .is_error = false,
+    } });
+
+    try testing.expectEqual(@as(usize, 0), agent.state.pending_tool_calls.len);
 }
 
 test "loadMessages accepts state-backed subslices" {

@@ -3,12 +3,14 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse (optimize != .Debug);
 
     // ── executable ──────────────────────────────────────────────────────
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
 
     // ── lua 5.4 (vendored via build.zig.zon) ────────────────────────────
@@ -32,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .link_libc = true,
         }),
     });
@@ -81,6 +84,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/test_root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);

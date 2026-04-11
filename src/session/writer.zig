@@ -38,6 +38,7 @@ pub const SessionWriter = struct {
         std.fs.cwd().makePath(session_dir) catch {};
 
         const file_ts = allocator.dupe(u8, timestamp) catch @panic("OOM");
+        defer allocator.free(file_ts);
         for (file_ts) |*c| {
             if (c.* == ':' or c.* == '.') c.* = '-';
         }
@@ -66,7 +67,6 @@ pub const SessionWriter = struct {
         };
     }
 
-
     /// Create an ephemeral writer that tracks state in memory but never writes to disk.
     /// Used for --no-session sub-agents.
     pub fn initEphemeral(allocator: std.mem.Allocator) SessionWriter {
@@ -88,7 +88,6 @@ pub const SessionWriter = struct {
         };
     }
 
-
     /// Continue writing to an existing session file.
     /// Seeds leaf_id so new entries chain from where the session left off.
     /// Skips header creation — the file already has one.
@@ -106,6 +105,23 @@ pub const SessionWriter = struct {
             .buffered_entries = .empty,
             .persist = true,
         };
+    }
+
+    pub fn deinit(self: *SessionWriter) void {
+        const leaf_owned_by_ids = if (self.leaf_id) |leaf_id| self.ids.contains(leaf_id) else false;
+
+        var id_iter = self.ids.iterator();
+        while (id_iter.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.ids.deinit(self.allocator);
+
+        for (self.buffered_entries.items) |entry| freeBufferedFileEntry(self.allocator, entry, self.session_id);
+        self.buffered_entries.deinit(self.allocator);
+
+        if (self.leaf_id) |leaf_id| {
+            if (!leaf_owned_by_ids) self.allocator.free(leaf_id);
+        }
+        self.allocator.free(self.session_id);
+        if (self.session_file.len > 0) self.allocator.free(self.session_file);
     }
 
     /// Append a message entry. Matches pi-mono's message_end persistence:
@@ -292,6 +308,20 @@ fn isoTimestamp(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 /// Generate a UUID v4-like string (lowercase hex with dashes).
+fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, session_id: []const u8) void {
+    switch (entry) {
+        .header => |header| {
+            if (!std.mem.eql(u8, header.id, session_id)) allocator.free(header.id);
+            allocator.free(header.timestamp);
+            if (header.parent_session) |parent| allocator.free(parent);
+        },
+        .entry => |session_entry| {
+            allocator.free(session_entry.id);
+            allocator.free(session_entry.timestamp);
+        },
+    }
+}
+
 fn generateUuid(buf: *[36]u8) void {
     var random_bytes: [16]u8 = undefined;
     std.crypto.random.bytes(&random_bytes);
@@ -300,9 +330,8 @@ fn generateUuid(buf: *[36]u8) void {
 
     _ = std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
         random_bytes[0],  random_bytes[1],  random_bytes[2],  random_bytes[3],
-        random_bytes[4],  random_bytes[5],
-        random_bytes[6],  random_bytes[7],
-        random_bytes[8],  random_bytes[9],
-        random_bytes[10], random_bytes[11], random_bytes[12], random_bytes[13], random_bytes[14], random_bytes[15],
+        random_bytes[4],  random_bytes[5],  random_bytes[6],  random_bytes[7],
+        random_bytes[8],  random_bytes[9],  random_bytes[10], random_bytes[11],
+        random_bytes[12], random_bytes[13], random_bytes[14], random_bytes[15],
     }) catch {};
 }

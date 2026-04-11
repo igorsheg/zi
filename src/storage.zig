@@ -169,6 +169,20 @@ pub fn getSessionsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const
     return std.fs.path.join(allocator, &.{ agent_dir, "sessions" });
 }
 
+/// Get the diagnostics root directory: <agent_dir>/diagnostics
+pub fn getDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
+    const agent_dir = try getAgentDir(allocator, agent_dir_override);
+    defer allocator.free(agent_dir);
+    return std.fs.path.join(allocator, &.{ agent_dir, "diagnostics" });
+}
+
+/// Get the memory diagnostics directory: <agent_dir>/diagnostics/memory
+pub fn getMemoryDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
+    const diagnostics_dir = try getDiagnosticsDir(allocator, agent_dir_override);
+    defer allocator.free(diagnostics_dir);
+    return std.fs.path.join(allocator, &.{ diagnostics_dir, "memory" });
+}
+
 /// Get the session directory for a specific cwd: <agent_dir>/sessions/<encoded-cwd>
 pub fn getSessionDirForCwd(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) ![]const u8 {
     const sessions_dir = try getSessionsDir(allocator, agent_dir_override);
@@ -267,4 +281,11 @@ test "getProjectDir joins cwd with .zi" {
     const dir = try getProjectDir(allocator, "/home/user/project");
     defer allocator.free(dir);
     try std.testing.expectEqualStrings("/home/user/project/.zi", dir);
+}
+
+test "getMemoryDiagnosticsDir nests under agent diagnostics" {
+    const allocator = std.testing.allocator;
+    const dir = try getMemoryDiagnosticsDir(allocator, "/tmp/zi-agent");
+    defer allocator.free(dir);
+    try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/memory", dir);
 }

@@ -566,6 +566,7 @@ pub const AgentSession = struct {
         self.allocator.destroy(self._stream_closure);
         self.event_listeners.deinit(self.allocator);
         self.agent.deinit();
+        self.session_store.deinit();
         self.resource_loader.deinit();
         // Provider bundle goes last — the agent's stream closure may
         // still hold references into the registry until agent.deinit

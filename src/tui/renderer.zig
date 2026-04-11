@@ -10,8 +10,7 @@ const Region = buffer_mod.Region;
 pub const Renderer = struct {
     current: Buffer,
     next: Buffer,
-    output: std.ArrayList(u8),
-    allocator: std.mem.Allocator,
+    frame_arena: std.heap.ArenaAllocator,
     fd: std.posix.fd_t,
     width: u32,
     height: u32,
@@ -21,8 +20,7 @@ pub const Renderer = struct {
         return .{
             .current = try Buffer.init(allocator, width, height),
             .next = try Buffer.init(allocator, width, height),
-            .output = .empty,
-            .allocator = allocator,
+            .frame_arena = std.heap.ArenaAllocator.init(allocator),
             .fd = fd,
             .width = width,
             .height = height,
@@ -33,7 +31,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         self.current.deinit();
         self.next.deinit();
-        self.output.deinit(self.allocator);
+        self.frame_arena.deinit();
     }
 
     pub fn begin(self: *Renderer) Region {
@@ -42,9 +40,11 @@ pub const Renderer = struct {
     }
 
     pub fn end(self: *Renderer) !void {
-        self.output.clearRetainingCapacity();
+        _ = self.frame_arena.reset(.retain_capacity);
+        const frame_allocator = self.frame_arena.allocator();
+        var output: std.ArrayList(u8) = .empty;
 
-        appendStr(&self.output, self.allocator, "\x1b[?2026h");
+        appendStr(&output, frame_allocator, "\x1b[?2026h");
 
         var last_fg: ?Color = null;
         var last_bg: ?Color = null;
@@ -59,33 +59,33 @@ pub const Renderer = struct {
 
                 if (!self.force_redraw and curr.eql(next_cell)) continue;
 
-                appendCursorPos(&self.output, self.allocator, x, y);
+                appendCursorPos(&output, frame_allocator, x, y);
 
                 if (last_fg == null or !last_fg.?.eql(next_cell.fg)) {
-                    appendFgColor(&self.output, self.allocator, next_cell.fg);
+                    appendFgColor(&output, frame_allocator, next_cell.fg);
                     last_fg = next_cell.fg;
                 }
 
                 if (last_bg == null or !last_bg.?.eql(next_cell.bg)) {
-                    appendBgColor(&self.output, self.allocator, next_cell.bg);
+                    appendBgColor(&output, frame_allocator, next_cell.bg);
                     last_bg = next_cell.bg;
                 }
 
                 if (last_attrs == null or !last_attrs.?.eql(next_cell.attrs)) {
-                    appendAttrs(&self.output, self.allocator, next_cell.attrs);
+                    appendAttrs(&output, frame_allocator, next_cell.attrs);
                     last_attrs = next_cell.attrs;
                 }
 
                 if (next_cell.width == 0) continue;
 
-                appendGrapheme(&self.output, self.allocator, next_cell.grapheme, &self.next.grapheme_pool);
+                appendGrapheme(&output, frame_allocator, next_cell.grapheme, &self.next.grapheme_pool);
             }
         }
 
-        appendStr(&self.output, self.allocator, "\x1b[0m");
-        appendStr(&self.output, self.allocator, "\x1b[?2026l");
+        appendStr(&output, frame_allocator, "\x1b[0m");
+        appendStr(&output, frame_allocator, "\x1b[?2026l");
 
-        writeAll(self.fd, self.output.items);
+        writeAll(self.fd, output.items);
 
         std.mem.swap(Buffer, &self.current, &self.next);
         self.force_redraw = false;

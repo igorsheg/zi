@@ -171,6 +171,7 @@ test "event ordering: text response emits canonical event sequence" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -251,6 +252,7 @@ test "tool call lifecycle: execute → result message → next turn" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -336,6 +338,7 @@ test "error terminal: stream error emits message_end then agent_end" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -395,6 +398,7 @@ test "no provider: stream error produces agent_end" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -484,6 +488,7 @@ test "convertToLlm: custom messages filtered before LLM call" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -584,6 +589,7 @@ test "transformContext: applied before convertToLlm, prunes old messages" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -672,6 +678,7 @@ test "steering: queued messages injected after tool execution completes" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -733,6 +740,7 @@ test "agentLoopContinue: resumes from context without emitting user message even
 
     try loop.runAgentLoopContinue(
         loop_arena.allocator(),
+        std.testing.allocator,
         context,
         config,
         EventCollector.sink,
@@ -787,6 +795,7 @@ test "agentLoopContinue: returns error on empty context" {
 
     const result = loop.runAgentLoopContinue(
         loop_arena.allocator(),
+        std.testing.allocator,
         context,
         config,
         EventCollector.sink,
@@ -829,6 +838,7 @@ test "agentLoopContinue: returns error when last message is assistant" {
 
     const result = loop.runAgentLoopContinue(
         loop_arena.allocator(),
+        std.testing.allocator,
         context,
         config,
         EventCollector.sink,
@@ -898,6 +908,7 @@ test "follow-up: messages processed after agent would stop" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -997,6 +1008,7 @@ test "tool call lifecycle: execute receives correct tool_call_id and args" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -1089,6 +1101,7 @@ test "steering: injected after ALL tool executions complete, visible in LLM cont
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -1197,6 +1210,7 @@ test "agentLoopContinue: allows custom message as last message via convertToLlm"
 
     try loop.runAgentLoopContinue(
         loop_arena.allocator(),
+        std.testing.allocator,
         context,
         config,
         EventCollector.sink,
@@ -1310,6 +1324,7 @@ test "prepareArguments: rewrites args before execution receives them" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -1402,6 +1417,7 @@ test "beforeToolCall: block=true prevents execution and emits error" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -1512,6 +1528,7 @@ test "afterToolCall: overrides content and isError in emitted result" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
@@ -1632,6 +1649,7 @@ test "loop continues after tool returns is_error=true" {
 
     loop.runAgentLoop(
         loop_arena.allocator(),
+        std.testing.allocator,
         &prompts,
         context,
         config,
