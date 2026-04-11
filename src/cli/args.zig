@@ -126,7 +126,6 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-
 test "parse run options preserves batch flags" {
     const result = parse(&.{ "--mode", "json", "--model", "gpt-4o", "-p", "hello" });
     switch (result) {
@@ -163,7 +162,7 @@ test "parse reports invalid mode" {
 }
 
 test "parse reports missing value for valued flags" {
-    const result = parse(&.{ "--model" });
+    const result = parse(&.{"--model"});
     switch (result) {
         .err => |diag| switch (diag) {
             .missing_value => |flag| try std.testing.expectEqualStrings("--model", flag),
