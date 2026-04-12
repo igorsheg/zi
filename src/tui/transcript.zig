@@ -355,6 +355,8 @@ pub const ToolExecution = struct {
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
     scroll_offset: u32 = 0,
+    measured_content_width: u32 = 0,
+    measured_result_height: u32 = 0,
 
     /// Optional pre-computed span tree from a Lua render_result hook.
     /// When present, `renderResult` paints from these spans instead
@@ -405,6 +407,7 @@ pub const ToolExecution = struct {
         json_util.freeJsonValue(self.allocator, self.args);
         self.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
         self.invalidateLuaRender();
+        self.notifyArgsChanged();
     }
 
     /// Mark that execution has started (tool_start received).
@@ -417,6 +420,17 @@ pub const ToolExecution = struct {
         self.args_complete = true;
     }
 
+    pub fn setExpanded(self: *ToolExecution, expanded: bool) void {
+        if (self.expanded == expanded) return;
+        self.expanded = expanded;
+        self.measured_content_width = 0;
+        self.measured_result_height = 0;
+        if (self.renderer.expanded_changed) |changed_fn| {
+            var ctx = self.makeStateContext();
+            changed_fn(&ctx);
+        }
+    }
+
     /// Set partial result (from tool_update). Deep-clones.
     pub fn setPartialResult(self: *ToolExecution, result: ?AgentToolResult, is_error: bool) void {
         if (self.result) |old| old.free(self.allocator);
@@ -424,6 +438,9 @@ pub const ToolExecution = struct {
         self.is_error = is_error;
         self.is_partial = true;
         self.invalidateLuaRender();
+        self.measured_content_width = 0;
+        self.measured_result_height = 0;
+        self.notifyResultChanged();
     }
 
     /// Set final result (from tool_end). Deep-clones.
@@ -433,6 +450,23 @@ pub const ToolExecution = struct {
         self.is_error = is_error;
         self.is_partial = false;
         self.invalidateLuaRender();
+        self.measured_content_width = 0;
+        self.measured_result_height = 0;
+        self.notifyResultChanged();
+    }
+
+    fn notifyArgsChanged(self: *ToolExecution) void {
+        if (self.renderer.args_changed) |changed_fn| {
+            var ctx = self.makeStateContext();
+            changed_fn(&ctx);
+        }
+    }
+
+    fn notifyResultChanged(self: *ToolExecution) void {
+        if (self.renderer.result_changed) |changed_fn| {
+            var ctx = self.makeStateContext();
+            changed_fn(&ctx);
+        }
     }
 
     // ── Rendering ─────────────────────────────────────────────────
@@ -451,9 +485,12 @@ pub const ToolExecution = struct {
     pub fn measure(self: *ToolExecution, width: u32) Measurement {
         if (width == 0) return .{ .min_height = 0, .preferred_height = 0 };
         const content_w = if (width > 2) width - 2 else 1;
+        const result_h = self.measureResult(content_w);
+        self.measured_content_width = content_w;
+        self.measured_result_height = result_h;
         var h: u32 = padding_y; // top padding
         h += 1; // call line
-        h += self.measureResult(content_w);
+        h += result_h;
         h += padding_y; // bottom padding
         return .{ .min_height = 1, .preferred_height = @max(1, h) };
     }
@@ -472,7 +509,7 @@ pub const ToolExecution = struct {
         }
 
         const content_w = if (w > 2) w - 2 else 1;
-        const result_h = self.measureResult(content_w);
+        const result_h = self.ensureMeasuredResultHeight(content_w);
         const total_h = padding_y + 1 + result_h + padding_y;
         var row: u32 = 0;
         var virtual_row: u32 = self.scroll_offset;
@@ -496,12 +533,20 @@ pub const ToolExecution = struct {
             if (virtual_row < result_start + result_h) {
                 const result_skip = virtual_row - result_start;
                 const result_region = region.sub(1, row, content_w, h - row);
-                self.renderResultFromOffset(result_region, result_skip, result_h);
+                self.renderResultFromOffset(result_region, result_skip);
                 break;
             }
 
             break;
         }
+    }
+
+    fn ensureMeasuredResultHeight(self: *ToolExecution, width: u32) u32 {
+        if (self.measured_content_width != width) {
+            self.measured_content_width = width;
+            self.measured_result_height = self.measureResult(width);
+        }
+        return self.measured_result_height;
     }
 
     fn renderCall(self: *ToolExecution, region: Region) void {
@@ -528,11 +573,8 @@ pub const ToolExecution = struct {
         _ = region.writeStr(0, 0, self.tool_name, self.theme.fg(.tool_title), Color.default, .{ .bold = true });
     }
 
-    fn renderResult(self: *ToolExecution, region: Region) void {
-        self.renderResultFromOffset(region, 0, self.measureResult(region.width));
-    }
-
-    fn renderResultFromOffset(self: *ToolExecution, region: Region, skip_rows: u32, total_rows: u32) void {
+    fn renderResultFromOffset(self: *ToolExecution, region: Region, skip_rows: u32) void {
+        const total_rows = self.ensureMeasuredResultHeight(region.width);
         if (skip_rows >= total_rows) return;
 
         if (self.lua_render_state) |s| {
@@ -550,13 +592,9 @@ pub const ToolExecution = struct {
         // states during tool_start / args streaming.
         if (self.result == null) return;
 
-        if (self.renderer.render_result) |render_fn| {
-            if (skip_rows == 0) {
-                var ctx = self.makeRenderContext(region);
-                render_fn(&ctx);
-                return;
-            }
-            self.renderCustomResultSlice(region, skip_rows, total_rows, render_fn);
+        if (self.renderer.render_result_slice) |render_fn| {
+            var ctx = self.makeRenderContext(region);
+            render_fn(&ctx, skip_rows);
             return;
         }
 
@@ -596,28 +634,6 @@ pub const ToolExecution = struct {
             self.renderSpanLine(region, row, line);
             row += 1;
         }
-    }
-
-    fn renderCustomResultSlice(
-        self: *ToolExecution,
-        region: Region,
-        skip_rows: u32,
-        total_rows: u32,
-        render_fn: *const fn (ctx: *const tool_display_mod.ToolRenderContext) void,
-    ) void {
-        if (region.width == 0 or region.height == 0 or total_rows == 0 or skip_rows >= total_rows) return;
-
-        var scratch = Buffer.init(self.allocator, region.width, total_rows) catch return;
-        defer scratch.deinit();
-
-        var ctx = self.makeRenderContext(scratch.region());
-        render_fn(&ctx);
-
-        blitRows(scratch.region(), region, skip_rows);
-    }
-
-    fn renderResultFallback(self: *ToolExecution, region: Region) void {
-        self.renderResultFallbackFromOffset(region, 0);
     }
 
     fn renderResultFallbackFromOffset(self: *ToolExecution, region: Region, skip_rows: u32) void {
@@ -710,7 +726,7 @@ pub const ToolExecution = struct {
         return buf;
     }
 
-    fn makeMeasureContext(self: *ToolExecution, width: u32) tool_display_mod.ToolRenderContext {
+    fn makeStateContext(self: *ToolExecution) tool_display_mod.ToolStateContext {
         return .{
             .tool_name = self.tool_name,
             .tool_call_id = self.tool_call_id,
@@ -721,10 +737,24 @@ pub const ToolExecution = struct {
             .expanded = self.expanded,
             .execution_started = self.execution_started,
             .args_complete = self.args_complete,
-            .theme = self.theme,
             .allocator = self.allocator,
             .state = self.renderer_state,
-            .region = undefined,
+        };
+    }
+
+    fn makeMeasureContext(self: *ToolExecution, width: u32) tool_display_mod.ToolMeasureContext {
+        return .{
+            .tool_name = self.tool_name,
+            .tool_call_id = self.tool_call_id,
+            .args = self.args,
+            .result = self.result,
+            .is_partial = self.is_partial,
+            .is_error = self.is_error,
+            .expanded = self.expanded,
+            .execution_started = self.execution_started,
+            .args_complete = self.args_complete,
+            .allocator = self.allocator,
+            .state = self.renderer_state,
             .width = width,
         };
     }
@@ -1142,7 +1172,7 @@ pub const Transcript = struct {
         for (self.items.items, 0..) |*item, idx| {
             if (item.kind == .tool_execution) {
                 const te: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
-                te.expanded = expanded;
+                te.setExpanded(expanded);
                 self.noteItemMutated(idx);
             }
         }
@@ -1656,11 +1686,11 @@ test "ToolExecution does not invoke result renderers before any result exists" {
             _ = ctx.region.writeStr(0, 0, "Edit /tmp/file.txt", ctx.theme.fg(.tool_title), Color.default, .{ .bold = true });
         }
 
-        fn renderResult(_: *const tool_display_mod.ToolRenderContext) void {
+        fn renderResult(_: *const tool_display_mod.ToolRenderContext, _: u32) void {
             render_result_calls += 1;
         }
 
-        fn measureResult(_: *const tool_display_mod.ToolRenderContext) u32 {
+        fn measureResult(_: *const tool_display_mod.ToolMeasureContext) u32 {
             measure_result_calls += 1;
             return 7;
         }
@@ -1674,7 +1704,7 @@ test "ToolExecution does not invoke result renderers before any result exists" {
 
     transcript.addToolExecution("tool-1", "edit", .{
         .render_call = &S.renderCall,
-        .render_result = &S.renderResult,
+        .render_result_slice = &S.renderResult,
         .measure_result = &S.measureResult,
     });
     transcript.toolMarkExecutionStarted("tool-1");

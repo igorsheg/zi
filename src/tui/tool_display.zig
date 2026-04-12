@@ -7,10 +7,42 @@ const AgentToolResult = agent_protocol.AgentToolResult;
 
 pub const ToolRenderer = struct {
     render_call: ?*const fn (ctx: *const ToolRenderContext) void = null,
-    render_result: ?*const fn (ctx: *const ToolRenderContext) void = null,
-    measure_result: ?*const fn (ctx: *const ToolRenderContext) u32 = null,
+    render_result_slice: ?*const fn (ctx: *const ToolRenderContext, first_row: u32) void = null,
+    measure_result: ?*const fn (ctx: *const ToolMeasureContext) u32 = null,
     init_state: ?*const fn (allocator: std.mem.Allocator) ?*anyopaque = null,
     deinit_state: ?*const fn (state: *anyopaque, allocator: std.mem.Allocator) void = null,
+    args_changed: ?*const fn (ctx: *const ToolStateContext) void = null,
+    result_changed: ?*const fn (ctx: *const ToolStateContext) void = null,
+    expanded_changed: ?*const fn (ctx: *const ToolStateContext) void = null,
+};
+
+pub const ToolStateContext = struct {
+    tool_name: []const u8,
+    tool_call_id: []const u8,
+    args: std.json.Value,
+    result: ?AgentToolResult,
+    is_partial: bool,
+    is_error: bool,
+    expanded: bool,
+    execution_started: bool,
+    args_complete: bool,
+    allocator: std.mem.Allocator,
+    state: ?*anyopaque,
+};
+
+pub const ToolMeasureContext = struct {
+    tool_name: []const u8,
+    tool_call_id: []const u8,
+    args: std.json.Value,
+    result: ?AgentToolResult,
+    is_partial: bool,
+    is_error: bool,
+    expanded: bool,
+    execution_started: bool,
+    args_complete: bool,
+    allocator: std.mem.Allocator,
+    state: ?*anyopaque,
+    width: u32,
 };
 
 pub const ToolRenderContext = struct {
@@ -98,7 +130,7 @@ const testing = std.testing;
 test "empty resolver returns empty renderer for any name" {
     const renderer = empty_resolver.resolve("anything");
     try testing.expect(renderer.render_call == null);
-    try testing.expect(renderer.render_result == null);
+    try testing.expect(renderer.render_result_slice == null);
 }
 
 test "fromStatic resolver finds registered renderer by name" {
@@ -113,7 +145,7 @@ test "fromStatic resolver finds registered renderer by name" {
 
     const hit = resolver.resolve("bash");
     try testing.expect(hit.render_call != null);
-    try testing.expect(hit.render_result == null);
+    try testing.expect(hit.render_result_slice == null);
 
     const miss = resolver.resolve("unknown");
     try testing.expect(miss.render_call == null);
