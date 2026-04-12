@@ -544,6 +544,12 @@ pub const ToolExecution = struct {
             return;
         }
 
+        // pi-mono only invokes result renderers once a tool has
+        // actually produced a result. Keep the same contract here so
+        // pending tools do not render placeholder/malformed result
+        // states during tool_start / args streaming.
+        if (self.result == null) return;
+
         if (self.renderer.render_result) |render_fn| {
             if (skip_rows == 0) {
                 var ctx = self.makeRenderContext(region);
@@ -649,6 +655,7 @@ pub const ToolExecution = struct {
             const lines = if (self.expanded) s.expanded else s.collapsed;
             return if (lines.len > 0) @intCast(lines.len - 1) else 0;
         }
+        if (self.result == null) return 0;
         if (self.renderer.measure_result) |measure_fn| {
             var ctx = self.makeMeasureContext(width);
             return measure_fn(&ctx);
@@ -1638,6 +1645,46 @@ test "Transcript preserves manual scroll when assistant content grows" {
     transcript.appendText(0, " eleven twelve thirteen fourteen");
 
     try testing.expectEqual(before, transcript.scrollOffset());
+}
+
+test "ToolExecution does not invoke result renderers before any result exists" {
+    const S = struct {
+        var measure_result_calls: usize = 0;
+        var render_result_calls: usize = 0;
+
+        fn renderCall(ctx: *const tool_display_mod.ToolRenderContext) void {
+            _ = ctx.region.writeStr(0, 0, "Edit /tmp/file.txt", ctx.theme.fg(.tool_title), Color.default, .{ .bold = true });
+        }
+
+        fn renderResult(_: *const tool_display_mod.ToolRenderContext) void {
+            render_result_calls += 1;
+        }
+
+        fn measureResult(_: *const tool_display_mod.ToolRenderContext) u32 {
+            measure_result_calls += 1;
+            return 7;
+        }
+    };
+
+    S.measure_result_calls = 0;
+    S.render_result_calls = 0;
+
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    transcript.addToolExecution("tool-1", "edit", .{
+        .render_call = &S.renderCall,
+        .render_result = &S.renderResult,
+        .measure_result = &S.measureResult,
+    });
+    transcript.toolMarkExecutionStarted("tool-1");
+
+    var buf = try Buffer.init(testing.allocator, 30, 6);
+    defer buf.deinit();
+    transcript.render(buf.region());
+
+    try testing.expectEqual(@as(usize, 0), S.measure_result_calls);
+    try testing.expectEqual(@as(usize, 0), S.render_result_calls);
 }
 
 test "Transcript scrolls through tool output without repeating the first rows" {

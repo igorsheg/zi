@@ -636,6 +636,29 @@ pub const AgentSession = struct {
         self.session_store = new_store;
     }
 
+    /// Reset the active session to a fresh header-only session while
+    /// preserving the current model + thinking defaults for future resume.
+    ///
+    /// Ownership: agent-thread only. Mutates `session_store` and
+    /// `agent.state`, both owned by the agent thread per doctrine.
+    pub fn startNewSession(self: *AgentSession) !void {
+        var new_store = blk: {
+            if (!self.session_store.writer.persist) {
+                break :blk SessionStore.createEphemeral(self.allocator);
+            }
+            const cwd = self.resource_loader.cwd;
+            const session_dir = try storage.getSessionDirForCwd(self.allocator, cwd, null);
+            defer self.allocator.free(session_dir);
+            break :blk SessionStore.create(self.allocator, session_dir, cwd);
+        };
+        errdefer new_store.deinit();
+
+        try self.replaceSessionStore(new_store);
+        self.agent.reset();
+        self.session_store.appendModelChange(ai.json_util.providerToString(self.agent.state.model.provider), self.agent.state.model.id);
+        self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(self.agent.state.thinking_level));
+    }
+
     /// Current context usage for the active model.
     ///
     /// Mirrors pi-mono's `AgentSession.getContextUsage()` semantics:
@@ -2225,6 +2248,75 @@ test "AgentSession: replaceSessionStore rebinds resumed session ids for agent an
     try testing.expect(ca.agent.session_id.?.ptr != ca.session_store.sessionId().ptr);
     try testing.expectEqualStrings("session-two", ca._builtin_ctx.?.session_id);
     try testing.expect(ca._builtin_ctx.?.session_id.ptr == ca.session_store.sessionId().ptr);
+}
+
+test "AgentSession: startNewSession resets transcript and seeds model plus thinking defaults" {
+    const allocator = testing.allocator;
+
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+
+    var ca = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
+        .registry = &registry,
+        .thinking_level = .medium,
+    });
+    defer ca.deinit();
+
+    const existing = [_]protocol.AgentMessage{
+        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } },
+    };
+    ca.agent.loadMessages(&existing);
+    const old_session_id = try allocator.dupe(u8, ca.session_store.sessionId());
+    defer allocator.free(old_session_id);
+
+    try ca.startNewSession();
+
+    try testing.expect(!std.mem.eql(u8, old_session_id, ca.session_store.sessionId()));
+    try testing.expectEqual(@as(usize, 0), ca.agent.state.messages.len);
+    try testing.expect(ca.agent.session_id != null);
+    try testing.expectEqualStrings(ca.session_store.sessionId(), ca.agent.session_id.?);
+    try testing.expect(ca._builtin_ctx != null);
+    try testing.expectEqualStrings(ca.session_store.sessionId(), ca._builtin_ctx.?.session_id);
+
+    const buffered = ca.session_store.writer.buffered_entries.items;
+    try testing.expectEqual(@as(usize, 3), buffered.len);
+    try testing.expect(buffered[0] == .header);
+    try testing.expect(buffered[1] == .entry);
+    try testing.expect(buffered[1].entry.entry == .model_change);
+    try testing.expectEqualStrings("faux", buffered[1].entry.entry.model_change.provider);
+    try testing.expectEqualStrings(faux.fauxModel().id, buffered[1].entry.entry.model_change.model_id);
+    try testing.expect(buffered[2] == .entry);
+    try testing.expect(buffered[2].entry.entry == .thinking_level_change);
+    try testing.expectEqualStrings("medium", buffered[2].entry.entry.thinking_level_change.thinking_level);
+}
+
+test "AgentSession: startNewSession preserves ephemeral mode" {
+    const allocator = testing.allocator;
+
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+
+    var ca = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
+        .registry = &registry,
+        .session_store = SessionStore.createEphemeral(allocator),
+        .thinking_level = .low,
+    });
+    defer ca.deinit();
+
+    try testing.expect(!ca.session_store.writer.persist);
+    try ca.startNewSession();
+
+    try testing.expect(!ca.session_store.writer.persist);
+    try testing.expectEqual(@as(usize, 0), ca.session_store.sessionFile().len);
+    try testing.expectEqual(@as(usize, 2), ca.session_store.writer.buffered_entries.items.len);
+    try testing.expect(ca.session_store.writer.buffered_entries.items[0].entry.entry == .model_change);
+    try testing.expect(ca.session_store.writer.buffered_entries.items[1].entry.entry == .thinking_level_change);
 }
 
 // --continue round-trip: write session → load → continue → verify context sent to provider

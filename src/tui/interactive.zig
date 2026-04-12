@@ -68,6 +68,12 @@ const SettingsAction = enum {
     open_thinking,
     toggle_hide_thinking,
 };
+
+const IdleRequestDispatch = struct {
+    busy_message: []const u8,
+    loader_message: []const u8,
+    spawn_failed_message: []const u8,
+};
 const auth_storage_mod = @import("../auth/storage.zig");
 const oauth_mod = @import("../auth/oauth.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
@@ -608,12 +614,7 @@ pub const Interactive = struct {
         // extensionless mode) — nothing to tear down on the agent
         // thread, plain ca.deinit() handles it.
         if (self.ca.extensionRunner() != null) {
-            var stale: [16]AgentRequest = undefined;
-            while (true) {
-                const n = self.request_queue.drainInto(&stale);
-                if (n == 0) break;
-                for (stale[0..n]) |*req| req.deinit(self.msg_allocator);
-            }
+            self.drainQueuedRequests();
             self.transcript.lua_runner = null;
             self.request_queue.push(.{ .shutdown = {} });
             const t = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch null;
@@ -1123,6 +1124,18 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
+            .session_new_started => {
+                self.transcript.clearAll();
+                self.active_editor.clearHistory();
+                self.status_text.setContent("new session started");
+                self.status_text.fg = self.theme.fg(.success);
+                self.tui.dirty = true;
+            },
+            .session_new_failed => |f| {
+                self.status_text.setContent(f.message);
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+            },
             .status_snapshot => |s| {
                 self.applyStatusSnapshot(s);
                 self.tui.dirty = true;
@@ -1404,10 +1417,18 @@ pub const Interactive = struct {
                 self.running = false;
                 return true;
             }
-            if (std.mem.eql(u8, name, "clear") or std.mem.eql(u8, name, "new")) {
+            if (std.mem.eql(u8, name, "clear")) {
                 self.transcript.clearAll();
                 self.status_text.setContent("");
                 self.tui.dirty = true;
+                return true;
+            }
+            if (std.mem.eql(u8, name, "new")) {
+                _ = self.dispatchIdleRequest(.{ .new_session = {} }, .{
+                    .busy_message = "cannot start a new session while agent is running",
+                    .loader_message = "Starting new session...",
+                    .spawn_failed_message = "failed to spawn new-session worker",
+                });
                 return true;
             }
             if (std.mem.eql(u8, name, "resume")) {
@@ -1510,6 +1531,43 @@ pub const Interactive = struct {
         };
     }
 
+    fn drainQueuedRequests(self: *Interactive) void {
+        var drain_buf: [16]AgentRequest = undefined;
+        while (true) {
+            const n = self.request_queue.drainInto(&drain_buf);
+            if (n == 0) return;
+            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
+        }
+    }
+
+    fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
+        if (self.is_streaming or self.agent_thread != null) {
+            var rejected = req;
+            rejected.deinit(self.msg_allocator);
+            self.status_text.setContent(options.busy_message);
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return false;
+        }
+
+        self.request_queue.push(req);
+        self.showLoader(options.loader_message);
+        self.tui.dirty = true;
+
+        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
+            self.hideLoader();
+            self.status_text.setContent(options.spawn_failed_message);
+            self.status_text.fg = self.theme.fg(.@"error");
+            // Request is still in the queue — drain it ourselves to
+            // avoid leaking payloads. Safe because idle-only callers
+            // guarantee no worker exists yet.
+            self.drainQueuedRequests();
+            self.tui.dirty = true;
+            return false;
+        };
+        return true;
+    }
+
     // ── Session picker (/resume) ────────────────────────────────
 
     fn closeResumePickerFlow(self: *Interactive) void {
@@ -1570,18 +1628,6 @@ pub const Interactive = struct {
             return;
         };
 
-        // zi-wub.15: block /resume during streaming. Rebuilding the
-        // transcript while a stream is still emitting events is
-        // chaos, and our single pre-run drain point would delay the
-        // request until the *next* prompt otherwise.
-        if (self.is_streaming or self.agent_thread != null) {
-            self.closeResumePickerFlow();
-            self.status_text.setContent("cannot resume while agent is running");
-            self.status_text.fg = self.theme.fg(.@"error");
-            self.tui.dirty = true;
-            return;
-        }
-
         // Clone path into msg_allocator (doctrine R3: cross-thread
         // payload slices must be thread-safe allocated).
         const path_copy = self.msg_allocator.dupe(u8, selected_path) catch {
@@ -1591,28 +1637,11 @@ pub const Interactive = struct {
             return;
         };
         self.closeResumePickerFlow();
-
-        self.request_queue.push(.{ .resume_session = .{ .path = path_copy } });
-
-        // Spawn a drain-only worker to process it. Agent thread is
-        // idle (checked above), so this starts a fresh thread whose
-        // only job is to bind lua ownership, drain the request
-        // queue, and exit.
-        self.showLoader("Loading session...");
-        self.tui.dirty = true;
-
-        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
-            self.hideLoader();
-            self.status_text.setContent("failed to spawn resume worker");
-            self.status_text.fg = self.theme.fg(.@"error");
-            // Request is still in the queue — drain it ourselves to
-            // avoid leaking the path copy. Safe because no thread is
-            // concurrently touching it.
-            var drain_buf: [4]AgentRequest = undefined;
-            const n = self.request_queue.drainInto(&drain_buf);
-            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
-            return;
-        };
+        _ = self.dispatchIdleRequest(.{ .resume_session = .{ .path = path_copy } }, .{
+            .busy_message = "cannot resume while agent is running",
+            .loader_message = "Loading session...",
+            .spawn_failed_message = "failed to spawn resume worker",
+        });
     }
 
     fn onSessionPickerCancel(ctx: ?*anyopaque) void {
@@ -1716,39 +1745,18 @@ pub const Interactive = struct {
 
     /// Enqueue a /model switch through the AgentRequest queue
     /// (zi-wub.16). The actual mutation runs on the agent thread
-    /// inside `handleSetModel`. Same shape as the .15 /resume path:
-    /// block during streaming, push request, spawn drain_only worker
-    /// when idle. Status update happens when `.model_switched`
-    /// drains back through the event queue.
+    /// inside `handleSetModel`. Status updates flow back via
+    /// `.model_switched` / `.model_switch_failed`.
     ///
     /// Model is a static catalog value (its slices live forever in
     /// `ai_models`), so we pass it by value into the request without
     /// cloning the inner strings.
     fn applyModelSwitch(self: *Interactive, m: ai_protocol.Model) void {
-        if (self.is_streaming or self.agent_thread != null) {
-            self.status_text.setContent("cannot switch model while agent is running");
-            self.status_text.fg = self.theme.fg(.@"error");
-            self.tui.dirty = true;
-            return;
-        }
-
-        self.request_queue.push(.{ .set_model = .{ .model = m } });
-
-        self.showLoader("Switching model...");
-        self.tui.dirty = true;
-
-        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
-            self.hideLoader();
-            self.status_text.setContent("failed to spawn model-switch worker");
-            self.status_text.fg = self.theme.fg(.@"error");
-            // Drain leaked request to free its payload (set_model
-            // currently has no allocations, but stay symmetric with
-            // the .15 path).
-            var drain_buf: [4]AgentRequest = undefined;
-            const n = self.request_queue.drainInto(&drain_buf);
-            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
-            return;
-        };
+        _ = self.dispatchIdleRequest(.{ .set_model = .{ .model = m } }, .{
+            .busy_message = "cannot switch model while agent is running",
+            .loader_message = "Switching model...",
+            .spawn_failed_message = "failed to spawn model-switch worker",
+        });
     }
 
     // ── Settings picker (/settings) ─────────────────────────────
@@ -1877,26 +1885,11 @@ pub const Interactive = struct {
     }
 
     fn applyThinkingLevelChange(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
-        if (self.is_streaming or self.agent_thread != null) {
-            self.status_text.setContent("cannot change thinking level while agent is running");
-            self.status_text.fg = self.theme.fg(.@"error");
-            self.tui.dirty = true;
-            return;
-        }
-
-        self.request_queue.push(.{ .set_thinking_level = .{ .level = level } });
-        self.showLoader("Updating thinking level...");
-        self.tui.dirty = true;
-
-        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
-            self.hideLoader();
-            self.status_text.setContent("failed to spawn thinking-level worker");
-            self.status_text.fg = self.theme.fg(.@"error");
-            var drain_buf: [4]AgentRequest = undefined;
-            const n = self.request_queue.drainInto(&drain_buf);
-            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
-            return;
-        };
+        _ = self.dispatchIdleRequest(.{ .set_thinking_level = .{ .level = level } }, .{
+            .busy_message = "cannot change thinking level while agent is running",
+            .loader_message = "Updating thinking level...",
+            .spawn_failed_message = "failed to spawn thinking-level worker",
+        });
     }
 
     // ── Login picker (/login) ───────────────────────────────────
@@ -2149,6 +2142,7 @@ pub const Interactive = struct {
             for (buf[0..n]) |*req| {
                 switch (req.*) {
                     .resume_session => |r| self.handleResumeSession(r.path),
+                    .new_session => self.handleNewSession(),
                     .set_model => |s| self.handleSetModel(s.model),
                     .set_thinking_level => |s| self.handleSetThinkingLevel(s.level),
                     // zi-wub.28: terminal request. Tears down the
@@ -2162,6 +2156,16 @@ pub const Interactive = struct {
                 req.deinit(self.msg_allocator);
             }
         }
+    }
+
+    fn handleNewSession(self: *Interactive) void {
+        self.ca.startNewSession() catch |err| {
+            const msg = std.fmt.allocPrint(self.msg_allocator, "failed to start new session: {s}", .{@errorName(err)}) catch return;
+            self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
+            return;
+        };
+        self.publishStatusSnapshot();
+        self.event_queue.push(.{ .session_new_started = {} });
     }
 
     /// Agent-thread handler for `AgentRequest.resume_session`.

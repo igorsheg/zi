@@ -162,6 +162,12 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
+    // --- /new outcomes ---
+    session_new_started: void,
+    session_new_failed: struct {
+        message: []u8,
+    },
+
     // --- shared status snapshot ---
     // Agent-thread owned model/thinking/context snapshot for the editor
     // border chips. Published whenever session state changes in a way the
@@ -237,6 +243,8 @@ pub const UiEvent = union(enum) {
                 if (s.restore_warning) |w| allocator.free(w);
             },
             .session_resume_failed => |f| allocator.free(f.message),
+            .session_new_started => {},
+            .session_new_failed => |f| allocator.free(f.message),
             .status_snapshot => |s| {
                 allocator.free(s.model_provider);
                 allocator.free(s.model_id);

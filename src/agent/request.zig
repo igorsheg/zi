@@ -18,6 +18,7 @@ const ai_protocol = @import("../ai/protocol.zig");
 /// Variants are added as consumers land. zi-wub.14 introduces the
 /// channel itself with the variants the next beads will need:
 ///   - resume_session : consumed by zi-wub.15 (/resume)
+///   - new_session    : consumed by /new
 ///   - set_model      : consumed by zi-wub.16 (/model)
 ///
 /// `shutdown` (zi-wub.28) is the terminal request: pushed by
@@ -32,6 +33,7 @@ const ai_protocol = @import("../ai/protocol.zig");
 /// frees with the same allocator after dispatch via `deinit`.
 pub const AgentRequest = union(enum) {
     resume_session: struct { path: []const u8 },
+    new_session: void,
     set_model: struct { model: ai_protocol.Model },
     set_thinking_level: struct { level: @import("protocol.zig").ThinkingLevel },
     shutdown: void,
@@ -39,6 +41,7 @@ pub const AgentRequest = union(enum) {
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .resume_session => |r| allocator.free(r.path),
+            .new_session => {},
             .set_model => {},
             .set_thinking_level => {},
             .shutdown => {},
