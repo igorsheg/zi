@@ -1231,11 +1231,11 @@ pub const Interactive = struct {
         const message = if (cancellable)
             std.fmt.bufPrint(
                 &buf,
-                "Retrying ({d}/{d}) in {d}s... (Esc to cancel)",
+                "Retrying ({d}/{d}) in {d}s… (Esc to cancel)",
                 .{ attempt, max_attempts, delay_seconds },
-            ) catch "Retrying..."
+            ) catch "Retrying…"
         else
-            std.fmt.bufPrint(&buf, "Retrying ({d}/{d})...", .{ attempt, max_attempts }) catch "Retrying...";
+            std.fmt.bufPrint(&buf, "Retrying ({d}/{d})…", .{ attempt, max_attempts }) catch "Retrying…";
         self.loader.spinner_fg = self.theme.fg(.warning);
         self.loader.message_fg = self.theme.fg(.muted);
         self.loader.setMessage(message);
@@ -1366,7 +1366,7 @@ pub const Interactive = struct {
         self.refreshGreeterVisibility();
         self.is_streaming = true;
         self.tui.setFocus(null); // defocus editor during streaming
-        self.showLoader("Working...");
+        self.showLoader("Working…");
         self.tui.dirty = true;
 
         self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .prompt = prompt_copy } }) catch {

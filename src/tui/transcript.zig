@@ -1770,18 +1770,19 @@ test "Transcript removeComponent removes item by identity and fixes indices" {
     try testing.expect(transcript.scrollOffset() <= 1);
 }
 
-test "Transcript animation hooks follow active thinking and stop on message end" {
+test "Transcript animation hooks stay static for assistant thinking blocks" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
     transcript.beginAssistantMessage();
     transcript.appendThinking(0, "ponder");
 
-    try testing.expect(transcript.nextAnimationDeadline(assistant_message_mod.AssistantMessage.shimmer_step_ns) != null);
+    try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(0));
+    try testing.expect(!transcript.tickAnimation(0));
 
     transcript.endAssistantMessage();
 
-    try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(assistant_message_mod.AssistantMessage.shimmer_step_ns));
+    try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(0));
 }
 
 test "Transcript clearAll removes all items and resets state" {

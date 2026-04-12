@@ -20,6 +20,10 @@ const buffer_mod = @import("../buffer.zig");
 const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
 const json_util = @import("../../ai/json_util.zig");
+const diff = @import("../../lib/diff.zig");
+const diff_json = @import("../../lib/diff_json.zig");
+const diff_view = @import("../../lib/diff_view.zig");
+const agent_protocol = @import("../../agent/root.zig").protocol;
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
 const ToolRenderContext = tool_display_mod.ToolRenderContext;
@@ -51,8 +55,12 @@ const Parsed = struct {
     /// Owned slab of formatted gutter strings (diff mode line numbers).
     /// Line.gutter slices into these; freed together in deinit.
     gutter_strs: [][]u8 = &.{},
+    /// Structured diff rows own their text independently because they do not
+    /// borrow from a collected raw payload.
+    owned_texts: [][]u8 = &.{},
     notice: ?[]const u8 = null, // optional bottom-line notice (stripped from box)
     header: ?[]const u8 = null, // optional file header for top border
+    owned_header: ?[]u8 = null,
     stats: ?DiffStats = null, // shown as a header row above drawTop
     gutter_width: u32 = 0,
     allocator: std.mem.Allocator,
@@ -60,6 +68,9 @@ const Parsed = struct {
     fn deinit(self: *Parsed) void {
         for (self.gutter_strs) |s| self.allocator.free(s);
         if (self.gutter_strs.len > 0) self.allocator.free(self.gutter_strs);
+        for (self.owned_texts) |s| self.allocator.free(s);
+        if (self.owned_texts.len > 0) self.allocator.free(self.owned_texts);
+        if (self.owned_header) |h| self.allocator.free(h);
         self.allocator.free(self.lines);
         self.allocator.free(self.owned_raw);
     }
@@ -102,8 +113,6 @@ const ParseMode = enum {
     plain,
     /// Each line is "N: text" — extract N as the gutter.
     numbered,
-    /// Each line is unified-diff (`+`, `-`, ` `, `@@`).
-    diff,
 };
 
 fn parseResult(
@@ -135,19 +144,11 @@ fn parseResult(
         }
     }
 
-    // Walk lines. Diff mode owns its own growable list inside
-    // parseDiffResult; plain/numbered preallocate against the raw line
+    // Walk lines. Plain/numbered preallocate against the raw line
     // count (no extra entries injected, only drops are possible).
     var line_count: usize = 1;
     for (raw) |c| {
         if (c == '\n') line_count += 1;
-    }
-
-    if (mode == .diff) {
-        return parseDiffResult(ctx.allocator, raw_full, raw, line_count, notice) catch {
-            ctx.allocator.free(raw_full);
-            return null;
-        };
     }
 
     const lines = ctx.allocator.alloc(Line, line_count) catch {
@@ -177,7 +178,6 @@ fn parseResult(
                         if (l.gutter.?.len > max_gutter) max_gutter = l.gutter.?.len;
                     }
                 },
-                .diff => unreachable,
             }
             lines[idx] = l;
             idx += 1;
@@ -194,180 +194,6 @@ fn parseResult(
         .gutter_width = @intCast(max_gutter),
         .allocator = ctx.allocator,
     };
-}
-
-// ── unified diff parser ─────────────────────────────────────────────
-//
-// Parses the output of `tui/components/diff.zig`'s `toUnified`:
-//
-//   --- a/path
-//   +++ b/path
-//   @@ -old_start,old_count +new_start,new_count @@
-//    context
-//   -removed
-//   +inserted
-//
-// Drops the `---`/`+++` headers entirely (they're shown as the box
-// title elsewhere). Keeps the `@@` headers as elision markers that
-// visualize the gap between hunks. Assigns line numbers from the @@
-// range so every content line gets a right-aligned gutter.
-fn parseDiffResult(
-    allocator: std.mem.Allocator,
-    raw_full: []u8,
-    raw: []const u8,
-    raw_line_estimate: usize,
-    notice: ?[]const u8,
-) !Parsed {
-    // Growable lines list — diff mode synthesizes elision entries for
-    // hunk gaps and drops header lines, so the final count differs from
-    // the raw line count in both directions. The previous fixed-cap
-    // version silently truncated diffs with >16 hunk gaps (oracle).
-    var lines_list: std.ArrayList(Line) = .empty;
-    errdefer lines_list.deinit(allocator);
-    try lines_list.ensureTotalCapacity(allocator, raw_line_estimate);
-
-    var gutter_strs: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (gutter_strs.items) |s| allocator.free(s);
-        gutter_strs.deinit(allocator);
-    }
-
-    var stats = DiffStats{};
-    var max_gutter: usize = 0;
-    var header: ?[]const u8 = null;
-
-    // Hunk state — incremented per content line within a hunk.
-    var old_lineno: u32 = 0;
-    var new_lineno: u32 = 0;
-    var hunk_old_end: u32 = 0; // first line AFTER the previous hunk (in old file)
-    var in_hunk = false;
-
-    var it = std.mem.splitScalar(u8, raw, '\n');
-    while (it.next()) |line_text| {
-        if (line_text.len == 0 and lines_list.items.len == 0) continue; // leading blank
-        // Capture the filename from `--- path` for the box header.
-        // Skip `+++ path` entirely.
-        if (std.mem.startsWith(u8, line_text, "--- ")) {
-            if (header == null) header = line_text[4..];
-            continue;
-        }
-        if (std.mem.startsWith(u8, line_text, "+++ ")) continue;
-        if (std.mem.startsWith(u8, line_text, "@@")) {
-            if (parseHunkHeader(line_text)) |hdr| {
-                if (in_hunk) {
-                    const gap = if (hdr.old_start > hunk_old_end) hdr.old_start - hunk_old_end else 0;
-                    if (gap > 0) {
-                        try lines_list.append(allocator, .{
-                            .text = "",
-                            .is_elision = true,
-                            .elision_count = gap,
-                        });
-                    }
-                }
-                old_lineno = hdr.old_start;
-                new_lineno = hdr.new_start;
-                hunk_old_end = hdr.old_start + hdr.old_count;
-                in_hunk = true;
-            }
-            continue;
-        }
-        if (!in_hunk or line_text.len == 0) continue;
-
-        const prefix = line_text[0];
-        const body = line_text[1..];
-        var line = Line{ .text = body };
-
-        switch (prefix) {
-            ' ' => {
-                const g = try std.fmt.allocPrint(allocator, "{d}", .{new_lineno});
-                try gutter_strs.append(allocator, g);
-                if (g.len > max_gutter) max_gutter = g.len;
-                line.gutter = g;
-                line.diff_style = .context;
-                line.highlight = false;
-                old_lineno += 1;
-                new_lineno += 1;
-            },
-            '-' => {
-                const g = try std.fmt.allocPrint(allocator, "{d}", .{old_lineno});
-                try gutter_strs.append(allocator, g);
-                if (g.len > max_gutter) max_gutter = g.len;
-                line.gutter = g;
-                line.diff_style = .removed;
-                line.highlight = true;
-                stats.removed += 1;
-                old_lineno += 1;
-            },
-            '+' => {
-                const g = try std.fmt.allocPrint(allocator, "{d}", .{new_lineno});
-                try gutter_strs.append(allocator, g);
-                if (g.len > max_gutter) max_gutter = g.len;
-                line.gutter = g;
-                line.diff_style = .added;
-                line.highlight = true;
-                stats.added += 1;
-                new_lineno += 1;
-            },
-            else => {
-                line.text = line_text;
-            },
-        }
-        try lines_list.append(allocator, line);
-    }
-
-    const owned_gutters = try gutter_strs.toOwnedSlice(allocator);
-    const owned_lines = try lines_list.toOwnedSlice(allocator);
-
-    return .{
-        .owned_raw = raw_full,
-        .raw = raw,
-        .lines = owned_lines,
-        .gutter_strs = owned_gutters,
-        .notice = notice,
-        .header = header,
-        .stats = stats,
-        .gutter_width = @intCast(max_gutter),
-        .allocator = allocator,
-    };
-}
-
-const HunkHeader = struct {
-    old_start: u32,
-    old_count: u32,
-    new_start: u32,
-    new_count: u32,
-};
-
-/// Parses `@@ -old_start,old_count +new_start,new_count @@` (git also
-/// allows the `,count` to be omitted when count == 1; handle both).
-fn parseHunkHeader(s: []const u8) ?HunkHeader {
-    // Find "-" then " +" then " @@".
-    const dash = std.mem.indexOfScalar(u8, s, '-') orelse return null;
-    const plus_seq = std.mem.indexOf(u8, s, " +") orelse return null;
-    if (plus_seq <= dash) return null;
-    const old_part = s[dash + 1 .. plus_seq];
-    const after_plus = s[plus_seq + 2 ..];
-    const end = std.mem.indexOf(u8, after_plus, " @@") orelse after_plus.len;
-    const new_part = after_plus[0..end];
-
-    const old_parsed = parseRange(old_part) orelse return null;
-    const new_parsed = parseRange(new_part) orelse return null;
-    return .{
-        .old_start = old_parsed[0],
-        .old_count = old_parsed[1],
-        .new_start = new_parsed[0],
-        .new_count = new_parsed[1],
-    };
-}
-
-fn parseRange(s: []const u8) ?[2]u32 {
-    if (std.mem.indexOfScalar(u8, s, ',')) |c| {
-        const a = std.fmt.parseInt(u32, s[0..c], 10) catch return null;
-        const b = std.fmt.parseInt(u32, s[c + 1 ..], 10) catch return null;
-        return .{ a, b };
-    }
-    const a = std.fmt.parseInt(u32, s, 10) catch return null;
-    return .{ a, 1 };
 }
 
 // ── shared draw helpers ─────────────────────────────────────────────
@@ -666,6 +492,140 @@ pub const write_renderer = ToolRenderer{
 
 // ── Edit ────────────────────────────────────────────────────────────
 
+fn parseStructuredDiffResult(ctx: *const ToolRenderContext) ?Parsed {
+    const result = ctx.result orelse return malformedEditParsed(ctx.allocator, "malformed edit result: missing tool result");
+    const details = switch (result.details) {
+        .object => |o| o,
+        else => return malformedEditParsed(ctx.allocator, "malformed edit result: missing structuredDiff details"),
+    };
+    const structured = details.get("structuredDiff") orelse
+        return malformedEditParsed(ctx.allocator, "malformed edit result: missing structuredDiff details");
+
+    var document = diff_json.fromJsonValue(ctx.allocator, structured) catch
+        return malformedEditParsed(ctx.allocator, "malformed edit result: invalid structuredDiff details");
+    defer document.deinit();
+
+    var view = diff_view.buildView(ctx.allocator, document) catch
+        return malformedEditParsed(ctx.allocator, "malformed edit result: failed to build diff view");
+    defer view.deinit();
+
+    return parsedFromDiffView(ctx.allocator, view, null) catch
+        malformedEditParsed(ctx.allocator, "malformed edit result: failed to render diff view");
+}
+
+fn malformedEditParsed(allocator: std.mem.Allocator, text: []const u8) ?Parsed {
+    const owned_raw = allocator.dupe(u8, text) catch return null;
+
+    const lines = allocator.alloc(Line, 1) catch {
+        allocator.free(owned_raw);
+        return null;
+    };
+    lines[0] = .{ .text = owned_raw, .highlight = false };
+    return .{
+        .owned_raw = owned_raw,
+        .raw = owned_raw,
+        .lines = lines,
+        .allocator = allocator,
+    };
+}
+
+fn parsedFromDiffView(
+    allocator: std.mem.Allocator,
+    view: diff_view.DiffView,
+    notice: ?[]const u8,
+) !Parsed {
+    var lines_list: std.ArrayList(Line) = .empty;
+    errdefer lines_list.deinit(allocator);
+
+    var gutter_strs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (gutter_strs.items) |s| allocator.free(s);
+        gutter_strs.deinit(allocator);
+    }
+
+    var owned_texts: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (owned_texts.items) |s| allocator.free(s);
+        owned_texts.deinit(allocator);
+    }
+
+    var header_owned: ?[]u8 = null;
+    errdefer {
+        if (header_owned) |h| allocator.free(h);
+    }
+    if (view.files.len > 0) {
+        header_owned = try allocator.dupe(u8, view.files[0].path);
+    }
+
+    var max_gutter: usize = 0;
+    for (view.files, 0..) |file, file_index| {
+        if (file_index > 0) {
+            const owned_path = try allocator.dupe(u8, file.path);
+            try owned_texts.append(allocator, owned_path);
+            try lines_list.append(allocator, .{ .text = "" });
+            try lines_list.append(allocator, .{ .text = owned_path, .highlight = false });
+        }
+
+        for (file.rows) |row| {
+            switch (row.kind) {
+                .gap => {
+                    try lines_list.append(allocator, .{
+                        .text = "",
+                        .is_elision = true,
+                        .elision_count = row.gap_count,
+                    });
+                },
+                .context, .added, .removed => {
+                    const owned = try allocator.dupe(u8, row.text);
+                    try owned_texts.append(allocator, owned);
+                    var line = Line{
+                        .text = owned,
+                        .diff_style = switch (row.kind) {
+                            .context => .context,
+                            .added => .added,
+                            .removed => .removed,
+                            else => unreachable,
+                        },
+                        .highlight = row.kind != .context,
+                    };
+                    const gutter_no = switch (row.kind) {
+                        .context => row.new_lineno,
+                        .added => row.new_lineno,
+                        .removed => row.old_lineno,
+                        else => null,
+                    };
+                    if (gutter_no) |ln| {
+                        const gutter = try std.fmt.allocPrint(allocator, "{d}", .{ln});
+                        try gutter_strs.append(allocator, gutter);
+                        if (gutter.len > max_gutter) max_gutter = gutter.len;
+                        line.gutter = gutter;
+                    }
+                    try lines_list.append(allocator, line);
+                },
+            }
+        }
+    }
+
+    const owned_gutters = try gutter_strs.toOwnedSlice(allocator);
+    const owned_lines = try lines_list.toOwnedSlice(allocator);
+    const owned_line_texts = try owned_texts.toOwnedSlice(allocator);
+    const owned_raw = try allocator.alloc(u8, 0);
+
+    return .{
+        .owned_raw = owned_raw,
+        .raw = owned_raw,
+        .lines = owned_lines,
+        .gutter_strs = owned_gutters,
+        .owned_texts = owned_line_texts,
+        .notice = notice,
+        .header = header_owned,
+        .owned_header = header_owned,
+        .stats = .{ .added = view.stats.added, .removed = view.stats.removed },
+        .gutter_width = @intCast(max_gutter),
+        .allocator = allocator,
+    };
+}
+
 fn editCall(ctx: *const ToolRenderContext) void {
     var buf: [1024]u8 = undefined;
     const path = argString(ctx.args, "path") orelse "...";
@@ -673,21 +633,40 @@ fn editCall(ctx: *const ToolRenderContext) void {
 }
 
 fn editResult(ctx: *const ToolRenderContext) void {
-    // Error results are plain text ("file not found", "could not find
-    // old_str", …) — no `@@` headers, nothing for the diff parser to
-    // latch onto. Fall back to plain mode so the user can actually
-    // read the error message.
-    const mode: ParseMode = if (ctx.is_error) .plain else .diff;
-    const excerpts: []const excerpt_mod.Excerpt = if (ctx.is_error) &TAIL_5 else &DIFF_COLLAPSED;
-    var parsed = parseResult(ctx, mode) orelse return;
+    if (ctx.is_error) {
+        var parsed = parseResult(ctx, .plain) orelse return;
+        defer parsed.deinit();
+        renderBoxed(ctx, &parsed, &TAIL_5);
+        return;
+    }
+
+    var parsed = parseStructuredDiffResult(ctx) orelse return;
     defer parsed.deinit();
-    renderBoxed(ctx, &parsed, excerpts);
+    renderBoxed(ctx, &parsed, &DIFF_COLLAPSED);
 }
 
 fn editMeasure(ctx: *const ToolRenderContext) u32 {
-    const mode: ParseMode = if (ctx.is_error) .plain else .diff;
-    const excerpts: []const excerpt_mod.Excerpt = if (ctx.is_error) &TAIL_5 else &DIFF_COLLAPSED;
-    return measureBoxed(ctx, mode, excerpts);
+    if (ctx.is_error) return measureBoxed(ctx, .plain, &TAIL_5);
+
+    var parsed = parseStructuredDiffResult(ctx) orelse return 0;
+    defer parsed.deinit();
+
+    const total: u32 = @intCast(parsed.lines.len);
+    if (total == 0) return 0;
+    const excerpts: []const excerpt_mod.Excerpt = if (ctx.expanded) &.{} else &DIFF_COLLAPSED;
+    var window = excerpt_mod.windowExcerpts(ctx.allocator, total, excerpts) catch return 1;
+    defer window.deinit();
+
+    var visible: u32 = 0;
+    var gaps: u32 = 0;
+    for (window.items) |item| switch (item) {
+        .span => |span| visible += span.end -| span.start,
+        .gap => gaps += 1,
+    };
+    var h = box_chrome.measureHeight(visible, gaps);
+    if (parsed.notice != null) h += 1;
+    if (parsed.stats != null) h += 1;
+    return h;
 }
 
 pub const edit_renderer = ToolRenderer{
@@ -899,3 +878,113 @@ pub const ls_renderer = ToolRenderer{
     .render_result = lsResult,
     .measure_result = lsMeasure,
 };
+
+test "edit renderer uses structured diff details" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 12);
+    defer buf.deinit();
+
+    const inputs = [_]diff.Input{.{
+        .old_path = "a.txt",
+        .new_path = "a.txt",
+        .old_text =
+        \\one
+        \\two
+        \\three
+        ,
+        .new_text =
+        \\one
+        \\TWO
+        \\three
+        ,
+    }};
+    var doc = try diff.buildDocument(testing.allocator, &inputs, .{});
+    defer doc.deinit();
+    const diff_value = try diff_json.toJsonValue(testing.allocator, doc);
+    defer json_util.freeJsonValue(testing.allocator, diff_value);
+
+    var details = std.json.ObjectMap.init(testing.allocator);
+    defer json_util.freeJsonValue(testing.allocator, .{ .object = details });
+    try details.put(try testing.allocator.dupe(u8, "structuredDiff"), try json_util.cloneJsonValue(testing.allocator, diff_value));
+
+    const content = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
+    defer {
+        testing.allocator.free(content[0].text.text);
+        testing.allocator.free(content);
+    }
+    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(u8, "ignored text payload") } };
+
+    const result = agent_protocol.AgentToolResult{
+        .content = content,
+        .details = .{ .object = details },
+        .is_error = false,
+    };
+
+    const ctx = ToolRenderContext{
+        .tool_name = "edit",
+        .tool_call_id = "call-1",
+        .args = .null,
+        .result = result,
+        .is_partial = false,
+        .is_error = false,
+        .expanded = true,
+        .execution_started = true,
+        .args_complete = true,
+        .theme = &theme_mod.Theme.dark,
+        .allocator = testing.allocator,
+        .state = null,
+        .region = buf.region(),
+        .width = buf.width,
+    };
+
+    editResult(&ctx);
+
+    var row0: [80]u8 = undefined;
+    var row2: [80]u8 = undefined;
+    var row3: [80]u8 = undefined;
+    var row4: [80]u8 = undefined;
+    try testing.expectEqualStrings("+1 -1", rowAscii(&buf, 0, &row0));
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 2, &row2), "a.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 3, &row3), "one") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "two") != null or std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "TWO") != null);
+}
+
+test "edit renderer shows malformed result message when structured diff details are missing" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 8);
+    defer buf.deinit();
+
+    const content = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
+    defer {
+        testing.allocator.free(content[0].text.text);
+        testing.allocator.free(content);
+    }
+    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(u8, "ignored text payload") } };
+
+    const result = agent_protocol.AgentToolResult{
+        .content = content,
+        .details = .null,
+        .is_error = false,
+    };
+
+    const ctx = ToolRenderContext{
+        .tool_name = "edit",
+        .tool_call_id = "call-2",
+        .args = .null,
+        .result = result,
+        .is_partial = false,
+        .is_error = false,
+        .expanded = true,
+        .execution_started = true,
+        .args_complete = true,
+        .theme = &theme_mod.Theme.dark,
+        .allocator = testing.allocator,
+        .state = null,
+        .region = buf.region(),
+        .width = buf.width,
+    };
+
+    try testing.expect(editMeasure(&ctx) > 0);
+    editResult(&ctx);
+
+    var row: [80]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 0, &row), "malformed edit result") != null);
+}

@@ -27,6 +27,8 @@ const protocol = @import("../agent/protocol.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const diff_mod = @import("../lib/diff.zig");
+const diff_unified = @import("../lib/diff_unified.zig");
+const diff_json = @import("../lib/diff_json.zig");
 const lock_registry = @import("../agent/lock_registry.zig");
 const json_value = @import("../json/value.zig");
 
@@ -257,22 +259,54 @@ fn execute(
     atomicWriteFile(io_path, final_bytes, stat.mode) catch
         return util.errorResult(allocator, "edit tool: write failed");
 
-    // Build a real Myers-based unified diff. `FileDiff` borrows from
-    // `base` and `new_content`, so we serialize to owned text before
-    // either source frees (defers above run at return).
-    var fd = diff_mod.build(
-        allocator,
-        std.fs.path.basename(resolved),
-        base,
-        new_content,
-        .{},
-    ) catch |err|
+    const inputs = [_]diff_mod.Input{.{
+        .old_path = std.fs.path.basename(resolved),
+        .new_path = std.fs.path.basename(resolved),
+        .old_text = base,
+        .new_text = new_content,
+    }};
+    var doc = diff_mod.buildDocument(allocator, &inputs, .{}) catch |err|
         return util.errorf(allocator, "diff failed: {s}", .{@errorName(err)});
-    defer fd.deinit();
+    defer doc.deinit();
 
-    const unified = diff_mod.toUnified(allocator, fd) catch
+    const unified = diff_unified.toUnified(allocator, doc) catch
         return util.errorResult(allocator, "diff serialize failed");
-    return util.textResult(allocator, unified);
+    const structured = diff_json.toJsonValue(allocator, doc) catch {
+        allocator.free(unified);
+        return util.errorResult(allocator, "diff details failed");
+    };
+
+    var details_obj = std.json.ObjectMap.init(allocator);
+    errdefer json_value.freeJsonValue(allocator, .{ .object = details_obj });
+    const structured_key = allocator.dupe(u8, "structuredDiff") catch
+        return allocFailureWithOwnedDiff(allocator, unified, structured);
+    details_obj.put(structured_key, structured) catch {
+        allocator.free(structured_key);
+        allocator.free(unified);
+        json_value.freeJsonValue(allocator, structured);
+        return util.errorResult(allocator, "diff details failed");
+    };
+
+    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+        return allocFailureWithOwnedDiffAndDetails(allocator, unified, .{ .object = details_obj });
+    blocks[0] = .{ .text = .{ .text = unified } };
+    return .{
+        .content = blocks,
+        .details = .{ .object = details_obj },
+        .is_error = false,
+    };
+}
+
+fn allocFailureWithOwnedDiff(allocator: std.mem.Allocator, unified: []u8, structured: std.json.Value) protocol.AgentToolResult {
+    allocator.free(unified);
+    json_value.freeJsonValue(allocator, structured);
+    return util.errorResult(allocator, "alloc failed");
+}
+
+fn allocFailureWithOwnedDiffAndDetails(allocator: std.mem.Allocator, unified: []u8, details: std.json.Value) protocol.AgentToolResult {
+    allocator.free(unified);
+    json_value.freeJsonValue(allocator, details);
+    return util.errorResult(allocator, "alloc failed");
 }
 
 // ── line ending handling ────────────────────────────────────────────
@@ -923,4 +957,72 @@ test "prepareArguments leaves non-canonical input unchanged when it cannot fold 
 
     const prepared = try prepareArguments(std.testing.allocator, input);
     try std.testing.expect(prepared == input);
+}
+
+test "execute returns unified diff in content and structuredDiff in details for a real file edit" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "note.txt",
+        .data = "one\ntwo\nthree\n",
+    });
+
+    const abs_path = try tmp.dir.realpathAlloc(testing.allocator, "note.txt");
+    defer testing.allocator.free(abs_path);
+
+    var edit_obj = std.json.ObjectMap.init(testing.allocator);
+    errdefer json_value.freeJsonValue(testing.allocator, .{ .object = edit_obj });
+    try edit_obj.put(try testing.allocator.dupe(u8, "old_str"), .{ .string = try testing.allocator.dupe(u8, "two\n") });
+    try edit_obj.put(try testing.allocator.dupe(u8, "new_str"), .{ .string = try testing.allocator.dupe(u8, "TWO\n") });
+
+    var edits_arr = std.json.Array.init(testing.allocator);
+    errdefer json_value.freeJsonValue(testing.allocator, .{ .array = edits_arr });
+    try edits_arr.append(.{ .object = edit_obj });
+
+    var args_obj = std.json.ObjectMap.init(testing.allocator);
+    errdefer json_value.freeJsonValue(testing.allocator, .{ .object = args_obj });
+    try args_obj.put(try testing.allocator.dupe(u8, "path"), .{ .string = try testing.allocator.dupe(u8, abs_path) });
+    try args_obj.put(try testing.allocator.dupe(u8, "edits"), .{ .array = edits_arr });
+    const args: std.json.Value = .{ .object = args_obj };
+    defer json_value.freeJsonValue(testing.allocator, args);
+
+    var builtin_ctx = util.BuiltinCtx{ .cwd = "/" };
+    const result = execute(
+        @ptrCast(&builtin_ctx),
+        testing.allocator,
+        "call-1",
+        args,
+        protocol.AbortSignal.none,
+        null,
+        null,
+    );
+    defer result.free(testing.allocator);
+
+    try testing.expect(!result.is_error);
+    try testing.expectEqual(@as(usize, 1), result.content.len);
+    try testing.expect(result.content[0] == .text);
+
+    const unified = result.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, unified, "--- note.txt\n") != null);
+    try testing.expect(std.mem.indexOf(u8, unified, "+++ note.txt\n") != null);
+    try testing.expect(std.mem.indexOf(u8, unified, "-two\n") != null);
+    try testing.expect(std.mem.indexOf(u8, unified, "+TWO\n") != null);
+
+    const details = switch (result.details) {
+        .object => |o| o,
+        else => return error.TestUnexpectedResult,
+    };
+    const structured = details.get("structuredDiff") orelse return error.TestUnexpectedResult;
+    var document = try diff_json.fromJsonValue(testing.allocator, structured);
+    defer document.deinit();
+
+    const regenerated = try diff_unified.toUnified(testing.allocator, document);
+    defer testing.allocator.free(regenerated);
+    try testing.expectEqualStrings(unified, regenerated);
+
+    const final_contents = try tmp.dir.readFileAlloc(testing.allocator, "note.txt", 1024);
+    defer testing.allocator.free(final_contents);
+    try testing.expectEqualStrings("one\nTWO\nthree\n", final_contents);
 }
