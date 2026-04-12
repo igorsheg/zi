@@ -25,6 +25,7 @@ const SubscriptionToken = agent_mod.SubscriptionToken;
 pub const SessionStore = session_mod.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
+pub const ContextUsage = session_mod.context_usage.ContextUsage;
 
 /// Composition root: wires Agent + SessionStore + tools + model resolution.
 ///
@@ -84,6 +85,7 @@ pub const AgentSession = struct {
     /// drops it AFTER the agent — provider structs and the registry
     /// must outlive any in-flight stream that might still hold them.
     _owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
+    _builtin_ctx: ?*builtin_util.BuiltinCtx = null,
 
     pub const EventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -176,10 +178,12 @@ pub const AgentSession = struct {
         // The bundle owns a per-session BuiltinCtx (cwd + session id)
         // that every tool ctx pointer references for the session
         // lifetime.
+        var builtin_ctx: ?*builtin_util.BuiltinCtx = null;
         const builtin_definitions = options.tools orelse blk: {
             var bundle = builtin_tools_mod.build(allocator, options.cwd) catch
                 break :blk @as([]const tool_def.ToolDefinition, &.{});
             bundle.ctx.session_id = store.sessionId();
+            builtin_ctx = bundle.ctx;
             break :blk @as([]const tool_def.ToolDefinition, bundle.definitions);
         };
 
@@ -383,7 +387,7 @@ pub const AgentSession = struct {
             },
             .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
             .stream_fn = stream_hook,
-            .session_id = if (options.session_store) |s| s.sessionId() else null,
+            .session_id = store.sessionId(),
             .get_api_key = get_api_key_hook,
             .before_tool_call = before_tool_hook,
             .after_tool_call = after_tool_hook,
@@ -403,6 +407,7 @@ pub const AgentSession = struct {
             .resource_loader = resource_loader,
             .model_registry = options.model_registry,
             ._owned_provider_bundle = owned_bundle,
+            ._builtin_ctx = builtin_ctx,
             ._extension_runner = ext_runner,
             ._extension_lua_state = ext_state,
         };
@@ -593,6 +598,82 @@ pub const AgentSession = struct {
         }
     }
 
+    pub fn replaceSessionStore(self: *AgentSession, new_store: SessionStore) !void {
+        const session_id = new_store.sessionId();
+        try self.agent.setSessionId(session_id);
+        if (self._builtin_ctx) |ctx| {
+            ctx.session_id = session_id;
+        }
+        self.session_store.deinit();
+        self.session_store = new_store;
+    }
+
+    /// Current context usage for the active model.
+    ///
+    /// Mirrors pi-mono's `AgentSession.getContextUsage()` semantics:
+    /// - no model / zero context window → null
+    /// - after compaction, usage stays unknown until the first successful
+    ///   post-compaction assistant response lands
+    /// - otherwise use the last assistant usage plus heuristic estimates for
+    ///   trailing messages
+    pub fn getContextUsage(self: *AgentSession) ?ContextUsage {
+        const model = self.agent.state.model;
+        if (model.context_window == 0) return null;
+
+        const entries = self.session_store.readEntries() catch return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const branch = session_mod.context_usage.buildBranchEntries(
+            arena.allocator(),
+            entries,
+            self.session_store.leafId(),
+        ) catch return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+
+        if (session_mod.context_usage.getLatestCompactionEntry(branch)) |_| {
+            var has_post_compaction_usage = false;
+            var i: usize = branch.len;
+            scan: while (i > 0) {
+                i -= 1;
+                switch (branch[i].entry) {
+                    .compaction => break :scan,
+                    .message => |m| switch (m.message) {
+                        .assistant => |assistant| switch (assistant.stop_reason) {
+                            .aborted, .@"error" => {},
+                            else => {
+                                const context_tokens = session_mod.context_usage.calculateContextTokens(assistant.usage);
+                                if (context_tokens > 0) {
+                                    has_post_compaction_usage = true;
+                                }
+                                break :scan;
+                            },
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+
+            if (!has_post_compaction_usage) {
+                return .{
+                    .tokens = null,
+                    .context_window = model.context_window,
+                    .percent = null,
+                };
+            }
+        }
+
+        return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+    }
+
+    fn contextUsageFromMessages(context_window: u64, messages: []const protocol.AgentMessage) ContextUsage {
+        const estimate = session_mod.context_usage.estimateContextTokens(messages);
+        return .{
+            .tokens = estimate.tokens,
+            .context_window = context_window,
+            .percent = (@as(f64, @floatFromInt(estimate.tokens)) / @as(f64, @floatFromInt(context_window))) * 100.0,
+        };
+    }
+
     pub fn deinit(self: *AgentSession) void {
         // Unsubscribe extension bridge FIRST so no agent event can
         // re-enter the runner mid-teardown. Then unsubscribe the
@@ -669,6 +750,54 @@ pub const AgentSession = struct {
         }
     }
 
+    fn bindExtensionRuntimeIfNeeded(self: *AgentSession) void {
+        const runner = self._extension_runner orelse return;
+        if (runner.isBound()) return;
+
+        runner.bindRuntime(.{
+            .session = @ptrCast(self),
+            .ui = null,
+            .command_actions = null,
+            .get_model = &runtimeGetModel,
+            .is_idle = &runtimeIsIdle,
+            .abort = &runtimeAbort,
+            .has_pending_messages = &runtimeHasPendingMessages,
+            .shutdown = null,
+            .get_context_usage = &runtimeGetContextUsage,
+            .get_system_prompt = &runtimeGetSystemPrompt,
+        }) catch {};
+    }
+
+    fn runtimeGetModel(session_ptr: *anyopaque) protocol.Model {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        return self.agent.state.model;
+    }
+
+    fn runtimeIsIdle(session_ptr: *anyopaque) bool {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        return !self.agent.state.is_streaming;
+    }
+
+    fn runtimeAbort(session_ptr: *anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.agent.abort();
+    }
+
+    fn runtimeHasPendingMessages(session_ptr: *anyopaque) bool {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        return self.agent.hasQueuedMessages();
+    }
+
+    fn runtimeGetContextUsage(session_ptr: *anyopaque) ?ContextUsage {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        return self.getContextUsage();
+    }
+
+    fn runtimeGetSystemPrompt(session_ptr: *anyopaque) []const u8 {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        return self.agent.state.system_prompt;
+    }
+
     /// Run a new prompt. Wires session persistence, then delegates to Agent.prompt.
     pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
         // zi-wub.6: this thread is now the lua owner. Bind BEFORE
@@ -679,6 +808,7 @@ pub const AgentSession = struct {
         if (self._extension_runner) |runner| {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
+        self.bindExtensionRuntimeIfNeeded();
         self.wireSubscription();
 
         const user_msg = protocol.AgentMessage{
@@ -700,6 +830,7 @@ pub const AgentSession = struct {
         if (self._extension_runner) |runner| {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
+        self.bindExtensionRuntimeIfNeeded();
         self.wireSubscription();
         self.agent.@"continue"() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
@@ -1039,10 +1170,9 @@ test "trySetModel updates session state and appends model change when auth exist
     try testing.expectEqualStrings(target.id, ca.agent.state.model.id);
     try testing.expectEqual(@as(usize, 1), ca.session_store.writer.buffered_entries.items.len);
     const entry = ca.session_store.writer.buffered_entries.items[0].entry;
-    try testing.expect(entry != null);
-    try testing.expect(entry.?.entry == .model_change);
-    try testing.expectEqualStrings("anthropic", entry.?.entry.model_change.provider);
-    try testing.expectEqualStrings(target.id, entry.?.entry.model_change.model_id);
+    try testing.expect(entry.entry == .model_change);
+    try testing.expectEqualStrings("anthropic", entry.entry.model_change.provider);
+    try testing.expectEqualStrings(target.id, entry.entry.model_change.model_id);
 }
 
 test "trySetModel reclamps xhigh to high and persists thinking change when target lacks xhigh" {
@@ -1081,9 +1211,8 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
     try testing.expectEqual(.high, ca.agent.state.thinking_level);
     try testing.expectEqual(@as(usize, 2), ca.session_store.writer.buffered_entries.items.len);
     const thinking_entry = ca.session_store.writer.buffered_entries.items[1].entry;
-    try testing.expect(thinking_entry != null);
-    try testing.expect(thinking_entry.?.entry == .thinking_level_change);
-    try testing.expectEqualStrings("high", thinking_entry.?.entry.thinking_level_change.thinking_level);
+    try testing.expect(thinking_entry.entry == .thinking_level_change);
+    try testing.expectEqualStrings("high", thinking_entry.entry.thinking_level_change.thinking_level);
 }
 
 test "trySetModel persists defaults through settings manager" {
@@ -1358,6 +1487,38 @@ fn createTestAgentSession(
     });
 }
 
+fn testUserMessage(text: []const u8, timestamp: i64) protocol.AgentMessage {
+    return .{ .user = .{
+        .content = .{ .text = text },
+        .timestamp = timestamp,
+    } };
+}
+
+fn testAssistantMessageWithUsage(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    total_tokens: u64,
+    timestamp: i64,
+) protocol.AgentMessage {
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText(text)};
+    var message = faux.fauxAssistantMessage(allocator, &content, .stop);
+    message.timestamp = timestamp;
+    message.usage = .{
+        .input = total_tokens,
+        .output = 0,
+        .cache_read = 0,
+        .cache_write = 0,
+        .total_tokens = total_tokens,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+    };
+    return .{ .assistant = message };
+}
+
+fn syncMessagesFromStore(session: *AgentSession) !void {
+    const context = try session.session_store.buildContext(session.session_store.leafId());
+    session.agent.loadMessages(context.messages);
+}
+
 const EventCollector = struct {
     events: std.ArrayListUnmanaged(protocol.AgentEvent),
     alloc: std.mem.Allocator,
@@ -1419,6 +1580,129 @@ fn testToolDefinition(name: []const u8, label: []const u8) tool_def.ToolDefiniti
     };
 }
 
+test "AgentSession: getContextUsage reports current context from assistant usage" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+    var collector = EventCollector.init(allocator);
+    var session = createTestAgentSession(allocator, &fp, &registry, &collector);
+    defer session.deinit();
+    defer collector.deinit();
+    defer registry.deinit();
+    defer fp.deinit();
+
+    session.session_store.appendMessage(testUserMessage("hello", 1));
+    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "hi", 200, 2));
+    try syncMessagesFromStore(&session);
+
+    const usage = session.getContextUsage().?;
+    try testing.expectEqual(@as(?u64, 200), usage.tokens);
+    try testing.expectEqual(faux.fauxModel().context_window, usage.context_window);
+    try testing.expect(usage.percent != null);
+    try testing.expectApproxEqRel((@as(f64, @floatFromInt(200)) / @as(f64, @floatFromInt(faux.fauxModel().context_window))) * 100.0, usage.percent.?, 1e-9);
+}
+
+test "AgentSession: getContextUsage falls back to in-memory messages for no-session runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+    var collector = EventCollector.init(allocator);
+    var session = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
+        .registry = &registry,
+        .tools = &.{},
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },
+        .no_session = true,
+    });
+    defer session.deinit();
+    defer collector.deinit();
+    defer registry.deinit();
+    defer fp.deinit();
+
+    const messages = [_]protocol.AgentMessage{
+        testUserMessage("hello", 1),
+        testAssistantMessageWithUsage(allocator, "hi", 200, 2),
+    };
+    session.agent.loadMessages(&messages);
+
+    const usage = session.getContextUsage().?;
+    try testing.expectEqual(@as(?u64, 200), usage.tokens);
+    try testing.expectEqual(faux.fauxModel().context_window, usage.context_window);
+    try testing.expect(usage.percent != null);
+}
+
+test "AgentSession: getContextUsage is unknown immediately after compaction" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+    var collector = EventCollector.init(allocator);
+    var session = createTestAgentSession(allocator, &fp, &registry, &collector);
+    defer session.deinit();
+    defer collector.deinit();
+    defer registry.deinit();
+    defer fp.deinit();
+
+    session.session_store.appendMessage(testUserMessage("first", 1));
+    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
+    session.session_store.appendMessage(testUserMessage("second", 3));
+    const kept_user_id = session.session_store.leafId().?;
+    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
+    session.session_store.appendCompaction("summary", kept_user_id, 195_000);
+    session.session_store.appendMessage(testUserMessage("third", 5));
+    try syncMessagesFromStore(&session);
+
+    const usage = session.getContextUsage().?;
+    try testing.expectEqual(@as(?u64, null), usage.tokens);
+    try testing.expectEqual(@as(?f64, null), usage.percent);
+    try testing.expectEqual(faux.fauxModel().context_window, usage.context_window);
+}
+
+test "AgentSession: getContextUsage prefers post-compaction assistant usage" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+    var collector = EventCollector.init(allocator);
+    var session = createTestAgentSession(allocator, &fp, &registry, &collector);
+    defer session.deinit();
+    defer collector.deinit();
+    defer registry.deinit();
+    defer fp.deinit();
+
+    session.session_store.appendMessage(testUserMessage("first", 1));
+    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
+    session.session_store.appendMessage(testUserMessage("second", 3));
+    const kept_user_id = session.session_store.leafId().?;
+    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
+    session.session_store.appendCompaction("summary", kept_user_id, 195_000);
+    session.session_store.appendMessage(testUserMessage("third", 5));
+    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
+    try syncMessagesFromStore(&session);
+
+    const usage = session.getContextUsage().?;
+    try testing.expectEqual(@as(?u64, 25_000), usage.tokens);
+    try testing.expect(usage.percent != null);
+    try testing.expectApproxEqRel((@as(f64, @floatFromInt(25_000)) / @as(f64, @floatFromInt(faux.fauxModel().context_window))) * 100.0, usage.percent.?, 1e-9);
+}
+
 // zi-1ry: `tool_allowlist` is a strict whitelist. Applied AFTER the
 // builtin + Lua-extension merge, it drops anything not explicitly
 // named — critical to prevent Task-in-Task subagent recursion when
@@ -1428,8 +1712,9 @@ test "AgentSession: tool_allowlist filters merged tool set" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    var seeded_ctx = builtin_util.BuiltinCtx{ .cwd = "/tmp/zi-test" };
     const seeded = [_]tool_def.ToolDefinition{
-        bash_tool.definition(&(builtin_util.BuiltinCtx{ .cwd = "/tmp/zi-test" })),
+        bash_tool.definition(&seeded_ctx),
         testToolDefinition("Task", "Task"),
         testToolDefinition("read", "Read"),
     };
@@ -1707,6 +1992,54 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     // Verify tool_execution events fired
     try testing.expect(collector.countType(.tool_execution_start) >= 1);
     try testing.expect(collector.countType(.tool_execution_end) >= 1);
+}
+
+test "AgentSession: replaceSessionStore rebinds resumed session ids for agent and builtins" {
+    const allocator = testing.allocator;
+
+    const makeStore = struct {
+        fn make(alloc: std.mem.Allocator, session_id: []const u8) SessionStore {
+            return .{
+                .allocator = alloc,
+                .writer = session_mod.writer.SessionWriter.initContinue(
+                    alloc,
+                    "",
+                    alloc.dupe(u8, session_id) catch @panic("OOM"),
+                    null,
+                ),
+                .cache_arena = null,
+                .cached_entries = null,
+                .cached_header = null,
+            };
+        }
+    }.make;
+
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+
+    var ca = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
+        .registry = &registry,
+        .session_store = makeStore(allocator, "session-one"),
+    });
+    defer ca.deinit();
+
+    try testing.expect(ca._builtin_ctx != null);
+    try testing.expect(ca.agent.session_id != null);
+    try testing.expectEqualStrings("session-one", ca.agent.session_id.?);
+    try testing.expect(ca.agent.session_id.?.ptr != ca.session_store.sessionId().ptr);
+    try testing.expectEqualStrings("session-one", ca._builtin_ctx.?.session_id);
+    try testing.expect(ca._builtin_ctx.?.session_id.ptr == ca.session_store.sessionId().ptr);
+
+    try ca.replaceSessionStore(makeStore(allocator, "session-two"));
+
+    try testing.expect(ca.agent.session_id != null);
+    try testing.expectEqualStrings("session-two", ca.agent.session_id.?);
+    try testing.expect(ca.agent.session_id.?.ptr != ca.session_store.sessionId().ptr);
+    try testing.expectEqualStrings("session-two", ca._builtin_ctx.?.session_id);
+    try testing.expect(ca._builtin_ctx.?.session_id.ptr == ca.session_store.sessionId().ptr);
 }
 
 // --continue round-trip: write session → load → continue → verify context sent to provider

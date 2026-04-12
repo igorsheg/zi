@@ -1,10 +1,14 @@
 const std = @import("std");
 const component_mod = @import("component.zig");
 const buffer_mod = @import("buffer.zig");
+const cell_mod = @import("cell.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
+const Cell = cell_mod.Cell;
+const Color = cell_mod.Color;
+const Attributes = cell_mod.Attributes;
 
 /// Anchor point for overlay positioning.
 pub const OverlayAnchor = enum {
@@ -15,6 +19,29 @@ pub const OverlayAnchor = enum {
     bottom_right,
     top_center,
     bottom_center,
+};
+
+/// How the overlay's own rectangle should be painted before the component
+/// renders into it.
+pub const OverlaySurface = union(enum) {
+    /// Paint nothing — underlying content remains visible anywhere the component
+    /// does not draw.
+    transparent,
+    /// Fill the overlay rect with spaces using this background color, hiding the
+    /// content below without adding a separate backdrop outside the rect.
+    fill: Color,
+};
+
+/// How the screen behind an overlay should be painted before the overlay's
+/// own surface and component render.
+pub const OverlayBackdrop = union(enum) {
+    /// Leave the already-rendered content untouched.
+    none,
+    /// Fill the full terminal region with this background color before drawing
+    /// the overlay. The overlay surface/component then render on top.
+    fill: Color,
+    /// Apply the terminal "dim" attribute to already-rendered cells.
+    dim,
 };
 
 /// Overlay positioning and sizing options.
@@ -42,6 +69,12 @@ pub const OverlayOptions = struct {
 
     /// If true, don't capture keyboard focus when shown.
     non_capturing: bool = false,
+
+    /// Whether the overlay rect is transparent or painted with a background
+    /// before the component renders.
+    surface: OverlaySurface = .transparent,
+    /// Whether a backdrop should be painted behind the overlay.
+    backdrop: OverlayBackdrop = .none,
 };
 
 /// Generic overlay layout presets. Terminal-level only — no knowledge of
@@ -56,6 +89,8 @@ pub const OverlayPresets = struct {
             .max_height_percent = 60,
             .margin_top = 2,
             .margin_bottom = 2,
+            .surface = .{ .fill = Color.default },
+            .backdrop = .dim,
         };
     }
 
@@ -68,6 +103,7 @@ pub const OverlayPresets = struct {
             .non_capturing = true,
             .margin_top = 1,
             .margin_right = 2,
+            .surface = .{ .fill = Color.default },
         };
     }
 };
@@ -230,7 +266,9 @@ pub const OverlayManager = struct {
             const layout = resolveLayout(entry.options, entry.component, term_w, term_h);
             if (layout.width == 0 or layout.height == 0) continue;
 
+            paintOverlayBackdrop(region, layout, entry.options.backdrop);
             const overlay_region = region.sub(layout.col, layout.row, layout.width, layout.height);
+            paintOverlaySurface(overlay_region, entry.options.surface);
             entry.component.render(overlay_region);
         }
     }
@@ -250,6 +288,47 @@ pub const OverlayManager = struct {
         return null;
     }
 };
+
+fn paintOverlayBackdrop(region: Region, layout: ResolvedLayout, backdrop: OverlayBackdrop) void {
+    switch (backdrop) {
+        .none => {},
+        .fill => |bg| region.fill(0, 0, region.width, region.height, Cell{ .bg = bg }),
+        .dim => {
+            var row: u32 = 0;
+            while (row < region.height) : (row += 1) {
+                var col: u32 = 0;
+                while (col < region.width) : (col += 1) {
+                    if (col >= layout.col and col < layout.col + layout.width and row >= layout.row and row < layout.row + layout.height) {
+                        continue;
+                    }
+                    var cell = region.get(col, row);
+                    cell.attrs = mergeBackdropAttrs(cell.attrs, .{ .dim = true });
+                    region.set(col, row, cell);
+                }
+            }
+        },
+    }
+}
+
+fn paintOverlaySurface(region: Region, surface: OverlaySurface) void {
+    switch (surface) {
+        .transparent => {},
+        .fill => |bg| region.fill(0, 0, region.width, region.height, Cell{ .bg = bg }),
+    }
+}
+
+fn mergeBackdropAttrs(base: Attributes, overlay: Attributes) Attributes {
+    return .{
+        .bold = base.bold or overlay.bold,
+        .dim = base.dim or overlay.dim,
+        .italic = base.italic or overlay.italic,
+        .underline = base.underline or overlay.underline,
+        .blink = base.blink or overlay.blink,
+        .inverse = base.inverse or overlay.inverse,
+        .hidden = base.hidden or overlay.hidden,
+        .strikethrough = base.strikethrough or overlay.strikethrough,
+    };
+}
 
 pub const ResolvedLayout = struct {
     row: u32,
@@ -394,6 +473,73 @@ test "OverlayHandle hide removes specific overlay" {
     // Remove first overlay by handle
     h1.hide();
     try testing.expectEqual(@as(usize, 1), mgr.stack.items.len);
+}
+
+test "overlay backdrop dim affects cells behind but not inside overlay rect" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
+    defer buf.deinit();
+    const root = buf.region();
+    root.fill(0, 0, root.width, root.height, Cell{ .grapheme = .{ .codepoint = 'x' } });
+
+    var mgr = OverlayManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const DummyComp = struct {
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn measure(_: *@This(), _: u32) Measurement {
+            return .{ .min_height = 1, .preferred_height = 2 };
+        }
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var d = DummyComp{};
+    _ = mgr.showOverlay(d.component(), .{
+        .anchor = .top_left,
+        .width = 4,
+        .surface = .{ .fill = Color.rgb(1, 2, 3) },
+        .backdrop = .dim,
+    }, null);
+
+    mgr.renderOverlays(root);
+
+    try testing.expect(buf.get(5, 2).attrs.dim);
+    try testing.expect(!buf.get(0, 0).attrs.dim);
+    try testing.expect(buf.get(0, 0).bg.eql(Color.rgb(1, 2, 3)));
+}
+
+test "overlay surface fill hides content below overlay rect" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
+    defer buf.deinit();
+    const root = buf.region();
+    root.fill(0, 0, root.width, root.height, Cell{ .grapheme = .{ .codepoint = 'x' } });
+
+    var mgr = OverlayManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const DummyComp = struct {
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn measure(_: *@This(), _: u32) Measurement {
+            return .{ .min_height = 1, .preferred_height = 2 };
+        }
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var d = DummyComp{};
+    _ = mgr.showOverlay(d.component(), .{
+        .anchor = .top_left,
+        .width = 4,
+        .surface = .{ .fill = Color.rgb(1, 2, 3) },
+    }, null);
+
+    mgr.renderOverlays(root);
+
+    try testing.expectEqual(@as(u21, ' '), buf.get(0, 0).grapheme.codepoint);
+    try testing.expect(buf.get(0, 0).bg.eql(Color.rgb(1, 2, 3)));
+    try testing.expectEqual(@as(u21, 'x'), buf.get(5, 2).grapheme.codepoint);
 }
 
 test "OverlayManager non-capturing overlay not returned by topmostCapturing" {

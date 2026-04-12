@@ -22,6 +22,20 @@ pub const SessionInfo = struct {
     message_count: u32,
 };
 
+fn freeSessionInfoFields(allocator: std.mem.Allocator, info: SessionInfo) void {
+    allocator.free(info.path);
+    allocator.free(info.session_id);
+    allocator.free(info.cwd);
+    allocator.free(info.timestamp);
+    allocator.free(info.first_message);
+}
+
+pub fn freeSessionInfos(allocator: std.mem.Allocator, sessions: []SessionInfo) void {
+    if (sessions.len == 0) return;
+    for (sessions) |info| freeSessionInfoFields(allocator, info);
+    allocator.free(sessions);
+}
+
 /// Facade over session writer/reader/context.
 /// Manages a single session's lifecycle: create, open, append, read, build context.
 pub const SessionStore = struct {
@@ -304,7 +318,7 @@ pub fn listSessions(allocator: std.mem.Allocator, cwd: []const u8) ![]SessionInf
         items[j] = key;
     }
 
-    return items;
+    return try results.toOwnedSlice(allocator);
 }
 
 /// Read a session file and extract listing metadata.
@@ -319,6 +333,13 @@ fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo 
     var first_message: ?[]const u8 = null;
     var message_count: u32 = 0;
     var found_header = false;
+    var success = false;
+    defer if (!success) {
+        if (session_id) |s| allocator.free(s);
+        if (cwd_str) |s| allocator.free(s);
+        if (ts_str) |s| allocator.free(s);
+        if (first_message) |s| allocator.free(s);
+    };
 
     var line_start: usize = 0;
     while (line_start < content.len) {
@@ -364,14 +385,16 @@ fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo 
 
     if (!found_header) return null;
 
-    return .{
+    const result = SessionInfo{
         .path = path,
-        .session_id = session_id orelse "",
-        .cwd = cwd_str orelse "",
-        .timestamp = ts_str orelse "",
-        .first_message = first_message orelse "(no messages)",
+        .session_id = session_id orelse allocator.dupe(u8, "") catch return null,
+        .cwd = cwd_str orelse allocator.dupe(u8, "") catch return null,
+        .timestamp = ts_str orelse allocator.dupe(u8, "") catch return null,
+        .first_message = first_message orelse allocator.dupe(u8, "(no messages)") catch return null,
         .message_count = message_count,
     };
+    success = true;
+    return result;
 }
 
 /// Extract user message text from a JSONL line. Returns truncated preview.
@@ -411,7 +434,10 @@ fn extractUserMessageText(allocator: std.mem.Allocator, line: []const u8) ?[]con
 /// Truncate to ~200 chars, collapse whitespace, single line.
 fn truncatePreview(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
     const max_len = 200;
-    var buf = allocator.alloc(u8, @min(text.len, max_len) + 3) catch return null; // +3 for "..."
+    const cap = @min(text.len, max_len) + 3;
+    const scratch = allocator.alloc(u8, cap) catch return null; // +3 for "..."
+    defer allocator.free(scratch);
+
     var pos: usize = 0;
     var prev_ws = false;
 
@@ -419,27 +445,25 @@ fn truncatePreview(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
         if (pos >= max_len) break;
         if (c == '\n' or c == '\r' or c == '\t') {
             if (!prev_ws and pos > 0) {
-                buf[pos] = ' ';
+                scratch[pos] = ' ';
                 pos += 1;
                 prev_ws = true;
             }
         } else {
-            buf[pos] = c;
+            scratch[pos] = c;
             pos += 1;
             prev_ws = false;
         }
     }
 
-    if (text.len > max_len and pos > 0) {
-        if (pos + 3 <= buf.len) {
-            buf[pos] = '.';
-            buf[pos + 1] = '.';
-            buf[pos + 2] = '.';
-            pos += 3;
-        }
+    if (text.len > max_len and pos > 0 and pos + 3 <= scratch.len) {
+        scratch[pos] = '.';
+        scratch[pos + 1] = '.';
+        scratch[pos + 2] = '.';
+        pos += 3;
     }
 
-    return buf[0..pos];
+    return allocator.dupe(u8, scratch[0..pos]) catch null;
 }
 
 test "open duplicates writer session and leaf ids from cached session data" {

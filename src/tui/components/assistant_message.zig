@@ -1,13 +1,20 @@
 const std = @import("std");
 const component_mod = @import("../component.zig");
 const buffer_mod = @import("../buffer.zig");
+const cell_mod = @import("../cell.zig");
 const markdown_mod = @import("markdown.zig");
 const text_mod = @import("text.zig");
 const theme_mod = @import("../theme.zig");
+const shimmer_mod = @import("../shimmer.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
+const Buffer = buffer_mod.Buffer;
+const Attributes = cell_mod.Attributes;
+const Cell = cell_mod.Cell;
+const Color = cell_mod.Color;
+const Shimmer = shimmer_mod.Config;
 
 pub const AssistantMessage = struct {
     allocator: std.mem.Allocator,
@@ -15,11 +22,14 @@ pub const AssistantMessage = struct {
     hide_thinking_block: bool = false,
     hidden_thinking_label: []const u8 = "Thinking...",
     scroll_offset: u32 = 0,
+    shimmer_phase: u32 = 0,
+    active_thinking_content_index: ?usize = null,
 
     blocks: std.ArrayListUnmanaged(Block) = .empty,
 
     const BlockKind = enum { text, thinking };
     const RenderKind = enum { markdown, label };
+    pub const shimmer_step_ns: i128 = 33_333_333; // ≈30 FPS
 
     const Block = struct {
         kind: BlockKind,
@@ -53,13 +63,43 @@ pub const AssistantMessage = struct {
         const block = self.ensureBlock(content_index, .text) orelse return;
         block.markdown.appendContent(delta);
         block.markdown.invalidate();
+        _ = self.deactivateThinkingShimmer();
     }
 
     pub fn appendThinking(self: *AssistantMessage, content_index: usize, delta: []const u8) void {
         const block = self.ensureBlock(content_index, .thinking) orelse return;
         block.markdown.appendContent(delta);
         block.markdown.invalidate();
+        self.active_thinking_content_index = content_index;
         if (self.hide_thinking_block) self.refreshThinkingVisibility(block);
+    }
+
+    pub fn deactivateThinkingShimmer(self: *AssistantMessage) bool {
+        const changed = self.active_thinking_content_index != null or self.shimmer_phase != 0;
+        self.active_thinking_content_index = null;
+        self.shimmer_phase = 0;
+        return changed;
+    }
+
+    pub fn nextAnimationDeadline(self: *AssistantMessage, now_ns: i128) ?i128 {
+        const block = self.activeThinkingBlock() orelse return null;
+        if (self.activeThinkingText(block).len == 0) return null;
+        return shimmer_mod.nextDeadline(now_ns, self.thinkingShimmerConfig());
+    }
+
+    pub fn tickAnimation(self: *AssistantMessage, now_ns: i128) bool {
+        const block = self.activeThinkingBlock() orelse {
+            if (self.shimmer_phase != 0) {
+                self.shimmer_phase = 0;
+                return true;
+            }
+            return false;
+        };
+
+        const phase = shimmer_mod.phaseForTime(now_ns, self.thinkingShimmerConfig(), self.activeThinkingText(block));
+        if (phase == self.shimmer_phase) return false;
+        self.shimmer_phase = phase;
+        return true;
     }
 
     pub fn setHideThinkingBlock(self: *AssistantMessage, hide: bool) void {
@@ -82,7 +122,10 @@ pub const AssistantMessage = struct {
         md.* = markdown_mod.Markdown.init(self.allocator);
         md.padding_x = 1;
         md.theme = self.theme;
-        if (kind == .thinking) md.fg = self.theme.fg(.thinking_text);
+        if (kind == .thinking) {
+            md.fg = self.theme.fg(.thinking_text);
+            md.attrs = .{ .italic = true };
+        }
 
         const label = self.allocator.create(text_mod.Text) catch {
             md.deinit();
@@ -138,6 +181,23 @@ pub const AssistantMessage = struct {
             if (content_index < block.content_index) return idx;
         }
         return self.blocks.items.len;
+    }
+
+    fn activeThinkingBlock(self: *AssistantMessage) ?*Block {
+        const content_index = self.active_thinking_content_index orelse return null;
+        const idx = self.findBlock(content_index) orelse return null;
+        const block = &self.blocks.items[idx];
+        if (block.kind != .thinking) return null;
+        if (self.activeThinkingText(block).len == 0) return null;
+        return block;
+    }
+
+    fn activeThinkingText(self: *const AssistantMessage, block: *const Block) []const u8 {
+        _ = self;
+        return switch (block.render_kind) {
+            .markdown => block.markdown.content,
+            .label => block.label.content,
+        };
     }
 
     pub fn measure(self: *AssistantMessage, width: u32) Measurement {
@@ -202,7 +262,6 @@ pub const AssistantMessage = struct {
     }
 
     fn renderComponentWithScroll(self: *AssistantMessage, block: *Block, region: Region, skip: u32, comp_h: u32) void {
-        _ = self;
         _ = comp_h;
         switch (block.render_kind) {
             .markdown => {
@@ -220,6 +279,49 @@ pub const AssistantMessage = struct {
                 txt.scroll_offset = saved;
             },
         }
+
+        if (self.isActiveThinkingBlock(block)) {
+            self.applyThinkingShimmer(region);
+        }
+    }
+
+    fn isActiveThinkingBlock(self: *AssistantMessage, block: *const Block) bool {
+        return if (self.activeThinkingBlock()) |active|
+            active.content_index == block.content_index
+        else
+            false;
+    }
+
+    fn applyThinkingShimmer(self: *AssistantMessage, region: Region) void {
+        if (region.width == 0 or region.height == 0) return;
+
+        const cfg = self.thinkingShimmerConfig();
+        var row: u32 = 0;
+        while (row < region.height) : (row += 1) {
+            var col: u32 = 0;
+            while (col < region.width) : (col += 1) {
+                const cell = region.get(col, row);
+                if (cell.eql(Cell.blank)) continue;
+
+                const strength = shimmerStrength(cfg, self.shimmer_phase, col);
+                region.set(col, row, styleCellForStrength(cell, cfg, strength));
+            }
+        }
+    }
+
+    fn thinkingShimmerConfig(self: *const AssistantMessage) Shimmer {
+        return .{
+            .step_ns = shimmer_step_ns,
+            .lead_pad_cols = 4,
+            .tail_pad_cols = 8,
+            .band_half_width = 5,
+            .base_fg = self.theme.fg(.thinking_text),
+            .edge_fg = self.theme.fg(.thinking_text),
+            .peak_fg = self.theme.fg(.accent),
+            .base_attrs = .{},
+            .edge_attrs = .{},
+            .peak_attrs = .{},
+        };
     }
 
     fn blockComponent(self: *AssistantMessage, block: *Block) Component {
@@ -238,3 +340,123 @@ pub const AssistantMessage = struct {
         };
     }
 };
+
+fn styleCellForStrength(cell: Cell, cfg: Shimmer, strength: u8) Cell {
+    var styled = cell;
+    styled.bg = Color.default;
+
+    if (strength == 0) {
+        styled.attrs = cell.attrs;
+        return styled;
+    }
+
+    const base_fg = if (cell.fg.is_default) cfg.base_fg else cell.fg;
+    styled.fg = lerpColor(base_fg, cfg.peak_fg, strength);
+    styled.attrs = if (strength >= 224) mergeAttrs(cell.attrs, cfg.peak_attrs) else cell.attrs;
+    return styled;
+}
+
+fn shimmerStrength(cfg: Shimmer, phase: u32, visual_col: u32) u8 {
+    const text_pos = @as(i64, cfg.lead_pad_cols) + @as(i64, visual_col);
+    const center = @as(i64, phase);
+    const dist = if (text_pos >= center) text_pos - center else center - text_pos;
+    const radius = @as(i64, cfg.band_half_width);
+    if (radius <= 0) return if (dist == 0) 255 else 0;
+    if (dist > radius) return 0;
+
+    const numerator = (radius - dist + 1) * 255;
+    const denominator = radius + 1;
+    return @intCast(@min(@divTrunc(numerator, denominator), 255));
+}
+
+fn lerpColor(from: Color, to: Color, t: u8) Color {
+    if (from.is_default) return if (t == 0) from else to;
+    if (to.is_default) return if (t == 255) to else from;
+
+    return .{
+        .r = lerpChannel(from.r, to.r, t),
+        .g = lerpChannel(from.g, to.g, t),
+        .b = lerpChannel(from.b, to.b, t),
+        .is_default = false,
+    };
+}
+
+fn lerpChannel(from: u8, to: u8, t: u8) u8 {
+    const from_i: i32 = from;
+    const to_i: i32 = to;
+    const delta = to_i - from_i;
+    const value = from_i + @divTrunc(delta * @as(i32, t), 255);
+    return @intCast(@max(0, @min(value, 255)));
+}
+
+fn mergeAttrs(base: Attributes, overlay: Attributes) Attributes {
+    return .{
+        .bold = base.bold or overlay.bold,
+        .dim = base.dim or overlay.dim,
+        .italic = base.italic or overlay.italic,
+        .underline = base.underline or overlay.underline,
+        .blink = base.blink or overlay.blink,
+        .inverse = base.inverse or overlay.inverse,
+        .hidden = base.hidden or overlay.hidden,
+        .strikethrough = base.strikethrough or overlay.strikethrough,
+    };
+}
+
+const testing = std.testing;
+
+test "assistant thinking shimmer tracks only the actively streaming block" {
+    var msg = AssistantMessage.init(testing.allocator);
+    defer msg.deinit();
+
+    msg.appendThinking(0, "ponder");
+    try testing.expect(msg.nextAnimationDeadline(AssistantMessage.shimmer_step_ns) != null);
+
+    msg.appendText(1, "done");
+    try testing.expectEqual(@as(?usize, null), msg.active_thinking_content_index);
+    try testing.expectEqual(@as(?i128, null), msg.nextAnimationDeadline(AssistantMessage.shimmer_step_ns));
+}
+
+test "assistant thinking shimmer highlights the visible latest block" {
+    var msg = AssistantMessage.init(testing.allocator);
+    defer msg.deinit();
+    msg.appendThinking(0, "abc");
+    msg.shimmer_phase = 5;
+
+    var buf = try Buffer.init(testing.allocator, 12, 2);
+    defer buf.deinit();
+    msg.render(buf.region());
+
+    try testing.expect(buf.get(1, 0).fg.eql(msg.theme.fg(.accent)));
+}
+
+test "assistant thinking shimmer also animates hidden thinking label" {
+    var msg = AssistantMessage.init(testing.allocator);
+    defer msg.deinit();
+    msg.setHideThinkingBlock(true);
+    msg.appendThinking(0, "secret thoughts");
+    msg.shimmer_phase = 5;
+
+    try testing.expect(msg.nextAnimationDeadline(AssistantMessage.shimmer_step_ns) != null);
+
+    var buf = try Buffer.init(testing.allocator, 16, 2);
+    defer buf.deinit();
+    msg.render(buf.region());
+
+    try testing.expect(buf.get(1, 0).fg.eql(msg.theme.fg(.accent)));
+}
+
+test "assistant thinking shimmer clears active thinking background" {
+    var msg = AssistantMessage.init(testing.allocator);
+    defer msg.deinit();
+    msg.appendThinking(0, "abc");
+    msg.shimmer_phase = 5;
+
+    const block = msg.activeThinkingBlock().?;
+    block.markdown.bg = msg.theme.fg(.muted);
+
+    var buf = try Buffer.init(testing.allocator, 12, 2);
+    defer buf.deinit();
+    msg.render(buf.region());
+
+    try testing.expect(buf.get(1, 0).bg.is_default);
+}

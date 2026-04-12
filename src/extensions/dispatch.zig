@@ -49,6 +49,9 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const context_mod = @import("context.zig");
+const agent_protocol = @import("../agent/protocol.zig");
+const session_mod = @import("../session/root.zig");
 const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
@@ -98,7 +101,7 @@ pub fn dispatchObserver(
 ) DispatchError!void {
     const handlers = runner.event_registry.handlers(kind);
     for (handlers) |h| {
-        runOneHandler(state, h, payload_idx) catch |err| {
+        runOneHandler(state, runner, h, payload_idx) catch |err| {
             log.warn("observer handler for {s} failed: {s}", .{ @tagName(kind), @errorName(err) });
             // Observer chain continues even on individual failure.
             continue;
@@ -131,9 +134,9 @@ pub fn dispatchCancellable(
         var co = try lua_runtime.Coroutine.init(state);
         defer co.deinit();
 
-        try pushHandlerAndPayload(state, &co, h.lua_ref, payload_idx);
+        try pushHandlerAndContext(state, runner, &co, h.lua_ref, payload_idx);
 
-        const r = try co.resumeWith(1);
+        const r = try co.resumeWith(2);
         switch (r.status) {
             .yielded => return error.UnexpectedYield,
             .ok, .finished => {},
@@ -209,9 +212,9 @@ pub fn dispatchTransformable(
         var co = try lua_runtime.Coroutine.init(state);
         defer co.deinit();
 
-        try pushHandlerAndPayload(state, &co, h.lua_ref, abs_payload);
+        try pushHandlerAndContext(state, runner, &co, h.lua_ref, abs_payload);
 
-        const r = try co.resumeWith(1);
+        const r = try co.resumeWith(2);
         switch (r.status) {
             .yielded => return error.UnexpectedYield,
             .ok, .finished => {},
@@ -246,8 +249,9 @@ pub fn dispatchTransformable(
 /// onto it. Stack on entry: main has payload at payload_idx.
 /// Stack on success: coroutine has [handler, payload], main is
 /// unchanged (xmove was preceded by lua_pushvalue).
-fn pushHandlerAndPayload(
+fn pushHandlerAndContext(
     state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
     co: *lua_runtime.Coroutine,
     handler_ref: c_int,
     payload_idx: c_int,
@@ -264,21 +268,25 @@ fn pushHandlerAndPayload(
     // Duplicate the payload on the main stack, then xmove the dup.
     c.lua_pushvalue(state.L, payload_idx);
     c.lua_xmove(state.L, co.L, 1);
+
+    // Second arg: shared extension context.
+    try context_mod.pushExtensionContext(co.L, runner);
 }
 
 /// One-shot handler runner used by dispatchObserver. Same shape as
 /// the cancellable/transformable inner loop but discards results.
 fn runOneHandler(
     state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
     h: event_registry.EventHandler,
     payload_idx: c_int,
 ) DispatchError!void {
     var co = try lua_runtime.Coroutine.init(state);
     defer co.deinit();
 
-    try pushHandlerAndPayload(state, &co, h.lua_ref, payload_idx);
+    try pushHandlerAndContext(state, runner, &co, h.lua_ref, payload_idx);
 
-    const r = try co.resumeWith(1);
+    const r = try co.resumeWith(2);
     switch (r.status) {
         .yielded => return error.UnexpectedYield,
         .ok, .finished => {},
@@ -305,11 +313,58 @@ fn setupCounterChain(state: *lua_runtime.LuaState, runner: *runner_mod.Extension
     _ = kind_name;
 }
 
+fn testGetModel(_: *anyopaque) agent_protocol.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = .{ .custom = "test-api" },
+        .provider = .{ .custom = "test-provider" },
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 1024,
+    };
+}
+
+fn testIsIdle(_: *anyopaque) bool {
+    return true;
+}
+
+fn testAbort(_: *anyopaque) void {}
+
+fn testHasPendingMessages(_: *anyopaque) bool {
+    return false;
+}
+
+fn testGetContextUsage(_: *anyopaque) ?session_mod.context_usage.ContextUsage {
+    return .{ .tokens = 321, .context_window = 1024, .percent = 31.34765625 };
+}
+
+fn testGetSystemPrompt(_: *anyopaque) []const u8 {
+    return "system";
+}
+
 test "dispatchObserver runs every handler in order" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
+
+    var dummy: u8 = 0;
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&dummy),
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+    });
 
     try setupCounterChain(&state, &runner, "message_end");
 
@@ -335,6 +390,45 @@ test "dispatchObserver runs every handler in order" {
         \\assert(_test_counters[2] == "b:ping", _test_counters[2])
         \\assert(_test_counters[3] == "c:ping", _test_counters[3])
     , "verify");
+}
+
+test "dispatchObserver passes extension context helpers" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    var dummy: u8 = 0;
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&dummy),
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+    });
+
+    api.installZiTable(&state, &runner);
+    try state.doString(
+        \\zi.on("message_end", function(event, ctx)
+        \\  local usage = ctx.get_context_usage()
+        \\  assert(usage.tokens == 321)
+        \\  assert(usage.context_window == 1024)
+        \\  assert(ctx.model.id == "test-model")
+        \\  assert(ctx.is_idle() == true)
+        \\  assert(ctx.get_system_prompt() == "system")
+        \\end)
+    , "ctx_observer");
+
+    c.lua_createtable(state.L, 0, 1);
+    _ = c.lua_pushstring(state.L, "ping");
+    c.lua_setfield(state.L, -2, "name");
+    try dispatchObserver(&state, &runner, .message_end, -1);
+    c.lua_pop(state.L, 1);
 }
 
 test "dispatchCancellable stops at first block=true" {

@@ -150,6 +150,72 @@ pub const Container = struct {
         }
     }
 
+    pub fn nextAnimationDeadline(self: *Container, now_ns: i128) ?i128 {
+        const w = self.last_render_width;
+        const h = self.last_render_height;
+        if (w == 0 or h == 0 or self.children.items.len == 0) return null;
+
+        var fixed_total: u32 = 0;
+        for (self.children.items, 0..) |child, i| {
+            if (self.flex_child_index != null and i == self.flex_child_index.?) continue;
+            fixed_total += child.measure(w).preferred_height;
+        }
+        const flex_height = if (self.flex_child_index != null)
+            (if (h > fixed_total) h - fixed_total else 0)
+        else
+            @as(u32, 0);
+
+        var next_deadline: ?i128 = null;
+        var y: u32 = 0;
+        for (self.children.items, 0..) |child, i| {
+            if (y >= h) break;
+            const child_h = if (self.flex_child_index != null and i == self.flex_child_index.?)
+                flex_height
+            else
+                child.measure(w).preferred_height;
+            const clamped_h = @min(child_h, h - y);
+            if (clamped_h > 0) {
+                if (child.nextAnimationDeadline(now_ns)) |deadline| {
+                    next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
+                }
+                y += clamped_h;
+            }
+        }
+        return next_deadline;
+    }
+
+    pub fn tickAnimation(self: *Container, now_ns: i128) bool {
+        const w = self.last_render_width;
+        const h = self.last_render_height;
+        if (w == 0 or h == 0 or self.children.items.len == 0) return false;
+
+        var fixed_total: u32 = 0;
+        for (self.children.items, 0..) |child, i| {
+            if (self.flex_child_index != null and i == self.flex_child_index.?) continue;
+            fixed_total += child.measure(w).preferred_height;
+        }
+        const flex_height = if (self.flex_child_index != null)
+            (if (h > fixed_total) h - fixed_total else 0)
+        else
+            @as(u32, 0);
+
+        var changed = false;
+        var y: u32 = 0;
+        for (self.children.items, 0..) |child, i| {
+            if (y >= h) break;
+            const child_h = if (self.flex_child_index != null and i == self.flex_child_index.?)
+                flex_height
+            else
+                child.measure(w).preferred_height;
+            const clamped_h = @min(child_h, h - y);
+            if (clamped_h > 0) {
+                changed = child.tickAnimation(now_ns) or changed;
+                y += clamped_h;
+            }
+        }
+        return changed;
+    }
+
     pub fn component(self: *Container) Component {
         return Component.init(Container, self);
     }
@@ -272,4 +338,79 @@ test "Container delegates input to focused child" {
     container.addChild(a.component());
     container.focused_child_index = 0;
     try testing.expect(!container.handleInput(.{ .code = .char, .char = 'a' }));
+}
+
+test "Container aggregates child animation deadlines and ticks" {
+    const AnimatedComp = struct {
+        height: u32 = 1,
+        deadline_ns: i128,
+        ticked: bool = false,
+
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn measure(self: *@This(), _: u32) Measurement {
+            return .{ .min_height = 1, .preferred_height = self.height };
+        }
+        pub fn nextAnimationDeadline(self: *@This(), _: i128) ?i128 {
+            return self.deadline_ns;
+        }
+        pub fn tickAnimation(self: *@This(), _: i128) bool {
+            self.ticked = true;
+            return true;
+        }
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var container = Container.init(testing.allocator);
+    defer container.deinit();
+
+    var slow = AnimatedComp{ .deadline_ns = 50 };
+    var fast = AnimatedComp{ .deadline_ns = 10 };
+    container.addChild(slow.component());
+    container.addChild(fast.component());
+
+    try testing.expectEqual(@as(?i128, 10), container.nextAnimationDeadline(0));
+    try testing.expect(container.tickAnimation(10));
+    try testing.expect(slow.ticked);
+    try testing.expect(fast.ticked);
+}
+
+test "Container animation skips clipped children" {
+    const AnimatedComp = struct {
+        height: u32 = 1,
+        deadline_ns: i128,
+        ticked: bool = false,
+
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn measure(self: *@This(), _: u32) Measurement {
+            return .{ .min_height = 1, .preferred_height = self.height };
+        }
+        pub fn nextAnimationDeadline(self: *@This(), _: i128) ?i128 {
+            return self.deadline_ns;
+        }
+        pub fn tickAnimation(self: *@This(), _: i128) bool {
+            self.ticked = true;
+            return true;
+        }
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var container = Container.init(testing.allocator);
+    defer container.deinit();
+    var visible = AnimatedComp{ .deadline_ns = 10 };
+    var clipped = AnimatedComp{ .deadline_ns = 5 };
+    container.addChild(visible.component());
+    container.addChild(clipped.component());
+
+    var buf = try Buffer.init(testing.allocator, 10, 1);
+    defer buf.deinit();
+    container.render(buf.region());
+
+    try testing.expectEqual(@as(?i128, 10), container.nextAnimationDeadline(0));
+    try testing.expect(container.tickAnimation(0));
+    try testing.expect(visible.ticked);
+    try testing.expect(!clipped.ticked);
 }

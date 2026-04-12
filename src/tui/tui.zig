@@ -134,6 +134,28 @@ pub const TUI = struct {
         self.dirty = true;
     }
 
+    pub fn nextAnimationDeadline(self: *TUI, now_ns: i128) ?i128 {
+        const suspend_root_animations = self.overlays.topmostCapturingComponent() != null;
+        var next_deadline: ?i128 = if (suspend_root_animations) null else self.root.nextAnimationDeadline(now_ns);
+        for (self.overlays.stack.items) |entry| {
+            if (entry.hidden) continue;
+            if (entry.component.nextAnimationDeadline(now_ns)) |deadline| {
+                next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
+            }
+        }
+        return next_deadline;
+    }
+
+    pub fn tickAnimations(self: *TUI, now_ns: i128) bool {
+        const suspend_root_animations = self.overlays.topmostCapturingComponent() != null;
+        var changed = if (suspend_root_animations) false else self.root.tickAnimation(now_ns);
+        for (self.overlays.stack.items) |entry| {
+            if (entry.hidden) continue;
+            changed = entry.component.tickAnimation(now_ns) or changed;
+        }
+        return changed;
+    }
+
     /// Render the layout tree and overlays into the cell buffer.
     /// Returns the cursor state (if any focused component reports one).
     pub fn render(self: *TUI) ?CursorState {

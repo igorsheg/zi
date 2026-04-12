@@ -3,6 +3,7 @@ const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const coding_agent = @import("../coding_agent.zig");
 const context_mod = @import("context.zig");
+const context_usage = @import("context_usage.zig");
 const proto = @import("protocol.zig");
 const session_controller = @import("../session_controller.zig");
 
@@ -90,7 +91,7 @@ fn prepareCompaction(
     if (path[path.len - 1].entry == .compaction) return error.AlreadyCompacted;
 
     const current_context = try context_mod.buildSessionContext(allocator, entries, leaf_id);
-    const tokens_before = estimateContextTokens(current_context.messages);
+    const tokens_before = context_usage.estimateContextTokens(current_context.messages).tokens;
 
     var boundary_start: usize = 0;
     var previous_summary: ?[]const u8 = null;
@@ -167,7 +168,7 @@ fn findCutPoint(entries: []const proto.SessionEntry, start_index: usize, keep_re
     while (i > start_index) {
         i -= 1;
         if (extractMessage(entries[i])) |msg| {
-            accumulated += estimateMessageTokens(msg);
+            accumulated += context_usage.estimateTokens(msg);
             if (accumulated >= keep_recent_tokens) {
                 cut_index = findNextValidCut(entries, i, start_index) orelse start_index;
                 break;
@@ -299,72 +300,6 @@ fn extractMessage(entry: proto.SessionEntry) ?AgentMessage {
     }
 }
 
-fn estimateContextTokens(messages: []const AgentMessage) u64 {
-    var total: u64 = 0;
-    for (messages) |msg| total += estimateMessageTokens(msg);
-    return total;
-}
-
-fn estimateMessageTokens(message: AgentMessage) u64 {
-    var chars: usize = 0;
-    switch (message) {
-        .user => |u| switch (u.content) {
-            .text => |t| chars += t.len,
-            .blocks => |blocks| for (blocks) |block| switch (block) {
-                .text => |t| chars += t.text.len,
-                else => {},
-            },
-        },
-        .assistant => |a| {
-            for (a.content) |block| switch (block) {
-                .text => |t| chars += t.text.len,
-                .thinking => |t| chars += t.thinking.len,
-                .tool_call => |tc| chars += tc.name.len + estimateJsonSize(tc.arguments),
-            };
-        },
-        .tool_result => |tr| {
-            chars += tr.tool_name.len;
-            for (tr.content) |block| switch (block) {
-                .text => |t| chars += t.text.len,
-                .image => chars += 4800,
-            };
-        },
-        .compaction_summary => |cs| chars += cs.summary.len,
-        .branch_summary => |bs| chars += bs.summary.len,
-        .custom => |cm| switch (cm.content) {
-            .text => |t| chars += t.len,
-            .blocks => |blocks| for (blocks) |block| switch (block) {
-                .text => |t| chars += t.text.len,
-                .image => chars += 4800,
-            },
-        },
-    }
-    return @intCast((chars + 3) / 4);
-}
-
-fn estimateJsonSize(value: std.json.Value) usize {
-    return switch (value) {
-        .null => 4,
-        .bool => 5,
-        .integer => 16,
-        .float => 16,
-        .number_string => |s| s.len,
-        .string => |s| s.len,
-        .array => |arr| blk: {
-            var total: usize = 2;
-            for (arr.items) |item| total += estimateJsonSize(item);
-            break :blk total;
-        },
-        .object => |obj| blk: {
-            var total: usize = 2;
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                total += entry.key_ptr.*.len + estimateJsonSize(entry.value_ptr.*);
-            }
-            break :blk total;
-        },
-    };
-}
 
 const testing = std.testing;
 

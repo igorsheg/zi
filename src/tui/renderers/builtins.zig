@@ -19,6 +19,7 @@ const excerpt_mod = @import("../excerpt.zig");
 const buffer_mod = @import("../buffer.zig");
 const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
+const json_util = @import("../../ai/json_util.zig");
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
 const ToolRenderContext = tool_display_mod.ToolRenderContext;
@@ -533,6 +534,17 @@ fn argString(args: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+fn argTimeoutSeconds(args: std.json.Value) ?u64 {
+    return switch (args) {
+        .object => |o| switch (o.get("timeout") orelse return null) {
+            .integer => |i| if (i > 0) @intCast(i) else null,
+            .float => |f| if (f > 0) @intFromFloat(@floor(f)) else null,
+            else => null,
+        },
+        else => null,
+    };
+}
+
 // ── collapsed excerpt presets ───────────────────────────────────────
 
 const READ_COLLAPSED = [_]excerpt_mod.Excerpt{
@@ -740,12 +752,21 @@ pub const find_renderer = ToolRenderer{
 fn bashCall(ctx: *const ToolRenderContext) void {
     const region = ctx.region;
     if (region.width == 0 or region.height == 0) return;
+
     var col: u32 = 0;
     col += region.writeStr(col, 0, "$ ", ctx.theme.fg(.tool_title), Color.default, .{ .bold = true });
-    if (argString(ctx.args, "command")) |cmd| {
-        _ = region.writeStr(col, 0, cmd, ctx.theme.fg(.tool_title), Color.default, .{ .bold = true });
+
+    const cmd = argString(ctx.args, "cmd") orelse argString(ctx.args, "command");
+    if (cmd) |command| {
+        col += region.writeStr(col, 0, command, ctx.theme.fg(.tool_title), Color.default, .{ .bold = true });
     } else {
-        _ = region.writeStr(col, 0, "...", ctx.theme.fg(.tool_output), Color.default, .{});
+        col += region.writeStr(col, 0, "...", ctx.theme.fg(.tool_output), Color.default, .{});
+    }
+
+    if (argTimeoutSeconds(ctx.args)) |timeout_secs| {
+        var timeout_buf: [32]u8 = undefined;
+        const suffix = std.fmt.bufPrint(&timeout_buf, " (timeout {d}s)", .{timeout_secs}) catch "";
+        _ = region.writeStr(col, 0, suffix, ctx.theme.fg(.dim), Color.default, .{});
     }
 }
 
@@ -764,6 +785,96 @@ pub const bash_renderer = ToolRenderer{
     .render_result = bashResult,
     .measure_result = bashMeasure,
 };
+
+fn rowAscii(buf: *const buffer_mod.Buffer, y: u32, out: []u8) []const u8 {
+    var len: usize = 0;
+    var x: u32 = 0;
+    while (x < buf.width and len < out.len) : (x += 1) {
+        const cp = buf.get(x, y).grapheme.codepoint;
+        out[len] = if (cp <= 0x7f) @intCast(cp) else '?';
+        len += 1;
+    }
+    return std.mem.trimRight(u8, out[0..len], " ");
+}
+
+fn makeBashArgsForTest(allocator: std.mem.Allocator, key: []const u8, command: []const u8, timeout: ?std.json.Value) !std.json.Value {
+    var obj = std.json.ObjectMap.init(allocator);
+    errdefer obj.deinit();
+
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    const owned_command = try allocator.dupe(u8, command);
+    errdefer allocator.free(owned_command);
+    try obj.put(owned_key, .{ .string = owned_command });
+
+    if (timeout) |value| {
+        const timeout_key = try allocator.dupe(u8, "timeout");
+        errdefer allocator.free(timeout_key);
+        try obj.put(timeout_key, value);
+    }
+
+    return .{ .object = obj };
+}
+
+test "bashCall renders cmd args with timeout suffix" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 64, 1);
+    defer buf.deinit();
+
+    const args = try makeBashArgsForTest(testing.allocator, "cmd", "echo hi", .{ .integer = 5 });
+    defer json_util.freeJsonValue(testing.allocator, args);
+
+    const ctx = ToolRenderContext{
+        .tool_name = "bash",
+        .tool_call_id = "call-1",
+        .args = args,
+        .result = null,
+        .is_partial = true,
+        .is_error = false,
+        .expanded = false,
+        .execution_started = false,
+        .args_complete = false,
+        .theme = &theme_mod.Theme.dark,
+        .allocator = testing.allocator,
+        .state = null,
+        .region = buf.region(),
+        .width = buf.width,
+    };
+
+    bashCall(&ctx);
+
+    var line: [64]u8 = undefined;
+    try testing.expectEqualStrings("$ echo hi (timeout 5s)", rowAscii(&buf, 0, &line));
+}
+
+test "bashCall falls back to legacy command arg for old sessions" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 32, 1);
+    defer buf.deinit();
+
+    const args = try makeBashArgsForTest(testing.allocator, "command", "ls -la", null);
+    defer json_util.freeJsonValue(testing.allocator, args);
+
+    const ctx = ToolRenderContext{
+        .tool_name = "bash",
+        .tool_call_id = "call-1",
+        .args = args,
+        .result = null,
+        .is_partial = true,
+        .is_error = false,
+        .expanded = false,
+        .execution_started = false,
+        .args_complete = false,
+        .theme = &theme_mod.Theme.dark,
+        .allocator = testing.allocator,
+        .state = null,
+        .region = buf.region(),
+        .width = buf.width,
+    };
+
+    bashCall(&ctx);
+
+    var line: [32]u8 = undefined;
+    try testing.expectEqualStrings("$ ls -la", rowAscii(&buf, 0, &line));
+}
 
 // ── Ls ──────────────────────────────────────────────────────────────
 

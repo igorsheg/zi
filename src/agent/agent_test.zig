@@ -628,3 +628,55 @@ test "Agent: sessionId forwarded to streamFn options" {
     try std.testing.expect(capture.captured_session_id != null);
     try std.testing.expectEqualStrings("session-abc", capture.captured_session_id.?);
 }
+
+test "Agent: sessionId survives caller lifetime and setSessionId replaces it" {
+    const allocator = std.testing.allocator;
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const msg = createAssistantMessage(allocator, "ok");
+    defer allocator.free(msg.content);
+    fp.setResponses(&.{msg});
+
+    const CaptureState = struct {
+        captured_session_id: ?[]const u8 = null,
+        fp_ptr: *faux.FauxProvider,
+    };
+    var capture = CaptureState{ .fp_ptr = &fp };
+
+    const capturingStreamFn = struct {
+        fn func(
+            ctx: ?*anyopaque,
+            alloc: std.mem.Allocator,
+            model: ai.protocol.Model,
+            context: ai.protocol.Context,
+            options: ai.protocol.SimpleStreamOptions,
+            callback: ai.provider.EventCallback,
+            callback_ctx: ?*anyopaque,
+        ) void {
+            const s: *CaptureState = @ptrCast(@alignCast(ctx.?));
+            s.captured_session_id = options.base.session_id;
+            const prov = s.fp_ptr.provider();
+            prov.streamSimple(alloc, model, context, options, callback, callback_ctx);
+        }
+    }.func;
+
+    const first_session_id = try allocator.dupe(u8, "session-one");
+    var agent = Agent.init(allocator, .{
+        .stream_fn = .{ .func = capturingStreamFn, .ctx = @ptrCast(&capture) },
+        .session_id = first_session_id,
+    });
+    defer agent.deinit();
+    allocator.free(first_session_id);
+
+    const second_session_id = try allocator.dupe(u8, "session-two");
+    try agent.setSessionId(second_session_id);
+    allocator.free(second_session_id);
+
+    const prompts = [_]protocol.AgentMessage{makeUserMessage("hello")};
+    try agent.prompt(&prompts);
+
+    try std.testing.expect(capture.captured_session_id != null);
+    try std.testing.expectEqualStrings("session-two", capture.captured_session_id.?);
+}

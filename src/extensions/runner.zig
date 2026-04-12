@@ -3,6 +3,7 @@ const registries = @import("registries/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../abort_signal.zig");
 const agent_protocol = @import("../agent/protocol.zig");
+const session_mod = @import("../session/root.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 ///
@@ -35,20 +36,21 @@ pub const ExtensionRuntime = union(enum) {
     bound: Bound,
 
     pub const Bound = struct {
-        /// Opaque pointer to AgentSession — avoids circular import in D1.
-        /// Phase B+ casts this to *AgentSession when invoking session-control
-        /// actions from command handlers.
         session: *anyopaque,
-
-        /// Optional UI context pointer — null in print/json modes, non-null in
-        /// interactive mode. Cast to *ExtensionUIContext in later phases.
         ui: ?*anyopaque = null,
-
-        /// Command-context actions — null in v1, populated in v2 when commands
-        /// are registered. Provides session control methods (new_session,
-        /// fork, navigate_tree, etc.) that are only safe in user-initiated
-        /// slash commands, not during autonomous tool execution.
         command_actions: ?*anyopaque = null,
+
+        /// Context action seams used by tool/event `ctx.*` helpers.
+        /// Stored as function pointers here so extension modules can call
+        /// through them without importing `coding_agent.zig` and creating
+        /// a cycle.
+        get_model: *const fn (session: *anyopaque) agent_protocol.Model,
+        is_idle: *const fn (session: *anyopaque) bool,
+        abort: *const fn (session: *anyopaque) void,
+        has_pending_messages: *const fn (session: *anyopaque) bool,
+        shutdown: ?*const fn (session: *anyopaque) void = null,
+        get_context_usage: *const fn (session: *anyopaque) ?session_mod.context_usage.ContextUsage,
+        get_system_prompt: *const fn (session: *anyopaque) []const u8,
     };
 };
 
@@ -534,6 +536,39 @@ test "ExtensionRunner starts in stub state" {
     try std.testing.expect(runner.generation == 0);
 }
 
+fn testGetModel(_: *anyopaque) agent_protocol.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = .{ .custom = "test-api" },
+        .provider = .{ .custom = "test-provider" },
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 1024,
+    };
+}
+
+fn testIsIdle(_: *anyopaque) bool {
+    return true;
+}
+
+fn testAbort(_: *anyopaque) void {}
+
+fn testHasPendingMessages(_: *anyopaque) bool {
+    return false;
+}
+
+fn testGetContextUsage(_: *anyopaque) ?session_mod.context_usage.ContextUsage {
+    return .{ .tokens = 64, .context_window = 1024, .percent = 6.25 };
+}
+
+fn testGetSystemPrompt(_: *anyopaque) []const u8 {
+    return "system";
+}
+
 test "bindRuntime rejects double-bind" {
     const allocator = std.testing.allocator;
     var runner = ExtensionRunner.init(allocator, 1);
@@ -546,6 +581,13 @@ test "bindRuntime rejects double-bind" {
         .session = ptr,
         .ui = null,
         .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
     };
 
     try runner.bindRuntime(bound);
@@ -558,6 +600,13 @@ test "bindRuntime rejects double-bind" {
         .session = ptr2,
         .ui = null,
         .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
     };
 
     const result = runner.bindRuntime(bound2);

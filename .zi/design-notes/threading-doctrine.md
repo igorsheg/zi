@@ -110,6 +110,45 @@ Rules of thumb for "is this a snapshot or a request?":
 - **Snapshot**: TUI needs to read data to render/filter. Frequent reads, occasional writes. Pointer-swap with a mutex is fine; seqlock/RCU are over-engineering unless you measure contention.
 - **Request**: TUI needs agent to DO something (mutate state, run code, perform I/O). Always a queue entry, never a direct call.
 
+## Lifetime ownership inside one thread
+
+Thread ownership is not enough. We also need one obvious owner for transient heap **within** a thread.
+
+```text
+thread doctrine answers:     who owns this by thread?
+flow doctrine answers:       who owns this until when?
+```
+
+Use both rules together:
+
+- **thread boundary** decides whether data is a snapshot, a request payload, or an event payload
+- **lifetime boundary** decides which object owns the heap until teardown
+
+### Lifetime rule
+
+**Transient heap data belongs to the flow that defines its lifetime. Components borrow it. Thread boundaries deep-copy it. Stable catalogs may be borrowed long-term.**
+
+### Owner ladder
+
+| Lifetime | Owner |
+|---|---|
+| process / session | domain or session owner |
+| one TUI flow / overlay | flow owner |
+| one component interaction | component |
+| cross-thread hop | message payload via `msg_allocator` |
+| static immutable catalog | producer |
+
+### What this means in practice
+
+- `ListPicker` owns query buffer + filtered scratch, but not heap-backed rows or search text
+- picker rows, formatted labels, previews, and derived search text belong to the flow that opened the picker
+- cancel / select / deinit should converge on one teardown path
+- no provenance heuristics like `free if ptr != other_ptr`
+- no returning `ArrayListUnmanaged.items` as if it were an exact owned slice
+- no freeing shortened slices as though they were the original allocation
+
+`/resume` and `/model` are the reference examples. See `.zi/design-notes/flow-owned-transient-data.md` for the detailed local doctrine.
+
 ## Sequencing rules (MUST)
 
 The phases are ordered for a reason. Violating the order will either break the build, pin the wrong owner, or mask bugs.

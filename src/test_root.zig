@@ -13,6 +13,7 @@ test {
     _ = @import("system_prompt.zig");
     _ = @import("resources/root.zig");
     _ = @import("skills/root.zig");
+    _ = @import("tools/bash.zig");
     _ = @import("tui/root.zig");
     _ = @import("slash_commands.zig");
     _ = @import("spawn/root.zig");

@@ -151,6 +151,10 @@ pub const Agent = struct {
         if (initial.error_message) |em| {
             state.error_message = aa.dupe(u8, em) catch em;
         }
+        const owned_session_id = if (options.session_id) |sid|
+            allocator.dupe(u8, sid) catch null
+        else
+            null;
         return .{
             .state = state,
             .listeners = .empty,
@@ -161,7 +165,7 @@ pub const Agent = struct {
             .stream_fn = options.stream_fn orelse unreachable_stream_hook,
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
-            .session_id = options.session_id,
+            .session_id = owned_session_id,
             .thinking_budgets = options.thinking_budgets,
             .transport = options.transport,
             .max_retry_delay_ms = options.max_retry_delay_ms,
@@ -183,6 +187,7 @@ pub const Agent = struct {
         self.follow_up_queue.deinit();
         self.runtime_arena.deinit();
         self.history_arena.deinit();
+        if (self.session_id) |sid| self.allocator.free(sid);
     }
 
     /// Subscribe to agent lifecycle events. Returns a token for unsubscribing.
@@ -261,6 +266,15 @@ pub const Agent = struct {
         self.state.streaming_message = null;
         self.state.error_message = null;
         self.clearAllQueues();
+    }
+
+    pub fn setSessionId(self: *Agent, session_id: ?[]const u8) !void {
+        const owned = if (session_id) |sid|
+            try self.allocator.dupe(u8, sid)
+        else
+            null;
+        if (self.session_id) |old| self.allocator.free(old);
+        self.session_id = owned;
     }
 
     /// Replace all messages (e.g., after loading a resumed session).

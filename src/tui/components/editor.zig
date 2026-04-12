@@ -396,7 +396,7 @@ pub const Editor = struct {
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
             var left_buf: [256]u8 = undefined;
-            var right_buf: [128]u8 = undefined;
+            var right_buf: [256]u8 = undefined;
             const left_text = self.formatStatusLeft(&left_buf);
             const right_text = self.formatStatusRight(&right_buf);
             _ = box_chrome.drawClosedTop(region, 0, left_text, right_text, style);
@@ -548,21 +548,65 @@ pub const Editor = struct {
         if (sd.model_id.len == 0) return null;
 
         var pos: usize = 0;
-        const id_len = @min(sd.model_id.len, buf.len);
-        @memcpy(buf[0..id_len], sd.model_id[0..id_len]);
-        pos = id_len;
+        var first = true;
 
-        if (sd.thinking_level.len > 0 and pos + 3 + sd.thinking_level.len < buf.len) {
-            buf[pos] = ' ';
-            buf[pos + 1] = '(';
-            pos += 2;
-            @memcpy(buf[pos..][0..sd.thinking_level.len], sd.thinking_level);
-            pos += sd.thinking_level.len;
-            buf[pos] = ')';
-            pos += 1;
+        if (sd.context_window > 0) {
+            var tokens_buf: [24]u8 = undefined;
+            var window_buf: [24]u8 = undefined;
+            const window_text = formatTokenCount(&window_buf, sd.context_window);
+            const label = if (sd.context_tokens) |tokens|
+                std.fmt.bufPrint(buf[pos..], "ctx {s}/{s}", .{ formatTokenCount(&tokens_buf, tokens), window_text }) catch ""
+            else
+                std.fmt.bufPrint(buf[pos..], "ctx ?/{s}", .{window_text}) catch "";
+            if (label.len > 0) {
+                pos += label.len;
+                first = false;
+            }
         }
 
-        return buf[0..pos];
+        if (sd.model_id.len > 0) {
+            const sep = " • ";
+            if (!first and pos + sep.len <= buf.len) {
+                @memcpy(buf[pos..][0..sep.len], sep);
+                pos += sep.len;
+            }
+            const copy_len = @min(sd.model_id.len, buf.len - pos);
+            @memcpy(buf[pos..][0..copy_len], sd.model_id[0..copy_len]);
+            pos += copy_len;
+            first = false;
+        }
+
+        if (sd.thinking_level.len > 0 and pos + 3 + sd.thinking_level.len < buf.len) {
+            const sep = " • ";
+            if (!first and pos + sep.len <= buf.len) {
+                @memcpy(buf[pos..][0..sep.len], sep);
+                pos += sep.len;
+            }
+            const written = std.fmt.bufPrint(buf[pos..], "thinking {s}", .{sd.thinking_level}) catch "";
+            pos += written.len;
+        }
+
+        return if (pos == 0) null else buf[0..pos];
+    }
+
+    fn formatTokenCount(buf: []u8, value: u64) []const u8 {
+        if (value < 1_000) {
+            return std.fmt.bufPrint(buf, "{d}", .{value}) catch "";
+        }
+        if (value < 10_000) {
+            const whole = @divTrunc(value, 1_000);
+            const tenth = @divTrunc(value % 1_000, 100);
+            return std.fmt.bufPrint(buf, "{d}.{d}k", .{ whole, tenth }) catch "";
+        }
+        if (value < 1_000_000) {
+            return std.fmt.bufPrint(buf, "{d}k", .{@divTrunc(value, 1_000)}) catch "";
+        }
+        if (value < 10_000_000) {
+            const whole = @divTrunc(value, 1_000_000);
+            const tenth = @divTrunc(value % 1_000_000, 100_000);
+            return std.fmt.bufPrint(buf, "{d}.{d}M", .{ whole, tenth }) catch "";
+        }
+        return std.fmt.bufPrint(buf, "{d}M", .{@divTrunc(value, 1_000_000)}) catch "";
     }
 
     // --- Internal helpers ---
@@ -855,6 +899,25 @@ test "Editor renders prompt and text to buffer" {
     try std.testing.expectEqual(@as(u21, '>'), buf.get(1, 1).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, 'x'), buf.get(3, 1).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, 0x2570), buf.get(0, 2).grapheme.codepoint);
+}
+
+test "editor status chips include context usage model and thinking" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    var status = StatusData.init(std.testing.allocator);
+    defer status.deinit();
+
+    status.setModelId("claude-sonnet-4-5");
+    status.setThinkingLevel("high");
+    status.context_tokens = 25_000;
+    status.context_window = 128_000;
+    editor.status_data = &status;
+
+    var buf: [256]u8 = undefined;
+    const text = editor.formatStatusRight(&buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, text, "ctx 25k/128k") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "claude-sonnet-4-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "thinking high") != null);
 }
 
 test "editor render after backspace clears deleted char from buffer" {

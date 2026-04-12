@@ -20,7 +20,7 @@ const InputResult = select_list_mod.InputResult;
 const Theme = theme_mod.Theme;
 const Color = cell_mod.Color;
 
-const MAX_ITEMS = 256;
+const MAX_ITEMS = 512;
 const MAX_QUERY = 128;
 
 /// Modal list picker — wraps SelectList as a Component for use in the overlay stack.
@@ -30,11 +30,16 @@ const MAX_QUERY = 128;
 /// When `searchable` is true, printable characters and backspace filter the list
 /// using fuzzy matching. The original (unfiltered) items are borrowed from the caller;
 /// the filtered view is managed internally.
+pub const Selection = struct {
+    item: *const SelectItem,
+    source_index: usize,
+};
+
 pub const ListPicker = struct {
     list: SelectList,
     title: []const u8 = "",
     theme: *const Theme,
-    on_select: ?*const fn (item: *const SelectItem, ctx: ?*anyopaque) void = null,
+    on_select: ?*const fn (selection: Selection, ctx: ?*anyopaque) void = null,
     on_cancel: ?*const fn (ctx: ?*anyopaque) void = null,
     callback_ctx: ?*anyopaque = null,
     focused: bool = false,
@@ -51,6 +56,8 @@ pub const ListPicker = struct {
     query_len: usize = 0,
     /// Scratch: indices from fuzzyFilter.
     match_indices: [MAX_ITEMS]usize = undefined,
+    /// Source-row index for each filtered row.
+    filtered_source_indices: [MAX_ITEMS]usize = undefined,
     /// Scratch: filtered items slice for SelectList.
     filtered_buf: [MAX_ITEMS]SelectItem = undefined,
     filtered_count: usize = 0,
@@ -167,7 +174,8 @@ pub const ListPicker = struct {
         switch (result) {
             .selected => {
                 if (self.list.getSelectedItem()) |item| {
-                    if (self.on_select) |cb| cb(item, self.callback_ctx);
+                    const source_index = self.selectedSourceIndex() orelse unreachable;
+                    if (self.on_select) |cb| cb(.{ .item = item, .source_index = source_index }, self.callback_ctx);
                 }
                 return true;
             },
@@ -226,6 +234,7 @@ pub const ListPicker = struct {
             // intentionally (for example /resume wants most-recent-first), and
             // empty-query fuzzy sorting would scramble that ordering.
             for (0..count) |i| {
+                self.filtered_source_indices[i] = i;
                 self.filtered_buf[i] = self.all_items[i];
             }
             self.filtered_count = count;
@@ -236,7 +245,9 @@ pub const ListPicker = struct {
             }
             const n = fuzzy_mod.fuzzyFilter(query, texts[0..count], &self.match_indices);
             for (0..n) |i| {
-                self.filtered_buf[i] = self.all_items[self.match_indices[i]];
+                const source_index = self.match_indices[i];
+                self.filtered_source_indices[i] = source_index;
+                self.filtered_buf[i] = self.all_items[source_index];
             }
             self.filtered_count = n;
         }
@@ -251,4 +262,68 @@ pub const ListPicker = struct {
         if (idx < self.all_items.len) return self.all_items[idx].label;
         return "";
     }
+
+    fn selectedSourceIndex(self: *const ListPicker) ?usize {
+        if (self.list.items.len == 0) return null;
+        const selected_index: usize = @intCast(self.list.selected_index);
+        if (!self.searchable) return selected_index;
+        if (selected_index >= self.filtered_count) return null;
+        return self.filtered_source_indices[selected_index];
+    }
 };
+
+const testing = std.testing;
+
+const SelectionCapture = struct {
+    source_index: ?usize = null,
+    value: ?[]const u8 = null,
+};
+
+fn captureSelection(selection: Selection, ctx: ?*anyopaque) void {
+    const capture: *SelectionCapture = @ptrCast(@alignCast(ctx));
+    capture.source_index = selection.source_index;
+    capture.value = selection.item.value;
+}
+
+test "searchable picker selection reports original source index" {
+    const theme = Theme.dark;
+    const items = [_]SelectItem{
+        .{ .value = "alpha", .label = "Alpha" },
+        .{ .value = "beta", .label = "Beta" },
+        .{ .value = "gamma", .label = "Gamma" },
+    };
+    const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
+
+    var picker = ListPicker.init(&theme);
+    var capture = SelectionCapture{};
+    picker.setSearchableItems(&items, &search_texts);
+    picker.on_select = &captureSelection;
+    picker.callback_ctx = @ptrCast(&capture);
+
+    _ = picker.handleInput(.{ .code = .char, .char = 'g' });
+    _ = picker.handleInput(.{ .code = .enter });
+
+    try testing.expectEqual(@as(?usize, 2), capture.source_index);
+    try testing.expectEqualStrings("gamma", capture.value.?);
+}
+
+test "plain picker selection reports visible source index" {
+    const theme = Theme.dark;
+    const items = [_]SelectItem{
+        .{ .value = "alpha", .label = "Alpha" },
+        .{ .value = "beta", .label = "Beta" },
+        .{ .value = "gamma", .label = "Gamma" },
+    };
+
+    var picker = ListPicker.init(&theme);
+    var capture = SelectionCapture{};
+    picker.list.setItems(&items);
+    picker.on_select = &captureSelection;
+    picker.callback_ctx = @ptrCast(&capture);
+
+    _ = picker.handleInput(.{ .code = .down });
+    _ = picker.handleInput(.{ .code = .enter });
+
+    try testing.expectEqual(@as(?usize, 1), capture.source_index);
+    try testing.expectEqualStrings("beta", capture.value.?);
+}

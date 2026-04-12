@@ -3,6 +3,8 @@ const resource_types = @import("resources/types.zig");
 
 pub const ContextFile = resource_types.AgentsFile;
 
+const default_tool_names = [_][]const u8{ "read", "bash", "edit", "write" };
+
 pub const ToolSnippet = struct {
     name: []const u8,
     snippet: []const u8,
@@ -30,6 +32,10 @@ fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn effectiveToolNames(tool_names: []const []const u8) []const []const u8 {
+    return if (tool_names.len > 0) tool_names else default_tool_names[0..];
+}
+
 /// Normalize cwd: backslash → forward slash (pi-mono system-prompt.ts:40)
 fn normalizeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     const result = try allocator.dupe(u8, cwd);
@@ -39,16 +45,12 @@ fn normalizeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     return result;
 }
 
-/// Build the system prompt matching pi-mono's system-prompt.ts:28-168.
+/// Build the system prompt following pi-mono's system-prompt.ts structure,
+/// while keeping zi branding and zi-local documentation references.
 ///
 /// This is a pure builder over already-resolved inputs. Discovery/loading of
 /// custom prompts, append prompts, and AGENTS/CLAUDE context files belongs to
 /// `src/resources/loader.zig`, not to prompt-building callsites.
-///
-/// If `custom_prompt` is set, it replaces the default identity/tools/guidelines
-/// section but still appends context files, date, and cwd.
-/// Otherwise builds the full default prompt with identity, tools, guidelines,
-/// context, date, and cwd.
 pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -60,26 +62,29 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
     const cwd = try normalizeCwd(allocator, options.cwd);
     defer allocator.free(cwd);
 
+    const tool_names = effectiveToolNames(options.tool_names);
+    const has_read = containsStr(tool_names, "read");
+
     if (options.custom_prompt) |custom| {
         try w.writeAll(custom);
-        try writeSkillsSection(w, options.skills_section);
         try writeAppendSystemPrompt(w, options.append_system_prompt);
         try writeContextFiles(w, options.context_files);
+        if (has_read) {
+            try writeSkillsSection(w, options.skills_section);
+        }
         try w.print("\nCurrent date: {s}", .{date});
         try w.print("\nCurrent working directory: {s}", .{cwd});
         return try aw.toOwnedSlice();
     }
 
-    // Default prompt: identity
     try w.writeAll(
-        "You are an expert coding assistant operating inside zi, a coding agent." ++
+        "You are an expert coding assistant operating inside zi, a coding agent harness." ++
             " You help users by reading files, executing commands, editing code, and writing new files.",
     );
 
-    // Available tools section — only show tools that have snippets
     try w.writeAll("\n\nAvailable tools:\n");
     var visible_count: usize = 0;
-    for (options.tool_names) |name| {
+    for (tool_names) |name| {
         if (findSnippet(options.tool_snippets, name)) |snippet| {
             try w.print("- {s}: {s}\n", .{ name, snippet });
             visible_count += 1;
@@ -93,16 +98,15 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
         "\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n",
     );
 
-    // Guidelines — deduplicated
     try w.writeAll("\nGuidelines:\n");
 
     var guideline_list: std.ArrayList([]const u8) = .empty;
     defer guideline_list.deinit(allocator);
 
-    const has_bash = containsStr(options.tool_names, "bash");
-    const has_grep = containsStr(options.tool_names, "grep");
-    const has_find = containsStr(options.tool_names, "find");
-    const has_ls = containsStr(options.tool_names, "ls");
+    const has_bash = containsStr(tool_names, "bash");
+    const has_grep = containsStr(tool_names, "grep");
+    const has_find = containsStr(tool_names, "find");
+    const has_ls = containsStr(tool_names, "ls");
 
     if (has_bash and !has_grep and !has_find and !has_ls) {
         try guideline_list.append(allocator, "Use bash for file operations like ls, rg, find");
@@ -131,10 +135,12 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
         try w.print("- {s}\n", .{g});
     }
 
-    try writeSkillsSection(w, options.skills_section);
+    try writeZiDocsSection(w);
     try writeAppendSystemPrompt(w, options.append_system_prompt);
-
     try writeContextFiles(w, options.context_files);
+    if (has_read) {
+        try writeSkillsSection(w, options.skills_section);
+    }
 
     try w.print("\nCurrent date: {s}", .{date});
     try w.print("\nCurrent working directory: {s}", .{cwd});
@@ -154,6 +160,18 @@ fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, item, needle)) return true;
     }
     return false;
+}
+
+fn writeZiDocsSection(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        "\nZi documentation (read only when the user asks about zi itself, extensions, themes, or the TUI):\n" ++
+            "- Main documentation: README.md\n" ++
+            "- Additional docs: docs/\n" ++
+            "- Architecture/spec: SPEC.md\n" ++
+            "- When asked about: extensions (docs/extensions.md), themes (docs/theme-system.md), extension UI contract (docs/extension-ui-contract.md)\n" ++
+            "- When working on zi topics, read the docs and follow .md cross-references before implementing\n" ++
+            "- Always read zi .md files completely and follow links to related docs\n",
+    );
 }
 
 fn writeSkillsSection(w: *std.Io.Writer, section: ?[]const u8) !void {
@@ -192,36 +210,72 @@ fn isoDate(allocator: std.mem.Allocator) ![]const u8 {
     });
 }
 
+fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !void {
+    var previous_index: usize = 0;
+    var have_previous = false;
+    for (needles) |needle| {
+        const index = std.mem.indexOf(u8, haystack, needle) orelse return error.MissingSubstring;
+        if (have_previous) {
+            try std.testing.expect(previous_index < index);
+        }
+        previous_index = index;
+        have_previous = true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "default prompt includes identity and cwd" {
+test "default prompt includes zi identity docs and cwd" {
     const result = try buildSystemPrompt(std.testing.allocator, .{
         .cwd = "/home/user/project",
     });
     defer std.testing.allocator.free(result);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "expert coding assistant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "operating inside zi, a coding agent harness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Zi documentation") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Current working directory: /home/user/project") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Be concise") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Be concise in your responses") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Available tools:") != null);
 }
 
-test "custom prompt replaces default but keeps context" {
+test "custom prompt orders append context skills and footer like pi-mono" {
     const files = [_]ContextFile{.{ .path = "AGENTS.md", .content = "be nice" }};
     const result = try buildSystemPrompt(std.testing.allocator, .{
         .custom_prompt = "You are a pirate.",
+        .append_system_prompt = &.{"appended guidance"},
         .context_files = &files,
+        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
         .cwd = "/tmp",
     });
     defer std.testing.allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "You are a pirate.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "expert coding assistant") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "AGENTS.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "be nice") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Current working directory: /tmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "operating inside zi") == null);
+    try expectOrderedSubstrings(result, &.{
+        "You are a pirate.",
+        "appended guidance",
+        "# Project Context",
+        "<available_skills>",
+        "Current date:",
+        "Current working directory: /tmp",
+    });
+}
+
+test "default prompt falls back to pi-mono default tool set" {
+    const result = try buildSystemPrompt(std.testing.allocator, .{
+        .tool_snippets = &.{
+            .{ .name = "read", .snippet = "Read files" },
+            .{ .name = "bash", .snippet = "Run commands" },
+            .{ .name = "grep", .snippet = "Search files" },
+        },
+    });
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "- read: Read files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "- bash: Run commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "- grep: Search files") == null);
 }
 
 test "tool guidelines adapt to available tools" {
@@ -238,28 +292,31 @@ test "tool guidelines adapt to available tools" {
     try std.testing.expect(std.mem.indexOf(u8, bash_grep, "Prefer grep/find/ls tools over bash") != null);
 }
 
-test "skills section is appended when provided" {
-    const result = try buildSystemPrompt(std.testing.allocator, .{
-        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
-    });
-    defer std.testing.allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "<available_skills>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "caveman") != null);
-}
-
-test "context files appended in default prompt" {
+test "default prompt orders docs append context and read-gated skills" {
     const files = [_]ContextFile{
         .{ .path = "/proj/AGENTS.md", .content = "rule 1" },
         .{ .path = "/proj/docs/STYLE.md", .content = "rule 2" },
     };
-    const result = try buildSystemPrompt(std.testing.allocator, .{
+    const with_read = try buildSystemPrompt(std.testing.allocator, .{
+        .append_system_prompt = &.{"appended guidance"},
         .context_files = &files,
+        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
     });
-    defer std.testing.allocator.free(result);
+    defer std.testing.allocator.free(with_read);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "# Project Context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "## /proj/AGENTS.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "rule 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "## /proj/docs/STYLE.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "rule 2") != null);
+    try expectOrderedSubstrings(with_read, &.{
+        "Zi documentation",
+        "appended guidance",
+        "# Project Context",
+        "<available_skills>",
+        "Current date:",
+    });
+
+    const without_read = try buildSystemPrompt(std.testing.allocator, .{
+        .tool_names = &.{"bash"},
+        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
+    });
+    defer std.testing.allocator.free(without_read);
+
+    try std.testing.expect(std.mem.indexOf(u8, without_read, "<available_skills>") == null);
 }

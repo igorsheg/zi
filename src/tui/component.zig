@@ -37,6 +37,8 @@ pub const Component = struct {
         cursor_state: *const fn (ptr: *anyopaque) ?CursorState,
         invalidate: *const fn (ptr: *anyopaque) void,
         set_focused: *const fn (ptr: *anyopaque, focused: bool) void,
+        next_animation_deadline: *const fn (ptr: *anyopaque, now_ns: i128) ?i128,
+        tick_animation: *const fn (ptr: *anyopaque, now_ns: i128) bool,
     };
 
     pub fn init(comptime T: type, ptr: *T) Component {
@@ -75,6 +77,20 @@ pub const Component = struct {
                     self.setFocused(focused);
                 }
             }
+            fn nextAnimationDeadline(erased: *anyopaque, now_ns: i128) ?i128 {
+                const self: *T = @ptrCast(@alignCast(erased));
+                if (@hasDecl(T, "nextAnimationDeadline")) {
+                    return self.nextAnimationDeadline(now_ns);
+                }
+                return null;
+            }
+            fn tickAnimation(erased: *anyopaque, now_ns: i128) bool {
+                const self: *T = @ptrCast(@alignCast(erased));
+                if (@hasDecl(T, "tickAnimation")) {
+                    return self.tickAnimation(now_ns);
+                }
+                return false;
+            }
         };
         return .{
             .ptr = @ptrCast(ptr),
@@ -85,6 +101,8 @@ pub const Component = struct {
                 .cursor_state = gen.cursorState,
                 .invalidate = gen.invalidate,
                 .set_focused = gen.setFocused,
+                .next_animation_deadline = gen.nextAnimationDeadline,
+                .tick_animation = gen.tickAnimation,
             },
         };
     }
@@ -119,4 +137,26 @@ pub const Component = struct {
     pub fn setFocused(self: Component, focused: bool) void {
         self.vtable.set_focused(self.ptr, focused);
     }
+
+    pub fn nextAnimationDeadline(self: Component, now_ns: i128) ?i128 {
+        return self.vtable.next_animation_deadline(self.ptr, now_ns);
+    }
+
+    pub fn tickAnimation(self: Component, now_ns: i128) bool {
+        return self.vtable.tick_animation(self.ptr, now_ns);
+    }
 };
+
+test "component defaults animation hooks for static components" {
+    const StaticComp = struct {
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn measure(_: *@This(), _: u32) Measurement {
+            return .{ .min_height = 1, .preferred_height = 1 };
+        }
+    };
+
+    var comp = StaticComp{};
+    const erased = Component.init(StaticComp, &comp);
+    try std.testing.expectEqual(@as(?i128, null), erased.nextAnimationDeadline(123));
+    try std.testing.expect(!erased.tickAnimation(123));
+}

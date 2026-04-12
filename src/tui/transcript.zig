@@ -864,10 +864,20 @@ pub const Transcript = struct {
         self.syncScrollAfterLayout();
     }
 
+    fn deactivateCurrentAssistantThinking(self: *Transcript) void {
+        const idx = self.current_assistant_idx orelse return;
+        if (idx >= self.items.items.len) return;
+        const item = &self.items.items[idx];
+        if (item.kind != .assistant_message) return;
+        const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
+        if (am.deactivateThinkingShimmer()) self.noteItemMutated(idx);
+    }
+
     // ── Generic mutation API ──────────────────────────────────────
 
     /// Append an arbitrary component to the transcript.
     pub fn addComponent(self: *Transcript, comp: Component) void {
+        self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
         _ = self.appendTranscriptItem(.{ .component = comp });
     }
@@ -923,6 +933,12 @@ pub const Transcript = struct {
 
     /// Start a new assistant message.
     pub fn beginAssistantMessage(self: *Transcript) void {
+        self.deactivateCurrentAssistantThinking();
+        self.current_assistant_idx = null;
+    }
+
+    pub fn endAssistantMessage(self: *Transcript) void {
+        self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
     }
 
@@ -996,6 +1012,7 @@ pub const Transcript = struct {
     ) void {
         if (self.pending_tools.contains(tool_call_id)) return;
 
+        self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
 
         const id = self.allocator.dupe(u8, tool_call_id) catch return;
@@ -1126,6 +1143,7 @@ pub const Transcript = struct {
 
     /// Add a user message bubble.
     pub fn addUserMessage(self: *Transcript, text: []const u8) void {
+        self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
 
         const md = self.allocator.create(markdown_mod.Markdown) catch return;
@@ -1191,6 +1209,28 @@ pub const Transcript = struct {
 
     pub fn component(self: *Transcript) component_mod.Component {
         return component_mod.Component.init(Transcript, self);
+    }
+
+    pub fn nextAnimationDeadline(self: *Transcript, now_ns: i128) ?i128 {
+        var next_deadline: ?i128 = null;
+        for (self.items.items) |*item| {
+            if (item.kind != .assistant_message) continue;
+            const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
+            if (am.nextAnimationDeadline(now_ns)) |deadline| {
+                next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
+            }
+        }
+        return next_deadline;
+    }
+
+    pub fn tickAnimation(self: *Transcript, now_ns: i128) bool {
+        var changed = false;
+        for (self.items.items) |*item| {
+            if (item.kind != .assistant_message) continue;
+            const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
+            changed = am.tickAnimation(now_ns) or changed;
+        }
+        return changed;
     }
 
     /// Render visible items into the region, respecting scroll_offset.
@@ -1346,7 +1386,7 @@ fn makeLoopConfig(fp: *faux.FauxProvider) agent_protocol.AgentLoopConfig {
 
 fn makeCommandArgs(allocator: std.mem.Allocator, command: []const u8) !std.json.Value {
     var obj = std.json.ObjectMap.init(allocator);
-    try obj.put("command", .{ .string = command });
+    try obj.put("cmd", .{ .string = command });
     return .{ .object = obj };
 }
 
@@ -1728,6 +1768,20 @@ test "Transcript removeComponent removes item by identity and fixes indices" {
     transcript.removeComponent(w3.component());
     // total height is now 1 (just w1), so scroll offset should be clamped to ≤ 1
     try testing.expect(transcript.scrollOffset() <= 1);
+}
+
+test "Transcript animation hooks follow active thinking and stop on message end" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    transcript.beginAssistantMessage();
+    transcript.appendThinking(0, "ponder");
+
+    try testing.expect(transcript.nextAnimationDeadline(assistant_message_mod.AssistantMessage.shimmer_step_ns) != null);
+
+    transcript.endAssistantMessage();
+
+    try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(assistant_message_mod.AssistantMessage.shimmer_step_ns));
 }
 
 test "Transcript clearAll removes all items and resets state" {

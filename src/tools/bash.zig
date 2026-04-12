@@ -126,6 +126,9 @@ fn runCommand(
     timeout_secs: ?u64,
     signal: agent.protocol.AbortSignal,
 ) agent.protocol.AgentToolResult {
+    var thread_safe_allocator: std.heap.ThreadSafeAllocator = .{ .child_allocator = allocator };
+    const io_allocator = thread_safe_allocator.allocator();
+
     const shell_argv: []const []const u8 = if (std.fs.accessAbsolute("/bin/bash", .{}))
         &.{ "/bin/bash", "-c", command }
     else |_|
@@ -150,15 +153,17 @@ fn runCommand(
     var stderr_result: ?[]u8 = null;
     var stderr_thread: ?std.Thread = null;
     if (child.stderr) |stderr_file| {
-        stderr_thread = std.Thread.spawn(.{}, readStderr, .{ stderr_file, allocator, &stderr_result }) catch null;
+        stderr_thread = std.Thread.spawn(.{}, readStderr, .{ stderr_file, io_allocator, &stderr_result }) catch null;
     }
 
     const stdout_data = if (child.stdout) |stdout_file|
-        stdout_file.readToEndAlloc(allocator, MAX_OUTPUT_BYTES) catch null
+        stdout_file.readToEndAlloc(io_allocator, MAX_OUTPUT_BYTES) catch null
     else
         null;
+    defer if (stdout_data) |data| io_allocator.free(data);
 
     if (stderr_thread) |t| t.join();
+    defer if (stderr_result) |data| io_allocator.free(data);
 
     const term = child.wait() catch null;
     timeout_guard.markExited();
@@ -175,13 +180,15 @@ fn runCommand(
         }
     }
 
-    const output_text = truncateHeadTail(allocator, merged.items) catch allocator.dupe(u8, merged.items) catch &.{};
+    const output_text = truncateHeadTail(allocator, merged.items) catch allocator.dupe(u8, merged.items) catch null;
+    defer if (output_text) |text| allocator.free(text);
+
     var result = std.ArrayList(u8).empty;
     defer result.deinit(allocator);
     result.appendSlice(allocator, "$ ") catch return util.errorResult(allocator, "bash tool: alloc failed");
     result.appendSlice(allocator, command) catch return util.errorResult(allocator, "bash tool: alloc failed");
     result.appendSlice(allocator, "\n\n") catch return util.errorResult(allocator, "bash tool: alloc failed");
-    result.appendSlice(allocator, if (output_text.len > 0) output_text else "(no output)") catch
+    result.appendSlice(allocator, if (output_text) |text| if (text.len > 0) text else "(no output)" else "(no output)") catch
         return util.errorResult(allocator, "bash tool: alloc failed");
 
     if (signal.isAborted()) {
@@ -296,6 +303,33 @@ test "oneText sanitizes invalid utf-8" {
 
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings("bad��tail", blocks[0].text.text);
+}
+
+test "runCommand handles concurrent stdout and stderr" {
+    const testing = std.testing;
+    const cmd =
+        \\i=0
+        \\while [ "$i" -lt 400 ]; do
+        \\  printf 'out%04d\n' "$i"
+        \\  printf 'err%04d\n' "$i" 1>&2
+        \\  i=$((i + 1))
+        \\done
+    ;
+
+    var iteration: usize = 0;
+    while (iteration < 32) : (iteration += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        const result = runCommand(arena.allocator(), cmd, "/tmp", 5, agent.protocol.AbortSignal.none);
+
+        try testing.expect(!result.is_error);
+        try testing.expectEqual(@as(usize, 1), result.content.len);
+        try testing.expect(result.content[0] == .text);
+        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "out0000") != null);
+        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "err0399") != null);
+        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "... output truncated ...") != null);
+    }
 }
 
 fn oneText(allocator: std.mem.Allocator, text: []const u8) []agent.protocol.AgentToolResult.ContentBlock {

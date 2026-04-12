@@ -162,6 +162,18 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
+    // --- shared status snapshot ---
+    // Agent-thread owned model/thinking/context snapshot for the editor
+    // border chips. Published whenever session state changes in a way the
+    // TUI must render without reading agent-owned state directly.
+    status_snapshot: struct {
+        model_provider: []u8,
+        model_id: []u8,
+        thinking_level: []u8,
+        context_tokens: ?u64,
+        context_window: u64,
+    },
+
     // --- /model outcomes (zi-wub.16) ---
     // Published by the agent thread after processing a set_model
     // AgentRequest. Provider + model id are owned (cloned into
@@ -225,6 +237,11 @@ pub const UiEvent = union(enum) {
                 if (s.restore_warning) |w| allocator.free(w);
             },
             .session_resume_failed => |f| allocator.free(f.message),
+            .status_snapshot => |s| {
+                allocator.free(s.model_provider);
+                allocator.free(s.model_id);
+                allocator.free(s.thinking_level);
+            },
             .model_switched => |m| {
                 allocator.free(m.provider);
                 allocator.free(m.id);

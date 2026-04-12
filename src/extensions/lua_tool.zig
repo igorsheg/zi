@@ -29,6 +29,7 @@ const agent_protocol = @import("../agent/protocol.zig");
 const abort_signal_mod = @import("../abort_signal.zig");
 const lua_renderer = @import("lua_renderer.zig");
 const api = @import("api.zig");
+const context_mod = @import("context.zig");
 const spawn_mod = @import("../spawn/spawn.zig");
 const spawn_types = @import("../spawn/types.zig");
 
@@ -204,15 +205,12 @@ fn runHandler(
     try lua_runtime.pushJsonValue(co.L, args);
 
     // arg 2: ctx table.
-    //   - update(partial) → C closure that forwards through the
-    //     update callback stashed on the runner
-    //   - cwd → parent agent's working directory
-    c.lua_createtable(co.L, 0, 2);
+    // Base fields come from the bound extension runtime; tool
+    // execution adds the `update(partial)` helper on top.
+    try context_mod.pushExtensionContext(co.L, runner);
     c.lua_pushlightuserdata(co.L, runner);
     c.lua_pushcclosure(co.L, &luaToolUpdate, 1);
     c.lua_setfield(co.L, -2, "update");
-    _ = c.lua_pushlstring(co.L, runner.cwd.ptr, runner.cwd.len);
-    c.lua_setfield(co.L, -2, "cwd");
 
     while (true) {
         const r = try co.resumeWith(2);

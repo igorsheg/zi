@@ -30,6 +30,7 @@ const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
 const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
+const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
 const session_store_mod = @import("../session/store.zig");
 const SessionStore = session_store_mod.SessionStore;
@@ -94,16 +95,24 @@ fn EventQueue(comptime T: type) type {
     return struct {
         items: std.ArrayListUnmanaged(T) = .empty,
         mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
         allocator: std.mem.Allocator,
+        wake_read_fd: posix.fd_t,
+        wake_write_fd: posix.fd_t,
 
         const Self = @This();
 
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return .{ .allocator = allocator };
+        pub fn init(allocator: std.mem.Allocator) !Self {
+            const pipe = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+            return .{
+                .allocator = allocator,
+                .wake_read_fd = pipe[0],
+                .wake_write_fd = pipe[1],
+            };
         }
 
         pub fn deinit(self: *Self) void {
+            posix.close(self.wake_read_fd);
+            posix.close(self.wake_write_fd);
             self.items.deinit(self.allocator);
         }
 
@@ -117,24 +126,263 @@ fn EventQueue(comptime T: type) type {
                 }
                 return;
             };
-            self.cond.signal();
+            self.signalWake();
         }
 
         pub fn drainInto(self: *Self, out: []T) usize {
             self.mutex.lock();
             defer self.mutex.unlock();
             const count = @min(self.items.items.len, out.len);
-            if (count == 0) return 0;
+            if (count == 0) {
+                self.drainWakePipe();
+                return 0;
+            }
             @memcpy(out[0..count], self.items.items[0..count]);
             if (count < self.items.items.len) {
                 const remaining = self.items.items.len - count;
                 std.mem.copyForwards(T, self.items.items[0..remaining], self.items.items[count .. count + remaining]);
             }
             self.items.items.len -= count;
+            if (self.items.items.len == 0) {
+                self.drainWakePipe();
+            } else {
+                self.signalWake();
+            }
             return count;
+        }
+
+        pub fn wakeReadFd(self: *const Self) posix.fd_t {
+            return self.wake_read_fd;
+        }
+
+        pub fn acknowledgeWake(self: *Self) void {
+            self.drainWakePipe();
+        }
+
+        fn signalWake(self: *Self) void {
+            _ = posix.write(self.wake_write_fd, &[1]u8{1}) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => 0,
+            };
+        }
+
+        fn drainWakePipe(self: *Self) void {
+            var buf: [64]u8 = undefined;
+            while (true) {
+                const n = posix.read(self.wake_read_fd, &buf) catch |err| switch (err) {
+                    error.WouldBlock => return,
+                    else => return,
+                };
+                if (n == 0 or n < buf.len) return;
+            }
         }
     };
 }
+
+test "EventQueue wake pipe signals poll and drains with queue" {
+    var q = try EventQueue(u8).init(std.testing.allocator);
+    defer q.deinit();
+
+    q.push(7);
+
+    var pfd = [1]posix.pollfd{.{
+        .fd = q.wakeReadFd(),
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try posix.poll(&pfd, 0);
+    try std.testing.expectEqual(@as(usize, 1), ready);
+
+    var out: [2]u8 = undefined;
+    const count = q.drainInto(&out);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(u8, 7), out[0]);
+
+    pfd[0].revents = 0;
+    const after = try posix.poll(&pfd, 0);
+    try std.testing.expectEqual(@as(usize, 0), after);
+}
+
+/// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y"
+fn formatRelativeTime(iso_ts: []const u8) []const u8 {
+    // Parse "YYYY-MM-DDThh:mm:ss" → epoch seconds
+    if (iso_ts.len < 19) return iso_ts;
+    const year = std.fmt.parseInt(i64, iso_ts[0..4], 10) catch return iso_ts;
+    const month = std.fmt.parseInt(u8, iso_ts[5..7], 10) catch return iso_ts;
+    const day = std.fmt.parseInt(u8, iso_ts[8..10], 10) catch return iso_ts;
+    const hour = std.fmt.parseInt(u8, iso_ts[11..13], 10) catch return iso_ts;
+    const min = std.fmt.parseInt(u8, iso_ts[14..16], 10) catch return iso_ts;
+    const sec = std.fmt.parseInt(u8, iso_ts[17..19], 10) catch return iso_ts;
+
+    // Rough epoch calculation (no leap second precision needed for "time ago")
+    const days_in_month = [_]u16{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    if (month < 1 or month > 12) return iso_ts;
+    const year_days = (year - 1970) * 365 + @divTrunc(year - 1969, 4);
+    const month_days: i64 = days_in_month[month - 1];
+    const ts_epoch = (year_days + month_days + day - 1) * 86400 + @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
+
+    const now = std.time.timestamp();
+    const diff = now - ts_epoch;
+    if (diff < 0) return "now";
+
+    const diff_u: u64 = @intCast(diff);
+    if (diff_u < 60) return "now";
+    if (diff_u < 3600) {
+        const mins = diff_u / 60;
+        return switch (mins) {
+            1 => "1m",
+            2 => "2m",
+            3 => "3m",
+            5 => "5m",
+            10 => "10m",
+            15 => "15m",
+            30 => "30m",
+            else => if (mins < 5) "few min" else if (mins < 30) "<30m" else "<1h",
+        };
+    }
+    if (diff_u < 86400) {
+        const hours = diff_u / 3600;
+        return switch (hours) {
+            1 => "1h",
+            2 => "2h",
+            3 => "3h",
+            else => if (hours < 12) "<12h" else "<1d",
+        };
+    }
+    const days = diff_u / 86400;
+    if (days == 1) return "yesterday";
+    if (days < 7) return if (days == 2) "2d" else if (days < 4) "few days" else "<1w";
+    if (days < 30) return if (days < 14) "1w" else if (days < 21) "2w" else "3w";
+    if (days < 365) {
+        const months = days / 30;
+        return if (months <= 1) "1mo" else if (months <= 2) "2mo" else if (months <= 6) "<6mo" else "<1y";
+    }
+    return ">1y";
+}
+
+/// Owns all transient heap-backed data for one `/resume` overlay.
+/// The picker borrows from this flow; teardown is one arena drop.
+const ResumePickerFlow = struct {
+    arena: std.heap.ArenaAllocator,
+    rows: []Row = &.{},
+    items: []SelectItem = &.{},
+    picker: ListPicker,
+    handle: ?tui_mod.OverlayHandle = null,
+
+    const Row = struct {
+        item: SelectItem,
+        path: []const u8,
+    };
+
+    fn init(gpa: std.mem.Allocator, theme: *const theme_mod.Theme, cwd: []const u8) !ResumePickerFlow {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const sessions = try session_store_mod.listSessions(a, cwd);
+        const rows = try a.alloc(Row, sessions.len);
+        const items = try a.alloc(SelectItem, sessions.len);
+
+        for (sessions, 0..) |session, i| {
+            const item: SelectItem = .{
+                .value = session.session_id,
+                .label = session.first_message,
+                .description = try std.fmt.allocPrint(a, "{d} msgs \xC2\xB7 {s}", .{
+                    session.message_count,
+                    formatRelativeTime(session.timestamp),
+                }),
+            };
+            rows[i] = .{ .item = item, .path = session.path };
+            items[i] = item;
+        }
+
+        var picker = ListPicker.init(theme);
+        picker.title = "Resume session";
+        picker.list.max_visible = 10;
+        picker.setSearchableItems(items, null);
+
+        return .{
+            .arena = arena,
+            .rows = rows,
+            .items = items,
+            .picker = picker,
+        };
+    }
+
+    fn deinit(self: *ResumePickerFlow) void {
+        self.arena.deinit();
+    }
+};
+
+/// Owns all transient heap-backed data for one `/model` overlay.
+/// Stable catalog models stay borrowed; derived search rows live here.
+const ModelPickerFlow = struct {
+    arena: std.heap.ArenaAllocator,
+    rows: []Row = &.{},
+    items: []SelectItem = &.{},
+    search_texts: []const []const u8 = &.{},
+    picker: ListPicker,
+    handle: ?tui_mod.OverlayHandle = null,
+
+    const Row = struct {
+        item: SelectItem,
+        model: ai_protocol.Model,
+        search_text: []const u8,
+    };
+
+    fn init(
+        gpa: std.mem.Allocator,
+        theme: *const theme_mod.Theme,
+        model_catalog: []const ai_protocol.Model,
+        auth_storage: *auth_storage_mod.AuthStorage,
+    ) !ModelPickerFlow {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        var count: usize = 0;
+        for (model_catalog) |model| {
+            if (auth_storage.hasAuth(json_util.providerToString(model.provider))) count += 1;
+        }
+
+        const rows = try a.alloc(Row, count);
+        const items = try a.alloc(SelectItem, count);
+        const search_texts = try a.alloc([]const u8, count);
+
+        var i: usize = 0;
+        for (model_catalog) |model| {
+            const provider_str = json_util.providerToString(model.provider);
+            if (!auth_storage.hasAuth(provider_str)) continue;
+
+            const item: SelectItem = .{
+                .value = model.id,
+                .label = model.id,
+                .description = provider_str,
+            };
+            const search_text = try std.fmt.allocPrint(a, "{s} {s}", .{ provider_str, model.id });
+            rows[i] = .{ .item = item, .model = model, .search_text = search_text };
+            items[i] = item;
+            search_texts[i] = search_text;
+            i += 1;
+        }
+
+        var picker = ListPicker.init(theme);
+        picker.title = "Select model";
+        picker.list.max_visible = 12;
+        picker.setSearchableItems(items, search_texts);
+
+        return .{
+            .arena = arena,
+            .rows = rows,
+            .items = items,
+            .search_texts = search_texts,
+            .picker = picker,
+        };
+    }
+
+    fn deinit(self: *ModelPickerFlow) void {
+        self.arena.deinit();
+    }
+};
 
 /// Interactive mode — wires AgentSession (blocking on its thread)
 /// to the TUI (main thread) via a thread-safe event queue.
@@ -188,12 +436,8 @@ pub const Interactive = struct {
     command_registry: CommandRegistry,
     slash_provider: SlashCommandProvider = undefined,
 
-    // ── Session picker (for /resume) ────────────────────────────
-    session_picker: ListPicker = undefined,
-    session_picker_items: [64]SelectItem = undefined,
-    session_picker_paths: [64][]const u8 = undefined,
-    session_picker_count: usize = 0,
-    session_picker_handle: ?tui_mod.OverlayHandle = null,
+    // ── Flow-owned transient pickers ────────────────────────────
+    resume_picker_flow: ?ResumePickerFlow = null,
 
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
@@ -203,12 +447,7 @@ pub const Interactive = struct {
     /// outlives Interactive, and the registry is immutable for the
     /// session lifetime, so the slice is stable.
     model_catalog: []const ai_protocol.Model = &.{},
-    model_picker: ListPicker = undefined,
-    model_picker_items: [512]SelectItem = undefined,
-    model_picker_search_texts: [512][]const u8 = undefined,
-    model_picker_models: [512]ai_protocol.Model = undefined,
-    model_picker_count: usize = 0,
-    model_picker_handle: ?tui_mod.OverlayHandle = null,
+    model_picker_flow: ?ModelPickerFlow = null,
 
     // ── Settings pickers (/settings) ───────────────────────────────
     settings_picker: ListPicker = undefined,
@@ -292,7 +531,7 @@ pub const Interactive = struct {
             .widget_below_container = container_mod.Container.init(state_allocator),
             .command_registry = CommandRegistry.init(state_allocator),
             .input = input_buffer_mod.InputBuffer.init(state_allocator),
-            .event_queue = EventQueue(UiEvent).init(msg_allocator),
+            .event_queue = try EventQueue(UiEvent).init(msg_allocator),
             .request_queue = RequestQueue.init(msg_allocator),
             .ca = ca,
             .memory_diagnostics = memory_diagnostics,
@@ -315,8 +554,16 @@ pub const Interactive = struct {
         self.editor.border_color = theme.fg(.border_muted);
         self.loader.spinner_fg = theme.fg(.accent);
         self.loader.message_fg = theme.fg(.muted);
-        self.status_data.model_id = ca.agent.state.model.id;
-        self.status_data.thinking_level = agentThinkingLabel(ca.agent.state.thinking_level);
+        self.status_data.setModelProvider(json_util.providerToString(ca.agent.state.model.provider));
+        self.status_data.setModelId(ca.agent.state.model.id);
+        self.status_data.setThinkingLevel(agentThinkingLabel(ca.agent.state.thinking_level));
+        if (ca.getContextUsage()) |usage| {
+            self.status_data.context_tokens = usage.tokens;
+            self.status_data.context_window = usage.context_window;
+        } else {
+            self.status_data.context_tokens = null;
+            self.status_data.context_window = ca.agent.state.model.context_window;
+        }
         self.editor.cwd = cwd;
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
         self.transcript.setHideThinkingBlock(self.hide_thinking_block);
@@ -386,7 +633,8 @@ pub const Interactive = struct {
             if (count == 0) break;
             for (drain_buf[0..count]) |*ev| ev.deinit(self.msg_allocator);
         }
-        self.freeModelPickerSearchTexts();
+        self.closeModelPickerFlow();
+        self.closeResumePickerFlow();
         self.command_registry.deinit();
         self.status_data.deinit();
         self.input.deinit();
@@ -460,10 +708,13 @@ pub const Interactive = struct {
         while (self.running) {
             // 1. Drain UI events (owned, thread-safe)
             var event_buf: [64]UiEvent = undefined;
-            const count = self.event_queue.drainInto(&event_buf);
-            for (event_buf[0..count]) |*ev| {
-                self.handleUiEvent(ev);
-                ev.deinit(self.msg_allocator);
+            while (true) {
+                const count = self.event_queue.drainInto(&event_buf);
+                if (count == 0) break;
+                for (event_buf[0..count]) |*ev| {
+                    self.handleUiEvent(ev);
+                    ev.deinit(self.msg_allocator);
+                }
             }
 
             // 2. Poll terminal input (non-blocking: MIN=0, TIME=0)
@@ -504,20 +755,21 @@ pub const Interactive = struct {
             // 3. Check for terminal resize
             _ = self.tui.checkResize();
 
-            // 3b. Tick loader animation
-            if (self.loader_active) {
-                if (self.loader.tick()) {
-                    self.tui.dirty = true;
-                }
+            // 3b. Tick any animated components that reached their deadline.
+            const now_ns = std.time.nanoTimestamp();
+            if (self.tui.tickAnimations(now_ns)) {
+                self.tui.dirty = true;
             }
+
             // 4. Render if dirty
             if (self.tui.dirty) {
                 self.renderFrame();
                 self.tui.dirty = false;
             }
 
-            // 5. Brief sleep to avoid busy-wait (1ms)
-            std.Thread.sleep(1_000_000);
+            // 5. Sleep until the next input/animation deadline, capped so
+            // cross-thread UI events still land promptly without a wake fd.
+            self.sleepUntilNextLoopDeadline();
         }
     }
 
@@ -721,14 +973,14 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .message_end_assistant => |m| {
+                self.transcript.endAssistantMessage();
+                self.tui.dirty = true;
                 if (m.is_aborted) {
                     self.status_text.setContent(m.error_message orelse "aborted");
                     self.status_text.fg = self.theme.fg(.@"error");
-                    self.tui.dirty = true;
                 } else if (m.error_message) |msg| {
                     self.status_text.setContent(userFacingFailureMessage(m.failure_kind, msg));
                     self.status_text.fg = self.theme.fg(.@"error");
-                    self.tui.dirty = true;
                 }
             },
             .tool_start => |t| {
@@ -763,8 +1015,6 @@ pub const Interactive = struct {
                 if (l.success) {
                     self.status_text.setContent(l.message);
                     self.status_text.fg = self.theme.fg(.success);
-                    self.status_data.model_id = self.ca.agent.state.model.id;
-                    self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
                 } else {
                     self.status_text.setContent(l.message);
                     self.status_text.fg = self.theme.fg(.@"error");
@@ -845,6 +1095,7 @@ pub const Interactive = struct {
                                     .thinking => |t| self.transcript.appendThinking(idx, t),
                                 }
                             }
+                            self.transcript.endAssistantMessage();
                         },
                     }
                 }
@@ -868,18 +1119,16 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
+            .status_snapshot => |s| {
+                self.applyStatusSnapshot(s);
+                self.tui.dirty = true;
+            },
             .model_switch_failed => |m| {
                 self.status_text.setContent(m.message);
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
             .model_switched => |m| {
-                // status_data.model_id is a borrow into the live
-                // model in agent state — agent thread already
-                // updated ca.agent.state.model, so reading it here
-                // is safe (the catalog slice is static, no race).
-                self.status_data.model_id = self.ca.agent.state.model.id;
-                self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
                 var buf: [80]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
                 self.status_text.setContent(msg);
@@ -887,7 +1136,6 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .thinking_level_changed => |t| {
-                self.status_data.thinking_level = agentThinkingLabel(self.ca.agent.state.thinking_level);
                 var buf: [96]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{t.level}) catch "thinking level updated";
                 self.status_text.setContent(msg);
@@ -900,6 +1148,14 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
         }
+    }
+
+    fn applyStatusSnapshot(self: *Interactive, snapshot: @FieldType(UiEvent, "status_snapshot")) void {
+        self.status_data.setModelProvider(snapshot.model_provider);
+        self.status_data.setModelId(snapshot.model_id);
+        self.status_data.setThinkingLevel(snapshot.thinking_level);
+        self.status_data.context_tokens = snapshot.context_tokens;
+        self.status_data.context_window = snapshot.context_window;
     }
 
     fn outputHeight(self: *Interactive) u32 {
@@ -984,6 +1240,52 @@ pub const Interactive = struct {
             }
         }
     }
+
+    fn nextLoopDeadlineNs(self: *Interactive, now_ns: i128) ?i128 {
+        var next_deadline: ?i128 = null;
+
+        if (self.input.flush_deadline_ns) |deadline| {
+            next_deadline = deadline;
+        }
+        if (self.kitty_deadline_ns) |deadline| {
+            next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
+        }
+        if (self.tui.nextAnimationDeadline(now_ns)) |deadline| {
+            next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
+        }
+
+        return next_deadline;
+    }
+
+    fn sleepUntilNextLoopDeadline(self: *Interactive) void {
+        const now_ns = std.time.nanoTimestamp();
+        const max_idle_sleep_ns: i128 = 8_333_334; // ≈120 FPS worst-case event latency without wake fd
+        const timeout_ns: i128 = if (self.nextLoopDeadlineNs(now_ns)) |deadline|
+            if (deadline <= now_ns) 0 else @min(deadline - now_ns, max_idle_sleep_ns)
+        else
+            max_idle_sleep_ns;
+        const timeout_ms: i32 = @intCast(@divFloor(timeout_ns + 999_999, 1_000_000));
+
+        var pfds = [2]posix.pollfd{
+            .{
+                .fd = self.tui.terminal.fd_in,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = self.event_queue.wakeReadFd(),
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+
+        const ready = posix.poll(&pfds, timeout_ms) catch return;
+        if (ready <= 0) return;
+        if (pfds[1].revents & posix.POLL.IN != 0) {
+            self.event_queue.acknowledgeWake();
+        }
+    }
+
     fn renderFrame(self: *Interactive) void {
         const w = self.tui.width();
         const h = self.tui.height();
@@ -1037,9 +1339,7 @@ pub const Interactive = struct {
             return;
         };
 
-        // Add user message after successful spawn (prompt_copy is safe to read here —
-        // the agent thread doesn't free it until run() completes)
-        self.transcript.addUserMessage(prompt_copy);
+        self.transcript.addUserMessage(text);
         self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
     }
 
@@ -1167,10 +1467,22 @@ pub const Interactive = struct {
             .max_height_percent = 40,
             .margin_bottom = 0,
             .margin_top = header_h,
+            .surface = .{ .fill = self.theme.bg(.tool_pending_bg) },
         };
     }
 
     // ── Session picker (/resume) ────────────────────────────────
+
+    fn closeResumePickerFlow(self: *Interactive) void {
+        if (self.resume_picker_flow) |*flow| {
+            if (flow.handle) |h| {
+                flow.handle = null;
+                h.hide();
+            }
+            flow.deinit();
+        }
+        self.resume_picker_flow = null;
+    }
 
     fn showSessionPicker(self: *Interactive) void {
         // zi-wub.26: cwd lives on the TUI side (Interactive was
@@ -1181,72 +1493,39 @@ pub const Interactive = struct {
         // session's cwd which in zi is always the process cwd
         // (we don't support per-session cwd switching), so this is
         // strictly equivalent.
-        const sessions = session_store_mod.listSessions(self.allocator, self.editor.cwd) catch {
+        self.closeResumePickerFlow();
+        var flow = ResumePickerFlow.init(self.allocator, self.theme, self.editor.cwd) catch {
             self.status_text.setContent("failed to list sessions");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
         };
+        errdefer flow.deinit();
 
-        if (sessions.len == 0) {
+        if (flow.rows.len == 0) {
             self.status_text.setContent("no sessions found");
             self.status_text.fg = self.theme.fg(.muted);
             return;
         }
 
-        // Build picker items: "first message preview" + "N msgs · relative time"
-        const count = @min(sessions.len, self.session_picker_items.len);
-        for (0..count) |i| {
-            // Format description: "N msgs · time ago"
-            var desc_buf: [64]u8 = undefined;
-            const desc = std.fmt.bufPrint(&desc_buf, "{d} msgs \xC2\xB7 {s}", .{
-                sessions[i].message_count,
-                formatRelativeTime(sessions[i].timestamp),
-            }) catch sessions[i].timestamp;
-
-            self.session_picker_items[i] = .{
-                .value = sessions[i].session_id,
-                .label = sessions[i].first_message,
-                .description = self.allocator.dupe(u8, desc) catch sessions[i].timestamp,
-            };
-            self.session_picker_paths[i] = sessions[i].path;
-        }
-        self.session_picker_count = count;
-
-        // Set up picker with fuzzy search
-        self.session_picker = ListPicker.init(self.theme);
-        self.session_picker.title = "Resume session";
-        self.session_picker.list.max_visible = 10;
-        self.session_picker.setSearchableItems(self.session_picker_items[0..count], null);
-        self.session_picker.on_select = &onSessionSelected;
-        self.session_picker.on_cancel = &onSessionPickerCancel;
-        self.session_picker.callback_ctx = @ptrCast(self);
-
-        // Show as bottom panel overlay (ivy-style, preserves footer)
-        self.session_picker_handle = self.tui.showOverlay(
-            self.session_picker.component(),
+        flow.picker.on_select = &onSessionSelected;
+        flow.picker.on_cancel = &onSessionPickerCancel;
+        flow.picker.callback_ctx = @ptrCast(self);
+        self.resume_picker_flow = flow;
+        self.resume_picker_flow.?.handle = self.tui.showOverlay(
+            self.resume_picker_flow.?.picker.component(),
             self.bottomPanelOptions(),
         );
     }
 
-    fn onSessionSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+    fn onSessionSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
+        const path = if (self.resume_picker_flow) |*flow|
+            if (selection.source_index < flow.rows.len) flow.rows[selection.source_index].path else null
+        else
+            null;
 
-        // Find the path for this selection
-        var selected_path: ?[]const u8 = null;
-        for (0..self.session_picker_count) |i| {
-            if (std.mem.eql(u8, self.session_picker_items[i].value, item.value)) {
-                selected_path = self.session_picker_paths[i];
-                break;
-            }
-        }
-
-        // Dismiss picker
-        if (self.session_picker_handle) |h| {
-            h.hide();
-            self.session_picker_handle = null;
-        }
-
-        const path = selected_path orelse {
+        const selected_path = path orelse {
+            self.closeResumePickerFlow();
             self.status_text.setContent("session not found");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
@@ -1257,6 +1536,7 @@ pub const Interactive = struct {
         // chaos, and our single pre-run drain point would delay the
         // request until the *next* prompt otherwise.
         if (self.is_streaming or self.agent_thread != null) {
+            self.closeResumePickerFlow();
             self.status_text.setContent("cannot resume while agent is running");
             self.status_text.fg = self.theme.fg(.@"error");
             self.tui.dirty = true;
@@ -1265,11 +1545,13 @@ pub const Interactive = struct {
 
         // Clone path into msg_allocator (doctrine R3: cross-thread
         // payload slices must be thread-safe allocated).
-        const path_copy = self.msg_allocator.dupe(u8, path) catch {
+        const path_copy = self.msg_allocator.dupe(u8, selected_path) catch {
+            self.closeResumePickerFlow();
             self.status_text.setContent("out of memory");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
         };
+        self.closeResumePickerFlow();
 
         self.request_queue.push(.{ .resume_session = .{ .path = path_copy } });
 
@@ -1296,10 +1578,7 @@ pub const Interactive = struct {
 
     fn onSessionPickerCancel(ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.session_picker_handle) |h| {
-            h.hide();
-            self.session_picker_handle = null;
-        }
+        self.closeResumePickerFlow();
     }
 
     // ── Model picker (/model) ───────────────────────────────────
@@ -1337,80 +1616,50 @@ pub const Interactive = struct {
         self.applyModelSwitch(m);
     }
 
-    fn freeModelPickerSearchTexts(self: *Interactive) void {
-        for (0..self.model_picker_count) |i| {
-            // Only free if it was heap-allocated (not a static fallback from m.id)
-            const txt = self.model_picker_search_texts[i];
-            if (txt.len > 0 and txt.ptr != self.model_picker_items[i].label.ptr) {
-                self.allocator.free(txt);
+    fn closeModelPickerFlow(self: *Interactive) void {
+        if (self.model_picker_flow) |*flow| {
+            if (flow.handle) |h| {
+                flow.handle = null;
+                h.hide();
             }
+            flow.deinit();
         }
-        self.model_picker_count = 0;
+        self.model_picker_flow = null;
     }
 
     fn showModelPicker(self: *Interactive) void {
-        self.freeModelPickerSearchTexts();
-        const all = self.model_catalog;
-        var count: usize = 0;
+        self.closeModelPickerFlow();
+        var flow = ModelPickerFlow.init(self.allocator, self.theme, self.model_catalog, self.auth_storage) catch {
+            self.status_text.setContent("failed to build model picker");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+        errdefer flow.deinit();
 
-        for (all) |m| {
-            if (count >= self.model_picker_items.len) break;
-            const provider_str = json_util.providerToString(m.provider);
-            if (!self.auth_storage.hasAuth(provider_str)) continue;
-
-            self.model_picker_models[count] = m;
-            self.model_picker_items[count] = .{
-                .value = m.id,
-                .label = m.id,
-                .description = provider_str,
-            };
-            var search_buf: [128]u8 = undefined;
-            const search_text = std.fmt.bufPrint(&search_buf, "{s} {s}", .{ provider_str, m.id }) catch m.id;
-            self.model_picker_search_texts[count] = self.allocator.dupe(u8, search_text) catch m.id;
-            count += 1;
-        }
-        self.model_picker_count = count;
-
-        if (count == 0) {
+        if (flow.rows.len == 0) {
             self.status_text.setContent("no models available");
             self.status_text.fg = self.theme.fg(.muted);
             return;
         }
-        self.model_picker = ListPicker.init(self.theme);
-        self.model_picker.title = "Select model";
-        self.model_picker.list.max_visible = 12;
-        self.model_picker.setSearchableItems(
-            self.model_picker_items[0..count],
-            self.model_picker_search_texts[0..count],
-        );
-        self.model_picker.on_select = &onModelSelected;
-        self.model_picker.on_cancel = &onModelPickerCancel;
-        self.model_picker.callback_ctx = @ptrCast(self);
 
-        self.model_picker_handle = self.tui.showOverlay(
-            self.model_picker.component(),
+        flow.picker.on_select = &onModelSelected;
+        flow.picker.on_cancel = &onModelPickerCancel;
+        flow.picker.callback_ctx = @ptrCast(self);
+        self.model_picker_flow = flow;
+        self.model_picker_flow.?.handle = self.tui.showOverlay(
+            self.model_picker_flow.?.picker.component(),
             self.bottomPanelOptions(),
         );
     }
 
-    fn onModelSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+    fn onModelSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
+        const selected_model = if (self.model_picker_flow) |*flow|
+            if (selection.source_index < flow.rows.len) flow.rows[selection.source_index].model else null
+        else
+            null;
 
-        var selected_model: ?ai_protocol.Model = null;
-        for (0..self.model_picker_count) |i| {
-            if (std.mem.eql(u8, self.model_picker_items[i].value, item.value) and
-                std.mem.eql(u8, self.model_picker_items[i].description.?, item.description.?))
-            {
-                selected_model = self.model_picker_models[i];
-                break;
-            }
-        }
-
-        if (self.model_picker_handle) |h| {
-            h.hide();
-            self.model_picker_handle = null;
-        }
-        self.freeModelPickerSearchTexts();
+        self.closeModelPickerFlow();
 
         const m = selected_model orelse {
             self.status_text.setContent("model not found");
@@ -1423,11 +1672,7 @@ pub const Interactive = struct {
 
     fn onModelPickerCancel(ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.model_picker_handle) |h| {
-            h.hide();
-            self.model_picker_handle = null;
-        }
-        self.freeModelPickerSearchTexts();
+        self.closeModelPickerFlow();
     }
 
     /// Enqueue a /model switch through the AgentRequest queue
@@ -1503,22 +1748,15 @@ pub const Interactive = struct {
         );
     }
 
-    fn onSettingsSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+    fn onSettingsSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        var action: ?SettingsAction = null;
-        for (0..self.settings_picker_count) |i| {
-            if (std.mem.eql(u8, self.settings_picker_items[i].value, item.value)) {
-                action = self.settings_picker_actions[i];
-                break;
-            }
-        }
-
         if (self.settings_picker_handle) |h| {
             h.hide();
             self.settings_picker_handle = null;
         }
+        if (selection.source_index >= self.settings_picker_count) return;
 
-        switch (action orelse return) {
+        switch (self.settings_picker_actions[selection.source_index]) {
             .open_thinking => self.showThinkingLevelPicker(),
             .toggle_hide_thinking => {
                 self.hide_thinking_block = !self.hide_thinking_block;
@@ -1540,7 +1778,13 @@ pub const Interactive = struct {
     }
 
     fn showThinkingLevelPicker(self: *Interactive) void {
-        const available = coding_agent_mod.AgentSession.getAvailableThinkingLevelsForModel(self.ca.agent.state.model);
+        const model = currentStatusModel(self) orelse {
+            self.status_text.setContent("current model unavailable");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        };
+        const available = coding_agent_mod.AgentSession.getAvailableThinkingLevelsForModel(model);
         const count = @min(available.len, self.thinking_picker_items.len);
         for (0..count) |i| {
             const level = available[i];
@@ -1560,9 +1804,8 @@ pub const Interactive = struct {
         self.thinking_picker.on_cancel = &onThinkingLevelPickerCancel;
         self.thinking_picker.callback_ctx = @ptrCast(self);
 
-        const current = self.ca.agent.state.thinking_level;
         for (0..count) |i| {
-            if (self.thinking_picker_levels[i] == current) {
+            if (std.mem.eql(u8, self.thinking_picker_items[i].value, self.status_data.thinking_level)) {
                 self.thinking_picker.list.selected_index = @intCast(i);
                 break;
             }
@@ -1574,23 +1817,15 @@ pub const Interactive = struct {
         );
     }
 
-    fn onThinkingLevelSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+    fn onThinkingLevelSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        var selected: ?agent_protocol.ThinkingLevel = null;
-        for (0..self.thinking_picker_count) |i| {
-            if (std.mem.eql(u8, self.thinking_picker_items[i].value, item.value)) {
-                selected = self.thinking_picker_levels[i];
-                break;
-            }
-        }
-
         if (self.thinking_picker_handle) |h| {
             h.hide();
             self.thinking_picker_handle = null;
         }
 
-        if (selected) |level| {
-            self.applyThinkingLevelChange(level);
+        if (selection.source_index < self.thinking_picker_count) {
+            self.applyThinkingLevelChange(self.thinking_picker_levels[selection.source_index]);
         }
     }
 
@@ -1660,13 +1895,13 @@ pub const Interactive = struct {
         );
     }
 
-    fn onLoginProviderSelected(item: *const SelectItem, ctx: ?*anyopaque) void {
+    fn onLoginProviderSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         if (self.login_picker_handle) |h| {
             h.hide();
             self.login_picker_handle = null;
         }
-        self.startLogin(item.value);
+        self.startLogin(selection.item.value);
     }
 
     fn onLoginPickerCancel(ctx: ?*anyopaque) void {
@@ -1800,63 +2035,6 @@ pub const Interactive = struct {
         self.event_queue.push(.{ .login_progress = .{ .message = owned, .kind = .info } });
     }
 
-    /// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y"
-    fn formatRelativeTime(iso_ts: []const u8) []const u8 {
-        // Parse "YYYY-MM-DDThh:mm:ss" → epoch seconds
-        if (iso_ts.len < 19) return iso_ts;
-        const year = std.fmt.parseInt(i64, iso_ts[0..4], 10) catch return iso_ts;
-        const month = std.fmt.parseInt(u8, iso_ts[5..7], 10) catch return iso_ts;
-        const day = std.fmt.parseInt(u8, iso_ts[8..10], 10) catch return iso_ts;
-        const hour = std.fmt.parseInt(u8, iso_ts[11..13], 10) catch return iso_ts;
-        const min = std.fmt.parseInt(u8, iso_ts[14..16], 10) catch return iso_ts;
-        const sec = std.fmt.parseInt(u8, iso_ts[17..19], 10) catch return iso_ts;
-
-        // Rough epoch calculation (no leap second precision needed for "time ago")
-        const days_in_month = [_]u16{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
-        if (month < 1 or month > 12) return iso_ts;
-        const year_days = (year - 1970) * 365 + @divTrunc(year - 1969, 4);
-        const month_days: i64 = days_in_month[month - 1];
-        const ts_epoch = (year_days + month_days + day - 1) * 86400 + @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
-
-        const now = std.time.timestamp();
-        const diff = now - ts_epoch;
-        if (diff < 0) return "now";
-
-        const diff_u: u64 = @intCast(diff);
-        if (diff_u < 60) return "now";
-        if (diff_u < 3600) {
-            const mins = diff_u / 60;
-            return switch (mins) {
-                1 => "1m",
-                2 => "2m",
-                3 => "3m",
-                5 => "5m",
-                10 => "10m",
-                15 => "15m",
-                30 => "30m",
-                else => if (mins < 5) "few min" else if (mins < 30) "<30m" else "<1h",
-            };
-        }
-        if (diff_u < 86400) {
-            const hours = diff_u / 3600;
-            return switch (hours) {
-                1 => "1h",
-                2 => "2h",
-                3 => "3h",
-                else => if (hours < 12) "<12h" else "<1d",
-            };
-        }
-        const days = diff_u / 86400;
-        if (days == 1) return "yesterday";
-        if (days < 7) return if (days == 2) "2d" else if (days < 4) "few days" else "<1w";
-        if (days < 30) return if (days < 14) "1w" else if (days < 21) "2w" else "3w";
-        if (days < 365) {
-            const months = days / 30;
-            return if (months <= 1) "1mo" else if (months <= 2) "2mo" else if (months <= 6) "<6mo" else "<1y";
-        }
-        return ">1y";
-    }
-
     /// Agent worker thread entry point. Handles both streaming
     /// prompts and drain-only request work (zi-wub.15). This is the
     /// ONLY path that runs on the agent thread — any future work
@@ -1966,9 +2144,15 @@ pub const Interactive = struct {
         // Agent-thread state mutations (doctrine: session_store +
         // ca.agent.state are agent-owned). Safe here — we're on the
         // agent thread and no stream is in flight.
-        self.ca.session_store.deinit();
-        self.ca.session_store = loaded.takeStore();
+        var new_store = loaded.takeStore();
+        errdefer new_store.deinit();
+        self.ca.replaceSessionStore(new_store) catch {
+            const msg = self.msg_allocator.dupe(u8, "failed to bind resumed session") catch return;
+            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
+            return;
+        };
         self.ca.agent.loadMessages(loaded.messages);
+        self.ca.agent.state.thinking_level = parseAgentThinkingLevel(loaded.thinking_level);
 
         // pi-mono parity: if the session recorded a last model,
         // route it through `restoreModelFromSession`. Falls back to
@@ -2060,6 +2244,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
+        self.publishStatusSnapshot();
         self.event_queue.push(.{ .session_resumed = .{
             .entries = owned_entries,
             .restore_warning = restore_warning,
@@ -2073,6 +2258,7 @@ pub const Interactive = struct {
     fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
         switch (self.ca.trySetModel(m)) {
             .success => |switched| {
+                self.publishStatusSnapshot();
                 const provider_str = json_util.providerToString(switched.model.provider);
                 const provider_copy = self.msg_allocator.dupe(u8, provider_str) catch return;
                 const id_copy = self.msg_allocator.dupe(u8, switched.model.id) catch {
@@ -2097,8 +2283,27 @@ pub const Interactive = struct {
         }
     }
 
+    fn publishStatusSnapshot(self: *Interactive) void {
+        const provider_copy = self.msg_allocator.dupe(u8, json_util.providerToString(self.ca.agent.state.model.provider)) catch return;
+        errdefer self.msg_allocator.free(provider_copy);
+        const model_id_copy = self.msg_allocator.dupe(u8, self.ca.agent.state.model.id) catch return;
+        errdefer self.msg_allocator.free(model_id_copy);
+        const thinking_copy = self.msg_allocator.dupe(u8, agentThinkingLabel(self.ca.agent.state.thinking_level)) catch return;
+        errdefer self.msg_allocator.free(thinking_copy);
+
+        const usage = self.ca.getContextUsage();
+        self.event_queue.push(.{ .status_snapshot = .{
+            .model_provider = provider_copy,
+            .model_id = model_id_copy,
+            .thinking_level = thinking_copy,
+            .context_tokens = if (usage) |u| u.tokens else null,
+            .context_window = if (usage) |u| u.context_window else self.ca.agent.state.model.context_window,
+        } });
+    }
+
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         const result = self.ca.trySetThinkingLevel(level);
+        self.publishStatusSnapshot();
         const level_copy = self.msg_allocator.dupe(u8, agentThinkingValue(result.level)) catch return;
         self.event_queue.push(.{ .thinking_level_changed = .{ .level = level_copy } });
     }
@@ -2108,8 +2313,18 @@ pub const Interactive = struct {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         switch (event) {
             .agent_event => |agent_event| {
-                const ui_event = convertAgentEvent(agent_event, self.msg_allocator) orelse return;
+                const ui_event = convertAgentEvent(agent_event, self.msg_allocator) orelse switch (agent_event) {
+                    .turn_end => {
+                        self.publishStatusSnapshot();
+                        return;
+                    },
+                    else => return,
+                };
                 self.event_queue.push(ui_event);
+                switch (agent_event) {
+                    .turn_end => self.publishStatusSnapshot(),
+                    else => {},
+                }
             },
             .phase_changed => |pc| {
                 if (pc.from == .waiting_to_retry and pc.to == .running_continue) {
@@ -2136,7 +2351,10 @@ pub const Interactive = struct {
                     .final_error = final_error,
                 } });
             },
-            .compaction_start, .compaction_end => {},
+            .compaction_start => {},
+            .compaction_end => {
+                self.publishStatusSnapshot();
+            },
         }
     }
 };
@@ -2317,9 +2535,30 @@ fn agentThinkingValue(level: agent_protocol.ThinkingLevel) []const u8 {
     };
 }
 
+fn parseAgentThinkingLevel(value: []const u8) agent_protocol.ThinkingLevel {
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    return .off;
+}
+
 fn currentThinkingSettingsDescription(self: *const Interactive) []const u8 {
-    if (!self.ca.agent.state.model.reasoning) return "Current model does not support thinking";
-    return agentThinkingValue(self.ca.agent.state.thinking_level);
+    const model = currentStatusModel(self) orelse return "Current model unavailable";
+    if (!model.reasoning) return "Current model does not support thinking";
+    return self.status_data.thinking_level;
+}
+
+fn currentStatusModel(self: *const Interactive) ?ai_protocol.Model {
+    for (self.model_catalog) |model| {
+        if (std.mem.eql(u8, json_util.providerToString(model.provider), self.status_data.model_provider) and
+            std.mem.eql(u8, model.id, self.status_data.model_id))
+        {
+            return model;
+        }
+    }
+    return null;
 }
 
 fn thinkingDescription(level: agent_protocol.ThinkingLevel) []const u8 {
