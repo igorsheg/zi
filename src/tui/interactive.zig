@@ -673,6 +673,7 @@ pub const Interactive = struct {
         self.active_editor.setBorderColor(self.theme.fg(.border_muted));
         self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
+        self.seedEditorHistoryFromCurrentSession();
         self.session_controller.wire();
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
@@ -1086,6 +1087,7 @@ pub const Interactive = struct {
             },
             .session_resumed => |r| {
                 self.transcript.clearAll();
+                self.repopulateEditorHistoryFromResumedEntries(r.entries);
                 for (r.entries) |entry| {
                     switch (entry) {
                         .user_text => |t| self.transcript.addUserMessage(t),
@@ -1158,6 +1160,33 @@ pub const Interactive = struct {
         self.status_data.setThinkingLevel(snapshot.thinking_level);
         self.status_data.context_tokens = snapshot.context_tokens;
         self.status_data.context_window = snapshot.context_window;
+    }
+
+    fn repopulateEditorHistoryFromResumedEntries(self: *Interactive, entries: []const ResumedEntry) void {
+        self.active_editor.clearHistory();
+        for (entries) |entry| {
+            switch (entry) {
+                .user_text => |t| self.active_editor.addToHistory(t),
+                .assistant_message => {},
+            }
+        }
+    }
+
+    fn seedEditorHistoryFromCurrentSession(self: *Interactive) void {
+        // Bind-time snapshot only: interactive owns the editor and no
+        // agent worker exists yet, so seeding recall from the already-
+        // loaded session state preserves the ownership doctrine without
+        // introducing a live TUI→agent read path.
+        self.active_editor.clearHistory();
+        for (self.ca.agent.state.messages) |msg| {
+            switch (msg) {
+                .user => |u| switch (u.content) {
+                    .text => |t| self.active_editor.addToHistory(t),
+                    else => {},
+                },
+                else => {},
+            }
+        }
     }
 
     fn outputHeight(self: *Interactive) u32 {
@@ -1323,6 +1352,8 @@ pub const Interactive = struct {
     fn onEditorSubmit(text: []const u8, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         if (text.len == 0) return;
+
+        self.active_editor.addToHistory(text);
 
         // Slash command dispatch
         if (text[0] == '/') {

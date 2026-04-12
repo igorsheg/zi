@@ -94,11 +94,86 @@ pub fn bucketForColumn(cfg: Config, phase: u32, visual_col: u32) Bucket {
     return .edge;
 }
 
+pub fn strengthForColumn(cfg: Config, phase: u32, visual_col: u32) u8 {
+    const text_pos = @as(i64, cfg.lead_pad_cols) + @as(i64, visual_col);
+    const center = @as(i64, phase);
+    const dist = if (text_pos >= center) text_pos - center else center - text_pos;
+    const radius = @as(i64, cfg.band_half_width);
+    if (radius <= 0) return if (dist == 0) 255 else 0;
+    if (dist > radius) return 0;
+
+    const numerator = (radius - dist + 1) * 255;
+    const denominator = radius + 1;
+    return @intCast(@min(@divTrunc(numerator, denominator), 255));
+}
+
+pub fn floorStrength(raw_strength: u8, floor: u8) u8 {
+    const raw: i32 = raw_strength;
+    const floor_i: i32 = floor;
+    if (raw <= floor_i) return 0;
+
+    const numer = (raw - floor_i) * 255;
+    const denom = 255 - floor_i;
+    return @intCast(@divTrunc(numer, denom));
+}
+
+pub fn lerpColor(from: Color, to: Color, t: u8) Color {
+    if (from.is_default) return if (t == 0) from else to;
+    if (to.is_default) return if (t == 255) to else from;
+
+    return .{
+        .r = lerpChannel(from.r, to.r, t),
+        .g = lerpChannel(from.g, to.g, t),
+        .b = lerpChannel(from.b, to.b, t),
+        .is_default = false,
+    };
+}
+
+pub fn writeSmooth(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, phase: u32, floor: u8) u32 {
+    if (text.len == 0 or y >= region.height or x >= region.width) return 0;
+
+    var written_cols: u32 = 0;
+    var visual_col: u32 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const char_start = i;
+        const width = decodeWidth(text, &i);
+        const strength = floorStrength(strengthForColumn(cfg, phase, visual_col), floor);
+        const fg = if (strength == 0) cfg.base_fg else lerpColor(cfg.base_fg, cfg.peak_fg, strength);
+        const attrs = if (strength >= 224) mergeAttrs(cfg.base_attrs, cfg.peak_attrs) else cfg.base_attrs;
+        written_cols += region.writeStr(x + written_cols, y, text[char_start..i], fg, Color.default, attrs);
+        visual_col += width;
+    }
+
+    return written_cols;
+}
+
 fn flushRun(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, bucket: Bucket) u32 {
     return switch (bucket) {
         .base => region.writeStr(x, y, text, cfg.base_fg, Color.default, cfg.base_attrs),
         .edge => region.writeStr(x, y, text, cfg.edge_fg, Color.default, cfg.edge_attrs),
         .peak => region.writeStr(x, y, text, cfg.peak_fg, Color.default, cfg.peak_attrs),
+    };
+}
+
+fn lerpChannel(from: u8, to: u8, t: u8) u8 {
+    const from_i: i32 = from;
+    const to_i: i32 = to;
+    const delta = to_i - from_i;
+    const value = from_i + @divTrunc(delta * @as(i32, t), 255);
+    return @intCast(@max(0, @min(value, 255)));
+}
+
+fn mergeAttrs(base: Attributes, overlay: Attributes) Attributes {
+    return .{
+        .bold = base.bold or overlay.bold,
+        .dim = base.dim or overlay.dim,
+        .italic = base.italic or overlay.italic,
+        .underline = base.underline or overlay.underline,
+        .blink = base.blink or overlay.blink,
+        .inverse = base.inverse or overlay.inverse,
+        .hidden = base.hidden or overlay.hidden,
+        .strikethrough = base.strikethrough or overlay.strikethrough,
     };
 }
 

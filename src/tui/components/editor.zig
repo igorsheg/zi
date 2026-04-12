@@ -33,6 +33,7 @@ const Theme = theme_mod.Theme;
 pub const Editor = struct {
     buf: std.ArrayList(u8),
     history: std.ArrayList([]u8),
+    history_index: i32 = -1,
     cursor_byte: u32 = 0,
     cursor_col: u32 = 0,
     scroll_x: u32 = 0,
@@ -40,7 +41,7 @@ pub const Editor = struct {
     max_visible_lines: u32 = 10,
     last_content_width: u32 = 80,
     last_applied_padding_x: u32 = 0,
-    prompt: []const u8 = "> ",
+    prompt: []const u8 = "",
     on_submit: ?EditorInterface.SubmitCallback = null,
     on_submit_ctx: ?*anyopaque = null,
     on_change: ?EditorInterface.ChangeCallback = null,
@@ -97,24 +98,14 @@ pub const Editor = struct {
 
     pub fn clear(self: *Editor) void {
         self.cancelAutocomplete();
-        self.buf.items.len = 0;
-        self.cursor_byte = 0;
-        self.cursor_col = 0;
-        self.scroll_x = 0;
-        self.scroll_y = 0;
-        self.notifyChange();
+        self.history_index = -1;
+        self.setTextInternal("");
     }
 
     pub fn setText(self: *Editor, text: []const u8) void {
         self.cancelAutocomplete();
-        self.buf.items.len = 0;
-        self.buf.appendSlice(self.allocator, text) catch return;
-        self.cursor_byte = @intCast(text.len);
-        const last_line_start = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |pos| pos + 1 else 0;
-        self.cursor_col = @intCast(grapheme_mod.strWidth(text[last_line_start..]));
-        self.scroll_x = 0;
-        self.ensureCursorVisible();
-        self.notifyChange();
+        self.history_index = -1;
+        self.setTextInternal(text);
     }
 
     pub fn insertText(self: *Editor, text: []const u8) void {
@@ -122,6 +113,7 @@ pub const Editor = struct {
     }
 
     pub fn insertTextAtCursor(self: *Editor, text: []const u8) void {
+        self.history_index = -1;
         self.buf.insertSlice(self.allocator, self.cursor_byte, text) catch return;
         var i: usize = 0;
         while (i < text.len) {
@@ -140,6 +132,14 @@ pub const Editor = struct {
         self.ensureCursorVisible();
         self.tryAutocomplete();
         self.notifyChange();
+    }
+
+    pub fn clearHistory(self: *Editor) void {
+        for (self.history.items) |entry| {
+            self.allocator.free(entry);
+        }
+        self.history.items.len = 0;
+        self.history_index = -1;
     }
 
     pub fn addToHistory(self: *Editor, text: []const u8) void {
@@ -275,6 +275,52 @@ pub const Editor = struct {
         }
     }
 
+    fn setTextInternal(self: *Editor, text: []const u8) void {
+        self.buf.items.len = 0;
+        self.buf.appendSlice(self.allocator, text) catch return;
+        self.cursor_byte = @intCast(text.len);
+        const last_line_start = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |pos| pos + 1 else 0;
+        self.cursor_col = @intCast(grapheme_mod.strWidth(text[last_line_start..]));
+        self.scroll_x = 0;
+        self.scroll_y = 0;
+        self.ensureCursorVisible();
+        self.notifyChange();
+    }
+
+    fn isEditorEmpty(self: *const Editor) bool {
+        return self.buf.items.len == 0;
+    }
+
+    fn isOnFirstVisualLine(self: *Editor) bool {
+        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return true;
+        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return true;
+        return cursor.visual_row == 0;
+    }
+
+    fn isOnLastVisualLine(self: *Editor) bool {
+        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return true;
+        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return true;
+        return cursor.visual_row + 1 >= wrapped_lines.len;
+    }
+
+    fn navigateHistory(self: *Editor, direction: i32) void {
+        if (self.history.items.len == 0) return;
+
+        const max_index: i32 = @intCast(self.history.items.len);
+        const new_index = self.history_index - direction;
+        if (new_index < -1 or new_index >= max_index) return;
+
+        self.history_index = new_index;
+        self.cancelAutocomplete();
+
+        if (self.history_index == -1) {
+            self.setTextInternal("");
+        } else {
+            const idx: usize = @intCast(self.history_index);
+            self.setTextInternal(self.history.items[idx]);
+        }
+    }
+
     // --- Input handling ---
 
     pub fn handleInput(self: *Editor, key: Key) bool {
@@ -344,6 +390,7 @@ pub const Editor = struct {
             .char => {
                 if (key.ctrl) return false;
                 if (key.char) |cp| {
+                    self.history_index = -1;
                     var utf8_buf: [4]u8 = undefined;
                     const len = std.unicode.utf8Encode(cp, &utf8_buf) catch return false;
                     self.buf.insertSlice(self.allocator, self.cursor_byte, utf8_buf[0..len]) catch return false;
@@ -357,6 +404,7 @@ pub const Editor = struct {
                 return false;
             },
             .backspace => {
+                self.history_index = -1;
                 if (self.cursor_byte == 0) return true;
                 if (self.buf.items[self.cursor_byte - 1] == '\n') {
                     const prev = self.cursor_byte - 1;
@@ -386,6 +434,7 @@ pub const Editor = struct {
                 return true;
             },
             .delete => {
+                self.history_index = -1;
                 if (self.cursor_byte >= self.buf.items.len) return true;
                 if (self.buf.items[self.cursor_byte] == '\n') {
                     const items = self.buf.items;
@@ -434,25 +483,29 @@ pub const Editor = struct {
                 return true;
             },
             .up => {
-                const cur_line = self.cursorLine();
-                if (cur_line == 0) return true;
-                const target_col = self.cursor_col;
-                const prev_line_start = self.lineStartByIndex(cur_line - 1);
-                const prev_line_end = self.currentLineStart() - 1;
-                self.cursor_byte = self.byteAtDisplayCol(prev_line_start, prev_line_end, target_col);
-                self.cursor_col = self.displayColAtByte(self.cursor_byte);
-                self.ensureCursorVisible();
+                if (self.isEditorEmpty()) {
+                    self.navigateHistory(-1);
+                } else if (self.history_index > -1 and self.isOnFirstVisualLine()) {
+                    self.navigateHistory(-1);
+                } else if (self.isOnFirstVisualLine()) {
+                    self.cursor_byte = self.currentLineStart();
+                    self.cursor_col = 0;
+                    self.ensureCursorVisible();
+                } else {
+                    self.moveCursorVisual(-1);
+                }
                 return true;
             },
             .down => {
-                const cur_line = self.cursorLine();
-                if (cur_line + 1 >= self.lineCount()) return true;
-                const target_col = self.cursor_col;
-                const next_line_start = self.lineStartByIndex(cur_line + 1);
-                const next_line_end = self.lineEndByStart(next_line_start);
-                self.cursor_byte = self.byteAtDisplayCol(next_line_start, next_line_end, target_col);
-                self.cursor_col = self.displayColAtByte(self.cursor_byte);
-                self.ensureCursorVisible();
+                if (self.history_index > -1 and self.isOnLastVisualLine()) {
+                    self.navigateHistory(1);
+                } else if (self.isOnLastVisualLine()) {
+                    self.cursor_byte = self.currentLineEnd();
+                    self.cursor_col = self.displayColAtByte(self.cursor_byte);
+                    self.ensureCursorVisible();
+                } else {
+                    self.moveCursorVisual(1);
+                }
                 return true;
             },
             .home => {
@@ -851,12 +904,33 @@ pub const Editor = struct {
     }
 
     fn insertNewline(self: *Editor) void {
+        self.history_index = -1;
         self.buf.insertSlice(self.allocator, self.cursor_byte, "\n") catch return;
         self.cursor_byte += 1;
         self.cursor_col = 0;
         self.ensureCursorVisible();
         self.tryAutocomplete();
         self.notifyChange();
+    }
+
+    fn moveCursorVisual(self: *Editor, direction: i32) void {
+        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return;
+        if (wrapped_lines.len == 0) return;
+        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return;
+
+        const current_row: i32 = @intCast(cursor.visual_row);
+        const max_rows: i32 = @intCast(wrapped_lines.len);
+        const target_row = current_row + direction;
+        if (target_row < 0 or target_row >= max_rows) return;
+
+        const current_idx: usize = @intCast(cursor.visual_row);
+        const current_line = wrapped_lines[current_idx];
+        const visual_col = cursor.x - current_line.text_x;
+        const target_idx: usize = @intCast(target_row);
+        const target_line = wrapped_lines[target_idx];
+        self.cursor_byte = self.byteAtDisplayCol(target_line.start, target_line.end, visual_col);
+        self.cursor_col = self.displayColAtByte(self.cursor_byte);
+        self.ensureCursorVisible();
     }
 
     fn currentLineStart(self: *const Editor) u32 {
@@ -1002,8 +1076,7 @@ test "Editor renders prompt and text to buffer" {
     defer buf.deinit();
     editor.render(buf.region());
     try std.testing.expectEqual(@as(u21, 0x256D), buf.get(0, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, '>'), buf.get(1, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'x'), buf.get(3, 1).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'x'), buf.get(1, 1).grapheme.codepoint);
     try std.testing.expectEqual(@as(u21, 0x2570), buf.get(0, 2).grapheme.codepoint);
 }
 
@@ -1374,4 +1447,54 @@ test "editor submit can be disabled through parity seam" {
     editor.setSubmitDisabled(false);
     _ = editor.handleInput(.{ .code = .enter });
     try std.testing.expectEqual(@as(u32, 1), submit_calls);
+}
+
+test "editor recalls most recent history entry on up from empty input" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    editor.addToHistory("first prompt");
+    editor.addToHistory("second prompt");
+
+    _ = editor.handleInput(.{ .code = .up });
+    try std.testing.expectEqualStrings("second prompt", editor.getText());
+
+    _ = editor.handleInput(.{ .code = .up });
+    try std.testing.expectEqualStrings("first prompt", editor.getText());
+}
+
+test "editor returns to empty input on down after history browse" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    editor.addToHistory("prompt");
+
+    _ = editor.handleInput(.{ .code = .up });
+    try std.testing.expectEqualStrings("prompt", editor.getText());
+
+    _ = editor.handleInput(.{ .code = .down });
+    try std.testing.expectEqualStrings("", editor.getText());
+}
+
+test "editor keeps multiline history active until cursor reaches top or bottom visual line" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    editor.addToHistory("older entry");
+    editor.addToHistory("line1\nline2\nline3");
+
+    _ = editor.handleInput(.{ .code = .up });
+    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
+
+    _ = editor.handleInput(.{ .code = .up });
+    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
+
+    _ = editor.handleInput(.{ .code = .up });
+    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
+
+    _ = editor.handleInput(.{ .code = .up });
+    try std.testing.expectEqualStrings("older entry", editor.getText());
+
+    _ = editor.handleInput(.{ .code = .down });
+    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
 }

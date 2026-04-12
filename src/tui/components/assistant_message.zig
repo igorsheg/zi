@@ -6,14 +6,13 @@ const markdown_mod = @import("markdown.zig");
 const text_mod = @import("text.zig");
 const theme_mod = @import("../theme.zig");
 const shimmer_mod = @import("../shimmer.zig");
+const word_wrap_mod = @import("../word_wrap.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
 const Buffer = buffer_mod.Buffer;
 const Attributes = cell_mod.Attributes;
-const Cell = cell_mod.Cell;
-const Color = cell_mod.Color;
 const Shimmer = shimmer_mod.Config;
 
 pub const AssistantMessage = struct {
@@ -263,6 +262,12 @@ pub const AssistantMessage = struct {
 
     fn renderComponentWithScroll(self: *AssistantMessage, block: *Block, region: Region, skip: u32, comp_h: u32) void {
         _ = comp_h;
+
+        if (self.isActiveThinkingBlock(block)) {
+            self.renderActiveThinkingBlock(block, region, skip);
+            return;
+        }
+
         switch (block.render_kind) {
             .markdown => {
                 const md = block.markdown;
@@ -279,10 +284,6 @@ pub const AssistantMessage = struct {
                 txt.scroll_offset = saved;
             },
         }
-
-        if (self.isActiveThinkingBlock(block)) {
-            self.applyThinkingShimmer(region);
-        }
     }
 
     fn isActiveThinkingBlock(self: *AssistantMessage, block: *const Block) bool {
@@ -292,20 +293,43 @@ pub const AssistantMessage = struct {
             false;
     }
 
-    fn applyThinkingShimmer(self: *AssistantMessage, region: Region) void {
+    fn renderActiveThinkingBlock(self: *AssistantMessage, block: *const Block, region: Region, skip: u32) void {
         if (region.width == 0 or region.height == 0) return;
 
-        const cfg = self.thinkingShimmerConfig();
-        var row: u32 = 0;
-        while (row < region.height) : (row += 1) {
-            var col: u32 = 0;
-            while (col < region.width) : (col += 1) {
-                const cell = region.get(col, row);
-                if (cell.eql(Cell.blank)) continue;
+        const text = self.activeThinkingText(block);
+        const pad_x: u32 = switch (block.render_kind) {
+            .markdown => block.markdown.padding_x,
+            .label => block.label.padding_x,
+        };
+        const base_attrs: Attributes = switch (block.render_kind) {
+            .markdown => block.markdown.attrs,
+            .label => block.label.attrs,
+        };
 
-                const strength = shimmerStrength(cfg, self.shimmer_phase, col);
-                region.set(col, row, styleCellForStrength(cell, cfg, strength));
-            }
+        const content_width: usize = @intCast(if (region.width > pad_x * 2) region.width - pad_x * 2 else 1);
+        const lines = word_wrap_mod.wordWrap(text, content_width, self.allocator) catch return;
+        defer self.allocator.free(lines);
+
+        var cfg = self.thinkingShimmerConfig();
+        cfg.base_attrs = base_attrs;
+        cfg.edge_attrs = base_attrs;
+        cfg.peak_attrs = base_attrs;
+
+        var row: u32 = 0;
+        var virtual_row: u32 = skip;
+        while (row < region.height) {
+            if (virtual_row >= lines.len) break;
+            _ = shimmer_mod.writeSmooth(
+                region,
+                pad_x,
+                row,
+                lines[virtual_row].text(text),
+                cfg,
+                self.shimmer_phase,
+                96,
+            );
+            row += 1;
+            virtual_row += 1;
         }
     }
 
@@ -340,67 +364,6 @@ pub const AssistantMessage = struct {
         };
     }
 };
-
-fn styleCellForStrength(cell: Cell, cfg: Shimmer, strength: u8) Cell {
-    var styled = cell;
-    styled.bg = Color.default;
-
-    if (strength == 0) {
-        styled.attrs = cell.attrs;
-        return styled;
-    }
-
-    const base_fg = if (cell.fg.is_default) cfg.base_fg else cell.fg;
-    styled.fg = lerpColor(base_fg, cfg.peak_fg, strength);
-    styled.attrs = if (strength >= 224) mergeAttrs(cell.attrs, cfg.peak_attrs) else cell.attrs;
-    return styled;
-}
-
-fn shimmerStrength(cfg: Shimmer, phase: u32, visual_col: u32) u8 {
-    const text_pos = @as(i64, cfg.lead_pad_cols) + @as(i64, visual_col);
-    const center = @as(i64, phase);
-    const dist = if (text_pos >= center) text_pos - center else center - text_pos;
-    const radius = @as(i64, cfg.band_half_width);
-    if (radius <= 0) return if (dist == 0) 255 else 0;
-    if (dist > radius) return 0;
-
-    const numerator = (radius - dist + 1) * 255;
-    const denominator = radius + 1;
-    return @intCast(@min(@divTrunc(numerator, denominator), 255));
-}
-
-fn lerpColor(from: Color, to: Color, t: u8) Color {
-    if (from.is_default) return if (t == 0) from else to;
-    if (to.is_default) return if (t == 255) to else from;
-
-    return .{
-        .r = lerpChannel(from.r, to.r, t),
-        .g = lerpChannel(from.g, to.g, t),
-        .b = lerpChannel(from.b, to.b, t),
-        .is_default = false,
-    };
-}
-
-fn lerpChannel(from: u8, to: u8, t: u8) u8 {
-    const from_i: i32 = from;
-    const to_i: i32 = to;
-    const delta = to_i - from_i;
-    const value = from_i + @divTrunc(delta * @as(i32, t), 255);
-    return @intCast(@max(0, @min(value, 255)));
-}
-
-fn mergeAttrs(base: Attributes, overlay: Attributes) Attributes {
-    return .{
-        .bold = base.bold or overlay.bold,
-        .dim = base.dim or overlay.dim,
-        .italic = base.italic or overlay.italic,
-        .underline = base.underline or overlay.underline,
-        .blink = base.blink or overlay.blink,
-        .inverse = base.inverse or overlay.inverse,
-        .hidden = base.hidden or overlay.hidden,
-        .strikethrough = base.strikethrough or overlay.strikethrough,
-    };
-}
 
 const testing = std.testing;
 

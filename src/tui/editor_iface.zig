@@ -27,6 +27,7 @@ pub const EditorInterface = struct {
         set_text: *const fn (ptr: *anyopaque, text: []const u8) void,
         insert_text_at_cursor: *const fn (ptr: *anyopaque, text: []const u8) void,
         clear: *const fn (ptr: *anyopaque) void,
+        clear_history: *const fn (ptr: *anyopaque) void,
         add_to_history: *const fn (ptr: *anyopaque, text: []const u8) void,
         set_on_submit: *const fn (ptr: *anyopaque, cb: ?SubmitCallback, ctx: ?*anyopaque) void,
         set_on_change: *const fn (ptr: *anyopaque, cb: ?ChangeCallback, ctx: ?*anyopaque) void,
@@ -59,6 +60,10 @@ pub const EditorInterface = struct {
             fn clear(erased: *anyopaque) void {
                 const self: *T = @ptrCast(@alignCast(erased));
                 self.clear();
+            }
+            fn clearHistory(erased: *anyopaque) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.clearHistory();
             }
             fn addToHistory(erased: *anyopaque, text: []const u8) void {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -105,6 +110,7 @@ pub const EditorInterface = struct {
                 .set_text = gen.setText,
                 .insert_text_at_cursor = gen.insertTextAtCursor,
                 .clear = gen.clear,
+                .clear_history = gen.clearHistory,
                 .add_to_history = gen.addToHistory,
                 .set_on_submit = gen.setOnSubmit,
                 .set_on_change = gen.setOnChange,
@@ -140,6 +146,10 @@ pub const EditorInterface = struct {
 
     pub fn clear(self: EditorInterface) void {
         self.vtable.clear(self.ptr);
+    }
+
+    pub fn clearHistory(self: EditorInterface) void {
+        self.vtable.clear_history(self.ptr);
     }
 
     pub fn addToHistory(self: EditorInterface, text: []const u8) void {
@@ -190,6 +200,7 @@ const MockEditor = struct {
     expanded_text: []const u8 = "",
     insert_count: u32 = 0,
     clear_count: u32 = 0,
+    clear_history_count: u32 = 0,
     history_count: u32 = 0,
     border_color: Color = Color.default,
     padding_x: u32 = 0,
@@ -219,6 +230,10 @@ const MockEditor = struct {
 
     pub fn clear(self: *MockEditor) void {
         self.clear_count += 1;
+    }
+
+    pub fn clearHistory(self: *MockEditor) void {
+        self.clear_history_count += 1;
     }
 
     pub fn addToHistory(self: *MockEditor, _: []const u8) void {
@@ -279,6 +294,9 @@ test "EditorInterface routes parity surface through vtable" {
 
     iface.insertTextAtCursor("!");
     try testing.expectEqual(@as(u32, 1), mock.insert_count);
+
+    iface.clearHistory();
+    try testing.expectEqual(@as(u32, 1), mock.clear_history_count);
 
     iface.addToHistory("prompt");
     try testing.expectEqual(@as(u32, 1), mock.history_count);

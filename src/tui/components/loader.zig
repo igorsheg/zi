@@ -2,14 +2,16 @@ const std = @import("std");
 const cell_mod = @import("../cell.zig");
 const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
+const shimmer_mod = @import("../shimmer.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
 const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const Shimmer = shimmer_mod.Config;
 
-/// Animated braille spinner with a static message label.
+/// Animated braille spinner with a shimmered message label.
 ///
 /// Renders as two rows: an empty line (top padding) followed by
 /// `{frame} {message}`, matching pi-mono's Loader component which
@@ -20,6 +22,7 @@ const Measurement = component_mod.Measurement;
 pub const Loader = struct {
     frame: u8 = 0,
     spinner_last_tick_ns: i128 = 0,
+    shimmer_phase: u32 = 0,
     /// Owned message buffer — setMessage copies into this.
     message_buf: [128]u8 = undefined,
     message_len: u8 = 0,
@@ -29,6 +32,7 @@ pub const Loader = struct {
 
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
     const spinner_interval_ns: i128 = 80_000_000; // 80ms
+    const shimmer_floor: u8 = 96;
 
     pub fn message(self: *const Loader) []const u8 {
         return self.message_buf[0..self.message_len];
@@ -48,15 +52,22 @@ pub const Loader = struct {
         self.active = true;
         self.frame = 0;
         self.spinner_last_tick_ns = 0;
+        self.shimmer_phase = 0;
     }
 
     pub fn nextAnimationDeadline(self: *Loader, now_ns: i128) ?i128 {
         if (!self.active) return null;
 
-        return if (self.spinner_last_tick_ns == 0)
+        var next_deadline = if (self.spinner_last_tick_ns == 0)
             now_ns
         else
             self.spinner_last_tick_ns + spinner_interval_ns;
+
+        if (self.message_len > 0) {
+            next_deadline = @min(next_deadline, shimmer_mod.nextDeadline(now_ns, self.shimmerConfig()));
+        }
+
+        return next_deadline;
     }
 
     pub fn tickAnimation(self: *Loader, now_ns: i128) bool {
@@ -71,6 +82,14 @@ pub const Loader = struct {
             changed = true;
         }
 
+        if (self.message_len > 0) {
+            const phase = shimmer_mod.phaseForTime(now_ns, self.shimmerConfig(), self.message());
+            if (phase != self.shimmer_phase) {
+                self.shimmer_phase = phase;
+                changed = true;
+            }
+        }
+
         return changed;
     }
 
@@ -82,7 +101,7 @@ pub const Loader = struct {
         var col: u32 = 1; // 1 col left padding
         col += region.writeStr(col, 1, frames[self.frame], self.spinner_fg, Color.default, Attributes.none);
         col += 1; // space
-        _ = region.writeStr(col, 1, self.message(), self.message_fg, Color.default, .{ .dim = true });
+        _ = shimmer_mod.writeSmooth(region, col, 1, self.message(), self.shimmerConfig(), self.shimmer_phase, shimmer_floor);
     }
 
     pub fn measure(_: *Loader, _: u32) Measurement {
@@ -91,6 +110,21 @@ pub const Loader = struct {
 
     pub fn component(self: *Loader) Component {
         return Component.init(Loader, self);
+    }
+
+    fn shimmerConfig(self: *const Loader) Shimmer {
+        return .{
+            .step_ns = 33_333_333,
+            .lead_pad_cols = 4,
+            .tail_pad_cols = 8,
+            .band_half_width = 5,
+            .base_fg = self.message_fg,
+            .edge_fg = self.message_fg,
+            .peak_fg = self.spinner_fg,
+            .base_attrs = .{ .dim = true },
+            .edge_attrs = .{ .dim = true },
+            .peak_attrs = .{},
+        };
     }
 };
 
