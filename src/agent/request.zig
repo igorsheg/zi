@@ -36,6 +36,7 @@ pub const AgentRequest = union(enum) {
     new_session: void,
     set_model: struct { model: ai_protocol.Model },
     set_thinking_level: struct { level: @import("protocol.zig").ThinkingLevel },
+    refresh_status_snapshot: void,
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
@@ -44,6 +45,7 @@ pub const AgentRequest = union(enum) {
             .new_session => {},
             .set_model => {},
             .set_thinking_level => {},
+            .refresh_status_snapshot => {},
             .shutdown => {},
         }
     }

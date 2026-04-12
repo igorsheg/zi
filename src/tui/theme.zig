@@ -57,12 +57,14 @@ pub const FgColor = enum {
     bash_mode,
 };
 
-/// Background color names — matches pi-mono's ThemeBg type.
+/// Background color names — mostly matches pi-mono's ThemeBg type, plus
+/// zi-specific surfaces that still need to participate in theme lookup.
 /// Used with Theme.bg() to look up background colors.
 pub const BgColor = enum {
     selected_bg,
     user_message_bg,
     custom_message_bg,
+    tool_transcript_bg,
     tool_pending_bg,
     tool_success_bg,
     tool_error_bg,
@@ -71,7 +73,8 @@ pub const BgColor = enum {
 /// Semantic color theme matching pi-mono's Theme class.
 ///
 /// pi-mono separates foreground colors (ThemeColor, 45 names) from background
-/// colors (ThemeBg, 6 names). Colors are defined in JSON with variable
+/// colors (ThemeBg, 6 names); zi keeps that shape and adds one transcript-
+/// specific background token. Colors are defined in JSON with variable
 /// references; zi stores resolved Color values directly.
 ///
 /// Default values come from pi-mono's dark.json with vars resolved to hex→RGB.
@@ -93,7 +96,7 @@ pub const Theme = struct {
     /// zi default dark theme — kanso-muted inspired.
     ///
     /// key design choices vs pi-mono's dark.json:
-    /// - toolSuccessBg is empty (no bg tint on completed tools)
+    /// - toolTranscriptBg and toolSuccessBg are empty (tool rows stay transparent)
     /// - softer warning yellow (#E6C384 vs #FFFF00)
     /// - tiered gray scale for dim/muted/output hierarchy
     /// - bashMode uses yellow (command stands out from output)
@@ -187,6 +190,7 @@ pub const Theme = struct {
         t.bg_colors[@intFromEnum(BgColor.selected_bg)] = selection;
         t.bg_colors[@intFromEnum(BgColor.user_message_bg)] = Color.rgb(0x15, 0x1B, 0x22);
         t.bg_colors[@intFromEnum(BgColor.custom_message_bg)] = Color.rgb(0x11, 0x18, 0x20);
+        t.bg_colors[@intFromEnum(BgColor.tool_transcript_bg)] = Color.default; // tool rows inherit terminal bg
         t.bg_colors[@intFromEnum(BgColor.tool_pending_bg)] = panel_bg;
         t.bg_colors[@intFromEnum(BgColor.tool_success_bg)] = Color.default; // no bg on success
         t.bg_colors[@intFromEnum(BgColor.tool_error_bg)] = panel_bg_red;
@@ -214,7 +218,8 @@ test "dark theme fg and bg lookups" {
     // userMessageBg = #151B22 (kanso-muted midpoint — subtle but visible)
     const user_bg = t.bg(.user_message_bg);
     try @import("std").testing.expectEqual(@as(u8, 0x15), user_bg.r);
-    // toolSuccessBg = default (no bg)
+    // toolTranscriptBg/toolSuccessBg = default (no bg)
+    try @import("std").testing.expect(t.bg(.tool_transcript_bg).is_default);
     try @import("std").testing.expect(t.bg(.tool_success_bg).is_default);
     // text = "" → Color.default
     try @import("std").testing.expect(t.fg(.text).is_default);

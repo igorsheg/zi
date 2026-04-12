@@ -560,16 +560,6 @@ pub const Interactive = struct {
         self.editor.border_color = theme.fg(.border_muted);
         self.loader.spinner_fg = theme.fg(.accent);
         self.loader.message_fg = theme.fg(.muted);
-        self.status_data.setModelProvider(json_util.providerToString(ca.agent.state.model.provider));
-        self.status_data.setModelId(ca.agent.state.model.id);
-        self.status_data.setThinkingLevel(agentThinkingLabel(ca.agent.state.thinking_level));
-        if (ca.getContextUsage()) |usage| {
-            self.status_data.context_tokens = usage.tokens;
-            self.status_data.context_window = usage.context_window;
-        } else {
-            self.status_data.context_tokens = null;
-            self.status_data.context_window = ca.agent.state.model.context_window;
-        }
         self.editor.cwd = cwd;
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
         self.transcript.setHideThinkingBlock(self.hide_thinking_block);
@@ -682,6 +672,11 @@ pub const Interactive = struct {
         self.editor.status_data = &self.status_data;
         self.editor.theme = self.theme;
 
+        // Prime the status chips via the agent-owned snapshot path before the
+        // first frame. This keeps model/thinking/context reads off the TUI
+        // thread even during startup.
+        self.bootstrapStatusSnapshot();
+
         // Wire autocomplete: registry → provider → editor
         self.slash_provider = SlashCommandProvider.init(&self.command_registry);
         self.active_editor.setAutocompleteProvider(self.slash_provider.provider());
@@ -775,6 +770,15 @@ pub const Interactive = struct {
             // cross-thread UI events still land promptly without a wake fd.
             self.sleepUntilNextLoopDeadline();
         }
+    }
+
+    fn bootstrapStatusSnapshot(self: *Interactive) void {
+        self.request_queue.push(.{ .refresh_status_snapshot = {} });
+        const thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
+            self.drainQueuedRequests();
+            return;
+        };
+        thread.join();
     }
 
     // ── InputBuffer callbacks ───────────────────────────────────────
@@ -2145,6 +2149,7 @@ pub const Interactive = struct {
                     .new_session => self.handleNewSession(),
                     .set_model => |s| self.handleSetModel(s.model),
                     .set_thinking_level => |s| self.handleSetThinkingLevel(s.level),
+                    .refresh_status_snapshot => self.publishStatusSnapshot(),
                     // zi-wub.28: terminal request. Tears down the
                     // runner + lua_State on the agent thread (the
                     // owner). After this returns, ca's extension

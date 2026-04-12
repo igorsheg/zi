@@ -64,6 +64,7 @@ fn execute(reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque)
     session.session_store.appendCompaction(summary, prep.first_kept_entry_id, prep.tokens_before);
     const new_context = try session.session_store.buildContext(session.session_store.leafId());
     session.agent.loadMessages(new_context.messages);
+    session.noteCompactionApplied();
     session.agent.state.error_message = null;
 
     return .{
@@ -299,7 +300,6 @@ fn extractMessage(entry: proto.SessionEntry) ?AgentMessage {
         else => return null,
     }
 }
-
 
 const testing = std.testing;
 

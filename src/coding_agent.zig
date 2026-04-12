@@ -85,6 +85,11 @@ pub const AgentSession = struct {
     /// must outlive any in-flight stream that might still hold them.
     _owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
     _builtin_ctx: ?*builtin_util.BuiltinCtx = null,
+    /// Mirrors pi-mono's post-compaction semantics without re-reading the
+    /// session file on every status render. True means the latest compaction
+    /// on the active branch has not yet been followed by a successful
+    /// assistant response with non-zero usage.
+    context_usage_unknown_after_compaction: bool = false,
 
     pub const EventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -384,6 +389,7 @@ pub const AgentSession = struct {
             .before_tool_call = before_tool_hook,
             .after_tool_call = after_tool_hook,
         });
+        const context_usage_unknown_after_compaction = contextUsageUnknownFromStore(allocator, &store);
 
         const self = AgentSession{
             .agent = a,
@@ -400,6 +406,7 @@ pub const AgentSession = struct {
             .model_registry = options.model_registry,
             ._owned_provider_bundle = owned_bundle,
             ._builtin_ctx = builtin_ctx,
+            .context_usage_unknown_after_compaction = context_usage_unknown_after_compaction,
             ._extension_runner = ext_runner,
             ._extension_lua_state = ext_state,
         };
@@ -634,6 +641,7 @@ pub const AgentSession = struct {
         }
         self.session_store.deinit();
         self.session_store = new_store;
+        self.refreshContextUsageStateFromStore();
     }
 
     /// Reset the active session to a fresh header-only session while
@@ -667,53 +675,81 @@ pub const AgentSession = struct {
     ///   post-compaction assistant response lands
     /// - otherwise use the last assistant usage plus heuristic estimates for
     ///   trailing messages
+    ///
+    /// Unlike the earlier zi implementation, this hot path does NOT reread the
+    /// session file. The compaction boundary is tracked on the agent thread and
+    /// refreshed only when the active session store changes.
     pub fn getContextUsage(self: *AgentSession) ?ContextUsage {
         const model = self.agent.state.model;
         if (model.context_window == 0) return null;
 
-        const entries = self.session_store.readEntries() catch return contextUsageFromMessages(model.context_window, self.agent.state.messages);
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        if (self.context_usage_unknown_after_compaction) {
+            return .{
+                .tokens = null,
+                .context_window = model.context_window,
+                .percent = null,
+            };
+        }
+
+        return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+    }
+
+    pub fn noteCompactionApplied(self: *AgentSession) void {
+        self.context_usage_unknown_after_compaction = true;
+    }
+
+    fn refreshContextUsageStateFromStore(self: *AgentSession) void {
+        self.context_usage_unknown_after_compaction = contextUsageUnknownFromStore(self.allocator, &self.session_store);
+    }
+
+    fn noteMessageForContextUsage(self: *AgentSession, message: protocol.AgentMessage) void {
+        if (!self.context_usage_unknown_after_compaction) return;
+        switch (message) {
+            .assistant => |assistant| switch (assistant.stop_reason) {
+                .aborted, .@"error" => {},
+                else => {
+                    if (session_mod.context_usage.calculateContextTokens(assistant.usage) > 0) {
+                        self.context_usage_unknown_after_compaction = false;
+                    }
+                },
+            },
+            else => {},
+        }
+    }
+
+    fn contextUsageUnknownFromStore(
+        allocator: std.mem.Allocator,
+        store: *const SessionStore,
+    ) bool {
+        const entries = store.cached_entries orelse return false;
+        var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const branch = session_mod.context_usage.buildBranchEntries(
             arena.allocator(),
             entries,
-            self.session_store.leafId(),
-        ) catch return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+            store.leafId(),
+        ) catch return false;
+        if (session_mod.context_usage.getLatestCompactionEntry(branch) == null) return false;
+        return !hasPostCompactionUsage(branch);
+    }
 
-        if (session_mod.context_usage.getLatestCompactionEntry(branch)) |_| {
-            var has_post_compaction_usage = false;
-            var i: usize = branch.len;
-            scan: while (i > 0) {
-                i -= 1;
-                switch (branch[i].entry) {
-                    .compaction => break :scan,
-                    .message => |m| switch (m.message) {
-                        .assistant => |assistant| switch (assistant.stop_reason) {
-                            .aborted, .@"error" => {},
-                            else => {
-                                const context_tokens = session_mod.context_usage.calculateContextTokens(assistant.usage);
-                                if (context_tokens > 0) {
-                                    has_post_compaction_usage = true;
-                                }
-                                break :scan;
-                            },
-                        },
-                        else => {},
+    fn hasPostCompactionUsage(branch: []const session_mod.protocol.SessionEntry) bool {
+        var i: usize = branch.len;
+        scan: while (i > 0) {
+            i -= 1;
+            switch (branch[i].entry) {
+                .compaction => break :scan,
+                .message => |m| switch (m.message) {
+                    .assistant => |assistant| switch (assistant.stop_reason) {
+                        .aborted, .@"error" => {},
+                        else => return session_mod.context_usage.calculateContextTokens(assistant.usage) > 0,
                     },
                     else => {},
-                }
-            }
-
-            if (!has_post_compaction_usage) {
-                return .{
-                    .tokens = null,
-                    .context_window = model.context_window,
-                    .percent = null,
-                };
+                },
+                else => {},
             }
         }
-
-        return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+        return false;
     }
 
     fn contextUsageFromMessages(context_window: u64, messages: []const protocol.AgentMessage) ContextUsage {
@@ -952,6 +988,11 @@ pub const AgentSession = struct {
     /// pi-mono ordering: extensions → listeners → persistence (agent-session.ts:507-530)
     fn eventListener(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(ctx));
+
+        switch (event) {
+            .message_end => |me| self.noteMessageForContextUsage(me.message),
+            else => {},
+        }
 
         // Forward to external handler first
         if (self.event_handler) |handler| {
@@ -1621,6 +1662,7 @@ fn testAssistantMessageWithUsage(
 fn syncMessagesFromStore(session: *AgentSession) !void {
     const context = try session.session_store.buildContext(session.session_store.leafId());
     session.agent.loadMessages(context.messages);
+    session.refreshContextUsageStateFromStore();
 }
 
 const EventCollector = struct {
@@ -1774,6 +1816,55 @@ test "AgentSession: getContextUsage is unknown immediately after compaction" {
     try testing.expectEqual(@as(?u64, null), usage.tokens);
     try testing.expectEqual(@as(?f64, null), usage.percent);
     try testing.expectEqual(faux.fauxModel().context_window, usage.context_window);
+}
+
+test "AgentSession: in-memory compaction state clears on the first successful post-compaction assistant" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+    var collector = EventCollector.init(allocator);
+    var session = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
+        .registry = &registry,
+        .tools = &.{},
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },
+        .no_session = true,
+    });
+    defer session.deinit();
+    defer collector.deinit();
+    defer registry.deinit();
+    defer fp.deinit();
+
+    const before = [_]protocol.AgentMessage{
+        .{ .compaction_summary = .{ .summary = "summary", .tokens_before = 195_000, .timestamp = 1 } },
+        testUserMessage("third", 2),
+    };
+    session.agent.loadMessages(&before);
+    session.noteCompactionApplied();
+
+    const unknown_usage = session.getContextUsage().?;
+    try testing.expectEqual(@as(?u64, null), unknown_usage.tokens);
+    try testing.expectEqual(@as(?f64, null), unknown_usage.percent);
+
+    const post = testAssistantMessageWithUsage(allocator, "response3", 25_000, 3);
+    const after = [_]protocol.AgentMessage{
+        before[0],
+        before[1],
+        post,
+    };
+    session.agent.loadMessages(&after);
+    session.noteMessageForContextUsage(post);
+
+    const known_usage = session.getContextUsage().?;
+    try testing.expectEqual(@as(?u64, 25_000), known_usage.tokens);
+    try testing.expect(known_usage.percent != null);
 }
 
 test "AgentSession: getContextUsage prefers post-compaction assistant usage" {

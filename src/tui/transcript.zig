@@ -417,7 +417,7 @@ const TranscriptLayout = struct {
 
 /// State for a single tool execution within the transcript.
 /// Owns all data (deep-cloned from events). Handles its own rendering
-/// with bg fill, call summary, and result display.
+/// with a theme-resolved surface, call summary, and result display.
 ///
 /// Rendering uses optional ToolRenderer functions for per-tool formatting.
 /// Falls back to: bold(tool_name) for call, truncated text for result.
@@ -552,11 +552,7 @@ pub const ToolExecution = struct {
     // ── Rendering ─────────────────────────────────────────────────
 
     fn bgColor(self: *ToolExecution) Color {
-        if (self.is_partial)
-            return self.theme.bg(.tool_pending_bg);
-        if (self.is_error)
-            return self.theme.bg(.tool_error_bg);
-        return self.theme.bg(.tool_success_bg);
+        return self.theme.bg(.tool_transcript_bg);
     }
 
     // Vertical padding inside the bg box (pi-mono: Box(paddingX=1, paddingY=1))
@@ -1742,6 +1738,40 @@ test "ToolExecution does not invoke result renderers before any result exists" {
 
     try testing.expectEqual(@as(usize, 0), S.measure_result_calls);
     try testing.expectEqual(@as(usize, 0), S.render_result_calls);
+}
+
+test "ToolExecution keeps transcript surface transparent across pending partial and final states" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    transcript.addToolExecution("tool-1", "bash", .{});
+
+    var pending = try Buffer.init(testing.allocator, 20, 6);
+    defer pending.deinit();
+    transcript.render(pending.region());
+    try testing.expect(pending.get(1, 1).bg.eql(Color.default));
+
+    var partial_content = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "running" } },
+    };
+    transcript.toolSetPartialResult("tool-1", .{ .content = &partial_content, .is_error = false }, false);
+
+    var partial = try Buffer.init(testing.allocator, 20, 6);
+    defer partial.deinit();
+    transcript.render(partial.region());
+    try testing.expect(partial.get(1, 1).bg.eql(Color.default));
+    try testing.expect(partial.get(1, 2).bg.eql(Color.default));
+
+    var error_content = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "boom" } },
+    };
+    transcript.toolSetFinalResult("tool-1", .{ .content = &error_content, .is_error = true }, true);
+
+    var final = try Buffer.init(testing.allocator, 20, 6);
+    defer final.deinit();
+    transcript.render(final.region());
+    try testing.expect(final.get(1, 1).bg.eql(Color.default));
+    try testing.expect(final.get(1, 2).bg.eql(Color.default));
 }
 
 test "Transcript scrolls through tool output without repeating the first rows" {
