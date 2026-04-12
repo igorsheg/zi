@@ -667,8 +667,12 @@ pub const Interactive = struct {
 
         self.detectGitBranch();
 
-        self.editor.on_submit = &onEditorSubmit;
-        self.editor.on_submit_ctx = @ptrCast(self);
+        self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
+        self.active_editor.setOnSubmit(&onEditorSubmit, @ptrCast(self));
+        self.active_editor.setOnChange(&onEditorChange, @ptrCast(self));
+        self.active_editor.setBorderColor(self.theme.fg(.border_muted));
+        self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
+        self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.session_controller.wire();
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
@@ -678,9 +682,7 @@ pub const Interactive = struct {
 
         // Wire autocomplete: registry → provider → editor
         self.slash_provider = SlashCommandProvider.init(&self.command_registry);
-        self.editor.setAutocompleteProvider(self.slash_provider.provider());
-
-        self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
+        self.active_editor.setAutocompleteProvider(self.slash_provider.provider());
 
         // Populate container slots with their initial children.
         self.refreshGreeterVisibility();
@@ -1310,7 +1312,13 @@ pub const Interactive = struct {
         }
     }
 
-    // --- Editor submit callback ---
+    // --- Editor callbacks ---
+
+    fn onEditorChange(_: []const u8, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.refreshGreeterVisibility();
+        self.tui.dirty = true;
+    }
 
     fn onEditorSubmit(text: []const u8, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));

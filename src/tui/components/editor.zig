@@ -8,6 +8,7 @@ const word_wrap_mod = @import("../word_wrap.zig");
 const box_chrome = @import("../box_chrome.zig");
 const status_data_mod = @import("../status_data.zig");
 const autocomplete_mod = @import("../autocomplete.zig");
+const editor_iface_mod = @import("../editor_iface.zig");
 const select_list_mod = @import("select_list.zig");
 const theme_mod = @import("../theme.zig");
 
@@ -23,6 +24,7 @@ const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const Suggestions = autocomplete_mod.Suggestions;
 const SuggestionSink = autocomplete_mod.SuggestionSink;
 const RequestSnapshot = autocomplete_mod.RequestSnapshot;
+const EditorInterface = editor_iface_mod.EditorInterface;
 const SelectItem = select_list_mod.SelectItem;
 const SelectList = select_list_mod.SelectList;
 const InputResult = select_list_mod.InputResult;
@@ -30,15 +32,21 @@ const Theme = theme_mod.Theme;
 
 pub const Editor = struct {
     buf: std.ArrayList(u8),
+    history: std.ArrayList([]u8),
     cursor_byte: u32 = 0,
     cursor_col: u32 = 0,
     scroll_x: u32 = 0,
     scroll_y: u32 = 0,
     max_visible_lines: u32 = 10,
     last_content_width: u32 = 80,
+    last_applied_padding_x: u32 = 0,
     prompt: []const u8 = "> ",
-    on_submit: ?*const fn (text: []const u8, ctx: ?*anyopaque) void = null,
+    on_submit: ?EditorInterface.SubmitCallback = null,
     on_submit_ctx: ?*anyopaque = null,
+    on_change: ?EditorInterface.ChangeCallback = null,
+    on_change_ctx: ?*anyopaque = null,
+    disable_submit: bool = false,
+    padding_x: u32 = 0,
     prompt_fg: Color = Color.rgb(100, 100, 100),
     text_fg: Color = Color.default,
     border_color: Color = Color.rgb(0x50, 0x50, 0x50),
@@ -57,18 +65,24 @@ pub const Editor = struct {
     autocomplete_list: SelectList = undefined,
     autocomplete_active: bool = false,
     autocomplete_prefix_len: u32 = 0,
+    autocomplete_max_visible: u32 = 5,
     sink_ctx: AutocompleteSinkCtx = .{},
     theme: ?*const Theme = null,
 
     pub fn init(allocator: std.mem.Allocator) Editor {
         return .{
             .buf = .empty,
+            .history = .empty,
             .allocator = allocator,
             .layout_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *Editor) void {
+        for (self.history.items) |entry| {
+            self.allocator.free(entry);
+        }
+        self.history.deinit(self.allocator);
         self.buf.deinit(self.allocator);
         self.layout_arena.deinit();
     }
@@ -77,15 +91,22 @@ pub const Editor = struct {
         return self.buf.items;
     }
 
+    pub fn getExpandedText(self: *const Editor) []const u8 {
+        return self.getText();
+    }
+
     pub fn clear(self: *Editor) void {
+        self.cancelAutocomplete();
         self.buf.items.len = 0;
         self.cursor_byte = 0;
         self.cursor_col = 0;
         self.scroll_x = 0;
         self.scroll_y = 0;
+        self.notifyChange();
     }
 
     pub fn setText(self: *Editor, text: []const u8) void {
+        self.cancelAutocomplete();
         self.buf.items.len = 0;
         self.buf.appendSlice(self.allocator, text) catch return;
         self.cursor_byte = @intCast(text.len);
@@ -93,9 +114,14 @@ pub const Editor = struct {
         self.cursor_col = @intCast(grapheme_mod.strWidth(text[last_line_start..]));
         self.scroll_x = 0;
         self.ensureCursorVisible();
+        self.notifyChange();
     }
 
     pub fn insertText(self: *Editor, text: []const u8) void {
+        self.insertTextAtCursor(text);
+    }
+
+    pub fn insertTextAtCursor(self: *Editor, text: []const u8) void {
         self.buf.insertSlice(self.allocator, self.cursor_byte, text) catch return;
         var i: usize = 0;
         while (i < text.len) {
@@ -112,6 +138,56 @@ pub const Editor = struct {
         }
         self.cursor_byte += @intCast(text.len);
         self.ensureCursorVisible();
+        self.tryAutocomplete();
+        self.notifyChange();
+    }
+
+    pub fn addToHistory(self: *Editor, text: []const u8) void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (self.history.items.len > 0 and std.mem.eql(u8, self.history.items[0], trimmed)) return;
+
+        const copy = self.allocator.dupe(u8, trimmed) catch return;
+        self.history.insert(self.allocator, 0, copy) catch {
+            self.allocator.free(copy);
+            return;
+        };
+
+        if (self.history.items.len > 100) {
+            const evicted = self.history.items[self.history.items.len - 1];
+            _ = self.history.pop();
+            self.allocator.free(evicted);
+        }
+    }
+
+    pub fn setOnSubmit(self: *Editor, cb: ?EditorInterface.SubmitCallback, ctx: ?*anyopaque) void {
+        self.on_submit = cb;
+        self.on_submit_ctx = ctx;
+    }
+
+    pub fn setOnChange(self: *Editor, cb: ?EditorInterface.ChangeCallback, ctx: ?*anyopaque) void {
+        self.on_change = cb;
+        self.on_change_ctx = ctx;
+    }
+
+    pub fn setBorderColor(self: *Editor, color: Color) void {
+        self.border_color = color;
+    }
+
+    pub fn setPaddingX(self: *Editor, padding: u32) void {
+        self.padding_x = padding;
+        self.ensureCursorVisible();
+    }
+
+    pub fn setAutocompleteMaxVisible(self: *Editor, max_visible: u32) void {
+        self.autocomplete_max_visible = @max(@as(u32, 3), @min(@as(u32, 20), max_visible));
+        if (self.autocomplete_active) {
+            self.autocomplete_list.max_visible = self.autocomplete_max_visible;
+        }
+    }
+
+    pub fn setSubmitDisabled(self: *Editor, disabled: bool) void {
+        self.disable_submit = disabled;
     }
 
     // --- Autocomplete ---
@@ -149,6 +225,7 @@ pub const Editor = struct {
             if (s.items.len > 0) {
                 self.autocomplete_list = .{
                     .theme = self.theme orelse &Theme.dark,
+                    .max_visible = self.autocomplete_max_visible,
                 };
                 self.autocomplete_list.setItems(s.items);
                 self.autocomplete_prefix_len = @intCast(s.prefix.len);
@@ -180,6 +257,7 @@ pub const Editor = struct {
         self.cursor_col = @intCast(grapheme_mod.strWidth(self.buf.items[line_start..self.cursor_byte]));
 
         self.cancelAutocomplete();
+        self.notifyChange();
         return true;
     }
 
@@ -189,6 +267,12 @@ pub const Editor = struct {
         }
         self.autocomplete_active = false;
         self.autocomplete_prefix_len = 0;
+    }
+
+    fn notifyChange(self: *Editor) void {
+        if (self.on_change) |cb| {
+            cb(self.getText(), self.on_change_ctx);
+        }
     }
 
     // --- Input handling ---
@@ -251,6 +335,7 @@ pub const Editor = struct {
                     self.insertNewline();
                     return true;
                 }
+                if (self.disable_submit) return true;
                 if (self.on_submit) |cb| {
                     cb(self.buf.items, self.on_submit_ctx);
                 }
@@ -266,6 +351,7 @@ pub const Editor = struct {
                     self.cursor_col += @as(u32, grapheme_mod.charWidth(cp));
                     self.ensureCursorVisible();
                     self.tryAutocomplete();
+                    self.notifyChange();
                     return true;
                 }
                 return false;
@@ -283,6 +369,7 @@ pub const Editor = struct {
                     self.cursor_byte = prev;
                     self.ensureCursorVisible();
                     self.tryAutocomplete();
+                    self.notifyChange();
                     return true;
                 }
                 const prev = self.prevCodepointBoundary();
@@ -295,6 +382,7 @@ pub const Editor = struct {
                 self.cursor_byte = prev;
                 self.cursor_col -= removed_width;
                 self.tryAutocomplete();
+                self.notifyChange();
                 return true;
             },
             .delete => {
@@ -304,6 +392,7 @@ pub const Editor = struct {
                     const next = self.cursor_byte + 1;
                     std.mem.copyForwards(u8, items[self.cursor_byte..], items[next..]);
                     self.buf.items.len -= 1;
+                    self.notifyChange();
                     return true;
                 }
                 const next = self.nextCodepointBoundary();
@@ -311,6 +400,7 @@ pub const Editor = struct {
                 const items = self.buf.items;
                 std.mem.copyForwards(u8, items[self.cursor_byte..], items[next..]);
                 self.buf.items.len -= remove_count;
+                self.notifyChange();
                 return true;
             },
             .left => {
@@ -386,10 +476,13 @@ pub const Editor = struct {
         const h = region.height;
         if (w == 0 or h < 3) return;
 
-        self.last_content_width = w;
+        const applied_padding = self.appliedPaddingX(w);
+        const content_width = self.effectiveContentWidth(w);
+        self.last_applied_padding_x = applied_padding;
+        self.last_content_width = content_width;
         self.ensureCursorVisible();
 
-        const wrapped_line_count = self.wrappedLineCountForWidth(w);
+        const wrapped_line_count = self.wrappedLineCountForWidth(content_width);
         const editor_h: u32 = @min(@min(wrapped_line_count, self.max_visible_lines) + 2, h);
 
         // Top border with rounded corners and inline status
@@ -409,7 +502,7 @@ pub const Editor = struct {
 
         // Content between borders
         const content = region.sub(0, 1, w, editor_h - 2);
-        const wrapped_lines = self.buildWrappedLinesScratch(w) catch return;
+        const wrapped_lines = self.buildWrappedLinesScratch(content_width) catch return;
 
         // Draw content rows
         {
@@ -433,10 +526,10 @@ pub const Editor = struct {
         }) {
             const line = wrapped_lines[wrapped_idx];
             const prefix = if (line.kind == .prompt) self.prompt else "  ";
-            _ = content.writeStr(1, visible_row, prefix, self.prompt_fg, Color.default, .{});
+            _ = content.writeStr(1 + applied_padding, visible_row, prefix, self.prompt_fg, Color.default, .{});
             const line_text = self.buf.items[line.start..line.end];
             if (line_text.len > 0) {
-                _ = content.writeStr(line.text_x, visible_row, line_text, self.text_fg, Color.default, .{});
+                _ = content.writeStr(applied_padding + line.text_x, visible_row, line_text, self.text_fg, Color.default, .{});
             }
         }
 
@@ -450,7 +543,8 @@ pub const Editor = struct {
     }
 
     pub fn measure(self: *Editor, width: u32) Measurement {
-        self.last_content_width = if (width == 0) 1 else width;
+        self.last_applied_padding_x = self.appliedPaddingX(width);
+        self.last_content_width = self.effectiveContentWidth(width);
         const wrapped_line_count = self.wrappedLineCountForWidth(self.last_content_width);
         const box_height = @min(wrapped_line_count, self.max_visible_lines) + 2;
 
@@ -474,7 +568,7 @@ pub const Editor = struct {
         if (cursor.visual_row < self.scroll_y) return null;
 
         return .{
-            .x = cursor.x,
+            .x = cursor.x + self.last_applied_padding_x,
             .y = (cursor.visual_row - self.scroll_y) + 1,
             .style = .bar,
         };
@@ -611,6 +705,16 @@ pub const Editor = struct {
 
     // --- Internal helpers ---
 
+    fn appliedPaddingX(self: *const Editor, total_width: u32) u32 {
+        if (total_width <= 1) return 0;
+        return @min(self.padding_x, @divFloor(total_width - 1, @as(u32, 2)));
+    }
+
+    fn effectiveContentWidth(self: *const Editor, total_width: u32) u32 {
+        const applied = self.appliedPaddingX(total_width);
+        return if (total_width > applied * 2) total_width - applied * 2 else 1;
+    }
+
     const WrappedLineKind = enum {
         prompt,
         continuation,
@@ -634,7 +738,7 @@ pub const Editor = struct {
     }
 
     fn buildWrappedLines(self: *const Editor, total_width: u32, allocator: std.mem.Allocator) ![]WrappedLine {
-        var lines: std.ArrayListUnmanaged(WrappedLine) = .{};
+        var lines: std.ArrayListUnmanaged(WrappedLine) = .empty;
         errdefer lines.deinit(allocator);
 
         const items = self.buf.items;
@@ -751,6 +855,8 @@ pub const Editor = struct {
         self.cursor_byte += 1;
         self.cursor_col = 0;
         self.ensureCursorVisible();
+        self.tryAutocomplete();
+        self.notifyChange();
     }
 
     fn currentLineStart(self: *const Editor) u32 {
@@ -1186,4 +1292,86 @@ test "slash command Enter on partial text accepts top pick and submits" {
     try std.testing.expectEqualStrings("/resume ", editor.getText());
     try std.testing.expect(submitted != null);
     try std.testing.expectEqualStrings("/resume ", submitted.?);
+}
+
+test "editor change callback fires for programmatic text mutations" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    var changes = std.ArrayList([]const u8).empty;
+    defer changes.deinit(std.testing.allocator);
+
+    const Ctx = struct { changes: *std.ArrayList([]const u8) };
+    var ctx = Ctx{ .changes = &changes };
+    editor.setOnChange(struct {
+        fn cb(text: []const u8, raw_ctx: ?*anyopaque) void {
+            const change_ctx: *Ctx = @ptrCast(@alignCast(raw_ctx));
+            const owned = std.testing.allocator.dupe(u8, text) catch return;
+            change_ctx.changes.append(std.testing.allocator, owned) catch {
+                std.testing.allocator.free(owned);
+                return;
+            };
+        }
+    }.cb, @ptrCast(&ctx));
+    defer {
+        for (changes.items) |entry| std.testing.allocator.free(entry);
+    }
+
+    editor.setText("hello");
+    editor.insertTextAtCursor(" world");
+    editor.clear();
+
+    try std.testing.expectEqual(@as(usize, 3), changes.items.len);
+    try std.testing.expectEqualStrings("hello", changes.items[0]);
+    try std.testing.expectEqualStrings("hello world", changes.items[1]);
+    try std.testing.expectEqualStrings("", changes.items[2]);
+}
+
+test "editor addToHistory trims deduplicates and caps entries" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    editor.addToHistory("   ");
+    editor.addToHistory("  first  ");
+    editor.addToHistory("first");
+    editor.addToHistory("second");
+
+    try std.testing.expectEqual(@as(usize, 2), editor.history.items.len);
+    try std.testing.expectEqualStrings("second", editor.history.items[0]);
+    try std.testing.expectEqualStrings("first", editor.history.items[1]);
+
+    var i: u32 = 0;
+    while (i < 105) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "prompt {d}", .{i});
+        editor.addToHistory(text);
+    }
+
+    try std.testing.expectEqual(@as(usize, 100), editor.history.items.len);
+    try std.testing.expectEqualStrings("prompt 104", editor.history.items[0]);
+    try std.testing.expectEqualStrings("prompt 5", editor.history.items[99]);
+}
+
+test "editor submit can be disabled through parity seam" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+
+    var submit_calls: u32 = 0;
+    const Ctx = struct { count: *u32 };
+    var ctx = Ctx{ .count = &submit_calls };
+    editor.setOnSubmit(struct {
+        fn cb(_: []const u8, raw_ctx: ?*anyopaque) void {
+            const submit_ctx: *Ctx = @ptrCast(@alignCast(raw_ctx));
+            submit_ctx.count.* += 1;
+        }
+    }.cb, @ptrCast(&ctx));
+
+    _ = editor.handleInput(.{ .code = .char, .char = 'x' });
+    editor.setSubmitDisabled(true);
+    _ = editor.handleInput(.{ .code = .enter });
+    try std.testing.expectEqual(@as(u32, 0), submit_calls);
+
+    editor.setSubmitDisabled(false);
+    _ = editor.handleInput(.{ .code = .enter });
+    try std.testing.expectEqual(@as(u32, 1), submit_calls);
 }
