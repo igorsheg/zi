@@ -14,16 +14,97 @@ const word_wrap_mod = @import("word_wrap.zig");
 const lua_renderer_mod = @import("../extensions/lua_renderer.zig");
 const runner_mod = @import("../extensions/runner.zig");
 
-const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 
 // ── Transcript Item ───────────────────────────────────────────────
 
+/// Type-erased transcript row interface.
+///
+/// Unlike the general TUI `Component` protocol, transcript rows MUST support
+/// native slice rendering. The transcript is a viewport compositor and never
+/// allocates full offscreen scratch surfaces just to crop visible rows.
+pub const TranscriptRenderable = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        render_slice: *const fn (ptr: *anyopaque, region: Region, first_row: u32) void,
+        measure: *const fn (ptr: *anyopaque, width: u32) Measurement,
+        next_animation_deadline: *const fn (ptr: *anyopaque, now_ns: i128) ?i128,
+        tick_animation: *const fn (ptr: *anyopaque, now_ns: i128) bool,
+    };
+
+    pub fn init(comptime T: type, ptr: *T) TranscriptRenderable {
+        comptime {
+            if (!@hasDecl(T, "renderSlice")) {
+                @compileError(@typeName(T) ++ " must implement renderSlice(region, first_row) to live in the transcript");
+            }
+            if (!@hasDecl(T, "measure")) {
+                @compileError(@typeName(T) ++ " must implement measure(width) to live in the transcript");
+            }
+        }
+
+        const gen = struct {
+            fn renderSlice(erased: *anyopaque, region: Region, first_row: u32) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.renderSlice(region, first_row);
+            }
+            fn measure(erased: *anyopaque, width: u32) Measurement {
+                const self: *T = @ptrCast(@alignCast(erased));
+                return self.measure(width);
+            }
+            fn nextAnimationDeadline(erased: *anyopaque, now_ns: i128) ?i128 {
+                const self: *T = @ptrCast(@alignCast(erased));
+                if (@hasDecl(T, "nextAnimationDeadline")) {
+                    return self.nextAnimationDeadline(now_ns);
+                }
+                return null;
+            }
+            fn tickAnimation(erased: *anyopaque, now_ns: i128) bool {
+                const self: *T = @ptrCast(@alignCast(erased));
+                if (@hasDecl(T, "tickAnimation")) {
+                    return self.tickAnimation(now_ns);
+                }
+                return false;
+            }
+        };
+
+        return .{
+            .ptr = @ptrCast(ptr),
+            .vtable = &.{
+                .render_slice = gen.renderSlice,
+                .measure = gen.measure,
+                .next_animation_deadline = gen.nextAnimationDeadline,
+                .tick_animation = gen.tickAnimation,
+            },
+        };
+    }
+
+    pub fn eql(a: TranscriptRenderable, b: TranscriptRenderable) bool {
+        return a.ptr == b.ptr and a.vtable == b.vtable;
+    }
+
+    pub fn renderSlice(self: TranscriptRenderable, region: Region, first_row: u32) void {
+        self.vtable.render_slice(self.ptr, region, first_row);
+    }
+
+    pub fn measure(self: TranscriptRenderable, width: u32) Measurement {
+        return self.vtable.measure(self.ptr, width);
+    }
+
+    pub fn nextAnimationDeadline(self: TranscriptRenderable, now_ns: i128) ?i128 {
+        return self.vtable.next_animation_deadline(self.ptr, now_ns);
+    }
+
+    pub fn tickAnimation(self: TranscriptRenderable, now_ns: i128) bool {
+        return self.vtable.tick_animation(self.ptr, now_ns);
+    }
+};
+
 /// Behavior tag for transcript-owned items.
-/// Rendering is now generic via Component slice hooks; kinds remain for
-/// routing updates and built-in lifecycle handling.
+/// Renderables remain tagged for routing updates and built-in lifecycle logic.
 pub const ItemKind = enum {
     generic,
     assistant_message,
@@ -34,21 +115,21 @@ pub const ItemKind = enum {
 /// Cleanup function type for owned items.
 pub const DeinitFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void;
 
-/// A single item in the transcript — generic component with optional metadata.
+/// A single item in the transcript — slice-native renderable plus metadata.
 ///
-/// Replaces the previous closed TranscriptRow union. Every item is a Component
-/// that can be rendered/measured via the vtable. Built-in types (assistant,
-/// tool, user) are convenience constructors that set `kind` + metadata.
-/// Extensions inject arbitrary components with kind=.generic.
+/// Replaces the previous closed TranscriptRow union. Built-in types
+/// (assistant, tool, user) are convenience constructors that set `kind` +
+/// metadata. Extensions may inject arbitrary transcript renderables with
+/// kind=.generic.
 pub const TranscriptItem = struct {
-    component: Component,
+    renderable: TranscriptRenderable,
     kind: ItemKind = .generic,
     /// For tool_execution: route updates by ID via pending_tools HashMap.
     tool_call_id: ?[]const u8 = null,
     /// Owned cleanup context. Called on item removal/transcript clear.
     deinit_ctx: ?*anyopaque = null,
     deinit_fn: ?DeinitFn = null,
-    /// Extra height added outside the component (e.g., spacer before user message).
+    /// Extra height added outside the renderable (e.g., spacer before user message).
     extra_height: u32 = 0,
 
     pub fn deinit(self: *TranscriptItem, allocator: std.mem.Allocator) void {
@@ -780,25 +861,7 @@ pub const ToolExecution = struct {
             .width = region.width,
         };
     }
-
-    pub fn component(self: *ToolExecution) Component {
-        return Component.init(ToolExecution, self);
-    }
 };
-
-fn blitRows(src: Region, dst: Region, start_row: u32) void {
-    if (start_row >= src.height) return;
-    const max_rows = @min(dst.height, src.height - start_row);
-    const max_cols = @min(dst.width, src.width);
-
-    var row: u32 = 0;
-    while (row < max_rows) : (row += 1) {
-        var col: u32 = 0;
-        while (col < max_cols) : (col += 1) {
-            dst.set(col, row, src.get(col, start_row + row));
-        }
-    }
-}
 
 // ── Markdown wrapper deinit ───────────────────────────────────────
 
@@ -816,9 +879,9 @@ fn deinitAssistantMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 // ── Transcript ────────────────────────────────────────────────────
 
-/// Scrollable conversation transcript with generic item storage.
+/// Scrollable conversation transcript with slice-native item storage.
 ///
-/// Items are Components with optional metadata (kind, tool_call_id).
+/// Items are transcript renderables with optional metadata (kind, tool_call_id).
 /// The transcript handles:
 /// - Appending items in event order
 /// - Streaming assistant message merge (current_assistant_idx for content deltas)
@@ -827,7 +890,7 @@ fn deinitAssistantMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 /// - Rendering visible items into a Region given a scroll offset
 ///
 /// Built-in types (assistant, tool, user) are convenience methods.
-/// Extensions add arbitrary Components via addComponent().
+/// Extensions add arbitrary transcript renderables via addRenderable().
 pub const Transcript = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
     /// Fast lookup: tool_call_id → item index for routing updates.
@@ -890,10 +953,6 @@ pub const Transcript = struct {
     }
 
     fn appendTranscriptItem(self: *Transcript, item: TranscriptItem) bool {
-        if (item.kind != .generic) {
-            std.debug.assert(item.component.supportsRenderSlice());
-        }
-
         self.items.append(self.allocator, item) catch return false;
         errdefer self.items.items.len -= 1;
         self.layout.appendItem() catch return false;
@@ -917,25 +976,20 @@ pub const Transcript = struct {
         if (am.deactivateThinkingShimmer()) self.noteItemMutated(idx);
     }
 
-    // ── Generic mutation API ──────────────────────────────────────
+    // ── External renderable API ───────────────────────────────────
 
-    /// Append an arbitrary component to the transcript.
-    ///
-    /// Lightweight fixed-height components may rely on the transcript's
-    /// scratch-buffer slice fallback. Any component that can grow beyond a
-    /// few rows should implement `renderSlice` so scrolling stays O(visible).
-    pub fn addComponent(self: *Transcript, comp: Component) void {
+    /// Append an arbitrary transcript renderable.
+    pub fn addRenderable(self: *Transcript, renderable: TranscriptRenderable) void {
         self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
-        _ = self.appendTranscriptItem(.{ .component = comp });
+        _ = self.appendTranscriptItem(.{ .renderable = renderable });
     }
 
-    /// Remove a specific component by identity. Used by extensions to retract items.
-    /// Matches pi-mono's Container.removeChild() identity-based removal.
-    pub fn removeComponent(self: *Transcript, comp: Component) void {
+    /// Remove a specific transcript renderable by identity.
+    pub fn removeRenderable(self: *Transcript, renderable: TranscriptRenderable) void {
         var i: usize = 0;
         while (i < self.items.items.len) {
-            if (Component.eql(self.items.items[i].component, comp)) {
+            if (TranscriptRenderable.eql(self.items.items[i].renderable, renderable)) {
                 var item = self.items.items[i];
                 // Clean up tool index if this was a tool execution
                 if (item.tool_call_id) |id| {
@@ -996,7 +1050,7 @@ pub const Transcript = struct {
         am.theme = self.theme;
         am.hide_thinking_block = self.hide_thinking_block;
         if (!self.appendTranscriptItem(.{
-            .component = am.component(),
+            .renderable = TranscriptRenderable.init(assistant_message_mod.AssistantMessage, am),
             .kind = .assistant_message,
             .extra_height = 1,
             .deinit_ctx = @ptrCast(am),
@@ -1086,7 +1140,7 @@ pub const Transcript = struct {
 
         const item_idx = self.items.items.len;
         if (!self.appendTranscriptItem(.{
-            .component = te.component(),
+            .renderable = TranscriptRenderable.init(ToolExecution, te),
             .kind = .tool_execution,
             .tool_call_id = te.tool_call_id,
             .extra_height = 1, // spacer before tool (pi-mono: Spacer(1))
@@ -1206,7 +1260,7 @@ pub const Transcript = struct {
         md.setContent(text);
 
         if (!self.appendTranscriptItem(.{
-            .component = md.component(),
+            .renderable = TranscriptRenderable.init(markdown_mod.Markdown, md),
             .kind = .user_message,
             .extra_height = 1, // spacer before user message
             .deinit_ctx = @ptrCast(md),
@@ -1262,7 +1316,7 @@ pub const Transcript = struct {
     pub fn nextAnimationDeadline(self: *Transcript, now_ns: i128) ?i128 {
         var next_deadline: ?i128 = null;
         for (self.items.items) |item| {
-            if (item.component.nextAnimationDeadline(now_ns)) |deadline| {
+            if (item.renderable.nextAnimationDeadline(now_ns)) |deadline| {
                 next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
             }
         }
@@ -1272,7 +1326,7 @@ pub const Transcript = struct {
     pub fn tickAnimation(self: *Transcript, now_ns: i128) bool {
         var changed = false;
         for (self.items.items) |item| {
-            changed = item.component.tickAnimation(now_ns) or changed;
+            changed = item.renderable.tickAnimation(now_ns) or changed;
         }
         return changed;
     }
@@ -1312,41 +1366,22 @@ pub const Transcript = struct {
             const spacer_visible = item.extra_height - row_skip;
             if (row_region.height > spacer_visible) {
                 const sub = row_region.sub(0, spacer_visible, w, row_region.height - spacer_visible);
-                renderComponentRows(self, item.component, sub, 0);
+                self.renderRenderableRows(item.renderable, sub, 0);
             }
             return;
         }
-        renderComponentRows(self, item.component, row_region, row_skip -| item.extra_height);
+        self.renderRenderableRows(item.renderable, row_region, row_skip -| item.extra_height);
     }
 
-    fn renderComponentRows(self: *Transcript, comp: Component, row_region: Region, skipped: u32) void {
-        if (skipped == 0) {
-            comp.render(row_region);
-            return;
-        }
-        if (!comp.renderSlice(row_region, skipped)) {
-            self.renderGenericSlice(comp, row_region, skipped);
-        }
-    }
-
-    fn renderGenericSlice(self: *Transcript, comp: Component, row_region: Region, skipped: u32) void {
-        // Fallback path for intentionally lightweight components that do not
-        // implement native slicing. Heavy transcript surfaces should expose
-        // `renderSlice` and stay off this scratch-buffer path.
+    fn renderRenderableRows(self: *Transcript, renderable: TranscriptRenderable, row_region: Region, skipped: u32) void {
+        _ = self;
         if (row_region.width == 0 or row_region.height == 0) return;
-
-        const total_h = comp.measure(row_region.width).preferred_height;
-        if (total_h == 0 or skipped >= total_h) return;
-
-        var scratch = Buffer.init(self.allocator, row_region.width, total_h) catch return;
-        defer scratch.deinit();
-        comp.render(scratch.region());
-        blitRows(scratch.region(), row_region, skipped);
+        renderable.renderSlice(row_region, skipped);
     }
 
     fn itemHeight(self: *Transcript, item: *TranscriptItem, width: u32) u32 {
         _ = self;
-        return @max(1, item.component.measure(width).preferred_height) + item.extra_height;
+        return @max(1, item.renderable.measure(width).preferred_height) + item.extra_height;
     }
 };
 
@@ -1536,10 +1571,14 @@ test "Transcript faux loop keeps scrolled assistant visible across width reflow 
     const FixedLines = struct {
         lines: []const []const u8,
 
-        pub fn render(self: *@This(), region: Region) void {
+        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
             var row: u32 = 0;
-            while (row < region.height and row < self.lines.len) : (row += 1) {
-                _ = region.writeStr(0, row, self.lines[row], Color.default, Color.default, .{});
+            var line_idx: usize = @intCast(first_row);
+            while (row < region.height and line_idx < self.lines.len) : ({
+                row += 1;
+                line_idx += 1;
+            }) {
+                _ = region.writeStr(0, row, self.lines[line_idx], Color.default, Color.default, .{});
             }
         }
 
@@ -1548,16 +1587,21 @@ test "Transcript faux loop keeps scrolled assistant visible across width reflow 
             return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
         }
 
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
+        pub fn renderable(self: *@This()) TranscriptRenderable {
+            return TranscriptRenderable.init(@This(), self);
         }
     };
 
     const WidthSensitive = struct {
-        pub fn render(_: *@This(), region: Region) void {
+        pub fn renderSlice(_: *@This(), region: Region, first_row: u32) void {
             const rows: u32 = if (region.width >= 40) 1 else 5;
+            if (first_row >= rows) return;
             var row: u32 = 0;
-            while (row < region.height and row < rows) : (row += 1) {
+            var virtual_row = first_row;
+            while (row < region.height and virtual_row < rows) : ({
+                row += 1;
+                virtual_row += 1;
+            }) {
                 _ = region.writeStr(0, row, "grow", Color.default, Color.default, .{});
             }
         }
@@ -1567,16 +1611,16 @@ test "Transcript faux loop keeps scrolled assistant visible across width reflow 
             return .{ .min_height = 1, .preferred_height = h };
         }
 
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
+        pub fn renderable(self: *@This()) TranscriptRenderable {
+            return TranscriptRenderable.init(@This(), self);
         }
     };
 
     var grow = WidthSensitive{};
-    harness.transcript.addComponent(grow.component());
+    harness.transcript.addRenderable(grow.renderable());
 
     var fixed = FixedLines{ .lines = &.{ "anchor 1", "anchor 2", "anchor 3", "anchor 4", "anchor 5", "anchor 6" } };
-    harness.transcript.addComponent(fixed.component());
+    harness.transcript.addRenderable(fixed.renderable());
 
     const wide_total = harness.transcript.totalHeight(80);
     try testing.expectEqual(@as(usize, 4), harness.transcript.items.items.len);
@@ -1604,7 +1648,7 @@ test "Transcript faux loop keeps scrolled assistant visible across width reflow 
     try expectAsciiAt(&after, 7, 1, '2');
 }
 
-test "Transcript built-in items advertise native slice rendering" {
+test "Transcript built-in items install transcript renderables" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1615,11 +1659,8 @@ test "Transcript built-in items advertise native slice rendering" {
 
     try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
     try testing.expectEqual(ItemKind.assistant_message, transcript.items.items[0].kind);
-    try testing.expect(transcript.items.items[0].component.supportsRenderSlice());
     try testing.expectEqual(ItemKind.user_message, transcript.items.items[1].kind);
-    try testing.expect(transcript.items.items[1].component.supportsRenderSlice());
     try testing.expectEqual(ItemKind.tool_execution, transcript.items.items[2].kind);
-    try testing.expect(transcript.items.items[2].component.supportsRenderSlice());
 }
 
 test "Transcript renders assistant text and tool execution in order" {
@@ -1730,8 +1771,9 @@ test "Transcript preserves visible anchor when earlier items grow" {
         height: u32,
         ch: u21,
 
-        pub fn render(self: *@This(), region: Region) void {
-            const rows = @min(region.height, self.height);
+        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
+            if (first_row >= self.height) return;
+            const rows = @min(region.height, self.height - first_row);
             var row: u32 = 0;
             while (row < rows) : (row += 1) {
                 region.set(0, row, .{ .grapheme = .{ .codepoint = self.ch } });
@@ -1742,8 +1784,8 @@ test "Transcript preserves visible anchor when earlier items grow" {
             return .{ .min_height = if (self.height > 0) 1 else 0, .preferred_height = self.height };
         }
 
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
+        pub fn renderable(self: *@This()) TranscriptRenderable {
+            return TranscriptRenderable.init(@This(), self);
         }
     };
 
@@ -1752,8 +1794,8 @@ test "Transcript preserves visible anchor when earlier items grow" {
 
     var first = Box{ .height = 3, .ch = 'A' };
     var second = Box{ .height = 3, .ch = 'B' };
-    transcript.addComponent(first.component());
-    transcript.addComponent(second.component());
+    transcript.addRenderable(first.renderable());
+    transcript.addRenderable(second.renderable());
     transcript.scrollBy(10, 2, 3);
 
     var before = try Buffer.init(testing.allocator, 10, 2);
@@ -1788,19 +1830,19 @@ test "ToolExecution collapsed fallback renders the overflow hint row" {
     try testing.expectEqual(@as(u21, '.'), buf.get(1, 8).grapheme.codepoint);
 }
 
-test "Transcript removeComponent removes item by identity and fixes indices" {
+test "Transcript removeRenderable removes item by identity and fixes indices" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    // Use a simple component wrapper for identity testing
+    // Use a simple renderable wrapper for identity testing
     const Wrapper = struct {
         val: u8 = 0,
-        pub fn render(_: *@This(), _: Region) void {}
+        pub fn renderSlice(_: *@This(), _: Region, _: u32) void {}
         pub fn measure(_: *@This(), _: u32) component_mod.Measurement {
             return .{ .min_height = 1, .preferred_height = 1 };
         }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
+        pub fn renderable(self: *@This()) TranscriptRenderable {
+            return TranscriptRenderable.init(@This(), self);
         }
     };
 
@@ -1808,27 +1850,27 @@ test "Transcript removeComponent removes item by identity and fixes indices" {
     var w2 = Wrapper{ .val = 2 };
     var w3 = Wrapper{ .val = 3 };
 
-    transcript.addComponent(w1.component());
-    transcript.addComponent(w2.component());
-    transcript.addComponent(w3.component());
+    transcript.addRenderable(w1.renderable());
+    transcript.addRenderable(w2.renderable());
+    transcript.addRenderable(w3.renderable());
 
     try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
 
     // Remove middle item
-    transcript.removeComponent(w2.component());
+    transcript.removeRenderable(w2.renderable());
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 
     // Remaining items should be w1 and w3
-    try testing.expect(Component.eql(transcript.items.items[0].component, w1.component()));
-    try testing.expect(Component.eql(transcript.items.items[1].component, w3.component()));
+    try testing.expect(TranscriptRenderable.eql(transcript.items.items[0].renderable, w1.renderable()));
+    try testing.expect(TranscriptRenderable.eql(transcript.items.items[1].renderable, w3.renderable()));
 
     // Remove non-existent — no-op
-    transcript.removeComponent(w2.component());
+    transcript.removeRenderable(w2.renderable());
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 
     // Scroll clamp: set scroll past total, remove item, verify clamped
     transcript.scrollBy(80, 1, 100);
-    transcript.removeComponent(w3.component());
+    transcript.removeRenderable(w3.renderable());
     // total height is now 1 (just w1), so scroll offset should be clamped to ≤ 1
     try testing.expect(transcript.scrollOffset() <= 1);
 }

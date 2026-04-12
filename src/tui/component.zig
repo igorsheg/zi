@@ -128,10 +128,6 @@ pub const Component = struct {
         self.vtable.render(self.ptr, region);
     }
 
-    pub fn supportsRenderSlice(self: Component) bool {
-        return self.vtable.render_slice != null;
-    }
-
     pub fn renderSlice(self: Component, region: Region, first_row: u32) bool {
         const render_slice = self.vtable.render_slice orelse return false;
         render_slice(self.ptr, region, first_row);
@@ -179,7 +175,6 @@ test "component defaults animation hooks for static components" {
     const erased = Component.init(StaticComp, &comp);
     try std.testing.expectEqual(@as(?i128, null), erased.nextAnimationDeadline(123));
     try std.testing.expect(!erased.tickAnimation(123));
-    try std.testing.expect(!erased.supportsRenderSlice());
     try std.testing.expect(!erased.renderSlice(undefined, 1));
 }
 
@@ -200,7 +195,6 @@ test "component dispatches optional renderSlice hook" {
 
     var comp = SliceComp{};
     const erased = Component.init(SliceComp, &comp);
-    try std.testing.expect(erased.supportsRenderSlice());
     try std.testing.expect(erased.renderSlice(undefined, 7));
     try std.testing.expect(comp.called);
     try std.testing.expectEqual(@as(u32, 7), comp.first_row);
