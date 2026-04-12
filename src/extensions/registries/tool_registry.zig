@@ -107,19 +107,10 @@ pub const ToolRegistry = struct {
     }
 
     fn freeEntry(self: *ToolRegistry, entry: *ToolDefinition) void {
-        const a = self.allocator;
-        a.free(entry.name);
-        a.free(entry.label);
-        a.free(entry.description);
-        if (entry.prompt_snippet) |s| a.free(s);
-        for (entry.prompt_guidelines) |g| a.free(g);
-        if (entry.prompt_guidelines.len > 0) a.free(entry.prompt_guidelines);
-        json_value.freeJsonValue(a, entry.parameters);
+        definition.freeOwned(self.allocator, entry);
         // `source` strings are borrowed by contract — do not free.
     }
 };
-
-const json_value = @import("../../json/value.zig");
 
 // =============================================================================
 // Tests

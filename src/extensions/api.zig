@@ -46,6 +46,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
+const tool_def = @import("../tools/definition.zig");
 const agent_protocol = @import("../agent/protocol.zig");
 const spawn_mod = @import("../spawn/spawn.zig");
 const spawn_types = @import("../spawn/types.zig");
@@ -258,12 +259,7 @@ fn buildExtensionTool(
 /// rejection path (`!accepted`) and by registry-insert OOM. Mirrors
 /// `ToolRegistry.freeEntry` minus the registry-managed bookkeeping.
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
-    allocator.free(tool.name);
-    allocator.free(tool.label);
-    allocator.free(tool.description);
-    if (tool.prompt_snippet) |s| allocator.free(s);
-    freeStringArray(allocator, tool.prompt_guidelines);
-    lua_runtime.freeJsonValue(allocator, tool.parameters);
+    tool_def.freeOwned(allocator, tool);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1171,7 +1167,10 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     runner.current_spawn_result = .{ .result = .{ .content = blocks, .is_error = false, .details = .{ .object = details } } };
     defer {
         const res = runner.current_spawn_result.?.result;
-        for (res.content) |b| switch (b) { .text => |tb| testing.allocator.free(tb.text), else => {} };
+        for (res.content) |b| switch (b) {
+            .text => |tb| testing.allocator.free(tb.text),
+            else => {},
+        };
         testing.allocator.free(res.content);
         lua_runtime.freeJsonValue(testing.allocator, res.details);
     }

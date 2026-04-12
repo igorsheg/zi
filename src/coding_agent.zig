@@ -2,7 +2,6 @@ const std = @import("std");
 const ai = @import("ai/root.zig");
 const agent_mod = @import("agent/root.zig");
 const session_mod = @import("session/root.zig");
-const bash_tool = @import("tools/bash.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
 const tool_def = @import("tools/definition.zig");
 const builtin_util = @import("tools/util.zig");
@@ -145,9 +144,9 @@ pub const AgentSession = struct {
         /// If null, a new session is created for `cwd`.
         session_store: ?SessionStore = null,
         no_session: bool = false,
-        /// Strict tool allowlist. When non-null, the final merged
-        /// tool set (builtins + Lua extensions) is filtered to only
-        /// tools whose `name` or `label` matches an entry in this
+        /// Strict tool allowlist. When non-null, the final
+        /// precedence-resolved tool set is filtered to only tools
+        /// whose `name` or `label` matches an entry in this
         /// list (case-insensitive). Empty slice → zero tools.
         /// Null → no filtering (default).
         ///
@@ -263,29 +262,22 @@ pub const AgentSession = struct {
             }
             state_ptr.setPackagePath(dirs_buf[0..dirs_n]) catch {};
 
+            runner_ptr.bindLuaOwnerThread(std.Thread.getCurrentId());
             if (loaded_extensions.extensions.len > 0) {
-                runner_ptr.bindLuaOwnerThread(std.Thread.getCurrentId());
                 const stats = resource_loader.loadExtensionsInto(state_ptr, runner_ptr);
                 std.log.scoped(.extensions).info(
                     "extensions: {d} loaded, {d} failed of {d} discovered",
                     .{ stats.loaded, stats.failed, stats.attempted },
                 );
             }
+
+            registerBaseToolDefinitions(runner_ptr, builtin_definitions);
         }
 
-        const definitions: []const tool_def.ToolDefinition = if (ext_runner) |r| build_blk: {
-            const ext_count = r.tool_registry.count();
-            if (ext_count == 0) break :build_blk builtin_definitions;
-            const merged = allocator.alloc(tool_def.ToolDefinition, builtin_definitions.len + ext_count) catch
-                break :build_blk builtin_definitions;
-            @memcpy(merged[0..builtin_definitions.len], builtin_definitions);
-            var n: usize = builtin_definitions.len;
-            for (r.tool_registry.items()) |entry| {
-                merged[n] = entry;
-                n += 1;
-            }
-            break :build_blk merged[0..n];
-        } else builtin_definitions;
+        const definitions: []const tool_def.ToolDefinition = if (ext_runner) |r|
+            r.tool_registry.items()
+        else
+            builtin_definitions;
 
         const filtered_definitions: []const tool_def.ToolDefinition = if (options.tool_allowlist) |allow| blk_f: {
             const filtered = allocator.alloc(tool_def.ToolDefinition, definitions.len) catch break :blk_f definitions;
@@ -418,6 +410,42 @@ pub const AgentSession = struct {
         // We'll wire this up in run/continueSession instead.
 
         return self;
+    }
+
+    fn registerBaseToolDefinitions(
+        runner: *ExtensionRunner,
+        defs: []const tool_def.ToolDefinition,
+    ) void {
+        for (defs) |def| {
+            registerBaseToolDefinition(runner, def);
+        }
+    }
+
+    fn registerBaseToolDefinition(runner: *ExtensionRunner, def: tool_def.ToolDefinition) void {
+        var cloned = tool_def.cloneOwned(runner.allocator, def) catch |err| {
+            std.log.scoped(.extensions).warn(
+                "failed to clone base tool '{s}' for registry: {s}",
+                .{ def.name, @errorName(err) },
+            );
+            return;
+        };
+
+        const accepted = runner.tool_registry.register(cloned) catch |err| {
+            std.log.scoped(.extensions).warn(
+                "failed to register base tool '{s}': {s}",
+                .{ def.name, @errorName(err) },
+            );
+            tool_def.freeOwned(runner.allocator, &cloned);
+            return;
+        };
+        if (!accepted) {
+            const winner = runner.tool_registry.get(def.name) orelse unreachable;
+            std.log.scoped(.extensions).info(
+                "base tool '{s}' from {s} ignored; already registered by {s}:{s}",
+                .{ def.name, def.source.kind, winner.source.kind, winner.source.id },
+            );
+            tool_def.freeOwned(runner.allocator, &cloned);
+        }
     }
 
     fn toolNameSlice(
@@ -1469,6 +1497,59 @@ fn createTestResourceLoader(allocator: std.mem.Allocator, cwd: []const u8) resou
     return resources.ResourceLoader.init(allocator, .{ .cwd = cwd }) catch @panic("OOM");
 }
 
+fn createTestResourceLoaderWithAgentDir(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) resources.ResourceLoader {
+    return resources.ResourceLoader.init(allocator, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+    }) catch @panic("OOM");
+}
+
+fn createAgentDirWithReadOverride(
+    allocator: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    snippet: []const u8,
+    guideline: []const u8,
+    result_text: []const u8,
+) ![]const u8 {
+    try tmp.dir.makeDir("extensions");
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll(
+        "return function(zi)\n" ++
+            "  zi.register_tool({\n" ++
+            "    name = \"read\",\n" ++
+            "    label = \"Override Read\",\n" ++
+            "    description = \"Override read for precedence tests\",\n",
+    );
+    try w.print("    prompt_snippet = \"{s}\",\n", .{snippet});
+    try w.print("    prompt_guidelines = {{ \"{s}\" }},\n", .{guideline});
+    try w.writeAll(
+        "    parameters = { type = \"object\", properties = {}, required = {} },\n" ++
+            "    execute = function(params, ctx)\n" ++
+            "      return {\n" ++
+            "        content = { { type = \"text\", text = \"",
+    );
+    try w.writeAll(result_text);
+    try w.writeAll(
+        "\" } },\n" ++
+            "      }\n" ++
+            "    end,\n" ++
+            "  })\n" ++
+            "end\n",
+    );
+
+    const src = try out.toOwnedSlice();
+    defer allocator.free(src);
+    try tmp.dir.writeFile(.{ .sub_path = "extensions/read.lua", .data = src });
+    return tmp.dir.realpathAlloc(allocator, ".");
+}
+
 /// Test helper: create a AgentSession wired to a faux provider.
 fn createTestAgentSession(
     allocator: std.mem.Allocator,
@@ -1703,43 +1784,147 @@ test "AgentSession: getContextUsage prefers post-compaction assistant usage" {
     try testing.expectApproxEqRel((@as(f64, @floatFromInt(25_000)) / @as(f64, @floatFromInt(faux.fauxModel().context_window))) * 100.0, usage.percent.?, 1e-9);
 }
 
-// zi-1ry: `tool_allowlist` is a strict whitelist. Applied AFTER the
-// builtin + Lua-extension merge, it drops anything not explicitly
-// named — critical to prevent Task-in-Task subagent recursion when
-// a child zi is spawned with `--tools bash,read`.
-test "AgentSession: tool_allowlist filters merged tool set" {
+// zi-1ry: `tool_allowlist` is a strict whitelist applied AFTER
+// precedence resolution. This keeps subagent spawns deterministic and
+// ensures an overriding extension still wins if its tool name is
+// allowlisted.
+test "AgentSession: tool_allowlist filters the post-precedence tool set" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var seeded_ctx = builtin_util.BuiltinCtx{ .cwd = "/tmp/zi-test" };
-    const seeded = [_]tool_def.ToolDefinition{
-        bash_tool.definition(&seeded_ctx),
-        testToolDefinition("Task", "Task"),
-        testToolDefinition("read", "Read"),
-    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const agent_dir = try createAgentDirWithReadOverride(
+        allocator,
+        &tmp,
+        "Allowlisted override snippet",
+        "Allowlisted override guideline",
+        "allowlisted override result",
+    );
+    defer allocator.free(agent_dir);
 
     var fp = faux.FauxProvider.init(allocator);
-    _ = &fp;
+    defer fp.deinit();
     var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
     try registry.register("faux", fp.provider(), null);
 
-    const allow = [_][]const u8{ "bash", "read" };
+    const allow = [_][]const u8{"read"};
     var ca = AgentSession.init(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "k",
         .cwd = "/tmp/zi-test",
-        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
+        .resource_loader = createTestResourceLoaderWithAgentDir(allocator, "/tmp/zi-test", agent_dir),
         .registry = &registry,
-        .tools = &seeded,
         .tool_allowlist = &allow,
         .no_session = true,
     });
     defer ca.deinit();
 
-    try testing.expectEqual(@as(usize, 2), ca.tools.len);
-    try testing.expectEqualStrings("bash", ca.tools[0].name);
-    try testing.expectEqualStrings("read", ca.tools[1].name);
+    try testing.expectEqual(@as(usize, 1), ca.tools.len);
+    try testing.expectEqualStrings("read", ca.tools[0].name);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Allowlisted override snippet") != null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Read file contents") == null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "- bash:") == null);
+}
+
+test "AgentSession: user extension overrides builtin tool at execution time" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const agent_dir = try createAgentDirWithReadOverride(
+        allocator,
+        &tmp,
+        "Execution override snippet",
+        "Execution override guideline",
+        "override read result",
+    );
+    defer allocator.free(agent_dir);
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+    var args_obj = std.json.ObjectMap.init(allocator);
+    try args_obj.put(try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, "/tmp/ignored") });
+    const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
+        faux.fauxToolCall("read", "tc-read-1", .{ .object = args_obj }),
+    };
+    const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done after override")};
+    fp.setResponses(&.{
+        faux.fauxAssistantMessage(allocator, &tc_content, .toolUse),
+        faux.fauxAssistantMessage(allocator, &text_content, .stop),
+    });
+
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    defer collector.deinit();
+    var ca = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoaderWithAgentDir(allocator, "/tmp/zi-test", agent_dir),
+        .registry = &registry,
+        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    try ca.run("use read");
+
+    try testing.expectEqual(@as(usize, 2), fp.call_count);
+    try testing.expectEqual(@as(usize, 4), ca.agent.state.messages.len);
+    try testing.expect(ca.agent.state.messages[2] == .tool_result);
+    const tr = ca.agent.state.messages[2].tool_result;
+    try testing.expectEqualStrings("read", tr.tool_name);
+    try testing.expectEqual(@as(usize, 1), tr.content.len);
+    switch (tr.content[0]) {
+        .text => |txt| try testing.expectEqualStrings("override read result", txt.text),
+        else => return error.ExpectedTextBlock,
+    }
+}
+
+test "AgentSession: final prompt metadata comes from the winning tool definition" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const agent_dir = try createAgentDirWithReadOverride(
+        allocator,
+        &tmp,
+        "Winning read snippet",
+        "Winning read guideline",
+        "prompt metadata override result",
+    );
+    defer allocator.free(agent_dir);
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    var ca = AgentSession.init(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoaderWithAgentDir(allocator, "/tmp/zi-test", agent_dir),
+        .registry = &registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Winning read snippet") != null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Winning read guideline") != null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Read file contents") == null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Use read to examine files instead of cat or sed.") == null);
 }
 
 // pi-mono test-harness.test.ts: "simple text response"
