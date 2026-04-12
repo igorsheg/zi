@@ -890,6 +890,10 @@ pub const Transcript = struct {
     }
 
     fn appendTranscriptItem(self: *Transcript, item: TranscriptItem) bool {
+        if (item.kind != .generic) {
+            std.debug.assert(item.component.supportsRenderSlice());
+        }
+
         self.items.append(self.allocator, item) catch return false;
         errdefer self.items.items.len -= 1;
         self.layout.appendItem() catch return false;
@@ -916,6 +920,10 @@ pub const Transcript = struct {
     // ── Generic mutation API ──────────────────────────────────────
 
     /// Append an arbitrary component to the transcript.
+    ///
+    /// Lightweight fixed-height components may rely on the transcript's
+    /// scratch-buffer slice fallback. Any component that can grow beyond a
+    /// few rows should implement `renderSlice` so scrolling stays O(visible).
     pub fn addComponent(self: *Transcript, comp: Component) void {
         self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
@@ -1322,6 +1330,9 @@ pub const Transcript = struct {
     }
 
     fn renderGenericSlice(self: *Transcript, comp: Component, row_region: Region, skipped: u32) void {
+        // Fallback path for intentionally lightweight components that do not
+        // implement native slicing. Heavy transcript surfaces should expose
+        // `renderSlice` and stay off this scratch-buffer path.
         if (row_region.width == 0 or row_region.height == 0) return;
 
         const total_h = comp.measure(row_region.width).preferred_height;
@@ -1591,6 +1602,24 @@ test "Transcript faux loop keeps scrolled assistant visible across width reflow 
     try expectAsciiAt(&after, 7, 0, '1');
     try expectAsciiAt(&after, 0, 1, 'a');
     try expectAsciiAt(&after, 7, 1, '2');
+}
+
+test "Transcript built-in items advertise native slice rendering" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    transcript.beginAssistantMessage();
+    transcript.appendText(0, "hello from assistant");
+    transcript.addUserMessage("user msg");
+    transcript.addToolExecution("tool-1", "bash", .{});
+
+    try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
+    try testing.expectEqual(ItemKind.assistant_message, transcript.items.items[0].kind);
+    try testing.expect(transcript.items.items[0].component.supportsRenderSlice());
+    try testing.expectEqual(ItemKind.user_message, transcript.items.items[1].kind);
+    try testing.expect(transcript.items.items[1].component.supportsRenderSlice());
+    try testing.expectEqual(ItemKind.tool_execution, transcript.items.items[2].kind);
+    try testing.expect(transcript.items.items[2].component.supportsRenderSlice());
 }
 
 test "Transcript renders assistant text and tool execution in order" {
