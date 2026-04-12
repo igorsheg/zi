@@ -23,6 +23,10 @@ pub const CursorState = struct {
 /// Components implement render/handleInput/measure/cursorState and expose
 /// themselves via `component()` for use in layout containers.
 ///
+/// Heavy components can optionally implement `renderSlice(region, first_row)`
+/// so viewport owners can paint visible rows directly without full-surface
+/// scratch rendering.
+///
 /// Focus: components that can receive focus implement `setFocused(bool)`.
 /// The FocusManager (on TUI) is the source of truth for who has focus.
 /// Components use `focused` state to gate input handling and cursor display.
@@ -32,6 +36,7 @@ pub const Component = struct {
 
     pub const VTable = struct {
         render: *const fn (ptr: *anyopaque, region: Region) void,
+        render_slice: ?*const fn (ptr: *anyopaque, region: Region, first_row: u32) void,
         handle_input: *const fn (ptr: *anyopaque, key: Key) bool,
         measure: *const fn (ptr: *anyopaque, width: u32) Measurement,
         cursor_state: *const fn (ptr: *anyopaque) ?CursorState,
@@ -46,6 +51,10 @@ pub const Component = struct {
             fn render(erased: *anyopaque, region: Region) void {
                 const self: *T = @ptrCast(@alignCast(erased));
                 self.render(region);
+            }
+            fn renderSlice(erased: *anyopaque, region: Region, first_row: u32) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.renderSlice(region, first_row);
             }
             fn handleInput(erased: *anyopaque, key: Key) bool {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -96,6 +105,7 @@ pub const Component = struct {
             .ptr = @ptrCast(ptr),
             .vtable = &.{
                 .render = gen.render,
+                .render_slice = if (@hasDecl(T, "renderSlice")) gen.renderSlice else null,
                 .handle_input = gen.handleInput,
                 .measure = gen.measure,
                 .cursor_state = gen.cursorState,
@@ -116,6 +126,12 @@ pub const Component = struct {
 
     pub fn render(self: Component, region: Region) void {
         self.vtable.render(self.ptr, region);
+    }
+
+    pub fn renderSlice(self: Component, region: Region, first_row: u32) bool {
+        const render_slice = self.vtable.render_slice orelse return false;
+        render_slice(self.ptr, region, first_row);
+        return true;
     }
 
     pub fn handleInput(self: Component, key: Key) bool {
@@ -159,4 +175,27 @@ test "component defaults animation hooks for static components" {
     const erased = Component.init(StaticComp, &comp);
     try std.testing.expectEqual(@as(?i128, null), erased.nextAnimationDeadline(123));
     try std.testing.expect(!erased.tickAnimation(123));
+    try std.testing.expect(!erased.renderSlice(undefined, 1));
+}
+
+test "component dispatches optional renderSlice hook" {
+    const SliceComp = struct {
+        called: bool = false,
+        first_row: u32 = 0,
+
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn renderSlice(self: *@This(), _: Region, first_row: u32) void {
+            self.called = true;
+            self.first_row = first_row;
+        }
+        pub fn measure(_: *@This(), _: u32) Measurement {
+            return .{ .min_height = 1, .preferred_height = 1 };
+        }
+    };
+
+    var comp = SliceComp{};
+    const erased = Component.init(SliceComp, &comp);
+    try std.testing.expect(erased.renderSlice(undefined, 7));
+    try std.testing.expect(comp.called);
+    try std.testing.expectEqual(@as(u32, 7), comp.first_row);
 }

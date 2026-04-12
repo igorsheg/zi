@@ -88,6 +88,10 @@ pub const Markdown = struct {
     }
 
     pub fn render(self: *Markdown, region: Region) void {
+        self.renderSlice(region, 0);
+    }
+
+    pub fn renderSlice(self: *Markdown, region: Region, first_row: u32) void {
         if (self.content.len == 0) return;
         const w = region.width;
         const h = region.height;
@@ -105,7 +109,7 @@ pub const Markdown = struct {
         }
 
         var row: u32 = 0;
-        var virtual_row: u32 = self.scroll_offset;
+        var virtual_row: u32 = self.scroll_offset + first_row;
         while (row < h) {
             if (virtual_row < self.padding_y) {
                 virtual_row += 1;

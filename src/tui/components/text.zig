@@ -74,6 +74,10 @@ pub const Text = struct {
     }
 
     pub fn render(self: *Text, region: Region) void {
+        self.renderSlice(region, 0);
+    }
+
+    pub fn renderSlice(self: *Text, region: Region, first_row: u32) void {
         if (self.content.len == 0) return;
 
         const w = region.width;
@@ -83,7 +87,6 @@ pub const Text = struct {
         const content_width = if (w > self.padding_x * 2) w - self.padding_x * 2 else 1;
         const lines = self.getWrappedLines(content_width) orelse return;
 
-        // fill background if non-default
         if (!self.bg.eql(Color.default)) {
             region.fill(0, 0, w, h, .{
                 .grapheme = .{ .codepoint = ' ' },
@@ -92,25 +95,19 @@ pub const Text = struct {
             });
         }
 
-        // virtual layout: padding_y top rows, then wrapped lines, then padding_y bottom
-        // scroll_offset indexes into this virtual space
         const pad_y = self.padding_y;
         var row: u32 = 0;
-        var virtual_row: u32 = self.scroll_offset;
+        var virtual_row: u32 = self.scroll_offset + first_row;
 
         while (row < h) {
             if (virtual_row < pad_y) {
-                // top padding — already blank/filled
                 virtual_row += 1;
                 row += 1;
                 continue;
             }
 
             const line_idx = virtual_row - pad_y;
-            if (line_idx >= lines.len) {
-                // bottom padding or past content
-                break;
-            }
+            if (line_idx >= lines.len) break;
 
             const line = lines[line_idx];
             const line_text = line.text(self.content);

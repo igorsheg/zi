@@ -21,9 +21,9 @@ const Color = cell_mod.Color;
 
 // ── Transcript Item ───────────────────────────────────────────────
 
-/// Behavior tag for items that need special rendering treatment.
-/// Most items are .generic (just render the component). Built-in types
-/// use tags for: bg fill (tool), spacer (user_message), scroll merge (assistant).
+/// Behavior tag for transcript-owned items.
+/// Rendering is now generic via Component slice hooks; kinds remain for
+/// routing updates and built-in lifecycle handling.
 pub const ItemKind = enum {
     generic,
     assistant_message,
@@ -354,7 +354,6 @@ pub const ToolExecution = struct {
     renderer_state: ?*anyopaque = null,
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
-    scroll_offset: u32 = 0,
     measured_content_width: u32 = 0,
     measured_result_height: u32 = 0,
 
@@ -496,6 +495,10 @@ pub const ToolExecution = struct {
     }
 
     pub fn render(self: *ToolExecution, region: Region) void {
+        self.renderSlice(region, 0);
+    }
+
+    pub fn renderSlice(self: *ToolExecution, region: Region, first_row: u32) void {
         const w = region.width;
         const h = region.height;
         if (w == 0 or h == 0) return;
@@ -512,7 +515,7 @@ pub const ToolExecution = struct {
         const result_h = self.ensureMeasuredResultHeight(content_w);
         const total_h = padding_y + 1 + result_h + padding_y;
         var row: u32 = 0;
-        var virtual_row: u32 = self.scroll_offset;
+        var virtual_row: u32 = first_row;
 
         while (row < h and virtual_row < total_h) {
             if (virtual_row < padding_y) {
@@ -1250,10 +1253,8 @@ pub const Transcript = struct {
 
     pub fn nextAnimationDeadline(self: *Transcript, now_ns: i128) ?i128 {
         var next_deadline: ?i128 = null;
-        for (self.items.items) |*item| {
-            if (item.kind != .assistant_message) continue;
-            const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
-            if (am.nextAnimationDeadline(now_ns)) |deadline| {
+        for (self.items.items) |item| {
+            if (item.component.nextAnimationDeadline(now_ns)) |deadline| {
                 next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
             }
         }
@@ -1262,10 +1263,8 @@ pub const Transcript = struct {
 
     pub fn tickAnimation(self: *Transcript, now_ns: i128) bool {
         var changed = false;
-        for (self.items.items) |*item| {
-            if (item.kind != .assistant_message) continue;
-            const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
-            changed = am.tickAnimation(now_ns) or changed;
+        for (self.items.items) |item| {
+            changed = item.component.tickAnimation(now_ns) or changed;
         }
         return changed;
     }
@@ -1299,68 +1298,26 @@ pub const Transcript = struct {
         }
     }
 
-    fn renderItem(self: *Transcript, item: *TranscriptItem, row_region: Region, skipped: u32, visible_h: u32, w: u32) void {
-        switch (item.kind) {
-            .tool_execution => {
-                const te: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
-                const saved = te.scroll_offset;
-                const row_skip = skipped;
-                if (item.extra_height > 0 and row_skip < item.extra_height) {
-                    const spacer_visible = item.extra_height - row_skip;
-                    if (visible_h > spacer_visible) {
-                        const tool_region = row_region.sub(0, spacer_visible, w, visible_h - spacer_visible);
-                        te.scroll_offset = 0;
-                        te.render(tool_region);
-                    }
-                } else {
-                    te.scroll_offset = row_skip -| item.extra_height;
-                    te.render(row_region);
-                }
-                te.scroll_offset = saved;
-            },
-            .user_message => {
-                const row_skip = skipped;
-                if (row_skip == 0) {
-                    if (visible_h > 1) {
-                        const md_region = row_region.sub(0, 1, w, visible_h - 1);
-                        const md: *markdown_mod.Markdown = @ptrCast(@alignCast(item.deinit_ctx.?));
-                        const saved = md.scroll_offset;
-                        md.scroll_offset = 0;
-                        md.render(md_region);
-                        md.scroll_offset = saved;
-                    }
-                } else {
-                    const md: *markdown_mod.Markdown = @ptrCast(@alignCast(item.deinit_ctx.?));
-                    const saved = md.scroll_offset;
-                    md.scroll_offset = row_skip - 1;
-                    md.render(row_region);
-                    md.scroll_offset = saved;
-                }
-            },
-            .assistant_message => {
-                const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
-                const saved = am.scroll_offset;
-                const row_skip = skipped;
-                if (item.extra_height > 0 and row_skip < item.extra_height) {
-                    const spacer_visible = item.extra_height - row_skip;
-                    if (visible_h > spacer_visible) {
-                        const am_region = row_region.sub(0, spacer_visible, w, visible_h - spacer_visible);
-                        am.scroll_offset = 0;
-                        am.render(am_region);
-                    }
-                } else {
-                    am.scroll_offset = row_skip -| item.extra_height;
-                    am.render(row_region);
-                }
-                am.scroll_offset = saved;
-            },
-            .generic => {
-                if (skipped == 0) {
-                    item.component.render(row_region);
-                } else {
-                    self.renderGenericSlice(item.component, row_region, skipped);
-                }
-            },
+    fn renderItem(self: *Transcript, item: *TranscriptItem, row_region: Region, skipped: u32, _: u32, w: u32) void {
+        const row_skip = skipped;
+        if (item.extra_height > 0 and row_skip < item.extra_height) {
+            const spacer_visible = item.extra_height - row_skip;
+            if (row_region.height > spacer_visible) {
+                const sub = row_region.sub(0, spacer_visible, w, row_region.height - spacer_visible);
+                renderComponentRows(self, item.component, sub, 0);
+            }
+            return;
+        }
+        renderComponentRows(self, item.component, row_region, row_skip -| item.extra_height);
+    }
+
+    fn renderComponentRows(self: *Transcript, comp: Component, row_region: Region, skipped: u32) void {
+        if (skipped == 0) {
+            comp.render(row_region);
+            return;
+        }
+        if (!comp.renderSlice(row_region, skipped)) {
+            self.renderGenericSlice(comp, row_region, skipped);
         }
     }
 

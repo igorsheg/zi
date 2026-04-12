@@ -14,7 +14,6 @@ pub const AssistantMessage = struct {
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
     hide_thinking_block: bool = false,
     hidden_thinking_label: []const u8 = "Thinking...",
-    scroll_offset: u32 = 0,
 
     blocks: std.ArrayListUnmanaged(Block) = .empty,
 
@@ -172,6 +171,10 @@ pub const AssistantMessage = struct {
     }
 
     pub fn render(self: *AssistantMessage, region: Region) void {
+        self.renderSlice(region, 0);
+    }
+
+    pub fn renderSlice(self: *AssistantMessage, region: Region, first_row: u32) void {
         const w = region.width;
         const h = region.height;
         if (w == 0 or h == 0) return;
@@ -185,57 +188,35 @@ pub const AssistantMessage = struct {
             const separator_h: u32 = if (seen_visible) 1 else 0;
             const total_h = separator_h + block_h;
             const item_end = virtual_y + total_h;
-            if (item_end <= self.scroll_offset) {
+            if (item_end <= first_row) {
                 virtual_y = item_end;
                 seen_visible = true;
                 continue;
             }
             if (screen_y >= h) break;
 
-            const skipped = if (virtual_y < self.scroll_offset) self.scroll_offset - virtual_y else 0;
+            const skipped = if (virtual_y < first_row) first_row - virtual_y else 0;
             const remaining = total_h - skipped;
             const visible_h = @min(remaining, h - screen_y);
             const row_region = region.sub(0, screen_y, w, visible_h);
-            self.renderBlock(block, row_region, skipped, visible_h, w, separator_h);
+            self.renderBlock(block, row_region, skipped, w, separator_h);
             screen_y += visible_h;
             virtual_y = item_end;
             seen_visible = true;
         }
     }
 
-    fn renderBlock(self: *AssistantMessage, block: *Block, row_region: Region, skipped: u32, visible_h: u32, w: u32, separator_h: u32) void {
+    fn renderBlock(self: *AssistantMessage, block: *Block, row_region: Region, skipped: u32, w: u32, separator_h: u32) void {
         const comp = self.blockComponent(block);
-        const comp_h = comp.measure(w).preferred_height;
         const row_skip = skipped;
         if (separator_h > 0 and row_skip < separator_h) {
             const sep_visible = separator_h - row_skip;
-            if (visible_h > sep_visible) {
-                const sub = row_region.sub(0, sep_visible, w, visible_h - sep_visible);
-                self.renderComponentWithScroll(block, sub, 0, comp_h);
+            if (row_region.height > sep_visible) {
+                const sub = row_region.sub(0, sep_visible, w, row_region.height - sep_visible);
+                renderComponentSlice(comp, sub, 0);
             }
         } else {
-            self.renderComponentWithScroll(block, row_region, row_skip -| separator_h, comp_h);
-        }
-    }
-
-    fn renderComponentWithScroll(self: *AssistantMessage, block: *Block, region: Region, skip: u32, comp_h: u32) void {
-        _ = self;
-        _ = comp_h;
-        switch (block.render_kind) {
-            .markdown => {
-                const md = block.markdown;
-                const saved = md.scroll_offset;
-                md.scroll_offset = skip;
-                md.render(region);
-                md.scroll_offset = saved;
-            },
-            .label => {
-                const txt = block.label;
-                const saved = txt.scroll_offset;
-                txt.scroll_offset = skip;
-                txt.render(region);
-                txt.scroll_offset = saved;
-            },
+            renderComponentSlice(comp, row_region, row_skip -| separator_h);
         }
     }
 
@@ -255,6 +236,14 @@ pub const AssistantMessage = struct {
         };
     }
 };
+
+fn renderComponentSlice(comp: Component, region: Region, first_row: u32) void {
+    if (first_row == 0) {
+        comp.render(region);
+        return;
+    }
+    _ = comp.renderSlice(region, first_row);
+}
 
 const testing = std.testing;
 

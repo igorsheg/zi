@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const tool_display_mod = @import("../tool_display.zig");
-const tool_surface = @import("../tool_surface.zig");
+const boxed_surface = @import("../boxed_surface.zig");
 const excerpt_mod = @import("../excerpt.zig");
 const buffer_mod = @import("../buffer.zig");
 const cell_mod = @import("../cell.zig");
@@ -23,7 +23,7 @@ const ToolRenderContext = tool_display_mod.ToolRenderContext;
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 const Allocator = std.mem.Allocator;
-const OwnedSurface = tool_surface.OwnedSurface;
+const OwnedSurface = boxed_surface.OwnedSurface;
 
 const ParseMode = enum {
     plain,
@@ -90,7 +90,7 @@ fn builtinResultChanged(ctx: *const ToolStateContext) void {
     state.update(ctx);
 }
 
-fn makePalette(ctx: *const ToolRenderContext) tool_surface.Palette {
+fn makePalette(ctx: *const ToolRenderContext) boxed_surface.Palette {
     const base: @import("../box_chrome.zig").Style = .{
         .chrome = ctx.theme.fg(.dim),
         .fg = if (ctx.is_error) ctx.theme.fg(.@"error") else ctx.theme.fg(.tool_output),
@@ -185,7 +185,7 @@ fn rebuildTextSurface(
     while (i <= raw_end) : (i += 1) {
         if (i == raw_end or raw_full[i] == '\n') {
             const line_text = raw_full[start..i];
-            var row = tool_surface.Row{ .text = line_text };
+            var row = boxed_surface.Row{ .text = line_text };
             switch (mode) {
                 .plain => {},
                 .numbered => {
@@ -280,7 +280,7 @@ fn rebuildSurfaceFromDiffView(surface: *OwnedSurface, view: diff_view.DiffView) 
                     const owned_text = try surface.allocator.dupe(u8, row.text);
                     try surface.owned_texts.append(surface.allocator, owned_text);
 
-                    var surface_row = tool_surface.Row{
+                    var surface_row = boxed_surface.Row{
                         .text = owned_text,
                         .style = switch (row.kind) {
                             .context => .context,
