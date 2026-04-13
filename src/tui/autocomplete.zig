@@ -38,8 +38,8 @@ pub const Suggestions = struct {
 };
 
 /// Callback sink for delivering suggestions from provider to editor.
-/// For sync providers (slash commands, local path completion), call publish()
-/// immediately in request(). Async providers can publish later.
+/// Sync providers publish immediately in request(). Providers that perform
+/// incremental background work should defer publication until tick().
 pub const SuggestionSink = struct {
     ptr: *anyopaque,
     publish_fn: *const fn (ptr: *anyopaque, suggestions: ?Suggestions) void,
@@ -58,6 +58,8 @@ pub const AutocompleteProvider = struct {
         request: *const fn (ptr: *anyopaque, snapshot: RequestSnapshot, sink: SuggestionSink) void,
         cancel: ?*const fn (ptr: *anyopaque) void,
         apply: *const fn (ptr: *anyopaque, text: []const u8, cursor: u32, item: *const SelectItem, replace_range: ReplaceRange) ?ApplyResult,
+        next_deadline: ?*const fn (ptr: *anyopaque, now_ns: i128) ?i128 = null,
+        tick: ?*const fn (ptr: *anyopaque, now_ns: i128, sink: SuggestionSink) bool = null,
     };
 
     pub fn request(self: AutocompleteProvider, snapshot: RequestSnapshot, sink: SuggestionSink) void {
@@ -71,12 +73,27 @@ pub const AutocompleteProvider = struct {
     pub fn apply(self: AutocompleteProvider, text: []const u8, cursor: u32, item: *const SelectItem, replace_range: ReplaceRange) ?ApplyResult {
         return self.vtable.apply(self.ptr, text, cursor, item, replace_range);
     }
+
+    pub fn nextDeadline(self: AutocompleteProvider, now_ns: i128) ?i128 {
+        if (self.vtable.next_deadline) |next| return next(self.ptr, now_ns);
+        return null;
+    }
+
+    pub fn tick(self: AutocompleteProvider, now_ns: i128, sink: SuggestionSink) bool {
+        if (self.vtable.tick) |tick_fn| return tick_fn(self.ptr, now_ns, sink);
+        return false;
+    }
 };
 
 const max_command_candidates = 256;
 const max_path_candidates = 64;
+const max_async_results = 20;
+const max_async_candidates = 8192;
 const max_path_bytes = 512;
 const path_delimiters = [_]u8{ ' ', '\t', '"', '\'', '=' };
+const attachment_debounce_ns: i128 = 20 * std.time.ns_per_ms;
+const async_tick_interval_ns: i128 = 16 * std.time.ns_per_ms;
+const async_dirs_per_tick: usize = 12;
 
 const TokenRange = struct {
     start_offset: u32,
@@ -95,6 +112,16 @@ const SearchPlan = struct {
     display_prefix: []const u8,
     is_at_prefix: bool,
     is_quoted_prefix: bool,
+};
+
+const FuzzySearchPlan = struct {
+    base_dir: []const u8,
+    query: []const u8,
+    display_base: []const u8,
+    is_quoted_prefix: bool,
+    replace_range: ReplaceRange,
+    refresh_mode: RequestMode,
+    auto_accept_single_on_tab: bool,
 };
 
 const FixedBuilder = struct {
@@ -196,12 +223,7 @@ pub const SlashCommandProvider = struct {
             n += 1;
         }
 
-        const matched = search.plain.filter(
-            prefix_after_slash,
-            self.text_buf[0..n],
-            &self.index_buf,
-        );
-
+        const matched = search.plain.filter(prefix_after_slash, self.text_buf[0..n], &self.index_buf);
         for (0..matched) |i| {
             const idx = self.index_buf[i];
             const cmd = self.getCommand(idx);
@@ -227,11 +249,13 @@ pub const SlashCommandProvider = struct {
 };
 
 pub const CombinedAutocompleteProvider = struct {
+    allocator: std.mem.Allocator,
     registry: *const CommandRegistry,
     cwd: []const u8,
 
     command_names: [max_command_candidates][]const u8 = undefined,
     command_indices: [max_command_candidates]usize = undefined,
+    path_indices: [max_path_candidates]usize = undefined,
     item_buf: [max_path_candidates]SelectItem = undefined,
     item_is_directory: [max_path_candidates]bool = .{false} ** max_path_candidates,
     value_storage: [max_path_candidates][max_path_bytes]u8 = undefined,
@@ -240,18 +264,72 @@ pub const CombinedAutocompleteProvider = struct {
     temp_path_buf: [max_path_bytes]u8 = undefined,
     temp_dir_buf: [max_path_bytes]u8 = undefined,
     apply_buf: [max_path_bytes]u8 = undefined,
+    async_search: AsyncSearch = .{},
+
+    const AsyncCandidate = struct {
+        relative_path: []const u8,
+        is_directory: bool,
+    };
+
+    const AsyncPhase = enum {
+        idle,
+        debouncing,
+        scanning,
+    };
+
+    const AsyncSearch = struct {
+        arena: ?std.heap.ArenaAllocator = null,
+        pending_dirs: std.ArrayList([]const u8) = .empty,
+        candidates: std.ArrayList(AsyncCandidate) = .empty,
+        replace_range: ReplaceRange = .{ .start_byte = 0, .end_byte = 0 },
+        base_dir: []const u8 = "",
+        display_base: []const u8 = "",
+        query: []const u8 = "",
+        is_quoted_prefix: bool = false,
+        refresh_mode: RequestMode = .regular,
+        auto_accept_single_on_tab: bool = false,
+        phase: AsyncPhase = .idle,
+        debounce_until_ns: i128 = 0,
+
+        fn reset(self: *AsyncSearch) void {
+            if (self.arena) |*arena| arena.deinit();
+            self.arena = null;
+            self.pending_dirs = .empty;
+            self.candidates = .empty;
+            self.replace_range = .{ .start_byte = 0, .end_byte = 0 };
+            self.base_dir = "";
+            self.display_base = "";
+            self.query = "";
+            self.is_quoted_prefix = false;
+            self.refresh_mode = .regular;
+            self.auto_accept_single_on_tab = false;
+            self.phase = .idle;
+            self.debounce_until_ns = 0;
+        }
+
+        fn arenaAllocator(self: *AsyncSearch) std.mem.Allocator {
+            return self.arena.?.allocator();
+        }
+    };
 
     const vtable = AutocompleteProvider.VTable{
         .request = @ptrCast(&requestImpl),
-        .cancel = null,
+        .cancel = @ptrCast(&cancelImpl),
         .apply = @ptrCast(&applyImpl),
+        .next_deadline = @ptrCast(&nextDeadlineImpl),
+        .tick = @ptrCast(&tickImpl),
     };
 
-    pub fn init(registry: *const CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
+    pub fn init(allocator: std.mem.Allocator, registry: *const CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
         return .{
+            .allocator = allocator,
             .registry = registry,
             .cwd = cwd,
         };
+    }
+
+    pub fn deinit(self: *CombinedAutocompleteProvider) void {
+        self.cancelAsyncSearch();
     }
 
     pub fn provider(self: *CombinedAutocompleteProvider) AutocompleteProvider {
@@ -268,23 +346,16 @@ pub const CombinedAutocompleteProvider = struct {
         const before_cursor = text[line_start..cursor];
 
         if (extractAtPrefix(before_cursor)) |token| {
-            const count = self.buildPathSuggestions(token.prefix);
-            if (count == 0) {
+            const plan = self.resolveFuzzySearchPlan(token.prefix, line_start + token.start_offset, cursor, snapshot.mode) orelse {
+                self.cancelAsyncSearch();
                 sink.publish(null);
                 return;
-            }
-            sink.publish(.{
-                .items = self.item_buf[0..count],
-                .replace_range = .{
-                    .start_byte = line_start + token.start_offset,
-                    .end_byte = cursor,
-                },
-                .submit_on_confirm = false,
-                .refresh_mode = if (snapshot.mode == .force) .force else .regular,
-                .auto_accept_single_on_tab = snapshot.mode == .force,
-            });
+            };
+            self.beginAsyncSearch(plan);
             return;
         }
+
+        self.cancelAsyncSearch();
 
         if (line_start == 0 and isSlashCommandNameContext(before_cursor)) {
             const prefix_after_slash = if (before_cursor.len > 1) before_cursor[1..] else "";
@@ -328,6 +399,35 @@ pub const CombinedAutocompleteProvider = struct {
             .refresh_mode = if (snapshot.mode == .force) .force else .regular,
             .auto_accept_single_on_tab = snapshot.mode == .force,
         });
+    }
+
+    fn cancelImpl(self: *CombinedAutocompleteProvider) void {
+        self.cancelAsyncSearch();
+    }
+
+    fn nextDeadlineImpl(self: *CombinedAutocompleteProvider, now_ns: i128) ?i128 {
+        return switch (self.async_search.phase) {
+            .idle => null,
+            .debouncing => self.async_search.debounce_until_ns,
+            .scanning => now_ns + async_tick_interval_ns,
+        };
+    }
+
+    fn tickImpl(self: *CombinedAutocompleteProvider, now_ns: i128, sink: SuggestionSink) bool {
+        switch (self.async_search.phase) {
+            .idle => return false,
+            .debouncing => {
+                if (now_ns < self.async_search.debounce_until_ns) return false;
+                self.async_search.phase = .scanning;
+            },
+            .scanning => {},
+        }
+
+        if (!self.processAsyncSearchTick()) return false;
+
+        const suggestions = self.finishAsyncSearch();
+        sink.publish(suggestions);
+        return true;
     }
 
     fn buildCommandItems(self: *CombinedAutocompleteProvider, prefix_after_slash: []const u8) usize {
@@ -438,6 +538,191 @@ pub const CombinedAutocompleteProvider = struct {
             .is_at_prefix = parsed.is_at_prefix,
             .is_quoted_prefix = parsed.is_quoted_prefix,
         };
+    }
+
+    fn resolveFuzzySearchPlan(self: *CombinedAutocompleteProvider, prefix: []const u8, replace_start_byte: u32, replace_end_byte: u32, mode: RequestMode) ?FuzzySearchPlan {
+        const parsed = parsePathPrefix(prefix);
+        if (!parsed.is_at_prefix) return null;
+
+        var base_dir = self.cwd;
+        var query = parsed.raw_prefix;
+        var display_base: []const u8 = "";
+
+        if (std.mem.lastIndexOfScalar(u8, parsed.raw_prefix, '/')) |slash_idx| {
+            display_base = parsed.raw_prefix[0 .. slash_idx + 1];
+            query = parsed.raw_prefix[slash_idx + 1 ..];
+
+            const absolute_base = self.resolveAbsolutePath(display_base) orelse return null;
+            if (!isDirectoryAbsolute(absolute_base)) return null;
+            base_dir = absolute_base;
+        }
+
+        return .{
+            .base_dir = base_dir,
+            .query = query,
+            .display_base = display_base,
+            .is_quoted_prefix = parsed.is_quoted_prefix,
+            .replace_range = .{ .start_byte = replace_start_byte, .end_byte = replace_end_byte },
+            .refresh_mode = if (mode == .force) .force else .regular,
+            .auto_accept_single_on_tab = mode == .force,
+        };
+    }
+
+    fn beginAsyncSearch(self: *CombinedAutocompleteProvider, plan: FuzzySearchPlan) void {
+        self.cancelAsyncSearch();
+
+        self.async_search.arena = std.heap.ArenaAllocator.init(self.allocator);
+        const arena = self.async_search.arenaAllocator();
+
+        self.async_search.base_dir = arena.dupe(u8, plan.base_dir) catch {
+            self.cancelAsyncSearch();
+            return;
+        };
+        self.async_search.display_base = arena.dupe(u8, plan.display_base) catch {
+            self.cancelAsyncSearch();
+            return;
+        };
+        self.async_search.query = arena.dupe(u8, plan.query) catch {
+            self.cancelAsyncSearch();
+            return;
+        };
+        self.async_search.pending_dirs.append(arena, self.async_search.base_dir) catch {
+            self.cancelAsyncSearch();
+            return;
+        };
+
+        self.async_search.replace_range = plan.replace_range;
+        self.async_search.is_quoted_prefix = plan.is_quoted_prefix;
+        self.async_search.refresh_mode = plan.refresh_mode;
+        self.async_search.auto_accept_single_on_tab = plan.auto_accept_single_on_tab;
+        self.async_search.debounce_until_ns = std.time.nanoTimestamp() + if (plan.refresh_mode == .force) @as(i128, 0) else attachment_debounce_ns;
+        self.async_search.phase = if (plan.refresh_mode == .force) .scanning else .debouncing;
+    }
+
+    fn processAsyncSearchTick(self: *CombinedAutocompleteProvider) bool {
+        var processed_dirs: usize = 0;
+        while (processed_dirs < async_dirs_per_tick) : (processed_dirs += 1) {
+            if (self.async_search.pending_dirs.items.len == 0) return true;
+            const dir_path = self.async_search.pending_dirs.pop().?;
+            self.scanDirectory(dir_path);
+            if (self.async_search.pending_dirs.items.len == 0) return true;
+        }
+        return self.async_search.pending_dirs.items.len == 0;
+    }
+
+    fn scanDirectory(self: *CombinedAutocompleteProvider, dir_path: []const u8) void {
+        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (std.mem.eql(u8, entry.name, ".git")) continue;
+            if (self.async_search.candidates.items.len >= max_async_candidates) {
+                self.async_search.pending_dirs.items.len = 0;
+                return;
+            }
+
+            var is_directory = entry.kind == .directory;
+            if (!is_directory and entry.kind == .sym_link) {
+                const stat: ?std.fs.File.Stat = dir.statFile(entry.name) catch null;
+                if (stat) |value| {
+                    is_directory = value.kind == .directory;
+                }
+            }
+
+            const arena = self.async_search.arenaAllocator();
+            const child_path = std.fs.path.join(arena, &.{ dir_path, entry.name }) catch continue;
+            const relative_path = self.relativeToAsyncBase(child_path) orelse continue;
+
+            self.async_search.candidates.append(arena, .{
+                .relative_path = relative_path,
+                .is_directory = is_directory,
+            }) catch continue;
+
+            if (is_directory) {
+                self.async_search.pending_dirs.append(arena, child_path) catch continue;
+            }
+        }
+    }
+
+    fn finishAsyncSearch(self: *CombinedAutocompleteProvider) ?Suggestions {
+        defer self.cancelAsyncSearch();
+
+        if (self.async_search.candidates.items.len == 0) return null;
+
+        var selected_indices: [max_async_results]usize = undefined;
+        var selected_count: usize = 0;
+
+        if (self.async_search.query.len == 0) {
+            selected_count = @min(self.async_search.candidates.items.len, selected_indices.len);
+            for (0..selected_count) |idx| selected_indices[idx] = idx;
+        } else {
+            const arena = self.async_search.arenaAllocator();
+            const paths = arena.alloc([]const u8, self.async_search.candidates.items.len) catch return null;
+            for (self.async_search.candidates.items, 0..) |candidate, idx| {
+                paths[idx] = candidate.relative_path;
+            }
+            selected_count = search.path.filter(self.async_search.query, paths, &selected_indices);
+            if (selected_count == 0) return null;
+        }
+
+        for (selected_indices[0..selected_count], 0..) |candidate_idx, out_idx| {
+            const candidate = self.async_search.candidates.items[candidate_idx];
+            const display_path = self.buildAsyncDisplayPath(out_idx, self.async_search.display_base, candidate.relative_path) orelse continue;
+            const completion_value = self.buildCompletionValue(out_idx, display_path, candidate.is_directory, true, self.async_search.is_quoted_prefix) orelse continue;
+            const label = self.buildLabel(out_idx, std.fs.path.basename(candidate.relative_path), candidate.is_directory) orelse continue;
+
+            self.item_buf[out_idx] = .{
+                .value = completion_value,
+                .label = label,
+                .description = display_path,
+            };
+            self.item_is_directory[out_idx] = candidate.is_directory;
+        }
+
+        return .{
+            .items = self.item_buf[0..selected_count],
+            .replace_range = self.async_search.replace_range,
+            .submit_on_confirm = false,
+            .refresh_mode = self.async_search.refresh_mode,
+            .auto_accept_single_on_tab = self.async_search.auto_accept_single_on_tab,
+        };
+    }
+
+    fn cancelAsyncSearch(self: *CombinedAutocompleteProvider) void {
+        self.async_search.reset();
+    }
+
+    fn relativeToAsyncBase(self: *CombinedAutocompleteProvider, absolute_path: []const u8) ?[]const u8 {
+        const base_dir = self.async_search.base_dir;
+        if (std.mem.eql(u8, base_dir, "/")) {
+            if (!std.mem.startsWith(u8, absolute_path, "/")) return null;
+            return absolute_path[1..];
+        }
+        if (!std.mem.startsWith(u8, absolute_path, base_dir)) return null;
+        if (absolute_path.len == base_dir.len) return "";
+        if (absolute_path[base_dir.len] != std.fs.path.sep) return null;
+        return absolute_path[base_dir.len + 1 ..];
+    }
+
+    fn buildAsyncDisplayPath(self: *CombinedAutocompleteProvider, idx: usize, display_base: []const u8, relative_path: []const u8) ?[]const u8 {
+        var builder = FixedBuilder{ .buf = self.description_storage[idx][0..] };
+        if (display_base.len > 0) {
+            if (!builder.append(display_base)) return null;
+        }
+        if (!builder.append(relative_path)) return null;
+        return builder.written();
+    }
+
+    fn resolveAbsolutePath(self: *CombinedAutocompleteProvider, raw_path: []const u8) ?[]const u8 {
+        if (raw_path.len == 0) return self.cwd;
+        if (raw_path[0] == '/') return raw_path;
+        if (std.mem.eql(u8, raw_path, "~") or std.mem.startsWith(u8, raw_path, "~/")) {
+            return self.expandHomePath(raw_path);
+        }
+
+        var builder = FixedBuilder{ .buf = self.temp_dir_buf[0..] };
+        return self.joinSearchDir(&builder, self.cwd, raw_path);
     }
 
     fn joinSearchDir(self: *CombinedAutocompleteProvider, builder: *FixedBuilder, base: []const u8, suffix: []const u8) ?[]const u8 {
@@ -632,6 +917,12 @@ fn currentLineStart(text: []const u8, cursor: u32) u32 {
     return 0;
 }
 
+fn isDirectoryAbsolute(path: []const u8) bool {
+    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    defer dir.close();
+    return true;
+}
+
 fn isSlashCommandNameContext(before_cursor: []const u8) bool {
     if (before_cursor.len == 0 or before_cursor[0] != '/') return false;
     return std.mem.indexOfScalar(u8, before_cursor, ' ') == null;
@@ -665,29 +956,17 @@ fn extractPathPrefix(before_cursor: []const u8, force_extract: bool) ?TokenRange
     const path_prefix = before_cursor[token_start..];
 
     if (force_extract) {
-        return .{
-            .start_offset = @intCast(token_start),
-            .prefix = path_prefix,
-        };
+        return .{ .start_offset = @intCast(token_start), .prefix = path_prefix };
     }
 
     if (std.mem.indexOfScalar(u8, path_prefix, '/')) |_| {
-        return .{
-            .start_offset = @intCast(token_start),
-            .prefix = path_prefix,
-        };
+        return .{ .start_offset = @intCast(token_start), .prefix = path_prefix };
     }
     if (std.mem.startsWith(u8, path_prefix, ".") or std.mem.startsWith(u8, path_prefix, "~/")) {
-        return .{
-            .start_offset = @intCast(token_start),
-            .prefix = path_prefix,
-        };
+        return .{ .start_offset = @intCast(token_start), .prefix = path_prefix };
     }
     if (path_prefix.len == 0 and before_cursor.len > 0 and before_cursor[before_cursor.len - 1] == ' ') {
-        return .{
-            .start_offset = @intCast(token_start),
-            .prefix = path_prefix,
-        };
+        return .{ .start_offset = @intCast(token_start), .prefix = path_prefix };
     }
     return null;
 }
@@ -741,9 +1020,7 @@ fn findUnclosedQuoteStart(text: []const u8) ?usize {
     for (text, 0..) |byte, idx| {
         if (byte != '"') continue;
         in_quotes = !in_quotes;
-        if (in_quotes) {
-            quote_start = idx;
-        }
+        if (in_quotes) quote_start = idx;
     }
     return if (in_quotes) quote_start else null;
 }
@@ -875,7 +1152,8 @@ test "CombinedAutocompleteProvider force tab completes slash command arguments w
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(&reg, cwd);
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    defer provider.deinit();
     var sink = TestSink{};
 
     provider.requestImpl(.{ .text = "/open no", .cursor_byte = 8, .mode = .force }, sink.sink());
@@ -888,11 +1166,64 @@ test "CombinedAutocompleteProvider force tab completes slash command arguments w
     try std.testing.expect(!sink.result.?.submit_on_confirm);
 }
 
+test "CombinedAutocompleteProvider async at-file search publishes on tick" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "notes.md", .data = "hello" });
+    try tmp.dir.makePath("docs");
+    try tmp.dir.writeFile(.{ .sub_path = "docs/guide.md", .data = "hi" });
+
+    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    var reg = CommandRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    defer provider.deinit();
+    var sink = TestSink{};
+
+    provider.requestImpl(.{ .text = "@gui", .cursor_byte = 4, .mode = .force }, sink.sink());
+    try std.testing.expect(sink.result == null);
+    try std.testing.expect(provider.nextDeadlineImpl(0) != null);
+
+    try std.testing.expect(provider.tickImpl(0, sink.sink()));
+    try std.testing.expect(sink.result != null);
+    try std.testing.expect(hasItem(sink.result.?.items, "@docs/guide.md"));
+    try std.testing.expectEqual(ReplaceRange{ .start_byte = 0, .end_byte = 4 }, sink.result.?.replace_range);
+}
+
+test "CombinedAutocompleteProvider replaces stale at-file request before tick publishes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "guide.md", .data = "hello" });
+    try tmp.dir.writeFile(.{ .sub_path = "notes.md", .data = "world" });
+
+    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    var reg = CommandRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    defer provider.deinit();
+    var sink = TestSink{};
+
+    provider.requestImpl(.{ .text = "@gu", .cursor_byte = 3, .mode = .force }, sink.sink());
+    provider.requestImpl(.{ .text = "@no", .cursor_byte = 3, .mode = .force }, sink.sink());
+
+    try std.testing.expect(provider.tickImpl(0, sink.sink()));
+    try std.testing.expect(sink.result != null);
+    try std.testing.expect(hasItem(sink.result.?.items, "@notes.md"));
+    try std.testing.expect(!hasItem(sink.result.?.items, "@guide.md"));
+}
+
 test "CombinedAutocompleteProvider apply consumes trailing quote when completing quoted path" {
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(&reg, "/tmp");
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, "/tmp");
+    defer provider.deinit();
     const item = SelectItem{ .value = "\"two words.txt\"", .label = "two words.txt" };
     const result = provider.applyImpl("\"tw\"", 3, &item, .{ .start_byte = 0, .end_byte = 3 }).?;
 

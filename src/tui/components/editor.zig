@@ -382,6 +382,16 @@ pub const Editor = struct {
         };
     }
 
+    pub fn nextAnimationDeadline(self: *Editor, now_ns: i128) ?i128 {
+        return self.autocomplete.nextAnimationDeadline(now_ns);
+    }
+
+    pub fn tickAnimation(self: *Editor, now_ns: i128) bool {
+        const outcome = self.autocomplete.tickAnimation(self.buffer, now_ns);
+        if (outcome.accepted) self.afterAutocompleteAcceptance();
+        return outcome.changed;
+    }
+
     pub fn setFocused(self: *Editor, focused: bool) void {
         self.focused = focused;
     }

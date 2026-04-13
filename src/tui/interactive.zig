@@ -447,6 +447,7 @@ pub const Interactive = struct {
     // ── Slash commands ──────────────────────────────────────────
     command_registry: CommandRegistry,
     autocomplete_provider: CombinedAutocompleteProvider = undefined,
+    autocomplete_provider_bound: bool = false,
     hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
 
     // ── Flow-owned transient pickers ────────────────────────────
@@ -634,6 +635,7 @@ pub const Interactive = struct {
         }
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
+        if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
         self.command_registry.deinit();
         self.status_data.deinit();
         self.input.deinit();
@@ -684,7 +686,8 @@ pub const Interactive = struct {
         self.bootstrapStatusSnapshot();
 
         // Wire autocomplete: combined slash + file path completion.
-        self.autocomplete_provider = CombinedAutocompleteProvider.init(&self.command_registry, self.cwd);
+        self.autocomplete_provider = CombinedAutocompleteProvider.init(self.allocator, &self.command_registry, self.cwd);
+        self.autocomplete_provider_bound = true;
         self.active_editor.setAutocompleteProvider(self.autocomplete_provider.provider());
 
         // Populate container slots with their initial children.

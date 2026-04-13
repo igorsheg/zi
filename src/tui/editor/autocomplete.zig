@@ -27,6 +27,11 @@ pub const InputOutcome = union(enum) {
     cancelled,
 };
 
+pub const TickOutcome = struct {
+    changed: bool,
+    accepted: bool,
+};
+
 pub const AutocompleteSession = struct {
     provider: ?AutocompleteProvider = null,
     list: SelectList = undefined,
@@ -73,9 +78,7 @@ pub const AutocompleteSession = struct {
     }
 
     pub fn cancel(self: *AutocompleteSession) void {
-        if (self.active) {
-            if (self.provider) |provider| provider.cancel();
-        }
+        if (self.provider) |provider| provider.cancel();
         self.active = false;
         self.request_mode = .regular;
         self.replace_start_byte = 0;
@@ -84,6 +87,25 @@ pub const AutocompleteSession = struct {
         self.auto_accept_single_on_tab = false;
         self.list.items = &.{};
         self.list.selected_index = 0;
+    }
+
+    pub fn nextAnimationDeadline(self: *const AutocompleteSession, now_ns: i128) ?i128 {
+        const provider = self.provider orelse return null;
+        return provider.nextDeadline(now_ns);
+    }
+
+    pub fn tickAnimation(self: *AutocompleteSession, buffer: *PromptBuffer, now_ns: i128) TickOutcome {
+        const provider = self.provider orelse return .{ .changed = false, .accepted = false };
+        self.sink_ctx = .{ .session = self };
+        const changed = provider.tick(now_ns, .{ .ptr = @ptrCast(&self.sink_ctx), .publish_fn = &sinkCallback });
+        if (!changed) return .{ .changed = false, .accepted = false };
+        if (self.isActive() and self.auto_accept_single_on_tab and self.list.items.len == 1) {
+            if (self.accept(buffer)) {
+                return .{ .changed = true, .accepted = true };
+            }
+            self.cancel();
+        }
+        return .{ .changed = true, .accepted = false };
     }
 
     pub fn measure(self: *const AutocompleteSession, width: u32) Measurement {
@@ -160,6 +182,7 @@ pub const AutocompleteSession = struct {
             self.cancel();
             return;
         };
+        self.request_mode = mode;
         self.sink_ctx = .{ .session = self };
         provider.request(
             .{ .text = buffer.text(), .cursor_byte = buffer.cursorByte(), .mode = mode },
@@ -266,7 +289,7 @@ test "AutocompleteSession enter accepts slash command selection and requests sub
 }
 
 fn makeCombinedProvider(registry: *const @import("../../slash_commands.zig").CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
-    return CombinedAutocompleteProvider.init(registry, cwd);
+    return CombinedAutocompleteProvider.init(testing.allocator, registry, cwd);
 }
 
 test "AutocompleteSession enter accepts file completion without submit" {
@@ -284,6 +307,7 @@ test "AutocompleteSession enter accepts file completion without submit" {
     defer registry.deinit();
 
     var provider = makeCombinedProvider(&registry, cwd);
+    defer provider.deinit();
     var session = AutocompleteSession.init(&Theme.dark);
     session.setProvider(provider.provider());
 
@@ -300,7 +324,7 @@ test "AutocompleteSession enter accepts file completion without submit" {
     try testing.expect(!session.isActive());
 }
 
-test "AutocompleteSession tab force-completes a single file suggestion immediately" {
+test "AutocompleteSession tab force-completes a single at-file suggestion after async tick" {
     const slash_commands_mod = @import("../../slash_commands.zig");
 
     var tmp = testing.tmpDir(.{});
@@ -314,15 +338,20 @@ test "AutocompleteSession tab force-completes a single file suggestion immediate
     defer registry.deinit();
 
     var provider = makeCombinedProvider(&registry, cwd);
+    defer provider.deinit();
     var session = AutocompleteSession.init(&Theme.dark);
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
     defer buffer.deinit();
-    buffer.setText("/open no");
+    buffer.setText("@no");
 
-    const outcome = session.processInput(.{ .code = .tab }, &buffer);
-    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
-    try testing.expectEqualStrings("/open notes.md", buffer.text());
+    const first = session.processInput(.{ .code = .tab }, &buffer);
+    try testing.expectEqual(InputOutcome.consumed, first);
+
+    const tick = session.tickAnimation(&buffer, 0);
+    try testing.expect(tick.changed);
+    try testing.expect(tick.accepted);
+    try testing.expectEqualStrings("@notes.md ", buffer.text());
     try testing.expect(!session.isActive());
 }
