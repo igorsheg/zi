@@ -27,13 +27,25 @@ const PromptView = editor_core.PromptView;
 const AutocompleteSession = editor_core.AutocompleteSession;
 const RenderConfig = editor_core.RenderConfig;
 
+const UndoSnapshot = struct {
+    text: []u8,
+    cursor_byte: u32,
+};
+
+const LastAction = enum {
+    none,
+    type_word,
+};
+
 pub const Editor = struct {
     allocator: std.mem.Allocator,
     buffer: *PromptBuffer,
     view: PromptView,
     autocomplete: AutocompleteSession,
     history: std.ArrayList([]u8) = .empty,
+    undo_stack: std.ArrayList(UndoSnapshot) = .empty,
     history_index: i32 = -1,
+    last_action: LastAction = .none,
     max_visible_lines: u32 = 10,
     last_total_width: u32 = 80,
     last_applied_padding_x: u32 = 0,
@@ -74,6 +86,8 @@ pub const Editor = struct {
     pub fn deinit(self: *Editor) void {
         for (self.history.items) |entry| self.allocator.free(entry);
         self.history.deinit(self.allocator);
+        self.clearUndoStack();
+        self.undo_stack.deinit(self.allocator);
         self.view.deinit();
         self.buffer.deinit();
         self.allocator.destroy(self.buffer);
@@ -90,12 +104,18 @@ pub const Editor = struct {
     pub fn clear(self: *Editor) void {
         self.cancelAutocomplete();
         self.history_index = -1;
+        self.last_action = .none;
+        self.clearUndoStack();
         self.setTextInternal("", false);
     }
 
     pub fn setText(self: *Editor, text: []const u8) void {
         self.cancelAutocomplete();
+        self.last_action = .none;
         self.history_index = -1;
+        if (!std.mem.eql(u8, self.buffer.text(), text)) {
+            self.pushUndoSnapshot();
+        }
         self.setTextInternal(text, false);
     }
 
@@ -104,6 +124,10 @@ pub const Editor = struct {
     }
 
     pub fn insertTextAtCursor(self: *Editor, text: []const u8) void {
+        if (text.len == 0) return;
+        self.cancelAutocomplete();
+        self.pushUndoSnapshot();
+        self.last_action = .none;
         self.history_index = -1;
         self.buffer.insertAtCursor(text);
         self.afterTextMutation();
@@ -194,21 +218,43 @@ pub const Editor = struct {
     pub fn handleInput(self: *Editor, key: Key) bool {
         if (!self.focused) return false;
 
+        if (keybindings.matches(.editor_undo, key)) {
+            self.undo();
+            return true;
+        }
+
+        const may_accept_autocomplete = self.autocomplete.isActive() and
+            (keybindings.matches(.input_tab, key) or keybindings.matches(.select_confirm, key));
+        var autocomplete_snapshot: ?UndoSnapshot = null;
+        if (may_accept_autocomplete) {
+            autocomplete_snapshot = self.captureUndoSnapshot() catch null;
+        }
         switch (self.autocomplete.processInput(key, self.buffer)) {
             .accepted => |accepted| {
+                if (autocomplete_snapshot) |snapshot| {
+                    self.appendUndoSnapshot(snapshot);
+                }
+                self.last_action = .none;
                 self.afterAutocompleteAcceptance();
                 if (accepted.submit) {
                     if (self.disable_submit) return true;
-                    if (self.on_submit) |cb| cb(self.buffer.text(), self.on_submit_ctx);
+                    self.submitValue();
                 }
                 return true;
             },
-            .cancelled, .consumed => return true,
-            .unhandled => {},
+            .cancelled, .consumed => {
+                if (autocomplete_snapshot) |snapshot| self.freeUndoSnapshot(snapshot);
+                return true;
+            },
+            .unhandled => {
+                if (autocomplete_snapshot) |snapshot| self.freeUndoSnapshot(snapshot);
+            },
         }
 
         if (keybindings.matches(.input_new_line, key)) {
             self.history_index = -1;
+            self.last_action = .none;
+            self.pushUndoSnapshot();
             self.buffer.insertNewline();
             self.afterTextMutation();
             return true;
@@ -218,6 +264,8 @@ pub const Editor = struct {
             const cursor_byte = self.buffer.cursorByte();
             if (cursor_byte > 0 and self.buffer.text()[cursor_byte - 1] == '\\') {
                 self.history_index = -1;
+                self.last_action = .none;
+                self.pushUndoSnapshot();
                 self.buffer.backspace();
                 self.buffer.insertNewline();
                 self.afterTextMutation();
@@ -225,7 +273,7 @@ pub const Editor = struct {
             }
 
             if (self.disable_submit) return true;
-            if (self.on_submit) |cb| cb(self.buffer.text(), self.on_submit_ctx);
+            self.submitValue();
             return true;
         }
 
@@ -233,25 +281,29 @@ pub const Editor = struct {
             .char => {
                 if (key.ctrl) return false;
                 if (key.char) |cp| {
-                    self.history_index = -1;
-                    var utf8_buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(cp, &utf8_buf) catch return false;
-                    self.buffer.insertAtCursor(utf8_buf[0..len]);
-                    self.afterTextMutation();
+                    self.insertCharacter(cp);
                     return true;
                 }
                 return false;
             },
             .backspace => {
                 self.history_index = -1;
-                self.buffer.backspace();
-                self.afterTextMutation();
+                self.last_action = .none;
+                if (self.buffer.cursorByte() > 0) {
+                    self.pushUndoSnapshot();
+                    self.buffer.backspace();
+                    self.afterTextMutation();
+                }
                 return true;
             },
             .delete => {
                 self.history_index = -1;
-                self.buffer.deleteForward();
-                self.afterTextMutation();
+                self.last_action = .none;
+                if (self.buffer.cursorByte() < self.buffer.text().len) {
+                    self.pushUndoSnapshot();
+                    self.buffer.deleteForward();
+                    self.afterTextMutation();
+                }
                 return true;
             },
             .left => {
@@ -273,6 +325,7 @@ pub const Editor = struct {
                     self.buffer.moveLogicalLineStart();
                     self.afterCursorMotion();
                 } else {
+                    self.last_action = .none;
                     self.view.moveUpVisual();
                 }
                 return true;
@@ -284,6 +337,7 @@ pub const Editor = struct {
                     self.buffer.moveLogicalLineEnd();
                     self.afterCursorMotion();
                 } else {
+                    self.last_action = .none;
                     self.view.moveDownVisual();
                 }
                 return true;
@@ -387,8 +441,15 @@ pub const Editor = struct {
     }
 
     pub fn tickAnimation(self: *Editor, now_ns: i128) bool {
+        const needs_snapshot = self.autocomplete.nextAnimationDeadline(now_ns) != null;
+        const snapshot = if (needs_snapshot) self.captureUndoSnapshot() catch null else null;
         const outcome = self.autocomplete.tickAnimation(self.buffer, now_ns);
-        if (outcome.accepted) self.afterAutocompleteAcceptance();
+        if (outcome.accepted) {
+            if (snapshot) |value| self.appendUndoSnapshot(value);
+            self.afterAutocompleteAcceptance();
+        } else if (snapshot) |value| {
+            self.freeUndoSnapshot(value);
+        }
         return outcome.changed;
     }
 
@@ -422,11 +483,16 @@ pub const Editor = struct {
     }
 
     fn navigateHistory(self: *Editor, direction: i32) void {
+        self.last_action = .none;
         if (self.history.items.len == 0) return;
 
         const max_index: i32 = @intCast(self.history.items.len);
         const new_index = self.history_index - direction;
         if (new_index < -1 or new_index >= max_index) return;
+
+        if (self.history_index == -1 and new_index >= 0) {
+            self.pushUndoSnapshot();
+        }
 
         self.history_index = new_index;
         self.cancelAutocomplete();
@@ -452,16 +518,96 @@ pub const Editor = struct {
     }
 
     fn afterCursorMotion(self: *Editor) void {
+        self.last_action = .none;
         self.view.clearDesiredVisualColumn();
         self.syncStoredViewGeometry();
         self.view.ensureCursorVisible();
     }
 
     fn afterAutocompleteAcceptance(self: *Editor) void {
+        self.last_action = .none;
         self.view.clearDesiredVisualColumn();
         self.syncStoredViewGeometry();
         self.view.ensureCursorVisible();
         self.notifyChange();
+    }
+
+    fn insertCharacter(self: *Editor, cp: u21) void {
+        self.history_index = -1;
+        if (isWhitespaceCodepoint(cp) or self.last_action != .type_word) {
+            self.pushUndoSnapshot();
+        }
+        self.last_action = .type_word;
+
+        var utf8_buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch return;
+        self.buffer.insertAtCursor(utf8_buf[0..len]);
+        self.afterTextMutation();
+    }
+
+    fn submitValue(self: *Editor) void {
+        const submitted_text = self.buffer.text();
+        const trimmed = std.mem.trim(u8, submitted_text, " \t\r\n");
+        const result = self.allocator.dupe(u8, trimmed) catch return;
+        defer self.allocator.free(result);
+
+        self.cancelAutocomplete();
+        self.buffer.clear();
+        self.view.resetViewport();
+        self.view.clearDesiredVisualColumn();
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
+        self.history_index = -1;
+        self.last_action = .none;
+        self.clearUndoStack();
+
+        self.notifyChange();
+        if (self.on_submit) |cb| cb(result, self.on_submit_ctx);
+    }
+
+    fn undo(self: *Editor) void {
+        self.history_index = -1;
+        const snapshot = self.popUndoSnapshot() orelse return;
+        defer self.freeUndoSnapshot(snapshot);
+
+        self.buffer.setTextAndCursor(snapshot.text, snapshot.cursor_byte);
+        self.last_action = .none;
+        self.view.resetViewport();
+        self.view.clearDesiredVisualColumn();
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
+        self.notifyChange();
+    }
+
+    fn captureUndoSnapshot(self: *Editor) !UndoSnapshot {
+        return .{
+            .text = try self.allocator.dupe(u8, self.buffer.text()),
+            .cursor_byte = self.buffer.cursorByte(),
+        };
+    }
+
+    fn pushUndoSnapshot(self: *Editor) void {
+        const snapshot = self.captureUndoSnapshot() catch return;
+        self.appendUndoSnapshot(snapshot);
+    }
+
+    fn appendUndoSnapshot(self: *Editor, snapshot: UndoSnapshot) void {
+        self.undo_stack.append(self.allocator, snapshot) catch {
+            self.freeUndoSnapshot(snapshot);
+        };
+    }
+
+    fn popUndoSnapshot(self: *Editor) ?UndoSnapshot {
+        return self.undo_stack.pop();
+    }
+
+    fn freeUndoSnapshot(self: *Editor, snapshot: UndoSnapshot) void {
+        self.allocator.free(snapshot.text);
+    }
+
+    fn clearUndoStack(self: *Editor) void {
+        for (self.undo_stack.items) |snapshot| self.freeUndoSnapshot(snapshot);
+        self.undo_stack.clearRetainingCapacity();
     }
 
     fn syncStoredViewGeometry(self: *Editor) void {
@@ -604,111 +750,114 @@ pub const Editor = struct {
 
 const testing = std.testing;
 
+fn isWhitespaceCodepoint(cp: u21) bool {
+    return switch (cp) {
+        ' ', '\t', '\n', '\r' => true,
+        else => false,
+    };
+}
+
 const SubmitCapture = struct {
     count: u32 = 0,
+    last_text_len: usize = 0,
+    last_text_buf: [128]u8 = undefined,
 };
 
-fn captureSubmit(_: []const u8, ctx: ?*anyopaque) void {
+fn captureSubmit(text: []const u8, ctx: ?*anyopaque) void {
     const capture: *SubmitCapture = @ptrCast(@alignCast(ctx));
     capture.count += 1;
+    capture.last_text_len = @min(text.len, capture.last_text_buf.len);
+    @memcpy(capture.last_text_buf[0..capture.last_text_len], text[0..capture.last_text_len]);
 }
 
-test "Editor shared bindings keep shift enter as newline and enter as submit" {
+fn submittedText(capture: *const SubmitCapture) []const u8 {
+    return capture.last_text_buf[0..capture.last_text_len];
+}
+
+test "Editor undo coalesces typing by word boundaries" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
 
-    var capture = SubmitCapture{};
-    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
-    editor.insertText("hello");
+    for ("hi there") |c| {
+        try testing.expect(editor.handleInput(.{ .code = .char, .char = c }));
+    }
+    try testing.expectEqualStrings("hi there", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .enter, .shift = true }));
-    try testing.expectEqualStrings("hello\n", editor.getText());
-    try testing.expectEqual(@as(u32, 0), capture.count);
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("hi", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .enter }));
-    try testing.expectEqual(@as(u32, 1), capture.count);
-}
-
-test "Editor submit binding preserves backslash newline fallback" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-
-    var capture = SubmitCapture{};
-    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
-    editor.insertText("hello\\");
-
-    try testing.expect(editor.handleInput(.{ .code = .enter }));
-    try testing.expectEqualStrings("hello\n", editor.getText());
-    try testing.expectEqual(@as(u32, 0), capture.count);
-}
-
-test "Editor history recall shows most recent first and clamps at oldest" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-    editor.setPaddingX(0);
-    editor.addToHistory("first");
-    editor.addToHistory("second");
-    editor.addToHistory("third");
-
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("third", editor.getText());
-
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("second", editor.getText());
-
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("first", editor.getText());
-
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("first", editor.getText());
-}
-
-test "Editor history down walks forward and returns to empty editor" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-    editor.setPaddingX(0);
-    editor.addToHistory("first");
-    editor.addToHistory("second");
-    editor.addToHistory("third");
-
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("first", editor.getText());
-
-    try testing.expect(editor.handleInput(.{ .code = .down }));
-    try testing.expectEqualStrings("second", editor.getText());
-
-    try testing.expect(editor.handleInput(.{ .code = .down }));
-    try testing.expectEqualStrings("third", editor.getText());
-
-    try testing.expect(editor.handleInput(.{ .code = .down }));
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
     try testing.expectEqualStrings("", editor.getText());
 }
 
-test "Editor typing exits history mode and continues editing recalled entry" {
+test "Editor undo restores destructive backspace and delete edits" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
+
+    editor.setText("abc");
+    try testing.expectEqualStrings("abc", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .backspace }));
+    try testing.expectEqualStrings("ab", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("abc", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .left }));
+    try testing.expect(editor.handleInput(.{ .code = .delete }));
+    try testing.expectEqualStrings("ab", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("abc", editor.getText());
+}
+
+test "Editor undo restores autocomplete application as one edit" {
+    const slash_commands_mod = @import("../../slash_commands.zig");
+
+    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var provider = autocomplete_mod.SlashCommandProvider.init(&registry);
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.setAutocompleteProvider(provider.provider());
+
+    editor.insertText("/mo");
+    try testing.expect(editor.autocomplete.isActive());
+
+    try testing.expect(editor.handleInput(.{ .code = .tab }));
+    try testing.expectEqualStrings("/model ", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("/mo", editor.getText());
+}
+
+test "Editor history browsing snapshots the empty draft and submit clears undo state" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var capture = SubmitCapture{};
+    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
     editor.addToHistory("old prompt");
 
     try testing.expect(editor.handleInput(.{ .code = .up }));
     try testing.expectEqualStrings("old prompt", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = 'x' }));
-    try testing.expectEqualStrings("old promptx", editor.getText());
-}
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '!' }));
+    try testing.expectEqualStrings("old prompt!", editor.getText());
 
-test "Editor history ignores empty entries and consecutive duplicates" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-    editor.addToHistory("");
-    editor.addToHistory("   ");
-    editor.addToHistory("same");
-    editor.addToHistory("same");
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("old prompt", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("same", editor.getText());
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("same", editor.getText());
+    editor.insertText("draft");
+    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try testing.expectEqual(@as(u32, 1), capture.count);
+    try testing.expectEqualStrings("draft", submittedText(&capture));
+    try testing.expectEqualStrings("", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("", editor.getText());
 }

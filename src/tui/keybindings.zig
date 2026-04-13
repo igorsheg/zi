@@ -7,6 +7,7 @@ pub const Action = enum {
     input_submit,
     input_new_line,
     input_tab,
+    editor_undo,
     select_up,
     select_down,
     select_page_up,
@@ -48,6 +49,7 @@ pub const Definition = struct {
 const key_enter = KeySpec{ .key = .{ .code = .enter }, .display = "enter" };
 const key_shift_enter = KeySpec{ .key = .{ .code = .enter, .shift = true }, .display = "shift+enter" };
 const key_tab = KeySpec{ .key = .{ .code = .tab }, .display = "tab" };
+const key_ctrl_dash = KeySpec{ .key = .{ .code = .char, .char = '-', .ctrl = true }, .display = "ctrl+-" };
 const key_up = KeySpec{ .key = .{ .code = .up }, .display = "up" };
 const key_down = KeySpec{ .key = .{ .code = .down }, .display = "down" };
 const key_escape = KeySpec{ .key = .{ .code = .escape }, .display = "esc" };
@@ -65,6 +67,7 @@ const key_shift_down = KeySpec{ .key = .{ .code = .down, .shift = true }, .displ
 const input_submit_bindings = [_]KeySpec{key_enter};
 const input_new_line_bindings = [_]KeySpec{key_shift_enter};
 const input_tab_bindings = [_]KeySpec{key_tab};
+const editor_undo_bindings = [_]KeySpec{key_ctrl_dash};
 const select_up_bindings = [_]KeySpec{key_up};
 const select_down_bindings = [_]KeySpec{key_down};
 const select_page_up_bindings = [_]KeySpec{key_page_up};
@@ -101,6 +104,12 @@ const definitions = [_]Definition{
         .section = .editor,
         .description = "Accept autocomplete / tab completion",
         .bindings = &input_tab_bindings,
+    },
+    .{
+        .action = .editor_undo,
+        .section = .editor,
+        .description = "Undo",
+        .bindings = &editor_undo_bindings,
     },
     .{
         .action = .select_up,
@@ -272,6 +281,7 @@ const testing = std.testing;
 test "keybindings match defaults across editor picker and app actions" {
     try testing.expect(matches(.input_submit, .{ .code = .enter }));
     try testing.expect(matches(.input_new_line, .{ .code = .enter, .shift = true }));
+    try testing.expect(matches(.editor_undo, .{ .code = .char, .char = '-', .ctrl = true }));
     try testing.expect(matches(.select_page_down, .{ .code = .page_down }));
     try testing.expect(matches(.select_end, .{ .code = .end }));
     try testing.expect(matches(.select_cancel, .{ .code = .char, .char = 'c', .ctrl = true }));
