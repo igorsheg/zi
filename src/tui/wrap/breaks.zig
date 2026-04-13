@@ -165,13 +165,11 @@ fn breakPiece(line: []const u8, start: usize, end: usize, max_width: usize) usiz
     var width: usize = 0;
 
     while (pos < end) {
-        const cp_len = std.unicode.utf8ByteSequenceLength(line[pos]) catch break;
-        if (pos + cp_len > end) break;
-        const cp = std.unicode.utf8Decode(line[pos..][0..cp_len]) catch break;
-        const cp_width: usize = @intCast(grapheme.charWidth(cp));
-        if (width + cp_width > max_width and width > 0) break;
-        width += cp_width;
-        pos += cp_len;
+        const next = @min(grapheme.nextGraphemeBoundary(line[0..end], pos), end);
+        const cluster_width = grapheme.strWidth(line[pos..next]);
+        if (width + cluster_width > max_width and width > 0) break;
+        width += cluster_width;
+        pos = next;
     }
 
     return if (pos > start) pos else @min(start + 1, end);

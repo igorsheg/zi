@@ -164,6 +164,7 @@ fn applyInteractiveTheme(interactive: *interactive_mod.Interactive, theme: *cons
     interactive.hotkeys_overlay.theme = theme;
     interactive.editor.setTheme(theme);
     interactive.transcript.theme = theme;
-    interactive.loader.spinner_fg = theme.fg(.accent);
-    interactive.loader.message_fg = theme.fg(.muted);
+    interactive.loader.shimmer_edge_fg = theme.fg(.muted);
+    interactive.loader.message_fg = theme.fg(.dim);
+    interactive.loader.shimmer_peak_fg = @import("../tui/cell.zig").Color.rgb(0xF2, 0xF1, 0xEF);
 }

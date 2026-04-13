@@ -128,7 +128,7 @@ fn setBg(theme: *Theme, color: BgColor, value: Color) void {
 
 fn buildZen() Theme {
     const ui_fg = Color.rgb(0xC5, 0xC9, 0xC7);
-    const ui_fg_dim = Color.rgb(0xA4, 0xA7, 0xA4);
+    const ui_fg_dim = Color.rgb(0x75, 0x79, 0x7F);
     const ui_nontext = Color.rgb(0x5C, 0x60, 0x66);
     const ui_comment = Color.rgb(0x75, 0x79, 0x7F);
     const ui_bg = Color.rgb(0x09, 0x0E, 0x13);
@@ -164,7 +164,7 @@ fn buildZen() Theme {
     setFg(&theme, .accent, syn_fun);
     setFg(&theme, .border, ui_bg_p2);
     setFg(&theme, .border_accent, ui_bg_search);
-    setFg(&theme, .border_muted, ui_bg_p1);
+    setFg(&theme, .border_muted, ui_nontext);
     setFg(&theme, .success, diag_ok);
     setFg(&theme, .@"error", diag_error);
     setFg(&theme, .warning, diag_warning);

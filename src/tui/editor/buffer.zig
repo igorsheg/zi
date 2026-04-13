@@ -95,7 +95,7 @@ pub const PromptBuffer = struct {
 
     pub fn backspace(self: *PromptBuffer) void {
         if (self.cursor_byte == 0) return;
-        const prev = self.prevCodepointBoundary();
+        const prev: u32 = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte));
         const items = self.buf.items;
         std.mem.copyForwards(u8, items[prev..], items[self.cursor_byte..]);
         self.buf.items.len -= self.cursor_byte - prev;
@@ -106,7 +106,7 @@ pub const PromptBuffer = struct {
 
     pub fn deleteForward(self: *PromptBuffer) void {
         if (self.cursor_byte >= self.buf.items.len) return;
-        const next = self.nextCodepointBoundary();
+        const next: u32 = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte));
         const items = self.buf.items;
         std.mem.copyForwards(u8, items[self.cursor_byte..], items[next..]);
         self.buf.items.len -= next - self.cursor_byte;
@@ -116,13 +116,13 @@ pub const PromptBuffer = struct {
 
     pub fn moveLeft(self: *PromptBuffer) void {
         if (self.cursor_byte == 0) return;
-        self.cursor_byte = self.prevCodepointBoundary();
+        self.cursor_byte = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte));
         self.recomputeCursorMetrics();
     }
 
     pub fn moveRight(self: *PromptBuffer) void {
         if (self.cursor_byte >= self.buf.items.len) return;
-        self.cursor_byte = self.nextCodepointBoundary();
+        self.cursor_byte = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte));
         self.recomputeCursorMetrics();
     }
 
@@ -203,29 +203,16 @@ pub const PromptBuffer = struct {
         var col: u32 = 0;
         var i: u32 = line_start;
         while (i < line_end) {
-            const cp_len: u32 = @intCast(std.unicode.utf8ByteSequenceLength(self.buf.items[i]) catch 1);
-            const end = @min(i + cp_len, line_end);
-            const cp = std.unicode.utf8Decode(self.buf.items[i..end]) catch '_';
-            const width: u32 = @as(u32, grapheme_mod.charWidth(cp));
-            if (col + width > target_col) break;
+            const next_boundary: u32 = @intCast(@min(
+                grapheme_mod.nextGraphemeBoundary(self.buf.items, i),
+                @as(usize, line_end),
+            ));
+            const width: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[i..next_boundary]));
+            if (col + width > target_col and width > 0) break;
             col += width;
-            i = end;
+            i = next_boundary;
         }
         return i;
-    }
-
-    fn prevCodepointBoundary(self: *const PromptBuffer) u32 {
-        if (self.cursor_byte == 0) return 0;
-        var i = self.cursor_byte - 1;
-        while (i > 0 and (self.buf.items[i] & 0xC0) == 0x80) : (i -= 1) {}
-        return i;
-    }
-
-    fn nextCodepointBoundary(self: *const PromptBuffer) u32 {
-        if (self.cursor_byte >= self.buf.items.len) return @intCast(self.buf.items.len);
-        var i = self.cursor_byte + 1;
-        while (i < self.buf.items.len and (self.buf.items[i] & 0xC0) == 0x80) : (i += 1) {}
-        return @intCast(i);
     }
 
     fn recomputeCursorMetrics(self: *PromptBuffer) void {
@@ -249,4 +236,3 @@ pub const PromptBuffer = struct {
         self.version_tag +%= 1;
     }
 };
-

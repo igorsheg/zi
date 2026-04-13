@@ -568,8 +568,9 @@ pub const Interactive = struct {
         self.transcript.lua_runner = ca.extensionRunner();
 
         self.editor.setTheme(theme);
-        self.loader.spinner_fg = theme.fg(.accent);
-        self.loader.message_fg = theme.fg(.muted);
+        self.loader.shimmer_edge_fg = theme.fg(.muted);
+        self.loader.message_fg = theme.fg(.dim);
+        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
         self.transcript.setHideThinkingBlock(self.hide_thinking_block);
@@ -1238,8 +1239,9 @@ pub const Interactive = struct {
     }
 
     fn showLoader(self: *Interactive, message: []const u8) void {
-        self.loader.spinner_fg = self.theme.fg(.accent);
-        self.loader.message_fg = self.theme.fg(.muted);
+        self.loader.shimmer_edge_fg = self.theme.fg(.muted);
+        self.loader.message_fg = self.theme.fg(.dim);
+        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
         self.loader.setMessage(message);
         self.loader.start();
         self.loader_active = true;
@@ -1258,8 +1260,9 @@ pub const Interactive = struct {
             ) catch "Retrying…"
         else
             std.fmt.bufPrint(&buf, "Retrying ({d}/{d})…", .{ attempt, max_attempts }) catch "Retrying…";
-        self.loader.spinner_fg = self.theme.fg(.warning);
-        self.loader.message_fg = self.theme.fg(.muted);
+        self.loader.shimmer_edge_fg = self.theme.fg(.warning);
+        self.loader.message_fg = self.theme.fg(.dim);
+        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
         self.loader.setMessage(message);
         self.loader.start();
         self.loader_active = true;

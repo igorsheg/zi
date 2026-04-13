@@ -1231,3 +1231,79 @@ test "Editor ignores manually typed marker-like text for atomic movement" {
     try testing.expect(editor.handleInput(.{ .code = .right }));
     try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
 }
+
+test "Editor arrow keys move by grapheme cluster for combining marks and emoji" {
+    const Case = struct {
+        text: []const u8,
+        atomic_len: u32,
+    };
+
+    const cases = [_]Case{
+        .{ .text = "Ae\u{0301}B", .atomic_len = @intCast("e\u{0301}".len) },
+        .{ .text = "A👋🏿B", .atomic_len = @intCast("👋🏿".len) },
+        .{ .text = "A👩‍🚀B", .atomic_len = @intCast("👩‍🚀".len) },
+        .{ .text = "A🇨🇦B", .atomic_len = @intCast("🇨🇦".len) },
+    };
+
+    for (cases) |case| {
+        var editor = Editor.init(testing.allocator);
+        defer editor.deinit();
+
+        editor.setText(case.text);
+        try testing.expect(editor.handleInput(.{ .code = .home }));
+        try testing.expect(editor.handleInput(.{ .code = .right }));
+        try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+
+        try testing.expect(editor.handleInput(.{ .code = .right }));
+        try testing.expectEqual(@as(u32, 1) + case.atomic_len, editor.buffer.cursorByte());
+
+        try testing.expect(editor.handleInput(.{ .code = .left }));
+        try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+    }
+}
+
+test "Editor backspace and delete remove whole grapheme clusters" {
+    const Case = struct {
+        atomic: []const u8,
+    };
+
+    const cases = [_]Case{
+        .{ .atomic = "e\u{0301}" },
+        .{ .atomic = "👋🏿" },
+        .{ .atomic = "👩‍🚀" },
+        .{ .atomic = "🇨🇦" },
+    };
+
+    for (cases) |case| {
+        {
+            var editor = Editor.init(testing.allocator);
+            defer editor.deinit();
+
+            const text = try std.fmt.allocPrint(testing.allocator, "A{s}B", .{case.atomic});
+            defer testing.allocator.free(text);
+            editor.setText(text);
+
+            try testing.expect(editor.handleInput(.{ .code = .home }));
+            try testing.expect(editor.handleInput(.{ .code = .right }));
+            try testing.expect(editor.handleInput(.{ .code = .right }));
+            try testing.expect(editor.handleInput(.{ .code = .backspace }));
+            try testing.expectEqualStrings("AB", editor.getText());
+            try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+        }
+
+        {
+            var editor = Editor.init(testing.allocator);
+            defer editor.deinit();
+
+            const text = try std.fmt.allocPrint(testing.allocator, "A{s}B", .{case.atomic});
+            defer testing.allocator.free(text);
+            editor.setText(text);
+
+            try testing.expect(editor.handleInput(.{ .code = .home }));
+            try testing.expect(editor.handleInput(.{ .code = .right }));
+            try testing.expect(editor.handleInput(.{ .code = .delete }));
+            try testing.expectEqualStrings("AB", editor.getText());
+            try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+        }
+    }
+}

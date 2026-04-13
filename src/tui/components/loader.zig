@@ -23,8 +23,9 @@ pub const Loader = struct {
     /// Owned message buffer — setMessage copies into this.
     message_buf: [128]u8 = undefined,
     message_len: u8 = 0,
-    spinner_fg: Color = Color.default,
+    shimmer_edge_fg: Color = Color.default,
     message_fg: Color = Color.default,
+    shimmer_peak_fg: Color = Color.default,
     active: bool = true,
 
     const shimmer_floor: u8 = 96;
@@ -85,10 +86,10 @@ pub const Loader = struct {
             .tail_pad_cols = 8,
             .band_half_width = 5,
             .base_fg = self.message_fg,
-            .edge_fg = self.message_fg,
-            .peak_fg = self.spinner_fg,
+            .edge_fg = self.shimmer_edge_fg,
+            .peak_fg = self.shimmer_peak_fg,
             .base_attrs = .{ .dim = true },
-            .edge_attrs = .{ .dim = true },
+            .edge_attrs = .{},
             .peak_attrs = .{},
         };
     }
