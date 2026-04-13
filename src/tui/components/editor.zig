@@ -32,6 +32,11 @@ const UndoSnapshot = struct {
     cursor_byte: u32,
 };
 
+const MarkerRange = struct {
+    start: u32,
+    end: u32,
+};
+
 const LastAction = enum {
     none,
     type_word,
@@ -44,6 +49,9 @@ pub const Editor = struct {
     autocomplete: AutocompleteSession,
     history: std.ArrayList([]u8) = .empty,
     undo_stack: std.ArrayList(UndoSnapshot) = .empty,
+    pastes: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    paste_counter: u32 = 0,
+    expanded_text_cache: std.ArrayList(u8) = .empty,
     history_index: i32 = -1,
     last_action: LastAction = .none,
     max_visible_lines: u32 = 10,
@@ -88,6 +96,9 @@ pub const Editor = struct {
         self.history.deinit(self.allocator);
         self.clearUndoStack();
         self.undo_stack.deinit(self.allocator);
+        self.clearStoredPastes();
+        self.pastes.deinit(self.allocator);
+        self.expanded_text_cache.deinit(self.allocator);
         self.view.deinit();
         self.buffer.deinit();
         self.allocator.destroy(self.buffer);
@@ -97,8 +108,8 @@ pub const Editor = struct {
         return self.buffer.text();
     }
 
-    pub fn getExpandedText(self: *const Editor) []const u8 {
-        return self.getText();
+    pub fn getExpandedText(self: *Editor) []const u8 {
+        return self.expandPasteMarkers();
     }
 
     pub fn clear(self: *Editor) void {
@@ -106,6 +117,8 @@ pub const Editor = struct {
         self.history_index = -1;
         self.last_action = .none;
         self.clearUndoStack();
+        self.clearStoredPastes();
+        self.paste_counter = 0;
         self.setTextInternal("", false);
     }
 
@@ -129,8 +142,46 @@ pub const Editor = struct {
         self.pushUndoSnapshot();
         self.last_action = .none;
         self.history_index = -1;
-        self.buffer.insertAtCursor(text);
-        self.afterTextMutation();
+        self.insertTextAtCursorInternal(text);
+    }
+
+    pub fn handlePaste(self: *Editor, pasted_text: []const u8) void {
+        self.cancelAutocomplete();
+        self.history_index = -1;
+        self.last_action = .none;
+        self.pushUndoSnapshot();
+
+        var filtered: std.ArrayList(u8) = .empty;
+        defer filtered.deinit(self.allocator);
+        appendNormalizedPaste(&filtered, self.allocator, pasted_text) catch return;
+
+        if (filtered.items.len > 0 and isPastePathLike(filtered.items) and self.cursorPrecededByWordByte()) {
+            filtered.insert(self.allocator, 0, ' ') catch return;
+        }
+
+        if (filtered.items.len == 0) return;
+
+        const line_count = countPasteLines(filtered.items);
+        const total_chars = filtered.items.len;
+        if (line_count > 10 or total_chars > 1000) {
+            self.paste_counter += 1;
+            const paste_id = self.paste_counter;
+            const stored = self.allocator.dupe(u8, filtered.items) catch return;
+            self.pastes.put(self.allocator, paste_id, stored) catch {
+                self.allocator.free(stored);
+                return;
+            };
+
+            var marker_buf: [64]u8 = undefined;
+            const marker = if (line_count > 10)
+                std.fmt.bufPrint(&marker_buf, "[paste #{d} +{d} lines]", .{ paste_id, line_count }) catch return
+            else
+                std.fmt.bufPrint(&marker_buf, "[paste #{d} {d} chars]", .{ paste_id, total_chars }) catch return;
+            self.insertTextAtCursorInternal(marker);
+            return;
+        }
+
+        self.insertTextAtCursorInternal(filtered.items);
     }
 
     pub fn clearHistory(self: *Editor) void {
@@ -291,7 +342,11 @@ pub const Editor = struct {
                 self.last_action = .none;
                 if (self.buffer.cursorByte() > 0) {
                     self.pushUndoSnapshot();
-                    self.buffer.backspace();
+                    if (self.findMarkerRangeTouchingCursor(.left)) |range| {
+                        self.buffer.replaceRange(range.start, range.end, "", 0);
+                    } else {
+                        self.buffer.backspace();
+                    }
                     self.afterTextMutation();
                 }
                 return true;
@@ -301,18 +356,30 @@ pub const Editor = struct {
                 self.last_action = .none;
                 if (self.buffer.cursorByte() < self.buffer.text().len) {
                     self.pushUndoSnapshot();
-                    self.buffer.deleteForward();
+                    if (self.findMarkerRangeTouchingCursor(.right)) |range| {
+                        self.buffer.replaceRange(range.start, range.end, "", 0);
+                    } else {
+                        self.buffer.deleteForward();
+                    }
                     self.afterTextMutation();
                 }
                 return true;
             },
             .left => {
-                self.buffer.moveLeft();
+                if (self.findMarkerRangeTouchingCursor(.left)) |range| {
+                    self.buffer.setCursorByte(range.start);
+                } else {
+                    self.buffer.moveLeft();
+                }
                 self.afterCursorMotion();
                 return true;
             },
             .right => {
-                self.buffer.moveRight();
+                if (self.findMarkerRangeTouchingCursor(.right)) |range| {
+                    self.buffer.setCursorByte(range.end);
+                } else {
+                    self.buffer.moveRight();
+                }
                 self.afterCursorMotion();
                 return true;
             },
@@ -482,6 +549,41 @@ pub const Editor = struct {
         self.notifyChange();
     }
 
+    fn insertTextAtCursorInternal(self: *Editor, text: []const u8) void {
+        if (text.len == 0) return;
+        self.buffer.insertAtCursor(text);
+        self.afterTextMutation();
+    }
+
+    fn expandPasteMarkers(self: *Editor) []const u8 {
+        if (self.pastes.count() == 0) return self.buffer.text();
+
+        self.expanded_text_cache.clearRetainingCapacity();
+        const text = self.buffer.text();
+        var last: usize = 0;
+        var index: usize = 0;
+        var expanded_any = false;
+        while (index < text.len) {
+            if (text[index] == '[') {
+                if (parsePasteMarker(text, index)) |marker| {
+                    if (self.pastes.get(marker.id)) |paste| {
+                        self.expanded_text_cache.appendSlice(self.allocator, text[last..index]) catch return self.buffer.text();
+                        self.expanded_text_cache.appendSlice(self.allocator, paste) catch return self.buffer.text();
+                        last = marker.end;
+                        index = marker.end;
+                        expanded_any = true;
+                        continue;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        if (!expanded_any) return self.buffer.text();
+        self.expanded_text_cache.appendSlice(self.allocator, text[last..]) catch return self.buffer.text();
+        return self.expanded_text_cache.items;
+    }
+
     fn navigateHistory(self: *Editor, direction: i32) void {
         self.last_action = .none;
         if (self.history.items.len == 0) return;
@@ -546,7 +648,7 @@ pub const Editor = struct {
     }
 
     fn submitValue(self: *Editor) void {
-        const submitted_text = self.buffer.text();
+        const submitted_text = self.expandPasteMarkers();
         const trimmed = std.mem.trim(u8, submitted_text, " \t\r\n");
         const result = self.allocator.dupe(u8, trimmed) catch return;
         defer self.allocator.free(result);
@@ -560,6 +662,8 @@ pub const Editor = struct {
         self.history_index = -1;
         self.last_action = .none;
         self.clearUndoStack();
+        self.clearStoredPastes();
+        self.paste_counter = 0;
 
         self.notifyChange();
         if (self.on_submit) |cb| cb(result, self.on_submit_ctx);
@@ -608,6 +712,51 @@ pub const Editor = struct {
     fn clearUndoStack(self: *Editor) void {
         for (self.undo_stack.items) |snapshot| self.freeUndoSnapshot(snapshot);
         self.undo_stack.clearRetainingCapacity();
+    }
+
+    fn clearStoredPastes(self: *Editor) void {
+        var it = self.pastes.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.pastes.clearRetainingCapacity();
+        self.expanded_text_cache.clearRetainingCapacity();
+    }
+
+    fn findMarkerRangeTouchingCursor(self: *const Editor, side: enum { left, right }) ?MarkerRange {
+        const text = self.buffer.text();
+        const cursor = self.buffer.cursorByte();
+        const line_start: usize = self.buffer.currentLineStart();
+        const line_end: usize = self.buffer.currentLineEnd();
+        var index = line_start;
+        while (index < line_end) {
+            if (text[index] == '[') {
+                if (self.validMarkerRangeAt(@intCast(index))) |range| {
+                    const matches = switch (side) {
+                        .left => cursor > range.start and cursor <= range.end,
+                        .right => cursor >= range.start and cursor < range.end,
+                    };
+                    if (matches) return range;
+                    index = range.end;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        return null;
+    }
+
+    fn validMarkerRangeAt(self: *const Editor, start: u32) ?MarkerRange {
+        const marker = parsePasteMarker(self.buffer.text(), start) orelse return null;
+        if (!self.pastes.contains(marker.id)) return null;
+        return .{ .start = start, .end = @intCast(marker.end) };
+    }
+
+    fn cursorPrecededByWordByte(self: *const Editor) bool {
+        const cursor = self.buffer.cursorByte();
+        if (cursor == 0) return false;
+        const byte = self.buffer.text()[cursor - 1];
+        return std.ascii.isAlphanumeric(byte) or byte == '_';
     }
 
     fn syncStoredViewGeometry(self: *Editor) void {
@@ -750,6 +899,83 @@ pub const Editor = struct {
 
 const testing = std.testing;
 
+const PasteMarker = struct {
+    id: u32,
+    end: usize,
+};
+
+fn parsePasteMarker(text: []const u8, start: usize) ?PasteMarker {
+    const prefix = "[paste #";
+    if (start + prefix.len >= text.len) return null;
+    if (!std.mem.startsWith(u8, text[start..], prefix)) return null;
+
+    var index = start + prefix.len;
+    const id_start = index;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+    if (index == id_start) return null;
+    const id = std.fmt.parseInt(u32, text[id_start..index], 10) catch return null;
+
+    if (index >= text.len) return null;
+    if (text[index] == ']') {
+        return .{ .id = id, .end = index + 1 };
+    }
+    if (text[index] != ' ') return null;
+    index += 1;
+    if (index >= text.len) return null;
+
+    if (text[index] == '+') {
+        index += 1;
+        const count_start = index;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+        if (index == count_start) return null;
+        if (!std.mem.startsWith(u8, text[index..], " lines]")) return null;
+        return .{ .id = id, .end = index + " lines]".len };
+    }
+
+    const count_start = index;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+    if (index == count_start) return null;
+    if (!std.mem.startsWith(u8, text[index..], " chars]")) return null;
+    return .{ .id = id, .end = index + " chars]".len };
+}
+
+fn appendNormalizedPaste(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pasted_text: []const u8) !void {
+    var index: usize = 0;
+    while (index < pasted_text.len) : (index += 1) {
+        const byte = pasted_text[index];
+        switch (byte) {
+            '\r' => {
+                if (index + 1 < pasted_text.len and pasted_text[index + 1] == '\n') {
+                    index += 1;
+                }
+                try out.append(allocator, '\n');
+            },
+            '\t' => try out.appendSlice(allocator, "    "),
+            '\n' => try out.append(allocator, '\n'),
+            else => {
+                if (byte >= 0x20) {
+                    try out.append(allocator, byte);
+                }
+            },
+        }
+    }
+}
+
+fn isPastePathLike(text: []const u8) bool {
+    return text.len > 0 and switch (text[0]) {
+        '/', '~', '.' => true,
+        else => false,
+    };
+}
+
+fn countPasteLines(text: []const u8) usize {
+    var count: usize = 1;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
 fn isWhitespaceCodepoint(cp: u21) bool {
     return switch (cp) {
         ' ', '\t', '\n', '\r' => true,
@@ -860,4 +1086,148 @@ test "Editor history browsing snapshots the empty draft and submit clears undo s
 
     try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
     try testing.expectEqualStrings("", editor.getText());
+}
+
+test "Editor handlePaste normalizes content and undoes atomically" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    editor.setText("open");
+    editor.handlePaste("/tmp\tfile\r\nnext\x01");
+    try testing.expectEqualStrings("open /tmp    file\nnext", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("open", editor.getText());
+}
+
+test "Editor large multiline paste inserts marker and submits expanded content" {
+    const pasted =
+        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var capture = SubmitCapture{};
+    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
+
+    editor.handlePaste(pasted);
+    try testing.expectEqualStrings("[paste #1 +11 lines]", editor.getText());
+    try testing.expectEqualStrings(pasted, editor.getExpandedText());
+
+    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try testing.expectEqual(@as(u32, 1), capture.count);
+    try testing.expectEqualStrings(pasted, submittedText(&capture));
+    try testing.expectEqualStrings("", editor.getText());
+    try testing.expectEqualStrings("", editor.getExpandedText());
+}
+
+test "Editor large single-line paste inserts char-count marker" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var pasted: [1001]u8 = undefined;
+    @memset(&pasted, 'a');
+
+    editor.handlePaste(pasted[0..]);
+    try testing.expectEqualStrings("[paste #1 1001 chars]", editor.getText());
+    try testing.expectEqual(@as(usize, 1001), editor.getExpandedText().len);
+    try testing.expectEqualStrings(pasted[0..], editor.getExpandedText());
+}
+
+test "Editor cursor arrows skip stored paste markers atomically" {
+    const pasted =
+        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    editor.insertText("A");
+    editor.handlePaste(pasted);
+    editor.insertText("B");
+
+    const marker_len = editor.getText().len - 2;
+
+    try testing.expect(editor.handleInput(.{ .code = .home }));
+    try testing.expectEqual(@as(u32, 0), editor.buffer.cursorByte());
+
+    try testing.expect(editor.handleInput(.{ .code = .right }));
+    try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+
+    try testing.expect(editor.handleInput(.{ .code = .right }));
+    try testing.expectEqual(@as(u32, @intCast(1 + marker_len)), editor.buffer.cursorByte());
+
+    try testing.expect(editor.handleInput(.{ .code = .left }));
+    try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+
+    try testing.expect(editor.handleInput(.{ .code = .left }));
+    try testing.expectEqual(@as(u32, 0), editor.buffer.cursorByte());
+}
+
+test "Editor delete keys remove stored paste markers atomically" {
+    const pasted =
+        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+
+    {
+        var editor = Editor.init(testing.allocator);
+        defer editor.deinit();
+
+        editor.insertText("A");
+        editor.handlePaste(pasted);
+        editor.insertText("B");
+
+        try testing.expect(editor.handleInput(.{ .code = .home }));
+        try testing.expect(editor.handleInput(.{ .code = .right }));
+        try testing.expect(editor.handleInput(.{ .code = .right }));
+        try testing.expect(editor.handleInput(.{ .code = .backspace }));
+        try testing.expectEqualStrings("AB", editor.getText());
+        try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+    }
+
+    {
+        var editor = Editor.init(testing.allocator);
+        defer editor.deinit();
+
+        editor.insertText("A");
+        editor.handlePaste(pasted);
+        editor.insertText("B");
+
+        try testing.expect(editor.handleInput(.{ .code = .home }));
+        try testing.expect(editor.handleInput(.{ .code = .right }));
+        try testing.expect(editor.handleInput(.{ .code = .delete }));
+        try testing.expectEqualStrings("AB", editor.getText());
+        try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+    }
+}
+
+test "Editor undo restores marker after atomic marker deletion" {
+    const pasted =
+        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    editor.insertText("A");
+    editor.handlePaste(pasted);
+    editor.insertText("B");
+    const original = try testing.allocator.dupe(u8, editor.getText());
+    defer testing.allocator.free(original);
+
+    try testing.expect(editor.handleInput(.{ .code = .home }));
+    try testing.expect(editor.handleInput(.{ .code = .right }));
+    try testing.expect(editor.handleInput(.{ .code = .right }));
+    try testing.expect(editor.handleInput(.{ .code = .backspace }));
+    try testing.expectEqualStrings("AB", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings(original, editor.getText());
+}
+
+test "Editor ignores manually typed marker-like text for atomic movement" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    editor.setText("[paste #99 +5 lines]");
+    try testing.expect(editor.handleInput(.{ .code = .home }));
+    try testing.expect(editor.handleInput(.{ .code = .right }));
+    try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
 }

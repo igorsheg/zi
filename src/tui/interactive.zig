@@ -815,7 +815,7 @@ pub const Interactive = struct {
     /// Called by InputBuffer when paste content is complete.
     fn onInputPaste(content: []const u8, raw_ctx: *anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(raw_ctx));
-        self.active_editor.insertText(content);
+        self.active_editor.handlePaste(content);
         self.refreshGreeterVisibility();
         self.tui.dirty = true;
     }

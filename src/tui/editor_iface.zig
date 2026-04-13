@@ -30,6 +30,7 @@ pub const EditorInterface = struct {
         get_expanded_text: *const fn (ptr: *anyopaque) []const u8,
         set_text: *const fn (ptr: *anyopaque, text: []const u8) void,
         insert_text_at_cursor: *const fn (ptr: *anyopaque, text: []const u8) void,
+        handle_paste: *const fn (ptr: *anyopaque, text: []const u8) void,
         clear: *const fn (ptr: *anyopaque) void,
         clear_history: *const fn (ptr: *anyopaque) void,
         add_to_history: *const fn (ptr: *anyopaque, text: []const u8) void,
@@ -65,6 +66,10 @@ pub const EditorInterface = struct {
             fn insertTextAtCursor(erased: *anyopaque, text: []const u8) void {
                 const self: *T = @ptrCast(@alignCast(erased));
                 self.insertTextAtCursor(text);
+            }
+            fn handlePaste(erased: *anyopaque, text: []const u8) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.handlePaste(text);
             }
             fn clear(erased: *anyopaque) void {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -138,6 +143,7 @@ pub const EditorInterface = struct {
                 .get_expanded_text = gen.getExpandedText,
                 .set_text = gen.setText,
                 .insert_text_at_cursor = gen.insertTextAtCursor,
+                .handle_paste = gen.handlePaste,
                 .clear = gen.clear,
                 .clear_history = gen.clearHistory,
                 .add_to_history = gen.addToHistory,
@@ -176,6 +182,10 @@ pub const EditorInterface = struct {
 
     pub fn insertText(self: EditorInterface, text: []const u8) void {
         self.insertTextAtCursor(text);
+    }
+
+    pub fn handlePaste(self: EditorInterface, text: []const u8) void {
+        self.vtable.handle_paste(self.ptr, text);
     }
 
     pub fn clear(self: EditorInterface) void {
@@ -253,6 +263,7 @@ const MockEditor = struct {
     text: []const u8 = "",
     expanded_text: []const u8 = "",
     insert_count: u32 = 0,
+    paste_count: u32 = 0,
     clear_count: u32 = 0,
     clear_history_count: u32 = 0,
     history_count: u32 = 0,
@@ -285,6 +296,10 @@ const MockEditor = struct {
 
     pub fn insertTextAtCursor(self: *MockEditor, _: []const u8) void {
         self.insert_count += 1;
+    }
+
+    pub fn handlePaste(self: *MockEditor, _: []const u8) void {
+        self.paste_count += 1;
     }
 
     pub fn clear(self: *MockEditor) void {
@@ -373,6 +388,9 @@ test "EditorInterface routes parity surface through vtable" {
 
     iface.insertTextAtCursor("!");
     try testing.expectEqual(@as(u32, 1), mock.insert_count);
+
+    iface.handlePaste("paste");
+    try testing.expectEqual(@as(u32, 1), mock.paste_count);
 
     iface.clearHistory();
     try testing.expectEqual(@as(u32, 1), mock.clear_history_count);
