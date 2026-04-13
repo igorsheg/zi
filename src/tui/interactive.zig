@@ -26,8 +26,7 @@ const status_data_mod = @import("status_data.zig");
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../slash_commands.zig");
-const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
-const SlashCommandProvider = autocomplete_mod.SlashCommandProvider;
+const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
 const select_list_mod = @import("components/select_list.zig");
@@ -447,7 +446,7 @@ pub const Interactive = struct {
 
     // ── Slash commands ──────────────────────────────────────────
     command_registry: CommandRegistry,
-    slash_provider: SlashCommandProvider = undefined,
+    autocomplete_provider: CombinedAutocompleteProvider = undefined,
     hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
 
     // ── Flow-owned transient pickers ────────────────────────────
@@ -684,9 +683,9 @@ pub const Interactive = struct {
         // thread even during startup.
         self.bootstrapStatusSnapshot();
 
-        // Wire autocomplete: registry → provider → editor
-        self.slash_provider = SlashCommandProvider.init(&self.command_registry);
-        self.active_editor.setAutocompleteProvider(self.slash_provider.provider());
+        // Wire autocomplete: combined slash + file path completion.
+        self.autocomplete_provider = CombinedAutocompleteProvider.init(&self.command_registry, self.cwd);
+        self.active_editor.setAutocompleteProvider(self.autocomplete_provider.provider());
 
         // Populate container slots with their initial children.
         self.refreshGreeterVisibility();
