@@ -5,6 +5,7 @@ const theme_mod = @import("../theme.zig");
 const select_list_mod = @import("../components/select_list.zig");
 const component_mod = @import("../component.zig");
 const buffer_mod = @import("buffer.zig");
+const keybindings = @import("../keybindings.zig");
 
 const Key = keys_mod.Key;
 const Theme = theme_mod.Theme;
@@ -111,7 +112,7 @@ pub const AutocompleteSession = struct {
         switch (result) {
             .selected => {
                 if (self.accept(buffer)) {
-                    return .{ .accepted = .{ .submit = key.code == .enter } };
+                    return .{ .accepted = .{ .submit = keybindings.matches(.input_submit, key) } };
                 }
                 self.cancel();
                 return .cancelled;
@@ -122,7 +123,7 @@ pub const AutocompleteSession = struct {
             },
             .consumed => return .consumed,
             .unhandled => {
-                if (key.code == .tab and !key.ctrl and !key.alt) {
+                if (keybindings.matches(.input_tab, key)) {
                     if (self.accept(buffer)) {
                         return .{ .accepted = .{ .submit = false } };
                     }
@@ -203,5 +204,28 @@ test "AutocompleteSession applies replacement range without borrowing mutable bu
     const outcome = session.processInput(.{ .code = .tab }, &buffer);
     try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
     try testing.expectEqualStrings("/model " ++ filler, buffer.text());
+    try testing.expect(!session.isActive());
+}
+
+test "AutocompleteSession enter accepts selection and requests submit" {
+    const slash_commands_mod = @import("../../slash_commands.zig");
+
+    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var provider = SlashCommandProvider.init(&registry);
+    var session = AutocompleteSession.init(&Theme.dark);
+    session.setProvider(provider.provider());
+
+    var buffer = PromptBuffer.init(testing.allocator);
+    defer buffer.deinit();
+    buffer.setText("/mo");
+
+    session.refresh(&buffer);
+    try testing.expect(session.isActive());
+
+    const outcome = session.processInput(.{ .code = .enter }, &buffer);
+    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = true } }, outcome);
+    try testing.expectEqualStrings("/model ", buffer.text());
     try testing.expect(!session.isActive());
 }

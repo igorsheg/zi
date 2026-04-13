@@ -5,6 +5,7 @@ const keys_mod = @import("../keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const component_mod = @import("../component.zig");
 const theme_mod = @import("../theme.zig");
+const keybindings = @import("../keybindings.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -30,36 +31,82 @@ pub const SelectList = struct {
     items: []const SelectItem = &.{},
     selected_index: u32 = 0,
     max_visible: u32 = 5,
+    wrap_navigation: bool = true,
+    empty_text: []const u8 = "No matching commands",
     theme: *const Theme,
 
     pub fn setItems(self: *SelectList, items: []const SelectItem) void {
+        const previous_value = self.selectedValue();
+        const previous_index = self.selected_index;
         self.items = items;
-        self.selected_index = 0;
+        if (previous_value) |value| {
+            if (self.setSelectedByValue(value)) return;
+        }
+        self.setSelectedIndexClamped(previous_index);
+    }
+
+    pub fn setSelectedIndexClamped(self: *SelectList, index: usize) void {
+        if (self.items.len == 0) {
+            self.selected_index = 0;
+            return;
+        }
+        self.selected_index = @intCast(@min(index, self.items.len - 1));
+    }
+
+    pub fn setSelectedByValue(self: *SelectList, value: []const u8) bool {
+        for (self.items, 0..) |item, idx| {
+            if (std.mem.eql(u8, item.value, value)) {
+                self.selected_index = @intCast(idx);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn selectedValue(self: *const SelectList) ?[]const u8 {
+        const item = self.getSelectedItem() orelse return null;
+        return item.value;
     }
 
     pub fn processInput(self: *SelectList, key: Key) InputResult {
-        if (key.code == .enter and !key.ctrl and !key.alt) {
+        if (keybindings.matches(.select_confirm, key)) {
             return if (self.items.len > 0) .selected else .consumed;
         }
-        if (key.code == .escape and !key.ctrl and !key.alt) return .cancelled;
+        if (keybindings.matches(.select_cancel, key)) return .cancelled;
 
-        if (key.code == .up and !key.ctrl and !key.alt) {
+        if (keybindings.matches(.select_up, key)) {
             if (self.items.len == 0) return .consumed;
-            if (self.selected_index == 0) {
-                self.selected_index = @intCast(self.items.len - 1);
-            } else {
-                self.selected_index -= 1;
-            }
+            self.moveBy(-1, self.wrap_navigation);
             return .consumed;
         }
 
-        if (key.code == .down and !key.ctrl and !key.alt) {
+        if (keybindings.matches(.select_down, key)) {
             if (self.items.len == 0) return .consumed;
-            if (self.selected_index >= self.items.len - 1) {
-                self.selected_index = 0;
-            } else {
-                self.selected_index += 1;
-            }
+            self.moveBy(1, self.wrap_navigation);
+            return .consumed;
+        }
+
+        if (keybindings.matches(.select_page_up, key)) {
+            if (self.items.len == 0) return .consumed;
+            self.moveBy(-@as(i64, @intCast(@max(self.max_visible, @as(u32, 1)))), false);
+            return .consumed;
+        }
+
+        if (keybindings.matches(.select_page_down, key)) {
+            if (self.items.len == 0) return .consumed;
+            self.moveBy(@as(i64, @intCast(@max(self.max_visible, @as(u32, 1)))), false);
+            return .consumed;
+        }
+
+        if (keybindings.matches(.select_home, key)) {
+            if (self.items.len == 0) return .consumed;
+            self.selected_index = 0;
+            return .consumed;
+        }
+
+        if (keybindings.matches(.select_end, key)) {
+            if (self.items.len == 0) return .consumed;
+            self.selected_index = @intCast(self.items.len - 1);
             return .consumed;
         }
 
@@ -72,7 +119,8 @@ pub const SelectList = struct {
         const text_color = self.theme.fg(.text);
 
         if (self.items.len == 0) {
-            _ = region.writeStr(0, 0, "  No matching commands", muted, Color.default, .{});
+            _ = region.writeStr(0, 0, "  ", muted, Color.default, .{});
+            _ = region.writeStr(2, 0, self.empty_text, muted, Color.default, .{});
             return;
         }
 
@@ -138,6 +186,22 @@ pub const SelectList = struct {
     pub fn getSelectedItem(self: *const SelectList) ?*const SelectItem {
         if (self.items.len == 0) return null;
         return &self.items[self.selected_index];
+    }
+
+    fn moveBy(self: *SelectList, delta: i64, wrap: bool) void {
+        if (self.items.len == 0) return;
+
+        const len: i64 = @intCast(self.items.len);
+        const current: i64 = @intCast(self.selected_index);
+        var next = current + delta;
+
+        if (wrap) {
+            next = @mod(next, len);
+        } else {
+            next = std.math.clamp(next, 0, len - 1);
+        }
+
+        self.selected_index = @intCast(next);
     }
 };
 
@@ -227,6 +291,69 @@ test "SelectList up/down wraps around" {
     try testing.expectEqual(@as(u32, 0), sl.selected_index);
 }
 
+test "SelectList page home and end navigation clamp within items" {
+    const theme = testTheme();
+
+    var many: [8]SelectItem = undefined;
+    for (&many, 0..) |*item, i| {
+        item.* = .{
+            .value = if (i == 0) "a" else if (i == 1) "b" else if (i == 2) "c" else if (i == 3) "d" else if (i == 4) "e" else if (i == 5) "f" else if (i == 6) "g" else "h",
+            .label = "Item",
+            .description = null,
+        };
+    }
+
+    var sl = SelectList{
+        .theme = &theme,
+        .max_visible = 3,
+    };
+    sl.setItems(&many);
+
+    _ = sl.processInput(.{ .code = .page_down });
+    try testing.expectEqual(@as(u32, 3), sl.selected_index);
+    _ = sl.processInput(.{ .code = .page_down });
+    try testing.expectEqual(@as(u32, 6), sl.selected_index);
+    _ = sl.processInput(.{ .code = .page_down });
+    try testing.expectEqual(@as(u32, 7), sl.selected_index);
+
+    _ = sl.processInput(.{ .code = .home });
+    try testing.expectEqual(@as(u32, 0), sl.selected_index);
+    _ = sl.processInput(.{ .code = .end });
+    try testing.expectEqual(@as(u32, 7), sl.selected_index);
+    _ = sl.processInput(.{ .code = .page_up });
+    try testing.expectEqual(@as(u32, 4), sl.selected_index);
+}
+
+test "SelectList preserves selection by value across setItems and renders custom empty text" {
+    const theme = testTheme();
+    const before = [_]SelectItem{
+        .{ .value = "alpha", .label = "Alpha" },
+        .{ .value = "beta", .label = "Beta" },
+        .{ .value = "gamma", .label = "Gamma" },
+    };
+    const after = [_]SelectItem{
+        .{ .value = "gamma", .label = "Gamma" },
+        .{ .value = "beta", .label = "Beta" },
+    };
+
+    var sl = SelectList{
+        .theme = &theme,
+        .empty_text = "Nothing here",
+    };
+    sl.setItems(&before);
+    try testing.expect(sl.setSelectedByValue("beta"));
+    sl.setItems(&after);
+
+    try testing.expectEqualStrings("beta", sl.selectedValue().?);
+    try testing.expectEqual(@as(u32, 1), sl.selected_index);
+
+    sl.setItems(&.{});
+    var buf = try Buffer.init(testing.allocator, 30, 3);
+    defer buf.deinit();
+    sl.render(buf.region());
+    try testing.expectEqual(@as(u21, 'N'), buf.get(2, 0).grapheme.codepoint);
+}
+
 test "SelectList enter returns selected" {
     const theme = testTheme();
     var items = makeItems();
@@ -244,15 +371,15 @@ test "SelectList enter returns selected" {
     try testing.expectEqualStrings("Beta", item.label);
 }
 
-test "SelectList escape returns cancelled" {
+test "SelectList escape and ctrl+c return cancelled" {
     const theme = testTheme();
 
     var sl = SelectList{
         .theme = &theme,
     };
 
-    const r = sl.processInput(.{ .code = .escape });
-    try testing.expectEqual(InputResult.cancelled, r);
+    try testing.expectEqual(InputResult.cancelled, sl.processInput(.{ .code = .escape }));
+    try testing.expectEqual(InputResult.cancelled, sl.processInput(.{ .code = .char, .char = 'c', .ctrl = true }));
 }
 
 test "SelectList empty items shows no match message" {

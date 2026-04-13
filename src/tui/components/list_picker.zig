@@ -35,6 +35,17 @@ pub const Selection = struct {
     source_index: usize,
 };
 
+pub const StatusKind = enum {
+    info,
+    loading,
+    @"error",
+};
+
+pub const Status = struct {
+    text: []const u8,
+    kind: StatusKind = .info,
+};
+
 pub const ListPicker = struct {
     list: SelectList,
     title: []const u8 = "",
@@ -43,6 +54,11 @@ pub const ListPicker = struct {
     on_cancel: ?*const fn (ctx: ?*anyopaque) void = null,
     callback_ctx: ?*anyopaque = null,
     focused: bool = false,
+    search_placeholder: ?[]const u8 = null,
+    empty_text: []const u8 = "No matching commands",
+    status: ?Status = null,
+    preferred_selection_value: ?[]const u8 = null,
+    pending_selection_index: ?usize = null,
 
     // ── Search state ────────────────────────────────────────────
     searchable: bool = false,
@@ -71,6 +87,17 @@ pub const ListPicker = struct {
 
     /// Set items and enable search. Caller owns `items` memory.
     /// `search_texts` is optional — if null, search matches on item.label.
+    pub fn setItems(self: *ListPicker, items: []const SelectItem) void {
+        self.searchable = false;
+        self.all_items = items;
+        self.search_texts = null;
+        self.query_len = 0;
+        self.filtered_count = 0;
+        self.list.empty_text = self.empty_text;
+        self.list.setItems(items);
+        self.applyPreferredSelection();
+    }
+
     pub fn setSearchableItems(
         self: *ListPicker,
         items: []const SelectItem,
@@ -80,7 +107,32 @@ pub const ListPicker = struct {
         self.all_items = items;
         self.search_texts = search_texts;
         self.query_len = 0;
+        self.list.empty_text = self.empty_text;
         self.applyFilter();
+    }
+
+    pub fn setSearchPlaceholder(self: *ListPicker, text: ?[]const u8) void {
+        self.search_placeholder = text;
+    }
+
+    pub fn setEmptyText(self: *ListPicker, text: []const u8) void {
+        self.empty_text = text;
+        self.list.empty_text = text;
+    }
+
+    pub fn setStatus(self: *ListPicker, status: ?Status) void {
+        self.status = status;
+    }
+
+    pub fn setInitialSelectionByValue(self: *ListPicker, value: []const u8) void {
+        self.preferred_selection_value = value;
+        self.pending_selection_index = null;
+        self.applyPreferredSelection();
+    }
+
+    pub fn setInitialSelectionIndex(self: *ListPicker, index: usize) void {
+        self.pending_selection_index = index;
+        self.applyPreferredSelection();
     }
 
     // ── Component interface ──────────────────────────────────────
@@ -113,6 +165,9 @@ pub const ListPicker = struct {
         if (content_h == 0 or w <= 3) return;
         const inner_w = w - 2;
 
+        var body_row: u32 = 1;
+        var body_height = content_h;
+
         if (self.searchable) {
             // Row 1: search input "/ query_text"
             const prompt = "/ ";
@@ -120,23 +175,35 @@ pub const ListPicker = struct {
             _ = region.writeStr(1, 1, prompt, self.theme.fg(.accent), Color.default, .{});
             if (self.query_len > 0) {
                 _ = region.writeStr(1 + prompt_w, 1, self.query_buf[0..self.query_len], self.theme.fg(.text), Color.default, .{});
+            } else if (self.search_placeholder) |placeholder| {
+                _ = region.writeStr(1 + prompt_w, 1, placeholder, self.theme.fg(.muted), Color.default, .{ .dim = true });
             }
-            // Separator line
             if (content_h > 1) {
                 var col: u32 = 1;
                 while (col < w - 1) : (col += 1) {
                     region.set(col, 2, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.theme.fg(.border_muted) }); // ─
                 }
             }
-            // List below separator
-            if (content_h > 2) {
-                const list_region = region.sub(1, 3, inner_w, content_h - 2);
-                self.list.render(list_region);
+            body_row = 3;
+            body_height = content_h -| 2;
+        }
+
+        if (self.status) |status| {
+            if (body_height > 0) {
+                const color = switch (status.kind) {
+                    .info => self.theme.fg(.muted),
+                    .loading => self.theme.fg(.accent),
+                    .@"error" => self.theme.fg(.@"error"),
+                };
+                _ = region.writeStr(1, body_row, status.text, color, Color.default, .{ .dim = status.kind == .info });
+                body_row += 1;
+                body_height -|= 1;
             }
-        } else {
-            // No search — list fills entire content area
-            const inner = region.sub(1, 1, inner_w, content_h);
-            self.list.render(inner);
+        }
+
+        if (body_height > 0) {
+            const list_region = region.sub(1, body_row, inner_w, body_height);
+            self.list.render(list_region);
         }
     }
 
@@ -183,7 +250,10 @@ pub const ListPicker = struct {
                 if (self.on_cancel) |cb| cb(self.callback_ctx);
                 return true;
             },
-            .consumed => return true,
+            .consumed => {
+                self.syncPreferredSelection();
+                return true;
+            },
             .unhandled => return false,
         }
     }
@@ -192,9 +262,10 @@ pub const ListPicker = struct {
         const inner_w = if (width > 2) width - 2 else 1;
         const inner_m = self.list.measure(inner_w);
         const search_rows: u32 = if (self.searchable) 2 else 0; // input + separator
+        const status_rows: u32 = if (self.status != null) 1 else 0;
         return .{
             .min_height = 3,
-            .preferred_height = inner_m.preferred_height + 2 + search_rows, // +2 borders
+            .preferred_height = inner_m.preferred_height + 2 + search_rows + status_rows, // +2 borders
         };
     }
 
@@ -253,6 +324,7 @@ pub const ListPicker = struct {
         }
 
         self.list.setItems(self.filtered_buf[0..self.filtered_count]);
+        self.applyPreferredSelection();
     }
 
     fn getSearchText(self: *const ListPicker, idx: usize) []const u8 {
@@ -270,9 +342,39 @@ pub const ListPicker = struct {
         if (selected_index >= self.filtered_count) return null;
         return self.filtered_source_indices[selected_index];
     }
+
+    fn applyPreferredSelection(self: *ListPicker) void {
+        if (self.preferred_selection_value) |value| {
+            if (self.list.setSelectedByValue(value)) return;
+        }
+
+        if (self.pending_selection_index) |index| {
+            if (self.searchable) {
+                if (index < self.all_items.len) {
+                    self.preferred_selection_value = self.all_items[index].value;
+                    if (self.list.setSelectedByValue(self.all_items[index].value)) {
+                        self.pending_selection_index = null;
+                        return;
+                    }
+                }
+            } else {
+                self.list.setSelectedIndexClamped(index);
+                self.pending_selection_index = null;
+                self.syncPreferredSelection();
+            }
+        }
+    }
+
+    fn syncPreferredSelection(self: *ListPicker) void {
+        if (self.list.selectedValue()) |value| {
+            self.preferred_selection_value = value;
+            self.pending_selection_index = null;
+        }
+    }
 };
 
 const testing = std.testing;
+const Buffer = buffer_mod.Buffer;
 
 const SelectionCapture = struct {
     source_index: ?usize = null,
@@ -307,6 +409,66 @@ test "searchable picker selection reports original source index" {
     try testing.expectEqualStrings("gamma", capture.value.?);
 }
 
+test "searchable picker preserves selected value across filter changes" {
+    const theme = Theme.dark;
+    const items = [_]SelectItem{
+        .{ .value = "alpha", .label = "Alpha" },
+        .{ .value = "beta", .label = "Beta" },
+        .{ .value = "gamma", .label = "Gamma" },
+    };
+    const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
+
+    var picker = ListPicker.init(&theme);
+    picker.setSearchableItems(&items, &search_texts);
+    picker.setInitialSelectionByValue("beta");
+
+    try testing.expectEqualStrings("beta", picker.list.selectedValue().?);
+
+    _ = picker.handleInput(.{ .code = .char, .char = 'g' });
+    try testing.expectEqualStrings("gamma", picker.list.selectedValue().?);
+
+    _ = picker.handleInput(.{ .code = .backspace });
+    try testing.expectEqualStrings("beta", picker.list.selectedValue().?);
+}
+
+test "picker initial selection index and status affect list behavior and measurement" {
+    const theme = Theme.dark;
+    const items = [_]SelectItem{
+        .{ .value = "alpha", .label = "Alpha" },
+        .{ .value = "beta", .label = "Beta" },
+        .{ .value = "gamma", .label = "Gamma" },
+    };
+
+    var picker = ListPicker.init(&theme);
+    picker.setSearchPlaceholder("Search models");
+    picker.setEmptyText("No models found");
+    picker.setStatus(.{ .text = "Loading models", .kind = .loading });
+    picker.setItems(&items);
+    picker.setInitialSelectionIndex(2);
+
+    try testing.expectEqualStrings("gamma", picker.list.selectedValue().?);
+    try testing.expectEqual(@as(u32, 6), picker.measure(40).preferred_height);
+}
+
+test "searchable picker renders placeholder status and custom empty text" {
+    const theme = Theme.dark;
+    var picker = ListPicker.init(&theme);
+    picker.title = "Models";
+    picker.setSearchPlaceholder("Search models");
+    picker.setEmptyText("No models found");
+    picker.setStatus(.{ .text = "Loading models", .kind = .loading });
+    picker.setSearchableItems(&.{}, null);
+
+    var buf = try Buffer.init(testing.allocator, 40, 8);
+    defer buf.deinit();
+
+    picker.render(buf.region());
+
+    try testing.expectEqual(@as(u21, 'S'), buf.get(3, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'L'), buf.get(1, 3).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'N'), buf.get(3, 4).grapheme.codepoint);
+}
+
 test "plain picker selection reports visible source index" {
     const theme = Theme.dark;
     const items = [_]SelectItem{
@@ -317,7 +479,7 @@ test "plain picker selection reports visible source index" {
 
     var picker = ListPicker.init(&theme);
     var capture = SelectionCapture{};
-    picker.list.setItems(&items);
+    picker.setItems(&items);
     picker.on_select = &captureSelection;
     picker.callback_ctx = @ptrCast(&capture);
 

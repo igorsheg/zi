@@ -1,4 +1,4 @@
-# Responses replay architecture spec
+# Replay architecture spec
 
 ## Status
 
@@ -19,16 +19,26 @@ The current replay path is too easy to get wrong because it still mixes:
 
 This spec defines the architecture zi should move to so replay is a modeled core system, not a recurring source of incidental bugs.
 
+This is a cross-provider spec. Replay is a core part of zi, not an OpenAI/Codex-only concern.
+
+However, sequencing matters:
+
+- **first** close strict pi-mono parity on the actively broken OpenAI Responses / Codex path,
+- **then** consolidate replay into the staged architecture described here,
+- **then** roll the same ownership/modeling rules across other providers with meaningful replay complexity.
+
 ## Source of truth
 
 pi-mono remains the oracle for observable behavior.
 
 This spec is about improving zi's internal architecture while preserving pi-mono parity for:
 
-- Codex event normalization,
-- Responses stream assembly,
+- provider stream normalization,
+- final assistant assembly,
 - replay transformation,
 - replay input serialization.
+
+The first concrete rollout target is OpenAI Responses / Codex because that path is currently the most replay-sensitive and has already produced real follow-up failures.
 
 If the implementation architecture changes but observable behavior drifts from pi-mono, the implementation is wrong.
 
@@ -65,14 +75,50 @@ The critical design rule is:
 2. **Replay data is owned**
    - no replay field may borrow from parse scratch, SSE buffers, temporary JSON trees, or stack-local builders.
 
-3. **Codex-specific behavior has one seam**
-   - Codex normalization lives in the event normalization stage, not in session accounting or TUI logic.
+3. **Provider-specific behavior has explicit seams**
+   - provider quirks live in provider normalization / provider request encoding seams, not in session accounting or TUI logic.
 
 4. **Transformation and encoding are distinct**
    - message replay policy is decided before wire serialization begins.
 
 5. **pi-mono remains the oracle**
    - same kept/dropped messages, same replayed reasoning/text/tool-call semantics, same ordering, same terminal behavior.
+
+## Scope and rollout
+
+Replay architecture is a global concern, but rollout should be staged.
+
+### Global rule
+
+Every provider with replay semantics must eventually follow the same model:
+
+- explicit normalization seam,
+- final-state assembly,
+- replay transform,
+- replay encode,
+- owned replay data with no scratch leakage.
+
+### Rollout order
+
+1. **OpenAI Responses / Codex**
+   - highest priority because it is actively broken and pi-mono already provides the target seams.
+2. **Other providers with complex replay semantics**
+   - Anthropic
+   - OpenAI Completions / compat paths
+   - Google / Bedrock where replay metadata and thought/tool signatures matter
+3. **Providers with simpler replay surfaces**
+   - adopt the ownership and transform/encode split only as needed by their product surface
+
+### Sequencing rule
+
+This spec does **not** authorize inventing a new replay architecture before parity is complete on the currently broken path.
+
+The immediate execution order is:
+
+1. finish strict pi-mono parity for OpenAI Responses / Codex replay + assembly,
+2. add conformance diffs/fixtures,
+3. then land the modeled replay architecture here,
+4. then roll the same structure across other providers.
 
 ## Architectural split
 
@@ -276,26 +322,33 @@ Allowed sources:
 
 Partial state may never be persisted directly unless the provider contract explicitly makes it final.
 
-## Codex seam rule
+## Provider seam rule
 
-Codex-specific logic must remain confined to the event normalization seam and request-shape seam.
+Provider-specific logic must remain confined to explicit normalization and request-shape seams.
 
-Codex must not introduce replay-policy drift in:
+No provider may introduce replay-policy drift in:
 - session accounting,
 - agent state management,
 - TUI rendering,
 - transcript persistence semantics.
 
-The only Codex-specific responsibilities are:
+The first concrete target remains Codex / OpenAI Responses, where provider-specific responsibilities include:
 - transport/header quirks,
 - request-body quirks specific to Codex,
 - terminal event normalization into shared Responses semantics.
+
+Other providers should follow the same rule:
+- provider quirks live in provider seams,
+- replay policy lives in replay transform / replay encode,
+- UI and session layers stay generic.
 
 ## Testing doctrine for replay architecture
 
 Tests must sit at behavior/conformance boundaries, not helper granularity.
 
 ### Priority tests
+
+#### First rollout target: OpenAI Responses / Codex
 
 1. **Codex terminal normalization conformance**
    - `response.done` / `response.completed` / `response.incomplete`
@@ -314,6 +367,15 @@ Tests must sit at behavior/conformance boundaries, not helper granularity.
 5. **Orphan tool-call replay**
    - synthetic tool result parity
 
+#### Follow-on provider rollout
+
+For other providers, add conformance tests only where the provider has real replay semantics worth preserving:
+
+- preserved reasoning/thought signatures,
+- provider-specific tool-call identity normalization,
+- cross-model replay behavior,
+- provider-specific final-state assembly quirks.
+
 ### Explicitly avoid
 
 - per-helper unit test spray
@@ -321,6 +383,12 @@ Tests must sit at behavior/conformance boundaries, not helper granularity.
 - tests that pin zi-only workarounds
 
 ## Migration plan
+
+### Phase 0. Finish strict parity on the broken path
+
+- complete strict pi-mono parity for OpenAI Responses / Codex replay + assembly
+- diff real follow-up payloads against pi-mono
+- close known request/replay drift before broader architectural movement
 
 ### Phase 1. Extract stage boundaries
 
@@ -341,9 +409,14 @@ Tests must sit at behavior/conformance boundaries, not helper granularity.
 ### Phase 4. Add conformance fixtures
 
 - compare zi and pi-mono replay payloads on real multi-turn transcripts
-- especially Codex tool-use follow-up turns
+- especially OpenAI Responses / Codex tool-use follow-up turns
 
-### Phase 5. Delete obsolete monolithic seams
+### Phase 5. Roll the same replay model across other providers
+
+- apply the same ownership and transform/encode rules provider by provider
+- only where the provider has replay complexity that justifies the seam
+
+### Phase 6. Delete obsolete monolithic seams
 
 - remove remaining monolithic replay/writer paths once the staged pipeline is fully authoritative
 
@@ -353,9 +426,10 @@ Tests must sit at behavior/conformance boundaries, not helper granularity.
 2. Replay uses a dedicated owned IR.
 3. Persisted replay metadata comes from final provider item payloads, not provisional deltas.
 4. No replay field borrows from temporary parse scratch.
-5. Codex-specific behavior is confined to explicit normalization/request seams.
-6. Conformance tests exist for follow-up turns that previously produced Responses/Codex 400s.
-7. `zig build` passes after each migration phase.
+5. Provider-specific behavior is confined to explicit normalization/request seams.
+6. Conformance tests exist for follow-up turns that previously produced OpenAI Responses / Codex 400s.
+7. The replay architecture is defined as a global subsystem, with staged provider rollout rather than Codex-only treatment.
+8. `zig build` passes after each migration phase.
 
 ## Design summary
 
@@ -369,4 +443,4 @@ The correct model is:
 - transform transcript into owned replay IR,
 - encode replay IR into exact provider wire input.
 
-That architecture keeps pi-mono parity while making lifetime and replay correctness structurally easier to maintain.
+That architecture keeps pi-mono parity while making lifetime and replay correctness structurally easier to maintain across the providers that need replay, without prematurely inventing a new system before parity is complete.

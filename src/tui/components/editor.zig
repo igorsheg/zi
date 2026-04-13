@@ -10,6 +10,7 @@ const autocomplete_mod = @import("../autocomplete.zig");
 const editor_iface_mod = @import("../editor_iface.zig");
 const theme_mod = @import("../theme.zig");
 const editor_core = @import("../editor/root.zig");
+const keybindings = @import("../keybindings.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -206,28 +207,29 @@ pub const Editor = struct {
             .unhandled => {},
         }
 
-        switch (key.code) {
-            .enter => {
-                if (key.shift) {
-                    self.history_index = -1;
-                    self.buffer.insertNewline();
-                    self.afterTextMutation();
-                    return true;
-                }
+        if (keybindings.matches(.input_new_line, key)) {
+            self.history_index = -1;
+            self.buffer.insertNewline();
+            self.afterTextMutation();
+            return true;
+        }
 
-                const cursor_byte = self.buffer.cursorByte();
-                if (cursor_byte > 0 and self.buffer.text()[cursor_byte - 1] == '\\') {
-                    self.history_index = -1;
-                    self.buffer.backspace();
-                    self.buffer.insertNewline();
-                    self.afterTextMutation();
-                    return true;
-                }
-
-                if (self.disable_submit) return true;
-                if (self.on_submit) |cb| cb(self.buffer.text(), self.on_submit_ctx);
+        if (keybindings.matches(.input_submit, key)) {
+            const cursor_byte = self.buffer.cursorByte();
+            if (cursor_byte > 0 and self.buffer.text()[cursor_byte - 1] == '\\') {
+                self.history_index = -1;
+                self.buffer.backspace();
+                self.buffer.insertNewline();
+                self.afterTextMutation();
                 return true;
-            },
+            }
+
+            if (self.disable_submit) return true;
+            if (self.on_submit) |cb| cb(self.buffer.text(), self.on_submit_ctx);
+            return true;
+        }
+
+        switch (key.code) {
             .char => {
                 if (key.ctrl) return false;
                 if (key.char) |cp| {
@@ -590,3 +592,42 @@ pub const Editor = struct {
     }
 };
 
+const testing = std.testing;
+
+const SubmitCapture = struct {
+    count: u32 = 0,
+};
+
+fn captureSubmit(_: []const u8, ctx: ?*anyopaque) void {
+    const capture: *SubmitCapture = @ptrCast(@alignCast(ctx));
+    capture.count += 1;
+}
+
+test "Editor shared bindings keep shift enter as newline and enter as submit" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var capture = SubmitCapture{};
+    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
+    editor.insertText("hello");
+
+    try testing.expect(editor.handleInput(.{ .code = .enter, .shift = true }));
+    try testing.expectEqualStrings("hello\n", editor.getText());
+    try testing.expectEqual(@as(u32, 0), capture.count);
+
+    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try testing.expectEqual(@as(u32, 1), capture.count);
+}
+
+test "Editor submit binding preserves backslash newline fallback" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var capture = SubmitCapture{};
+    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
+    editor.insertText("hello\\");
+
+    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try testing.expectEqualStrings("hello\n", editor.getText());
+    try testing.expectEqual(@as(u32, 0), capture.count);
+}

@@ -10,6 +10,7 @@ const text_mod = @import("components/text.zig");
 const greeter_mod = @import("components/greeter.zig");
 const footer_mod = @import("components/footer.zig");
 const editor_mod = @import("components/editor.zig");
+const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
 const loader_mod = @import("components/loader.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
@@ -23,6 +24,7 @@ const input_buffer_mod = @import("input_buffer.zig");
 const status_data_mod = @import("status_data.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
+const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../slash_commands.zig");
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const SlashCommandProvider = autocomplete_mod.SlashCommandProvider;
@@ -304,6 +306,8 @@ const ResumePickerFlow = struct {
         var picker = ListPicker.init(theme);
         picker.title = "Resume session";
         picker.list.max_visible = 10;
+        picker.setSearchPlaceholder("Filter sessions");
+        picker.setEmptyText("No matching sessions");
         picker.setSearchableItems(items, null);
 
         return .{
@@ -374,6 +378,8 @@ const ModelPickerFlow = struct {
         var picker = ListPicker.init(theme);
         picker.title = "Select model";
         picker.list.max_visible = 12;
+        picker.setSearchPlaceholder("Search models");
+        picker.setEmptyText("No matching models");
         picker.setSearchableItems(items, search_texts);
 
         return .{
@@ -442,6 +448,7 @@ pub const Interactive = struct {
     // ── Slash commands ──────────────────────────────────────────
     command_registry: CommandRegistry,
     slash_provider: SlashCommandProvider = undefined,
+    hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
 
     // ── Flow-owned transient pickers ────────────────────────────
     resume_picker_flow: ?ResumePickerFlow = null,
@@ -528,6 +535,7 @@ pub const Interactive = struct {
             .status_text = text_mod.Text.init(state_allocator),
             .greeter = .{ .theme = theme, .version = "0.1.0" },
             .footer = .{ .theme = theme },
+            .hotkeys_overlay = .{ .theme = theme },
             .transcript = Transcript.init(state_allocator),
             .resolver = resolver,
             .status_data = StatusData.init(state_allocator),
@@ -817,13 +825,7 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
                 return;
             }
-            // Overlay didn't consume it — Esc dismisses the topmost overlay
-            if (key.code == .escape) {
-                self.tui.hideOverlay();
-                return;
-            }
-            // Ctrl+C also dismisses overlay instead of exiting
-            if (key.code == .char and key.char != null and key.char.? == 'c' and key.ctrl) {
+            if (keybindings.matches(.select_cancel, key)) {
                 self.tui.hideOverlay();
                 return;
             }
@@ -831,7 +833,7 @@ pub const Interactive = struct {
         }
 
         // App-level keybindings — no overlay active
-        if (key.code == .escape) {
+        if (keybindings.matches(.app_interrupt, key)) {
             if (self.retry_waiting) {
                 self.session_controller.abortRetry();
                 return;
@@ -847,7 +849,7 @@ pub const Interactive = struct {
 
         // Ctrl+C: double-tap guard (pi-mono parity)
         // First press: clear editor. Second press within 500ms: exit.
-        if (key.code == .char and key.char != null and key.char.? == 'c' and key.ctrl) {
+        if (keybindings.matches(.app_clear, key)) {
             if (self.login_thread != null) {
                 self.login_cancelled.store(true, .release);
                 return;
@@ -877,23 +879,21 @@ pub const Interactive = struct {
         }
 
         // Ctrl+D: exit only when editor is empty (pi-mono parity)
-        if (key.code == .char and key.char != null and key.char.? == 'd' and key.ctrl) {
+        if (keybindings.matches(.app_exit, key)) {
             if (self.active_editor.getText().len == 0) {
                 self.running = false;
                 return;
             }
         }
 
-        // ctrl+o — toggle tool output expansion
-        if (key.code == .char and key.char != null and key.char.? == 'o' and key.ctrl) {
+        if (keybindings.matches(.app_toggle_tools, key)) {
             self.tool_output_expanded = !self.tool_output_expanded;
             self.transcript.setToolOutputExpanded(self.tool_output_expanded);
             self.tui.dirty = true;
             return;
         }
 
-        // ctrl+t — toggle thinking block visibility
-        if (key.code == .char and key.char != null and key.char.? == 't' and key.ctrl) {
+        if (keybindings.matches(.app_toggle_thinking, key)) {
             self.hide_thinking_block = !self.hide_thinking_block;
             self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
             self.transcript.setHideThinkingBlock(self.hide_thinking_block);
@@ -917,13 +917,16 @@ pub const Interactive = struct {
 
         const page_size = @max(1, output_h -| 2);
 
-        const delta: ?i64 = switch (key.code) {
-            .page_up => -@as(i64, @intCast(page_size)),
-            .page_down => @as(i64, @intCast(page_size)),
-            .up => if (key.shift) @as(i64, -3) else null,
-            .down => if (key.shift) @as(i64, 3) else null,
-            else => null,
-        };
+        const delta: ?i64 = if (keybindings.matches(.app_scroll_page_up, key))
+            -@as(i64, @intCast(page_size))
+        else if (keybindings.matches(.app_scroll_page_down, key))
+            @as(i64, @intCast(page_size))
+        else if (keybindings.matches(.app_scroll_line_up, key))
+            -3
+        else if (keybindings.matches(.app_scroll_line_down, key))
+            3
+        else
+            null;
 
         if (delta) |d| {
             const w = self.tui.width();
@@ -1458,6 +1461,10 @@ pub const Interactive = struct {
                 self.showSettingsPicker();
                 return true;
             }
+            if (std.mem.eql(u8, name, "hotkeys")) {
+                self.showHotkeysOverlay();
+                return true;
+            }
             if (std.mem.eql(u8, name, "mem")) {
                 self.writeMemoryDiagnostic();
                 return true;
@@ -1532,6 +1539,55 @@ pub const Interactive = struct {
             .margin_top = header_h,
             .surface = .{ .fill = self.theme.bg(.tool_pending_bg) },
         };
+    }
+
+    fn centerDialogOptions(self: *Interactive) overlay_mod.OverlayOptions {
+        var options = overlay_mod.OverlayPresets.centerDialog();
+        const width = self.tui.width();
+        const header_h = self.header_container.measure(width).preferred_height;
+        options.margin_top = header_h;
+        options.margin_bottom = 1;
+        options.surface = .{ .fill = self.theme.bg(.tool_pending_bg) };
+        return options;
+    }
+
+    fn showHotkeysOverlay(self: *Interactive) void {
+        _ = self.tui.showOverlay(self.hotkeys_overlay.component(), self.centerDialogOptions());
+    }
+
+    fn configureSimplePicker(
+        self: *Interactive,
+        picker: *ListPicker,
+        title: []const u8,
+        max_visible: u32,
+        items: []const SelectItem,
+        on_select: ?*const fn (selection: PickerSelection, ctx: ?*anyopaque) void,
+        on_cancel: ?*const fn (ctx: ?*anyopaque) void,
+    ) void {
+        picker.* = ListPicker.init(self.theme);
+        picker.title = title;
+        picker.list.max_visible = max_visible;
+        picker.setItems(items);
+        picker.on_select = on_select;
+        picker.on_cancel = on_cancel;
+        picker.callback_ctx = @ptrCast(self);
+    }
+
+    fn showSimplePickerOverlay(
+        self: *Interactive,
+        handle: *?tui_mod.OverlayHandle,
+        picker: *ListPicker,
+    ) void {
+        self.hideSimplePickerOverlay(handle);
+        handle.* = self.tui.showOverlay(picker.component(), self.bottomPanelOptions());
+    }
+
+    fn hideSimplePickerOverlay(self: *Interactive, handle: *?tui_mod.OverlayHandle) void {
+        _ = self;
+        if (handle.*) |h| {
+            handle.* = null;
+            h.hide();
+        }
     }
 
     fn drainQueuedRequests(self: *Interactive) void {
@@ -1716,6 +1772,14 @@ pub const Interactive = struct {
         flow.picker.on_select = &onModelSelected;
         flow.picker.on_cancel = &onModelPickerCancel;
         flow.picker.callback_ctx = @ptrCast(self);
+        for (flow.rows, 0..) |row, i| {
+            if (std.mem.eql(u8, json_util.providerToString(row.model.provider), self.status_data.model_provider) and
+                std.mem.eql(u8, row.model.id, self.status_data.model_id))
+            {
+                flow.picker.setInitialSelectionIndex(i);
+                break;
+            }
+        }
         self.model_picker_flow = flow;
         self.model_picker_flow.?.handle = self.tui.showOverlay(
             self.model_picker_flow.?.picker.component(),
@@ -1784,26 +1848,20 @@ pub const Interactive = struct {
         count += 1;
 
         self.settings_picker_count = count;
-        self.settings_picker = ListPicker.init(self.theme);
-        self.settings_picker.title = "Settings";
-        self.settings_picker.list.max_visible = 10;
-        self.settings_picker.list.setItems(self.settings_picker_items[0..count]);
-        self.settings_picker.on_select = &onSettingsSelected;
-        self.settings_picker.on_cancel = &onSettingsPickerCancel;
-        self.settings_picker.callback_ctx = @ptrCast(self);
-
-        self.settings_picker_handle = self.tui.showOverlay(
-            self.settings_picker.component(),
-            self.bottomPanelOptions(),
+        self.configureSimplePicker(
+            &self.settings_picker,
+            "Settings",
+            10,
+            self.settings_picker_items[0..count],
+            &onSettingsSelected,
+            &onSettingsPickerCancel,
         );
+        self.showSimplePickerOverlay(&self.settings_picker_handle, &self.settings_picker);
     }
 
     fn onSettingsSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.settings_picker_handle) |h| {
-            h.hide();
-            self.settings_picker_handle = null;
-        }
+        self.hideSimplePickerOverlay(&self.settings_picker_handle);
         if (selection.source_index >= self.settings_picker_count) return;
 
         switch (self.settings_picker_actions[selection.source_index]) {
@@ -1821,10 +1879,7 @@ pub const Interactive = struct {
 
     fn onSettingsPickerCancel(ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.settings_picker_handle) |h| {
-            h.hide();
-            self.settings_picker_handle = null;
-        }
+        self.hideSimplePickerOverlay(&self.settings_picker_handle);
     }
 
     fn showThinkingLevelPicker(self: *Interactive) void {
@@ -1846,33 +1901,21 @@ pub const Interactive = struct {
             };
         }
         self.thinking_picker_count = count;
-        self.thinking_picker = ListPicker.init(self.theme);
-        self.thinking_picker.title = "Thinking level";
-        self.thinking_picker.list.max_visible = 8;
-        self.thinking_picker.list.setItems(self.thinking_picker_items[0..count]);
-        self.thinking_picker.on_select = &onThinkingLevelSelected;
-        self.thinking_picker.on_cancel = &onThinkingLevelPickerCancel;
-        self.thinking_picker.callback_ctx = @ptrCast(self);
-
-        for (0..count) |i| {
-            if (std.mem.eql(u8, self.thinking_picker_items[i].value, self.status_data.thinking_level)) {
-                self.thinking_picker.list.selected_index = @intCast(i);
-                break;
-            }
-        }
-
-        self.thinking_picker_handle = self.tui.showOverlay(
-            self.thinking_picker.component(),
-            self.bottomPanelOptions(),
+        self.configureSimplePicker(
+            &self.thinking_picker,
+            "Thinking level",
+            8,
+            self.thinking_picker_items[0..count],
+            &onThinkingLevelSelected,
+            &onThinkingLevelPickerCancel,
         );
+        self.thinking_picker.setInitialSelectionByValue(if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off");
+        self.showSimplePickerOverlay(&self.thinking_picker_handle, &self.thinking_picker);
     }
 
     fn onThinkingLevelSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.thinking_picker_handle) |h| {
-            h.hide();
-            self.thinking_picker_handle = null;
-        }
+        self.hideSimplePickerOverlay(&self.thinking_picker_handle);
 
         if (selection.source_index < self.thinking_picker_count) {
             self.applyThinkingLevelChange(self.thinking_picker_levels[selection.source_index]);
@@ -1881,10 +1924,7 @@ pub const Interactive = struct {
 
     fn onThinkingLevelPickerCancel(ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.thinking_picker_handle) |h| {
-            h.hide();
-            self.thinking_picker_handle = null;
-        }
+        self.hideSimplePickerOverlay(&self.thinking_picker_handle);
     }
 
     fn applyThinkingLevelChange(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
@@ -1916,35 +1956,26 @@ pub const Interactive = struct {
             return;
         }
 
-        self.login_picker = ListPicker.init(self.theme);
-        self.login_picker.title = "Login";
-        self.login_picker.list.max_visible = 8;
-        self.login_picker.list.setItems(self.login_picker_items[0..count]);
-        self.login_picker.on_select = &onLoginProviderSelected;
-        self.login_picker.on_cancel = &onLoginPickerCancel;
-        self.login_picker.callback_ctx = @ptrCast(self);
-
-        self.login_picker_handle = self.tui.showOverlay(
-            self.login_picker.component(),
-            self.bottomPanelOptions(),
+        self.configureSimplePicker(
+            &self.login_picker,
+            "Login",
+            8,
+            self.login_picker_items[0..count],
+            &onLoginProviderSelected,
+            &onLoginPickerCancel,
         );
+        self.showSimplePickerOverlay(&self.login_picker_handle, &self.login_picker);
     }
 
     fn onLoginProviderSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.login_picker_handle) |h| {
-            h.hide();
-            self.login_picker_handle = null;
-        }
+        self.hideSimplePickerOverlay(&self.login_picker_handle);
         self.startLogin(selection.item.value);
     }
 
     fn onLoginPickerCancel(ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (self.login_picker_handle) |h| {
-            h.hide();
-            self.login_picker_handle = null;
-        }
+        self.hideSimplePickerOverlay(&self.login_picker_handle);
     }
 
     fn startLogin(self: *Interactive, provider_id: []const u8) void {
@@ -2594,7 +2625,7 @@ fn parseAgentThinkingLevel(value: []const u8) agent_protocol.ThinkingLevel {
 fn currentThinkingSettingsDescription(self: *const Interactive) []const u8 {
     const model = currentStatusModel(self) orelse return "Current model unavailable";
     if (!model.reasoning) return "Current model does not support thinking";
-    return self.status_data.thinking_level;
+    return if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off";
 }
 
 fn currentStatusModel(self: *const Interactive) ?ai_protocol.Model {

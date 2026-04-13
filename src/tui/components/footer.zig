@@ -3,6 +3,7 @@ const cell_mod = @import("../cell.zig");
 const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
 const theme_mod = @import("../theme.zig");
+const keybindings = @import("../keybindings.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -18,7 +19,8 @@ pub const Footer = struct {
         const h = region.height;
         if (w == 0 or h == 0) return;
 
-        const hints = "esc abort \xC2\xB7 ctrl+c quit \xC2\xB7 ctrl+o expand tools \xC2\xB7 ctrl+t thinking";
+        var buf: [128]u8 = undefined;
+        const hints = keybindings.formatFooter(&buf);
         _ = region.writeStr(0, 0, hints, self.theme.fg(.dim), Color.default, .{});
     }
 

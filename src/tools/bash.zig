@@ -62,8 +62,8 @@ fn execute(
     _: []const u8,
     args: std.json.Value,
     signal: agent.protocol.AbortSignal,
-    _: ?agent.protocol.AgentToolUpdateCallback,
-    _: ?*anyopaque,
+    on_update: ?agent.protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
 ) agent.protocol.AgentToolResult {
     const ctx: *util.BuiltinCtx = @ptrCast(@alignCast(raw_ctx orelse
         return util.errorResult(allocator, "bash tool: missing context")));
@@ -113,10 +113,10 @@ fn execute(
         const lock_entry = lock_registry.global().acquireKey(git_lock_key) catch
             return util.errorResult(allocator, "bash tool: failed to acquire git lock");
         defer lock_registry.global().release(lock_entry);
-        return runCommand(allocator, final_command, effective_cwd, extractTimeout(args), signal);
+        return runCommand(allocator, final_command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
     }
 
-    return runCommand(allocator, final_command, effective_cwd, extractTimeout(args), signal);
+    return runCommand(allocator, final_command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
 }
 
 fn runCommand(
@@ -125,6 +125,8 @@ fn runCommand(
     cwd: []const u8,
     timeout_secs: ?u64,
     signal: agent.protocol.AbortSignal,
+    on_update: ?agent.protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
 ) agent.protocol.AgentToolResult {
     var thread_safe_allocator: std.heap.ThreadSafeAllocator = .{ .child_allocator = allocator };
     const io_allocator = thread_safe_allocator.allocator();
@@ -150,59 +152,37 @@ fn runCommand(
     var timeout_guard = TimeoutGuard.start(timeout_secs, child.id);
     defer timeout_guard.stop();
 
-    var stderr_result: ?[]u8 = null;
-    var stderr_thread: ?std.Thread = null;
-    if (child.stderr) |stderr_file| {
-        stderr_thread = std.Thread.spawn(.{}, readStderr, .{ stderr_file, io_allocator, &stderr_result }) catch null;
-    }
-
-    const stdout_data = if (child.stdout) |stdout_file|
-        stdout_file.readToEndAlloc(io_allocator, MAX_OUTPUT_BYTES) catch null
+    const completed = if (on_update) |cb|
+        runStreamingCapture(allocator, io_allocator, &child, command, cb, update_ctx)
     else
-        null;
-    defer if (stdout_data) |data| io_allocator.free(data);
-
-    if (stderr_thread) |t| t.join();
-    defer if (stderr_result) |data| io_allocator.free(data);
+        runBufferedCapture(allocator, io_allocator, &child);
+    defer if (completed.merged_output.len > 0) allocator.free(completed.merged_output);
 
     const term = child.wait() catch null;
     timeout_guard.markExited();
 
-    var merged: std.ArrayListUnmanaged(u8) = .empty;
-    defer merged.deinit(allocator);
-    if (stdout_data) |data| {
-        if (data.len > 0) merged.appendSlice(allocator, data) catch {};
-    }
-    if (stderr_result) |data| {
-        if (data.len > 0) {
-            if (merged.items.len > 0) merged.appendSlice(allocator, "\n") catch {};
-            merged.appendSlice(allocator, data) catch {};
-        }
-    }
-
-    const output_text = truncateHeadTail(allocator, merged.items) catch allocator.dupe(u8, merged.items) catch null;
+    const output_text = truncateHeadTail(allocator, completed.merged_output) catch allocator.dupe(u8, completed.merged_output) catch null;
     defer if (output_text) |text| allocator.free(text);
 
-    var result = std.ArrayList(u8).empty;
-    defer result.deinit(allocator);
-    result.appendSlice(allocator, "$ ") catch return util.errorResult(allocator, "bash tool: alloc failed");
-    result.appendSlice(allocator, command) catch return util.errorResult(allocator, "bash tool: alloc failed");
-    result.appendSlice(allocator, "\n\n") catch return util.errorResult(allocator, "bash tool: alloc failed");
-    result.appendSlice(allocator, if (output_text) |text| if (text.len > 0) text else "(no output)" else "(no output)") catch
+    const result_text = formatCommandTranscript(allocator, command, if (output_text) |text| text else "") catch
         return util.errorResult(allocator, "bash tool: alloc failed");
+    defer allocator.free(result_text);
 
     if (signal.isAborted()) {
-        result.appendSlice(allocator, "\n\ncommand aborted") catch {};
-        return .{ .content = oneText(allocator, result.items), .is_error = true };
+        const aborted = appendTail(allocator, result_text, "\n\ncommand aborted") catch result_text;
+        defer if (aborted.ptr != result_text.ptr) allocator.free(aborted);
+        return .{ .content = oneText(allocator, aborted), .is_error = true };
     }
 
     if (timeout_guard.did_timeout.load(.acquire)) {
         if (timeout_secs) |secs| {
             const tail = std.fmt.allocPrint(allocator, "\n\ncommand timed out after {d} seconds", .{secs}) catch "";
             defer if (tail.len > 0) allocator.free(tail);
-            result.appendSlice(allocator, tail) catch {};
+            const timed_out = appendTail(allocator, result_text, tail) catch result_text;
+            defer if (timed_out.ptr != result_text.ptr) allocator.free(timed_out);
+            return .{ .content = oneText(allocator, timed_out), .is_error = true };
         }
-        return .{ .content = oneText(allocator, result.items), .is_error = true };
+        return .{ .content = oneText(allocator, result_text), .is_error = true };
     }
 
     if (term) |t| switch (t) {
@@ -210,16 +190,17 @@ fn runCommand(
             if (code != 0) {
                 const tail = std.fmt.allocPrint(allocator, "\n\nexit code {d}", .{code}) catch "";
                 defer if (tail.len > 0) allocator.free(tail);
-                result.appendSlice(allocator, tail) catch {};
-                return .{ .content = oneText(allocator, result.items), .is_error = true };
+                const failed = appendTail(allocator, result_text, tail) catch result_text;
+                defer if (failed.ptr != result_text.ptr) allocator.free(failed);
+                return .{ .content = oneText(allocator, failed), .is_error = true };
             }
         },
         else => {
-            return .{ .content = oneText(allocator, result.items), .is_error = true };
+            return .{ .content = oneText(allocator, result_text), .is_error = true };
         },
     };
 
-    return .{ .content = oneText(allocator, result.items) };
+    return .{ .content = oneText(allocator, result_text) };
 }
 
 const TimeoutGuard = struct {
@@ -271,6 +252,165 @@ const TimeoutGuard = struct {
     }
 };
 
+const CompletedOutput = struct {
+    merged_output: []u8 = &.{},
+};
+
+const StreamKind = enum { stdout, stderr };
+
+const StreamingCapture = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    stdout: std.ArrayListUnmanaged(u8) = .empty,
+    stderr: std.ArrayListUnmanaged(u8) = .empty,
+    stdout_done: bool = false,
+    stderr_done: bool = false,
+    dirty: bool = false,
+
+    fn deinit(self: *StreamingCapture) void {
+        self.stdout.deinit(self.allocator);
+        self.stderr.deinit(self.allocator);
+    }
+
+    fn append(self: *StreamingCapture, kind: StreamKind, bytes: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const list = switch (kind) {
+            .stdout => &self.stdout,
+            .stderr => &self.stderr,
+        };
+        if (list.items.len >= MAX_OUTPUT_BYTES) return;
+
+        const take = @min(bytes.len, MAX_OUTPUT_BYTES - list.items.len);
+        if (take == 0) return;
+        list.appendSlice(self.allocator, bytes[0..take]) catch return;
+        self.dirty = true;
+    }
+
+    fn markDone(self: *StreamingCapture, kind: StreamKind) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (kind) {
+            .stdout => self.stdout_done = true,
+            .stderr => self.stderr_done = true,
+        }
+    }
+
+    fn isComplete(self: *StreamingCapture) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.stdout_done and self.stderr_done;
+    }
+
+    fn emitDirtyUpdate(
+        self: *StreamingCapture,
+        allocator: std.mem.Allocator,
+        command: []const u8,
+        cb: agent.protocol.AgentToolUpdateCallback,
+        update_ctx: ?*anyopaque,
+    ) void {
+        self.mutex.lock();
+        if (!self.dirty) {
+            self.mutex.unlock();
+            return;
+        }
+        self.dirty = false;
+        const merged = mergeOutputs(allocator, self.stdout.items, self.stderr.items) catch {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+        defer if (merged.len > 0) allocator.free(merged);
+        emitPartialTranscriptUpdate(allocator, command, merged, cb, update_ctx);
+    }
+
+    fn takeMergedOutput(self: *StreamingCapture, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return mergeOutputs(allocator, self.stdout.items, self.stderr.items);
+    }
+};
+
+fn runBufferedCapture(
+    allocator: std.mem.Allocator,
+    io_allocator: std.mem.Allocator,
+    child: *std.process.Child,
+) CompletedOutput {
+    var stderr_result: ?[]u8 = null;
+    var stderr_thread: ?std.Thread = null;
+    if (child.stderr) |stderr_file| {
+        stderr_thread = std.Thread.spawn(.{}, readStderr, .{ stderr_file, io_allocator, &stderr_result }) catch null;
+    }
+
+    const stdout_data = if (child.stdout) |stdout_file|
+        stdout_file.readToEndAlloc(io_allocator, MAX_OUTPUT_BYTES) catch null
+    else
+        null;
+    defer if (stdout_data) |data| io_allocator.free(data);
+
+    if (stderr_thread) |t| t.join();
+    defer if (stderr_result) |data| io_allocator.free(data);
+
+    return .{
+        .merged_output = mergeOutputs(
+            allocator,
+            if (stdout_data) |data| data else "",
+            if (stderr_result) |data| data else "",
+        ) catch allocator.dupe(u8, "") catch &.{},
+    };
+}
+
+fn runStreamingCapture(
+    allocator: std.mem.Allocator,
+    io_allocator: std.mem.Allocator,
+    child: *std.process.Child,
+    command: []const u8,
+    cb: agent.protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
+) CompletedOutput {
+    var capture = StreamingCapture{ .allocator = io_allocator };
+    defer capture.deinit();
+
+    var stdout_thread: ?std.Thread = null;
+    var stderr_thread: ?std.Thread = null;
+
+    if (child.stdout) |stdout_file| {
+        stdout_thread = std.Thread.spawn(.{}, readStream, .{ stdout_file, &capture, StreamKind.stdout }) catch blk: {
+            capture.markDone(.stdout);
+            break :blk null;
+        };
+    } else capture.markDone(.stdout);
+
+    if (child.stderr) |stderr_file| {
+        stderr_thread = std.Thread.spawn(.{}, readStream, .{ stderr_file, &capture, StreamKind.stderr }) catch blk: {
+            capture.markDone(.stderr);
+            break :blk null;
+        };
+    } else capture.markDone(.stderr);
+
+    while (!capture.isComplete()) {
+        capture.emitDirtyUpdate(allocator, command, cb, update_ctx);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    capture.emitDirtyUpdate(allocator, command, cb, update_ctx);
+
+    if (stdout_thread) |t| t.join();
+    if (stderr_thread) |t| t.join();
+
+    return .{ .merged_output = capture.takeMergedOutput(allocator) catch allocator.dupe(u8, "") catch &.{} };
+}
+
+fn readStream(file: std.fs.File, capture: *StreamingCapture, kind: StreamKind) void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = file.read(&buf) catch break;
+        if (n == 0) break;
+        capture.append(kind, buf[0..n]);
+    }
+    capture.markDone(kind);
+}
+
 test "TimeoutGuard.stop does not wait for the full timeout after process exit" {
     const testing = std.testing;
 
@@ -321,7 +461,7 @@ test "runCommand handles concurrent stdout and stderr" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
 
-        const result = runCommand(arena.allocator(), cmd, "/tmp", 5, agent.protocol.AbortSignal.none);
+        const result = runCommand(arena.allocator(), cmd, "/tmp", 5, agent.protocol.AbortSignal.none, null, null);
 
         try testing.expect(!result.is_error);
         try testing.expectEqual(@as(usize, 1), result.content.len);
@@ -332,6 +472,53 @@ test "runCommand handles concurrent stdout and stderr" {
     }
 }
 
+test "runCommand emits partial updates while command is still running" {
+    const testing = std.testing;
+
+    const CallbackState = struct {
+        count: usize = 0,
+        saw_partial: bool = false,
+
+        const Self = @This();
+
+        fn callback(partial_result: agent.protocol.AgentToolResult, ctx: ?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.count += 1;
+            if (partial_result.content.len > 0 and partial_result.content[0] == .text) {
+                if (std.mem.indexOf(u8, partial_result.content[0].text.text, "first") != null) {
+                    self.saw_partial = true;
+                }
+            }
+        }
+    };
+
+    const cmd =
+        \\printf 'first\n'
+        \\sleep 0.2
+        \\printf 'second\n' 1>&2
+        \\sleep 0.2
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var state = CallbackState{};
+    const result = runCommand(
+        arena.allocator(),
+        cmd,
+        "/tmp",
+        5,
+        agent.protocol.AbortSignal.none,
+        &CallbackState.callback,
+        @ptrCast(&state),
+    );
+
+    try testing.expect(!result.is_error);
+    try testing.expect(state.count >= 1);
+    try testing.expect(state.saw_partial);
+    try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "second") != null);
+}
+
 fn oneText(allocator: std.mem.Allocator, text: []const u8) []agent.protocol.AgentToolResult.ContentBlock {
     const owned = json_util.utf8LossyAlloc(allocator, text) catch allocator.dupe(u8, text) catch return &.{};
     errdefer allocator.free(owned);
@@ -339,6 +526,47 @@ fn oneText(allocator: std.mem.Allocator, text: []const u8) []agent.protocol.Agen
     const blocks = allocator.alloc(agent.protocol.AgentToolResult.ContentBlock, 1) catch return &.{};
     blocks[0] = .{ .text = .{ .text = owned } };
     return blocks;
+}
+
+fn formatCommandTranscript(allocator: std.mem.Allocator, command: []const u8, output: []const u8) ![]u8 {
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(allocator);
+    try result.appendSlice(allocator, "$ ");
+    try result.appendSlice(allocator, command);
+    try result.appendSlice(allocator, "\n\n");
+    try result.appendSlice(allocator, if (output.len > 0) output else "(no output)");
+    return result.toOwnedSlice(allocator);
+}
+
+fn appendTail(allocator: std.mem.Allocator, base: []const u8, tail: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, tail });
+}
+
+fn emitPartialTranscriptUpdate(
+    allocator: std.mem.Allocator,
+    command: []const u8,
+    merged_output: []const u8,
+    cb: agent.protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
+) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const output = truncateHeadTail(aa, merged_output) catch aa.dupe(u8, merged_output) catch return;
+    const text = formatCommandTranscript(aa, command, output) catch return;
+    cb(.{ .content = oneText(aa, text) }, update_ctx);
+}
+
+fn mergeOutputs(allocator: std.mem.Allocator, stdout_data: []const u8, stderr_data: []const u8) ![]u8 {
+    var merged: std.ArrayListUnmanaged(u8) = .empty;
+    defer merged.deinit(allocator);
+    if (stdout_data.len > 0) try merged.appendSlice(allocator, stdout_data);
+    if (stderr_data.len > 0) {
+        if (merged.items.len > 0) try merged.appendSlice(allocator, "\n");
+        try merged.appendSlice(allocator, stderr_data);
+    }
+    return merged.toOwnedSlice(allocator);
 }
 
 fn readStderr(stderr_file: std.fs.File, alloc: std.mem.Allocator, result: *?[]u8) void {
