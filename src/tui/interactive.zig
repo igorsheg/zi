@@ -523,7 +523,7 @@ pub const Interactive = struct {
         compaction_executor: ?CompactionExecutor,
     ) !Interactive {
         _ = allocator;
-        const theme = &theme_mod.Theme.dark;
+        const theme = theme_mod.Theme.defaultForTerminal();
         const state_allocator = memory_diagnostics.tui.allocator();
 
         var self: Interactive = .{
