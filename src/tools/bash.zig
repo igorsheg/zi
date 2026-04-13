@@ -9,6 +9,8 @@ const lock_registry = @import("../agent/lock_registry.zig");
 const HEAD_LINES: usize = 50;
 const TAIL_LINES: usize = 50;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const STREAM_UPDATE_POLL_MS: u64 = 50;
+const STREAM_UPDATE_MIN_INTERVAL_MS: u64 = 100;
 
 const bash_schema =
     \\{"type":"object","properties":{"cmd":{"type":"string","description":"The shell command to execute."},"cwd":{"type":"string","description":"Working directory for the command (absolute path). Defaults to workspace root."},"timeout":{"type":"number","description":"Timeout in seconds."}},"required":["cmd"]}
@@ -303,26 +305,12 @@ const StreamingCapture = struct {
         return self.stdout_done and self.stderr_done;
     }
 
-    fn emitDirtyUpdate(
-        self: *StreamingCapture,
-        allocator: std.mem.Allocator,
-        command: []const u8,
-        cb: agent.protocol.AgentToolUpdateCallback,
-        update_ctx: ?*anyopaque,
-    ) void {
+    fn takeDirtyMergedOutput(self: *StreamingCapture, allocator: std.mem.Allocator) ?[]u8 {
         self.mutex.lock();
-        if (!self.dirty) {
-            self.mutex.unlock();
-            return;
-        }
+        defer self.mutex.unlock();
+        if (!self.dirty) return null;
         self.dirty = false;
-        const merged = mergeOutputs(allocator, self.stdout.items, self.stderr.items) catch {
-            self.mutex.unlock();
-            return;
-        };
-        self.mutex.unlock();
-        defer if (merged.len > 0) allocator.free(merged);
-        emitPartialTranscriptUpdate(allocator, command, merged, cb, update_ctx);
+        return mergeOutputs(allocator, self.stdout.items, self.stderr.items) catch null;
     }
 
     fn takeMergedOutput(self: *StreamingCapture, allocator: std.mem.Allocator) ![]u8 {
@@ -389,11 +377,30 @@ fn runStreamingCapture(
         };
     } else capture.markDone(.stderr);
 
+    var last_emit_ns: i128 = 0;
+    var last_emitted_hash: ?u64 = null;
+
     while (!capture.isComplete()) {
-        capture.emitDirtyUpdate(allocator, command, cb, update_ctx);
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        const now_ns = std.time.nanoTimestamp();
+        if (last_emit_ns == 0 or now_ns - last_emit_ns >= STREAM_UPDATE_MIN_INTERVAL_MS * std.time.ns_per_ms) {
+            if (capture.takeDirtyMergedOutput(allocator)) |merged| {
+                defer if (merged.len > 0) allocator.free(merged);
+                if (emitPartialTranscriptUpdate(allocator, command, merged, cb, update_ctx, last_emitted_hash)) |new_hash| {
+                    last_emitted_hash = new_hash;
+                    last_emit_ns = now_ns;
+                }
+            }
+        }
+        std.Thread.sleep(STREAM_UPDATE_POLL_MS * std.time.ns_per_ms);
     }
-    capture.emitDirtyUpdate(allocator, command, cb, update_ctx);
+
+    if (capture.takeDirtyMergedOutput(allocator)) |merged| {
+        defer if (merged.len > 0) allocator.free(merged);
+        if (emitPartialTranscriptUpdate(allocator, command, merged, cb, update_ctx, last_emitted_hash)) |new_hash| {
+            last_emitted_hash = new_hash;
+            last_emit_ns = std.time.nanoTimestamp();
+        }
+    }
 
     if (stdout_thread) |t| t.join();
     if (stderr_thread) |t| t.join();
@@ -548,14 +555,20 @@ fn emitPartialTranscriptUpdate(
     merged_output: []const u8,
     cb: agent.protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
-) void {
+    previous_hash: ?u64,
+) ?u64 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const output = truncateHeadTail(aa, merged_output) catch aa.dupe(u8, merged_output) catch return;
-    const text = formatCommandTranscript(aa, command, output) catch return;
+    const output = truncateHeadTail(aa, merged_output) catch aa.dupe(u8, merged_output) catch return null;
+    const text = formatCommandTranscript(aa, command, output) catch return null;
+    const hash = std.hash.Wyhash.hash(0, text);
+    if (previous_hash) |prev| {
+        if (prev == hash) return null;
+    }
     cb(.{ .content = oneText(aa, text) }, update_ctx);
+    return hash;
 }
 
 fn mergeOutputs(allocator: std.mem.Allocator, stdout_data: []const u8, stderr_data: []const u8) ![]u8 {
