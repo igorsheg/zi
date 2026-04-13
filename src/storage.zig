@@ -183,6 +183,13 @@ pub fn getMemoryDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override:
     return std.fs.path.join(allocator, &.{ diagnostics_dir, "memory" });
 }
 
+/// Get the logs diagnostics directory: <agent_dir>/diagnostics/logs
+pub fn getLogDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
+    const diagnostics_dir = try getDiagnosticsDir(allocator, agent_dir_override);
+    defer allocator.free(diagnostics_dir);
+    return std.fs.path.join(allocator, &.{ diagnostics_dir, "logs" });
+}
+
 /// Get the session directory for a specific cwd: <agent_dir>/sessions/<encoded-cwd>
 pub fn getSessionDirForCwd(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) ![]const u8 {
     const sessions_dir = try getSessionsDir(allocator, agent_dir_override);
@@ -288,4 +295,11 @@ test "getMemoryDiagnosticsDir nests under agent diagnostics" {
     const dir = try getMemoryDiagnosticsDir(allocator, "/tmp/zi-agent");
     defer allocator.free(dir);
     try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/memory", dir);
+}
+
+test "getLogDiagnosticsDir nests under agent diagnostics" {
+    const allocator = std.testing.allocator;
+    const dir = try getLogDiagnosticsDir(allocator, "/tmp/zi-agent");
+    defer allocator.free(dir);
+    try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/logs", dir);
 }

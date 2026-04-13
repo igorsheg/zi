@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const logging = @import("../logging.zig");
 const auth = @import("../auth/root.zig");
 const settings_mod = @import("../settings/root.zig");
 const agent = @import("../agent/root.zig");
@@ -13,6 +14,8 @@ const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 
 pub fn run(allocator: std.mem.Allocator, options: args.RunOptions) !void {
+    logging.setThreadLabel(.batch);
+
     const is_continue = options.continue_path != null;
     const prompt = if (is_continue) null else (options.prompt_text orelse {
         try stderr.writeAll("error: no prompt provided\n");

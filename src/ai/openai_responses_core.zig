@@ -211,8 +211,6 @@ pub fn streamCore(
     };
     defer allocator.free(body_copy);
 
-    writeProviderPayloadLog(allocator, core.provider_label, uri_str, extra_headers_buf[0..n_extra], payload_buf.items);
-
     req.sendBodyComplete(body_copy) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to send body: {s}", .{@errorName(err)});
         return;
@@ -334,75 +332,6 @@ fn assistantHasToolCalls(msg: protocol.AssistantMessage) bool {
         if (block == .tool_call) return true;
     }
     return false;
-}
-
-fn openPayloadLogFile() ?std.fs.File {
-    const enabled = std.posix.getenv("ZI_PROVIDER_PAYLOAD_LOG") orelse return null;
-    if (enabled.len == 0 or std.mem.eql(u8, enabled, "0") or std.mem.eql(u8, enabled, "false")) return null;
-    std.fs.cwd().makePath(".pi") catch return null;
-    return std.fs.cwd().createFile(".pi/provider-payload-zi.log", .{
-        .read = false,
-        .truncate = false,
-    }) catch return null;
-}
-
-fn writeProviderPayloadLog(
-    allocator: std.mem.Allocator,
-    provider_label: []const u8,
-    uri_str: []const u8,
-    headers: []const std.http.Header,
-    payload_json: []const u8,
-) void {
-    const file = openPayloadLogFile() orelse return;
-    defer file.close();
-
-    var out: std.io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .indent_2 } };
-
-    jw.beginObject() catch return;
-    jw.objectField("timestamp") catch return;
-    jw.write(std.time.milliTimestamp()) catch return;
-    jw.objectField("provider") catch return;
-    jw.write(provider_label) catch return;
-    jw.objectField("url") catch return;
-    jw.write(uri_str) catch return;
-    jw.objectField("headers") catch return;
-    jw.beginArray() catch return;
-    for (headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "authorization")) continue;
-        jw.beginObject() catch return;
-        jw.objectField("name") catch return;
-        jw.write(h.name) catch return;
-        jw.objectField("value") catch return;
-        jw.write(h.value) catch return;
-        jw.endObject() catch return;
-    }
-    jw.beginObject() catch return;
-    jw.objectField("name") catch return;
-    jw.write("content-type") catch return;
-    jw.objectField("value") catch return;
-    jw.write("application/json") catch return;
-    jw.endObject() catch return;
-    jw.beginObject() catch return;
-    jw.objectField("name") catch return;
-    jw.write("accept-encoding") catch return;
-    jw.objectField("value") catch return;
-    jw.write("identity") catch return;
-    jw.endObject() catch return;
-    jw.endArray() catch return;
-    jw.objectField("payload") catch return;
-    if (std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{})) |parsed| {
-        defer parsed.deinit();
-        jw.write(parsed.value) catch return;
-    } else |_| {
-        jw.write(payload_json) catch return;
-    }
-    jw.endObject() catch return;
-    out.writer.writeAll("\n\n") catch return;
-
-    file.seekFromEnd(0) catch return;
-    file.writeAll(out.written()) catch return;
 }
 
 /// Drain a Reader of openai-responses SSE bytes, emit

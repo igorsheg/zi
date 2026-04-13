@@ -1,14 +1,20 @@
 const std = @import("std");
 const terminal_mod = @import("tui/terminal.zig");
 const memory_debug = @import("debug/tracked_allocator.zig");
+const logging = @import("logging.zig");
 const cli = @import("cli/root.zig");
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
 pub const panic = terminal_mod.panic;
+pub const std_options: std.Options = .{
+    .logFn = logging.logFn,
+};
 
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 
 pub fn main() !void {
+    logging.setThreadLabel(.main);
+
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
 
@@ -59,6 +65,11 @@ pub fn main() !void {
         },
     };
 
+    var log_session = try logging.init(allocator, .{
+        .sink_mode = sinkModeForCommand(command),
+    });
+    defer log_session.deinit();
+
     try cli.dispatch.run(.{
         .allocator = allocator,
         .msg_allocator = msg_allocator,
@@ -74,4 +85,15 @@ fn writeParseDiagnostic(diag: cli.args.Diagnostic) !void {
     var err_writer = stderr.writer(&err_buf);
     try cli.help.writeDiagnostic(&err_writer.interface, diag);
     try err_writer.end();
+}
+
+fn sinkModeForCommand(command: cli.args.Command) logging.SinkMode {
+    return switch (command) {
+        .help, .version, .list_models => .stderr_only,
+        .run => |options| blk: {
+            const has_prompt = options.print_mode or options.mode == .json or options.prompt_text != null;
+            const is_continue = options.continue_path != null;
+            break :blk if (has_prompt or is_continue) .stderr_and_file else .file_only;
+        },
+    };
 }

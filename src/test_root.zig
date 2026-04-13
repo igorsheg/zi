@@ -1,7 +1,16 @@
+const std = @import("std");
+const logging = @import("logging.zig");
+
+pub const std_options: std.Options = .{
+    .logFn = logging.logFn,
+};
+
 test {
+    logging.setThreadLabel(.@"test");
     _ = @import("abort_signal.zig");
     _ = @import("storage.zig");
     _ = @import("debug/tracked_allocator.zig");
+    _ = @import("logging.zig");
     _ = @import("ai/root.zig");
     _ = @import("json/root.zig");
     _ = @import("auth/root.zig");

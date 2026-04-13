@@ -36,6 +36,7 @@ const SelectItem = select_list_mod.SelectItem;
 const session_store_mod = @import("../session/store.zig");
 const SessionStore = session_store_mod.SessionStore;
 const storage = @import("../storage.zig");
+const logging = @import("../logging.zig");
 
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
@@ -2023,6 +2024,8 @@ pub const Interactive = struct {
     };
 
     fn loginThreadFn(ctx: *LoginContext) void {
+        logging.setThreadLabel(.login);
+
         const self = ctx.interactive;
         const provider = ctx.provider;
         self.msg_allocator.destroy(ctx);
@@ -2117,6 +2120,8 @@ pub const Interactive = struct {
     ///                  own success/failure events, so the TUI
     ///                  state unwinds without wiping a good status)
     fn agentThreadFn(self: *Interactive, work: AgentWork) void {
+        logging.setThreadLabel(.agent);
+
         defer switch (work) {
             .prompt => |p| self.msg_allocator.free(p),
             .drain_only => {},

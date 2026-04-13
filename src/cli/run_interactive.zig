@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const logging = @import("../logging.zig");
 const auth = @import("../auth/root.zig");
 const settings_mod = @import("../settings/root.zig");
 const sdk = @import("../sdk.zig");
@@ -13,6 +14,8 @@ const context_mod = @import("context.zig");
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 
 pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
+    logging.setThreadLabel(.tui);
+
     var auth_storage = auth.storage.AuthStorage.create(ctx.allocator, null) catch {
         try stderr.writeAll("warning: could not load auth storage\n");
         unreachable;
