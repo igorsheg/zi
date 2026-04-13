@@ -8,14 +8,19 @@ pub const RequestSnapshot = struct {
     cursor_byte: u32,
 };
 
+pub const ReplaceRange = struct {
+    start_byte: u32,
+    end_byte: u32,
+};
+
 pub const ApplyResult = struct {
-    new_text: []const u8,
-    new_cursor: u32,
+    replacement_text: []const u8,
+    cursor_in_replacement: u32,
 };
 
 pub const Suggestions = struct {
     items: []const SelectItem,
-    prefix: []const u8,
+    replace_range: ReplaceRange,
 };
 
 /// Callback sink for delivering suggestions from provider to editor.
@@ -38,7 +43,7 @@ pub const AutocompleteProvider = struct {
     pub const VTable = struct {
         request: *const fn (ptr: *anyopaque, snapshot: RequestSnapshot, sink: SuggestionSink) void,
         cancel: ?*const fn (ptr: *anyopaque) void,
-        apply: *const fn (ptr: *anyopaque, text: []const u8, cursor: u32, item: *const SelectItem, prefix: []const u8) ?ApplyResult,
+        apply: *const fn (ptr: *anyopaque, text: []const u8, cursor: u32, item: *const SelectItem, replace_range: ReplaceRange) ?ApplyResult,
     };
 
     pub fn request(self: AutocompleteProvider, snapshot: RequestSnapshot, sink: SuggestionSink) void {
@@ -49,8 +54,8 @@ pub const AutocompleteProvider = struct {
         if (self.vtable.cancel) |c| c(self.ptr);
     }
 
-    pub fn apply(self: AutocompleteProvider, text: []const u8, cursor: u32, item: *const SelectItem, prefix: []const u8) ?ApplyResult {
-        return self.vtable.apply(self.ptr, text, cursor, item, prefix);
+    pub fn apply(self: AutocompleteProvider, text: []const u8, cursor: u32, item: *const SelectItem, replace_range: ReplaceRange) ?ApplyResult {
+        return self.vtable.apply(self.ptr, text, cursor, item, replace_range);
     }
 };
 
@@ -141,12 +146,10 @@ pub const SlashCommandProvider = struct {
             };
         }
 
-        const prefix = text[0..cursor];
-
         if (matched > 0) {
             sink.publish(.{
                 .items = self.item_buf[0..matched],
-                .prefix = prefix,
+                .replace_range = .{ .start_byte = 0, .end_byte = cursor },
             });
         } else {
             sink.publish(null);
@@ -160,9 +163,7 @@ pub const SlashCommandProvider = struct {
         return &self.registry.dynamic.items[idx - self.registry.builtins.len];
     }
 
-    fn applyImpl(self: *SlashCommandProvider, text: []const u8, _: u32, item: *const SelectItem, prefix: []const u8) ?ApplyResult {
-        const suffix = if (prefix.len <= text.len) text[prefix.len..] else "";
-
+    fn applyImpl(self: *SlashCommandProvider, _: []const u8, _: u32, item: *const SelectItem, _: ReplaceRange) ?ApplyResult {
         var pos: usize = 0;
 
         self.apply_buf[pos] = '/';
@@ -175,15 +176,9 @@ pub const SlashCommandProvider = struct {
         self.apply_buf[pos] = ' ';
         pos += 1;
 
-        const new_cursor: u32 = @intCast(pos);
-
-        if (pos + suffix.len > self.apply_buf.len) return null;
-        @memcpy(self.apply_buf[pos..][0..suffix.len], suffix);
-        pos += suffix.len;
-
         return .{
-            .new_text = self.apply_buf[0..pos],
-            .new_cursor = new_cursor,
+            .replacement_text = self.apply_buf[0..pos],
+            .cursor_in_replacement = @intCast(pos),
         };
     }
 };
@@ -220,6 +215,7 @@ test "SlashCommandProvider suggests commands on slash prefix" {
 
     try std.testing.expect(ts.result != null);
     try std.testing.expect(hasItem(ts.result.?.items, "model"));
+    try std.testing.expectEqual(ReplaceRange{ .start_byte = 0, .end_byte = 3 }, ts.result.?.replace_range);
 }
 
 test "SlashCommandProvider empty prefix returns all commands" {
@@ -251,11 +247,11 @@ test "SlashCommandProvider apply inserts command" {
     var p = SlashCommandProvider.init(&reg);
 
     const item = SelectItem{ .value = "model", .label = "model" };
-    const result = p.applyImpl("/mo", 3, &item, "/mo");
+    const result = p.applyImpl("/mo", 3, &item, .{ .start_byte = 0, .end_byte = 3 });
 
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("/model ", result.?.new_text);
-    try std.testing.expectEqual(@as(u32, 7), result.?.new_cursor);
+    try std.testing.expectEqualStrings("/model ", result.?.replacement_text);
+    try std.testing.expectEqual(@as(u32, 7), result.?.cursor_in_replacement);
 }
 
 test "SlashCommandProvider no suggestions on second line" {

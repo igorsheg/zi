@@ -2,7 +2,7 @@ const std = @import("std");
 const cell_mod = @import("../cell.zig");
 const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
-const word_wrap_mod = @import("../word_wrap.zig");
+const display_wrap_mod = @import("../display_wrap.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -10,7 +10,7 @@ const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const grapheme = @import("../grapheme.zig");
-const Line = word_wrap_mod.Line;
+const Line = display_wrap_mod.Line;
 
 /// Styled text with word wrapping, padding, and scroll support.
 ///
@@ -153,7 +153,7 @@ pub const Text = struct {
             self.cached_lines = null;
         }
 
-        const lines = word_wrap_mod.wordWrap(self.content, content_width, self.allocator) catch return null;
+        const lines = display_wrap_mod.wordWrap(self.content, content_width, self.allocator) catch return null;
         self.cached_lines = lines;
         self.cached_width = content_width;
         self.cached_content_ptr = self.content.ptr;

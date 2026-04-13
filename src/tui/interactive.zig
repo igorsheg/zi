@@ -410,6 +410,7 @@ pub const Interactive = struct {
     msg_allocator: std.mem.Allocator,
     tui: TUI,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    cwd: []const u8 = "",
 
     // ── Owned components ──────────────────────────────────────────
     editor: editor_mod.Editor,
@@ -522,6 +523,7 @@ pub const Interactive = struct {
             .msg_allocator = msg_allocator,
             .tui = try TUI.init(state_allocator),
             .theme = theme,
+            .cwd = cwd,
             .editor = editor_mod.Editor.init(state_allocator),
             .status_text = text_mod.Text.init(state_allocator),
             .greeter = .{ .theme = theme, .version = "0.1.0" },
@@ -556,16 +558,15 @@ pub const Interactive = struct {
         // extensionless modes; the transcript no-ops gracefully.
         self.transcript.lua_runner = ca.extensionRunner();
 
-        self.editor.prompt_fg = theme.fg(.muted);
-        self.editor.border_color = theme.fg(.border_muted);
+        self.editor.setTheme(theme);
         self.loader.spinner_fg = theme.fg(.accent);
         self.loader.message_fg = theme.fg(.muted);
-        self.editor.cwd = cwd;
+        self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
         self.transcript.setHideThinkingBlock(self.hide_thinking_block);
-        // NOTE: status_data pointer and active_editor are bound in run() where
-        // self is at its final address. Binding here would capture a pointer to
-        // the local `self` that becomes dangling after the by-value return.
+        // NOTE: active_editor is bound in run() where self is at its final
+        // address. Binding it here would capture a pointer to the local `self`
+        // that becomes dangling after the by-value return.
         self.transcript.theme = theme;
         return self;
     }
@@ -656,21 +657,19 @@ pub const Interactive = struct {
         self.tui.terminal.enableMouseTracking();
         self.kitty_deadline_ns = std.time.nanoTimestamp() + 150_000_000; // 150ms
 
-        self.detectGitBranch();
-
         self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
         self.active_editor.setOnSubmit(&onEditorSubmit, @ptrCast(self));
         self.active_editor.setOnChange(&onEditorChange, @ptrCast(self));
-        self.active_editor.setBorderColor(self.theme.fg(.border_muted));
+        self.active_editor.setTheme(self.theme);
+        self.active_editor.setCwd(self.cwd);
         self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
+        self.active_editor.setStatusData(&self.status_data);
         self.seedEditorHistoryFromCurrentSession();
         self.session_controller.wire();
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
-        // Bind pointers now that self is at its stable address (not a stack copy).
-        self.editor.status_data = &self.status_data;
-        self.editor.theme = self.theme;
+        self.detectGitBranch();
 
         // Prime the status chips via the agent-owned snapshot path before the
         // first frame. This keeps model/thinking/context reads off the TUI
@@ -1210,7 +1209,7 @@ pub const Interactive = struct {
         const h = self.tui.height();
         const w = self.tui.width();
         const max_h = @max(3, h * 30 / 100);
-        self.editor.max_visible_lines = max_h;
+        self.active_editor.setMaxVisibleLines(max_h);
 
         // Sum all non-flex children's measured heights
         var fixed_total: u32 = 0;
@@ -1284,7 +1283,7 @@ pub const Interactive = struct {
         if (result.term.Exited == 0) {
             const branch = std.mem.trimRight(u8, result.stdout, " \t\n\r");
             if (branch.len > 0) {
-                self.editor.setGitBranch(branch);
+                self.active_editor.setGitBranch(branch);
             }
         }
     }
@@ -1347,7 +1346,7 @@ pub const Interactive = struct {
 
         // Update editor max height before layout measures it
         const max_h = @max(3, h * 30 / 100);
-        self.editor.max_visible_lines = max_h;
+        self.active_editor.setMaxVisibleLines(max_h);
 
         // Render via TUI (root tree + overlays) and get cursor state
         if (self.tui.render()) |cs| {
@@ -1498,7 +1497,7 @@ pub const Interactive = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
 
-        const path = self.memory_diagnostics.writeSnapshotFile(scratch, self.editor.cwd, null) catch {
+        const path = self.memory_diagnostics.writeSnapshotFile(scratch, self.cwd, null) catch {
             self.status_text.setContent("failed to write memory diagnostics");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
@@ -1595,7 +1594,7 @@ pub const Interactive = struct {
         // (we don't support per-session cwd switching), so this is
         // strictly equivalent.
         self.closeResumePickerFlow();
-        var flow = ResumePickerFlow.init(self.allocator, self.theme, self.editor.cwd) catch {
+        var flow = ResumePickerFlow.init(self.allocator, self.theme, self.cwd) catch {
             self.status_text.setContent("failed to list sessions");
             self.status_text.fg = self.theme.fg(.@"error");
             return;

@@ -2,10 +2,14 @@ const std = @import("std");
 const component_mod = @import("component.zig");
 const cell_mod = @import("cell.zig");
 const autocomplete_mod = @import("autocomplete.zig");
+const status_data_mod = @import("status_data.zig");
+const theme_mod = @import("theme.zig");
 
 const Component = component_mod.Component;
 const Color = cell_mod.Color;
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
+const StatusData = status_data_mod.StatusData;
+const Theme = theme_mod.Theme;
 
 /// Type-erased editor interface for runtime editor swapping.
 ///
@@ -32,9 +36,14 @@ pub const EditorInterface = struct {
         set_on_submit: *const fn (ptr: *anyopaque, cb: ?SubmitCallback, ctx: ?*anyopaque) void,
         set_on_change: *const fn (ptr: *anyopaque, cb: ?ChangeCallback, ctx: ?*anyopaque) void,
         set_autocomplete_provider: *const fn (ptr: *anyopaque, provider: AutocompleteProvider) void,
+        set_theme: *const fn (ptr: *anyopaque, theme: *const Theme) void,
+        set_status_data: *const fn (ptr: *anyopaque, status_data: *const StatusData) void,
+        set_cwd: *const fn (ptr: *anyopaque, cwd: []const u8) void,
+        set_git_branch: *const fn (ptr: *anyopaque, branch: ?[]const u8) void,
         set_border_color: *const fn (ptr: *anyopaque, color: Color) void,
         set_padding_x: *const fn (ptr: *anyopaque, padding: u32) void,
         set_autocomplete_max_visible: *const fn (ptr: *anyopaque, max_visible: u32) void,
+        set_max_visible_lines: *const fn (ptr: *anyopaque, max_visible: u32) void,
         set_submit_disabled: *const fn (ptr: *anyopaque, disabled: bool) void,
         component: *const fn (ptr: *anyopaque) Component,
     };
@@ -81,6 +90,22 @@ pub const EditorInterface = struct {
                 const self: *T = @ptrCast(@alignCast(erased));
                 self.setAutocompleteProvider(provider);
             }
+            fn setTheme(erased: *anyopaque, theme: *const Theme) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.setTheme(theme);
+            }
+            fn setStatusData(erased: *anyopaque, status_data: *const StatusData) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.setStatusData(status_data);
+            }
+            fn setCwd(erased: *anyopaque, cwd: []const u8) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.setCwd(cwd);
+            }
+            fn setGitBranch(erased: *anyopaque, branch: ?[]const u8) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.setGitBranch(branch);
+            }
             fn setBorderColor(erased: *anyopaque, color: Color) void {
                 const self: *T = @ptrCast(@alignCast(erased));
                 self.setBorderColor(color);
@@ -92,6 +117,10 @@ pub const EditorInterface = struct {
             fn setAutocompleteMaxVisible(erased: *anyopaque, max_visible: u32) void {
                 const self: *T = @ptrCast(@alignCast(erased));
                 self.setAutocompleteMaxVisible(max_visible);
+            }
+            fn setMaxVisibleLines(erased: *anyopaque, max_visible: u32) void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.setMaxVisibleLines(max_visible);
             }
             fn setSubmitDisabled(erased: *anyopaque, disabled: bool) void {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -115,9 +144,14 @@ pub const EditorInterface = struct {
                 .set_on_submit = gen.setOnSubmit,
                 .set_on_change = gen.setOnChange,
                 .set_autocomplete_provider = gen.setAutocompleteProvider,
+                .set_theme = gen.setTheme,
+                .set_status_data = gen.setStatusData,
+                .set_cwd = gen.setCwd,
+                .set_git_branch = gen.setGitBranch,
                 .set_border_color = gen.setBorderColor,
                 .set_padding_x = gen.setPaddingX,
                 .set_autocomplete_max_visible = gen.setAutocompleteMaxVisible,
+                .set_max_visible_lines = gen.setMaxVisibleLines,
                 .set_submit_disabled = gen.setSubmitDisabled,
                 .component = gen.component,
             },
@@ -168,6 +202,22 @@ pub const EditorInterface = struct {
         self.vtable.set_autocomplete_provider(self.ptr, provider);
     }
 
+    pub fn setTheme(self: EditorInterface, theme: *const Theme) void {
+        self.vtable.set_theme(self.ptr, theme);
+    }
+
+    pub fn setStatusData(self: EditorInterface, status_data: *const StatusData) void {
+        self.vtable.set_status_data(self.ptr, status_data);
+    }
+
+    pub fn setCwd(self: EditorInterface, cwd: []const u8) void {
+        self.vtable.set_cwd(self.ptr, cwd);
+    }
+
+    pub fn setGitBranch(self: EditorInterface, branch: ?[]const u8) void {
+        self.vtable.set_git_branch(self.ptr, branch);
+    }
+
     pub fn setBorderColor(self: EditorInterface, color: Color) void {
         self.vtable.set_border_color(self.ptr, color);
     }
@@ -178,6 +228,10 @@ pub const EditorInterface = struct {
 
     pub fn setAutocompleteMaxVisible(self: EditorInterface, max_visible: u32) void {
         self.vtable.set_autocomplete_max_visible(self.ptr, max_visible);
+    }
+
+    pub fn setMaxVisibleLines(self: EditorInterface, max_visible: u32) void {
+        self.vtable.set_max_visible_lines(self.ptr, max_visible);
     }
 
     pub fn setSubmitDisabled(self: EditorInterface, disabled: bool) void {
@@ -202,9 +256,14 @@ const MockEditor = struct {
     clear_count: u32 = 0,
     clear_history_count: u32 = 0,
     history_count: u32 = 0,
+    theme: *const Theme = &Theme.dark,
+    status_data: ?*const StatusData = null,
+    cwd: []const u8 = "",
+    git_branch: ?[]const u8 = null,
     border_color: Color = Color.default,
     padding_x: u32 = 0,
     autocomplete_max_visible: u32 = 0,
+    max_visible_lines: u32 = 0,
     submit_disabled: bool = false,
     submit_cb: ?EditorInterface.SubmitCallback = null,
     submit_ctx: ?*anyopaque = null,
@@ -252,6 +311,22 @@ const MockEditor = struct {
 
     pub fn setAutocompleteProvider(_: *MockEditor, _: AutocompleteProvider) void {}
 
+    pub fn setTheme(self: *MockEditor, theme: *const Theme) void {
+        self.theme = theme;
+    }
+
+    pub fn setStatusData(self: *MockEditor, status_data: *const StatusData) void {
+        self.status_data = status_data;
+    }
+
+    pub fn setCwd(self: *MockEditor, cwd: []const u8) void {
+        self.cwd = cwd;
+    }
+
+    pub fn setGitBranch(self: *MockEditor, branch: ?[]const u8) void {
+        self.git_branch = branch;
+    }
+
     pub fn setBorderColor(self: *MockEditor, color: Color) void {
         self.border_color = color;
     }
@@ -262,6 +337,10 @@ const MockEditor = struct {
 
     pub fn setAutocompleteMaxVisible(self: *MockEditor, max_visible: u32) void {
         self.autocomplete_max_visible = max_visible;
+    }
+
+    pub fn setMaxVisibleLines(self: *MockEditor, max_visible: u32) void {
+        self.max_visible_lines = max_visible;
     }
 
     pub fn setSubmitDisabled(self: *MockEditor, disabled: bool) void {
@@ -301,6 +380,20 @@ test "EditorInterface routes parity surface through vtable" {
     iface.addToHistory("prompt");
     try testing.expectEqual(@as(u32, 1), mock.history_count);
 
+    iface.setTheme(&Theme.dark);
+    try testing.expectEqual(&Theme.dark, mock.theme);
+
+    var status_data = StatusData.init(testing.allocator);
+    defer status_data.deinit();
+    iface.setStatusData(&status_data);
+    try testing.expectEqual(&status_data, mock.status_data.?);
+
+    iface.setCwd("/tmp/project");
+    try testing.expectEqualStrings("/tmp/project", mock.cwd);
+
+    iface.setGitBranch("main");
+    try testing.expectEqualStrings("main", mock.git_branch.?);
+
     iface.setBorderColor(Color.rgb(1, 2, 3));
     try testing.expectEqual(Color.rgb(1, 2, 3), mock.border_color);
 
@@ -309,6 +402,9 @@ test "EditorInterface routes parity surface through vtable" {
 
     iface.setAutocompleteMaxVisible(9);
     try testing.expectEqual(@as(u32, 9), mock.autocomplete_max_visible);
+
+    iface.setMaxVisibleLines(12);
+    try testing.expectEqual(@as(u32, 12), mock.max_visible_lines);
 
     iface.setSubmitDisabled(true);
     try testing.expect(mock.submit_disabled);

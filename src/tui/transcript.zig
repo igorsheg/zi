@@ -10,7 +10,7 @@ const agent_protocol = @import("../agent/root.zig").protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
-const word_wrap_mod = @import("word_wrap.zig");
+const display_wrap_mod = @import("display_wrap.zig");
 const lua_renderer_mod = @import("../extensions/lua_renderer.zig");
 const runner_mod = @import("../extensions/runner.zig");
 
@@ -440,8 +440,8 @@ pub const ToolExecution = struct {
 
     /// Optional pre-computed span tree from a Lua render_result hook.
     /// When present, `renderResult` paints from these spans instead
-    /// of the zig-native vtable or the text fallback. Computed by
-    /// `Transcript.lua_renderer_ctx` dispatch at
+    /// of the zig-native vtable or the built-in plain-text renderer.
+    /// Computed by `Transcript.lua_renderer_ctx` dispatch at
     /// `setFinalResult`/`setPartialResult`/`setArgs` time.
     lua_render_state: ?*lua_renderer_mod.LuaRenderState = null,
     /// Lua render states are produced on the agent thread using the
@@ -632,8 +632,8 @@ pub const ToolExecution = struct {
     fn renderCall(self: *ToolExecution, region: Region) void {
         // When a Lua render hook owns this tool, `lines[0]` of the
         // precomputed spans is the title line (e.g. "Task <desc>").
-        // Paint it here instead of the default bold-toolname
-        // fallback so we don't double up.
+        // Paint it here instead of the built-in bold tool-title
+        // renderer so we don't double up.
         if (self.lua_render_state) |s| {
             const lines = if (self.expanded) s.expanded else s.collapsed;
             if (lines.len > 0) {
@@ -645,11 +645,11 @@ pub const ToolExecution = struct {
             var ctx = self.makeRenderContext(region);
             render_fn(&ctx);
         } else {
-            self.renderCallFallback(region);
+            self.renderCallDefault(region);
         }
     }
 
-    fn renderCallFallback(self: *ToolExecution, region: Region) void {
+    fn renderCallDefault(self: *ToolExecution, region: Region) void {
         _ = region.writeStr(0, 0, self.tool_name, self.theme.fg(.tool_title), Color.default, .{ .bold = true });
     }
 
@@ -678,7 +678,7 @@ pub const ToolExecution = struct {
             return;
         }
 
-        self.renderResultFallbackFromOffset(region, skip_rows);
+        self.renderResultPlainTextFromOffset(region, skip_rows);
     }
 
     /// Paint a single span-line at `row` inside `region`. Used for
@@ -716,13 +716,13 @@ pub const ToolExecution = struct {
         }
     }
 
-    fn renderResultFallbackFromOffset(self: *ToolExecution, region: Region, skip_rows: u32) void {
+    fn renderResultPlainTextFromOffset(self: *ToolExecution, region: Region, skip_rows: u32) void {
         const result_text = self.getResultText() orelse return;
         defer self.allocator.free(result_text);
 
         const fg = if (self.is_error) self.theme.fg(.@"error") else self.theme.fg(.tool_output);
         const w: usize = @intCast(region.width);
-        const lines = word_wrap_mod.wordWrap(result_text, w, self.allocator) catch return;
+        const lines = display_wrap_mod.wordWrap(result_text, w, self.allocator) catch return;
         defer self.allocator.free(lines);
 
         const max_preview: u32 = if (self.expanded) @intCast(lines.len) else 5;
@@ -756,15 +756,15 @@ pub const ToolExecution = struct {
             var ctx = self.makeMeasureContext(width);
             return measure_fn(&ctx);
         }
-        return self.measureResultFallback(width);
+        return self.measureResultPlainText(width);
     }
 
-    fn measureResultFallback(self: *ToolExecution, width: u32) u32 {
+    fn measureResultPlainText(self: *ToolExecution, width: u32) u32 {
         const result_text = self.getResultText() orelse return 0;
         defer self.allocator.free(result_text);
 
         const w: usize = @intCast(width);
-        const lines = word_wrap_mod.wordWrap(result_text, w, self.allocator) catch return 1;
+        const lines = display_wrap_mod.wordWrap(result_text, w, self.allocator) catch return 1;
         defer self.allocator.free(lines);
 
         if (self.expanded) return @intCast(lines.len);
@@ -1842,7 +1842,7 @@ test "Transcript preserves visible anchor when earlier items grow" {
     try testing.expectEqual(@as(u21, 'B'), after.get(0, 0).grapheme.codepoint);
 }
 
-test "ToolExecution collapsed fallback renders the overflow hint row" {
+test "ToolExecution collapsed plain text renderer shows overflow hint row" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 

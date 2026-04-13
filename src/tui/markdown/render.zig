@@ -1,7 +1,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const theme_mod = @import("../theme.zig");
-const word_wrap_mod = @import("../word_wrap.zig");
+const display_wrap_mod = @import("../display_wrap.zig");
 const grapheme_mod = @import("../grapheme.zig");
 
 pub const Span = struct {
@@ -599,7 +599,7 @@ fn wrapFlatText(flat: FlatText, width: u32, arena: std.mem.Allocator) ![]const R
 }
 
 fn wrapFlatTextToRendered(flat: FlatText, width: u32, arena: std.mem.Allocator) ![]const RenderedLine {
-    const wrapped = try word_wrap_mod.wordWrap(flat.text, width, arena);
+    const wrapped = try display_wrap_mod.wordWrap(flat.text, width, arena);
     var lines: std.ArrayListUnmanaged(RenderedLine) = .empty;
     errdefer lines.deinit(arena);
     for (wrapped) |line| {
@@ -609,7 +609,7 @@ fn wrapFlatTextToRendered(flat: FlatText, width: u32, arena: std.mem.Allocator) 
 }
 
 fn wrapFlatTextToSpans(flat: FlatText, width: u32, arena: std.mem.Allocator) ![]const []const Span {
-    const wrapped = try word_wrap_mod.wordWrap(flat.text, width, arena);
+    const wrapped = try display_wrap_mod.wordWrap(flat.text, width, arena);
     var lines: std.ArrayListUnmanaged([]const Span) = .empty;
     errdefer lines.deinit(arena);
     for (wrapped) |line| {

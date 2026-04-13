@@ -4,16 +4,14 @@ const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
 const keys_mod = @import("../keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
-const word_wrap_mod = @import("../word_wrap.zig");
 const box_chrome = @import("../box_chrome.zig");
 const status_data_mod = @import("../status_data.zig");
 const autocomplete_mod = @import("../autocomplete.zig");
 const editor_iface_mod = @import("../editor_iface.zig");
-const select_list_mod = @import("select_list.zig");
 const theme_mod = @import("../theme.zig");
+const editor_core = @import("../editor/root.zig");
 
 const Color = cell_mod.Color;
-const Attributes = cell_mod.Attributes;
 const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -21,27 +19,26 @@ const CursorState = component_mod.CursorState;
 const Key = keys_mod.Key;
 const StatusData = status_data_mod.StatusData;
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
-const Suggestions = autocomplete_mod.Suggestions;
-const SuggestionSink = autocomplete_mod.SuggestionSink;
-const RequestSnapshot = autocomplete_mod.RequestSnapshot;
 const EditorInterface = editor_iface_mod.EditorInterface;
-const SelectItem = select_list_mod.SelectItem;
-const SelectList = select_list_mod.SelectList;
-const InputResult = select_list_mod.InputResult;
 const Theme = theme_mod.Theme;
+const PromptBuffer = editor_core.PromptBuffer;
+const PromptView = editor_core.PromptView;
+const AutocompleteSession = editor_core.AutocompleteSession;
+const RenderConfig = editor_core.RenderConfig;
 
 pub const Editor = struct {
-    buf: std.ArrayList(u8),
-    history: std.ArrayList([]u8),
+    allocator: std.mem.Allocator,
+    buffer: *PromptBuffer,
+    view: PromptView,
+    autocomplete: AutocompleteSession,
+    history: std.ArrayList([]u8) = .empty,
     history_index: i32 = -1,
-    cursor_byte: u32 = 0,
-    cursor_col: u32 = 0,
-    scroll_x: u32 = 0,
-    scroll_y: u32 = 0,
     max_visible_lines: u32 = 10,
-    last_content_width: u32 = 80,
+    last_total_width: u32 = 80,
     last_applied_padding_x: u32 = 0,
-    prompt: []const u8 = "",
+    last_content_width: u32 = 80,
+    last_viewport_rows: u32 = 10,
+    prompt: []const u8 = "> ",
     on_submit: ?EditorInterface.SubmitCallback = null,
     on_submit_ctx: ?*anyopaque = null,
     on_change: ?EditorInterface.ChangeCallback = null,
@@ -57,39 +54,32 @@ pub const Editor = struct {
     /// Git branch displayed in top border (fixed buffer, set by Interactive).
     git_branch_buf: [128]u8 = undefined,
     git_branch_len: u8 = 0,
-    allocator: std.mem.Allocator,
-    layout_arena: std.heap.ArenaAllocator,
     focused: bool = true,
-
-    // ── Autocomplete ──────────────────────────────────────────────
-    autocomplete_provider: ?AutocompleteProvider = null,
-    autocomplete_list: SelectList = undefined,
-    autocomplete_active: bool = false,
-    autocomplete_prefix_len: u32 = 0,
-    autocomplete_max_visible: u32 = 5,
-    sink_ctx: AutocompleteSinkCtx = .{},
     theme: ?*const Theme = null,
 
     pub fn init(allocator: std.mem.Allocator) Editor {
+        const buffer = allocator.create(PromptBuffer) catch @panic("OOM");
+        buffer.* = PromptBuffer.init(allocator);
+        var view = PromptView.init(allocator, buffer);
+        view.setViewportHeight(10);
         return .{
-            .buf = .empty,
-            .history = .empty,
             .allocator = allocator,
-            .layout_arena = std.heap.ArenaAllocator.init(allocator),
+            .buffer = buffer,
+            .view = view,
+            .autocomplete = AutocompleteSession.init(&Theme.dark),
         };
     }
 
     pub fn deinit(self: *Editor) void {
-        for (self.history.items) |entry| {
-            self.allocator.free(entry);
-        }
+        for (self.history.items) |entry| self.allocator.free(entry);
         self.history.deinit(self.allocator);
-        self.buf.deinit(self.allocator);
-        self.layout_arena.deinit();
+        self.view.deinit();
+        self.buffer.deinit();
+        self.allocator.destroy(self.buffer);
     }
 
     pub fn getText(self: *const Editor) []const u8 {
-        return self.buf.items;
+        return self.buffer.text();
     }
 
     pub fn getExpandedText(self: *const Editor) []const u8 {
@@ -99,13 +89,13 @@ pub const Editor = struct {
     pub fn clear(self: *Editor) void {
         self.cancelAutocomplete();
         self.history_index = -1;
-        self.setTextInternal("");
+        self.setTextInternal("", false);
     }
 
     pub fn setText(self: *Editor, text: []const u8) void {
         self.cancelAutocomplete();
         self.history_index = -1;
-        self.setTextInternal(text);
+        self.setTextInternal(text, false);
     }
 
     pub fn insertText(self: *Editor, text: []const u8) void {
@@ -114,30 +104,12 @@ pub const Editor = struct {
 
     pub fn insertTextAtCursor(self: *Editor, text: []const u8) void {
         self.history_index = -1;
-        self.buf.insertSlice(self.allocator, self.cursor_byte, text) catch return;
-        var i: usize = 0;
-        while (i < text.len) {
-            if (text[i] == '\n') {
-                self.cursor_col = 0;
-                i += 1;
-            } else {
-                const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-                const end = @min(i + cp_len, text.len);
-                const cp = std.unicode.utf8Decode(text[i..end]) catch '_';
-                self.cursor_col += @as(u32, grapheme_mod.charWidth(cp));
-                i = end;
-            }
-        }
-        self.cursor_byte += @intCast(text.len);
-        self.ensureCursorVisible();
-        self.tryAutocomplete();
-        self.notifyChange();
+        self.buffer.insertAtCursor(text);
+        self.afterTextMutation();
     }
 
     pub fn clearHistory(self: *Editor) void {
-        for (self.history.items) |entry| {
-            self.allocator.free(entry);
-        }
+        for (self.history.items) |entry| self.allocator.free(entry);
         self.history.items.len = 0;
         self.history_index = -1;
     }
@@ -170,221 +142,90 @@ pub const Editor = struct {
         self.on_change_ctx = ctx;
     }
 
+    pub fn setTheme(self: *Editor, theme: *const Theme) void {
+        self.theme = theme;
+        self.prompt_fg = theme.fg(.muted);
+        self.border_color = theme.fg(.border_muted);
+        self.autocomplete.setTheme(theme);
+    }
+
+    pub fn setStatusData(self: *Editor, status_data: *const StatusData) void {
+        self.status_data = status_data;
+    }
+
+    pub fn setCwd(self: *Editor, cwd: []const u8) void {
+        self.cwd = cwd;
+    }
+
     pub fn setBorderColor(self: *Editor, color: Color) void {
         self.border_color = color;
     }
 
     pub fn setPaddingX(self: *Editor, padding: u32) void {
         self.padding_x = padding;
-        self.ensureCursorVisible();
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
     }
 
     pub fn setAutocompleteMaxVisible(self: *Editor, max_visible: u32) void {
-        self.autocomplete_max_visible = @max(@as(u32, 3), @min(@as(u32, 20), max_visible));
-        if (self.autocomplete_active) {
-            self.autocomplete_list.max_visible = self.autocomplete_max_visible;
-        }
+        self.autocomplete.setMaxVisible(max_visible);
+    }
+
+    pub fn setMaxVisibleLines(self: *Editor, max_visible_lines: u32) void {
+        self.max_visible_lines = @max(@as(u32, 1), max_visible_lines);
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
     }
 
     pub fn setSubmitDisabled(self: *Editor, disabled: bool) void {
         self.disable_submit = disabled;
     }
 
-    // --- Autocomplete ---
-
-    pub fn setAutocompleteProvider(self: *Editor, prov: AutocompleteProvider) void {
-        self.cancelAutocomplete();
-        self.autocomplete_provider = prov;
-    }
-
-    fn tryAutocomplete(self: *Editor) void {
-        const prov = self.autocomplete_provider orelse return;
-
-        if (self.buf.items.len > 0 and self.buf.items[0] == '/') {
-            // Sink context lives on Editor (not stack) so async providers
-            // can publish results after request() returns.
-            self.sink_ctx = .{ .editor = self };
-            prov.request(
-                .{ .text = self.buf.items, .cursor_byte = self.cursor_byte },
-                .{ .ptr = @ptrCast(&self.sink_ctx), .publish_fn = &autocompleteSinkCallback },
-            );
-        } else if (self.autocomplete_active) {
-            self.cancelAutocomplete();
-        }
-    }
-
-    const AutocompleteSinkCtx = struct {
-        editor: *Editor = undefined,
-    };
-
-    fn autocompleteSinkCallback(ptr: *anyopaque, suggestions: ?Suggestions) void {
-        const ctx: *AutocompleteSinkCtx = @ptrCast(@alignCast(ptr));
-        const self = ctx.editor;
-
-        if (suggestions) |s| {
-            if (s.items.len > 0) {
-                self.autocomplete_list = .{
-                    .theme = self.theme orelse &Theme.dark,
-                    .max_visible = self.autocomplete_max_visible,
-                };
-                self.autocomplete_list.setItems(s.items);
-                self.autocomplete_prefix_len = @intCast(s.prefix.len);
-                self.autocomplete_active = true;
-                return;
-            }
-        }
-        self.cancelAutocomplete();
-    }
-
-    fn acceptAutocomplete(self: *Editor) bool {
-        const prov = self.autocomplete_provider orelse return false;
-        const item = self.autocomplete_list.getSelectedItem() orelse return false;
-
-        const prefix_len = self.autocomplete_prefix_len;
-        const prefix = if (prefix_len <= self.buf.items.len) self.buf.items[0..prefix_len] else self.buf.items;
-        const result = prov.apply(
-            self.buf.items,
-            self.cursor_byte,
-            item,
-            prefix,
-        ) orelse return false;
-
-        self.buf.items.len = 0;
-        self.buf.appendSlice(self.allocator, result.new_text) catch return false;
-        self.cursor_byte = result.new_cursor;
-
-        const line_start = if (std.mem.lastIndexOfScalar(u8, self.buf.items[0..self.cursor_byte], '\n')) |pos| pos + 1 else 0;
-        self.cursor_col = @intCast(grapheme_mod.strWidth(self.buf.items[line_start..self.cursor_byte]));
-
-        self.cancelAutocomplete();
-        self.notifyChange();
-        return true;
+    pub fn setAutocompleteProvider(self: *Editor, provider: AutocompleteProvider) void {
+        self.autocomplete.setTheme(self.theme orelse &Theme.dark);
+        self.autocomplete.setProvider(provider);
     }
 
     pub fn cancelAutocomplete(self: *Editor) void {
-        if (self.autocomplete_active) {
-            if (self.autocomplete_provider) |prov| prov.cancel();
-        }
-        self.autocomplete_active = false;
-        self.autocomplete_prefix_len = 0;
+        self.autocomplete.cancel();
     }
-
-    fn notifyChange(self: *Editor) void {
-        if (self.on_change) |cb| {
-            cb(self.getText(), self.on_change_ctx);
-        }
-    }
-
-    fn setTextInternal(self: *Editor, text: []const u8) void {
-        self.buf.items.len = 0;
-        self.buf.appendSlice(self.allocator, text) catch return;
-        self.cursor_byte = @intCast(text.len);
-        const last_line_start = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |pos| pos + 1 else 0;
-        self.cursor_col = @intCast(grapheme_mod.strWidth(text[last_line_start..]));
-        self.scroll_x = 0;
-        self.scroll_y = 0;
-        self.ensureCursorVisible();
-        self.notifyChange();
-    }
-
-    fn isEditorEmpty(self: *const Editor) bool {
-        return self.buf.items.len == 0;
-    }
-
-    fn isOnFirstVisualLine(self: *Editor) bool {
-        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return true;
-        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return true;
-        return cursor.visual_row == 0;
-    }
-
-    fn isOnLastVisualLine(self: *Editor) bool {
-        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return true;
-        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return true;
-        return cursor.visual_row + 1 >= wrapped_lines.len;
-    }
-
-    fn navigateHistory(self: *Editor, direction: i32) void {
-        if (self.history.items.len == 0) return;
-
-        const max_index: i32 = @intCast(self.history.items.len);
-        const new_index = self.history_index - direction;
-        if (new_index < -1 or new_index >= max_index) return;
-
-        self.history_index = new_index;
-        self.cancelAutocomplete();
-
-        if (self.history_index == -1) {
-            self.setTextInternal("");
-        } else {
-            const idx: usize = @intCast(self.history_index);
-            self.setTextInternal(self.history.items[idx]);
-        }
-    }
-
-    // --- Input handling ---
 
     pub fn handleInput(self: *Editor, key: Key) bool {
         if (!self.focused) return false;
 
-        // Autocomplete interception — when picker is active, handle its keys first
-        if (self.autocomplete_active) {
-            const result = self.autocomplete_list.processInput(key);
-            switch (result) {
-                .selected => {
-                    if (self.acceptAutocomplete()) {
-                        // Apply succeeded — submit the completed command
-                        if (key.code == .enter) {
-                            if (self.on_submit) |cb| {
-                                cb(self.buf.items, self.on_submit_ctx);
-                            }
-                        }
-                    } else {
-                        self.cancelAutocomplete();
-                    }
-                    return true;
-                },
-                .cancelled => {
-                    self.cancelAutocomplete();
-                    return true;
-                },
-                .consumed => return true,
-                .unhandled => {
-                    if (key.code == .tab and !key.ctrl and !key.alt) {
-                        // Tab accepts the top pick without submitting
-                        if (self.acceptAutocomplete()) return true;
-                        self.cancelAutocomplete();
-                        return true;
-                    } else if (key.code == .char and !key.ctrl and !key.alt) {
-                        // let char fall through to normal handling, then tryAutocomplete
-                    } else if (key.code == .backspace) {
-                        // let backspace fall through, then tryAutocomplete
-                    } else {
-                        self.cancelAutocomplete();
-                    }
-                },
-            }
+        switch (self.autocomplete.processInput(key, self.buffer)) {
+            .accepted => |accepted| {
+                self.afterAutocompleteAcceptance();
+                if (accepted.submit) {
+                    if (self.disable_submit) return true;
+                    if (self.on_submit) |cb| cb(self.buffer.text(), self.on_submit_ctx);
+                }
+                return true;
+            },
+            .cancelled, .consumed => return true,
+            .unhandled => {},
         }
 
         switch (key.code) {
             .enter => {
                 if (key.shift) {
-                    self.insertNewline();
+                    self.history_index = -1;
+                    self.buffer.insertNewline();
+                    self.afterTextMutation();
                     return true;
                 }
-                if (self.cursor_byte > 0 and self.buf.items[self.cursor_byte - 1] == '\\') {
-                    const prev = self.cursor_byte - 1;
-                    const items = self.buf.items;
-                    std.mem.copyForwards(u8, items[prev..], items[self.cursor_byte..]);
-                    self.buf.items.len -= 1;
-                    self.cursor_byte = prev;
-                    self.cursor_col -= 1;
-                    self.insertNewline();
+
+                const cursor_byte = self.buffer.cursorByte();
+                if (cursor_byte > 0 and self.buffer.text()[cursor_byte - 1] == '\\') {
+                    self.history_index = -1;
+                    self.buffer.backspace();
+                    self.buffer.insertNewline();
+                    self.afterTextMutation();
                     return true;
                 }
+
                 if (self.disable_submit) return true;
-                if (self.on_submit) |cb| {
-                    cb(self.buf.items, self.on_submit_ctx);
-                }
+                if (self.on_submit) |cb| cb(self.buffer.text(), self.on_submit_ctx);
                 return true;
             },
             .char => {
@@ -393,152 +234,88 @@ pub const Editor = struct {
                     self.history_index = -1;
                     var utf8_buf: [4]u8 = undefined;
                     const len = std.unicode.utf8Encode(cp, &utf8_buf) catch return false;
-                    self.buf.insertSlice(self.allocator, self.cursor_byte, utf8_buf[0..len]) catch return false;
-                    self.cursor_byte += @intCast(len);
-                    self.cursor_col += @as(u32, grapheme_mod.charWidth(cp));
-                    self.ensureCursorVisible();
-                    self.tryAutocomplete();
-                    self.notifyChange();
+                    self.buffer.insertAtCursor(utf8_buf[0..len]);
+                    self.afterTextMutation();
                     return true;
                 }
                 return false;
             },
             .backspace => {
                 self.history_index = -1;
-                if (self.cursor_byte == 0) return true;
-                if (self.buf.items[self.cursor_byte - 1] == '\n') {
-                    const prev = self.cursor_byte - 1;
-                    const prev_line_start = self.lineStartByIndex(self.cursorLine() -| 1);
-                    self.cursor_col = self.displayColAtByte(prev);
-                    _ = prev_line_start;
-                    const items = self.buf.items;
-                    std.mem.copyForwards(u8, items[prev..], items[self.cursor_byte..]);
-                    self.buf.items.len -= 1;
-                    self.cursor_byte = prev;
-                    self.ensureCursorVisible();
-                    self.tryAutocomplete();
-                    self.notifyChange();
-                    return true;
-                }
-                const prev = self.prevCodepointBoundary();
-                const removed_bytes = self.cursor_byte - prev;
-                const removed_text = self.buf.items[prev..self.cursor_byte];
-                const removed_width: u32 = @intCast(grapheme_mod.strWidth(removed_text));
-                const items = self.buf.items;
-                std.mem.copyForwards(u8, items[prev..], items[self.cursor_byte..]);
-                self.buf.items.len -= removed_bytes;
-                self.cursor_byte = prev;
-                self.cursor_col -= removed_width;
-                self.tryAutocomplete();
-                self.notifyChange();
+                self.buffer.backspace();
+                self.afterTextMutation();
                 return true;
             },
             .delete => {
                 self.history_index = -1;
-                if (self.cursor_byte >= self.buf.items.len) return true;
-                if (self.buf.items[self.cursor_byte] == '\n') {
-                    const items = self.buf.items;
-                    const next = self.cursor_byte + 1;
-                    std.mem.copyForwards(u8, items[self.cursor_byte..], items[next..]);
-                    self.buf.items.len -= 1;
-                    self.notifyChange();
-                    return true;
-                }
-                const next = self.nextCodepointBoundary();
-                const remove_count = next - self.cursor_byte;
-                const items = self.buf.items;
-                std.mem.copyForwards(u8, items[self.cursor_byte..], items[next..]);
-                self.buf.items.len -= remove_count;
-                self.notifyChange();
+                self.buffer.deleteForward();
+                self.afterTextMutation();
                 return true;
             },
             .left => {
-                if (self.cursor_byte == 0) return true;
-                if (self.buf.items[self.cursor_byte - 1] == '\n') {
-                    self.cursor_byte -= 1;
-                    self.cursor_col = self.displayColAtByte(self.cursor_byte);
-                    self.ensureCursorVisible();
-                    return true;
-                }
-                const prev = self.prevCodepointBoundary();
-                const moved_text = self.buf.items[prev..self.cursor_byte];
-                const moved_width: u32 = @intCast(grapheme_mod.strWidth(moved_text));
-                self.cursor_byte = prev;
-                self.cursor_col -= moved_width;
+                self.buffer.moveLeft();
+                self.afterCursorMotion();
                 return true;
             },
             .right => {
-                if (self.cursor_byte >= self.buf.items.len) return true;
-                if (self.buf.items[self.cursor_byte] == '\n') {
-                    self.cursor_byte += 1;
-                    self.cursor_col = 0;
-                    self.ensureCursorVisible();
-                    return true;
-                }
-                const next = self.nextCodepointBoundary();
-                const moved_text = self.buf.items[self.cursor_byte..next];
-                const moved_width: u32 = @intCast(grapheme_mod.strWidth(moved_text));
-                self.cursor_byte = next;
-                self.cursor_col += moved_width;
+                self.buffer.moveRight();
+                self.afterCursorMotion();
                 return true;
             },
             .up => {
-                if (self.isEditorEmpty()) {
+                if (self.buffer.text().len == 0) {
                     self.navigateHistory(-1);
-                } else if (self.history_index > -1 and self.isOnFirstVisualLine()) {
+                } else if (self.history_index > -1 and self.view.isCursorOnFirstVisualLine()) {
                     self.navigateHistory(-1);
-                } else if (self.isOnFirstVisualLine()) {
-                    self.cursor_byte = self.currentLineStart();
-                    self.cursor_col = 0;
-                    self.ensureCursorVisible();
+                } else if (self.view.isCursorOnFirstVisualLine()) {
+                    self.buffer.moveLogicalLineStart();
+                    self.afterCursorMotion();
                 } else {
-                    self.moveCursorVisual(-1);
+                    self.view.moveUpVisual();
                 }
                 return true;
             },
             .down => {
-                if (self.history_index > -1 and self.isOnLastVisualLine()) {
+                if (self.history_index > -1 and self.view.isCursorOnLastVisualLine()) {
                     self.navigateHistory(1);
-                } else if (self.isOnLastVisualLine()) {
-                    self.cursor_byte = self.currentLineEnd();
-                    self.cursor_col = self.displayColAtByte(self.cursor_byte);
-                    self.ensureCursorVisible();
+                } else if (self.view.isCursorOnLastVisualLine()) {
+                    self.buffer.moveLogicalLineEnd();
+                    self.afterCursorMotion();
                 } else {
-                    self.moveCursorVisual(1);
+                    self.view.moveDownVisual();
                 }
                 return true;
             },
             .home => {
-                self.cursor_byte = self.currentLineStart();
-                self.cursor_col = 0;
+                self.buffer.moveLogicalLineStart();
+                self.afterCursorMotion();
                 return true;
             },
             .end => {
-                self.cursor_byte = self.currentLineEnd();
-                self.cursor_col = self.displayColAtByte(self.cursor_byte);
+                self.buffer.moveLogicalLineEnd();
+                self.afterCursorMotion();
                 return true;
             },
             else => return false,
         }
     }
 
-    // --- Rendering ---
-
     pub fn render(self: *Editor, region: Region) void {
         const w = region.width;
         const h = region.height;
         if (w == 0 or h < 3) return;
 
-        const applied_padding = self.appliedPaddingX(w);
-        const content_width = self.effectiveContentWidth(w);
-        self.last_applied_padding_x = applied_padding;
-        self.last_content_width = content_width;
-        self.ensureCursorVisible();
+        self.autocomplete.setTheme(self.theme orelse &Theme.dark);
 
-        const wrapped_line_count = self.wrappedLineCountForWidth(content_width);
-        const editor_h: u32 = @min(@min(wrapped_line_count, self.max_visible_lines) + 2, h);
+        const text_row_cap = @min(self.max_visible_lines, h - 2);
+        self.syncViewGeometry(w, text_row_cap);
+        const total_lines = self.view.totalVisualLineCount();
+        const visible_rows = @min(total_lines, text_row_cap);
+        self.syncViewGeometry(w, visible_rows);
+        self.view.ensureCursorVisible();
 
-        // Top border with rounded corners and inline status
+        const editor_h = visible_rows + 2;
+
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
             var left_buf: [256]u8 = undefined;
@@ -547,17 +324,12 @@ pub const Editor = struct {
             const right_text = self.formatStatusRight(&right_buf);
             _ = box_chrome.drawClosedTop(region, 0, left_text, right_text, style);
         }
-        // Bottom border with rounded corners
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
             _ = box_chrome.drawClosedBottom(region, editor_h - 1, style);
         }
 
-        // Content between borders
-        const content = region.sub(0, 1, w, editor_h - 2);
-        const wrapped_lines = self.buildWrappedLinesScratch(content_width) catch return;
-
-        // Draw content rows
+        const content = region.sub(0, 1, w, visible_rows);
         {
             const chrome_style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
             var row: u32 = 0;
@@ -571,41 +343,25 @@ pub const Editor = struct {
             }
         }
 
-        var visible_row: u32 = 0;
-        var wrapped_idx: usize = self.scroll_y;
-        while (visible_row < content.height and wrapped_idx < wrapped_lines.len) : ({
-            visible_row += 1;
-            wrapped_idx += 1;
-        }) {
-            const line = wrapped_lines[wrapped_idx];
-            const prefix = if (line.kind == .prompt) self.prompt else "  ";
-            _ = content.writeStr(1 + applied_padding, visible_row, prefix, self.prompt_fg, Color.default, .{});
-            const line_text = self.buf.items[line.start..line.end];
-            if (line_text.len > 0) {
-                _ = content.writeStr(applied_padding + line.text_x, visible_row, line_text, self.text_fg, Color.default, .{});
-            }
-        }
+        editor_core.renderVisibleLines(content, self.buffer, self.view.visibleLines(), RenderConfig{
+            .prompt = self.prompt,
+            .applied_padding_x = self.last_applied_padding_x,
+            .prompt_fg = self.prompt_fg,
+            .text_fg = self.text_fg,
+        });
 
-        // Autocomplete picker below bottom border
-        if (self.autocomplete_active and self.autocomplete_list.items.len > 0) {
-            if (h > editor_h) {
-                const picker_region = region.sub(0, editor_h, w, h - editor_h);
-                self.autocomplete_list.render(picker_region);
-            }
+        if (self.autocomplete.isActive() and h > editor_h) {
+            const picker_region = region.sub(0, editor_h, w, h - editor_h);
+            self.autocomplete.render(picker_region);
         }
     }
 
     pub fn measure(self: *Editor, width: u32) Measurement {
-        self.last_applied_padding_x = self.appliedPaddingX(width);
-        self.last_content_width = self.effectiveContentWidth(width);
-        const wrapped_line_count = self.wrappedLineCountForWidth(self.last_content_width);
+        self.autocomplete.setTheme(self.theme orelse &Theme.dark);
+        self.syncViewGeometry(width, self.max_visible_lines);
+        const wrapped_line_count = self.view.totalVisualLineCount();
         const box_height = @min(wrapped_line_count, self.max_visible_lines) + 2;
-
-        var picker_height: u32 = 0;
-        if (self.autocomplete_active and self.autocomplete_list.items.len > 0) {
-            picker_height = self.autocomplete_list.measure(width).preferred_height;
-        }
-
+        const picker_height = self.autocomplete.measure(width).preferred_height;
         return .{
             .min_height = 3,
             .preferred_height = box_height + picker_height,
@@ -614,15 +370,12 @@ pub const Editor = struct {
 
     pub fn cursorState(self: *Editor) ?CursorState {
         if (!self.focused) return null;
-
-        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return null;
-
-        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return null;
-        if (cursor.visual_row < self.scroll_y) return null;
-
+        self.syncStoredViewGeometry();
+        const cursor = self.view.visualCursor() orelse return null;
+        if (cursor.visual_row >= self.last_viewport_rows) return null;
         return .{
-            .x = cursor.x + self.last_applied_padding_x,
-            .y = (cursor.visual_row - self.scroll_y) + 1,
+            .x = cursor.visual_col + self.last_applied_padding_x,
+            .y = cursor.visual_row + 1,
             .style = .bar,
         };
     }
@@ -635,24 +388,108 @@ pub const Editor = struct {
         return Component.init(Editor, self);
     }
 
-    // --- Git branch (owned fixed buffer) ---
-
     pub fn setGitBranch(self: *Editor, branch: ?[]const u8) void {
-        if (branch) |b| {
-            const len: u8 = @intCast(@min(b.len, self.git_branch_buf.len));
-            @memcpy(self.git_branch_buf[0..len], b[0..len]);
+        if (branch) |value| {
+            const len: u8 = @intCast(@min(value.len, self.git_branch_buf.len));
+            @memcpy(self.git_branch_buf[0..len], value[0..len]);
             self.git_branch_len = len;
         } else {
             self.git_branch_len = 0;
         }
     }
 
+    fn setTextInternal(self: *Editor, text: []const u8, preserve_history_index: bool) void {
+        self.buffer.setText(text);
+        self.view.resetViewport();
+        self.view.clearDesiredVisualColumn();
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
+        if (!preserve_history_index) self.history_index = -1;
+        self.autocomplete.refresh(self.buffer);
+        self.notifyChange();
+    }
+
+    fn navigateHistory(self: *Editor, direction: i32) void {
+        if (self.history.items.len == 0) return;
+
+        const max_index: i32 = @intCast(self.history.items.len);
+        const new_index = self.history_index - direction;
+        if (new_index < -1 or new_index >= max_index) return;
+
+        self.history_index = new_index;
+        self.cancelAutocomplete();
+
+        if (self.history_index == -1) {
+            self.setTextInternal("", true);
+        } else {
+            const idx: usize = @intCast(self.history_index);
+            self.setTextInternal(self.history.items[idx], true);
+        }
+    }
+
+    fn notifyChange(self: *Editor) void {
+        if (self.on_change) |cb| cb(self.buffer.text(), self.on_change_ctx);
+    }
+
+    fn afterTextMutation(self: *Editor) void {
+        self.view.clearDesiredVisualColumn();
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
+        self.autocomplete.refresh(self.buffer);
+        self.notifyChange();
+    }
+
+    fn afterCursorMotion(self: *Editor) void {
+        self.view.clearDesiredVisualColumn();
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
+    }
+
+    fn afterAutocompleteAcceptance(self: *Editor) void {
+        self.view.clearDesiredVisualColumn();
+        self.syncStoredViewGeometry();
+        self.view.ensureCursorVisible();
+        self.notifyChange();
+    }
+
+    fn syncStoredViewGeometry(self: *Editor) void {
+        self.syncViewGeometry(self.last_total_width, self.last_viewport_rows);
+    }
+
+    fn syncViewGeometry(self: *Editor, total_width: u32, viewport_rows: u32) void {
+        const applied_padding = self.appliedPaddingX(total_width);
+        const content_width = self.effectiveContentWidth(total_width);
+        const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
+        const continuation_prompt = "  ";
+        const continuation_width: u32 = @intCast(grapheme_mod.strWidth(continuation_prompt));
+
+        self.last_total_width = total_width;
+        self.last_applied_padding_x = applied_padding;
+        self.last_content_width = content_width;
+        self.last_viewport_rows = @max(@as(u32, 1), viewport_rows);
+
+        self.view.setLayoutConfig(.{
+            .width_cols = content_width,
+            .first_line_text_col = 1 + prompt_width,
+            .continuation_text_col = 1 + continuation_width,
+        });
+        self.view.setViewportHeight(self.last_viewport_rows);
+    }
+
+    fn appliedPaddingX(self: *const Editor, total_width: u32) u32 {
+        if (total_width <= 1) return 0;
+        return @min(self.padding_x, @divFloor(total_width - 1, @as(u32, 2)));
+    }
+
+    fn effectiveContentWidth(self: *const Editor, total_width: u32) u32 {
+        const applied = self.appliedPaddingX(total_width);
+        return if (total_width > applied * 2) total_width - applied * 2 else 1;
+    }
+
     fn getGitBranch(self: *const Editor) ?[]const u8 {
         if (self.git_branch_len == 0) return null;
         return self.git_branch_buf[0..self.git_branch_len];
     }
-
-    // --- Status formatting (no allocations) ---
 
     fn formatStatusLeft(self: *const Editor, buf: []u8) ?[]const u8 {
         var pos: usize = 0;
@@ -691,17 +528,17 @@ pub const Editor = struct {
     }
 
     fn formatStatusRight(self: *const Editor, buf: []u8) ?[]const u8 {
-        const sd = self.status_data orelse return null;
-        if (sd.model_id.len == 0) return null;
+        const status = self.status_data orelse return null;
+        if (status.model_id.len == 0) return null;
 
         var pos: usize = 0;
         var first = true;
 
-        if (sd.context_window > 0) {
+        if (status.context_window > 0) {
             var tokens_buf: [24]u8 = undefined;
             var window_buf: [24]u8 = undefined;
-            const window_text = formatTokenCount(&window_buf, sd.context_window);
-            const label = if (sd.context_tokens) |tokens|
+            const window_text = formatTokenCount(&window_buf, status.context_window);
+            const label = if (status.context_tokens) |tokens|
                 std.fmt.bufPrint(buf[pos..], "ctx {s}/{s}", .{ formatTokenCount(&tokens_buf, tokens), window_text }) catch ""
             else
                 std.fmt.bufPrint(buf[pos..], "ctx ?/{s}", .{window_text}) catch "";
@@ -711,25 +548,25 @@ pub const Editor = struct {
             }
         }
 
-        if (sd.model_id.len > 0) {
+        if (status.model_id.len > 0) {
             const sep = " • ";
             if (!first and pos + sep.len <= buf.len) {
                 @memcpy(buf[pos..][0..sep.len], sep);
                 pos += sep.len;
             }
-            const copy_len = @min(sd.model_id.len, buf.len - pos);
-            @memcpy(buf[pos..][0..copy_len], sd.model_id[0..copy_len]);
+            const copy_len = @min(status.model_id.len, buf.len - pos);
+            @memcpy(buf[pos..][0..copy_len], status.model_id[0..copy_len]);
             pos += copy_len;
             first = false;
         }
 
-        if (sd.thinking_level.len > 0 and pos + 3 + sd.thinking_level.len < buf.len) {
+        if (status.thinking_level.len > 0 and pos + 3 + status.thinking_level.len < buf.len) {
             const sep = " • ";
             if (!first and pos + sep.len <= buf.len) {
                 @memcpy(buf[pos..][0..sep.len], sep);
                 pos += sep.len;
             }
-            const written = std.fmt.bufPrint(buf[pos..], "thinking {s}", .{sd.thinking_level}) catch "";
+            const written = std.fmt.bufPrint(buf[pos..], "thinking {s}", .{status.thinking_level}) catch "";
             pos += written.len;
         }
 
@@ -737,17 +574,13 @@ pub const Editor = struct {
     }
 
     fn formatTokenCount(buf: []u8, value: u64) []const u8 {
-        if (value < 1_000) {
-            return std.fmt.bufPrint(buf, "{d}", .{value}) catch "";
-        }
+        if (value < 1_000) return std.fmt.bufPrint(buf, "{d}", .{value}) catch "";
         if (value < 10_000) {
             const whole = @divTrunc(value, 1_000);
             const tenth = @divTrunc(value % 1_000, 100);
             return std.fmt.bufPrint(buf, "{d}.{d}k", .{ whole, tenth }) catch "";
         }
-        if (value < 1_000_000) {
-            return std.fmt.bufPrint(buf, "{d}k", .{@divTrunc(value, 1_000)}) catch "";
-        }
+        if (value < 1_000_000) return std.fmt.bufPrint(buf, "{d}k", .{@divTrunc(value, 1_000)}) catch "";
         if (value < 10_000_000) {
             const whole = @divTrunc(value, 1_000_000);
             const tenth = @divTrunc(value % 1_000_000, 100_000);
@@ -755,746 +588,5 @@ pub const Editor = struct {
         }
         return std.fmt.bufPrint(buf, "{d}M", .{@divTrunc(value, 1_000_000)}) catch "";
     }
-
-    // --- Internal helpers ---
-
-    fn appliedPaddingX(self: *const Editor, total_width: u32) u32 {
-        if (total_width <= 1) return 0;
-        return @min(self.padding_x, @divFloor(total_width - 1, @as(u32, 2)));
-    }
-
-    fn effectiveContentWidth(self: *const Editor, total_width: u32) u32 {
-        const applied = self.appliedPaddingX(total_width);
-        return if (total_width > applied * 2) total_width - applied * 2 else 1;
-    }
-
-    const WrappedLineKind = enum {
-        prompt,
-        continuation,
-    };
-
-    const WrappedLine = struct {
-        start: u32,
-        end: u32,
-        kind: WrappedLineKind,
-        text_x: u32,
-    };
-
-    const CursorVisualPosition = struct {
-        visual_row: u32,
-        x: u32,
-    };
-
-    fn buildWrappedLinesScratch(self: *Editor, total_width: u32) ![]WrappedLine {
-        _ = self.layout_arena.reset(.retain_capacity);
-        return self.buildWrappedLines(total_width, self.layout_arena.allocator());
-    }
-
-    fn buildWrappedLines(self: *const Editor, total_width: u32, allocator: std.mem.Allocator) ![]WrappedLine {
-        var lines: std.ArrayListUnmanaged(WrappedLine) = .empty;
-        errdefer lines.deinit(allocator);
-
-        const items = self.buf.items;
-        const continuation = "  ";
-        const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
-        const continuation_width: u32 = @intCast(grapheme_mod.strWidth(continuation));
-        const first_text_width = if (total_width > prompt_width + 1) total_width - prompt_width - 1 else 1;
-        const continuation_text_width = if (total_width > continuation_width + 1) total_width - continuation_width - 1 else 1;
-
-        var logical_line_idx: u32 = 0;
-        var line_start: usize = 0;
-        while (true) {
-            const line_end = std.mem.indexOfScalarPos(u8, items, line_start, '\n') orelse items.len;
-            const line_text = items[line_start..line_end];
-
-            if (logical_line_idx == 0) {
-                try self.appendWrappedSlices(&lines, line_text, @intCast(line_start), .prompt, 1 + prompt_width, first_text_width, continuation_text_width, allocator);
-            } else {
-                try self.appendWrappedSlices(&lines, line_text, @intCast(line_start), .continuation, 1 + continuation_width, continuation_text_width, continuation_text_width, allocator);
-            }
-
-            logical_line_idx += 1;
-            if (line_end >= items.len) break;
-            line_start = line_end + 1;
-        }
-
-        if (lines.items.len == 0) {
-            try lines.append(allocator, .{ .start = 0, .end = 0, .kind = .prompt, .text_x = 1 + prompt_width });
-        }
-
-        return try lines.toOwnedSlice(allocator);
-    }
-
-    fn appendWrappedSlices(
-        self: *const Editor,
-        out: *std.ArrayListUnmanaged(WrappedLine),
-        line_text: []const u8,
-        base_start: u32,
-        first_kind: WrappedLineKind,
-        first_text_x: u32,
-        first_width: u32,
-        continuation_width: u32,
-        allocator: std.mem.Allocator,
-    ) !void {
-        _ = self;
-        const continuation = "  ";
-        const continuation_prefix_width: u32 = @intCast(grapheme_mod.strWidth(continuation));
-        const continuation_text_x = 1 + continuation_prefix_width;
-        const continuation_max_width = if (continuation_width == 0) @as(u32, 1) else continuation_width;
-
-        var remaining = line_text;
-        var remaining_base = base_start;
-        var current_kind = first_kind;
-        var current_text_x = first_text_x;
-        var current_width = if (first_width == 0) @as(u32, 1) else first_width;
-
-        while (true) {
-            const wrapped = try word_wrap_mod.wordWrap(remaining, @intCast(current_width), allocator);
-            defer allocator.free(wrapped);
-
-            if (wrapped.len == 0) break;
-            const first = wrapped[0];
-            const raw_end: usize = if (wrapped.len > 1) wrapped[1].start else remaining.len;
-            try out.append(allocator, .{
-                .start = remaining_base + @as(u32, @intCast(first.start)),
-                // Preserve editor whitespace exactly. wordWrap trims trailing
-                // whitespace and strips leading whitespace on continuation
-                // lines for display components; editor must keep those bytes
-                // visible and cursor-addressable.
-                .end = remaining_base + @as(u32, @intCast(raw_end)),
-                .kind = current_kind,
-                .text_x = current_text_x,
-            });
-
-            if (wrapped.len == 1) break;
-
-            remaining_base += @as(u32, @intCast(wrapped[1].start));
-            remaining = remaining[wrapped[1].start..];
-            current_kind = .continuation;
-            current_text_x = continuation_text_x;
-            current_width = continuation_max_width;
-        }
-    }
-
-    fn wrappedLineCountForWidth(self: *Editor, total_width: u32) u32 {
-        const wrapped_lines = self.buildWrappedLinesScratch(total_width) catch return self.lineCount();
-        return @intCast(wrapped_lines.len);
-    }
-
-    fn findCursorVisualPosition(self: *const Editor, wrapped_lines: []const WrappedLine) ?CursorVisualPosition {
-        if (wrapped_lines.len == 0) return .{ .visual_row = 0, .x = 1 };
-
-        var idx: usize = 0;
-        while (idx < wrapped_lines.len) : (idx += 1) {
-            const line = wrapped_lines[idx];
-            const next_start = if (idx + 1 < wrapped_lines.len) wrapped_lines[idx + 1].start else line.end;
-            if (self.cursor_byte >= line.start and self.cursor_byte <= line.end) {
-                const col: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[line.start..self.cursor_byte]));
-                return .{ .visual_row = @intCast(idx), .x = line.text_x + col };
-            }
-            if (self.cursor_byte > line.end and self.cursor_byte < next_start) {
-                const col: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[line.start..line.end]));
-                return .{ .visual_row = @intCast(idx), .x = line.text_x + col };
-            }
-        }
-
-        const last = wrapped_lines[wrapped_lines.len - 1];
-        const col: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[last.start..last.end]));
-        return .{ .visual_row = @intCast(wrapped_lines.len - 1), .x = last.text_x + col };
-    }
-
-    fn insertNewline(self: *Editor) void {
-        self.history_index = -1;
-        self.buf.insertSlice(self.allocator, self.cursor_byte, "\n") catch return;
-        self.cursor_byte += 1;
-        self.cursor_col = 0;
-        self.ensureCursorVisible();
-        self.tryAutocomplete();
-        self.notifyChange();
-    }
-
-    fn moveCursorVisual(self: *Editor, direction: i32) void {
-        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return;
-        if (wrapped_lines.len == 0) return;
-        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return;
-
-        const current_row: i32 = @intCast(cursor.visual_row);
-        const max_rows: i32 = @intCast(wrapped_lines.len);
-        const target_row = current_row + direction;
-        if (target_row < 0 or target_row >= max_rows) return;
-
-        const current_idx: usize = @intCast(cursor.visual_row);
-        const current_line = wrapped_lines[current_idx];
-        const visual_col = cursor.x - current_line.text_x;
-        const target_idx: usize = @intCast(target_row);
-        const target_line = wrapped_lines[target_idx];
-        self.cursor_byte = self.byteAtDisplayCol(target_line.start, target_line.end, visual_col);
-        self.cursor_col = self.displayColAtByte(self.cursor_byte);
-        self.ensureCursorVisible();
-    }
-
-    fn currentLineStart(self: *const Editor) u32 {
-        if (self.cursor_byte == 0) return 0;
-        var i = self.cursor_byte - 1;
-        while (i > 0 and self.buf.items[i] != '\n') : (i -= 1) {}
-        if (self.buf.items[i] == '\n') return i + 1;
-        return 0;
-    }
-
-    fn currentLineEnd(self: *const Editor) u32 {
-        var i = self.cursor_byte;
-        while (i < self.buf.items.len and self.buf.items[i] != '\n') : (i += 1) {}
-        return @intCast(i);
-    }
-
-    fn cursorLine(self: *const Editor) u32 {
-        var count: u32 = 0;
-        for (self.buf.items[0..self.cursor_byte]) |b| {
-            if (b == '\n') count += 1;
-        }
-        return count;
-    }
-
-    fn lineCount(self: *const Editor) u32 {
-        if (self.buf.items.len == 0) return 1;
-        var count: u32 = 1;
-        for (self.buf.items) |b| {
-            if (b == '\n') count += 1;
-        }
-        return count;
-    }
-
-    fn lineStartByIndex(self: *const Editor, n: u32) u32 {
-        if (n == 0) return 0;
-        var count: u32 = 0;
-        for (self.buf.items, 0..) |b, i| {
-            if (b == '\n') {
-                count += 1;
-                if (count == n) return @intCast(i + 1);
-            }
-        }
-        return @intCast(self.buf.items.len);
-    }
-
-    fn lineEndByStart(self: *const Editor, start: u32) u32 {
-        var i = start;
-        while (i < self.buf.items.len and self.buf.items[i] != '\n') : (i += 1) {}
-        return i;
-    }
-
-    fn displayColAtByte(self: *const Editor, byte: u32) u32 {
-        var line_start: u32 = 0;
-        if (byte > 0) {
-            var i: u32 = byte - 1;
-            while (i > 0 and self.buf.items[i] != '\n') : (i -= 1) {}
-            if (i < byte and self.buf.items[i] == '\n') {
-                line_start = i + 1;
-            }
-        }
-        return @intCast(grapheme_mod.strWidth(self.buf.items[line_start..byte]));
-    }
-
-    fn byteAtDisplayCol(self: *const Editor, line_start: u32, line_end: u32, target_col: u32) u32 {
-        var col: u32 = 0;
-        var i: u32 = line_start;
-        while (i < line_end) {
-            const cp_len: u32 = @intCast(std.unicode.utf8ByteSequenceLength(self.buf.items[i]) catch 1);
-            const end = @min(i + cp_len, line_end);
-            const cp = std.unicode.utf8Decode(self.buf.items[i..end]) catch '_';
-            const w_val: u32 = @as(u32, grapheme_mod.charWidth(cp));
-            if (col + w_val > target_col) break;
-            col += w_val;
-            i = end;
-        }
-        return i;
-    }
-
-    fn ensureCursorVisible(self: *Editor) void {
-        const wrapped_lines = self.buildWrappedLinesScratch(self.last_content_width) catch return;
-
-        const cursor = self.findCursorVisualPosition(wrapped_lines) orelse return;
-        if (cursor.visual_row < self.scroll_y) {
-            self.scroll_y = cursor.visual_row;
-        } else if (cursor.visual_row >= self.scroll_y + self.max_visible_lines) {
-            self.scroll_y = cursor.visual_row - self.max_visible_lines + 1;
-        }
-    }
-
-    fn prevCodepointBoundary(self: *const Editor) u32 {
-        if (self.cursor_byte == 0) return 0;
-        var i = self.cursor_byte - 1;
-        while (i > 0 and (self.buf.items[i] & 0xC0) == 0x80) : (i -= 1) {}
-        return i;
-    }
-
-    fn nextCodepointBoundary(self: *const Editor) u32 {
-        if (self.cursor_byte >= self.buf.items.len) return @intCast(self.buf.items.len);
-        var i = self.cursor_byte + 1;
-        while (i < self.buf.items.len and (self.buf.items[i] & 0xC0) == 0x80) : (i += 1) {}
-        return @intCast(i);
-    }
 };
 
-// --- Tests ---
-
-test "Editor insert, cursor tracking, and submit" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'h' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'i' });
-    try std.testing.expectEqualStrings("hi", editor.getText());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-
-    const cs = editor.cursorState().?;
-    try std.testing.expectEqual(@as(u32, 5), cs.x);
-}
-
-test "Editor backspace, delete, and navigation" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'b' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'c' });
-    _ = editor.handleInput(.{ .code = .backspace });
-    try std.testing.expectEqualStrings("ab", editor.getText());
-    _ = editor.handleInput(.{ .code = .home });
-    try std.testing.expectEqual(@as(u32, 0), editor.cursor_col);
-    _ = editor.handleInput(.{ .code = .end });
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-    editor.clear();
-    try std.testing.expectEqualStrings("", editor.getText());
-}
-
-test "Editor renders prompt and text to buffer" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'x' });
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 3);
-    defer buf.deinit();
-    editor.render(buf.region());
-    try std.testing.expectEqual(@as(u21, 0x256D), buf.get(0, 0).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'x'), buf.get(1, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 0x2570), buf.get(0, 2).grapheme.codepoint);
-}
-
-test "editor status chips include context usage model and thinking" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-    var status = StatusData.init(std.testing.allocator);
-    defer status.deinit();
-
-    status.setModelId("claude-sonnet-4-5");
-    status.setThinkingLevel("high");
-    status.context_tokens = 25_000;
-    status.context_window = 128_000;
-    editor.status_data = &status;
-
-    var buf: [256]u8 = undefined;
-    const text = editor.formatStatusRight(&buf).?;
-    try std.testing.expect(std.mem.indexOf(u8, text, "ctx 25k/128k") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "claude-sonnet-4-5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "thinking high") != null);
-}
-
-test "editor render after backspace clears deleted char from buffer" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 3);
-    defer buf.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'b' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'c' });
-
-    editor.render(buf.region());
-    try std.testing.expectEqual(@as(u21, 'c'), buf.get(5, 1).grapheme.codepoint);
-
-    _ = editor.handleInput(.{ .code = .backspace });
-
-    buf.clear();
-    editor.render(buf.region());
-
-    try std.testing.expectEqual(@as(u21, 'b'), buf.get(4, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), buf.get(5, 1).grapheme.codepoint);
-
-    const cs = editor.cursorState().?;
-    try std.testing.expectEqual(@as(u32, 5), cs.x);
-    try std.testing.expectEqual(@as(u32, 1), cs.y);
-}
-
-test "Editor handles newline insertion and cross-line backspace" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'b' });
-    _ = editor.handleInput(.{ .code = .enter, .shift = true });
-    _ = editor.handleInput(.{ .code = .char, .char = 'c' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'd' });
-
-    try std.testing.expectEqualStrings("ab\ncd", editor.getText());
-    try std.testing.expectEqual(@as(u32, 1), editor.cursorLine());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-
-    editor.clear();
-    _ = editor.handleInput(.{ .code = .char, .char = 'x' });
-    _ = editor.handleInput(.{ .code = .char, .char = '\\' });
-    _ = editor.handleInput(.{ .code = .enter });
-    _ = editor.handleInput(.{ .code = .char, .char = 'y' });
-    try std.testing.expectEqualStrings("x\ny", editor.getText());
-
-    _ = editor.handleInput(.{ .code = .home });
-    try std.testing.expectEqual(@as(u32, 0), editor.cursor_col);
-    _ = editor.handleInput(.{ .code = .backspace });
-    try std.testing.expectEqualStrings("xy", editor.getText());
-    try std.testing.expectEqual(@as(u32, 1), editor.cursor_col);
-}
-
-test "Editor up/down navigation moves between lines" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    editor.insertText("abc\nde\nfghij");
-    try std.testing.expectEqualStrings("abc\nde\nfghij", editor.getText());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursorLine());
-    try std.testing.expectEqual(@as(u32, 5), editor.cursor_col);
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqual(@as(u32, 1), editor.cursorLine());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqual(@as(u32, 0), editor.cursorLine());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-
-    _ = editor.handleInput(.{ .code = .down });
-    try std.testing.expectEqual(@as(u32, 1), editor.cursorLine());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-
-    _ = editor.handleInput(.{ .code = .down });
-    try std.testing.expectEqual(@as(u32, 2), editor.cursorLine());
-    try std.testing.expectEqual(@as(u32, 2), editor.cursor_col);
-}
-
-test "Editor wraps long content when rendering" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-    editor.setText("hello world");
-
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 10, 4);
-    defer buf.deinit();
-    editor.render(buf.region());
-
-    try std.testing.expectEqual(@as(u21, '>'), buf.get(1, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'h'), buf.get(3, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, 'w'), buf.get(3, 2).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u32, 4), editor.measure(10).preferred_height);
-
-    const cs = editor.cursorState().?;
-    try std.testing.expectEqual(@as(u32, 8), cs.x);
-    try std.testing.expectEqual(@as(u32, 2), cs.y);
-}
-
-test "Editor preserves trailing spaces in render and cursor position" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'a' });
-    _ = editor.handleInput(.{ .code = .char, .char = ' ' });
-    try std.testing.expectEqualStrings("a ", editor.getText());
-
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 20, 3);
-    defer buf.deinit();
-    editor.render(buf.region());
-
-    try std.testing.expectEqual(@as(u21, 'a'), buf.get(3, 1).grapheme.codepoint);
-    try std.testing.expectEqual(@as(u21, ' '), buf.get(4, 1).grapheme.codepoint);
-
-    const cs = editor.cursorState().?;
-    try std.testing.expectEqual(@as(u32, 5), cs.x);
-    try std.testing.expectEqual(@as(u32, 1), cs.y);
-}
-
-test "Editor scrolls wrapped cursor into view" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-    editor.max_visible_lines = 2;
-    editor.setText("one two three four");
-
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 9, 4);
-    defer buf.deinit();
-    editor.render(buf.region());
-
-    try std.testing.expectEqual(@as(u32, 2), editor.scroll_y);
-    const cs = editor.cursorState().?;
-    try std.testing.expectEqual(@as(u32, 7), cs.x);
-    try std.testing.expectEqual(@as(u32, 2), cs.y);
-}
-
-test "slash command autocomplete end-to-end" {
-    const allocator = std.testing.allocator;
-
-    const slash_commands_mod = @import("../../slash_commands.zig");
-    var registry = slash_commands_mod.CommandRegistry.init(allocator);
-    defer registry.deinit();
-
-    var slash_provider = autocomplete_mod.SlashCommandProvider.init(&registry);
-
-    var editor = Editor.init(allocator);
-    defer editor.deinit();
-    editor.setAutocompleteProvider(slash_provider.provider());
-    editor.theme = &theme_mod.Theme.dark;
-
-    var submitted: ?[]const u8 = null;
-    const SubmitCtx = struct { submitted: *?[]const u8 };
-    var submit_ctx = SubmitCtx{ .submitted = &submitted };
-    editor.on_submit = struct {
-        fn cb(text: []const u8, ctx: ?*anyopaque) void {
-            const sc: *SubmitCtx = @ptrCast(@alignCast(ctx));
-            sc.submitted.* = text;
-        }
-    }.cb;
-    editor.on_submit_ctx = @ptrCast(&submit_ctx);
-
-    // Type "/" → autocomplete activates with all commands
-    _ = editor.handleInput(.{ .code = .char, .char = '/' });
-    try std.testing.expect(editor.autocomplete_active);
-
-    // Type "m" → narrows to commands starting with "m" (model)
-    _ = editor.handleInput(.{ .code = .char, .char = 'm' });
-    try std.testing.expect(editor.autocomplete_active);
-    const item = editor.autocomplete_list.getSelectedItem();
-    try std.testing.expect(item != null);
-    try std.testing.expectEqualStrings("model", item.?.value);
-
-    // Press Enter → accept autocomplete + submit
-    _ = editor.handleInput(.{ .code = .enter });
-
-    // Autocomplete dismissed
-    try std.testing.expect(!editor.autocomplete_active);
-
-    // Editor text is "/model "
-    try std.testing.expectEqualStrings("/model ", editor.getText());
-
-    // Submit fired with "/model "
-    try std.testing.expect(submitted != null);
-    try std.testing.expectEqualStrings("/model ", submitted.?);
-}
-
-test "slash command Tab accepts top pick without submitting" {
-    const allocator = std.testing.allocator;
-
-    const slash_commands_mod = @import("../../slash_commands.zig");
-    var registry = slash_commands_mod.CommandRegistry.init(allocator);
-    defer registry.deinit();
-
-    var slash_provider = autocomplete_mod.SlashCommandProvider.init(&registry);
-
-    var editor = Editor.init(allocator);
-    defer editor.deinit();
-    editor.setAutocompleteProvider(slash_provider.provider());
-    editor.theme = &theme_mod.Theme.dark;
-
-    var submitted: ?[]const u8 = null;
-    const SubmitCtx = struct { submitted: *?[]const u8 };
-    var submit_ctx = SubmitCtx{ .submitted = &submitted };
-    editor.on_submit = struct {
-        fn cb(text: []const u8, ctx: ?*anyopaque) void {
-            const sc: *SubmitCtx = @ptrCast(@alignCast(ctx));
-            sc.submitted.* = text;
-        }
-    }.cb;
-    editor.on_submit_ctx = @ptrCast(&submit_ctx);
-
-    // Type "/re" → autocomplete shows "resume" as top pick
-    _ = editor.handleInput(.{ .code = .char, .char = '/' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'r' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'e' });
-    try std.testing.expect(editor.autocomplete_active);
-
-    // Tab → accept top pick, but do NOT submit
-    _ = editor.handleInput(.{ .code = .tab });
-    try std.testing.expect(!editor.autocomplete_active);
-    try std.testing.expectEqualStrings("/resume ", editor.getText());
-    try std.testing.expect(submitted == null); // no submit on Tab
-
-    // Now Enter submits the completed text
-    _ = editor.handleInput(.{ .code = .enter });
-    try std.testing.expect(submitted != null);
-    try std.testing.expectEqualStrings("/resume ", submitted.?);
-}
-
-test "slash command Enter on partial text accepts top pick and submits" {
-    const allocator = std.testing.allocator;
-
-    const slash_commands_mod = @import("../../slash_commands.zig");
-    var registry = slash_commands_mod.CommandRegistry.init(allocator);
-    defer registry.deinit();
-
-    var slash_provider = autocomplete_mod.SlashCommandProvider.init(&registry);
-
-    var editor = Editor.init(allocator);
-    defer editor.deinit();
-    editor.setAutocompleteProvider(slash_provider.provider());
-    editor.theme = &theme_mod.Theme.dark;
-
-    var submitted: ?[]const u8 = null;
-    const SubmitCtx = struct { submitted: *?[]const u8 };
-    var submit_ctx = SubmitCtx{ .submitted = &submitted };
-    editor.on_submit = struct {
-        fn cb(text: []const u8, ctx: ?*anyopaque) void {
-            const sc: *SubmitCtx = @ptrCast(@alignCast(ctx));
-            sc.submitted.* = text;
-        }
-    }.cb;
-    editor.on_submit_ctx = @ptrCast(&submit_ctx);
-
-    // Type "/re" → autocomplete active, top pick is "resume"
-    _ = editor.handleInput(.{ .code = .char, .char = '/' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'r' });
-    _ = editor.handleInput(.{ .code = .char, .char = 'e' });
-    try std.testing.expect(editor.autocomplete_active);
-
-    // Enter → accept top pick + submit in one action
-    _ = editor.handleInput(.{ .code = .enter });
-    try std.testing.expect(!editor.autocomplete_active);
-    try std.testing.expectEqualStrings("/resume ", editor.getText());
-    try std.testing.expect(submitted != null);
-    try std.testing.expectEqualStrings("/resume ", submitted.?);
-}
-
-test "editor change callback fires for programmatic text mutations" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    var changes = std.ArrayList([]const u8).empty;
-    defer changes.deinit(std.testing.allocator);
-
-    const Ctx = struct { changes: *std.ArrayList([]const u8) };
-    var ctx = Ctx{ .changes = &changes };
-    editor.setOnChange(struct {
-        fn cb(text: []const u8, raw_ctx: ?*anyopaque) void {
-            const change_ctx: *Ctx = @ptrCast(@alignCast(raw_ctx));
-            const owned = std.testing.allocator.dupe(u8, text) catch return;
-            change_ctx.changes.append(std.testing.allocator, owned) catch {
-                std.testing.allocator.free(owned);
-                return;
-            };
-        }
-    }.cb, @ptrCast(&ctx));
-    defer {
-        for (changes.items) |entry| std.testing.allocator.free(entry);
-    }
-
-    editor.setText("hello");
-    editor.insertTextAtCursor(" world");
-    editor.clear();
-
-    try std.testing.expectEqual(@as(usize, 3), changes.items.len);
-    try std.testing.expectEqualStrings("hello", changes.items[0]);
-    try std.testing.expectEqualStrings("hello world", changes.items[1]);
-    try std.testing.expectEqualStrings("", changes.items[2]);
-}
-
-test "editor addToHistory trims deduplicates and caps entries" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    editor.addToHistory("   ");
-    editor.addToHistory("  first  ");
-    editor.addToHistory("first");
-    editor.addToHistory("second");
-
-    try std.testing.expectEqual(@as(usize, 2), editor.history.items.len);
-    try std.testing.expectEqualStrings("second", editor.history.items[0]);
-    try std.testing.expectEqualStrings("first", editor.history.items[1]);
-
-    var i: u32 = 0;
-    while (i < 105) : (i += 1) {
-        var buf: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "prompt {d}", .{i});
-        editor.addToHistory(text);
-    }
-
-    try std.testing.expectEqual(@as(usize, 100), editor.history.items.len);
-    try std.testing.expectEqualStrings("prompt 104", editor.history.items[0]);
-    try std.testing.expectEqualStrings("prompt 5", editor.history.items[99]);
-}
-
-test "editor submit can be disabled through parity seam" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    var submit_calls: u32 = 0;
-    const Ctx = struct { count: *u32 };
-    var ctx = Ctx{ .count = &submit_calls };
-    editor.setOnSubmit(struct {
-        fn cb(_: []const u8, raw_ctx: ?*anyopaque) void {
-            const submit_ctx: *Ctx = @ptrCast(@alignCast(raw_ctx));
-            submit_ctx.count.* += 1;
-        }
-    }.cb, @ptrCast(&ctx));
-
-    _ = editor.handleInput(.{ .code = .char, .char = 'x' });
-    editor.setSubmitDisabled(true);
-    _ = editor.handleInput(.{ .code = .enter });
-    try std.testing.expectEqual(@as(u32, 0), submit_calls);
-
-    editor.setSubmitDisabled(false);
-    _ = editor.handleInput(.{ .code = .enter });
-    try std.testing.expectEqual(@as(u32, 1), submit_calls);
-}
-
-test "editor recalls most recent history entry on up from empty input" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    editor.addToHistory("first prompt");
-    editor.addToHistory("second prompt");
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqualStrings("second prompt", editor.getText());
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqualStrings("first prompt", editor.getText());
-}
-
-test "editor returns to empty input on down after history browse" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    editor.addToHistory("prompt");
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqualStrings("prompt", editor.getText());
-
-    _ = editor.handleInput(.{ .code = .down });
-    try std.testing.expectEqualStrings("", editor.getText());
-}
-
-test "editor keeps multiline history active until cursor reaches top or bottom visual line" {
-    var editor = Editor.init(std.testing.allocator);
-    defer editor.deinit();
-
-    editor.addToHistory("older entry");
-    editor.addToHistory("line1\nline2\nline3");
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
-
-    _ = editor.handleInput(.{ .code = .up });
-    try std.testing.expectEqualStrings("older entry", editor.getText());
-
-    _ = editor.handleInput(.{ .code = .down });
-    try std.testing.expectEqualStrings("line1\nline2\nline3", editor.getText());
-}
