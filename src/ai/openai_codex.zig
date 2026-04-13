@@ -68,6 +68,7 @@ pub const OpenAICodexProvider = struct {
             .auth = .{ .build = buildBearerAuth },
             .extra_headers = extra_hdrs[0..n_hdrs],
             .provider_label = "openai-codex-responses",
+            .event_mapper = .{ .map = core.codexEventMapper },
             .build_request = &buildCodexRequestJson,
         }, callback, callback_ctx);
     }
@@ -99,6 +100,7 @@ pub const OpenAICodexProvider = struct {
             .auth = .{ .build = buildBearerAuth },
             .extra_headers = extra_hdrs[0..n_hdrs],
             .provider_label = "openai-codex-responses",
+            .event_mapper = .{ .map = core.codexEventMapper },
             .build_request = &buildCodexRequestJson,
             .reasoning_effort = effort,
             .reasoning_summary = if (effort != null) "auto" else null,
@@ -128,9 +130,9 @@ fn buildCodexRequestJson(
     out: *std.ArrayListUnmanaged(u8),
     model: protocol.Model,
     context: protocol.Context,
+    options: protocol.StreamOptions,
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
-    session_id: ?[]const u8,
 ) anyerror!void {
     var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
@@ -162,9 +164,14 @@ fn buildCodexRequestJson(
     try jw.write("reasoning.encrypted_content");
     try jw.endArray();
 
-    if (session_id) |sid| {
+    if (options.session_id) |sid| {
         try jw.objectField("prompt_cache_key");
         try jw.write(sid);
+    }
+
+    if (options.temperature) |temperature| {
+        try jw.objectField("temperature");
+        try jw.write(temperature);
     }
 
     try jw.objectField("tool_choice");
@@ -174,7 +181,7 @@ fn buildCodexRequestJson(
     try jw.write(true);
 
     if (context.tools) |tools| {
-        try core.writeTools(&jw, tools, false);
+        try core.writeTools(&jw, tools, .null_value);
     }
 
     if (model.reasoning and reasoning_effort != null) {
@@ -311,7 +318,7 @@ test "buildCodexRequestJson includes prompt_cache_key when session_id is set" {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
 
-    try buildCodexRequestJson(alloc, &out, model, ctx, null, null, "session-abc");
+    try buildCodexRequestJson(alloc, &out, model, ctx, .{ .session_id = "session-abc" }, null, null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_key\":\"session-abc\"") != null);
 }
 
@@ -334,8 +341,39 @@ test "buildCodexRequestJson omits reasoning when no reasoning effort is requeste
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
 
-    try buildCodexRequestJson(alloc, &out, model, ctx, null, null, null);
+    try buildCodexRequestJson(alloc, &out, model, ctx, .{}, null, null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning\"") == null);
+}
+
+test "buildCodexRequestJson writes codex tool strict null and temperature" {
+    const alloc = testing.allocator;
+    const model = protocol.Model{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+    var params = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer params.object.deinit();
+    const tool = protocol.Tool{
+        .name = "bash",
+        .description = "run shell",
+        .parameters = params,
+    };
+    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
+    const ctx = protocol.Context{ .messages = &.{msg}, .tools = &.{tool} };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try buildCodexRequestJson(alloc, &out, model, ctx, .{ .temperature = 0.25 }, null, null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"strict\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"temperature\":0.25") != null);
 }
 
 fn buildBearerAuth(

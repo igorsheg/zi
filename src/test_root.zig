@@ -12,6 +12,7 @@ test {
     _ = @import("coding_agent.zig");
     _ = @import("system_prompt.zig");
     _ = @import("resources/root.zig");
+    _ = @import("search/root.zig");
     _ = @import("skills/root.zig");
     _ = @import("tools/bash.zig");
     _ = @import("tui/root.zig");

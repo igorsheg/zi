@@ -7,7 +7,7 @@ const theme_mod = @import("../theme.zig");
 const box_chrome = @import("../box_chrome.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const cell_mod = @import("../cell.zig");
-const fuzzy_mod = @import("../fuzzy.zig");
+const search = @import("../../search/root.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -243,7 +243,7 @@ pub const ListPicker = struct {
             for (0..count) |i| {
                 texts[i] = self.getSearchText(i);
             }
-            const n = fuzzy_mod.fuzzyFilter(query, texts[0..count], &self.match_indices);
+            const n = search.plain.filter(query, texts[0..count], &self.match_indices);
             for (0..n) |i| {
                 const source_index = self.match_indices[i];
                 self.filtered_source_indices[i] = source_index;

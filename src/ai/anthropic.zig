@@ -392,11 +392,10 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
     const event_type = json_value.asString(obj.get("type")) orelse return;
 
     if (std.mem.eql(u8, event_type, "message_start")) {
-        // Shape: { message: { usage: { input_tokens, output_tokens } } }
+        // Shape: { message: { usage: { input_tokens, output_tokens, cache_read_input_tokens?, cache_creation_input_tokens? } } }
         const message = json_value.asObject(obj.get("message")) orelse return;
         const usage = json_value.asObject(message.get("usage")) orelse return;
-        if (json_value.asU64(usage.get("input_tokens"))) |n| state.partial.usage.input = n;
-        if (json_value.asU64(usage.get("output_tokens"))) |n| state.partial.usage.output = n;
+        updateUsageFromObject(&state.partial.usage, usage);
     } else if (std.mem.eql(u8, event_type, "content_block_start")) {
         // Shape: { index, content_block: { type, id?, name?, ... } }
         const block_json = json_value.asObject(obj.get("content_block")) orelse return;
@@ -491,7 +490,7 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             },
         }
     } else if (std.mem.eql(u8, event_type, "message_delta")) {
-        // Shape: { delta: { stop_reason, stop_sequence }, usage: { output_tokens } }
+        // Shape: { delta: { stop_reason, stop_sequence }, usage: { output_tokens, input_tokens?, cache_read_input_tokens?, cache_creation_input_tokens? } }
         if (json_value.asObject(obj.get("delta"))) |delta_obj| {
             if (json_value.asString(delta_obj.get("stop_reason"))) |reason| {
                 if (std.mem.eql(u8, reason, "end_turn")) {
@@ -504,8 +503,7 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             }
         }
         if (json_value.asObject(obj.get("usage"))) |usage| {
-            if (json_value.asU64(usage.get("input_tokens"))) |n| state.partial.usage.input = n;
-            if (json_value.asU64(usage.get("output_tokens"))) |n| state.partial.usage.output = n;
+            updateUsageFromObject(&state.partial.usage, usage);
         }
     } else if (std.mem.eql(u8, event_type, "error")) {
         // Shape: { error: { type, message } }
@@ -519,6 +517,14 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
         };
         emitFailure(state.allocator, callback, callback_ctx, state.partial.api, state.partial.provider, state.partial.model, failure, err_msg);
     }
+}
+
+fn updateUsageFromObject(usage: *protocol.Usage, obj: std.json.ObjectMap) void {
+    if (json_value.asU64(obj.get("input_tokens"))) |n| usage.input = n;
+    if (json_value.asU64(obj.get("output_tokens"))) |n| usage.output = n;
+    if (json_value.asU64(obj.get("cache_read_input_tokens"))) |n| usage.cache_read = n;
+    if (json_value.asU64(obj.get("cache_creation_input_tokens"))) |n| usage.cache_write = n;
+    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
 // =================================================================
@@ -1018,4 +1024,60 @@ test "SSE parse: braces inside string values survive a real Edit-tool payload" {
     // literal characters in the result — no truncation, no lost
     // closing brace.
     try testing.expectEqualStrings("{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}", partial);
+}
+
+test "Anthropic SSE usage keeps cache tokens in total_tokens" {
+    var turn_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer turn_arena.deinit();
+    var scratch_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_arena.deinit();
+
+    var state = StreamState{
+        .allocator = turn_arena.allocator(),
+        .scratch = &scratch_arena,
+        .content_blocks = .empty,
+        .partial = .{
+            .content = &.{},
+            .api = .anthropic_messages,
+            .provider = .anthropic,
+            .model = "claude-test",
+            .usage = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total_tokens = 0,
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+            },
+            .stop_reason = .stop,
+            .timestamp = 0,
+        },
+        .stop_reason = null,
+    };
+    defer {
+        for (state.content_blocks.items) |*block| block.deinit(turn_arena.allocator());
+        state.content_blocks.deinit(turn_arena.allocator());
+    }
+
+    const Noop = struct {
+        fn callback(_: protocol.AssistantMessageEvent, _: ?*anyopaque) void {}
+    };
+
+    handleSseEvent(.{ .data = 
+        \\{"type":"message_start","message":{"usage":{"input_tokens":1200,"output_tokens":10,"cache_read_input_tokens":800,"cache_creation_input_tokens":400}}}
+    }, &state, &Noop.callback, null);
+    try testing.expectEqual(@as(u64, 1200), state.partial.usage.input);
+    try testing.expectEqual(@as(u64, 10), state.partial.usage.output);
+    try testing.expectEqual(@as(u64, 800), state.partial.usage.cache_read);
+    try testing.expectEqual(@as(u64, 400), state.partial.usage.cache_write);
+    try testing.expectEqual(@as(u64, 2410), state.partial.usage.total_tokens);
+
+    handleSseEvent(.{ .data = 
+        \\{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":25,"cache_read_input_tokens":900}} 
+    }, &state, &Noop.callback, null);
+    try testing.expectEqual(@as(u64, 1200), state.partial.usage.input);
+    try testing.expectEqual(@as(u64, 25), state.partial.usage.output);
+    try testing.expectEqual(@as(u64, 900), state.partial.usage.cache_read);
+    try testing.expectEqual(@as(u64, 400), state.partial.usage.cache_write);
+    try testing.expectEqual(@as(u64, 2525), state.partial.usage.total_tokens);
 }

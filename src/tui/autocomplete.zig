@@ -1,5 +1,5 @@
 const std = @import("std");
-const fuzzy = @import("fuzzy.zig");
+const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
 const SelectItem = select_list_mod.SelectItem;
 
@@ -130,7 +130,7 @@ pub const SlashCommandProvider = struct {
             n += 1;
         }
 
-        const matched = fuzzy.fuzzyFilter(
+        const matched = search.plain.filter(
             prefix_after_slash,
             self.text_buf[0..n],
             &self.index_buf,

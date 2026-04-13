@@ -50,6 +50,7 @@ const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const provider_failure = @import("provider_failure.zig");
 const partial_json = @import("../json/partial.zig");
+const replay = @import("openai_responses_replay.zig");
 const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 const AbortGuard = @import("../abort_guard.zig").AbortGuard;
 
@@ -70,6 +71,21 @@ pub const AuthFactory = struct {
 };
 
 /// Per-call configuration injected by the wrapping provider.
+pub const EventMapOutcome = union(enum) {
+    pass_through,
+    normalized: struct {
+        event_type: []const u8,
+        stop_after_event: bool = false,
+        normalize_terminal_status: bool = false,
+    },
+    fail: []const u8,
+};
+
+pub const EventMapper = struct {
+    ctx: ?*anyopaque = null,
+    map: *const fn (allocator: std.mem.Allocator, root: std.json.Value, event_type: []const u8, ctx: ?*anyopaque) anyerror!EventMapOutcome,
+};
+
 pub const CoreOptions = struct {
     /// Override base URL. If null, `model.base_url` is used. Phase 3c
     /// (openai-codex) will pass a hard-coded chatgpt.com URL here.
@@ -84,6 +100,8 @@ pub const CoreOptions = struct {
     extra_headers: []const protocol.Header = &.{},
     /// Provider label for diagnostics in error messages.
     provider_label: []const u8 = "openai-responses",
+    /// Codex-specific normalization seam before shared responses processing.
+    event_mapper: EventMapper = .{ .map = identityEventMapper },
     /// Reasoning effort string (e.g. "low", "medium", "high").
     /// Null means the caller didn't set a level — provider defaults apply.
     reasoning_effort: ?[]const u8 = null,
@@ -97,9 +115,9 @@ pub const CoreOptions = struct {
         out: *std.ArrayListUnmanaged(u8),
         model: protocol.Model,
         context: protocol.Context,
+        options: protocol.StreamOptions,
         reasoning_effort: ?[]const u8,
         reasoning_summary: ?[]const u8,
-        session_id: ?[]const u8,
     ) anyerror!void = null,
 };
 
@@ -119,7 +137,7 @@ pub fn streamCore(
     var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer payload_buf.deinit(allocator);
     const build_fn = core.build_request orelse &buildRequestJson;
-    build_fn(allocator, &payload_buf, model, context, core.reasoning_effort, core.reasoning_summary, options.session_id) catch |err| {
+    build_fn(allocator, &payload_buf, model, context, options, core.reasoning_effort, core.reasoning_summary) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)});
         return;
     };
@@ -227,7 +245,7 @@ pub fn streamCore(
     }
 
     const reader = response.reader(&transfer_buf);
-    processStream(allocator, reader, model, options.signal, core.provider_label, callback, callback_ctx);
+    processStreamMapped(allocator, reader, model, options.signal, core.provider_label, core.event_mapper, callback, callback_ctx);
 }
 
 // =============================================================================
@@ -235,6 +253,7 @@ pub fn streamCore(
 // =============================================================================
 
 const ItemKind = enum { reasoning, message, function_call };
+const MessagePartKind = enum { output_text, refusal };
 
 const ItemState = struct {
     kind: ItemKind,
@@ -249,6 +268,7 @@ const ItemState = struct {
 
     // message fields
     content_part_started: bool = false,
+    message_part_kind: ?MessagePartKind = null,
     msg_id: []const u8 = "",
     msg_phase: ?[]const u8 = null,
     text_signature: ?[]const u8 = null,
@@ -398,6 +418,19 @@ pub fn processStream(
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
 ) void {
+    processStreamMapped(allocator, reader, model, abort_flag, provider_label, .{ .map = identityEventMapper }, callback, callback_ctx);
+}
+
+pub fn processStreamMapped(
+    allocator: std.mem.Allocator,
+    reader: anytype,
+    model: protocol.Model,
+    abort_flag: AbortSignal,
+    provider_label: []const u8,
+    event_mapper: EventMapper,
+    callback: ai_provider.EventCallback,
+    callback_ctx: ?*anyopaque,
+) void {
     var scratch_arena = std.heap.ArenaAllocator.init(allocator);
     defer scratch_arena.deinit();
 
@@ -412,12 +445,13 @@ pub fn processStream(
         allocator: std.mem.Allocator,
         state: *StreamState,
         scratch: *std.heap.ArenaAllocator,
+        mapper: EventMapper,
         callback: ai_provider.EventCallback,
         callback_ctx: ?*anyopaque,
 
         fn onEvent(evt: sse.SseEvent, ctx: ?*anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            try handleEvent(self.allocator, self.state, self.scratch, evt, self.callback, self.callback_ctx);
+            try handleEvent(self.allocator, self.state, self.scratch, evt, self.mapper, self.callback, self.callback_ctx);
         }
     };
 
@@ -425,6 +459,7 @@ pub fn processStream(
         .allocator = allocator,
         .state = &state,
         .scratch = &scratch_arena,
+        .mapper = event_mapper,
         .callback = callback,
         .callback_ctx = callback_ctx,
     };
@@ -433,11 +468,14 @@ pub fn processStream(
         .func = &StreamCtx.onEvent,
         .ctx = @ptrCast(&stream_ctx),
     }) catch |err| {
-        if (abort_flag.isAborted()) {
-            state.partial.stop_reason = .aborted;
-        } else {
-            emitError(allocator, callback, callback_ctx, model, provider_label, "stream read error: {s}", .{@errorName(err)});
-            return;
+        switch (err) {
+            error.StopStreaming => {},
+            else => if (abort_flag.isAborted()) {
+                state.partial.stop_reason = .aborted;
+            } else {
+                emitError(allocator, callback, callback_ctx, model, provider_label, "stream read error: {s}", .{@errorName(err)});
+                return;
+            },
         }
     };
 
@@ -461,13 +499,14 @@ pub fn processStream(
     }
 }
 
-const HandleErr = error{OutOfMemory};
+const HandleErr = error{ OutOfMemory, StopStreaming };
 
 fn handleEvent(
     allocator: std.mem.Allocator,
     state: *StreamState,
     scratch: *std.heap.ArenaAllocator,
     evt: sse.SseEvent,
+    event_mapper: EventMapper,
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
 ) HandleErr!void {
@@ -479,7 +518,25 @@ fn handleEvent(
 
     const type_v = root.object.get("type") orelse return;
     if (type_v != .string) return;
-    const t = type_v.string;
+    const raw_type = type_v.string;
+
+    var mapped_type = raw_type;
+    var stop_after_event = false;
+    var normalize_terminal_status = false;
+    switch (event_mapper.map(allocator, root, raw_type, event_mapper.ctx) catch return) {
+        .pass_through => {},
+        .normalized => |normalized| {
+            mapped_type = normalized.event_type;
+            stop_after_event = normalized.stop_after_event;
+            normalize_terminal_status = normalized.normalize_terminal_status;
+        },
+        .fail => |message| {
+            state.partial.stop_reason = .@"error";
+            state.partial.error_message = message;
+            return error.StopStreaming;
+        },
+    }
+    const t = mapped_type;
 
     // ── lifecycle: response id capture ─────────────────────────────
     if (std.mem.eql(u8, t, "response.created")) {
@@ -586,7 +643,19 @@ fn handleEvent(
     if (std.mem.eql(u8, t, "response.content_part.added")) {
         if (state.current) |cur| {
             const it = &state.items.items[cur];
-            if (it.kind == .message) it.content_part_started = true;
+            if (it.kind == .message) {
+                if (root.object.get("part")) |part| if (part == .object) {
+                    if (part.object.get("type")) |part_type| if (part_type == .string) {
+                        if (std.mem.eql(u8, part_type.string, "output_text")) {
+                            it.content_part_started = true;
+                            it.message_part_kind = .output_text;
+                        } else if (std.mem.eql(u8, part_type.string, "refusal")) {
+                            it.content_part_started = true;
+                            it.message_part_kind = .refusal;
+                        }
+                    };
+                };
+            }
         }
         return;
     }
@@ -597,6 +666,8 @@ fn handleEvent(
         const cur = state.current orelse return;
         const it = &state.items.items[cur];
         if (it.kind != .message or !it.content_part_started) return;
+        if (std.mem.eql(u8, t, "response.output_text.delta") and it.message_part_kind != .output_text) return;
+        if (std.mem.eql(u8, t, "response.refusal.delta") and it.message_part_kind != .refusal) return;
         const dv = root.object.get("delta") orelse return;
         if (dv != .string) return;
         try it.text_buf.appendSlice(allocator, dv.string);
@@ -650,6 +721,11 @@ fn handleEvent(
         const st = &state.items.items[cur];
 
         if (std.mem.eql(u8, it_type, "reasoning") and st.kind == .reasoning) {
+            const final_text = finalThinkingTextFromItem(allocator, item) catch null;
+            if (final_text) |text| {
+                defer allocator.free(text);
+                try clearAndSetText(&st.text_buf, allocator, text);
+            }
             // Stringify the entire item as the thinking signature so
             // multi-turn pairing preserves `encrypted_content` and any
             // future fields the responses API adds (matches pi-mono's
@@ -663,12 +739,17 @@ fn handleEvent(
             } }, callback_ctx);
             state.current = null;
         } else if (std.mem.eql(u8, it_type, "message") and st.kind == .message) {
-            // pi-mono extracts msg_id + phase from the item; we already
-            // captured them on output_item.added. Encode as TextSignatureV1.
-            // If the item carries an updated id (rare), prefer it.
             if (item.object.get("id")) |id| if (id == .string) {
                 st.msg_id = allocator.dupe(u8, id.string) catch st.msg_id;
             };
+            if (item.object.get("phase")) |phase| if (phase == .string) {
+                st.msg_phase = allocator.dupe(u8, phase.string) catch st.msg_phase;
+            };
+            const final_text = finalMessageTextFromItem(allocator, item) catch null;
+            if (final_text) |text| {
+                defer allocator.free(text);
+                try clearAndSetText(&st.text_buf, allocator, text);
+            }
             st.text_signature = encodeTextSignatureV1(allocator, st.msg_id, st.msg_phase) catch null;
             try updatePartialContent(allocator, state);
             callback(.{ .text_end = .{
@@ -678,10 +759,24 @@ fn handleEvent(
             } }, callback_ctx);
             state.current = null;
         } else if (std.mem.eql(u8, it_type, "function_call") and st.kind == .function_call) {
+            if (item.object.get("call_id")) |call_id| if (call_id == .string) {
+                st.tool_call_id = allocator.dupe(u8, call_id.string) catch st.tool_call_id;
+            };
+            if (item.object.get("id")) |item_id| if (item_id == .string) {
+                st.tool_item_id = allocator.dupe(u8, item_id.string) catch st.tool_item_id;
+            };
+            if (item.object.get("name")) |name| if (name == .string) {
+                st.tool_name = allocator.dupe(u8, name.string) catch st.tool_name;
+            };
+            if (item.object.get("arguments")) |arguments| if (arguments == .string) {
+                st.tool_args_partial.clearRetainingCapacity();
+                try st.tool_args_partial.appendSlice(allocator, arguments.string);
+            };
             // Final reparse via the caller's allocator so the value
             // outlives the per-delta scratch arena.
             const final_args = partial_json.parseStreaming(allocator, st.tool_args_partial.items) catch .null;
             st.tool_args_parsed = final_args;
+            st.tool_composite_id = "";
             try ensureToolCompositeId(allocator, st);
             try updatePartialContent(allocator, state);
             const tc: protocol.ToolCall = .{
@@ -714,7 +809,7 @@ fn handleEvent(
         };
         if (resp.object.get("usage")) |u| if (u == .object) parseUsage(u, &state.partial);
         if (resp.object.get("status")) |s| if (s == .string) {
-            state.partial.stop_reason = mapResponseStatus(s.string);
+            state.partial.stop_reason = mapResponseStatus(if (normalize_terminal_status) normalizeCodexStatus(s.string) else s.string);
         };
         // pi-mono: if any tool_call block exists and stop is the default
         // `stop`, override to `toolUse`.
@@ -724,6 +819,7 @@ fn handleEvent(
                 break;
             };
         }
+        if (stop_after_event) return error.StopStreaming;
         return;
     }
 
@@ -739,6 +835,52 @@ fn handleEvent(
 // =============================================================================
 // Rendering helpers
 // =============================================================================
+
+fn clearAndSetText(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    buf.clearRetainingCapacity();
+    try buf.appendSlice(allocator, text);
+}
+
+fn finalThinkingTextFromItem(allocator: std.mem.Allocator, item: std.json.Value) ![]const u8 {
+    if (item != .object) return allocator.dupe(u8, "");
+    const summary = item.object.get("summary") orelse return allocator.dupe(u8, "");
+    if (summary != .array) return allocator.dupe(u8, "");
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (summary.array.items, 0..) |part, idx| {
+        if (part != .object) continue;
+        const text = part.object.get("text") orelse continue;
+        if (text != .string) continue;
+        if (idx > 0) try out.appendSlice(allocator, "\n\n");
+        try out.appendSlice(allocator, text.string);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn finalMessageTextFromItem(allocator: std.mem.Allocator, item: std.json.Value) ![]const u8 {
+    if (item != .object) return allocator.dupe(u8, "");
+    const content = item.object.get("content") orelse return allocator.dupe(u8, "");
+    if (content != .array) return allocator.dupe(u8, "");
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const part_type = part.object.get("type") orelse continue;
+        if (part_type != .string) continue;
+        if (std.mem.eql(u8, part_type.string, "output_text")) {
+            const text = part.object.get("text") orelse continue;
+            if (text != .string) continue;
+            try out.appendSlice(allocator, text.string);
+        } else if (std.mem.eql(u8, part_type.string, "refusal")) {
+            const refusal = part.object.get("refusal") orelse continue;
+            if (refusal != .string) continue;
+            try out.appendSlice(allocator, refusal.string);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 fn updatePartialContent(allocator: std.mem.Allocator, state: *StreamState) HandleErr!void {
     const buf = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, state.items.items.len);
@@ -802,6 +944,64 @@ fn encodeTextSignatureV1(
     }
     try jw.endObject();
     return out.toOwnedSlice();
+}
+
+fn identityEventMapper(
+    _: std.mem.Allocator,
+    _: std.json.Value,
+    _: []const u8,
+    _: ?*anyopaque,
+) anyerror!EventMapOutcome {
+    return .pass_through;
+}
+
+pub fn codexEventMapper(
+    allocator: std.mem.Allocator,
+    root: std.json.Value,
+    event_type: []const u8,
+    _: ?*anyopaque,
+) anyerror!EventMapOutcome {
+    if (std.mem.eql(u8, event_type, "error")) {
+        const code = if (root.object.get("code")) |c| if (c == .string) c.string else "" else "";
+        const message = if (root.object.get("message")) |m| if (m == .string) m.string else "" else "";
+        if (message.len > 0) return .{ .fail = try std.fmt.allocPrint(allocator, "Codex error: {s}", .{message}) };
+        if (code.len > 0) return .{ .fail = try std.fmt.allocPrint(allocator, "Codex error: {s}", .{code}) };
+        return .{ .fail = try std.fmt.allocPrint(allocator, "Codex error: {s}", .{try stringifyJsonValue(allocator, root)}) };
+    }
+
+    if (std.mem.eql(u8, event_type, "response.failed")) {
+        if (root.object.get("response")) |resp| if (resp == .object) {
+            if (resp.object.get("error")) |err| if (err == .object) {
+                if (err.object.get("message")) |message| if (message == .string and message.string.len > 0) {
+                    return .{ .fail = try allocator.dupe(u8, message.string) };
+                };
+            };
+        };
+        return .{ .fail = try allocator.dupe(u8, "Codex response failed") };
+    }
+
+    if (std.mem.eql(u8, event_type, "response.done") or
+        std.mem.eql(u8, event_type, "response.completed") or
+        std.mem.eql(u8, event_type, "response.incomplete"))
+    {
+        return .{ .normalized = .{
+            .event_type = "response.completed",
+            .stop_after_event = true,
+            .normalize_terminal_status = true,
+        } };
+    }
+
+    return .pass_through;
+}
+
+fn normalizeCodexStatus(status: []const u8) []const u8 {
+    if (std.mem.eql(u8, status, "completed")) return "completed";
+    if (std.mem.eql(u8, status, "incomplete")) return "incomplete";
+    if (std.mem.eql(u8, status, "failed")) return "failed";
+    if (std.mem.eql(u8, status, "cancelled")) return "cancelled";
+    if (std.mem.eql(u8, status, "queued")) return "queued";
+    if (std.mem.eql(u8, status, "in_progress")) return "in_progress";
+    return "completed";
 }
 
 fn parseUsage(usage: std.json.Value, partial: *protocol.AssistantMessage) void {
@@ -897,7 +1097,13 @@ pub fn writeBaseFields(jw: *std.json.Stringify, model: protocol.Model) !void {
     try jw.write(false);
 }
 
-pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, include_strict: bool) !void {
+pub const ToolStrictMode = enum {
+    omit,
+    false_value,
+    null_value,
+};
+
+pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, strict_mode: ToolStrictMode) !void {
     try jw.objectField("tools");
     try jw.beginArray();
     for (tools) |tool| {
@@ -910,13 +1116,33 @@ pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, include
         try jw.write(tool.description);
         try jw.objectField("parameters");
         try jw.write(tool.parameters);
-        if (include_strict) {
-            try jw.objectField("strict");
-            try jw.write(false);
+        switch (strict_mode) {
+            .omit => {},
+            .false_value => {
+                try jw.objectField("strict");
+                try jw.write(false);
+            },
+            .null_value => {
+                try jw.objectField("strict");
+                try jw.write(null);
+            },
         }
         try jw.endObject();
     }
     try jw.endArray();
+}
+
+fn resolveCacheRetention(cache_retention: ?protocol.CacheRetention) protocol.CacheRetention {
+    if (cache_retention) |retention| return retention;
+    const env = std.posix.getenv("PI_CACHE_RETENTION") orelse return .short;
+    if (std.mem.eql(u8, env, "long")) return .long;
+    return .short;
+}
+
+fn getPromptCacheRetention(base_url: []const u8, cache_retention: protocol.CacheRetention) ?[]const u8 {
+    if (cache_retention != .long) return null;
+    if (std.mem.indexOf(u8, base_url, "api.openai.com") != null) return "24h";
+    return null;
 }
 
 pub fn buildRequestJson(
@@ -924,11 +1150,10 @@ pub fn buildRequestJson(
     out: *std.ArrayListUnmanaged(u8),
     model: protocol.Model,
     context: protocol.Context,
+    options: protocol.StreamOptions,
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
-    session_id: ?[]const u8,
 ) !void {
-    _ = session_id;
     var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
@@ -941,8 +1166,30 @@ pub fn buildRequestJson(
     try writeInput(allocator, &jw, model, context);
     try jw.endArray();
 
+    const cache_retention = resolveCacheRetention(options.cache_retention);
+    if (cache_retention != .none) {
+        if (options.session_id) |sid| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(sid);
+        }
+    }
+    if (getPromptCacheRetention(model.base_url, cache_retention)) |retention| {
+        try jw.objectField("prompt_cache_retention");
+        try jw.write(retention);
+    }
+
+    if (options.max_tokens) |max_tokens| {
+        try jw.objectField("max_output_tokens");
+        try jw.write(max_tokens);
+    }
+
+    if (options.temperature) |temperature| {
+        try jw.objectField("temperature");
+        try jw.write(temperature);
+    }
+
     if (context.tools) |tools| {
-        try writeTools(&jw, tools, true);
+        try writeTools(&jw, tools, .false_value);
     }
 
     if (model.reasoning) {
@@ -959,7 +1206,7 @@ pub fn buildRequestJson(
             try jw.beginArray();
             try jw.write("reasoning.encrypted_content");
             try jw.endArray();
-        } else {
+        } else if (model.provider != .github_copilot) {
             // No reasoning requested — send effort: "none"
             // pi-mono: openai-responses.ts:224
             try jw.objectField("reasoning");
@@ -990,73 +1237,7 @@ pub fn writeInputOpts(
     context: protocol.Context,
     include_system_prompt: bool,
 ) !void {
-    if (include_system_prompt) {
-        if (context.system_prompt) |sys| {
-            try jw.beginObject();
-            try jw.objectField("role");
-            try jw.write(if (model.reasoning) "developer" else "system");
-            try jw.objectField("content");
-            try jw.write(sys);
-            try jw.endObject();
-        }
-    }
-
-    var tool_id_map: std.ArrayListUnmanaged(ToolCallIdMapping) = .empty;
-    defer {
-        for (tool_id_map.items) |mapping| mapping.deinit(allocator);
-        tool_id_map.deinit(allocator);
-    }
-
-    var pending_tool_calls: std.ArrayListUnmanaged(PendingToolCall) = .empty;
-    defer {
-        for (pending_tool_calls.items) |pending| pending.deinit(allocator);
-        pending_tool_calls.deinit(allocator);
-    }
-
-    var existing_tool_result_ids: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (existing_tool_result_ids.items) |id| allocator.free(id);
-        existing_tool_result_ids.deinit(allocator);
-    }
-
-    var msg_index: usize = 0;
-    for (context.messages) |msg| {
-        defer msg_index += 1;
-        switch (msg) {
-            .user => |u| {
-                try flushPendingSyntheticToolResults(allocator, jw, &pending_tool_calls, existing_tool_result_ids.items, &tool_id_map);
-                for (existing_tool_result_ids.items) |id| allocator.free(id);
-                existing_tool_result_ids.clearRetainingCapacity();
-                try writeUserMessage(allocator, jw, u);
-            },
-            .assistant => |a| {
-                try flushPendingSyntheticToolResults(allocator, jw, &pending_tool_calls, existing_tool_result_ids.items, &tool_id_map);
-                for (existing_tool_result_ids.items) |id| allocator.free(id);
-                existing_tool_result_ids.clearRetainingCapacity();
-
-                if (a.stop_reason == .@"error" or a.stop_reason == .aborted) continue;
-
-                try writeAssistantMessage(allocator, jw, model, a, msg_index, &tool_id_map);
-
-                for (pending_tool_calls.items) |pending| pending.deinit(allocator);
-                pending_tool_calls.clearRetainingCapacity();
-                for (a.content) |block| switch (block) {
-                    .tool_call => |tcall| {
-                        try pending_tool_calls.append(allocator, .{
-                            .id = try getMappedToolCallId(allocator, tool_id_map.items, tcall.id),
-                            .name = try allocator.dupe(u8, tcall.name),
-                        });
-                    },
-                    else => {},
-                };
-            },
-            .tool_result => |tr| {
-                const mapped_tool_call_id = try getMappedToolCallId(allocator, tool_id_map.items, tr.tool_call_id);
-                try existing_tool_result_ids.append(allocator, mapped_tool_call_id);
-                try writeToolResultMessage(allocator, jw, tr, mapped_tool_call_id);
-            },
-        }
-    }
+    try replay.writeResponsesInput(allocator, jw, model, context, .{ .include_system_prompt = include_system_prompt });
 }
 
 const ToolCallIdMapping = struct {
@@ -1294,11 +1475,6 @@ fn writeAssistantMessage(
                 const fallback = try std.fmt.allocPrint(allocator, "msg_{d}", .{msg_index});
                 msg_id_alloc = fallback;
                 msg_id = fallback;
-            }
-            if (target_model.api == .openai_codex_responses and assistantHasToolCalls(a)) {
-                if (msg_phase) |phase| {
-                    if (std.mem.eql(u8, phase, "commentary")) continue;
-                }
             }
             try jw.beginObject();
             try jw.objectField("type");
@@ -1583,7 +1759,12 @@ const test_model: protocol.Model = .{
 /// Mirrors the pattern in openai_completions.zig tests. Uses page_allocator
 /// for the per-line scratch since these are unit tests and allocator churn
 /// doesn't matter.
-fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestCollector) void {
+fn runProcessWithMapper(
+    arena: std.mem.Allocator,
+    sse_bytes: []const u8,
+    event_mapper: EventMapper,
+    collector: *TestCollector,
+) void {
     var stream = std.io.fixedBufferStream(sse_bytes);
     const Reader = struct {
         s: *std.io.FixedBufferStream([]const u8),
@@ -1604,7 +1785,11 @@ fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestC
         }
     };
     var r = Reader{ .s = &stream };
-    processStream(arena, &r, test_model, AbortSignal.none, "openai-responses", TestCollector.cb, collector);
+    processStreamMapped(arena, &r, test_model, AbortSignal.none, "openai-responses", event_mapper, TestCollector.cb, collector);
+}
+
+fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestCollector) void {
+    runProcessWithMapper(arena, sse_bytes, .{ .map = identityEventMapper }, collector);
 }
 
 test "processStream maps reasoning summary deltas to a thinking block" {
@@ -1694,6 +1879,81 @@ test "processStream concatenates function_call argument chunks and overrides sto
     try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.toolUse, col.done_reason.?);
 }
 
+test "processStreamMapped codex mapper stops after terminal response.completed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var col = TestCollector{ .allocator = testing.allocator };
+    defer col.deinit();
+
+    const sse_bytes =
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
+        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\" ignored\"}\n\n";
+
+    runProcessWithMapper(alloc, sse_bytes, .{ .map = codexEventMapper }, &col);
+
+    try testing.expectEqualStrings("Hello", col.text.items);
+    try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.stop, col.done_reason.?);
+}
+
+test "processStreamMapped codex mapper normalizes response.done and response.incomplete" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var done_col = TestCollector{ .allocator = testing.allocator };
+    defer done_col.deinit();
+    const done_sse =
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
+        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
+        "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\"}}\n\n";
+    runProcessWithMapper(alloc, done_sse, .{ .map = codexEventMapper }, &done_col);
+    try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.stop, done_col.done_reason.?);
+
+    var incomplete_col = TestCollector{ .allocator = testing.allocator };
+    defer incomplete_col.deinit();
+    const incomplete_sse =
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
+        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n";
+    runProcessWithMapper(alloc, incomplete_sse, .{ .map = codexEventMapper }, &incomplete_col);
+    try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.length, incomplete_col.done_reason.?);
+}
+
+test "processStream uses final output_item payload for message phase and tool ids" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var col = TestCollector{ .allocator = testing.allocator };
+    defer col.deinit();
+
+    const sse_bytes =
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_added\"}}\n\n" ++
+        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"draft\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_final\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"final text\"}]}}\n\n" ++
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_added\",\"call_id\":\"call_added\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"draft\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"cmd\\\":\\\"draft\\\"}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_final\",\"call_id\":\"call_final\",\"name\":\"bash_final\",\"arguments\":\"{\\\"cmd\\\":\\\"final\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+
+    runProcess(alloc, sse_bytes, &col);
+
+    try testing.expectEqualStrings("final text", col.text.items);
+    try testing.expectEqualStrings("call_final|fc_final", col.final_tool_id);
+    try testing.expectEqualStrings("bash_final", col.final_tool_name);
+}
+
 test "normalizeResponsesToolCallId rewrites foreign tool call ids for codex-compatible targets" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1744,7 +2004,7 @@ test "buildRequestJson emits store:false, input[], and reasoning:none for reason
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    try buildRequestJson(alloc, &out, test_model, ctx, null, null, null);
+    try buildRequestJson(alloc, &out, test_model, ctx, .{}, null, null);
 
     try testing.expect(std.mem.indexOf(u8, out.items, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"store\":false") != null);
@@ -1752,6 +2012,32 @@ test "buildRequestJson emits store:false, input[], and reasoning:none for reason
     try testing.expect(std.mem.indexOf(u8, out.items, "\"type\":\"input_text\"") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning\"") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"effort\":\"none\"") != null);
+}
+
+test "buildRequestJson includes prompt cache, max_output_tokens, and temperature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ctx: protocol.Context = .{
+        .messages = &.{
+            .{ .user = .{ .content = .{ .text = "hi" }, .timestamp = 0 } },
+        },
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try buildRequestJson(alloc, &out, test_model, ctx, .{
+        .session_id = "session-123",
+        .cache_retention = .long,
+        .max_tokens = 321,
+        .temperature = 0.5,
+    }, null, null);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_key\":\"session-123\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_retention\":\"24h\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"max_output_tokens\":321") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"temperature\":0.5") != null);
 }
 
 test "writeInputOpts preserves same-model tool call ids" {
@@ -1972,49 +2258,4 @@ test "processStream infers toolUse at EOF when tool calls are present" {
     runProcess(alloc, sse_bytes, &col);
 
     try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.toolUse, col.done_reason.?);
-}
-
-test "writeInputOpts omits commentary text for codex tool-call assistant replay even when stop reason drifted to stop" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var commentary_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer commentary_args.object.deinit();
-
-    const assistant = protocol.AssistantMessage{
-        .content = &.{
-            .{ .text = .{ .text = "Doing another small stack", .text_signature = "{\"v\":1,\"id\":\"msg_commentary\",\"phase\":\"commentary\"}" } },
-            .{ .tool_call = .{ .id = "call_1|fc_1", .name = "read", .arguments = commentary_args } },
-        },
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .model = "gpt-5.4",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
-        .stop_reason = .stop,
-        .timestamp = 0,
-    };
-    const ctx: protocol.Context = .{ .messages = &.{.{ .assistant = assistant }} };
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(alloc);
-    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
-    try jw.beginArray();
-    try writeInputOpts(alloc, &jw, protocol.Model{
-        .id = "gpt-5.4",
-        .name = "codex",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 4096,
-        .max_tokens = 1024,
-    }, ctx, false);
-    try jw.endArray();
-
-    try testing.expect(std.mem.indexOf(u8, out.items, "msg_commentary") == null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"function_call\"") != null);
 }
