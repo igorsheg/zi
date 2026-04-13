@@ -5,6 +5,7 @@ const auth = @import("../auth/root.zig");
 const settings_mod = @import("../settings/root.zig");
 const sdk = @import("../sdk.zig");
 const interactive_mod = @import("../tui/interactive.zig");
+const theme_mod = @import("../tui/theme.zig");
 const tool_display = @import("../tui/tool_display.zig");
 const builtin_renderers = @import("../tui/renderers/builtins.zig");
 const compactor = @import("../session/compactor.zig");
@@ -128,10 +129,41 @@ pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
     );
     defer interactive.deinit();
 
+    applyInteractiveTheme(&interactive, resolveSelectedTheme(&ca, &settings));
+
     if (needs_auth) {
         interactive.status_text.setContent("no API key — use /login to authenticate");
         interactive.status_text.fg = interactive.theme.fg(.warning);
     }
 
     try interactive.run();
+}
+
+fn resolveSelectedTheme(ca: *sdk.AgentSession, settings: *const settings_mod.manager.SettingsManager) *const theme_mod.Theme {
+    if (settings.getTheme()) |selected_name| {
+        if (ca.resource_loader.findThemeByName(selected_name)) |loaded| {
+            return &loaded.theme;
+        }
+    }
+
+    const fallback_name: []const u8 = switch (theme_mod.Theme.detectTerminalBackground()) {
+        .dark => "dark",
+        .light => "light",
+    };
+    if (ca.resource_loader.findThemeByName(fallback_name)) |loaded| {
+        return &loaded.theme;
+    }
+
+    return theme_mod.Theme.defaultForTerminal();
+}
+
+fn applyInteractiveTheme(interactive: *interactive_mod.Interactive, theme: *const theme_mod.Theme) void {
+    interactive.theme = theme;
+    interactive.greeter.theme = theme;
+    interactive.footer.theme = theme;
+    interactive.hotkeys_overlay.theme = theme;
+    interactive.editor.setTheme(theme);
+    interactive.transcript.theme = theme;
+    interactive.loader.spinner_fg = theme.fg(.accent);
+    interactive.loader.message_fg = theme.fg(.muted);
 }

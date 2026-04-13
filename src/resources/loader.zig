@@ -4,12 +4,16 @@ const extension_loader = @import("../extensions/loader.zig");
 const extension_runner = @import("../extensions/runner.zig");
 const lua_runtime = @import("../extensions/lua_runtime.zig");
 const skills = @import("../skills/root.zig");
+const settings_manager_mod = @import("../settings/manager.zig");
+const theme_json = @import("../themes/json.zig");
+const tui_theme = @import("../tui/theme.zig");
 const types = @import("types.zig");
 
 pub const ResourceLoader = struct {
     allocator: std.mem.Allocator,
     cwd: []const u8,
     agent_dir: []const u8,
+    settings_manager: ?*settings_manager_mod.SettingsManager,
     system_prompt_source: ?[]const u8,
     append_system_prompt_source: ?[]const u8,
     injected_agents_files: []types.AgentsFile,
@@ -29,6 +33,7 @@ pub const ResourceLoader = struct {
     pub const Options = struct {
         cwd: []const u8,
         agent_dir_override: ?[]const u8 = null,
+        settings_manager: ?*settings_manager_mod.SettingsManager = null,
         system_prompt: ?[]const u8 = null,
         append_system_prompt: ?[]const u8 = null,
         injected_agents_files: []const types.AgentsFile = &.{},
@@ -54,6 +59,7 @@ pub const ResourceLoader = struct {
             .allocator = allocator,
             .cwd = cwd,
             .agent_dir = agent_dir,
+            .settings_manager = options.settings_manager,
             .system_prompt_source = system_prompt_source,
             .append_system_prompt_source = append_system_prompt_source,
             .injected_agents_files = injected_agents_files,
@@ -108,6 +114,13 @@ pub const ResourceLoader = struct {
         return self.themes;
     }
 
+    pub fn findThemeByName(self: *const ResourceLoader, name: []const u8) ?*const types.Theme {
+        for (self.themes.themes) |*theme| {
+            if (std.mem.eql(u8, theme.name, name)) return theme;
+        }
+        return null;
+    }
+
     pub fn getPromptInputs(self: *const ResourceLoader) types.LoadedPromptInputs {
         return .{
             .system_prompt = self.system_prompt,
@@ -121,6 +134,7 @@ pub const ResourceLoader = struct {
         self.extended_prompt_paths = try mergeResourcePaths(self.allocator, self.extended_prompt_paths, paths.prompt_paths);
         self.extended_theme_paths = try mergeResourcePaths(self.allocator, self.extended_theme_paths, paths.theme_paths);
         try self.reloadSkills();
+        try self.reloadThemes();
     }
 
     pub fn reload(self: *ResourceLoader) !void {
@@ -128,6 +142,7 @@ pub const ResourceLoader = struct {
 
         try self.reloadExtensions();
         try self.reloadSkills();
+        try self.reloadThemes();
 
         self.system_prompt = if (self.system_prompt_source) |source|
             try resolvePromptInput(self.allocator, self.cwd, source)
@@ -182,6 +197,67 @@ pub const ResourceLoader = struct {
         try applyExtendedSkillMetadata(self.allocator, self.skills.skills, self.extended_skill_paths);
     }
 
+    fn reloadThemes(self: *ResourceLoader) !void {
+        freeLoadedThemes(self.allocator, self.themes.themes);
+        freeDiagnostics(self.allocator, self.themes.diagnostics);
+        self.themes = .{};
+
+        var themes: std.ArrayListUnmanaged(types.Theme) = .empty;
+        errdefer {
+            freeLoadedThemes(self.allocator, themes.items);
+            themes = .empty;
+        }
+        var diagnostics: std.ArrayListUnmanaged(types.ResourceDiagnostic) = .empty;
+        errdefer freeDiagnostics(self.allocator, diagnostics.items);
+
+        try appendBuiltinTheme(self.allocator, &themes, &diagnostics, "dark", tui_theme.Theme.dark);
+        try appendBuiltinTheme(self.allocator, &themes, &diagnostics, "light", tui_theme.Theme.light);
+
+        const global_dir = try std.fs.path.join(self.allocator, &.{ self.agent_dir, "themes" });
+        defer self.allocator.free(global_dir);
+        try loadThemesFromPath(self, global_dir, .{
+            .source = "local",
+            .scope = .user,
+            .origin = .top_level,
+            .base_dir = global_dir,
+        }, &themes, &diagnostics);
+
+        const project_dir_root = try storage.getProjectDir(self.allocator, self.cwd);
+        defer self.allocator.free(project_dir_root);
+        const project_themes_dir = try std.fs.path.join(self.allocator, &.{ project_dir_root, "themes" });
+        defer self.allocator.free(project_themes_dir);
+        try loadThemesFromPath(self, project_themes_dir, .{
+            .source = "local",
+            .scope = .project,
+            .origin = .top_level,
+            .base_dir = project_themes_dir,
+        }, &themes, &diagnostics);
+
+        if (self.settings_manager) |settings| {
+            if (settings.getThemePaths()) |paths| {
+                for (paths) |path| {
+                    const resolved = resolveResourcePath(self.allocator, self.cwd, path) catch continue;
+                    defer self.allocator.free(resolved);
+                    try loadThemesFromPath(self, resolved, .{
+                        .source = "settings",
+                        .scope = .temporary,
+                        .origin = .top_level,
+                        .base_dir = resolved,
+                    }, &themes, &diagnostics);
+                }
+            }
+        }
+
+        for (self.extended_theme_paths) |entry| {
+            try loadThemesFromPath(self, entry.path, entry.metadata, &themes, &diagnostics);
+        }
+
+        self.themes = .{
+            .themes = try themes.toOwnedSlice(self.allocator),
+            .diagnostics = try diagnostics.toOwnedSlice(self.allocator),
+        };
+    }
+
     fn clearLoadedState(self: *ResourceLoader) void {
         freeLoadedExtensions(self.allocator, self.extensions.extensions);
         self.extensions = .{};
@@ -189,6 +265,10 @@ pub const ResourceLoader = struct {
         freeLoadedSkills(self.allocator, self.skills.skills);
         freeDiagnostics(self.allocator, self.skills.diagnostics);
         self.skills = .{};
+
+        freeLoadedThemes(self.allocator, self.themes.themes);
+        freeDiagnostics(self.allocator, self.themes.diagnostics);
+        self.themes = .{};
 
         freeAgentsFiles(self.allocator, self.agents_files);
         self.agents_files = &.{};
@@ -430,6 +510,177 @@ fn freeLoadedSkill(allocator: std.mem.Allocator, skill: types.Skill) void {
     allocator.free(skill.source_info.path);
     allocator.free(skill.source_info.source);
     if (skill.source_info.base_dir) |base_dir| allocator.free(base_dir);
+}
+
+fn freeLoadedThemes(allocator: std.mem.Allocator, loaded: []const types.Theme) void {
+    for (loaded) |theme| freeLoadedTheme(allocator, theme);
+    if (loaded.len > 0) allocator.free(loaded);
+}
+
+fn freeLoadedTheme(allocator: std.mem.Allocator, theme: types.Theme) void {
+    allocator.free(theme.name);
+    allocator.free(theme.path);
+    if (theme.source_info) |source_info| {
+        allocator.free(source_info.path);
+        allocator.free(source_info.source);
+        if (source_info.base_dir) |base_dir| allocator.free(base_dir);
+    }
+}
+
+fn appendBuiltinTheme(
+    allocator: std.mem.Allocator,
+    themes: *std.ArrayListUnmanaged(types.Theme),
+    diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
+    label: []const u8,
+    theme_value: tui_theme.Theme,
+) !void {
+    const builtin_path = try std.fmt.allocPrint(allocator, "<builtin:{s}>", .{label});
+    errdefer allocator.free(builtin_path);
+
+    try appendThemeUnique(allocator, themes, diagnostics, .{
+        .name = try allocator.dupe(u8, label),
+        .path = builtin_path,
+        .theme = theme_value,
+        .source_info = .{
+            .path = try allocator.dupe(u8, builtin_path),
+            .source = try allocator.dupe(u8, "builtin"),
+            .scope = .temporary,
+            .origin = .top_level,
+        },
+    });
+}
+
+fn loadThemesFromPath(
+    self: *ResourceLoader,
+    path: []const u8,
+    metadata: types.PathMetadata,
+    themes: *std.ArrayListUnmanaged(types.Theme),
+    diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
+) !void {
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |dir_err| switch (dir_err) {
+        error.FileNotFound => return,
+        error.NotDir => {
+            if (!std.mem.endsWith(u8, path, ".json")) {
+                try diagnostics.append(self.allocator, try themeDiagnostic(self.allocator, .warning, try std.fmt.allocPrint(self.allocator, "theme path is not a json file", .{}), path));
+                return;
+            }
+            try loadThemeFromFile(self.allocator, path, metadata, themes, diagnostics);
+            return;
+        },
+        else => {
+            try diagnostics.append(self.allocator, try themeDiagnostic(self.allocator, .warning, try std.fmt.allocPrint(self.allocator, "failed to open theme path: {s}", .{@errorName(dir_err)}), path));
+            return;
+        },
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const file_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
+        defer self.allocator.free(file_path);
+        try loadThemeFromFile(self.allocator, file_path, metadata, themes, diagnostics);
+    }
+}
+
+fn loadThemeFromFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    metadata: types.PathMetadata,
+    themes: *std.ArrayListUnmanaged(types.Theme),
+    diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
+) !void {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+        try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to open theme file: {s}", .{@errorName(err)}), path));
+        return;
+    };
+    defer file.close();
+
+    const bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to read theme file: {s}", .{@errorName(err)}), path));
+        return;
+    };
+    defer allocator.free(bytes);
+
+    const loaded = theme_json.loadFromSlice(allocator, bytes) catch |err| {
+        try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to parse theme file: {s}", .{@errorName(err)}), path));
+        return;
+    };
+    defer loaded.deinit(allocator);
+
+    try appendThemeUnique(allocator, themes, diagnostics, .{
+        .name = try allocator.dupe(u8, loaded.name),
+        .path = try allocator.dupe(u8, path),
+        .theme = loaded.theme,
+        .source_info = .{
+            .path = try allocator.dupe(u8, path),
+            .source = try allocator.dupe(u8, metadata.source),
+            .scope = metadata.scope,
+            .origin = metadata.origin,
+            .base_dir = if (metadata.base_dir) |base_dir| try allocator.dupe(u8, base_dir) else null,
+        },
+    });
+}
+
+fn appendThemeUnique(
+    allocator: std.mem.Allocator,
+    themes: *std.ArrayListUnmanaged(types.Theme),
+    diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
+    theme: types.Theme,
+) !void {
+    errdefer freeLoadedTheme(allocator, theme);
+
+    for (themes.items) |existing| {
+        if (!std.mem.eql(u8, existing.name, theme.name)) continue;
+        try diagnostics.append(allocator, try collisionDiagnostic(allocator, existing, theme));
+        return;
+    }
+
+    try themes.append(allocator, theme);
+}
+
+fn collisionDiagnostic(allocator: std.mem.Allocator, winner: types.Theme, loser: types.Theme) !types.ResourceDiagnostic {
+    return .{
+        .kind = .collision,
+        .message = try std.fmt.allocPrint(allocator, "name \"{s}\" collision", .{loser.name}),
+        .path = try allocator.dupe(u8, loser.path),
+        .collision = .{
+            .resource_type = .theme,
+            .name = try allocator.dupe(u8, loser.name),
+            .winner_path = try allocator.dupe(u8, winner.path),
+            .loser_path = try allocator.dupe(u8, loser.path),
+            .winner_source = if (winner.source_info) |info| try allocator.dupe(u8, info.source) else null,
+            .loser_source = if (loser.source_info) |info| try allocator.dupe(u8, info.source) else null,
+        },
+    };
+}
+
+fn themeDiagnostic(
+    allocator: std.mem.Allocator,
+    kind: types.ResourceDiagnosticKind,
+    message: []const u8,
+    path: ?[]const u8,
+) !types.ResourceDiagnostic {
+    return .{
+        .kind = kind,
+        .message = message,
+        .path = if (path) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn resolveResourcePath(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, path, " \t\r\n");
+    if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
+    if (std.mem.eql(u8, trimmed, "~")) {
+        const home = std.posix.getenv("HOME") orelse return allocator.dupe(u8, trimmed);
+        return allocator.dupe(u8, home);
+    }
+    if (std.mem.startsWith(u8, trimmed, "~/")) {
+        const home = std.posix.getenv("HOME") orelse return allocator.dupe(u8, trimmed);
+        return std.fs.path.join(allocator, &.{ home, trimmed[2..] });
+    }
+    return std.fs.path.join(allocator, &.{ cwd, trimmed });
 }
 
 fn copyDiagnostics(allocator: std.mem.Allocator, diagnostics: []const types.ResourceDiagnostic) ![]types.ResourceDiagnostic {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const tui_theme = @import("../tui/theme.zig");
 
 pub const ResourceType = enum {
     extension,
@@ -124,6 +125,7 @@ pub const LoadedPrompts = struct {
 pub const Theme = struct {
     name: []const u8,
     path: []const u8,
+    theme: tui_theme.Theme,
     source_info: ?SourceInfo = null,
 };
 

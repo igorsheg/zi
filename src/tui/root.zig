@@ -18,7 +18,6 @@ pub const tui = @import("tui.zig");
 pub const input_buffer = @import("input_buffer.zig");
 pub const editor_iface = @import("editor_iface.zig");
 pub const theme = @import("theme.zig");
-pub const theme_loader = @import("theme_loader.zig");
 pub const renderers = @import("renderers/root.zig");
 pub const excerpt = @import("excerpt.zig");
 pub const box_chrome = @import("box_chrome.zig");

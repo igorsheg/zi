@@ -95,6 +95,7 @@ pub fn createAgentSession(
 
     const resource_loader = try resources.ResourceLoader.init(allocator, .{
         .cwd = options.cwd,
+        .settings_manager = options.settings_manager,
         .system_prompt = options.system_prompt,
         .append_system_prompt = options.append_system_prompt,
         .injected_agents_files = options.context_files,

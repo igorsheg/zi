@@ -1,6 +1,6 @@
 const std = @import("std");
-const cell_mod = @import("cell.zig");
-const theme_mod = @import("theme.zig");
+const cell_mod = @import("../tui/cell.zig");
+const theme_mod = @import("../tui/theme.zig");
 
 const Color = cell_mod.Color;
 const Theme = theme_mod.Theme;
@@ -92,17 +92,6 @@ fn parseHexByte(text: []const u8) !u8 {
     return std.fmt.parseInt(u8, text, 16) catch error.InvalidColor;
 }
 
-fn expectThemeEq(expected: Theme, actual: Theme) !void {
-    inline for (@typeInfo(FgColor).@"enum".fields) |field| {
-        const token: FgColor = @enumFromInt(field.value);
-        try expectColorEq(expected.fg(token), actual.fg(token));
-    }
-    inline for (@typeInfo(BgColor).@"enum".fields) |field| {
-        const token: BgColor = @enumFromInt(field.value);
-        try expectColorEq(expected.bg(token), actual.bg(token));
-    }
-}
-
 fn expectColorEq(expected: Color, actual: Color) !void {
     try std.testing.expectEqual(expected.is_default, actual.is_default);
     if (!expected.is_default) {
@@ -112,18 +101,85 @@ fn expectColorEq(expected: Color, actual: Color) !void {
     }
 }
 
-test "embedded dark json matches Theme.dark" {
-    const loaded = try loadFromSlice(std.testing.allocator, theme_mod.builtin_dark_json);
+test "theme json parses a complete custom theme" {
+    const json =
+        \\{
+        \\  "name": "custom",
+        \\  "fg": {
+        \\    "accent": "#010203",
+        \\    "border": "#020304",
+        \\    "border_accent": "#030405",
+        \\    "border_muted": "#040506",
+        \\    "success": "#050607",
+        \\    "error": "#060708",
+        \\    "warning": "#070809",
+        \\    "muted": "#08090A",
+        \\    "dim": "#090A0B",
+        \\    "text": "#0A0B0C",
+        \\    "thinking_text": "#0B0C0D",
+        \\    "user_message_text": "#0C0D0E",
+        \\    "custom_message_text": "#0D0E0F",
+        \\    "custom_message_label": "#0E0F10",
+        \\    "tool_title": "#0F1011",
+        \\    "tool_output": "#101112",
+        \\    "md_heading": "#111213",
+        \\    "md_link": "#121314",
+        \\    "md_link_url": "#131415",
+        \\    "md_code": "#141516",
+        \\    "md_code_block": "#151617",
+        \\    "md_code_block_border": "#161718",
+        \\    "md_quote": "#171819",
+        \\    "md_quote_border": "#18191A",
+        \\    "md_hr": "#191A1B",
+        \\    "md_list_bullet": "#1A1B1C",
+        \\    "tool_diff_added": "#1B1C1D",
+        \\    "tool_diff_removed": "#1C1D1E",
+        \\    "tool_diff_context": "#1D1E1F",
+        \\    "syntax_comment": "#1E1F20",
+        \\    "syntax_keyword": "#1F2021",
+        \\    "syntax_function": "#202122",
+        \\    "syntax_variable": "#212223",
+        \\    "syntax_string": "#222324",
+        \\    "syntax_number": "#232425",
+        \\    "syntax_type": "#242526",
+        \\    "syntax_operator": "#252627",
+        \\    "syntax_punctuation": "#262728",
+        \\    "thinking_off": "#272829",
+        \\    "thinking_minimal": "#28292A",
+        \\    "thinking_low": "#292A2B",
+        \\    "thinking_medium": "#2A2B2C",
+        \\    "thinking_high": "#2B2C2D",
+        \\    "thinking_xhigh": "#2C2D2E",
+        \\    "bash_mode": "#2D2E2F"
+        \\  },
+        \\  "bg": {
+        \\    "selected_bg": "#303132",
+        \\    "user_message_bg": "#313233",
+        \\    "custom_message_bg": "#323334",
+        \\    "tool_transcript_bg": "#333435",
+        \\    "tool_pending_bg": "#343536",
+        \\    "tool_success_bg": "#353637",
+        \\    "tool_error_bg": "#363738"
+        \\  }
+        \\}
+    ;
+
+    const loaded = try loadFromSlice(std.testing.allocator, json);
     defer loaded.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("dark", loaded.name);
-    try expectThemeEq(theme_mod.Theme.dark, loaded.theme);
+    try std.testing.expectEqualStrings("custom", loaded.name);
+    try expectColorEq(Color.rgb(0x01, 0x02, 0x03), loaded.theme.fg(.accent));
+    try expectColorEq(Color.rgb(0x34, 0x35, 0x36), loaded.theme.bg(.tool_pending_bg));
 }
 
-test "embedded light json matches Theme.light" {
-    const loaded = try loadFromSlice(std.testing.allocator, theme_mod.builtin_light_json);
-    defer loaded.deinit(std.testing.allocator);
+test "theme json rejects missing colors" {
+    const json =
+        \\{
+        \\  "name": "broken",
+        \\  "fg": { "accent": "#010203" },
+        \\  "bg": { "selected_bg": "#303132" }
+        \\}
+    ;
 
-    try std.testing.expectEqualStrings("light", loaded.name);
-    try expectThemeEq(theme_mod.Theme.light, loaded.theme);
+    try std.testing.expectError(error.MissingColor, loadFromSlice(std.testing.allocator, json));
 }
