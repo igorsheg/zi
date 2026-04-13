@@ -26,6 +26,7 @@ const PromptBuffer = editor_core.PromptBuffer;
 const PromptView = editor_core.PromptView;
 const AutocompleteSession = editor_core.AutocompleteSession;
 const RenderConfig = editor_core.RenderConfig;
+const BindingAction = keybindings.Action;
 
 const UndoSnapshot = struct {
     text: []u8,
@@ -269,13 +270,7 @@ pub const Editor = struct {
     pub fn handleInput(self: *Editor, key: Key) bool {
         if (!self.focused) return false;
 
-        if (keybindings.matches(.editor_undo, key)) {
-            self.undo();
-            return true;
-        }
-
-        const may_accept_autocomplete = self.autocomplete.isActive() and
-            (keybindings.matches(.input_tab, key) or keybindings.matches(.select_confirm, key));
+        const may_accept_autocomplete = self.autocomplete.isActive() and keybindings.isEditorAutocompleteAccept(key);
         var autocomplete_snapshot: ?UndoSnapshot = null;
         if (may_accept_autocomplete) {
             autocomplete_snapshot = self.captureUndoSnapshot() catch null;
@@ -302,124 +297,13 @@ pub const Editor = struct {
             },
         }
 
-        if (keybindings.matches(.input_new_line, key)) {
-            self.history_index = -1;
-            self.last_action = .none;
-            self.pushUndoSnapshot();
-            self.buffer.insertNewline();
-            self.afterTextMutation();
-            return true;
-        }
-
-        if (keybindings.matches(.input_submit, key)) {
-            const cursor_byte = self.buffer.cursorByte();
-            if (cursor_byte > 0 and self.buffer.text()[cursor_byte - 1] == '\\') {
-                self.history_index = -1;
-                self.last_action = .none;
-                self.pushUndoSnapshot();
-                self.buffer.backspace();
-                self.buffer.insertNewline();
-                self.afterTextMutation();
-                return true;
-            }
-
-            if (self.disable_submit) return true;
-            self.submitValue();
-            return true;
-        }
-
-        switch (key.code) {
-            .char => {
-                if (key.ctrl) return false;
-                if (key.char) |cp| {
-                    self.insertCharacter(cp);
-                    return true;
-                }
-                return false;
-            },
-            .backspace => {
-                self.history_index = -1;
-                self.last_action = .none;
-                if (self.buffer.cursorByte() > 0) {
-                    self.pushUndoSnapshot();
-                    if (self.findMarkerRangeTouchingCursor(.left)) |range| {
-                        self.buffer.replaceRange(range.start, range.end, "", 0);
-                    } else {
-                        self.buffer.backspace();
-                    }
-                    self.afterTextMutation();
-                }
+        switch (keybindings.resolveEditorCommand(key)) {
+            .action => |action| return self.handleEditorAction(action),
+            .insert_codepoint => |cp| {
+                self.insertCharacter(cp);
                 return true;
             },
-            .delete => {
-                self.history_index = -1;
-                self.last_action = .none;
-                if (self.buffer.cursorByte() < self.buffer.text().len) {
-                    self.pushUndoSnapshot();
-                    if (self.findMarkerRangeTouchingCursor(.right)) |range| {
-                        self.buffer.replaceRange(range.start, range.end, "", 0);
-                    } else {
-                        self.buffer.deleteForward();
-                    }
-                    self.afterTextMutation();
-                }
-                return true;
-            },
-            .left => {
-                if (self.findMarkerRangeTouchingCursor(.left)) |range| {
-                    self.buffer.setCursorByte(range.start);
-                } else {
-                    self.buffer.moveLeft();
-                }
-                self.afterCursorMotion();
-                return true;
-            },
-            .right => {
-                if (self.findMarkerRangeTouchingCursor(.right)) |range| {
-                    self.buffer.setCursorByte(range.end);
-                } else {
-                    self.buffer.moveRight();
-                }
-                self.afterCursorMotion();
-                return true;
-            },
-            .up => {
-                if (self.buffer.text().len == 0) {
-                    self.navigateHistory(-1);
-                } else if (self.history_index > -1 and self.view.isCursorOnFirstVisualLine()) {
-                    self.navigateHistory(-1);
-                } else if (self.view.isCursorOnFirstVisualLine()) {
-                    self.buffer.moveLogicalLineStart();
-                    self.afterCursorMotion();
-                } else {
-                    self.last_action = .none;
-                    self.view.moveUpVisual();
-                }
-                return true;
-            },
-            .down => {
-                if (self.history_index > -1 and self.view.isCursorOnLastVisualLine()) {
-                    self.navigateHistory(1);
-                } else if (self.view.isCursorOnLastVisualLine()) {
-                    self.buffer.moveLogicalLineEnd();
-                    self.afterCursorMotion();
-                } else {
-                    self.last_action = .none;
-                    self.view.moveDownVisual();
-                }
-                return true;
-            },
-            .home => {
-                self.buffer.moveLogicalLineStart();
-                self.afterCursorMotion();
-                return true;
-            },
-            .end => {
-                self.buffer.moveLogicalLineEnd();
-                self.afterCursorMotion();
-                return true;
-            },
-            else => return false,
+            .unhandled => return false,
         }
     }
 
@@ -535,6 +419,122 @@ pub const Editor = struct {
             self.git_branch_len = len;
         } else {
             self.git_branch_len = 0;
+        }
+    }
+
+    fn handleEditorAction(self: *Editor, action: BindingAction) bool {
+        switch (action) {
+            .editor_undo => {
+                self.undo();
+                return true;
+            },
+            .input_new_line => {
+                self.history_index = -1;
+                self.last_action = .none;
+                self.pushUndoSnapshot();
+                self.buffer.insertNewline();
+                self.afterTextMutation();
+                return true;
+            },
+            .input_submit => {
+                const cursor_byte = self.buffer.cursorByte();
+                if (cursor_byte > 0 and self.buffer.text()[cursor_byte - 1] == '\\') {
+                    self.history_index = -1;
+                    self.last_action = .none;
+                    self.pushUndoSnapshot();
+                    self.buffer.backspace();
+                    self.buffer.insertNewline();
+                    self.afterTextMutation();
+                    return true;
+                }
+
+                if (self.disable_submit) return true;
+                self.submitValue();
+                return true;
+            },
+            .editor_backspace => {
+                self.history_index = -1;
+                self.last_action = .none;
+                if (self.buffer.cursorByte() > 0) {
+                    self.pushUndoSnapshot();
+                    if (self.findMarkerRangeTouchingCursor(.left)) |range| {
+                        self.buffer.replaceRange(range.start, range.end, "", 0);
+                    } else {
+                        self.buffer.backspace();
+                    }
+                    self.afterTextMutation();
+                }
+                return true;
+            },
+            .editor_delete => {
+                self.history_index = -1;
+                self.last_action = .none;
+                if (self.buffer.cursorByte() < self.buffer.text().len) {
+                    self.pushUndoSnapshot();
+                    if (self.findMarkerRangeTouchingCursor(.right)) |range| {
+                        self.buffer.replaceRange(range.start, range.end, "", 0);
+                    } else {
+                        self.buffer.deleteForward();
+                    }
+                    self.afterTextMutation();
+                }
+                return true;
+            },
+            .editor_move_left => {
+                if (self.findMarkerRangeTouchingCursor(.left)) |range| {
+                    self.buffer.setCursorByte(range.start);
+                } else {
+                    self.buffer.moveLeft();
+                }
+                self.afterCursorMotion();
+                return true;
+            },
+            .editor_move_right => {
+                if (self.findMarkerRangeTouchingCursor(.right)) |range| {
+                    self.buffer.setCursorByte(range.end);
+                } else {
+                    self.buffer.moveRight();
+                }
+                self.afterCursorMotion();
+                return true;
+            },
+            .editor_move_up => {
+                if (self.buffer.text().len == 0) {
+                    self.navigateHistory(-1);
+                } else if (self.history_index > -1 and self.view.isCursorOnFirstVisualLine()) {
+                    self.navigateHistory(-1);
+                } else if (self.view.isCursorOnFirstVisualLine()) {
+                    self.buffer.moveLogicalLineStart();
+                    self.afterCursorMotion();
+                } else {
+                    self.last_action = .none;
+                    self.view.moveUpVisual();
+                }
+                return true;
+            },
+            .editor_move_down => {
+                if (self.history_index > -1 and self.view.isCursorOnLastVisualLine()) {
+                    self.navigateHistory(1);
+                } else if (self.view.isCursorOnLastVisualLine()) {
+                    self.buffer.moveLogicalLineEnd();
+                    self.afterCursorMotion();
+                } else {
+                    self.last_action = .none;
+                    self.view.moveDownVisual();
+                }
+                return true;
+            },
+            .editor_move_home => {
+                self.buffer.moveLogicalLineStart();
+                self.afterCursorMotion();
+                return true;
+            },
+            .editor_move_end => {
+                self.buffer.moveLogicalLineEnd();
+                self.afterCursorMotion();
+                return true;
+            },
+            else => return false,
         }
     }
 
@@ -1058,6 +1058,56 @@ test "Editor undo restores autocomplete application as one edit" {
     try testing.expectEqualStrings("/mo", editor.getText());
 }
 
+test "Editor submit actions preserve disable-submit and escaped newline semantics" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var capture = SubmitCapture{};
+    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
+    editor.setSubmitDisabled(true);
+
+    editor.insertText("draft");
+    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try testing.expectEqual(@as(u32, 0), capture.count);
+    try testing.expectEqualStrings("draft", editor.getText());
+
+    editor.setText("line\\");
+    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try testing.expectEqual(@as(u32, 0), capture.count);
+    try testing.expectEqualStrings("line\n", editor.getText());
+
+    editor.setSubmitDisabled(false);
+    editor.setText("alpha");
+    try testing.expect(editor.handleInput(.{ .code = .enter, .shift = true }));
+    try testing.expectEqualStrings("alpha\n", editor.getText());
+}
+
+test "Editor autocomplete confirm respects disable-submit and stays undoable" {
+    const slash_commands_mod = @import("../../slash_commands.zig");
+
+    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var provider = autocomplete_mod.SlashCommandProvider.init(&registry);
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var capture = SubmitCapture{};
+    editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
+    editor.setAutocompleteProvider(provider.provider());
+    editor.setSubmitDisabled(true);
+
+    editor.insertText("/mo");
+    try testing.expect(editor.autocomplete.isActive());
+
+    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try testing.expectEqual(@as(u32, 0), capture.count);
+    try testing.expectEqualStrings("/model ", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("/mo", editor.getText());
+}
+
 test "Editor history browsing snapshots the empty draft and submit clears undo state" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
@@ -1085,6 +1135,40 @@ test "Editor history browsing snapshots the empty draft and submit clears undo s
     try testing.expectEqualStrings("", editor.getText());
 
     try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expectEqualStrings("", editor.getText());
+}
+
+test "Editor up/down keep wrapped-line movement and history crossover semantics" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    editor.setText("abcd efgh ijkl");
+    _ = editor.measure(9);
+    editor.buffer.setCursorByte(5);
+    editor.view.clearDesiredVisualColumn();
+
+    try testing.expect(editor.handleInput(.{ .code = .down }));
+    try testing.expectEqual(@as(u32, 10), editor.buffer.cursorByte());
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqual(@as(u32, 5), editor.buffer.cursorByte());
+
+    editor.setText("hello");
+    editor.buffer.setCursorByte(3);
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqual(@as(u32, 0), editor.buffer.cursorByte());
+
+    try testing.expect(editor.handleInput(.{ .code = .down }));
+    try testing.expectEqual(@as(u32, 5), editor.buffer.cursorByte());
+
+    editor.clear();
+    editor.addToHistory("older");
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("older", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .down }));
     try testing.expectEqualStrings("", editor.getText());
 }
 

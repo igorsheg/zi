@@ -8,6 +8,14 @@ pub const Action = enum {
     input_new_line,
     input_tab,
     editor_undo,
+    editor_backspace,
+    editor_delete,
+    editor_move_left,
+    editor_move_right,
+    editor_move_up,
+    editor_move_down,
+    editor_move_home,
+    editor_move_end,
     select_up,
     select_down,
     select_page_up,
@@ -44,11 +52,22 @@ pub const Definition = struct {
     description: []const u8,
     bindings: []const KeySpec,
     footer_label: ?[]const u8 = null,
+    show_in_help: bool = true,
+};
+
+pub const EditorCommand = union(enum) {
+    unhandled,
+    action: Action,
+    insert_codepoint: u21,
 };
 
 const key_enter = KeySpec{ .key = .{ .code = .enter }, .display = "enter" };
 const key_shift_enter = KeySpec{ .key = .{ .code = .enter, .shift = true }, .display = "shift+enter" };
 const key_tab = KeySpec{ .key = .{ .code = .tab }, .display = "tab" };
+const key_backspace = KeySpec{ .key = .{ .code = .backspace }, .display = "backspace" };
+const key_delete = KeySpec{ .key = .{ .code = .delete }, .display = "delete" };
+const key_left = KeySpec{ .key = .{ .code = .left }, .display = "left" };
+const key_right = KeySpec{ .key = .{ .code = .right }, .display = "right" };
 const key_ctrl_dash = KeySpec{ .key = .{ .code = .char, .char = '-', .ctrl = true }, .display = "ctrl+-" };
 const key_up = KeySpec{ .key = .{ .code = .up }, .display = "up" };
 const key_down = KeySpec{ .key = .{ .code = .down }, .display = "down" };
@@ -68,6 +87,14 @@ const input_submit_bindings = [_]KeySpec{key_enter};
 const input_new_line_bindings = [_]KeySpec{key_shift_enter};
 const input_tab_bindings = [_]KeySpec{key_tab};
 const editor_undo_bindings = [_]KeySpec{key_ctrl_dash};
+const editor_backspace_bindings = [_]KeySpec{key_backspace};
+const editor_delete_bindings = [_]KeySpec{key_delete};
+const editor_move_left_bindings = [_]KeySpec{key_left};
+const editor_move_right_bindings = [_]KeySpec{key_right};
+const editor_move_up_bindings = [_]KeySpec{key_up};
+const editor_move_down_bindings = [_]KeySpec{key_down};
+const editor_move_home_bindings = [_]KeySpec{key_home};
+const editor_move_end_bindings = [_]KeySpec{key_end};
 const select_up_bindings = [_]KeySpec{key_up};
 const select_down_bindings = [_]KeySpec{key_down};
 const select_page_up_bindings = [_]KeySpec{key_page_up};
@@ -110,6 +137,62 @@ const definitions = [_]Definition{
         .section = .editor,
         .description = "Undo",
         .bindings = &editor_undo_bindings,
+    },
+    .{
+        .action = .editor_backspace,
+        .section = .editor,
+        .description = "Delete backward",
+        .bindings = &editor_backspace_bindings,
+        .show_in_help = false,
+    },
+    .{
+        .action = .editor_delete,
+        .section = .editor,
+        .description = "Delete forward",
+        .bindings = &editor_delete_bindings,
+        .show_in_help = false,
+    },
+    .{
+        .action = .editor_move_left,
+        .section = .editor,
+        .description = "Move cursor left",
+        .bindings = &editor_move_left_bindings,
+        .show_in_help = false,
+    },
+    .{
+        .action = .editor_move_right,
+        .section = .editor,
+        .description = "Move cursor right",
+        .bindings = &editor_move_right_bindings,
+        .show_in_help = false,
+    },
+    .{
+        .action = .editor_move_up,
+        .section = .editor,
+        .description = "Move cursor up / previous history entry",
+        .bindings = &editor_move_up_bindings,
+        .show_in_help = false,
+    },
+    .{
+        .action = .editor_move_down,
+        .section = .editor,
+        .description = "Move cursor down / next history entry",
+        .bindings = &editor_move_down_bindings,
+        .show_in_help = false,
+    },
+    .{
+        .action = .editor_move_home,
+        .section = .editor,
+        .description = "Move to line start",
+        .bindings = &editor_move_home_bindings,
+        .show_in_help = false,
+    },
+    .{
+        .action = .editor_move_end,
+        .section = .editor,
+        .description = "Move to line end",
+        .bindings = &editor_move_end_bindings,
+        .show_in_help = false,
     },
     .{
         .action = .select_up,
@@ -237,6 +320,33 @@ pub fn matches(action: Action, key: Key) bool {
     return false;
 }
 
+pub fn resolveEditorCommand(key: Key) EditorCommand {
+    if (matches(.editor_undo, key)) return .{ .action = .editor_undo };
+    if (matches(.input_new_line, key)) return .{ .action = .input_new_line };
+    if (matches(.input_submit, key)) return .{ .action = .input_submit };
+
+    switch (key.code) {
+        .backspace => return .{ .action = .editor_backspace },
+        .delete => return .{ .action = .editor_delete },
+        .left => return .{ .action = .editor_move_left },
+        .right => return .{ .action = .editor_move_right },
+        .up => return .{ .action = .editor_move_up },
+        .down => return .{ .action = .editor_move_down },
+        .home => return .{ .action = .editor_move_home },
+        .end => return .{ .action = .editor_move_end },
+        .char => {
+            if (key.ctrl) return .unhandled;
+            if (key.char) |cp| return .{ .insert_codepoint = cp };
+            return .unhandled;
+        },
+        else => return .unhandled,
+    }
+}
+
+pub fn isEditorAutocompleteAccept(key: Key) bool {
+    return matches(.input_tab, key) or matches(.select_confirm, key);
+}
+
 pub fn formatBindings(action: Action, separator: []const u8, buf: []u8) []const u8 {
     var pos: usize = 0;
     for (definition(action).bindings, 0..) |binding, idx| {
@@ -282,11 +392,25 @@ test "keybindings match defaults across editor picker and app actions" {
     try testing.expect(matches(.input_submit, .{ .code = .enter }));
     try testing.expect(matches(.input_new_line, .{ .code = .enter, .shift = true }));
     try testing.expect(matches(.editor_undo, .{ .code = .char, .char = '-', .ctrl = true }));
+    try testing.expect(matches(.editor_backspace, .{ .code = .backspace }));
+    try testing.expect(matches(.editor_move_left, .{ .code = .left }));
     try testing.expect(matches(.select_page_down, .{ .code = .page_down }));
     try testing.expect(matches(.select_end, .{ .code = .end }));
     try testing.expect(matches(.select_cancel, .{ .code = .char, .char = 'c', .ctrl = true }));
     try testing.expect(matches(.app_toggle_tools, .{ .code = .char, .char = 'o', .ctrl = true }));
     try testing.expect(!matches(.app_toggle_tools, .{ .code = .char, .char = 'o' }));
+}
+
+test "keybindings resolve editor commands with current editor semantics" {
+    try testing.expectEqual(EditorCommand{ .action = .input_submit }, resolveEditorCommand(.{ .code = .enter }));
+    try testing.expectEqual(EditorCommand{ .action = .input_new_line }, resolveEditorCommand(.{ .code = .enter, .shift = true }));
+    try testing.expectEqual(EditorCommand{ .action = .editor_move_left }, resolveEditorCommand(.{ .code = .left, .ctrl = true }));
+    try testing.expectEqual(EditorCommand{ .action = .editor_backspace }, resolveEditorCommand(.{ .code = .backspace, .alt = true }));
+    try testing.expectEqual(EditorCommand{ .insert_codepoint = 'x' }, resolveEditorCommand(.{ .code = .char, .char = 'x', .alt = true }));
+    try testing.expectEqual(EditorCommand.unhandled, resolveEditorCommand(.{ .code = .char, .char = 'x', .ctrl = true }));
+    try testing.expect(isEditorAutocompleteAccept(.{ .code = .tab }));
+    try testing.expect(isEditorAutocompleteAccept(.{ .code = .enter }));
+    try testing.expect(!isEditorAutocompleteAccept(.{ .code = .enter, .shift = true }));
 }
 
 test "keybindings format footer from shared definitions" {

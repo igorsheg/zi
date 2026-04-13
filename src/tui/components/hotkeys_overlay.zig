@@ -45,6 +45,7 @@ pub const HotkeysOverlay = struct {
         var last_section: ?keybindings.Section = null;
 
         for (keybindings.all()) |def| {
+            if (!def.show_in_help) continue;
             if (last_section == null or last_section.? != def.section) {
                 if (content_row >= inner.height) break;
                 if (last_section != null) {
@@ -89,6 +90,7 @@ pub const HotkeysOverlay = struct {
         var rows: u32 = 0;
         var last_section: ?keybindings.Section = null;
         for (keybindings.all()) |def| {
+            if (!def.show_in_help) continue;
             if (last_section == null or last_section.? != def.section) {
                 if (last_section != null) rows += 1;
                 rows += 1;
@@ -119,6 +121,7 @@ pub const HotkeysOverlay = struct {
     fn maxKeyWidth() u32 {
         var max_width: usize = 0;
         for (keybindings.all()) |def| {
+            if (!def.show_in_help) continue;
             var binding_buf: [64]u8 = undefined;
             const width = grapheme_mod.strWidth(keybindings.formatBindings(def.action, " / ", &binding_buf));
             if (width > max_width) max_width = width;
