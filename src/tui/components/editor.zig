@@ -641,3 +641,74 @@ test "Editor submit binding preserves backslash newline fallback" {
     try testing.expectEqualStrings("hello\n", editor.getText());
     try testing.expectEqual(@as(u32, 0), capture.count);
 }
+
+test "Editor history recall shows most recent first and clamps at oldest" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.setPaddingX(0);
+    editor.addToHistory("first");
+    editor.addToHistory("second");
+    editor.addToHistory("third");
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("third", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("second", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("first", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("first", editor.getText());
+}
+
+test "Editor history down walks forward and returns to empty editor" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.setPaddingX(0);
+    editor.addToHistory("first");
+    editor.addToHistory("second");
+    editor.addToHistory("third");
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("first", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .down }));
+    try testing.expectEqualStrings("second", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .down }));
+    try testing.expectEqualStrings("third", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .down }));
+    try testing.expectEqualStrings("", editor.getText());
+}
+
+test "Editor typing exits history mode and continues editing recalled entry" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.addToHistory("old prompt");
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("old prompt", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .char, .char = 'x' }));
+    try testing.expectEqualStrings("old promptx", editor.getText());
+}
+
+test "Editor history ignores empty entries and consecutive duplicates" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.addToHistory("");
+    editor.addToHistory("   ");
+    editor.addToHistory("same");
+    editor.addToHistory("same");
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("same", editor.getText());
+
+    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("same", editor.getText());
+}

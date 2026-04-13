@@ -239,6 +239,35 @@ pub const AutocompleteSession = struct {
 
 const testing = std.testing;
 
+fn hasAsyncSearchBackend() bool {
+    return commandExists("fd") or commandExists("fdfind");
+}
+
+fn commandExists(command: []const u8) bool {
+    const result = std.process.Child.run(.{
+        .allocator = testing.allocator,
+        .argv = &.{ command, "--version" },
+        .max_output_bytes = 1024,
+    }) catch return false;
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    return switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn driveAsyncTick(session: *AutocompleteSession, buffer: *PromptBuffer) TickOutcome {
+    var now_ns: i128 = 0;
+    var attempts: usize = 0;
+    while (attempts < 8) : (attempts += 1) {
+        const outcome = session.tickAnimation(buffer, now_ns);
+        if (outcome.changed) return outcome;
+        now_ns += 16 * std.time.ns_per_ms;
+    }
+    return .{ .changed = false, .accepted = false };
+}
+
 test "AutocompleteSession applies replacement range without borrowing mutable buffer slices" {
     const slash_commands_mod = @import("../../slash_commands.zig");
 
@@ -325,6 +354,8 @@ test "AutocompleteSession enter accepts file completion without submit" {
 }
 
 test "AutocompleteSession tab force-completes a single at-file suggestion after async tick" {
+    if (!hasAsyncSearchBackend()) return error.SkipZigTest;
+
     const slash_commands_mod = @import("../../slash_commands.zig");
 
     var tmp = testing.tmpDir(.{});
@@ -349,7 +380,7 @@ test "AutocompleteSession tab force-completes a single at-file suggestion after 
     const first = session.processInput(.{ .code = .tab }, &buffer);
     try testing.expectEqual(InputOutcome.consumed, first);
 
-    const tick = session.tickAnimation(&buffer, 0);
+    const tick = driveAsyncTick(&session, &buffer);
     try testing.expect(tick.changed);
     try testing.expect(tick.accepted);
     try testing.expectEqualStrings("@notes.md ", buffer.text());
