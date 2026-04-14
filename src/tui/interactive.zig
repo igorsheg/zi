@@ -1161,16 +1161,18 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
-            .model_switched => |m| {
+            .model_switched => {
                 var buf: [80]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{m.id}) catch "model switched";
+                const label = if (self.status_data.model_id.len > 0) self.status_data.model_id else "model switched";
+                const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{label}) catch "model switched";
                 self.status_text.setContent(msg);
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
             },
-            .thinking_level_changed => |t| {
+            .thinking_level_changed => {
                 var buf: [96]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{t.level}) catch "thinking level updated";
+                const level = if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off";
+                const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{level}) catch "thinking level updated";
                 self.status_text.setContent(msg);
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
@@ -1899,8 +1901,9 @@ pub const Interactive = struct {
 
     /// Enqueue a /model switch through the AgentRequest queue
     /// (zi-wub.16). The actual mutation runs on the agent thread
-    /// inside `handleSetModel`. Status updates flow back via
-    /// `.model_switched` / `.model_switch_failed`.
+    /// inside `handleSetModel`. Semantic state flows back via
+    /// `status_snapshot`; `.model_switched` / `.model_switch_failed`
+    /// are banner outcomes.
     ///
     /// Model is a static catalog value (its slices live forever in
     /// `ai_models`), so we pass it by value into the request without
@@ -2375,15 +2378,9 @@ pub const Interactive = struct {
     /// into a TUI-owned event payload.
     fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
         switch (self.ca.trySetModel(m)) {
-            .success => |switched| {
+            .success => |_| {
                 self.publishStatusSnapshot();
-                const provider_str = json_util.providerToString(switched.model.provider);
-                const provider_copy = self.msg_allocator.dupe(u8, provider_str) catch return;
-                const id_copy = self.msg_allocator.dupe(u8, switched.model.id) catch {
-                    self.msg_allocator.free(provider_copy);
-                    return;
-                };
-                self.event_queue.push(.{ .model_switched = .{ .provider = provider_copy, .id = id_copy } });
+                self.event_queue.push(.{ .model_switched = {} });
             },
             .no_auth => |blocked| {
                 const provider_str = json_util.providerToString(blocked.provider);
@@ -2451,10 +2448,9 @@ pub const Interactive = struct {
     }
 
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
-        const result = self.ca.trySetThinkingLevel(level);
+        _ = self.ca.trySetThinkingLevel(level);
         self.publishStatusSnapshot();
-        const level_copy = self.msg_allocator.dupe(u8, agentThinkingValue(result.level)) catch return;
-        self.event_queue.push(.{ .thinking_level_changed = .{ .level = level_copy } });
+        self.event_queue.push(.{ .thinking_level_changed = {} });
     }
 
     /// Session event callback — runs on the AGENT THREAD.
