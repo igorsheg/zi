@@ -1012,11 +1012,16 @@ pub const Transcript = struct {
 
     // ── External renderable API ───────────────────────────────────
 
-    /// Append an arbitrary transcript renderable.
-    pub fn addRenderable(self: *Transcript, renderable: TranscriptRenderable) void {
+    /// Append an arbitrary transcript item.
+    pub fn addItem(self: *Transcript, item: TranscriptItem) bool {
         self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
-        _ = self.appendTranscriptItem(.{ .renderable = renderable });
+        return self.appendTranscriptItem(item);
+    }
+
+    /// Append an arbitrary transcript renderable.
+    pub fn addRenderable(self: *Transcript, renderable: TranscriptRenderable) void {
+        _ = self.addItem(.{ .renderable = renderable });
     }
 
     /// Remove a specific transcript renderable by identity.
@@ -1265,6 +1270,11 @@ pub const Transcript = struct {
         te.lua_render_state = @ptrCast(@alignCast(pending.state));
         te.lua_render_deinit = pending.deinit;
         te.lua_render_allocator = runner.allocator;
+    }
+
+    /// Clear any pending tool-result routing state.
+    pub fn clearPendingToolRouting(self: *Transcript) void {
+        self.pending_tools.clearRetainingCapacity();
     }
 
     /// Toggle expansion state on all tool executions.

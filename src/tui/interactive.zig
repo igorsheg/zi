@@ -14,6 +14,7 @@ const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
 const loader_mod = @import("components/loader.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
+const session_resume_render_mod = @import("session_resume_render.zig");
 const container_mod = @import("container.zig");
 const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
@@ -46,9 +47,8 @@ const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
 const AgentRequest = agent_mod.AgentRequest;
 const RequestQueue = agent_mod.RequestQueue;
-const ResumedAssistantBlock = ui_event_mod.ResumedAssistantBlock;
-const ResumedEntry = ui_event_mod.ResumedEntry;
 const agent_protocol = agent_mod.protocol;
+const message_memory = agent_mod.message_memory;
 const SessionController = session_controller_mod.SessionController;
 const RetryPolicy = session_controller_mod.RetryPolicy;
 const CompactionPolicy = session_controller_mod.CompactionPolicy;
@@ -1147,22 +1147,16 @@ pub const Interactive = struct {
             },
             .session_resumed => |r| {
                 self.transcript.clearAll();
-                self.repopulateEditorHistoryFromResumedEntries(r.entries);
-                for (r.entries) |entry| {
-                    switch (entry) {
-                        .user_text => |t| self.transcript.addUserMessage(t),
-                        .assistant_message => |blocks| {
-                            self.transcript.beginAssistantMessage();
-                            for (blocks, 0..) |block, idx| {
-                                switch (block) {
-                                    .text => |t| self.transcript.appendText(idx, t),
-                                    .thinking => |t| self.transcript.appendThinking(idx, t),
-                                }
-                            }
-                            self.transcript.endAssistantMessage();
-                        },
-                    }
-                }
+                session_resume_render_mod.seedEditorHistory(self.active_editor, r.messages);
+                session_resume_render_mod.applySessionMessages(
+                    &self.transcript,
+                    self.resolver,
+                    r.messages,
+                    .{
+                        .theme = self.theme,
+                        .retry_attempt = self.retry_attempt,
+                    },
+                );
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 // Prefer the restore warning over the generic
                 // "session resumed" banner when a fallback happened
@@ -1232,16 +1226,6 @@ pub const Interactive = struct {
         self.status_data.setThinkingLevel(snapshot.thinking_level);
         self.status_data.context_tokens = snapshot.context_tokens;
         self.status_data.context_window = snapshot.context_window;
-    }
-
-    fn repopulateEditorHistoryFromResumedEntries(self: *Interactive, entries: []const ResumedEntry) void {
-        self.active_editor.clearHistory();
-        for (entries) |entry| {
-            switch (entry) {
-                .user_text => |t| self.active_editor.addToHistory(t),
-                .assistant_message => {},
-            }
-        }
     }
 
     fn seedEditorHistoryFromCurrentSession(self: *Interactive) void {
@@ -2338,8 +2322,8 @@ pub const Interactive = struct {
 
     /// Agent-thread handler for `AgentRequest.resume_session`.
     /// Loads the session via `openSession` (agent_arena allocated),
-    /// projects messages into `ResumedEntry` display values cloned
-    /// into `msg_allocator` (doctrine R3), and publishes either
+    /// deep-clones the resolved AgentMessage snapshot into
+    /// `msg_allocator` (doctrine R3), and publishes either
     /// `.session_resumed` or `.session_resume_failed` back to the TUI.
     ///
     /// Transcript rebuild stays on the TUI thread — this handler
@@ -2395,69 +2379,18 @@ pub const Interactive = struct {
             }
         }
 
-        // Project messages into a display list, cloned into
-        // msg_allocator so the TUI can free them independently of
-        // agent_arena. Preserve assistant text + thinking block order
-        // so resume rebuild matches live TUI semantics.
-        var entries = std.ArrayListUnmanaged(ResumedEntry).empty;
-        defer entries.deinit(self.msg_allocator);
-
-        for (loaded.messages) |msg| {
-            switch (msg) {
-                .user => |u| switch (u.content) {
-                    .text => |t| {
-                        const cloned = self.msg_allocator.dupe(u8, t) catch continue;
-                        entries.append(self.msg_allocator, .{ .user_text = cloned }) catch {
-                            self.msg_allocator.free(cloned);
-                        };
-                    },
-                    else => {},
-                },
-                .assistant => |a| {
-                    var blocks = std.ArrayListUnmanaged(ResumedAssistantBlock).empty;
-                    defer blocks.deinit(self.msg_allocator);
-                    for (a.content) |block| {
-                        switch (block) {
-                            .text => |tc| {
-                                const cloned = self.msg_allocator.dupe(u8, tc.text) catch continue;
-                                blocks.append(self.msg_allocator, .{ .text = cloned }) catch {
-                                    self.msg_allocator.free(cloned);
-                                };
-                            },
-                            .thinking => |th| {
-                                const cloned = self.msg_allocator.dupe(u8, th.thinking) catch continue;
-                                blocks.append(self.msg_allocator, .{ .thinking = cloned }) catch {
-                                    self.msg_allocator.free(cloned);
-                                };
-                            },
-                            else => {},
-                        }
-                    }
-                    if (blocks.items.len > 0) {
-                        const owned_blocks = blocks.toOwnedSlice(self.msg_allocator) catch {
-                            for (blocks.items) |*block| block.deinit(self.msg_allocator);
-                            continue;
-                        };
-                        entries.append(self.msg_allocator, .{ .assistant_message = owned_blocks }) catch {
-                            for (owned_blocks) |*block| block.deinit(self.msg_allocator);
-                            self.msg_allocator.free(owned_blocks);
-                        };
-                    }
-                },
-                else => {},
-            }
-        }
-
-        const owned_entries = entries.toOwnedSlice(self.msg_allocator) catch {
-            // toOwnedSlice failed — free what we gathered and report.
-            for (entries.items) |*e| e.deinit(self.msg_allocator);
-            const msg = self.msg_allocator.dupe(u8, "out of memory building resume view") catch return;
+        // Clone the resolved AgentMessage snapshot into msg_allocator
+        // so the TUI can reconstruct transcript state without any
+        // borrowed pointers crossing the queue boundary.
+        const owned_messages = message_memory.cloneMessages(self.msg_allocator, loaded.messages) catch {
+            if (restore_warning) |warning| self.msg_allocator.free(warning);
+            const msg = self.msg_allocator.dupe(u8, "out of memory building resume snapshot") catch return;
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
         self.publishStatusSnapshot();
         self.event_queue.push(.{ .session_resumed = .{
-            .entries = owned_entries,
+            .messages = owned_messages,
             .restore_warning = restore_warning,
         } });
     }

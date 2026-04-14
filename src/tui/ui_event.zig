@@ -1,7 +1,9 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
-const agent_protocol = @import("../agent/root.zig").protocol;
+const agent_root = @import("../agent/root.zig");
+const agent_protocol = agent_root.protocol;
+const message_memory = agent_root.message_memory;
 const session_controller_mod = @import("../session_controller.zig");
 const AgentToolResult = agent_protocol.AgentToolResult;
 const RunOutcome = session_controller_mod.RunOutcome;
@@ -10,36 +12,6 @@ const RunOutcome = session_controller_mod.RunOutcome;
 /// main thread. The agent thread converts AgentEvent → UiEvent before
 /// pushing to the EventQueue, ensuring no borrowed pointers cross
 /// the thread boundary.
-/// Projection of a session message into a form the transcript can
-/// rebuild from without borrowing agent-owned AgentMessage data.
-/// Extended by zi-wub.24 to cover tool calls + results.
-pub const ResumedAssistantBlock = union(enum) {
-    text: []u8,
-    thinking: []u8,
-
-    pub fn deinit(self: *ResumedAssistantBlock, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .text => |s| allocator.free(s),
-            .thinking => |s| allocator.free(s),
-        }
-    }
-};
-
-pub const ResumedEntry = union(enum) {
-    user_text: []u8,
-    assistant_message: []ResumedAssistantBlock,
-
-    pub fn deinit(self: *ResumedEntry, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .user_text => |s| allocator.free(s),
-            .assistant_message => |blocks| {
-                for (blocks) |*block| block.deinit(allocator);
-                allocator.free(blocks);
-            },
-        }
-    }
-};
-
 pub const UiEvent = union(enum) {
     // --- message lifecycle ---
     message_start_assistant: void,
@@ -142,15 +114,13 @@ pub const UiEvent = union(enum) {
     // --- /resume outcomes (zi-wub.15) ---
     // Published by the agent thread after processing a
     // resume_session AgentRequest. The TUI rebuilds the transcript
-    // from `entries` and frees them.
+    // from an owned AgentMessage snapshot and frees it after apply.
     //
-    // Payload shape is intentionally a display projection, NOT the
-    // full AgentMessage list — AgentMessage ownership stays on the
-    // agent thread (doctrine R3). The payload carries user text plus
-    // assistant content blocks (text/thinking) so resume rebuild can
-    // preserve the same semantics as live rendering.
+    // Payload is a full deep-cloned message list allocated from
+    // `msg_allocator` so the TUI can reconstruct transcript surfaces
+    // without re-reading agent-owned session state.
     session_resumed: struct {
-        entries: []ResumedEntry,
+        messages: []agent_protocol.AgentMessage,
         /// Optional warning from `restoreModelFromSession` when the
         /// saved model could not be brought back verbatim (missing
         /// from the catalog or lost auth). Owned by the event —
@@ -238,8 +208,7 @@ pub const UiEvent = union(enum) {
                 if (r.final_error) |msg| allocator.free(msg);
             },
             .session_resumed => |s| {
-                for (s.entries) |*e| e.deinit(allocator);
-                allocator.free(s.entries);
+                message_memory.freeMessages(allocator, s.messages);
                 if (s.restore_warning) |w| allocator.free(w);
             },
             .session_resume_failed => |f| allocator.free(f.message),

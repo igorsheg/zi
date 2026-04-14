@@ -8,6 +8,7 @@ pub const defaultConvertToLlm = @import("agent.zig").defaultConvertToLlm;
 pub const defaultConvertToLlmHook = @import("agent.zig").defaultConvertToLlmHook;
 pub const SubscriptionToken = @import("agent.zig").SubscriptionToken;
 pub const request = @import("request.zig");
+pub const message_memory = @import("message_memory.zig");
 pub const AgentRequest = request.AgentRequest;
 pub const RequestQueue = request.RequestQueue;
 
