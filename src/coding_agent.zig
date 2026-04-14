@@ -115,6 +115,14 @@ pub const AgentSession = struct {
         changed: bool,
     };
 
+    pub const StatusSnapshot = struct {
+        model_provider: []const u8,
+        model_id: []const u8,
+        thinking_level: protocol.ThinkingLevel,
+        context_tokens: ?u64,
+        context_window: u64,
+    };
+
     pub const Options = struct {
         model: ai.protocol.Model,
         /// Static API key fallback. Used only when no `auth_storage` is
@@ -679,7 +687,7 @@ pub const AgentSession = struct {
     /// Unlike the earlier zi implementation, this hot path does NOT reread the
     /// session file. The compaction boundary is tracked on the agent thread and
     /// refreshed only when the active session store changes.
-    pub fn getContextUsage(self: *AgentSession) ?ContextUsage {
+    pub fn getContextUsage(self: *const AgentSession) ?ContextUsage {
         const model = self.agent.state.model;
         if (model.context_window == 0) return null;
 
@@ -692,6 +700,17 @@ pub const AgentSession = struct {
         }
 
         return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+    }
+
+    pub fn statusSnapshot(self: *const AgentSession) StatusSnapshot {
+        const usage = self.getContextUsage();
+        return .{
+            .model_provider = ai.json_util.providerToString(self.agent.state.model.provider),
+            .model_id = self.agent.state.model.id,
+            .thinking_level = self.agent.state.thinking_level,
+            .context_tokens = if (usage) |u| u.tokens else null,
+            .context_window = if (usage) |u| u.context_window else self.agent.state.model.context_window,
+        };
     }
 
     pub fn noteCompactionApplied(self: *AgentSession) void {

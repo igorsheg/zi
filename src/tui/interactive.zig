@@ -15,7 +15,7 @@ const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
 const loader_mod = @import("components/loader.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
-const session_resume_render_mod = @import("session_resume_render.zig");
+const conversation_projection_mod = @import("conversation_projection.zig");
 const container_mod = @import("container.zig");
 const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
@@ -618,7 +618,7 @@ pub const Interactive = struct {
         self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.active_editor.setStatusData(&self.status_data);
-        self.seedEditorHistoryFromCurrentSession();
+        self.rebuildConversationFromMessages(self.ca.agent.state.messages);
         self.session_controller.wire();
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
@@ -948,12 +948,8 @@ pub const Interactive = struct {
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {
-            .assistant_text_delta => |d| {
-                self.transcript.appendText(d.content_index, d.delta);
-                self.tui.dirty = true;
-            },
-            .assistant_thinking_delta => |d| {
-                self.transcript.appendThinking(d.content_index, d.delta);
+            .assistant_text_delta, .assistant_thinking_delta => {
+                _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
             },
             .error_message => |e| {
@@ -962,19 +958,16 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .message_start_assistant => {
-                self.transcript.beginAssistantMessage();
+                _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
             },
             .message_start_user => {},
-            .tool_call_streaming => |t| {
-                const renderer = self.resolver.resolve(t.tool_name);
-                self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
-                self.transcript.toolSetArgs(t.tool_call_id, t.args);
-                if (t.is_complete) self.transcript.toolSetArgsComplete(t.tool_call_id);
+            .tool_call_streaming => {
+                _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
             },
             .message_end_assistant => |m| {
-                self.transcript.endAssistantMessage();
+                _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
                 if (m.is_aborted) {
                     self.status_text.setContent(m.error_message orelse "aborted");
@@ -985,20 +978,17 @@ pub const Interactive = struct {
                 }
             },
             .tool_start => |t| {
-                const renderer = self.resolver.resolve(t.tool_name);
-                self.transcript.addToolExecution(t.tool_call_id, t.tool_name, renderer);
-                self.transcript.toolSetArgs(t.tool_call_id, t.args);
-                self.transcript.toolMarkExecutionStarted(t.tool_call_id);
+                _ = self.applyConversationLiveEvent(ev.*);
                 self.status_text.setContent(t.tool_name);
                 self.status_text.fg = self.theme.fg(.accent);
                 self.tui.dirty = true;
             },
-            .tool_update => |t| {
-                self.transcript.toolSetPartialResult(t.tool_call_id, t.result, t.is_error);
+            .tool_update => {
+                _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
             },
-            .tool_end => |t| {
-                self.transcript.toolSetFinalResult(t.tool_call_id, t.result, t.is_error);
+            .tool_end => {
+                _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
             },
             .login_progress => |l| {
@@ -1084,17 +1074,7 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .session_resumed => |r| {
-                self.transcript.clearAll();
-                session_resume_render_mod.seedEditorHistory(self.active_editor, r.messages);
-                session_resume_render_mod.applySessionMessages(
-                    &self.transcript,
-                    self.resolver,
-                    r.messages,
-                    .{
-                        .theme = self.theme,
-                        .retry_attempt = self.retry_attempt,
-                    },
-                );
+                self.rebuildConversationFromMessages(r.messages);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 // Prefer the restore warning over the generic
                 // "session resumed" banner when a fallback happened
@@ -1116,8 +1096,7 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .session_new_started => {
-                self.transcript.clearAll();
-                self.active_editor.clearHistory();
+                self.rebuildConversationFromMessages(&.{});
                 self.status_text.setContent("new session started");
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
@@ -1166,21 +1145,21 @@ pub const Interactive = struct {
         self.status_data.context_window = snapshot.context_window;
     }
 
-    fn seedEditorHistoryFromCurrentSession(self: *Interactive) void {
-        // Bind-time snapshot only: interactive owns the editor and no
-        // agent worker exists yet, so seeding recall from the already-
-        // loaded session state preserves the ownership doctrine without
-        // introducing a live TUI→agent read path.
-        self.active_editor.clearHistory();
-        for (self.ca.agent.state.messages) |msg| {
-            switch (msg) {
-                .user => |u| switch (u.content) {
-                    .text => |t| self.active_editor.addToHistory(t),
-                    else => {},
-                },
-                else => {},
-            }
-        }
+    fn rebuildConversationFromMessages(self: *Interactive, messages: []const agent_protocol.AgentMessage) void {
+        conversation_projection_mod.rebuildFromMessages(
+            &self.transcript,
+            self.active_editor,
+            self.resolver,
+            messages,
+            .{
+                .theme = self.theme,
+                .retry_attempt = self.retry_attempt,
+            },
+        );
+    }
+
+    fn applyConversationLiveEvent(self: *Interactive, ev: UiEvent) bool {
+        return conversation_projection_mod.applyLiveEvent(&self.transcript, self.resolver, ev);
     }
 
     const TranscriptMouseZone = struct {
@@ -2338,10 +2317,10 @@ pub const Interactive = struct {
             return;
         };
         self.publishStatusSnapshot();
-        self.event_queue.push(.{ .session_resumed = .{
-            .messages = owned_messages,
-            .restore_warning = restore_warning,
-        } });
+        self.event_queue.push(.{ .session_resumed = message_memory.SessionResumeSnapshot.initOwned(
+            owned_messages,
+            restore_warning,
+        ) });
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
@@ -2377,21 +2356,30 @@ pub const Interactive = struct {
     }
 
     fn publishStatusSnapshot(self: *Interactive) void {
-        const provider_copy = self.msg_allocator.dupe(u8, json_util.providerToString(self.ca.agent.state.model.provider)) catch return;
+        const snapshot = self.ca.statusSnapshot();
+        const provider_copy = self.msg_allocator.dupe(u8, snapshot.model_provider) catch return;
         errdefer self.msg_allocator.free(provider_copy);
-        const model_id_copy = self.msg_allocator.dupe(u8, self.ca.agent.state.model.id) catch return;
+        const model_id_copy = self.msg_allocator.dupe(u8, snapshot.model_id) catch return;
         errdefer self.msg_allocator.free(model_id_copy);
-        const thinking_copy = self.msg_allocator.dupe(u8, agentThinkingLabel(self.ca.agent.state.thinking_level)) catch return;
+        const thinking_copy = self.msg_allocator.dupe(u8, agentThinkingLabel(snapshot.thinking_level)) catch return;
         errdefer self.msg_allocator.free(thinking_copy);
 
-        const usage = self.ca.getContextUsage();
         self.event_queue.push(.{ .status_snapshot = .{
             .model_provider = provider_copy,
             .model_id = model_id_copy,
             .thinking_level = thinking_copy,
-            .context_tokens = if (usage) |u| u.tokens else null,
-            .context_window = if (usage) |u| u.context_window else self.ca.agent.state.model.context_window,
+            .context_tokens = snapshot.context_tokens,
+            .context_window = snapshot.context_window,
         } });
+    }
+
+    fn publishStatusSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
+        switch (event) {
+            // Status chips reflect current semantic state, so publish at
+            // message commit boundaries instead of waiting for turn_end.
+            .message_end => self.publishStatusSnapshot(),
+            else => {},
+        }
     }
 
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
@@ -2406,18 +2394,10 @@ pub const Interactive = struct {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         switch (event) {
             .agent_event => |agent_event| {
-                const ui_event = convertAgentEvent(agent_event, self.msg_allocator) orelse switch (agent_event) {
-                    .turn_end => {
-                        self.publishStatusSnapshot();
-                        return;
-                    },
-                    else => return,
-                };
-                self.event_queue.push(ui_event);
-                switch (agent_event) {
-                    .turn_end => self.publishStatusSnapshot(),
-                    else => {},
+                if (convertAgentEvent(agent_event, self.msg_allocator)) |ui_event| {
+                    self.event_queue.push(ui_event);
                 }
+                self.publishStatusSnapshotForAgentEvent(agent_event);
             },
             .phase_changed => |pc| {
                 if (pc.from == .waiting_to_retry and pc.to == .running_continue) {

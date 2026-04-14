@@ -3,6 +3,38 @@ const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const protocol = @import("protocol.zig");
 
+pub const SessionResumeSnapshot = struct {
+    messages: []protocol.AgentMessage,
+    restore_warning: ?[]u8 = null,
+
+    pub fn initOwned(messages: []protocol.AgentMessage, restore_warning: ?[]u8) SessionResumeSnapshot {
+        return .{
+            .messages = messages,
+            .restore_warning = restore_warning,
+        };
+    }
+
+    pub fn clone(
+        allocator: std.mem.Allocator,
+        messages: []const protocol.AgentMessage,
+        restore_warning: ?[]const u8,
+    ) !SessionResumeSnapshot {
+        const owned_messages = try cloneMessages(allocator, messages);
+        errdefer freeMessages(allocator, owned_messages);
+        const warning_copy = if (restore_warning) |warning| try allocator.dupe(u8, warning) else null;
+        return .{
+            .messages = owned_messages,
+            .restore_warning = warning_copy,
+        };
+    }
+
+    pub fn deinit(self: *SessionResumeSnapshot, allocator: std.mem.Allocator) void {
+        freeMessages(allocator, self.messages);
+        if (self.restore_warning) |warning| allocator.free(warning);
+        self.* = undefined;
+    }
+};
+
 pub fn cloneMessages(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage) ![]protocol.AgentMessage {
     const cloned = try allocator.alloc(protocol.AgentMessage, messages.len);
     var initialized: usize = 0;

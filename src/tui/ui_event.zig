@@ -116,20 +116,12 @@ pub const UiEvent = union(enum) {
     // resume_session AgentRequest. The TUI rebuilds the transcript
     // from an owned AgentMessage snapshot and frees it after apply.
     //
-    // Payload is a full deep-cloned message list allocated from
-    // `msg_allocator`. This is intentionally a semantic snapshot,
-    // not a transcript-row projection: the agent owns authoritative
-    // session messages, and the TUI reconstructs its local transcript
-    // and editor state without re-reading agent-owned session state.
-    session_resumed: struct {
-        messages: []agent_protocol.AgentMessage,
-        /// Optional warning from `restoreModelFromSession` when the
-        /// saved model could not be brought back verbatim (missing
-        /// from the catalog or lost auth). Owned by the event —
-        /// freed in `deinit`. Rendered after the transcript rebuild
-        /// so it survives the "session resumed" status update.
-        restore_warning: ?[]u8 = null,
-    },
+    // Payload is a full deep-cloned semantic snapshot allocated from
+    // `msg_allocator`. This is intentionally not a transcript-row
+    // projection: the agent owns authoritative session messages, and
+    // the TUI reconstructs its local transcript and editor state
+    // without re-reading agent-owned session state.
+    session_resumed: message_memory.SessionResumeSnapshot,
     session_resume_failed: struct {
         message: []u8,
     },
@@ -211,10 +203,7 @@ pub const UiEvent = union(enum) {
             .retry_end => |r| {
                 if (r.final_error) |msg| allocator.free(msg);
             },
-            .session_resumed => |s| {
-                message_memory.freeMessages(allocator, s.messages);
-                if (s.restore_warning) |w| allocator.free(w);
-            },
+            .session_resumed => |*s| s.deinit(allocator),
             .session_resume_failed => |f| allocator.free(f.message),
             .session_new_started => {},
             .session_new_failed => |f| allocator.free(f.message),
