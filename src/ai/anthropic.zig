@@ -196,7 +196,8 @@ pub const AnthropicProvider = struct {
         }
 
         // Parse SSE stream line by line
-        var parser = sse.SseParser{};
+        var parser = sse.SseParser.init(allocator);
+        defer parser.deinit();
         const reader = response.reader(&transfer_buf);
 
         // Per-delta scratch arena for partial-JSON reparses.
@@ -262,6 +263,9 @@ pub const AnthropicProvider = struct {
         }) catch |err| {
             if (options.signal.isAborted()) {
                 state.partial.stop_reason = .aborted;
+            } else if (err == error.EventDataTooLarge) {
+                emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "stream event exceeded {d} bytes", .{sse.max_event_data_bytes});
+                return;
             } else {
                 emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)});
                 return;

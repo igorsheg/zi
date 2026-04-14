@@ -1,14 +1,15 @@
 const std = @import("std");
-const agent = @import("../agent/root.zig");
+const protocol = @import("../agent/protocol.zig");
 const json_util = @import("../ai/json_util.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
+const output_buffer = @import("../lib/output_buffer.zig");
 const AbortGuard = @import("../abort_guard.zig").AbortGuard;
 const lock_registry = @import("../agent/lock_registry.zig");
 
 const HEAD_LINES: usize = 50;
 const TAIL_LINES: usize = 50;
-const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const TRUNCATED_FMT = "... [{d} lines truncated] ...";
 const STREAM_UPDATE_POLL_MS: u64 = 50;
 const STREAM_UPDATE_MIN_INTERVAL_MS: u64 = 100;
 
@@ -63,10 +64,10 @@ fn execute(
     allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
-    signal: agent.protocol.AbortSignal,
-    on_update: ?agent.protocol.AgentToolUpdateCallback,
+    signal: protocol.AbortSignal,
+    on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
-) agent.protocol.AgentToolResult {
+) protocol.AgentToolResult {
     const ctx: *util.BuiltinCtx = @ptrCast(@alignCast(raw_ctx orelse
         return util.errorResult(allocator, "bash tool: missing context")));
 
@@ -126,10 +127,10 @@ fn runCommand(
     command: []const u8,
     cwd: []const u8,
     timeout_secs: ?u64,
-    signal: agent.protocol.AbortSignal,
-    on_update: ?agent.protocol.AgentToolUpdateCallback,
+    signal: protocol.AbortSignal,
+    on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
-) agent.protocol.AgentToolResult {
+) protocol.AgentToolResult {
     var thread_safe_allocator: std.heap.ThreadSafeAllocator = .{ .child_allocator = allocator };
     const io_allocator = thread_safe_allocator.allocator();
 
@@ -158,15 +159,12 @@ fn runCommand(
         runStreamingCapture(allocator, io_allocator, &child, command, cb, update_ctx)
     else
         runBufferedCapture(allocator, io_allocator, &child);
-    defer if (completed.merged_output.len > 0) allocator.free(completed.merged_output);
+    defer if (completed.output_text.len > 0) allocator.free(completed.output_text);
 
     const term = child.wait() catch null;
     timeout_guard.markExited();
 
-    const output_text = truncateHeadTail(allocator, completed.merged_output) catch allocator.dupe(u8, completed.merged_output) catch null;
-    defer if (output_text) |text| allocator.free(text);
-
-    const result_text = formatCommandTranscript(allocator, command, if (output_text) |text| text else "") catch
+    const result_text = formatCommandTranscript(allocator, command, completed.output_text) catch
         return util.errorResult(allocator, "bash tool: alloc failed");
     defer allocator.free(result_text);
 
@@ -255,38 +253,32 @@ const TimeoutGuard = struct {
 };
 
 const CompletedOutput = struct {
-    merged_output: []u8 = &.{},
+    output_text: []u8 = &.{},
 };
 
 const StreamKind = enum { stdout, stderr };
 
 const StreamingCapture = struct {
-    allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
-    stdout: std.ArrayListUnmanaged(u8) = .empty,
-    stderr: std.ArrayListUnmanaged(u8) = .empty,
+    output: output_buffer.LineOutputBuffer,
     stdout_done: bool = false,
     stderr_done: bool = false,
     dirty: bool = false,
 
-    fn deinit(self: *StreamingCapture) void {
-        self.stdout.deinit(self.allocator);
-        self.stderr.deinit(self.allocator);
+    fn init(allocator: std.mem.Allocator) StreamingCapture {
+        return .{
+            .output = output_buffer.LineOutputBuffer.init(allocator, HEAD_LINES, TAIL_LINES),
+        };
     }
 
-    fn append(self: *StreamingCapture, kind: StreamKind, bytes: []const u8) void {
+    fn deinit(self: *StreamingCapture) void {
+        self.output.deinit();
+    }
+
+    fn append(self: *StreamingCapture, bytes: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        const list = switch (kind) {
-            .stdout => &self.stdout,
-            .stderr => &self.stderr,
-        };
-        if (list.items.len >= MAX_OUTPUT_BYTES) return;
-
-        const take = @min(bytes.len, MAX_OUTPUT_BYTES - list.items.len);
-        if (take == 0) return;
-        list.appendSlice(self.allocator, bytes[0..take]) catch return;
+        self.output.addChunk(bytes) catch return;
         self.dirty = true;
     }
 
@@ -305,18 +297,20 @@ const StreamingCapture = struct {
         return self.stdout_done and self.stderr_done;
     }
 
-    fn takeDirtyMergedOutput(self: *StreamingCapture, allocator: std.mem.Allocator) ?[]u8 {
+    fn takeDirtySnapshot(self: *StreamingCapture, allocator: std.mem.Allocator) ?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (!self.dirty) return null;
         self.dirty = false;
-        return mergeOutputs(allocator, self.stdout.items, self.stderr.items) catch null;
+        const snapshot = self.output.snapshotAlloc(allocator, TRUNCATED_FMT) catch return null;
+        return snapshot.text;
     }
 
-    fn takeMergedOutput(self: *StreamingCapture, allocator: std.mem.Allocator) ![]u8 {
+    fn finishText(self: *StreamingCapture, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return mergeOutputs(allocator, self.stdout.items, self.stderr.items);
+        const final = try self.output.finishAlloc(allocator, TRUNCATED_FMT);
+        return final.text;
     }
 };
 
@@ -325,28 +319,24 @@ fn runBufferedCapture(
     io_allocator: std.mem.Allocator,
     child: *std.process.Child,
 ) CompletedOutput {
-    var stderr_result: ?[]u8 = null;
+    var capture = StreamingCapture.init(io_allocator);
+    defer capture.deinit();
+
     var stderr_thread: ?std.Thread = null;
     if (child.stderr) |stderr_file| {
-        stderr_thread = std.Thread.spawn(.{}, readStderr, .{ stderr_file, io_allocator, &stderr_result }) catch null;
-    }
+        stderr_thread = std.Thread.spawn(.{}, readStream, .{ stderr_file, &capture, StreamKind.stderr }) catch blk: {
+            capture.markDone(.stderr);
+            break :blk null;
+        };
+    } else capture.markDone(.stderr);
 
-    const stdout_data = if (child.stdout) |stdout_file|
-        stdout_file.readToEndAlloc(io_allocator, MAX_OUTPUT_BYTES) catch null
-    else
-        null;
-    defer if (stdout_data) |data| io_allocator.free(data);
+    if (child.stdout) |stdout_file| {
+        readStream(stdout_file, &capture, StreamKind.stdout);
+    } else capture.markDone(.stdout);
 
     if (stderr_thread) |t| t.join();
-    defer if (stderr_result) |data| io_allocator.free(data);
 
-    return .{
-        .merged_output = mergeOutputs(
-            allocator,
-            if (stdout_data) |data| data else "",
-            if (stderr_result) |data| data else "",
-        ) catch allocator.dupe(u8, "") catch &.{},
-    };
+    return .{ .output_text = capture.finishText(allocator) catch allocator.dupe(u8, "") catch &.{} };
 }
 
 fn runStreamingCapture(
@@ -354,10 +344,10 @@ fn runStreamingCapture(
     io_allocator: std.mem.Allocator,
     child: *std.process.Child,
     command: []const u8,
-    cb: agent.protocol.AgentToolUpdateCallback,
+    cb: protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) CompletedOutput {
-    var capture = StreamingCapture{ .allocator = io_allocator };
+    var capture = StreamingCapture.init(io_allocator);
     defer capture.deinit();
 
     var stdout_thread: ?std.Thread = null;
@@ -383,9 +373,9 @@ fn runStreamingCapture(
     while (!capture.isComplete()) {
         const now_ns = std.time.nanoTimestamp();
         if (last_emit_ns == 0 or now_ns - last_emit_ns >= STREAM_UPDATE_MIN_INTERVAL_MS * std.time.ns_per_ms) {
-            if (capture.takeDirtyMergedOutput(allocator)) |merged| {
-                defer if (merged.len > 0) allocator.free(merged);
-                if (emitPartialTranscriptUpdate(allocator, command, merged, cb, update_ctx, last_emitted_hash)) |new_hash| {
+            if (capture.takeDirtySnapshot(allocator)) |snapshot| {
+                defer if (snapshot.len > 0) allocator.free(snapshot);
+                if (emitPartialTranscriptUpdate(allocator, command, snapshot, cb, update_ctx, last_emitted_hash)) |new_hash| {
                     last_emitted_hash = new_hash;
                     last_emit_ns = now_ns;
                 }
@@ -394,18 +384,17 @@ fn runStreamingCapture(
         std.Thread.sleep(STREAM_UPDATE_POLL_MS * std.time.ns_per_ms);
     }
 
-    if (capture.takeDirtyMergedOutput(allocator)) |merged| {
-        defer if (merged.len > 0) allocator.free(merged);
-        if (emitPartialTranscriptUpdate(allocator, command, merged, cb, update_ctx, last_emitted_hash)) |new_hash| {
+    if (capture.takeDirtySnapshot(allocator)) |snapshot| {
+        defer if (snapshot.len > 0) allocator.free(snapshot);
+        if (emitPartialTranscriptUpdate(allocator, command, snapshot, cb, update_ctx, last_emitted_hash)) |new_hash| {
             last_emitted_hash = new_hash;
-            last_emit_ns = std.time.nanoTimestamp();
         }
     }
 
     if (stdout_thread) |t| t.join();
     if (stderr_thread) |t| t.join();
 
-    return .{ .merged_output = capture.takeMergedOutput(allocator) catch allocator.dupe(u8, "") catch &.{} };
+    return .{ .output_text = capture.finishText(allocator) catch allocator.dupe(u8, "") catch &.{} };
 }
 
 fn readStream(file: std.fs.File, capture: *StreamingCapture, kind: StreamKind) void {
@@ -413,7 +402,7 @@ fn readStream(file: std.fs.File, capture: *StreamingCapture, kind: StreamKind) v
     while (true) {
         const n = file.read(&buf) catch break;
         if (n == 0) break;
-        capture.append(kind, buf[0..n]);
+        capture.append(buf[0..n]);
     }
     capture.markDone(kind);
 }
@@ -468,14 +457,14 @@ test "runCommand handles concurrent stdout and stderr" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
 
-        const result = runCommand(arena.allocator(), cmd, "/tmp", 5, agent.protocol.AbortSignal.none, null, null);
+        const result = runCommand(arena.allocator(), cmd, "/tmp", 5, protocol.AbortSignal.none, null, null);
 
         try testing.expect(!result.is_error);
         try testing.expectEqual(@as(usize, 1), result.content.len);
         try testing.expect(result.content[0] == .text);
         try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "out0000") != null);
         try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "err0399") != null);
-        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "... output truncated ...") != null);
+        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "lines truncated") != null);
     }
 }
 
@@ -488,7 +477,7 @@ test "runCommand emits partial updates while command is still running" {
 
         const Self = @This();
 
-        fn callback(partial_result: agent.protocol.AgentToolResult, ctx: ?*anyopaque) void {
+        fn callback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.count += 1;
             if (partial_result.content.len > 0 and partial_result.content[0] == .text) {
@@ -515,7 +504,7 @@ test "runCommand emits partial updates while command is still running" {
         cmd,
         "/tmp",
         5,
-        agent.protocol.AbortSignal.none,
+        protocol.AbortSignal.none,
         &CallbackState.callback,
         @ptrCast(&state),
     );
@@ -526,11 +515,11 @@ test "runCommand emits partial updates while command is still running" {
     try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "second") != null);
 }
 
-fn oneText(allocator: std.mem.Allocator, text: []const u8) []agent.protocol.AgentToolResult.ContentBlock {
+fn oneText(allocator: std.mem.Allocator, text: []const u8) []protocol.AgentToolResult.ContentBlock {
     const owned = json_util.utf8LossyAlloc(allocator, text) catch allocator.dupe(u8, text) catch return &.{};
     errdefer allocator.free(owned);
 
-    const blocks = allocator.alloc(agent.protocol.AgentToolResult.ContentBlock, 1) catch return &.{};
+    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch return &.{};
     blocks[0] = .{ .text = .{ .text = owned } };
     return blocks;
 }
@@ -552,8 +541,8 @@ fn appendTail(allocator: std.mem.Allocator, base: []const u8, tail: []const u8) 
 fn emitPartialTranscriptUpdate(
     allocator: std.mem.Allocator,
     command: []const u8,
-    merged_output: []const u8,
-    cb: agent.protocol.AgentToolUpdateCallback,
+    output_text: []const u8,
+    cb: protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
     previous_hash: ?u64,
 ) ?u64 {
@@ -561,29 +550,13 @@ fn emitPartialTranscriptUpdate(
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const output = truncateHeadTail(aa, merged_output) catch aa.dupe(u8, merged_output) catch return null;
-    const text = formatCommandTranscript(aa, command, output) catch return null;
+    const text = formatCommandTranscript(aa, command, output_text) catch return null;
     const hash = std.hash.Wyhash.hash(0, text);
     if (previous_hash) |prev| {
         if (prev == hash) return null;
     }
     cb(.{ .content = oneText(aa, text) }, update_ctx);
     return hash;
-}
-
-fn mergeOutputs(allocator: std.mem.Allocator, stdout_data: []const u8, stderr_data: []const u8) ![]u8 {
-    var merged: std.ArrayListUnmanaged(u8) = .empty;
-    defer merged.deinit(allocator);
-    if (stdout_data.len > 0) try merged.appendSlice(allocator, stdout_data);
-    if (stderr_data.len > 0) {
-        if (merged.items.len > 0) try merged.appendSlice(allocator, "\n");
-        try merged.appendSlice(allocator, stderr_data);
-    }
-    return merged.toOwnedSlice(allocator);
-}
-
-fn readStderr(stderr_file: std.fs.File, alloc: std.mem.Allocator, result: *?[]u8) void {
-    result.* = stderr_file.readToEndAlloc(alloc, MAX_OUTPUT_BYTES) catch null;
 }
 
 fn extractTimeout(args: std.json.Value) ?u64 {
@@ -660,33 +633,6 @@ fn injectGitTrailers(allocator: std.mem.Allocator, cmd: []const u8, session_id: 
         session_id,
         cmd[idx + needle.len ..],
     });
-}
-
-fn truncateHeadTail(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var lines = std.ArrayList([]const u8).empty;
-    defer lines.deinit(allocator);
-
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| {
-        try lines.append(allocator, line);
-    }
-
-    if (lines.items.len <= HEAD_LINES + TAIL_LINES) return allocator.dupe(u8, text);
-
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    for (lines.items[0..HEAD_LINES], 0..) |line, idx| {
-        if (idx > 0) try out.append(allocator, '\n');
-        try out.appendSlice(allocator, line);
-    }
-    try out.appendSlice(allocator, "\n... output truncated ...\n");
-    const tail_start = lines.items.len - TAIL_LINES;
-    for (lines.items[tail_start..], 0..) |line, idx| {
-        if (idx > 0) try out.append(allocator, '\n');
-        try out.appendSlice(allocator, line);
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn globMatches(pattern: []const u8, text: []const u8) bool {

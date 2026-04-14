@@ -6,6 +6,9 @@ const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
+const output_buffer = @import("../lib/output_buffer.zig");
+
+const MAX_DIR_ENTRIES: usize = 1000;
 
 const SCHEMA =
     \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path to the directory to list. Defaults to cwd."}}}
@@ -71,10 +74,12 @@ fn execute(
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    for (names.items, 0..) |n, i| {
-        if (i > 0) aw.writer.writeAll("\n") catch break;
-        aw.writer.writeAll(n) catch break;
-    }
+    output_buffer.appendHeadTail(
+        &aw.writer,
+        names.items,
+        MAX_DIR_ENTRIES,
+        "... [{d} more entries] ...",
+    ) catch return util.errorResult(allocator, "ls alloc failed");
     aw.writer.writeAll("\n\n(note: prefer the read tool for directory listing — it handles both files and directories.)") catch {};
 
     const out = aw.toOwnedSlice() catch

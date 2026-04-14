@@ -89,11 +89,7 @@ fn writeParseDiagnostic(diag: cli.args.Diagnostic) !void {
 
 fn sinkModeForCommand(command: cli.args.Command) logging.SinkMode {
     return switch (command) {
-        .help, .version, .list_models => .stderr_only,
-        .run => |options| blk: {
-            const has_prompt = options.print_mode or options.mode == .json or options.prompt_text != null;
-            const is_continue = options.continue_path != null;
-            break :blk if (has_prompt or is_continue) .stderr_and_file else .file_only;
-        },
+        .help, .version, .list_models => .disabled,
+        .run => .file_only,
     };
 }

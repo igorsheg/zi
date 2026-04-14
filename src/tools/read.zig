@@ -14,6 +14,7 @@ const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
+const output_buffer = @import("../lib/output_buffer.zig");
 
 const MAX_LINES: usize = 500;
 const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -172,7 +173,7 @@ fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentT
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    util.appendHeadTail(&aw.writer, names.items, MAX_DIR_ENTRIES, "... [{d} more entries] ...") catch
+    output_buffer.appendHeadTail(&aw.writer, names.items, MAX_DIR_ENTRIES, "... [{d} more entries] ...") catch
         return util.errorResult(allocator, "directory listing failed");
 
     const out = aw.toOwnedSlice() catch
@@ -252,7 +253,7 @@ fn readTextFile(
             aw.writer.writeAll(line) catch break;
         }
     } else {
-        util.appendHeadTail(
+        output_buffer.appendHeadTail(
             &aw.writer,
             numbered.items,
             MAX_LINES,

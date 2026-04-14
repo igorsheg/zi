@@ -368,7 +368,8 @@ pub fn processStreamMapped(
 
     callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
-    var parser = sse.SseParser{};
+    var parser = sse.SseParser.init(allocator);
+    defer parser.deinit();
 
     const StreamCtx = struct {
         allocator: std.mem.Allocator,
@@ -401,6 +402,17 @@ pub fn processStreamMapped(
             error.StopStreaming => {},
             else => if (abort_flag.isAborted()) {
                 state.partial.stop_reason = .aborted;
+            } else if (err == error.EventDataTooLarge) {
+                emitError(
+                    allocator,
+                    callback,
+                    callback_ctx,
+                    model,
+                    provider_label,
+                    "stream event exceeded {d} bytes",
+                    .{sse.max_event_data_bytes},
+                );
+                return;
             } else {
                 emitError(allocator, callback, callback_ctx, model, provider_label, "stream read error: {s}", .{@errorName(err)});
                 return;

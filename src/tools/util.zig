@@ -1,8 +1,8 @@
 //! Shared helpers for built-in tools.
 //!
 //! pi-mono parity: ports the pieces of the personal pi override tools that
-//! every tool needs — path resolution, secret guard, head/tail truncation,
-//! schema parsing, and AgentToolResult builders.
+//! every tool needs — path resolution, secret guard, schema parsing, and
+//! AgentToolResult builders.
 //!
 //! Design notes:
 //! - Tools are registered with a `*BuiltinCtx` so they know cwd without
@@ -171,37 +171,6 @@ pub fn isSecretFile(path: []const u8) bool {
     if (std.mem.eql(u8, base, ".env")) return true;
     if (std.mem.startsWith(u8, base, ".env.")) return true;
     return false;
-}
-
-/// Append a head+tail truncation of `lines` to `out`. If
-/// `lines.len <= max`, all lines are appended verbatim joined by `\n`.
-/// Otherwise the first `max/2` and last `max/2` lines are kept with
-/// a marker between them.
-pub fn appendHeadTail(
-    out: *std.Io.Writer,
-    lines: []const []const u8,
-    max: usize,
-    comptime marker_fmt: []const u8,
-) !void {
-    if (lines.len <= max) {
-        for (lines, 0..) |line, i| {
-            if (i > 0) try out.writeAll("\n");
-            try out.writeAll(line);
-        }
-        return;
-    }
-    const half = max / 2;
-    for (lines[0..half], 0..) |line, i| {
-        if (i > 0) try out.writeAll("\n");
-        try out.writeAll(line);
-    }
-    try out.writeAll("\n\n");
-    try out.print(marker_fmt, .{lines.len - 2 * half});
-    try out.writeAll("\n\n");
-    for (lines[lines.len - half ..], 0..) |line, i| {
-        if (i > 0) try out.writeAll("\n");
-        try out.writeAll(line);
-    }
 }
 
 test "textResult owns copied text" {

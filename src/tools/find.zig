@@ -9,6 +9,7 @@ const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
+const output_buffer = @import("../lib/output_buffer.zig");
 
 const DEFAULT_LIMIT: usize = 500;
 
@@ -131,20 +132,12 @@ fn execute(
         }
         w.print("\n\n(showing {d}-{d} of {d} results)", .{ offset + 1, end, total }) catch {};
     } else if (total > limit) {
-        const half = limit / 2;
-        var i: usize = 0;
-        while (i < half) : (i += 1) {
-            if (i > 0) w.writeAll("\n") catch break;
-            w.writeAll(paths.items[i]) catch break;
-        }
-        w.print("\n\n... [{d} more results, use a more specific pattern to narrow] ...\n\n", .{total - 2 * half}) catch {};
-        i = total - half;
-        var first = true;
-        while (i < total) : (i += 1) {
-            if (!first) w.writeAll("\n") catch break;
-            first = false;
-            w.writeAll(paths.items[i]) catch break;
-        }
+        output_buffer.appendHeadTail(
+            w,
+            paths.items,
+            limit,
+            "... [{d} more results, use a more specific pattern to narrow] ...",
+        ) catch return util.errorResult(allocator, "find alloc failed");
         w.print("\n\n({d} total results)", .{total}) catch {};
     } else {
         for (paths.items, 0..) |p, idx| {
