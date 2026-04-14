@@ -58,6 +58,18 @@ It owns:
 - input handling
 
 It should render published state, not reach back into agent or provider internals.
+When another owner publishes semantic state, the TUI should reconstruct its own local presentation state from that snapshot instead of depending on view-specific cross-thread payloads.
+
+## Cross-owner boundary philosophy
+
+Across the TUI↔agent boundary, prefer authoritative semantic snapshots over lossy projections tailored to one consumer.
+
+That means:
+- the producer publishes the domain state it actually owns
+- the consumer rebuilds its local caches, transcript/editor state, and render surfaces from that snapshot
+- request messages stay about mutation and work, not "please precompute my UI"
+
+Lossy consumer-specific transport models create a shadow architecture. They duplicate only part of the real contract, drift when new UI-visible semantics appear, and pressure the system back toward shared-state reads or ad hoc exceptions.
 
 ## Provider philosophy
 

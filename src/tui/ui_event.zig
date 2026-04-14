@@ -117,8 +117,10 @@ pub const UiEvent = union(enum) {
     // from an owned AgentMessage snapshot and frees it after apply.
     //
     // Payload is a full deep-cloned message list allocated from
-    // `msg_allocator` so the TUI can reconstruct transcript surfaces
-    // without re-reading agent-owned session state.
+    // `msg_allocator`. This is intentionally a semantic snapshot,
+    // not a transcript-row projection: the agent owns authoritative
+    // session messages, and the TUI reconstructs its local transcript
+    // and editor state without re-reading agent-owned session state.
     session_resumed: struct {
         messages: []agent_protocol.AgentMessage,
         /// Optional warning from `restoreModelFromSession` when the
@@ -142,6 +144,8 @@ pub const UiEvent = union(enum) {
     // Agent-thread owned model/thinking/context snapshot for the editor
     // border chips. Published whenever session state changes in a way the
     // TUI must render without reading agent-owned state directly.
+    // Semantic state crosses the boundary; chip formatting/layout stays
+    // TUI-owned rather than becoming part of the mailbox payload.
     status_snapshot: struct {
         model_provider: []u8,
         model_id: []u8,

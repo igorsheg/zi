@@ -26,6 +26,27 @@ Use a **request** when the agent must mutate state, run code, or touch I/O.
 
 Never turn per-keystroke UI behavior into RPC into Lua or agent internals.
 
+## Semantic snapshots, not projections
+
+When a mailbox boundary publishes read-oriented state, prefer an authoritative semantic snapshot over a lossy transport projection tailored to one consumer.
+
+The producer owns authoritative domain state.
+The consumer owns local reconstruction.
+
+In practice:
+- publish the semantic fields the producer actually owns
+- let the consumer rebuild transcript/editor/render/cache state locally
+- avoid pre-rendered rows, chip strings, or other view-specific payloads as the default cross-thread contract
+
+Current zi examples follow this rule:
+- status updates cross as a semantic snapshot of model, thinking level, and context numbers; the TUI formats and lays out its own chips
+- session resume crosses as an owned message snapshot; the TUI rebuilds transcript items and editor history from it
+
+Why this rule exists:
+- semantic snapshots stay aligned with the producer's real contract
+- consumer-specific projections drift when new UI-visible semantics appear
+- drift creates pressure for shared-state reads, ad hoc parallel payloads, or "just this one" ownership exceptions
+
 ## Short-lived helper threads
 
 Helpers are allowed, but they do not get their own ownership exception.
@@ -50,7 +71,7 @@ The split stays the same:
 | session store and agent state | agent |
 | transcript widgets, overlays, editor, components | TUI |
 | cross-thread queue storage and payloads | `msg_allocator` |
-| published snapshots | produced by agent, consumed by TUI |
+| published snapshots | produced by agent as semantic state, consumed by TUI for local reconstruction |
 
 ## Allocator rule
 
@@ -78,11 +99,13 @@ Avoid:
 - borrowed slices crossing queues
 - adding mutexes to compensate for unclear ownership
 - making rendering depend on synchronous calls into agent-owned state
+- treating one consumer's temporary render model as the default cross-thread payload
 
 ## Practical test
 
-When adding a feature, ask two questions:
+When adding a feature, ask three questions:
 1. who owns this resource for its whole lifetime?
 2. is this a snapshot read or a mutation request?
+3. if it is a snapshot, is it authoritative semantic state, and which consumer reconstructs local view state from it?
 
 If those answers are unclear, the design is not done.
