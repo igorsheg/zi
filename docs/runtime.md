@@ -26,6 +26,22 @@ Use a **request** when the agent must mutate state, run code, or touch I/O.
 
 Never turn per-keystroke UI behavior into RPC into Lua or agent internals.
 
+## Short-lived helper threads
+
+Helpers are allowed, but they do not get their own ownership exception.
+
+Two helper shapes are valid:
+
+- **one-shot publisher** — a helper does blocking work and publishes owned results into an existing mailbox-backed owner channel, usually the event queue. This is the right shape for flows like login or future background discovery where the helper must report progress or completion back to the TUI without mutating TUI state directly.
+- **private joined helper** — a helper exists only to support one owner's local operation, such as a watchdog, timeout killer, or stdout/stderr reader. It does not create a product-level message boundary and is joined before the operation returns.
+
+Use a dedicated mailbox or owned loop for a helper only when that helper becomes a real long-lived owner boundary with its own queue policy, shutdown semantics, or observability needs. Do not wrap one-shot helpers in faux actors just for symmetry.
+
+The split stays the same:
+- mailbox messages for cross-owner mutation/work
+- snapshots for render-speed reads
+- one-shot helper publication for temporary background work that reports back through an existing owner channel
+
 ## Ownership table
 
 | Resource family | Owner |
