@@ -1,5 +1,6 @@
 pub const cell = @import("cell.zig");
 pub const buffer = @import("buffer.zig");
+pub const ansi = @import("ansi.zig");
 pub const grapheme = @import("grapheme.zig");
 pub const keys = @import("keys.zig");
 pub const renderer = @import("renderer.zig");

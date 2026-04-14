@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const ansi = @import("ansi.zig");
 
 /// Global terminal pointer for signal/panic cleanup.
 /// Set by Terminal.installSignalHandlers(), cleared by Terminal.deinit().
@@ -104,74 +105,74 @@ pub const Terminal = struct {
     }
 
     pub fn hideCursor(self: *Terminal) void {
-        self.write("\x1b[?25l");
+        self.write(ansi.hide_cursor);
     }
 
     pub fn showCursor(self: *Terminal) void {
-        self.write("\x1b[?25h");
+        self.write(ansi.show_cursor);
     }
 
     pub fn setCursorPos(self: *Terminal, col: u32, row: u32) void {
         var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ row + 1, col + 1 }) catch return;
+        const s = ansi.formatCursorPos(&buf, col, row) catch return;
         self.write(s);
     }
 
     pub fn clearScreen(self: *Terminal) void {
-        self.write("\x1b[2J\x1b[H");
+        self.write(ansi.clear_and_home);
     }
 
     pub fn setTitle(self: *Terminal, title: []const u8) void {
-        self.write("\x1b]0;");
+        self.write(ansi.title_prefix);
         self.write(title);
-        self.write("\x07");
+        self.write(ansi.title_suffix);
     }
 
     // --- Keyboard protocol ---
 
     pub fn enableBracketedPaste(self: *Terminal) void {
-        self.write("\x1b[?2004h");
+        self.write(ansi.bracketed_paste_enable);
     }
 
     pub fn disableBracketedPaste(self: *Terminal) void {
-        self.write("\x1b[?2004l");
+        self.write(ansi.bracketed_paste_disable);
     }
 
     /// Query kitty keyboard protocol support (CSI ? u).
     pub fn queryKittyProtocol(self: *Terminal) void {
-        self.write("\x1b[?u");
+        self.write(ansi.kitty_query);
     }
 
     /// Enable kitty keyboard protocol: disambiguate + event types + alternate keys.
     pub fn enableKittyProtocol(self: *Terminal) void {
-        self.write("\x1b[>7u");
+        self.write(ansi.kitty_keyboard_enable);
         self.kitty_active = true;
     }
 
     pub fn disableKittyProtocol(self: *Terminal) void {
-        self.write("\x1b[<u");
+        self.write(ansi.kitty_keyboard_disable);
         self.kitty_active = false;
     }
 
     /// Enable xterm modifyOtherKeys mode 2 (fallback when kitty unavailable).
     pub fn enableModifyOtherKeys(self: *Terminal) void {
-        self.write("\x1b[>4;2m");
+        self.write(ansi.modify_other_keys_enable);
         self.modify_other_keys_active = true;
     }
 
     pub fn disableModifyOtherKeys(self: *Terminal) void {
-        self.write("\x1b[>4;0m");
+        self.write(ansi.modify_other_keys_disable);
         self.modify_other_keys_active = false;
     }
 
     /// Enable SGR mouse tracking (button events + scroll wheel).
     pub fn enableMouseTracking(self: *Terminal) void {
-        self.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        self.write(ansi.mouse_tracking_enable);
     }
 
     /// Disable mouse tracking.
     pub fn disableMouseTracking(self: *Terminal) void {
-        self.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+        self.write(ansi.mouse_tracking_disable);
     }
 
 
@@ -199,13 +200,7 @@ pub const Terminal = struct {
     /// Minimal restore for signal/panic context (async-signal-safe).
     /// Only uses write() — no allocations, no locks.
     pub fn emergencyRestore(self: *Terminal) void {
-        const seq = "\x1b[?25h" ++ // show cursor
-            "\x1b[?2004l" ++ // disable bracketed paste
-            "\x1b[<u" ++ // disable kitty
-            "\x1b[>4;0m" ++ // disable modifyOtherKeys
-            "\x1b[?1006l\x1b[?1002l\x1b[?1000l" ++ // disable mouse tracking
-            "\x1b[0m"; // reset attributes
-        _ = posix.write(self.fd_out, seq) catch {};
+        _ = posix.write(self.fd_out, ansi.emergency_restore) catch {};
         if (self.original_termios) |orig| {
             posix.tcsetattr(self.fd_in, .FLUSH, orig) catch {};
         }

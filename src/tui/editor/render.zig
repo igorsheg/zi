@@ -22,7 +22,7 @@ pub fn renderVisibleLines(region: Region, buffer: *const PromptBuffer, visible_l
             .prompt_first => config.prompt,
             .wrapped_continuation => config.continuation_prompt,
         };
-        _ = region.writeStr(1 + config.applied_padding_x, @intCast(row), prompt, config.prompt_fg, Color.default, .{});
+        _ = region.writeStr(config.applied_padding_x, @intCast(row), prompt, config.prompt_fg, Color.default, .{});
         const text = buffer.text()[line.byte_start..line.byte_end];
         if (text.len > 0) {
             _ = region.writeStr(config.applied_padding_x + line.text_col, @intCast(row), text, config.text_fg, Color.default, .{});

@@ -26,20 +26,17 @@ pub const HotkeysOverlay = struct {
 
         const border_color = self.theme.fg(.border);
         const style = box_chrome.Style{ .chrome = border_color, .fg = border_color, .dim = border_color };
-        _ = box_chrome.drawClosedTop(region, 0, "Hotkeys", null, style);
-        _ = box_chrome.drawClosedBottom(region, h - 1, style);
+        const frame = box_chrome.closedFrame(region);
+        _ = frame.drawTop("Hotkeys", null, style);
+        _ = frame.drawBottom(style);
 
-        var row: u32 = 1;
-        while (row + 1 < h) : (row += 1) {
-            _ = box_chrome.drawClosedContentPrefix(region, row, style);
-            if (w > 1) {
-                region.set(w - 1, row, .{ .grapheme = .{ .codepoint = 0x2502 }, .fg = border_color });
-            }
+        const inner = frame.inner;
+        var row: u32 = 0;
+        while (row < inner.height) : (row += 1) {
+            _ = frame.drawBodyRow(row, style);
         }
 
-        if (w <= 3 or h <= 2) return;
-
-        const inner = region.sub(1, 1, w - 2, h - 2);
+        if (inner.width == 0 or inner.height == 0) return;
         const key_width = maxKeyWidth();
         var content_row: u32 = 0;
         var last_section: ?keybindings.Section = null;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ansi = @import("ansi.zig");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");
 const Cell = cell_mod.Cell;
@@ -53,7 +54,7 @@ pub const Renderer = struct {
     pub fn end(self: *Renderer) !void {
         self.output.clearRetainingCapacity();
 
-        appendStr(self, "\x1b[?2026h");
+        appendStr(self, ansi.sync_enable);
 
         var last_fg: ?Color = null;
         var last_bg: ?Color = null;
@@ -103,8 +104,8 @@ pub const Renderer = struct {
             }
         }
 
-        appendStr(self, "\x1b[0m");
-        appendStr(self, "\x1b[?2026l");
+        appendStr(self, ansi.reset);
+        appendStr(self, ansi.sync_disable);
 
         writeAll(self.fd, self.output.items);
 
@@ -131,40 +132,40 @@ fn appendStr(self: *Renderer, s: []const u8) void {
 
 fn appendCursorPos(self: *Renderer, x: u32, y: u32) void {
     var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch return;
+    const s = ansi.formatCursorPos(&buf, x, y) catch return;
     self.output.appendSlice(self.allocator, s) catch return;
 }
 
 fn appendFgColor(self: *Renderer, fg: Color) void {
     if (fg.is_default) {
-        appendStr(self, "\x1b[39m");
+        appendStr(self, ansi.default_fg);
     } else {
         var buf: [24]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "\x1b[38;2;{d};{d};{d}m", .{ fg.r, fg.g, fg.b }) catch return;
+        const s = ansi.formatFgRgb(&buf, fg.r, fg.g, fg.b) catch return;
         self.output.appendSlice(self.allocator, s) catch return;
     }
 }
 
 fn appendBgColor(self: *Renderer, bg: Color) void {
     if (bg.is_default) {
-        appendStr(self, "\x1b[49m");
+        appendStr(self, ansi.default_bg);
     } else {
         var buf: [24]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "\x1b[48;2;{d};{d};{d}m", .{ bg.r, bg.g, bg.b }) catch return;
+        const s = ansi.formatBgRgb(&buf, bg.r, bg.g, bg.b) catch return;
         self.output.appendSlice(self.allocator, s) catch return;
     }
 }
 
 fn appendAttrs(self: *Renderer, attrs: Attributes) void {
-    appendStr(self, "\x1b[22;23;24;25;27;28;29m");
-    if (attrs.bold) appendStr(self, "\x1b[1m");
-    if (attrs.dim) appendStr(self, "\x1b[2m");
-    if (attrs.italic) appendStr(self, "\x1b[3m");
-    if (attrs.underline) appendStr(self, "\x1b[4m");
-    if (attrs.blink) appendStr(self, "\x1b[5m");
-    if (attrs.inverse) appendStr(self, "\x1b[7m");
-    if (attrs.hidden) appendStr(self, "\x1b[8m");
-    if (attrs.strikethrough) appendStr(self, "\x1b[9m");
+    appendStr(self, ansi.attrs_reset);
+    if (attrs.bold) appendStr(self, ansi.bold);
+    if (attrs.dim) appendStr(self, ansi.dim);
+    if (attrs.italic) appendStr(self, ansi.italic);
+    if (attrs.underline) appendStr(self, ansi.underline);
+    if (attrs.blink) appendStr(self, ansi.blink);
+    if (attrs.inverse) appendStr(self, ansi.inverse);
+    if (attrs.hidden) appendStr(self, ansi.hidden);
+    if (attrs.strikethrough) appendStr(self, ansi.strikethrough);
 }
 
 fn appendGrapheme(self: *Renderer, grapheme: cell_mod.Grapheme, pool: *const buffer_mod.GraphemePool) void {

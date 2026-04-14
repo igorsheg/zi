@@ -9,6 +9,7 @@ const keybindings = @import("../keybindings.zig");
 
 const Key = keys_mod.Key;
 const Theme = theme_mod.Theme;
+const SelectItem = select_list_mod.SelectItem;
 const SelectList = select_list_mod.SelectList;
 const Suggestions = autocomplete_mod.Suggestions;
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
@@ -193,6 +194,7 @@ pub const AutocompleteSession = struct {
     fn accept(self: *AutocompleteSession, buffer: *PromptBuffer) bool {
         const provider = self.provider orelse return false;
         const item = self.list.getSelectedItem() orelse return false;
+        const should_continue = shouldContinueAfterAccept(item);
         const result = provider.apply(
             buffer.text(),
             buffer.cursorByte(),
@@ -209,8 +211,16 @@ pub const AutocompleteSession = struct {
             result.replacement_text,
             result.cursor_in_replacement,
         );
-        self.cancel();
+        if (should_continue) {
+            self.request(buffer, self.request_mode);
+        } else {
+            self.cancel();
+        }
         return true;
+    }
+
+    fn shouldContinueAfterAccept(item: *const SelectItem) bool {
+        return std.mem.endsWith(u8, item.label, "/");
     }
 
     fn sinkCallback(ptr: *anyopaque, suggestions: ?Suggestions) void {
@@ -351,6 +361,40 @@ test "AutocompleteSession enter accepts file completion without submit" {
     try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
     try testing.expectEqualStrings("./src/main.zig", buffer.text());
     try testing.expect(!session.isActive());
+}
+
+test "AutocompleteSession tab on directory completion refreshes into the expanded directory" {
+    const slash_commands_mod = @import("../../slash_commands.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("src");
+    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "const x = 1;" });
+
+    const cwd = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(cwd);
+
+    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var provider = makeCombinedProvider(&registry, cwd);
+    defer provider.deinit();
+    var session = AutocompleteSession.init(&Theme.dark);
+    session.setProvider(provider.provider());
+
+    var buffer = PromptBuffer.init(testing.allocator);
+    defer buffer.deinit();
+    buffer.setText("./sr");
+
+    session.refresh(&buffer);
+    try testing.expect(session.isActive());
+    try testing.expectEqualStrings("src/", session.list.getSelectedItem().?.label);
+
+    const outcome = session.processInput(.{ .code = .tab }, &buffer);
+    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
+    try testing.expectEqualStrings("./src/", buffer.text());
+    try testing.expect(session.isActive());
+    try testing.expectEqualStrings("main.zig", session.list.getSelectedItem().?.label);
 }
 
 test "AutocompleteSession tab force-completes a single at-file suggestion after async tick" {

@@ -144,47 +144,44 @@ pub const ListPicker = struct {
 
         const border_color = self.theme.fg(.border);
         const style = box_chrome.Style{ .chrome = border_color, .fg = border_color, .dim = border_color };
+        const frame = box_chrome.closedFrame(region);
 
         // Top border with title
-        _ = box_chrome.drawClosedTop(region, 0, if (self.title.len > 0) self.title else null, null, style);
+        _ = frame.drawTop(if (self.title.len > 0) self.title else null, null, style);
         // Bottom border
-        _ = box_chrome.drawClosedBottom(region, h - 1, style);
+        _ = frame.drawBottom(style);
 
-        // Side borders on all content rows
-        const content_h = h -| 2;
+        const inner = frame.inner;
+        const content_h = inner.height;
         if (content_h > 0) {
             var row: u32 = 0;
             while (row < content_h) : (row += 1) {
-                _ = box_chrome.drawClosedContentPrefix(region, row + 1, style);
-                if (w > 1) {
-                    region.set(w - 1, row + 1, .{ .grapheme = .{ .codepoint = 0x2502 }, .fg = border_color });
-                }
+                _ = frame.drawBodyRow(row, style);
             }
         }
 
-        if (content_h == 0 or w <= 3) return;
-        const inner_w = w - 2;
+        if (content_h == 0 or inner.width == 0) return;
 
-        var body_row: u32 = 1;
+        var body_row: u32 = 0;
         var body_height = content_h;
 
         if (self.searchable) {
-            // Row 1: search input "/ query_text"
+            // Row 0: search input "/ query_text"
             const prompt = "/ ";
             const prompt_w: u32 = @intCast(grapheme_mod.strWidth(prompt));
-            _ = region.writeStr(1, 1, prompt, self.theme.fg(.accent), Color.default, .{});
+            _ = inner.writeStr(0, 0, prompt, self.theme.fg(.accent), Color.default, .{});
             if (self.query_len > 0) {
-                _ = region.writeStr(1 + prompt_w, 1, self.query_buf[0..self.query_len], self.theme.fg(.text), Color.default, .{});
+                _ = inner.writeStr(prompt_w, 0, self.query_buf[0..self.query_len], self.theme.fg(.text), Color.default, .{});
             } else if (self.search_placeholder) |placeholder| {
-                _ = region.writeStr(1 + prompt_w, 1, placeholder, self.theme.fg(.muted), Color.default, .{ .dim = true });
+                _ = inner.writeStr(prompt_w, 0, placeholder, self.theme.fg(.muted), Color.default, .{ .dim = true });
             }
             if (content_h > 1) {
-                var col: u32 = 1;
-                while (col < w - 1) : (col += 1) {
-                    region.set(col, 2, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.theme.fg(.border_muted) }); // ─
+                var col: u32 = 0;
+                while (col < inner.width) : (col += 1) {
+                    inner.set(col, 1, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.theme.fg(.border_muted) }); // ─
                 }
             }
-            body_row = 3;
+            body_row = 2;
             body_height = content_h -| 2;
         }
 
@@ -195,14 +192,14 @@ pub const ListPicker = struct {
                     .loading => self.theme.fg(.accent),
                     .@"error" => self.theme.fg(.@"error"),
                 };
-                _ = region.writeStr(1, body_row, status.text, color, Color.default, .{ .dim = status.kind == .info });
+                _ = inner.writeStr(0, body_row, status.text, color, Color.default, .{ .dim = status.kind == .info });
                 body_row += 1;
                 body_height -|= 1;
             }
         }
 
         if (body_height > 0) {
-            const list_region = region.sub(1, body_row, inner_w, body_height);
+            const list_region = inner.sub(0, body_row, inner.width, body_height);
             self.list.render(list_region);
         }
     }

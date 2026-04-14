@@ -173,7 +173,7 @@ const grapheme_mod = @import("grapheme.zig");
 
 /// Draw closed top border: ╭─ {left} ──── {right} ─╮
 /// Labels are optional. Fill with ─ between them.
-pub fn drawClosedTop(region: Region, row: u32, left: ?[]const u8, right: ?[]const u8, style: Style) u32 {
+fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]const u8, style: Style) u32 {
     if (row >= region.height or region.width < 4) return 0;
     const w = region.width;
     var col: u32 = 0;
@@ -229,7 +229,7 @@ pub fn drawClosedTop(region: Region, row: u32, left: ?[]const u8, right: ?[]cons
 }
 
 /// Draw closed bottom border: ╰─────╯
-pub fn drawClosedBottom(region: Region, row: u32, style: Style) u32 {
+fn drawClosedBottomBorder(region: Region, row: u32, style: Style) u32 {
     if (row >= region.height or region.width < 4) return 0;
     const w = region.width;
     var col: u32 = 0;
@@ -246,34 +246,126 @@ pub fn drawClosedBottom(region: Region, row: u32, style: Style) u32 {
     return 1;
 }
 
-/// Draw closed content line prefix: │ at col 0.
-/// Returns 1 (rows consumed, not cols).
-pub fn drawClosedContentPrefix(region: Region, row: u32, style: Style) u32 {
-    if (row >= region.height) return 0;
-    _ = region.writeStr(0, row, "│", style.chrome, Color.default, .{});
-    return 1;
+/// Returns the width strictly inside a closed frame, excluding both borders.
+pub fn closedInnerWidth(total_width: u32) u32 {
+    return if (total_width > 2) total_width - 2 else 1;
 }
 
-test "drawClosedTop renders with labels" {
-    var buf = try Buffer.init(testing.allocator, 40, 1);
+pub const ClosedFrame = struct {
+    outer: Region,
+    body: Region,
+    inner: Region,
+
+    pub fn init(region: Region) ClosedFrame {
+        const body = if (region.height > 2)
+            region.sub(0, 1, region.width, region.height - 2)
+        else
+            region.sub(region.width, region.height, 0, 0);
+
+        const inner = if (region.width > 2 and region.height > 2)
+            region.sub(1, 1, closedInnerWidth(region.width), region.height - 2)
+        else
+            region.sub(region.width, region.height, 0, 0);
+
+        return .{
+            .outer = region,
+            .body = body,
+            .inner = inner,
+        };
+    }
+
+    pub fn drawTop(self: ClosedFrame, left: ?[]const u8, right: ?[]const u8, style: Style) u32 {
+        return drawClosedTopBorder(self.outer, 0, left, right, style);
+    }
+
+    pub fn drawBottom(self: ClosedFrame, style: Style) u32 {
+        if (self.outer.height == 0) return 0;
+        return drawClosedBottomBorder(self.outer, self.outer.height - 1, style);
+    }
+
+    /// Draw both side borders for a closed content row: │ ... │
+    /// `body_row` is indexed within the box body, so 0 is the first row
+    /// beneath the top border.
+    pub fn drawBodyRow(self: ClosedFrame, body_row: u32, style: Style) u32 {
+        if (self.outer.width == 0 or self.outer.height <= 2) return 0;
+        if (body_row >= self.body.height) return 0;
+
+        const row = body_row + 1;
+        _ = self.outer.writeStr(0, row, "│", style.chrome, Color.default, .{});
+        if (self.outer.width > 1) {
+            _ = self.outer.writeStr(self.outer.width - 1, row, "│", style.chrome, Color.default, .{});
+        }
+        return 1;
+    }
+
+    pub fn innerRow(self: ClosedFrame, body_row: u32) Region {
+        if (body_row >= self.inner.height) {
+            return self.inner.sub(self.inner.width, self.inner.height, 0, 0);
+        }
+        return self.inner.sub(0, body_row, self.inner.width, 1);
+    }
+};
+
+pub fn closedFrame(region: Region) ClosedFrame {
+    return ClosedFrame.init(region);
+}
+
+test "ClosedFrame draws top with labels" {
+    var buf = try Buffer.init(testing.allocator, 40, 3);
     defer buf.deinit();
-    _ = drawClosedTop(buf.region(), 0, "left", "right", test_style);
+    const frame = closedFrame(buf.region());
+    _ = frame.drawTop("left", "right", test_style);
     try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
     try testing.expectEqual(@as(u21, '╮'), buf.get(39, 0).grapheme.codepoint);
 }
 
-test "drawClosedTop renders without labels" {
-    var buf = try Buffer.init(testing.allocator, 20, 1);
+test "ClosedFrame draws top without labels" {
+    var buf = try Buffer.init(testing.allocator, 20, 3);
     defer buf.deinit();
-    _ = drawClosedTop(buf.region(), 0, null, null, test_style);
+    const frame = closedFrame(buf.region());
+    _ = frame.drawTop(null, null, test_style);
     try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
     try testing.expectEqual(@as(u21, '╮'), buf.get(19, 0).grapheme.codepoint);
 }
 
-test "drawClosedBottom renders corners" {
-    var buf = try Buffer.init(testing.allocator, 20, 1);
+test "ClosedFrame draws bottom corners" {
+    var buf = try Buffer.init(testing.allocator, 20, 3);
     defer buf.deinit();
-    _ = drawClosedBottom(buf.region(), 0, test_style);
-    try testing.expectEqual(@as(u21, '╰'), buf.get(0, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '╯'), buf.get(19, 0).grapheme.codepoint);
+    const frame = closedFrame(buf.region());
+    _ = frame.drawBottom(test_style);
+    try testing.expectEqual(@as(u21, '╰'), buf.get(0, 2).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '╯'), buf.get(19, 2).grapheme.codepoint);
+}
+
+test "ClosedFrame draws both side borders on body rows" {
+    var buf = try Buffer.init(testing.allocator, 8, 3);
+    defer buf.deinit();
+    const frame = closedFrame(buf.region());
+    _ = frame.drawBodyRow(0, test_style);
+    try testing.expectEqual(@as(u21, '│'), buf.get(0, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '│'), buf.get(7, 1).grapheme.codepoint);
+}
+
+test "closedFrame exposes body and inner geometry" {
+    var buf = try Buffer.init(testing.allocator, 10, 5);
+    defer buf.deinit();
+    const frame = closedFrame(buf.region());
+
+    try testing.expectEqual(@as(u32, 10), frame.outer.width);
+    try testing.expectEqual(@as(u32, 5), frame.outer.height);
+
+    try testing.expectEqual(@as(u32, 10), frame.body.width);
+    try testing.expectEqual(@as(u32, 3), frame.body.height);
+    try testing.expectEqual(@as(u32, 0), frame.body.x);
+    try testing.expectEqual(@as(u32, 1), frame.body.y);
+
+    try testing.expectEqual(@as(u32, 8), frame.inner.width);
+    try testing.expectEqual(@as(u32, 3), frame.inner.height);
+    try testing.expectEqual(@as(u32, 1), frame.inner.x);
+    try testing.expectEqual(@as(u32, 1), frame.inner.y);
+}
+
+test "closedInnerWidth excludes both borders" {
+    try testing.expectEqual(@as(u32, 8), closedInnerWidth(10));
+    try testing.expectEqual(@as(u32, 1), closedInnerWidth(2));
 }

@@ -60,7 +60,7 @@ pub const Editor = struct {
     last_applied_padding_x: u32 = 0,
     last_content_width: u32 = 80,
     last_viewport_rows: u32 = 10,
-    prompt: []const u8 = "> ",
+    prompt: []const u8 = "",
     on_submit: ?EditorInterface.SubmitCallback = null,
     on_submit_ctx: ?*anyopaque = null,
     on_change: ?EditorInterface.ChangeCallback = null,
@@ -322,6 +322,7 @@ pub const Editor = struct {
         self.view.ensureCursorVisible();
 
         const editor_h = visible_rows + 2;
+        const frame = box_chrome.closedFrame(region.sub(0, 0, w, editor_h));
 
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
@@ -329,29 +330,30 @@ pub const Editor = struct {
             var right_buf: [256]u8 = undefined;
             const left_text = self.formatStatusLeft(&left_buf);
             const right_text = self.formatStatusRight(&right_buf);
-            _ = box_chrome.drawClosedTop(region, 0, left_text, right_text, style);
+            _ = frame.drawTop(left_text, right_text, style);
         }
         {
             const style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
-            _ = box_chrome.drawClosedBottom(region, editor_h - 1, style);
+            _ = frame.drawBottom(style);
         }
 
-        const content = region.sub(0, 1, w, visible_rows);
+        const inner = frame.inner.sub(0, 0, frame.inner.width, visible_rows);
         {
             const chrome_style = box_chrome.Style{ .chrome = self.border_color, .fg = self.border_color, .dim = self.border_color };
             var row: u32 = 0;
-            while (row < content.height) : (row += 1) {
-                content.fill(0, row, content.width, 1, .{
+            while (row < inner.height) : (row += 1) {
+                frame.innerRow(row).fill(0, 0, inner.width, 1, .{
                     .grapheme = .{ .codepoint = ' ' },
                     .fg = Color.default,
                     .bg = Color.default,
                 });
-                _ = box_chrome.drawClosedContentPrefix(content, row, chrome_style);
+                _ = frame.drawBodyRow(row, chrome_style);
             }
         }
 
-        editor_core.renderVisibleLines(content, self.buffer, self.view.visibleLines(), RenderConfig{
+        editor_core.renderVisibleLines(inner, self.buffer, self.view.visibleLines(), RenderConfig{
             .prompt = self.prompt,
+            .continuation_prompt = self.continuationPrompt(),
             .applied_padding_x = self.last_applied_padding_x,
             .prompt_fg = self.prompt_fg,
             .text_fg = self.text_fg,
@@ -381,7 +383,7 @@ pub const Editor = struct {
         const cursor = self.view.visualCursor() orelse return null;
         if (cursor.visual_row >= self.last_viewport_rows) return null;
         return .{
-            .x = cursor.visual_col + self.last_applied_padding_x,
+            .x = 1 + cursor.visual_col + self.last_applied_padding_x,
             .y = cursor.visual_row + 1,
             .style = .bar,
         };
@@ -767,8 +769,7 @@ pub const Editor = struct {
         const applied_padding = self.appliedPaddingX(total_width);
         const content_width = self.effectiveContentWidth(total_width);
         const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
-        const continuation_prompt = "  ";
-        const continuation_width: u32 = @intCast(grapheme_mod.strWidth(continuation_prompt));
+        const continuation_width: u32 = @intCast(grapheme_mod.strWidth(self.continuationPrompt()));
 
         self.last_total_width = total_width;
         self.last_applied_padding_x = applied_padding;
@@ -777,25 +778,36 @@ pub const Editor = struct {
 
         self.view.setLayoutConfig(.{
             .width_cols = content_width,
-            .first_line_text_col = 1 + prompt_width,
-            .continuation_text_col = 1 + continuation_width,
+            .first_line_text_col = prompt_width,
+            .continuation_text_col = continuation_width,
         });
         self.view.setViewportHeight(self.last_viewport_rows);
     }
 
     fn appliedPaddingX(self: *const Editor, total_width: u32) u32 {
-        if (total_width <= 1) return 0;
-        return @min(self.padding_x, @divFloor(total_width - 1, @as(u32, 2)));
+        const drawable_width = self.drawableContentRegionWidth(total_width);
+        if (drawable_width <= 1) return 0;
+        return @min(self.padding_x, @divFloor(drawable_width - 1, @as(u32, 2)));
     }
 
     fn effectiveContentWidth(self: *const Editor, total_width: u32) u32 {
+        const drawable_width = self.drawableContentRegionWidth(total_width);
         const applied = self.appliedPaddingX(total_width);
-        return if (total_width > applied * 2) total_width - applied * 2 else 1;
+        return if (drawable_width > applied * 2) drawable_width - applied * 2 else 1;
+    }
+
+    fn drawableContentRegionWidth(self: *const Editor, total_width: u32) u32 {
+        _ = self;
+        return box_chrome.closedInnerWidth(total_width);
     }
 
     fn getGitBranch(self: *const Editor) ?[]const u8 {
         if (self.git_branch_len == 0) return null;
         return self.git_branch_buf[0..self.git_branch_len];
+    }
+
+    fn continuationPrompt(self: *const Editor) []const u8 {
+        return if (self.prompt.len == 0) "" else "  ";
     }
 
     fn formatStatusLeft(self: *const Editor, buf: []u8) ?[]const u8 {
@@ -867,13 +879,8 @@ pub const Editor = struct {
             first = false;
         }
 
-        if (status.thinking_level.len > 0 and pos + 3 + status.thinking_level.len < buf.len) {
-            const sep = " • ";
-            if (!first and pos + sep.len <= buf.len) {
-                @memcpy(buf[pos..][0..sep.len], sep);
-                pos += sep.len;
-            }
-            const written = std.fmt.bufPrint(buf[pos..], "thinking {s}", .{status.thinking_level}) catch "";
+        if (status.thinking_level.len > 0) {
+            const written = std.fmt.bufPrint(buf[pos..], " ({s})", .{status.thinking_level}) catch "";
             pos += written.len;
         }
 
@@ -898,6 +905,7 @@ pub const Editor = struct {
 };
 
 const testing = std.testing;
+const Buffer = buffer_mod.Buffer;
 
 const PasteMarker = struct {
     id: u32,
@@ -998,6 +1006,80 @@ fn captureSubmit(text: []const u8, ctx: ?*anyopaque) void {
 
 fn submittedText(capture: *const SubmitCapture) []const u8 {
     return capture.last_text_buf[0..capture.last_text_len];
+}
+
+fn bufferRowAscii(buf: *const Buffer, row: u32, out: []u8) []const u8 {
+    const width = @min(buf.width, out.len);
+    for (0..width) |x| {
+        const cell = buf.get(@intCast(x), row);
+        const cp = switch (cell.grapheme) {
+            .codepoint => |value| value,
+            .pooled => ' ',
+        };
+        out[x] = if (cp < 128) @intCast(cp) else ' ';
+    }
+    return out[0..width];
+}
+
+test "Editor status line renders thinking inline with model" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var status = StatusData.init(testing.allocator);
+    defer status.deinit();
+    status.setModelId("claude-4-sonnet");
+    status.setThinkingLevel("high");
+    status.context_tokens = 1_234;
+    status.context_window = 200_000;
+
+    editor.setStatusData(&status);
+
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings(
+        "ctx 1.2k/200k • claude-4-sonnet (high)",
+        editor.formatStatusRight(&buf).?,
+    );
+}
+
+test "Editor renders input without a prompt marker" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.insertText("hello world");
+
+    var buf = try Buffer.init(testing.allocator, 24, 4);
+    defer buf.deinit();
+    editor.render(buf.region());
+
+    var row_buf: [64]u8 = undefined;
+    const row = bufferRowAscii(&buf, 1, &row_buf);
+    try testing.expect(std.mem.indexOf(u8, row, "hello world") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, row, '>') == null);
+}
+
+test "Editor renders closed side borders on content rows" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.insertText("hello");
+
+    var buf = try Buffer.init(testing.allocator, 12, 4);
+    defer buf.deinit();
+    editor.render(buf.region());
+
+    try testing.expectEqual(@as(u21, '│'), buf.get(0, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '│'), buf.get(11, 1).grapheme.codepoint);
+}
+
+test "Editor keeps the last pre-wrap character visible before the right border" {
+    var editor = Editor.init(testing.allocator);
+    defer editor.deinit();
+    editor.insertText("abcdef");
+
+    var buf = try Buffer.init(testing.allocator, 8, 4);
+    defer buf.deinit();
+    editor.render(buf.region());
+
+    try testing.expectEqual(@as(u21, 'f'), buf.get(6, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '│'), buf.get(7, 1).grapheme.codepoint);
 }
 
 test "Editor undo coalesces typing by word boundaries" {
