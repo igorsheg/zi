@@ -18,6 +18,13 @@ const Key = keys_mod.Key;
 /// One child can be designated as "focused" (receives input and provides cursor).
 ///
 /// Children are borrowed — Container does not own their lifetimes.
+pub const ChildRect = struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+};
+
 pub const Container = struct {
     children: std.ArrayListUnmanaged(Component) = .empty,
     /// Index of the child that fills remaining vertical space.
@@ -69,6 +76,39 @@ pub const Container = struct {
         self.children.items.len = 0;
         self.flex_child_index = null;
         self.focused_child_index = null;
+    }
+
+    pub fn childRect(self: *const Container, index: usize) ?ChildRect {
+        if (index >= self.children.items.len) return null;
+        const w = self.last_render_width;
+        const h = self.last_render_height;
+        if (w == 0 or h == 0) return null;
+
+        var fixed_total: u32 = 0;
+        for (self.children.items, 0..) |child, i| {
+            if (self.flex_child_index != null and i == self.flex_child_index.?) continue;
+            fixed_total += child.measure(w).preferred_height;
+        }
+        const flex_height = if (self.flex_child_index != null)
+            (if (h > fixed_total) h - fixed_total else 0)
+        else
+            @as(u32, 0);
+
+        var y: u32 = 0;
+        for (self.children.items, 0..) |child, i| {
+            if (y >= h) break;
+            const child_h = if (self.flex_child_index != null and i == self.flex_child_index.?)
+                flex_height
+            else
+                child.measure(w).preferred_height;
+            if (child_h == 0) continue;
+            const clamped_h = @min(child_h, h - y);
+            if (i == index) {
+                return .{ .x = 0, .y = y, .width = w, .height = clamped_h };
+            }
+            y += clamped_h;
+        }
+        return null;
     }
 
     // ── Component interface ────────────────────────────────────────
@@ -374,6 +414,32 @@ test "Container aggregates child animation deadlines and ticks" {
     try testing.expect(container.tickAnimation(10));
     try testing.expect(slow.ticked);
     try testing.expect(fast.ticked);
+}
+
+test "Container childRect reports rendered child geometry" {
+    var container = Container.init(testing.allocator);
+    defer container.deinit();
+
+    var header = TestComponent{ .height = 2, .label = 'H' };
+    var body = TestComponent{ .height = 0, .label = 'B' };
+    var footer = TestComponent{ .height = 1, .label = 'F' };
+    container.addChild(header.component());
+    container.addChild(body.component());
+    container.addChild(footer.component());
+    container.flex_child_index = 1;
+
+    var buf = try Buffer.init(testing.allocator, 10, 8);
+    defer buf.deinit();
+    container.render(buf.region());
+
+    const header_rect = container.childRect(0).?;
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 0, .width = 10, .height = 2 }, header_rect);
+
+    const body_rect = container.childRect(1).?;
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 2, .width = 10, .height = 5 }, body_rect);
+
+    const footer_rect = container.childRect(2).?;
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 7, .width = 10, .height = 1 }, footer_rect);
 }
 
 test "Container animation skips clipped children" {

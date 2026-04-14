@@ -22,6 +22,7 @@ const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
 const status_data_mod = @import("status_data.zig");
+const clipboard_mod = @import("clipboard.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
@@ -53,6 +54,12 @@ const RetryPolicy = session_controller_mod.RetryPolicy;
 const CompactionPolicy = session_controller_mod.CompactionPolicy;
 const CompactionExecutor = session_controller_mod.CompactionExecutor;
 const SessionEvent = session_controller_mod.SessionEvent;
+const ChildRect = container_mod.ChildRect;
+
+const MouseCapture = union(enum) {
+    none,
+    transcript_selection: void,
+};
 
 /// Discriminates what a spawned agent worker thread is doing.
 /// `prompt` is the classic path (subscribe + ca.run); `drain_only`
@@ -508,6 +515,7 @@ pub const Interactive = struct {
     /// Kitty protocol negotiation: deadline (ns timestamp) for query response.
     /// null = negotiation complete.
     kitty_deadline_ns: ?i128 = null,
+    mouse_capture: MouseCapture = .none,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -763,7 +771,9 @@ pub const Interactive = struct {
             }
 
             // 3. Check for terminal resize
-            _ = self.tui.checkResize();
+            if (self.tui.checkResize()) {
+                self.cancelTranscriptSelection();
+            }
 
             // 3b. Tick any animated components that reached their deadline.
             const now_ns = std.time.nanoTimestamp();
@@ -942,20 +952,59 @@ pub const Interactive = struct {
     }
 
     fn handleMouse(self: *Interactive, event: keys_mod.MouseEvent) void {
-        switch (event.button) {
-            .scroll_up => {
-                const w = self.tui.width();
-                const output_h = self.outputHeight();
-                self.transcript.scrollBy(w, output_h, -3);
-                self.tui.dirty = true;
+        if (self.tui.hasOverlay()) {
+            self.cancelTranscriptSelection();
+            return;
+        }
+
+        if (event.kind == .scroll) {
+            switch (event.button) {
+                .scroll_up => {
+                    const w = self.tui.width();
+                    const output_h = self.outputHeight();
+                    self.transcript.scrollBy(w, output_h, -3);
+                    self.tui.dirty = true;
+                },
+                .scroll_down => {
+                    const w = self.tui.width();
+                    const output_h = self.outputHeight();
+                    self.transcript.scrollBy(w, output_h, 3);
+                    self.tui.dirty = true;
+                },
+                else => {},
+            }
+            return;
+        }
+
+        switch (self.mouse_capture) {
+            .none => {
+                if (event.kind != .down or event.button != .left) return;
+                const zone = self.transcriptMouseZone(event, false) orelse return;
+                if (zone.zone != .inside) return;
+                if (self.transcript.beginSelection(zone.width, zone.height, zone.local_x, zone.local_y)) {
+                    self.mouse_capture = .{ .transcript_selection = {} };
+                    self.tui.dirty = true;
+                }
             },
-            .scroll_down => {
-                const w = self.tui.width();
-                const output_h = self.outputHeight();
-                self.transcript.scrollBy(w, output_h, 3);
-                self.tui.dirty = true;
+            .transcript_selection => {
+                const zone = self.transcriptMouseZone(event, true) orelse return;
+                const now_ns = std.time.nanoTimestamp();
+                switch (event.kind) {
+                    .drag, .move => {
+                        if (self.transcript.updateSelection(zone.width, zone.height, zone.local_x, zone.local_y, zone.zone, now_ns)) {
+                            self.tui.dirty = true;
+                        }
+                    },
+                    .up => {
+                        _ = self.transcript.endSelection(zone.width, zone.height, zone.local_x, zone.local_y, zone.zone, now_ns);
+                        self.mouse_capture = .none;
+                        self.copyTranscriptSelection(zone.width);
+                        self.cancelTranscriptSelection();
+                        self.tui.dirty = true;
+                    },
+                    else => {},
+                }
             },
-            else => {},
         }
     }
 
@@ -1210,6 +1259,76 @@ pub const Interactive = struct {
                 else => {},
             }
         }
+    }
+
+    const TranscriptMouseZone = struct {
+        zone: transcript_mod.DragZone,
+        local_x: u32,
+        local_y: u32,
+        width: u32,
+        height: u32,
+    };
+
+    fn transcriptRect(self: *Interactive) ?ChildRect {
+        return self.tui.root.childRect(1);
+    }
+
+    fn transcriptMouseZone(self: *Interactive, event: keys_mod.MouseEvent, allow_outside: bool) ?TranscriptMouseZone {
+        const rect = self.transcriptRect() orelse return null;
+        if (rect.width == 0 or rect.height == 0) return null;
+
+        const ex: i32 = event.x;
+        const ey: i32 = event.y;
+        const left: i32 = @intCast(rect.x);
+        const top: i32 = @intCast(rect.y);
+        const right: i32 = left + @as(i32, @intCast(rect.width));
+        const bottom: i32 = top + @as(i32, @intCast(rect.height));
+
+        if (!allow_outside and (ex < left or ex >= right or ey < top or ey >= bottom)) return null;
+
+        const clamped_x: u32 = if (ex < left)
+            0
+        else if (ex >= right)
+            rect.width - 1
+        else
+            @intCast(ex - left);
+
+        const zone: transcript_mod.DragZone = if (ey < top)
+            .above
+        else if (ey >= bottom)
+            .below
+        else
+            .inside;
+        if (!allow_outside and zone != .inside) return null;
+
+        const local_y: u32 = switch (zone) {
+            .inside => @intCast(ey - top),
+            .above => 0,
+            .below => rect.height - 1,
+        };
+
+        return .{
+            .zone = zone,
+            .local_x = clamped_x,
+            .local_y = local_y,
+            .width = rect.width,
+            .height = rect.height,
+        };
+    }
+
+    fn cancelTranscriptSelection(self: *Interactive) void {
+        self.transcript.cancelSelection();
+        self.mouse_capture = .none;
+    }
+
+    fn copyTranscriptSelection(self: *Interactive, width: u32) void {
+        const selected = self.transcript.selectedText(self.allocator, width) catch return;
+        const text = selected orelse return;
+        defer self.allocator.free(text);
+
+        clipboard_mod.copyText(text);
+        self.status_text.setContent("copied selection");
+        self.status_text.fg = self.theme.fg(.success);
     }
 
     fn outputHeight(self: *Interactive) u32 {
@@ -1558,6 +1677,7 @@ pub const Interactive = struct {
     }
 
     fn showHotkeysOverlay(self: *Interactive) void {
+        self.cancelTranscriptSelection();
         _ = self.tui.showOverlay(self.hotkeys_overlay.component(), self.centerDialogOptions());
     }
 
@@ -1584,6 +1704,7 @@ pub const Interactive = struct {
         handle: *?tui_mod.OverlayHandle,
         picker: *ListPicker,
     ) void {
+        self.cancelTranscriptSelection();
         self.hideSimplePickerOverlay(handle);
         handle.* = self.tui.showOverlay(picker.component(), self.bottomPanelOptions());
     }
@@ -1672,6 +1793,7 @@ pub const Interactive = struct {
         flow.picker.on_select = &onSessionSelected;
         flow.picker.on_cancel = &onSessionPickerCancel;
         flow.picker.callback_ctx = @ptrCast(self);
+        self.cancelTranscriptSelection();
         self.resume_picker_flow = flow;
         self.resume_picker_flow.?.handle = self.tui.showOverlay(
             self.resume_picker_flow.?.picker.component(),
@@ -1786,6 +1908,7 @@ pub const Interactive = struct {
                 break;
             }
         }
+        self.cancelTranscriptSelection();
         self.model_picker_flow = flow;
         self.model_picker_flow.?.handle = self.tui.showOverlay(
             self.model_picker_flow.?.picker.component(),

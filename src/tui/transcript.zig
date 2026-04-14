@@ -148,6 +148,41 @@ const LayoutItemState = struct {
     dirty: bool = true,
 };
 
+const SelectionPoint = struct {
+    row: u32,
+    col: u32,
+};
+
+const NormalizedSelection = struct {
+    start: SelectionPoint,
+    end: SelectionPoint,
+};
+
+const AutoScrollDirection = enum {
+    none,
+    up,
+    down,
+};
+
+pub const DragZone = enum {
+    inside,
+    above,
+    below,
+};
+
+const ActiveSelection = struct {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+    dragging: bool = true,
+    auto_scroll: AutoScrollDirection = .none,
+    next_tick_ns: ?i128 = null,
+};
+
+const SelectionState = union(enum) {
+    inactive,
+    active: ActiveSelection,
+};
+
 const FenwickTree = struct {
     tree: std.ArrayListUnmanaged(u32) = .empty,
     allocator: std.mem.Allocator,
@@ -903,6 +938,8 @@ pub const Transcript = struct {
     /// Cached from last render() call, used by clampScroll().
     last_render_width: u32 = 80,
 
+    selection: SelectionState = .inactive,
+
     /// Optional runner pointer used to dispatch Lua `render_result`
     /// hooks at tool_execution_end time. When null (tests, headless
     /// modes, no-extensions build), Lua renderers are never invoked
@@ -917,6 +954,7 @@ pub const Transcript = struct {
     }
 
     pub fn deinit(self: *Transcript) void {
+        self.cancelSelection();
         for (self.items.items) |*item| item.deinit(self.allocator);
         self.items.deinit(self.allocator);
         self.pending_tools.deinit(self.allocator);
@@ -1019,6 +1057,7 @@ pub const Transcript = struct {
 
     /// Remove all items and reset state. Used on session reset / /clear.
     pub fn clearAll(self: *Transcript) void {
+        self.cancelSelection();
         for (self.items.items) |*item| item.deinit(self.allocator);
         self.items.items.len = 0;
         self.pending_tools.clearRetainingCapacity();
@@ -1268,6 +1307,224 @@ pub const Transcript = struct {
         }
     }
 
+    // ── Selection ────────────────────────────────────────────────
+
+    pub fn beginSelection(self: *Transcript, width: u32, visible_height: u32, local_x: u32, local_y: u32) bool {
+        if (visible_height == 0 or width == 0) return false;
+        const point = self.selectionPointForLocal(width, visible_height, local_x, local_y) orelse return false;
+        self.last_visible_height = visible_height;
+        self.layout.follow_bottom = false;
+        self.selection = .{ .active = .{
+            .anchor = point,
+            .focus = point,
+        } };
+        return true;
+    }
+
+    pub fn updateSelection(self: *Transcript, width: u32, visible_height: u32, local_x: u32, local_y: u32, zone: DragZone, now_ns: i128) bool {
+        const active = switch (self.selection) {
+            .inactive => return false,
+            .active => |*active| active,
+        };
+
+        self.last_visible_height = visible_height;
+        const total = self.totalHeight(width);
+        if (total == 0 or visible_height == 0) return false;
+
+        const clamped_x = if (width == 0) 0 else @min(local_x, width - 1);
+        active.focus.col = clamped_x;
+        switch (zone) {
+            .inside => {
+                const point = self.selectionPointForLocal(width, visible_height, clamped_x, local_y) orelse return false;
+                active.focus = point;
+                self.disarmAutoScroll(active);
+            },
+            .above => {
+                active.focus.row = self.layout.scrollOffset();
+                self.armAutoScroll(active, .up, now_ns);
+            },
+            .below => {
+                const last_visible_row = self.layout.scrollOffset() + @min(visible_height - 1, total - 1);
+                active.focus.row = @min(last_visible_row, total - 1);
+                self.armAutoScroll(active, .down, now_ns);
+            },
+        }
+        return true;
+    }
+
+    pub fn endSelection(self: *Transcript, width: u32, visible_height: u32, local_x: u32, local_y: u32, zone: DragZone, now_ns: i128) bool {
+        const updated = self.updateSelection(width, visible_height, local_x, local_y, zone, now_ns);
+        const active = switch (self.selection) {
+            .inactive => return updated,
+            .active => |*active| active,
+        };
+        active.dragging = false;
+        self.disarmAutoScroll(active);
+        return updated;
+    }
+
+    pub fn cancelSelection(self: *Transcript) void {
+        self.selection = .inactive;
+    }
+
+    pub fn hasSelection(self: *Transcript, width: u32) bool {
+        return self.normalizedSelection(width) != null;
+    }
+
+    pub fn selectedText(self: *Transcript, allocator: std.mem.Allocator, width: u32) !?[]u8 {
+        const selection = self.normalizedSelection(width) orelse return null;
+        if (width == 0) return null;
+
+        var scratch = try Buffer.init(allocator, width, 1);
+        defer scratch.deinit();
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+
+        var row = selection.start.row;
+        while (row <= selection.end.row) : (row += 1) {
+            scratch.clear();
+            self.renderAbsoluteRow(scratch.region(), width, row);
+            const used_cols = rowUsedColumns(scratch.region(), 0);
+            const start_col = if (row == selection.start.row) @min(selection.start.col, used_cols) else 0;
+            const end_col = if (row == selection.end.row) @min(selection.end.col, used_cols) else used_cols;
+            if (row != selection.start.row) try out.append(allocator, '\n');
+            try appendRowColumns(&out, allocator, scratch.region(), 0, start_col, end_col);
+        }
+
+        const owned = try out.toOwnedSlice(allocator);
+        if (owned.len == 0) {
+            allocator.free(owned);
+            return null;
+        }
+        return owned;
+    }
+
+    fn selectionPointForLocal(self: *Transcript, width: u32, visible_height: u32, local_x: u32, local_y: u32) ?SelectionPoint {
+        const total = self.totalHeight(width);
+        if (total == 0 or visible_height == 0) return null;
+        const clamped_y = @min(local_y, visible_height - 1);
+        const row = @min(self.layout.scrollOffset() + clamped_y, total - 1);
+        const col = if (width == 0) 0 else @min(local_x, width - 1);
+        return .{ .row = row, .col = col };
+    }
+
+    fn normalizedSelection(self: *Transcript, width: u32) ?NormalizedSelection {
+        const active = switch (self.selection) {
+            .inactive => return null,
+            .active => |active| active,
+        };
+        const total = self.totalHeight(width);
+        if (total == 0) return null;
+
+        var anchor = active.anchor;
+        var focus = active.focus;
+        const max_row = total - 1;
+        anchor.row = @min(anchor.row, max_row);
+        focus.row = @min(focus.row, max_row);
+
+        if (anchor.row == focus.row and anchor.col == focus.col) return null;
+        const anchor_before_focus = anchor.row < focus.row or (anchor.row == focus.row and anchor.col < focus.col);
+        return if (anchor_before_focus)
+            .{ .start = anchor, .end = focus }
+        else
+            .{ .start = focus, .end = anchor };
+    }
+
+    fn armAutoScroll(self: *Transcript, active: *ActiveSelection, dir: AutoScrollDirection, now_ns: i128) void {
+        _ = self;
+        active.auto_scroll = dir;
+        active.next_tick_ns = now_ns + 50 * std.time.ns_per_ms;
+    }
+
+    fn disarmAutoScroll(self: *Transcript, active: *ActiveSelection) void {
+        _ = self;
+        active.auto_scroll = .none;
+        active.next_tick_ns = null;
+    }
+
+    fn tickSelectionAutoScroll(self: *Transcript, now_ns: i128) bool {
+        const active = switch (self.selection) {
+            .inactive => return false,
+            .active => |*active| active,
+        };
+        const dir = active.auto_scroll;
+        const due = active.next_tick_ns orelse return false;
+        if (dir == .none or now_ns < due or self.last_visible_height == 0) return false;
+
+        const total = self.totalHeight(self.last_render_width);
+        if (total == 0) {
+            self.disarmAutoScroll(active);
+            return false;
+        }
+
+        switch (dir) {
+            .up => {
+                if (self.layout.scrollOffset() == 0) {
+                    self.disarmAutoScroll(active);
+                    return false;
+                }
+                self.layout.scrollBy(-1, self.last_visible_height);
+                if (active.focus.row > 0) active.focus.row -= 1;
+            },
+            .down => {
+                const max_scroll = self.layout.maxScrollOffset(self.last_visible_height);
+                if (self.layout.scrollOffset() >= max_scroll) {
+                    self.disarmAutoScroll(active);
+                    return false;
+                }
+                self.layout.scrollBy(1, self.last_visible_height);
+                active.focus.row = @min(active.focus.row + 1, total - 1);
+            },
+            .none => return false,
+        }
+        active.next_tick_ns = now_ns + 50 * std.time.ns_per_ms;
+        return true;
+    }
+
+    fn renderAbsoluteRow(self: *Transcript, region: Region, width: u32, absolute_row: u32) void {
+        self.ensureLayout(width);
+        const total = self.layout.totalHeight();
+        if (absolute_row >= total) return;
+
+        const idx = self.layout.heights.lowerBound(absolute_row);
+        if (idx >= self.items.items.len) return;
+        const item_start = self.layout.prefixHeightBefore(idx);
+        const item = &self.items.items[idx];
+        self.renderItem(item, region, absolute_row - item_start, region.height, width);
+    }
+
+    fn rowSelectedColumnRange(self: *Transcript, absolute_row: u32, max_cols: u32) ?struct { start_col: u32, end_col: u32 } {
+        const selection = self.normalizedSelection(self.last_render_width) orelse return null;
+        if (absolute_row < selection.start.row or absolute_row > selection.end.row) return null;
+
+        var start_col: u32 = 0;
+        var end_col: u32 = max_cols;
+        if (absolute_row == selection.start.row) start_col = @min(selection.start.col, max_cols);
+        if (absolute_row == selection.end.row) end_col = @min(selection.end.col, max_cols);
+        if (start_col >= end_col) return null;
+        return .{ .start_col = start_col, .end_col = end_col };
+    }
+
+    fn renderSelectionOverlay(self: *Transcript, region: Region) void {
+        const selection = self.normalizedSelection(self.last_render_width) orelse return;
+        if (region.height == 0 or region.width == 0) return;
+
+        var screen_row: u32 = 0;
+        while (screen_row < region.height) : (screen_row += 1) {
+            const absolute_row = self.layout.scrollOffset() + screen_row;
+            if (absolute_row < selection.start.row or absolute_row > selection.end.row) continue;
+            const used_cols = rowUsedColumns(region, screen_row);
+            const range = self.rowSelectedColumnRange(absolute_row, used_cols) orelse continue;
+            var col = range.start_col;
+            while (col < range.end_col and col < region.width) : (col += 1) {
+                var cell = region.get(col, screen_row);
+                cell.bg = self.theme.bg(.selected_bg);
+                region.set(col, screen_row, cell);
+            }
+        }
+    }
+
     // ── Layout / scroll ───────────────────────────────────────────
 
     /// Total height of all items at the given width.
@@ -1310,7 +1567,10 @@ pub const Transcript = struct {
     }
 
     pub fn nextAnimationDeadline(self: *Transcript, now_ns: i128) ?i128 {
-        var next_deadline: ?i128 = null;
+        var next_deadline: ?i128 = switch (self.selection) {
+            .inactive => null,
+            .active => |active| active.next_tick_ns,
+        };
         for (self.items.items) |item| {
             if (item.renderable.nextAnimationDeadline(now_ns)) |deadline| {
                 next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
@@ -1320,7 +1580,7 @@ pub const Transcript = struct {
     }
 
     pub fn tickAnimation(self: *Transcript, now_ns: i128) bool {
-        var changed = false;
+        var changed = self.tickSelectionAutoScroll(now_ns);
         for (self.items.items) |item| {
             changed = item.renderable.tickAnimation(now_ns) or changed;
         }
@@ -1354,6 +1614,7 @@ pub const Transcript = struct {
             screen_y += visible_h;
             skipped = 0;
         }
+        self.renderSelectionOverlay(region);
     }
 
     fn renderItem(self: *Transcript, item: *TranscriptItem, row_region: Region, skipped: u32, _: u32, w: u32) void {
@@ -1380,6 +1641,49 @@ pub const Transcript = struct {
         return @max(1, item.renderable.measure(width).preferred_height) + item.extra_height;
     }
 };
+
+fn rowUsedColumns(region: Region, row: u32) u32 {
+    if (row >= region.height) return 0;
+    var last_used: u32 = 0;
+    var col: u32 = 0;
+    while (col < region.width) : (col += 1) {
+        const cell = region.get(col, row);
+        if (cell.width == 0) continue;
+        if (!cellIsBlank(region.buf, cell)) {
+            last_used = @min(region.width, col + @as(u32, cell.width));
+        }
+    }
+    return last_used;
+}
+
+fn cellIsBlank(buf: *const Buffer, cell: cell_mod.Cell) bool {
+    return switch (cell.grapheme) {
+        .codepoint => |cp| cp == ' ',
+        .pooled => |id| blk: {
+            for (buf.grapheme_pool.get(id)) |b| {
+                if (b != ' ') break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn appendRowColumns(out: *std.ArrayList(u8), allocator: std.mem.Allocator, region: Region, row: u32, start_col: u32, end_col: u32) !void {
+    if (row >= region.height or start_col >= end_col) return;
+    var col = start_col;
+    while (col < end_col and col < region.width) : (col += 1) {
+        const cell = region.get(col, row);
+        if (cell.width == 0) continue;
+        switch (cell.grapheme) {
+            .codepoint => |cp| {
+                var utf8_buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(cp, &utf8_buf) catch continue;
+                try out.appendSlice(allocator, utf8_buf[0..len]);
+            },
+            .pooled => |id| try out.appendSlice(allocator, region.buf.grapheme_pool.get(id)),
+        }
+    }
+}
 
 // ── Tests ─────────────────────────────────────────────────────────
 
@@ -1918,6 +2222,90 @@ test "Transcript animation hooks stay static for assistant thinking blocks" {
     transcript.endAssistantMessage();
 
     try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(0));
+}
+
+test "Transcript selection copies across visual rows" {
+    const FixedLines = struct {
+        lines: []const []const u8,
+
+        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
+            var row: u32 = 0;
+            var line_idx: usize = @intCast(first_row);
+            while (row < region.height and line_idx < self.lines.len) : ({
+                row += 1;
+                line_idx += 1;
+            }) {
+                _ = region.writeStr(0, row, self.lines[line_idx], Color.default, Color.default, .{});
+            }
+        }
+
+        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
+            const h: u32 = @intCast(self.lines.len);
+            return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
+        }
+
+        pub fn renderable(self: *@This()) TranscriptRenderable {
+            return TranscriptRenderable.init(@This(), self);
+        }
+    };
+
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var lines = FixedLines{ .lines = &.{ "alpha", "bravo" } };
+    transcript.addRenderable(lines.renderable());
+
+    try testing.expect(transcript.beginSelection(10, 2, 1, 0));
+    try testing.expect(transcript.updateSelection(10, 2, 4, 1, .inside, 0));
+
+    const selected = (try transcript.selectedText(testing.allocator, 10)).?;
+    defer testing.allocator.free(selected);
+    try testing.expectEqualStrings("lpha\nbrav", selected);
+}
+
+test "Transcript selection autoscroll advances viewport while dragging below" {
+    const FixedLines = struct {
+        lines: []const []const u8,
+
+        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
+            var row: u32 = 0;
+            var line_idx: usize = @intCast(first_row);
+            while (row < region.height and line_idx < self.lines.len) : ({
+                row += 1;
+                line_idx += 1;
+            }) {
+                _ = region.writeStr(0, row, self.lines[line_idx], Color.default, Color.default, .{});
+            }
+        }
+
+        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
+            const h: u32 = @intCast(self.lines.len);
+            return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
+        }
+
+        pub fn renderable(self: *@This()) TranscriptRenderable {
+            return TranscriptRenderable.init(@This(), self);
+        }
+    };
+
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var lines = FixedLines{ .lines = &.{ "row0", "row1", "row2", "row3" } };
+    transcript.addRenderable(lines.renderable());
+
+    try testing.expect(transcript.beginSelection(10, 2, 0, 1));
+    try testing.expect(transcript.updateSelection(10, 2, 3, 1, .below, 0));
+    try testing.expectEqual(@as(?i128, 50 * std.time.ns_per_ms), transcript.nextAnimationDeadline(0));
+    try testing.expect(!transcript.tickAnimation(49 * std.time.ns_per_ms));
+    try testing.expect(transcript.tickAnimation(50 * std.time.ns_per_ms));
+    try testing.expectEqual(@as(u32, 1), transcript.scrollOffset());
+
+    var buf = try Buffer.init(testing.allocator, 10, 2);
+    defer buf.deinit();
+    transcript.render(buf.region());
+    try testing.expectEqual(@as(u21, 'r'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '1'), buf.get(3, 0).grapheme.codepoint);
 }
 
 test "Transcript clearAll removes all items and resets state" {
