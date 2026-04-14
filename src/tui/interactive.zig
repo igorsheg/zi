@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const mailbox_mod = @import("../runtime/mailbox.zig");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");
 const renderer_mod = @import("renderer.zig");
@@ -105,113 +106,38 @@ const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
 const StatusData = status_data_mod.StatusData;
 
-/// Thread-safe queue: agent thread pushes, main thread drains.
-fn EventQueue(comptime T: type) type {
-    return struct {
-        items: std.ArrayListUnmanaged(T) = .empty,
-        mutex: std.Thread.Mutex = .{},
-        allocator: std.mem.Allocator,
-        wake_read_fd: posix.fd_t,
-        wake_write_fd: posix.fd_t,
+/// Mailbox-backed agent/helper → TUI event channel.
+///
+/// The queue shape remains part of zi's runtime doctrine, but wakeup
+/// signaling now comes from the shared mailbox primitive rather than a
+/// bespoke event pipe implementation.
+const UiEventQueue = mailbox_mod.Mailbox(UiEvent, .{
+    .cleanup = .deinit,
+    .policy = .unbounded,
+    .wakeup = .pipe,
+});
 
-        const Self = @This();
-
-        pub fn init(allocator: std.mem.Allocator) !Self {
-            const pipe = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-            return .{
-                .allocator = allocator,
-                .wake_read_fd = pipe[0],
-                .wake_write_fd = pipe[1],
-            };
-        }
-
-        pub fn deinit(self: *Self) void {
-            posix.close(self.wake_read_fd);
-            posix.close(self.wake_write_fd);
-            self.items.deinit(self.allocator);
-        }
-
-        pub fn push(self: *Self, item: T) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.items.append(self.allocator, item) catch {
-                var mutable = item;
-                if (@hasDecl(T, "deinit")) {
-                    mutable.deinit(self.allocator);
-                }
-                return;
-            };
-            self.signalWake();
-        }
-
-        pub fn drainInto(self: *Self, out: []T) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const count = @min(self.items.items.len, out.len);
-            if (count == 0) {
-                self.drainWakePipe();
-                return 0;
-            }
-            @memcpy(out[0..count], self.items.items[0..count]);
-            if (count < self.items.items.len) {
-                const remaining = self.items.items.len - count;
-                std.mem.copyForwards(T, self.items.items[0..remaining], self.items.items[count .. count + remaining]);
-            }
-            self.items.items.len -= count;
-            if (self.items.items.len == 0) {
-                self.drainWakePipe();
-            } else {
-                self.signalWake();
-            }
-            return count;
-        }
-
-        pub fn wakeReadFd(self: *const Self) posix.fd_t {
-            return self.wake_read_fd;
-        }
-
-        pub fn acknowledgeWake(self: *Self) void {
-            self.drainWakePipe();
-        }
-
-        fn signalWake(self: *Self) void {
-            _ = posix.write(self.wake_write_fd, &[1]u8{1}) catch |err| switch (err) {
-                error.WouldBlock => 0,
-                else => 0,
-            };
-        }
-
-        fn drainWakePipe(self: *Self) void {
-            var buf: [64]u8 = undefined;
-            while (true) {
-                const n = posix.read(self.wake_read_fd, &buf) catch |err| switch (err) {
-                    error.WouldBlock => return,
-                    else => return,
-                };
-                if (n == 0 or n < buf.len) return;
-            }
-        }
-    };
-}
-
-test "EventQueue wake pipe signals poll and drains with queue" {
-    var q = try EventQueue(u8).init(std.testing.allocator);
+test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
+    var q = try UiEventQueue.init(std.testing.allocator);
     defer q.deinit();
 
-    q.push(7);
+    q.push(.message_start_user);
 
     var pfd = [1]posix.pollfd{.{
-        .fd = q.wakeReadFd(),
+        .fd = q.wakeReadFd().?,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
     const ready = try posix.poll(&pfd, 0);
     try std.testing.expectEqual(@as(usize, 1), ready);
 
-    var out: [2]u8 = undefined;
+    var out: [2]UiEvent = undefined;
     const count = q.drainInto(&out);
     try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqual(@as(u8, 7), out[0]);
+    switch (out[0]) {
+        .message_start_user => {},
+        else => return error.UnexpectedResult,
+    }
 
     pfd[0].revents = 0;
     const after = try posix.poll(&pfd, 0);
@@ -413,13 +339,11 @@ const ModelPickerFlow = struct {
 /// with domain-specific state (editor, transcript, agent, containers).
 pub const Interactive = struct {
     allocator: std.mem.Allocator,
-    /// Thread-safe GPA-backed allocator for cross-thread message
-    /// payloads and queue backing storage (zi-wub.8). Used by phase 3
-    /// migrations (.9 EventQueue backing, .10 convertAgentEvent
-    /// clones, .14 AgentRequest queue, .17 login callbacks). NOT the
-    /// same as `allocator` (which is the shared arena) — this one
-    /// wraps the root GPA directly so cross-thread free paths work.
-    /// See .zi/design-notes/threading-doctrine.md R2/R3.
+    /// Thread-safe GPA-backed allocator for cross-thread mailbox
+    /// payloads and mailbox backing storage. This is NOT the same as
+    /// `allocator` (which is the shared arena) — it wraps the root GPA
+    /// directly so producer/consumer free paths stay allocator-correct.
+    /// See `docs/runtime.md` doctrine R3.
     msg_allocator: std.mem.Allocator,
     tui: TUI,
     theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
@@ -491,13 +415,11 @@ pub const Interactive = struct {
     login_thread: ?std.Thread = null,
     login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    event_queue: EventQueue(UiEvent),
-    /// TUI → agent mutation channel (zi-wub.14). TUI thread enqueues
-    /// AgentRequest values, the agent thread drains at turn boundary.
-    /// See `src/agent/request.zig` and the threading doctrine.
-    /// Consumers land in zi-wub.15 (/resume) and .16 (/model); .14
-    /// only introduces the channel, so the queue is wired but no one
-    /// pushes to it yet. Backed by `msg_allocator` per doctrine R3.
+    event_queue: UiEventQueue,
+    /// TUI → agent mutation channel. TUI thread enqueues AgentRequest
+    /// values, the agent thread drains them at turn boundaries.
+    /// Backed by `msg_allocator` per doctrine R3. See
+    /// `src/agent/request.zig` and `docs/runtime.md`.
     request_queue: RequestQueue,
     ca: *AgentSession,
     memory_diagnostics: *const memory_debug.Diagnostics,
@@ -556,8 +478,8 @@ pub const Interactive = struct {
             .widget_below_container = container_mod.Container.init(state_allocator),
             .command_registry = CommandRegistry.init(state_allocator),
             .input = input_buffer_mod.InputBuffer.init(state_allocator),
-            .event_queue = try EventQueue(UiEvent).init(msg_allocator),
-            .request_queue = RequestQueue.init(msg_allocator),
+            .event_queue = try UiEventQueue.init(msg_allocator),
+            .request_queue = try RequestQueue.init(msg_allocator),
             .ca = ca,
             .memory_diagnostics = memory_diagnostics,
             .session_controller = SessionController.init(state_allocator, ca, .{
@@ -614,7 +536,7 @@ pub const Interactive = struct {
         //      consumed — quit semantics > best-effort delivery)
         //   2. null transcript.lua_runner so any late refresh path
         //      can't dereference a freed runner
-        //   3. push .shutdown, spawn one final drain_only worker,
+        //   3. trySend `.shutdown`, spawn one final drain_only worker,
         //      join it. The worker binds owner, drains, calls
         //      ca.shutdownExtensionsOnAgentThread() which nulls the
         //      ext fields so the upcoming ca.deinit() skips them.
@@ -625,9 +547,20 @@ pub const Interactive = struct {
         if (self.ca.extensionRunner() != null) {
             self.drainQueuedRequests();
             self.transcript.lua_runner = null;
-            self.request_queue.push(.{ .shutdown = {} });
-            const t = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch null;
-            if (t) |handle| handle.join();
+            switch (self.request_queue.trySend(.{ .shutdown = {} })) {
+                .ok => {},
+                .dropped => unreachable,
+                .closed, .full, .oom => |rejected| {
+                    var failed_req = rejected;
+                    failed_req.deinit(self.msg_allocator);
+                    @panic("failed to enqueue final agent shutdown request");
+                },
+            }
+            const t = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
+                self.drainQueuedRequests();
+                @panic("failed to spawn final agent shutdown worker");
+            };
+            t.join();
         }
 
         if (self.session_event_token) |token| {
@@ -635,6 +568,8 @@ pub const Interactive = struct {
             self.session_event_token = null;
         }
         self.session_controller.deinit();
+        self.request_queue.close();
+        self.event_queue.close();
 
         // drain and free any remaining events
         var drain_buf: [64]UiEvent = undefined;
@@ -650,9 +585,8 @@ pub const Interactive = struct {
         self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
-        // Drain any leftover requests (no consumers in .14, but be
-        // defensive once .15+ start pushing). Agent thread is joined
-        // above, so this runs without contention.
+        // Any unexpectedly undrained requests are mailbox-owned here;
+        // deinit cleans them with AgentRequest.deinit.
         self.request_queue.deinit();
         self.widget_below_container.deinit();
         self.editor_container.deinit();
@@ -788,13 +722,17 @@ pub const Interactive = struct {
             }
 
             // 5. Sleep until the next input/animation deadline, capped so
-            // cross-thread UI events still land promptly without a wake fd.
+            // timer-driven UI work still wakes promptly alongside mailbox events.
             self.sleepUntilNextLoopDeadline();
         }
     }
 
     fn bootstrapStatusSnapshot(self: *Interactive) void {
-        self.request_queue.push(.{ .refresh_status_snapshot = {} });
+        switch (self.request_queue.trySend(.{ .refresh_status_snapshot = {} })) {
+            .ok => {},
+            .dropped => unreachable,
+            .closed, .full, .oom => return,
+        }
         const thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
             self.drainQueuedRequests();
             return;
@@ -1418,7 +1356,7 @@ pub const Interactive = struct {
 
     fn sleepUntilNextLoopDeadline(self: *Interactive) void {
         const now_ns = std.time.nanoTimestamp();
-        const max_idle_sleep_ns: i128 = 8_333_334; // ≈120 FPS worst-case event latency without wake fd
+        const max_idle_sleep_ns: i128 = 8_333_334; // ≈120 FPS cap while still honoring timer deadlines even with mailbox wakeups
         const timeout_ns: i128 = if (self.nextLoopDeadlineNs(now_ns)) |deadline|
             if (deadline <= now_ns) 0 else @min(deadline - now_ns, max_idle_sleep_ns)
         else
@@ -1432,7 +1370,7 @@ pub const Interactive = struct {
                 .revents = 0,
             },
             .{
-                .fd = self.event_queue.wakeReadFd(),
+                .fd = self.event_queue.wakeReadFd().?,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
@@ -1720,7 +1658,18 @@ pub const Interactive = struct {
             return false;
         }
 
-        self.request_queue.push(req);
+        switch (self.request_queue.trySend(req)) {
+            .ok => {},
+            .dropped => unreachable,
+            .closed, .full, .oom => |rejected| {
+                var failed_req = rejected;
+                failed_req.deinit(self.msg_allocator);
+                self.status_text.setContent(options.spawn_failed_message);
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+                return false;
+            },
+        }
         self.showLoader(options.loader_message);
         self.tui.dirty = true;
 
@@ -2283,8 +2232,8 @@ pub const Interactive = struct {
     /// agent thread. Runs inside `agentThreadFn` at a turn boundary.
     ///
     /// Drain → dispatch is split so handlers can publish UiEvents
-    /// back via EventQueue (and in future may take longer than the
-    /// drain critical section allows).
+    /// back via the mailbox-backed event queue (and in future may take
+    /// longer than the drain critical section allows).
     fn processAgentRequests(self: *Interactive) void {
         var buf: [16]AgentRequest = undefined;
         while (true) {

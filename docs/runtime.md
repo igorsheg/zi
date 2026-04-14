@@ -12,7 +12,7 @@ Short-lived helper threads may exist, but they publish through the same channels
 
 ## Two channels, no third
 
-Cross-thread communication uses only:
+Cross-thread communication uses only two mailbox-backed channels:
 - **request queue**: TUI -> agent for mutations, work, and I/O
 - **event queue**: agent/helper -> TUI for published results and UI events
 

@@ -38,9 +38,9 @@ pub fn main() !void {
     defer agent_arena.deinit();
     const allocator = agent_arena.allocator();
 
-    // zi-wub.8: dedicated thread-safe GPA for cross-thread message
-    // payloads and queue backing storage (EventQueue, AgentRequest
-    // queue, convertAgentEvent clones, login callbacks). Wraps the
+    // Dedicated thread-safe GPA for cross-thread mailbox payloads
+    // and mailbox backing storage (event queue, request queue,
+    // converted agent events, login callbacks). Wraps the
     // ROOT GPA directly — NOT the arena — so producer/consumer pairs
     // can free individually and we don't pin growing payloads in the
     // arena's lifetime. See `docs/runtime.md` for the ownership rule

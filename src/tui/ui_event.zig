@@ -10,8 +10,8 @@ const RunOutcome = session_controller_mod.RunOutcome;
 
 /// TUI-owned event type. All fields are deep-copied and owned by the
 /// main thread. The agent thread converts AgentEvent → UiEvent before
-/// pushing to the EventQueue, ensuring no borrowed pointers cross
-/// the thread boundary.
+/// pushing to the mailbox-backed event queue, ensuring no borrowed
+/// pointers cross the thread boundary.
 pub const UiEvent = union(enum) {
     // --- message lifecycle ---
     message_start_assistant: void,
