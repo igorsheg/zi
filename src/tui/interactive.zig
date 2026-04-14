@@ -106,6 +106,44 @@ const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
 const StatusData = status_data_mod.StatusData;
 
+const PublishedStatusSnapshot = struct {
+    model_provider: []u8,
+    model_id: []u8,
+    thinking_level: agent_protocol.ThinkingLevel,
+    context_tokens: ?u64,
+    context_window: u64,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        snapshot: AgentSession.StatusSnapshot,
+    ) !PublishedStatusSnapshot {
+        const model_provider = try allocator.dupe(u8, snapshot.model_provider);
+        errdefer allocator.free(model_provider);
+        const model_id = try allocator.dupe(u8, snapshot.model_id);
+        return .{
+            .model_provider = model_provider,
+            .model_id = model_id,
+            .thinking_level = snapshot.thinking_level,
+            .context_tokens = snapshot.context_tokens,
+            .context_window = snapshot.context_window,
+        };
+    }
+
+    fn deinit(self: *PublishedStatusSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.model_provider);
+        allocator.free(self.model_id);
+        self.* = undefined;
+    }
+
+    fn eql(self: PublishedStatusSnapshot, snapshot: AgentSession.StatusSnapshot) bool {
+        return std.mem.eql(u8, self.model_provider, snapshot.model_provider) and
+            std.mem.eql(u8, self.model_id, snapshot.model_id) and
+            self.thinking_level == snapshot.thinking_level and
+            self.context_tokens == snapshot.context_tokens and
+            self.context_window == snapshot.context_window;
+    }
+};
+
 /// Mailbox-backed agent/helper → TUI event channel.
 ///
 /// The queue shape remains part of zi's runtime doctrine, but wakeup
@@ -361,6 +399,10 @@ pub const Interactive = struct {
     transcript: Transcript,
     resolver: ToolRendererResolver,
     status_data: StatusData,
+    /// Agent-thread dedupe cache for semantic status publication.
+    /// Owned storage lives in `msg_allocator` so teardown can free it on
+    /// the TUI thread after all workers are joined.
+    last_published_status_snapshot: ?PublishedStatusSnapshot = null,
     loader: Loader = .{},
     loader_active: bool = false,
     retry_active: bool = false,
@@ -582,6 +624,10 @@ pub const Interactive = struct {
         self.closeResumePickerFlow();
         if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
         self.command_registry.deinit();
+        if (self.last_published_status_snapshot) |*snapshot| {
+            snapshot.deinit(self.msg_allocator);
+            self.last_published_status_snapshot = null;
+        }
         self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
@@ -2357,6 +2403,8 @@ pub const Interactive = struct {
 
     fn publishStatusSnapshot(self: *Interactive) void {
         const snapshot = self.ca.statusSnapshot();
+        if (self.shouldSkipStatusSnapshotPublish(snapshot)) return;
+
         const provider_copy = self.msg_allocator.dupe(u8, snapshot.model_provider) catch return;
         errdefer self.msg_allocator.free(provider_copy);
         const model_id_copy = self.msg_allocator.dupe(u8, snapshot.model_id) catch return;
@@ -2364,6 +2412,7 @@ pub const Interactive = struct {
         const thinking_copy = self.msg_allocator.dupe(u8, agentThinkingLabel(snapshot.thinking_level)) catch return;
         errdefer self.msg_allocator.free(thinking_copy);
 
+        self.rememberPublishedStatusSnapshot(snapshot);
         self.event_queue.push(.{ .status_snapshot = .{
             .model_provider = provider_copy,
             .model_id = model_id_copy,
@@ -2371,6 +2420,25 @@ pub const Interactive = struct {
             .context_tokens = snapshot.context_tokens,
             .context_window = snapshot.context_window,
         } });
+    }
+
+    fn shouldSkipStatusSnapshotPublish(
+        self: *const Interactive,
+        snapshot: AgentSession.StatusSnapshot,
+    ) bool {
+        const last = self.last_published_status_snapshot orelse return false;
+        return last.eql(snapshot);
+    }
+
+    fn rememberPublishedStatusSnapshot(
+        self: *Interactive,
+        snapshot: AgentSession.StatusSnapshot,
+    ) void {
+        const replacement = PublishedStatusSnapshot.init(self.msg_allocator, snapshot) catch return;
+        if (self.last_published_status_snapshot) |*last| {
+            last.deinit(self.msg_allocator);
+        }
+        self.last_published_status_snapshot = replacement;
     }
 
     fn publishStatusSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
