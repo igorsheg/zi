@@ -165,10 +165,10 @@ fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
 fn writeZiDocsSection(w: *std.Io.Writer) !void {
     try w.writeAll(
         "\nZi documentation (read only when the user asks about zi itself, extensions, themes, or the TUI):\n" ++
-            "- Main documentation: README.md\n" ++
-            "- Additional docs: docs/\n" ++
-            "- Architecture/spec: SPEC.md\n" ++
-            "- When asked about: extensions (docs/extensions.md), themes (docs/theme-system.md), extension UI contract (docs/extension-ui-contract.md)\n" ++
+            "- Start with docs/README.md\n" ++
+            "- Core docs: docs/principles.md, docs/architecture.md, docs/runtime.md\n" ++
+            "- Topic docs: extensions (docs/extensions.md), TUI (docs/tui.md), themes (docs/theme-system.md), replay/providers (docs/replay.md)\n" ++
+            "- Historical notes live in docs/archive/ but are not the source of truth\n" ++
             "- When working on zi topics, read the docs and follow .md cross-references before implementing\n" ++
             "- Always read zi .md files completely and follow links to related docs\n",
     );

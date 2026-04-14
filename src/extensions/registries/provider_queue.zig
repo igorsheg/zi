@@ -1,9 +1,8 @@
 //! Provider queue — pending custom-provider registrations awaiting bind.
 //!
-//! v1 leaves this empty: `zi.register_provider` is a v2 surface
-//! (docs/extensions.md line 182). The queue exists from D2 because
-//! the bind sequence (docs §Lifecycle step 5: "flush provider_queue")
-//! is the documented seam — the runner accepts registrations during
+//! v1 leaves this empty: `zi.register_provider` is not yet exposed.
+//! The queue exists because the documented lifecycle separates load from
+//! bind — the runner accepts registrations during
 //! the load phase (when AgentSession isn't built yet) and flushes
 //! them into the AI provider registry once binding completes.
 //!
@@ -54,8 +53,8 @@ pub const ProviderQueue = struct {
     /// Append a provider to the queue. Always succeeds (modulo OOM)
     /// — duplicate-api detection happens at flush time, when the
     /// queue collides with the existing AI provider registry, not
-    /// here. The queue is preserve-everything; the flush picks the
-    /// winner per docs/extensions.md §Discovery precedence.
+    /// here. The queue preserves registrations until bind, where normal
+    /// extension precedence rules are applied.
     pub fn enqueue(self: *ProviderQueue, p: PendingProvider) !void {
         try self.pending.append(self.allocator, p);
     }

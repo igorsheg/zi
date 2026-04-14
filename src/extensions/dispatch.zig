@@ -1,6 +1,6 @@
 //! Event dispatch — walks the chains in `event_registry` and runs
-//! Lua handlers under the three semantics defined in
-//! docs/extensions.md §Event Handler Semantics.
+//! Lua handlers under the observer / mutable / transformable semantics
+//! described in `docs/extensions.md`.
 //!
 //! Three primitives, each generic over the event payload:
 //!

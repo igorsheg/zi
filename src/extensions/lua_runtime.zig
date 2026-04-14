@@ -17,8 +17,8 @@
 //!   - tool / event / command registries
 //!   - the actual yieldable host functions (`zi.spawn`, `ctx.ui.*`)
 //!
-//! Coroutine c-call discipline (see docs/extensions.md §Lua Coroutine
-//! C-Call Model): every tool execution and event handler runs in a
+//! Coroutine c-call discipline (see `docs/extensions.md`): every tool
+//! execution and event handler runs in a
 //! dedicated coroutine. The infrastructure below assumes the same and
 //! never calls `lua_pcall` on a function that may yield. Yieldable host
 //! functions MUST use `lua_yieldk` with a continuation, otherwise Lua

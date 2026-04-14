@@ -6,6 +6,22 @@ pi-mono is cloned locally at `.references/pi-mono/`. When you need to reference 
 
 opentui is cloned locally at `.references/opentui/`. When you need to reference opentui source (zig TUI patterns, buffer/renderer/utf8), always use local reads/greps against `.references/opentui/` - never the github tools. The code is on disk.
 
+## Docs
+
+Canonical repo docs live in `docs/`.
+
+Start with:
+- `docs/README.md`
+- `docs/principles.md`
+- `docs/architecture.md`
+- `docs/runtime.md`
+- `docs/extensions.md`
+- `docs/tui.md`
+- `docs/theme-system.md`
+- `docs/replay.md`
+
+`docs/archive/` contains historical notes and superseded specs. It is context, not source of truth.
+
 ## Doctrine
 
 zi must never be less capable than pi-mono at the architecture, design, or product layer. minimum bar: parity with pi-mono. maximum bar: extend pi-mono while preserving its contracts. zig is an implementation advantage, not a reason to collapse product surfaces, remove composition seams, or replace dedicated flows with narrower shortcuts.
@@ -56,7 +72,7 @@ test types, in priority order:
 
 ## Threading & Allocator Ownership
 
-zi runs two long-lived threads — **TUI** and **agent** — plus short-lived helpers (login, spawn children). Every resource has **exactly one owning thread for its entire lifetime**. No "usually X, sometimes Y with a mutex." Full rationale + phase history: `.zi/design-notes/threading-doctrine.md`. This section is the operational summary.
+zi runs two long-lived threads — **TUI** and **agent** — plus short-lived helpers (login, spawn children). Every resource has **exactly one owning thread for its entire lifetime**. No "usually X, sometimes Y with a mutex." Canonical doctrine: `docs/runtime.md`. This section is the operational summary.
 
 ### Owner table (frozen)
 

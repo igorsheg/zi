@@ -4,8 +4,8 @@ const ai_protocol = @import("../ai/protocol.zig");
 /// AgentRequest — TUI thread → agent thread mutation channel.
 ///
 /// This is the second of the two cross-thread channels mandated by
-/// the threading doctrine (the first being `EventQueue`, agent → TUI).
-/// See `.zi/design-notes/threading-doctrine.md` and bead `zi-wub.14`.
+/// the runtime ownership doctrine (the first being `EventQueue`, agent → TUI).
+/// See `docs/runtime.md` and bead `zi-wub.14`.
 ///
 /// Direction:
 ///

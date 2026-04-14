@@ -58,8 +58,8 @@ pub const AgentSession = struct {
     /// Owned ExtensionRunner — current generation. Populated by the
     /// sdk factory in Phase A3+; nil in v1 bootstraps until the runner
     /// construction path is wired. Reload replaces this pointer
-    /// atomically with a new generation (see docs/extensions.md §
-    /// Ownership and Reload). When set, `deinit` takes it down before
+    /// atomically with a new generation (see `docs/extensions.md`). When set,
+    /// `deinit` takes it down before
     /// the agent so any final event observers can still fire against
     /// a live session.
     _extension_runner: ?*ExtensionRunner = null,
@@ -222,7 +222,7 @@ pub const AgentSession = struct {
         // list so Lua-registered tools can join the agent's tool set.
         // Failures here are non-fatal: ext_state/ext_runner stay null,
         // builtin tools still flow through, agent runs without
-        // extensions. See docs/extensions.md § Bootstrap order.
+        // extensions. See `docs/extensions.md`.
         var ext_state: ?*lua_runtime.LuaState = null;
         var ext_runner: ?*ExtensionRunner = null;
         ext_setup: {

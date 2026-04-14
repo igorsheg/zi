@@ -157,7 +157,7 @@ const FixedBuilder = struct {
 // NOT reach into `ExtensionRunner.command_registry` directly and must
 // NOT call into lua. Instead, swap `registry` for a TUI-owned
 // `*const CommandSnapshot` that the agent thread publishes after each
-// mutation. See .zi/design-notes/command-snapshot.md.
+// mutation. See `docs/runtime.md`.
 
 pub const SlashCommandProvider = struct {
     registry: *const CommandRegistry,

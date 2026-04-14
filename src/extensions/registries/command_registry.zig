@@ -1,9 +1,9 @@
 //! Command registry — slash command name → CommandDef.
 //!
-//! v1 leaves this empty: `zi.register_command` is a v2 surface
-//! (docs/extensions.md line 178). The registry exists from D2
-//! anyway because the bind seam (`ExtensionRuntime.Bound.command_actions`)
-//! is reserved in v1 and the runner needs SOMEWHERE to store
+//! v1 leaves this empty: `zi.register_command` is not yet exposed.
+//! The registry exists anyway because the bind seam
+//! (`ExtensionRuntime.Bound.command_actions`) is reserved in v1 and the
+//! runner needs SOMEWHERE to store
 //! pending entries when v2 ships. Adding this as a same-shape sibling
 //! to `tool_registry` keeps the runner's internal API symmetric.
 //!

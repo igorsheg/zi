@@ -43,8 +43,8 @@ pub fn main() !void {
     // queue, convertAgentEvent clones, login callbacks). Wraps the
     // ROOT GPA directly — NOT the arena — so producer/consumer pairs
     // can free individually and we don't pin growing payloads in the
-    // arena's lifetime. See .zi/design-notes/threading-doctrine.md
-    // (R2, R3) for why this is the foundation of phase 3.
+    // arena's lifetime. See `docs/runtime.md` for the ownership rule
+    // behind this split.
     var ts_msg: std.heap.ThreadSafeAllocator = .{ .child_allocator = msg_backing_tracker.allocator() };
     const msg_allocator = ts_msg.allocator();
 

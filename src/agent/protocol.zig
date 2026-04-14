@@ -289,7 +289,7 @@ pub const AgentState = struct {
 /// Used by the extension runner's `tool_call` event dispatch: Lua
 /// handlers return a replacement `input` table, which the runner
 /// deep-copies into an owned `std.json.Value` and surfaces here.
-/// See docs/extensions.md § Agent Core Seams § Mutable tool_call args.
+/// See `docs/extensions.md`.
 pub const BeforeToolCallResult = struct {
     block: bool = false,
     reason: ?[]const u8 = null,
@@ -356,7 +356,7 @@ pub const AfterToolCallHook = struct {
 /// against a stable shape; until the provider-layer wiring lands, the
 /// field is unused at runtime.
 ///
-/// See docs/extensions.md § Agent Core Seams § Provider payload transform.
+/// See `docs/extensions.md`.
 pub const OnPayloadHook = struct {
     func: *const fn (payload: std.json.Value, model: Model, ctx: ?*anyopaque) std.json.Value,
     ctx: ?*anyopaque = null,

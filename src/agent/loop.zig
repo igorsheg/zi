@@ -411,7 +411,7 @@ fn executeToolCalls(
                 // beforeToolCall hook: can block execution OR replace args.
                 // Replacement args come from extension `tool_call` handlers
                 // that return a new input table; null means "unchanged".
-                // See docs/extensions.md § Agent Core Seams § Mutable args.
+                // See `docs/extensions.md`.
                 var effective_args = prepared_args;
                 if (config.before_tool_call) |hook| {
                     const hook_ctx = protocol.BeforeToolCallContext{

@@ -17,7 +17,7 @@
 //! `ExtensionRunner`s sharing one binary would still each have their
 //! own `zi` table bound to their own runner.
 //!
-//! Ownership rules (docs/extensions.md §Ownership-and-Reload §Invariants):
+//! Ownership rules (see `docs/extensions.md`):
 //!
 //!   1. Every string we read from Lua is duped via the runner's
 //!      allocator BEFORE the Lua stack unwinds. Lua's GC must not
@@ -319,8 +319,8 @@ fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
 /// Returns null on unknown names — the caller raises a Lua error
 /// with the offending string in the message.
 ///
-/// Spec source: docs/extensions.md §Event Hooks lines 137-170.
-/// We support the v1-checked subset; v2 events get added here as
+/// Event names are documented in `docs/extensions.md`.
+/// We support the current implemented subset; new events get added here as
 /// their dispatch points come online (D4 grows the table when it
 /// hooks new event sources).
 fn parseEventKind(name: []const u8) ?event_registry.EventKind {

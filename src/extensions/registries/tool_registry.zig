@@ -6,8 +6,8 @@
 //!
 //! Why first-registered-wins (and not last-wins): the loader walks
 //! sources in precedence order — `explicit > user > project > builtin`
-//! (see docs/extensions.md §Discovery) — so an earlier registration
-//! is by definition the more authoritative one. A user's
+//! (see `docs/extensions.md`) — so an earlier registration is by
+//! definition the more authoritative one. A user's
 //! `~/.zi/agent/extensions/task.lua` overrides the builtin `task`
 //! tool because it loads first. Late registrations with the same
 //! name are silently dropped with a diagnostic; this matches pi-mono's
@@ -16,8 +16,7 @@
 //! Tool definitions OWN their strings and JSON schema via the runner's
 //! allocator. The schema in particular MUST be deep-cloned out of Lua
 //! memory at registration time — Lua tables can be GC'd while zig is
-//! still holding pointers to them. See docs/extensions.md §Ownership
-//! and Reload §Invariants.
+//! still holding pointers to them. See `docs/extensions.md`.
 
 const std = @import("std");
 const definition = @import("../../tools/definition.zig");

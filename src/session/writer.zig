@@ -24,9 +24,9 @@ pub const SessionWriter = struct {
 
     /// Construct a new writer. `session_dir` is the already-resolved directory
     /// for this session's files — the sdk layer computes it via
-    /// `sdk.resolveSessionDir` BEFORE reaching here so v2's `session_directory`
-    /// extension hook gets a chance to override it. See
-    /// docs/extensions.md § Session Directory Resolution.
+    /// `sdk.resolveSessionDir` BEFORE reaching here so the extension layer can
+    /// override session placement before persistence starts. See
+    /// `docs/extensions.md`.
     pub fn init(allocator: std.mem.Allocator, session_dir: []const u8, cwd: []const u8) SessionWriter {
         var uuid_buf: [36]u8 = undefined;
         generateUuid(&uuid_buf);
