@@ -327,6 +327,7 @@ pub fn writeTextBlock(jw: *Stringify, tc: ai.protocol.TextContent) !void {
     try jw.objectField("type");
     try jw.write("text");
     try jw.objectField("text");
+    // Tiny sanitization buffer, freed before the block writer returns.
     const sanitized = try json_util.utf8LossyAlloc(std.heap.page_allocator, tc.text);
     defer std.heap.page_allocator.free(sanitized);
     try jw.write(sanitized);

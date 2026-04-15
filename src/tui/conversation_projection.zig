@@ -132,6 +132,7 @@ pub fn applySessionMessages(
 }
 
 fn seedHistoryFromMessage(editor: EditorInterface, message: agent_protocol.AgentMessage) void {
+    // Tiny extraction buffer, freed immediately after the history append.
     const text = extractUserMessageText(std.heap.page_allocator, message) orelse return;
     defer text.deinit(std.heap.page_allocator);
     editor.addToHistory(text.slice());

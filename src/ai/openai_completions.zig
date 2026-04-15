@@ -1029,9 +1029,8 @@ fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protoc
                                     try jw.objectField("image_url");
                                     try jw.beginObject();
                                     try jw.objectField("url");
-                                    // data:<mime>;base64,<data> — assembled
-                                    // on the page allocator, freed before
-                                    // the field closes.
+                                    // Tiny helper allocation, freed before the field closes.
+                                    // data:<mime>;base64,<data>
                                     const data_url = try std.fmt.allocPrint(
                                         std.heap.page_allocator,
                                         "data:{s};base64,{s}",
@@ -1059,7 +1058,8 @@ fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protoc
                 try jw.objectField("tool_call_id");
                 try jw.write(tr.tool_call_id);
                 try jw.objectField("content");
-                // Concatenate text content blocks.
+                // Concatenate text content blocks. Tiny scratch buffer,
+                // freed before return.
                 var concat: std.ArrayListUnmanaged(u8) = .empty;
                 defer concat.deinit(std.heap.page_allocator);
                 for (tr.content) |cb| {
@@ -1086,7 +1086,8 @@ fn writeAssistantMessage(jw: *std.json.Stringify, a: protocol.AssistantMessage) 
     try jw.write("assistant");
 
     // Concatenate non-empty text blocks. pi-mono uses
-    // join("") which is just byte concatenation.
+    // join("") which is just byte concatenation. Tiny scratch buffer,
+    // freed before return.
     var text_concat: std.ArrayListUnmanaged(u8) = .empty;
     defer text_concat.deinit(std.heap.page_allocator);
     for (a.content) |b| {
@@ -1124,7 +1125,8 @@ fn writeAssistantMessage(jw: *std.json.Stringify, a: protocol.AssistantMessage) 
             try jw.objectField("name");
             try jw.write(tc.name);
             try jw.objectField("arguments");
-            // Stringify the JSON value as a string field.
+            // Stringify the JSON value as a string field. Tiny scratch
+            // buffer, freed before return.
             var args_buf: std.io.Writer.Allocating = .init(std.heap.page_allocator);
             defer args_buf.deinit();
             var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };

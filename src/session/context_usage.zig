@@ -172,6 +172,7 @@ fn getAssistantUsage(message: agent.protocol.AgentMessage) ?ai.protocol.Usage {
 }
 
 fn estimateJsonSize(value: std.json.Value) usize {
+    // Tiny stringify scratch allocation, freed before return.
     var out: std.io.Writer.Allocating = .init(std.heap.page_allocator);
     defer out.deinit();
 

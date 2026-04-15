@@ -31,9 +31,10 @@ pub fn main() !void {
     // owner during steady state — TUI thread only touches it during
     // pre-spawn init (auth, settings, ca creation) and post-join
     // deinit, never concurrently with the agent thread. Cross-thread
-    // payloads route through msg_allocator (zi-wub.9/.10) and the
-    // TUI thread allocates from its own tui_arena (zi-wub.11), so
-    // the ThreadSafeAllocator band-aid (.13) is no longer needed.
+    // payloads route through msg_allocator (zi-wub.9/.10), while the
+    // TUI keeps local state on its own tracked allocator/backing
+    // tracker (zi-wub.11), so the ThreadSafeAllocator band-aid (.13)
+    // is no longer needed.
     var agent_arena = std.heap.ArenaAllocator.init(agent_backing_tracker.allocator());
     defer agent_arena.deinit();
     const allocator = agent_arena.allocator();

@@ -383,11 +383,15 @@ const ModelPickerFlow = struct {
 /// Composes TUI (reusable rendering/focus/overlay infrastructure)
 /// with domain-specific state (editor, transcript, agent, containers).
 pub const Interactive = struct {
+    /// TUI-local tracked allocator for widget/component state and other
+    /// heap data that never crosses threads. Use this (or a short-lived
+    /// arena backed by it) for local scratch.
     allocator: std.mem.Allocator,
     /// Thread-safe GPA-backed allocator for cross-thread mailbox
     /// payloads and mailbox backing storage. This is NOT the same as
-    /// `allocator` (which is the shared arena) — it wraps the root GPA
-    /// directly so producer/consumer free paths stay allocator-correct.
+    /// `allocator` (which is TUI-local tracked state storage) — it wraps
+    /// the root GPA directly so producer/consumer free paths stay
+    /// allocator-correct.
     /// See `docs/runtime.md` doctrine R3.
     msg_allocator: std.mem.Allocator,
     tui: TUI,
@@ -1684,7 +1688,7 @@ pub const Interactive = struct {
     // Generic presets live in overlay.zig (OverlayPresets).
 
     fn writeMemoryDiagnostic(self: *Interactive) void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const scratch = arena.allocator();
 
@@ -1920,8 +1924,9 @@ pub const Interactive = struct {
         };
 
         // Scratch arena for resolver output — resolver owns warning/
-        // err strings and we display them inline, then drop them.
-        var scratch = std.heap.ArenaAllocator.init(self.msg_allocator);
+        // err strings and we display them inline, then drop them. This
+        // never crosses threads, so keep it on the TUI-local allocator.
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const result = ai_resolve.resolveCliModel(.{
             .cli_model = pattern,

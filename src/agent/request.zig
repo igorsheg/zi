@@ -30,8 +30,9 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 ///
 /// Allocator rule (doctrine R3): every payload slice carried by an
 /// AgentRequest MUST be allocated from the thread-safe `msg_allocator`,
-/// not from `tui_arena` or `agent_arena`. The agent-thread consumer
-/// frees with the same allocator after dispatch via `deinit`.
+/// not from the TUI-local state allocator or `agent_arena`. The
+/// agent-thread consumer frees with the same allocator after dispatch
+/// via `deinit`.
 pub const AgentRequest = union(enum) {
     resume_session: struct { path: []const u8 },
     new_session: void,

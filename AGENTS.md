@@ -83,7 +83,7 @@ zi runs two long-lived threads — **TUI** and **agent** — plus short-lived he
 | `tools`, `render_registry`, extension registries | agent | writes agent-only; TUI reads via published snapshots |
 | `transcript`, widgets, overlays, editor, components | TUI | render from snapshots, never call back into agent |
 | `pending_renders` map | shared via `pending_renders_mutex` | producer: agent; consumer: TUI paint (bounded critical section) |
-| `tui_arena` | TUI only | widget/layout scratch |
+| TUI-local allocator / short-lived TUI scratch arenas | TUI only | widget, layout, resolver scratch; currently backed by the tracked TUI allocator |
 | `agent_arena` | agent only | lua, session, tool exec scratch |
 | `msg_allocator` (thread-safe GPA) | shared | backing storage AND payloads for anything crossing threads |
 
@@ -101,7 +101,7 @@ zi runs two long-lived threads — **TUI** and **agent** — plus short-lived he
    apply to widgets, repaint              ext runner — all via msg_allocator)
 ```
 
-`AgentRequest` variants live in `src/agent/request.zig`. Current set: `resume_session`, `set_model`, `shutdown`. Add new variants there when the TUI needs the agent to DO something.
+`AgentRequest` variants live in `src/agent/request.zig`. Current set: `resume_session`, `new_session`, `set_model`, `set_thinking_level`, `refresh_status_snapshot`, `shutdown`. Add new variants there when the TUI needs the agent to DO something.
 
 ### Snapshot vs request (rule of thumb)
 
@@ -111,6 +111,15 @@ zi runs two long-lived threads — **TUI** and **agent** — plus short-lived he
 ### Allocator rule (doctrine R3)
 
 Anything crossing threads — **queue backing storage AND payloads** — must come from `msg_allocator`. If you migrate a queue, migrate `ArrayListUnmanaged.items`, key tables, payloads, and the consumer's free path. Half-migration reintroduces the arena race.
+
+### Cache ownership review rule
+
+Global cache/registry entries must own keys and values unless explicitly documented as immortal.
+
+Suspicious patterns:
+- borrowed keys in process/global maps
+- borrowed values in process/global maps
+- trimmed subslices of larger owned allocations retained past the producer's lifetime
 
 ### Adding a new cross-thread action
 
@@ -123,7 +132,7 @@ Anything crossing threads — **queue backing storage AND payloads** — must co
 
 - **Direct mutation from TUI**: `self.ca.agent.state.model = ...` from TUI code. Use `AgentRequest.set_model`.
 - **Lua from TUI**: calling anything that touches `lua_State` from the TUI thread. `assertOnLuaThread` is fatal in safe builds — this will crash.
-- **Arena sharing**: handing `tui_arena` or `agent_arena` to the other thread, or to a queue payload. Use `msg_allocator`.
+- **Allocator sharing across owners**: handing TUI-local scratch allocations or `agent_arena` allocations to the other thread, or to a queue payload. Use `msg_allocator`.
 - **Borrowed payload slices**: passing a slice owned by the sender's arena through a queue. The receiver frees with `msg_allocator` — must be duped first.
 - **Reaching across for "just a read"**: e.g. reading `ca.session_store.writer.cwd` from TUI (this was zi-wub.26). Publish a snapshot at bind time or via event.
 - **Adding a mutex to defend against unclear ownership**: ask "am I encoding ownership or papering over its absence?" The latter belongs on a follow-up ticket, not in the hot path.

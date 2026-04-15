@@ -1,9 +1,12 @@
 const std = @import("std");
+const string_util = @import("../lib/string_util.zig");
 
+// Process-global cache/store backing. Entries own both key and value storage;
+// `clearCache()` frees those allocations in tests.
 const allocator = std.heap.page_allocator;
 
 /// Cache for shell command results. Process-lifetime cache matching pi-mono.
-/// Key: full config string including "!" prefix. Value: result or null on failure.
+/// Key: full config string including "!" prefix. Value: owned result or null on failure.
 var command_cache: std.StringHashMap(?[]const u8) = std.StringHashMap(?[]const u8).init(allocator);
 
 /// Resolve a config value.
@@ -44,6 +47,7 @@ pub fn resolveConfigValueOrError(config: []const u8) error{ResolveFailed}![]cons
 pub fn clearCache() void {
     var it = command_cache.iterator();
     while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
         if (entry.value_ptr.*) |val| {
             allocator.free(val);
         }
@@ -82,7 +86,10 @@ fn executeCommand(config: []const u8) ?[]const u8 {
     }
 
     const result = executeCommandUncached(config);
-    command_cache.put(config, result) catch {};
+    const owned_key = allocator.dupe(u8, config) catch return result;
+    errdefer allocator.free(owned_key);
+
+    command_cache.put(owned_key, result) catch return result;
     return result;
 }
 
@@ -97,15 +104,15 @@ fn executeCommandUncached(config: []const u8) ?[]const u8 {
     }) catch return null;
 
     defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
 
     if (result.term != .Exited or result.term.Exited != 0) {
-        allocator.free(result.stdout);
         return null;
     }
 
-    const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    const trimmed = string_util.dupeTrimmed(allocator, result.stdout, &std.ascii.whitespace) catch return null;
+    errdefer allocator.free(trimmed);
     if (trimmed.len == 0) {
-        allocator.free(result.stdout);
         return null;
     }
 
@@ -114,17 +121,19 @@ fn executeCommandUncached(config: []const u8) ?[]const u8 {
 
 // --- tests ---
 
-
 test "shell command returns trimmed stdout" {
     clearCache();
+    defer clearCache();
+
     const val = resolveConfigValue("!echo hello");
     try std.testing.expectEqualStrings("hello", val.?);
 }
 
 test "command results are cached" {
     clearCache();
+    defer clearCache();
+
     const a = resolveConfigValue("!echo cached-test");
     const b = resolveConfigValue("!echo cached-test");
     try std.testing.expectEqual(a.?.ptr, b.?.ptr);
 }
-

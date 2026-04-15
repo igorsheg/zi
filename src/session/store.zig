@@ -257,6 +257,7 @@ fn isValidSessionFile(path: []const u8) bool {
     const first_line_end = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
     const first_line = buf[0..first_line_end];
 
+    // Tiny parse helper allocation, freed immediately after header validation.
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, first_line, .{
         .allocate = .alloc_always,
     }) catch return false;

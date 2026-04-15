@@ -65,6 +65,7 @@ pub fn errorf(
 ) protocol.AgentToolResult {
     const msg = std.fmt.allocPrint(allocator, fmt, args) catch
         return errorResult(allocator, "(error formatting failure)");
+    defer allocator.free(msg);
     return errorResult(allocator, msg);
 }
 

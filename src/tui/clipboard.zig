@@ -17,6 +17,7 @@ pub fn copyText(text: []const u8) void {
 }
 
 fn emitOsc52(text: []const u8) void {
+    // Tiny helper allocations, freed before return.
     const Encoder = std.base64.standard.Encoder;
     const encoded_len = Encoder.calcSize(text.len);
     const allocator = std.heap.page_allocator;
@@ -38,6 +39,8 @@ fn emitOsc52(text: []const u8) void {
 }
 
 fn copyViaCommand(argv: []const []const u8, text: []const u8) bool {
+    // Short-lived child-process bookkeeping allocator; storage dies with the
+    // helper process object before return.
     var child = std.process.Child.init(argv, std.heap.page_allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
