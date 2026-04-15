@@ -1009,7 +1009,9 @@ pub const AgentSession = struct {
         const self: *AgentSession = @ptrCast(@alignCast(ctx));
 
         switch (event) {
-            .message_end => |me| self.noteMessageForContextUsage(me.message),
+            .message_end => |me| {
+                self.noteMessageForContextUsage(me.message);
+            },
             else => {},
         }
 

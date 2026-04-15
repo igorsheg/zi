@@ -64,6 +64,7 @@ pub const FgColor = enum {
 pub const BgColor = enum {
     selected_bg,
     user_message_bg,
+    pending_user_message_bg,
     custom_message_bg,
     tool_transcript_bg,
     tool_pending_bg,
@@ -215,6 +216,7 @@ fn buildZen() Theme {
 
     setBg(&theme, .selected_bg, ui_bg_sel);
     setBg(&theme, .user_message_bg, ui_bg_p1);
+    setBg(&theme, .pending_user_message_bg, ui_bg);
     setBg(&theme, .custom_message_bg, ui_bg_p1);
     setBg(&theme, .tool_transcript_bg, ui_bg);
     setBg(&theme, .tool_pending_bg, ui_bg);
@@ -312,6 +314,7 @@ fn buildPearl() Theme {
 
     setBg(&theme, .selected_bg, ui_bg_p2);
     setBg(&theme, .user_message_bg, ui_bg_p1);
+    setBg(&theme, .pending_user_message_bg, Color.rgb(0xD0, 0xCE, 0xCC));
     setBg(&theme, .custom_message_bg, ui_bg_p1);
     setBg(&theme, .tool_transcript_bg, ui_bg);
     setBg(&theme, .tool_pending_bg, ui_bg);
@@ -338,6 +341,7 @@ test "dark theme matches kanso zen defaults" {
     try expectColorEq(Color.rgb(0xC5, 0xC9, 0xC7), theme.fg(.text));
     try expectColorEq(Color.rgb(0x09, 0x0E, 0x13), theme.bg(.tool_pending_bg));
     try expectColorEq(Color.rgb(0x39, 0x3B, 0x44), theme.bg(.selected_bg));
+    try expectColorEq(Color.rgb(0x09, 0x0E, 0x13), theme.bg(.pending_user_message_bg));
 }
 
 test "light theme matches kanso pearl defaults" {
@@ -346,6 +350,7 @@ test "light theme matches kanso pearl defaults" {
     try expectColorEq(Color.rgb(0x22, 0x26, 0x2D), theme.fg(.text));
     try expectColorEq(Color.rgb(0xF2, 0xF1, 0xEF), theme.bg(.tool_pending_bg));
     try expectColorEq(Color.rgb(0xDD, 0xDD, 0xDB), theme.bg(.selected_bg));
+    try expectColorEq(Color.rgb(0xD0, 0xCE, 0xCC), theme.bg(.pending_user_message_bg));
 }
 
 test "terminal background detection mirrors pi-mono COLORFGBG heuristic" {

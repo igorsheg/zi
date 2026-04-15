@@ -155,11 +155,16 @@ const UiEventQueue = mailbox_mod.Mailbox(UiEvent, .{
     .wakeup = .pipe,
 });
 
+const QueuedInputKind = enum {
+    steering,
+    follow_up,
+};
+
 test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
     var q = try UiEventQueue.init(std.testing.allocator);
     defer q.deinit();
 
-    q.push(.message_start_user);
+    q.push(.{ .message_start_user = .{ .text = try std.testing.allocator.dupe(u8, "hello") } });
 
     var pfd = [1]posix.pollfd{.{
         .fd = q.wakeReadFd().?,
@@ -176,6 +181,7 @@ test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
         .message_start_user => {},
         else => return error.UnexpectedResult,
     }
+    out[0].deinit(std.testing.allocator);
 
     pfd[0].revents = 0;
     const after = try posix.poll(&pfd, 0);
@@ -665,6 +671,7 @@ pub const Interactive = struct {
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.active_editor.setStatusData(&self.status_data);
         self.rebuildConversationFromMessages(self.ca.agent.state.messages);
+        self.syncQueueSnapshotFromAgent();
         self.session_controller.wire();
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
@@ -899,6 +906,16 @@ pub const Interactive = struct {
             return;
         }
 
+        if (keybindings.matches(.app_queue_follow_up, key)) {
+            self.handleFollowUpShortcut();
+            return;
+        }
+
+        if (keybindings.matches(.app_restore_queued, key)) {
+            self.restoreQueuedInputsToEditor();
+            return;
+        }
+
         // scroll: page up/down, shift+up/down
         if (self.handleScroll(key)) return;
 
@@ -1007,7 +1024,11 @@ pub const Interactive = struct {
                 _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
             },
-            .message_start_user => {},
+            .message_start_user => {
+                _ = self.applyConversationLiveEvent(ev.*);
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.tui.dirty = true;
+            },
             .tool_call_streaming => {
                 _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
@@ -1107,6 +1128,10 @@ pub const Interactive = struct {
                 }
                 self.tui.dirty = true;
             },
+            .queue_snapshot => |q| {
+                self.applyQueueSnapshot(q);
+                self.tui.dirty = true;
+            },
             .request_worker_finished => {
                 // zi-wub.15: drain-only worker completed. Just join
                 // and hide the loader — do NOT touch status_text or
@@ -1121,6 +1146,7 @@ pub const Interactive = struct {
             },
             .session_resumed => |r| {
                 self.rebuildConversationFromMessages(r.messages);
+                self.syncQueueSnapshotFromAgent();
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 // Prefer the restore warning over the generic
                 // "session resumed" banner when a fallback happened
@@ -1143,6 +1169,7 @@ pub const Interactive = struct {
             },
             .session_new_started => {
                 self.rebuildConversationFromMessages(&.{});
+                self.syncQueueSnapshotFromAgent();
                 self.status_text.setContent("new session started");
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
@@ -1191,6 +1218,16 @@ pub const Interactive = struct {
         self.status_data.setThinkingLevel(snapshot.thinking_level);
         self.status_data.context_tokens = snapshot.context_tokens;
         self.status_data.context_window = snapshot.context_window;
+    }
+
+    fn applyQueueSnapshot(self: *Interactive, snapshot: agent_mod.QueuedMessageSnapshot) void {
+        self.transcript.syncQueuedUserMessages(snapshot.steering, snapshot.follow_up);
+    }
+
+    fn syncQueueSnapshotFromAgent(self: *Interactive) void {
+        var snapshot = self.ca.agent.snapshotQueuedMessages(self.allocator);
+        defer snapshot.deinit(self.allocator);
+        self.applyQueueSnapshot(snapshot);
     }
 
     fn rebuildConversationFromMessages(self: *Interactive, messages: []const agent_protocol.AgentMessage) void {
@@ -1442,23 +1479,65 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn onEditorSubmit(text: []const u8, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        if (text.len == 0) return;
+    fn queueMessageWhileStreaming(self: *Interactive, kind: QueuedInputKind, text: []const u8) void {
+        const msg: agent_protocol.AgentMessage = .{ .user = .{
+            .content = .{ .text = text },
+            .timestamp = std.time.milliTimestamp(),
+        } };
+        switch (kind) {
+            .steering => self.ca.agent.steer(msg),
+            .follow_up => self.ca.agent.followUp(msg),
+        }
+        self.syncQueueSnapshotFromAgent();
+        self.active_editor.clear();
+        self.refreshGreeterVisibility();
+        self.tui.dirty = true;
+    }
 
-        self.active_editor.addToHistory(text);
+    fn restoreQueuedInputsToEditor(self: *Interactive) void {
+        var snapshot = self.ca.agent.clearQueuedMessages(self.allocator);
+        defer snapshot.deinit(self.allocator);
 
-        // Slash command dispatch
-        if (text[0] == '/') {
-            if (self.dispatchSlashCommand(text)) return;
+        const count = snapshot.steering.len + snapshot.follow_up.len;
+        if (count == 0) {
+            self.status_text.setContent("no queued messages");
+            self.status_text.fg = self.theme.fg(.muted);
+            self.tui.dirty = true;
+            return;
         }
 
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        for (snapshot.steering) |entry| {
+            if (buf.items.len > 0) buf.appendSlice(self.allocator, "\n\n") catch return;
+            buf.appendSlice(self.allocator, entry.text) catch return;
+        }
+        for (snapshot.follow_up) |entry| {
+            if (buf.items.len > 0) buf.appendSlice(self.allocator, "\n\n") catch return;
+            buf.appendSlice(self.allocator, entry.text) catch return;
+        }
+
+        const current_text = self.active_editor.getText();
+        if (current_text.len > 0) {
+            if (buf.items.len > 0) buf.appendSlice(self.allocator, "\n\n") catch return;
+            buf.appendSlice(self.allocator, current_text) catch return;
+        }
+
+        self.active_editor.setText(buf.items);
+        self.syncQueueSnapshotFromAgent();
+        self.refreshGreeterVisibility();
+        self.status_text.setContent(if (count == 1) "restored 1 queued message" else "restored queued messages");
+        self.status_text.fg = self.theme.fg(.success);
+        self.tui.dirty = true;
+    }
+
+    fn submitPrompt(self: *Interactive, text: []const u8) void {
         const prompt_copy = self.msg_allocator.dupe(u8, text) catch return;
 
         self.active_editor.clear();
         self.refreshGreeterVisibility();
         self.is_streaming = true;
-        self.tui.setFocus(null); // defocus editor during streaming
         self.showLoader("Working…");
         self.tui.dirty = true;
 
@@ -1470,9 +1549,39 @@ pub const Interactive = struct {
             self.msg_allocator.free(prompt_copy);
             return;
         };
+    }
 
-        self.transcript.addUserMessage(text);
-        self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+    fn handleSubmittedText(self: *Interactive, text: []const u8, queued_kind: ?QueuedInputKind) void {
+        if (text.len == 0) return;
+
+        self.active_editor.addToHistory(text);
+
+        if (text[0] == '/' and self.dispatchSlashCommand(text)) return;
+
+        if (queued_kind) |kind| {
+            self.queueMessageWhileStreaming(kind, text);
+            return;
+        }
+
+        self.submitPrompt(text);
+    }
+
+    fn handleFollowUpShortcut(self: *Interactive) void {
+        const expanded = self.active_editor.getExpandedText();
+        const text = std.mem.trim(u8, expanded, " \t\r\n");
+        if (text.len == 0) return;
+
+        if (self.is_streaming) {
+            self.handleSubmittedText(text, .follow_up);
+            return;
+        }
+
+        self.handleSubmittedText(text, null);
+    }
+
+    fn onEditorSubmit(text: []const u8, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.handleSubmittedText(text, if (self.is_streaming) .steering else null);
     }
 
     /// Dispatch a slash command. Returns true if handled (caller should not send to agent).
@@ -2193,6 +2302,11 @@ pub const Interactive = struct {
         self.event_queue.push(.{ .login_progress = .{ .message = owned, .kind = .info } });
     }
 
+    fn publishQueueSnapshot(self: *Interactive) void {
+        const snapshot = self.ca.agent.snapshotQueuedMessages(self.msg_allocator);
+        self.event_queue.push(.{ .queue_snapshot = snapshot });
+    }
+
     /// Agent worker thread entry point. Handles both streaming
     /// prompts and drain-only request work (zi-wub.15). This is the
     /// ONLY path that runs on the agent thread — any future work
@@ -2447,6 +2561,16 @@ pub const Interactive = struct {
         }
     }
 
+    fn publishQueueSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
+        switch (event) {
+            .message_start => |ms| switch (ms.message) {
+                .user => self.publishQueueSnapshot(),
+                else => {},
+            },
+            else => {},
+        }
+    }
+
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         _ = self.ca.trySetThinkingLevel(level);
         self.publishStatusSnapshot();
@@ -2458,6 +2582,7 @@ pub const Interactive = struct {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         switch (event) {
             .agent_event => |agent_event| {
+                self.publishQueueSnapshotForAgentEvent(agent_event);
                 if (convertAgentEvent(agent_event, self.msg_allocator)) |ui_event| {
                     self.event_queue.push(ui_event);
                 }
@@ -2522,6 +2647,24 @@ fn containsCI(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn cloneUserDisplayText(allocator: std.mem.Allocator, user: ai_protocol.UserMessage) ?[]u8 {
+    return switch (user.content) {
+        .text => |text| if (text.len == 0) null else allocator.dupe(u8, text) catch null,
+        .blocks => |blocks| blk: {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            for (blocks) |block| {
+                switch (block) {
+                    .text => |text| out.appendSlice(allocator, text.text) catch return null,
+                    .image => {},
+                }
+            }
+            if (out.items.len == 0) break :blk null;
+            break :blk out.toOwnedSlice(allocator) catch null;
+        },
+    };
+}
+
 /// Convert an AgentEvent to a TUI-owned UiEvent with deep-copied data.
 /// Runs on the agent thread. Returns null for events the TUI doesn't need.
 fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
@@ -2529,7 +2672,10 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
         .message_start => |ms| {
             return switch (ms.message) {
                 .assistant => .message_start_assistant,
-                .user => .message_start_user,
+                .user => |user| blk: {
+                    const text = cloneUserDisplayText(allocator, user) orelse break :blk null;
+                    break :blk .{ .message_start_user = .{ .text = text } };
+                },
                 else => null,
             };
         },

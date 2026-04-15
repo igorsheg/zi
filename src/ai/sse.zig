@@ -155,7 +155,7 @@ pub fn streamEvents(
 
     while (true) {
         var chunk_writer: std.Io.Writer = .fixed(chunk_buf);
-        const n = reader.stream(&chunk_writer, .limited(effective_chunk_size)) catch |err| switch (err) {
+        const n = streamReaderChunk(reader, &chunk_writer, .limited(effective_chunk_size)) catch |err| switch (err) {
             error.EndOfStream => {
                 try flushPendingLines(parser, &pending, handler, false);
                 return;
@@ -169,6 +169,13 @@ pub fn streamEvents(
         try pending.appendSlice(allocator, chunk_writer.buffered());
         try flushPendingLines(parser, &pending, handler, false);
     }
+}
+
+fn streamReaderChunk(reader: anytype, w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+    return switch (comptime @typeInfo(@TypeOf(reader))) {
+        .pointer => reader.*.stream(w, limit),
+        else => reader.stream(w, limit),
+    };
 }
 
 fn flushPendingLines(

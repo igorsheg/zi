@@ -13,6 +13,23 @@ pub const QueueMode = enum {
     one_at_a_time,
 };
 
+pub const QueuedMessageText = struct {
+    text: []u8,
+};
+
+pub const QueuedMessageSnapshot = struct {
+    steering: []QueuedMessageText,
+    follow_up: []QueuedMessageText,
+
+    pub fn deinit(self: *QueuedMessageSnapshot, allocator: std.mem.Allocator) void {
+        for (self.steering) |entry| allocator.free(entry.text);
+        for (self.follow_up) |entry| allocator.free(entry.text);
+        allocator.free(self.steering);
+        allocator.free(self.follow_up);
+        self.* = undefined;
+    }
+};
+
 /// FIFO queue for steering or follow-up messages.
 /// Drain semantics depend on mode: `all` returns everything, `one_at_a_time` returns the first.
 /// pi-mono source: packages/agent/src/agent.ts:112-143
@@ -20,6 +37,7 @@ pub const PendingMessageQueue = struct {
     messages: std.ArrayList(protocol.AgentMessage),
     mode: QueueMode,
     allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, mode: QueueMode) PendingMessageQueue {
         return .{
@@ -30,14 +48,24 @@ pub const PendingMessageQueue = struct {
     }
 
     pub fn deinit(self: *PendingMessageQueue) void {
+        self.clear();
         self.messages.deinit(self.allocator);
     }
 
     pub fn enqueue(self: *PendingMessageQueue, msg: protocol.AgentMessage) void {
-        self.messages.append(self.allocator, msg) catch return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const owned = dupeAgentMessage(self.allocator, msg);
+        self.messages.append(self.allocator, owned) catch {
+            var mutable = owned;
+            freeAgentMessage(self.allocator, &mutable);
+        };
     }
 
-    pub fn hasItems(self: *const PendingMessageQueue) bool {
+    pub fn hasItems(self: *PendingMessageQueue) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.messages.items.len > 0;
     }
 
@@ -45,24 +73,58 @@ pub const PendingMessageQueue = struct {
     /// `all`: returns all items, clears internal list.
     /// `one_at_a_time`: returns first item only, removes it from the front.
     pub fn drain(self: *PendingMessageQueue, arena: std.mem.Allocator) []const protocol.AgentMessage {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.messages.items.len == 0) return &.{};
 
         if (self.mode == .all) {
-            const result = arena.dupe(protocol.AgentMessage, self.messages.items) catch return &.{};
+            const result = arena.alloc(protocol.AgentMessage, self.messages.items.len) catch return &.{};
+            for (self.messages.items, 0..) |msg, i| {
+                result[i] = dupeAgentMessage(arena, msg);
+            }
+            for (self.messages.items) |*msg| freeAgentMessage(self.allocator, msg);
             self.messages.clearRetainingCapacity();
             return result;
         }
 
-        // one_at_a_time: take first element
         const first = self.messages.items[0];
         const result = arena.alloc(protocol.AgentMessage, 1) catch return &.{};
-        result[0] = first;
-        _ = self.messages.orderedRemove(0);
+        result[0] = dupeAgentMessage(arena, first);
+        var removed = self.messages.orderedRemove(0);
+        freeAgentMessage(self.allocator, &removed);
         return result;
     }
 
     pub fn clear(self: *PendingMessageQueue) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.messages.items) |*msg| freeAgentMessage(self.allocator, msg);
         self.messages.clearRetainingCapacity();
+    }
+
+    pub fn snapshotTexts(self: *PendingMessageQueue, allocator: std.mem.Allocator) []QueuedMessageText {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var out: std.ArrayList(QueuedMessageText) = .empty;
+        defer out.deinit(allocator);
+
+        for (self.messages.items) |msg| {
+            const text = extractQueuedMessageText(msg) orelse continue;
+            const owned = allocator.dupe(u8, text) catch {
+                for (out.items) |entry| allocator.free(entry.text);
+                return &.{};
+            };
+            out.append(allocator, .{ .text = owned }) catch {
+                allocator.free(owned);
+                for (out.items) |entry| allocator.free(entry.text);
+                return &.{};
+            };
+        }
+        return out.toOwnedSlice(allocator) catch {
+            for (out.items) |entry| allocator.free(entry.text);
+            return &.{};
+        };
     }
 };
 
@@ -232,6 +294,19 @@ pub const Agent = struct {
         self.clearFollowUpQueue();
     }
 
+    pub fn snapshotQueuedMessages(self: *Agent, allocator: std.mem.Allocator) QueuedMessageSnapshot {
+        return .{
+            .steering = self.steering_queue.snapshotTexts(allocator),
+            .follow_up = self.follow_up_queue.snapshotTexts(allocator),
+        };
+    }
+
+    pub fn clearQueuedMessages(self: *Agent, allocator: std.mem.Allocator) QueuedMessageSnapshot {
+        const snapshot = self.snapshotQueuedMessages(allocator);
+        self.clearAllQueues();
+        return snapshot;
+    }
+
     fn resetHistoryArena(self: *Agent) void {
         self.history_arena.deinit();
         self.history_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -246,7 +321,7 @@ pub const Agent = struct {
         self.state.pending_tool_calls = &.{};
     }
 
-    pub fn hasQueuedMessages(self: *const Agent) bool {
+    pub fn hasQueuedMessages(self: *Agent) bool {
         return self.steering_queue.hasItems() or self.follow_up_queue.hasItems();
     }
 
@@ -635,6 +710,124 @@ fn dupeToolResultMessage(alloc: std.mem.Allocator, msg: ai.protocol.ToolResultMe
     result.tool_name = alloc.dupe(u8, msg.tool_name) catch msg.tool_name;
     result.details = cloneOptionalJson(alloc, msg.details);
     return result;
+}
+
+fn freeAgentMessage(alloc: std.mem.Allocator, msg: *protocol.AgentMessage) void {
+    switch (msg.*) {
+        .user => |*u| freeUserMessage(alloc, u),
+        .assistant => |*a| freeAssistantMessage(alloc, a),
+        .tool_result => |*t| freeToolResultMessage(alloc, t),
+        .compaction_summary => |*c| alloc.free(c.summary),
+        .branch_summary => |*b| {
+            alloc.free(b.summary);
+            alloc.free(b.from_id);
+        },
+        .custom => |*c| {
+            alloc.free(c.custom_type);
+            switch (c.content) {
+                .text => |text| alloc.free(text),
+                .blocks => |blocks| freeUserBlocks(alloc, blocks),
+            }
+            if (c.details) |*details| json_util.freeJsonValue(alloc, details.*);
+        },
+    }
+    msg.* = undefined;
+}
+
+fn freeUserMessage(alloc: std.mem.Allocator, msg: *ai.protocol.UserMessage) void {
+    switch (msg.content) {
+        .text => |text| alloc.free(text),
+        .blocks => |blocks| freeUserBlocks(alloc, blocks),
+    }
+}
+
+fn freeUserBlocks(alloc: std.mem.Allocator, blocks: []const ai.protocol.UserMessage.UserMessageContent.Block) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| {
+                alloc.free(text.text);
+                if (text.text_signature) |sig| alloc.free(sig);
+            },
+            .image => |image| {
+                alloc.free(image.data);
+                alloc.free(image.mime_type);
+            },
+        }
+    }
+    alloc.free(blocks);
+}
+
+fn freeAssistantMessage(alloc: std.mem.Allocator, msg: *ai.protocol.AssistantMessage) void {
+    for (msg.content) |block| {
+        switch (block) {
+            .text => |text| {
+                alloc.free(text.text);
+                if (text.text_signature) |sig| alloc.free(sig);
+            },
+            .thinking => |thinking| {
+                alloc.free(thinking.thinking);
+                if (thinking.thinking_signature) |sig| alloc.free(sig);
+            },
+            .tool_call => |tool_call| {
+                alloc.free(tool_call.id);
+                alloc.free(tool_call.name);
+                json_util.freeJsonValue(alloc, tool_call.arguments);
+                if (tool_call.thought_signature) |sig| alloc.free(sig);
+            },
+        }
+    }
+    alloc.free(msg.content);
+    alloc.free(msg.model);
+    if (msg.api == .custom) alloc.free(msg.api.custom);
+    if (msg.provider == .custom) alloc.free(msg.provider.custom);
+    if (msg.error_message) |text| alloc.free(text);
+    if (msg.response_id) |id| alloc.free(id);
+}
+
+fn freeToolResultMessage(alloc: std.mem.Allocator, msg: *ai.protocol.ToolResultMessage) void {
+    for (msg.content) |block| {
+        switch (block) {
+            .text => |text| {
+                alloc.free(text.text);
+                if (text.text_signature) |sig| alloc.free(sig);
+            },
+            .image => |image| {
+                alloc.free(image.data);
+                alloc.free(image.mime_type);
+            },
+        }
+    }
+    alloc.free(msg.content);
+    alloc.free(msg.tool_call_id);
+    alloc.free(msg.tool_name);
+    if (msg.details) |*details| json_util.freeJsonValue(alloc, details.*);
+}
+
+fn extractQueuedMessageText(msg: protocol.AgentMessage) ?[]const u8 {
+    return switch (msg) {
+        .user => |user| switch (user.content) {
+            .text => |text| text,
+            .blocks => |blocks| blk: {
+                var first: ?[]const u8 = null;
+                var total_len: usize = 0;
+                var text_count: usize = 0;
+                for (blocks) |block| {
+                    switch (block) {
+                        .text => |text_block| {
+                            if (first == null) first = text_block.text;
+                            total_len += text_block.text.len;
+                            text_count += 1;
+                        },
+                        .image => {},
+                    }
+                }
+                if (text_count == 0) break :blk null;
+                if (text_count == 1 and first != null and total_len == first.?.len) break :blk first.?;
+                break :blk null;
+            },
+        },
+        else => null,
+    };
 }
 
 // -- Default hooks ----------------------------------------------------------

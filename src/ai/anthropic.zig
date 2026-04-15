@@ -182,10 +182,14 @@ pub const AnthropicProvider = struct {
             var err_body_buf: [4096]u8 = undefined;
             var n_read: usize = 0;
             while (n_read < err_body_buf.len) {
-                const data = reader.take(err_body_buf.len - n_read) catch break;
-                if (data.len == 0) break;
-                @memcpy(err_body_buf[n_read..][0..data.len], data);
-                n_read += data.len;
+                var writer: std.Io.Writer = .fixed(err_body_buf[n_read..]);
+                const n = reader.stream(&writer, .limited(err_body_buf.len - n_read)) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.WriteFailed => unreachable,
+                    else => break,
+                };
+                if (n == 0) break;
+                n_read += n;
             }
             const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
                 emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to normalize HTTP error: {s}", .{@errorName(err)});

@@ -155,6 +155,7 @@ test "theme json parses a complete custom theme" {
         \\  "bg": {
         \\    "selected_bg": "#303132",
         \\    "user_message_bg": "#313233",
+        \\    "pending_user_message_bg": "#2E2F30",
         \\    "custom_message_bg": "#323334",
         \\    "tool_transcript_bg": "#333435",
         \\    "tool_pending_bg": "#343536",
@@ -170,6 +171,7 @@ test "theme json parses a complete custom theme" {
     try std.testing.expectEqualStrings("custom", loaded.name);
     try expectColorEq(Color.rgb(0x01, 0x02, 0x03), loaded.theme.fg(.accent));
     try expectColorEq(Color.rgb(0x34, 0x35, 0x36), loaded.theme.bg(.tool_pending_bg));
+    try expectColorEq(Color.rgb(0x2E, 0x2F, 0x30), loaded.theme.bg(.pending_user_message_bg));
 }
 
 test "theme json rejects missing colors" {

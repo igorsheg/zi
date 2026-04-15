@@ -92,7 +92,10 @@ pub const OpenAICodexProvider = struct {
         const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent, options.base.session_id);
 
         const clamped = protocol.clampReasoning(options.reasoning, model);
-        const effort: ?[]const u8 = if (clamped) |l| protocol.thinkingLevelToString(l) else null;
+        const effort: ?[]const u8 = if (clamped) |l|
+            clampCodexReasoningEffort(model.id, protocol.thinkingLevelToString(l))
+        else
+            null;
 
         core.streamCore(allocator, model, context, options.base, .{
             .base_url = if (model.base_url.len > 0) null else "https://chatgpt.com/backend-api",
@@ -255,6 +258,25 @@ fn fillCodexHeaders(buf: *[6]protocol.Header, account_id: []const u8, user_agent
     return 5;
 }
 
+fn clampCodexReasoningEffort(model_id: []const u8, effort: []const u8) []const u8 {
+    const id = if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |idx| model_id[idx + 1 ..] else model_id;
+    if ((std.mem.startsWith(u8, id, "gpt-5.2") or
+        std.mem.startsWith(u8, id, "gpt-5.3") or
+        std.mem.startsWith(u8, id, "gpt-5.4")) and
+        std.mem.eql(u8, effort, "minimal"))
+    {
+        return "low";
+    }
+    if (std.mem.eql(u8, id, "gpt-5.1") and std.mem.eql(u8, effort, "xhigh")) {
+        return "high";
+    }
+    if (std.mem.eql(u8, id, "gpt-5.1-codex-mini")) {
+        if (std.mem.eql(u8, effort, "high") or std.mem.eql(u8, effort, "xhigh")) return "high";
+        return "medium";
+    }
+    return effort;
+}
+
 fn buildUserAgent(allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -281,6 +303,14 @@ test "extractAccountId returns the chatgpt account claim from oauth tokens" {
     const token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
     const account_id = try extractAccountId(allocator, token);
     try testing.expectEqualStrings("acct_123", account_id);
+}
+
+test "clampCodexReasoningEffort matches pi-mono codex rules" {
+    try testing.expectEqualStrings("low", clampCodexReasoningEffort("gpt-5.4", "minimal"));
+    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.1", "xhigh"));
+    try testing.expectEqualStrings("medium", clampCodexReasoningEffort("gpt-5.1-codex-mini", "low"));
+    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.1-codex-mini", "xhigh"));
+    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.4", "high"));
 }
 
 test "fillCodexHeaders matches the codex-required header set" {

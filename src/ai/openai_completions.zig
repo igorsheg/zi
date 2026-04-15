@@ -228,10 +228,14 @@ pub const OpenAICompletionsProvider = struct {
             var err_body_buf: [4096]u8 = undefined;
             var n_read: usize = 0;
             while (n_read < err_body_buf.len) {
-                const data = reader.take(err_body_buf.len - n_read) catch break;
-                if (data.len == 0) break;
-                @memcpy(err_body_buf[n_read..][0..data.len], data);
-                n_read += data.len;
+                var writer: std.Io.Writer = .fixed(err_body_buf[n_read..]);
+                const n = reader.stream(&writer, .limited(err_body_buf.len - n_read)) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.WriteFailed => unreachable,
+                    else => break,
+                };
+                if (n == 0) break;
+                n_read += n;
             }
             const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
                 emitError(allocator, callback, callback_ctx, model, "failed to normalize HTTP error: {s}", .{@errorName(err)});
@@ -1255,30 +1259,8 @@ const test_model: protocol.Model = .{
 };
 
 fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestCollector) void {
-    var stream = std.io.fixedBufferStream(sse_bytes);
-    const Reader = struct {
-        s: *std.io.FixedBufferStream([]const u8),
-        fn takeDelimiterInclusive(self: *@This(), delim: u8) ![]const u8 {
-            var line: std.ArrayListUnmanaged(u8) = .empty;
-            // Single-shot reader that returns one line including \n,
-            // or error.EndOfStream when out of data. We don't need
-            // efficient buffering for tests.
-            while (true) {
-                var byte: [1]u8 = undefined;
-                const n = self.s.read(&byte) catch return error.EndOfStream;
-                if (n == 0) {
-                    if (line.items.len == 0) return error.EndOfStream;
-                    return line.toOwnedSlice(std.heap.page_allocator) catch return error.EndOfStream;
-                }
-                line.append(std.heap.page_allocator, byte[0]) catch return error.EndOfStream;
-                if (byte[0] == delim) {
-                    return line.toOwnedSlice(std.heap.page_allocator) catch return error.EndOfStream;
-                }
-            }
-        }
-    };
-    var r = Reader{ .s = &stream };
-    processStream(arena, &r, test_model, AbortSignal.none, TestCollector.callback, collector);
+    var reader: std.Io.Reader = .fixed(sse_bytes);
+    processStream(arena, &reader, test_model, AbortSignal.none, TestCollector.callback, collector);
 }
 
 test "processStream emits text_delta then done for a simple text response" {

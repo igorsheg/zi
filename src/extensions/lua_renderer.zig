@@ -531,6 +531,9 @@ fn parseFgColor(name: []const u8) ?theme_mod.FgColor {
 fn parseBgColor(name: []const u8) ?theme_mod.BgColor {
     const T = theme_mod.BgColor;
     if (std.mem.eql(u8, name, "selected_bg")) return T.selected_bg;
+    if (std.mem.eql(u8, name, "user_message_bg")) return T.user_message_bg;
+    if (std.mem.eql(u8, name, "pending_user_message_bg")) return T.pending_user_message_bg;
+    if (std.mem.eql(u8, name, "custom_message_bg")) return T.custom_message_bg;
     if (std.mem.eql(u8, name, "tool_transcript_bg")) return T.tool_transcript_bg;
     if (std.mem.eql(u8, name, "tool_pending_bg")) return T.tool_pending_bg;
     if (std.mem.eql(u8, name, "tool_success_bg")) return T.tool_success_bg;

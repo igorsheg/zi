@@ -15,7 +15,7 @@ const RunOutcome = session_controller_mod.RunOutcome;
 pub const UiEvent = union(enum) {
     // --- message lifecycle ---
     message_start_assistant: void,
-    message_start_user: void,
+    message_start_user: struct { text: []u8 },
 
     // --- streaming content ---
     assistant_text_delta: struct {
@@ -111,6 +111,12 @@ pub const UiEvent = union(enum) {
     // request work would wipe the success message.
     request_worker_finished: void,
 
+    // --- queued-message snapshot ---
+    // Authoritative snapshot of agent-owned steering/follow-up queues.
+    // Used by the TUI to render queued user-message rows and restore them
+    // for amendment without maintaining a parallel semantic mirror.
+    queue_snapshot: agent_root.QueuedMessageSnapshot,
+
     // --- /resume outcomes (zi-wub.15) ---
     // Published by the agent thread after processing a
     // resume_session AgentRequest. The TUI rebuilds the transcript
@@ -199,6 +205,8 @@ pub const UiEvent = union(enum) {
             .retry_end => |r| {
                 if (r.final_error) |msg| allocator.free(msg);
             },
+            .message_start_user => |u| allocator.free(u.text),
+            .queue_snapshot => |*q| q.deinit(allocator),
             .session_resumed => |*s| s.deinit(allocator),
             .session_resume_failed => |f| allocator.free(f.message),
             .session_new_started => {},
@@ -213,7 +221,7 @@ pub const UiEvent = union(enum) {
             .prompt_worker_finished => |p| {
                 if (p.internal_error) |msg| allocator.free(msg);
             },
-            .message_start_assistant, .message_start_user, .retry_wait_finished, .request_worker_finished, .model_switched, .thinking_level_changed => {},
+            .message_start_assistant, .retry_wait_finished, .request_worker_finished, .model_switched, .thinking_level_changed => {},
         }
     }
 };

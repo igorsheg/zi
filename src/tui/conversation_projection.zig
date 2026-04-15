@@ -75,6 +75,10 @@ pub fn applyLiveEvent(
             transcript.beginAssistantMessage();
             return true;
         },
+        .message_start_user => |u| {
+            transcript.addUserMessage(.{ .text = u.text });
+            return true;
+        },
         .assistant_text_delta => |d| {
             transcript.appendText(d.content_index, d.delta);
             return true;
@@ -155,7 +159,7 @@ fn appendProjectedMessage(
 fn appendUserMessage(transcript: *Transcript, message: agent_protocol.AgentMessage) void {
     const text = extractUserMessageText(transcript.allocator, message) orelse return;
     defer text.deinit(transcript.allocator);
-    transcript.addUserMessage(text.slice());
+    transcript.addUserMessage(.{ .text = text.slice() });
 }
 
 fn appendAssistantMessage(

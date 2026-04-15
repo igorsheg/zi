@@ -5,8 +5,10 @@ const cell_mod = @import("cell.zig");
 const grapheme = @import("grapheme.zig");
 const markdown_mod = @import("components/markdown.zig");
 const assistant_message_mod = @import("components/assistant_message.zig");
+const user_message_mod = @import("components/user_message.zig");
 const tool_display_mod = @import("tool_display.zig");
-const agent_protocol = @import("../agent/root.zig").protocol;
+const agent_mod = @import("../agent/root.zig");
+const agent_protocol = agent_mod.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
@@ -109,6 +111,7 @@ pub const ItemKind = enum {
     generic,
     assistant_message,
     user_message,
+    queued_user_message,
     tool_execution,
 };
 
@@ -908,6 +911,12 @@ fn deinitAssistantMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(am);
 }
 
+fn deinitUserMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const um: *user_message_mod.UserMessage = @ptrCast(@alignCast(ctx));
+    um.deinit();
+    allocator.destroy(um);
+}
+
 // ── Transcript ────────────────────────────────────────────────────
 
 /// Scrollable conversation transcript with slice-native item storage.
@@ -1029,34 +1038,58 @@ pub const Transcript = struct {
         var i: usize = 0;
         while (i < self.items.items.len) {
             if (TranscriptRenderable.eql(self.items.items[i].renderable, renderable)) {
-                var item = self.items.items[i];
-                // Clean up tool index if this was a tool execution
-                if (item.tool_call_id) |id| {
-                    _ = self.pending_tools.remove(id);
-                }
-                item.deinit(self.allocator);
-                _ = self.items.orderedRemove(i);
-                self.layout.removeItem(i);
-                // Fix up pending_tools indices for items after the removed one
-                var iter = self.pending_tools.iterator();
-                while (iter.next()) |entry| {
-                    if (entry.value_ptr.* > i) {
-                        entry.value_ptr.* -= 1;
-                    }
-                }
-                // Fix up current_assistant_idx
-                if (self.current_assistant_idx) |idx| {
-                    if (idx == i) {
-                        self.current_assistant_idx = null;
-                    } else if (idx > i) {
-                        self.current_assistant_idx = idx - 1;
-                    }
-                }
-                // Clamp scroll_offset so content doesn't render blank
-                self.clampScroll();
+                self.removeItemAt(i);
                 return; // remove first match only
             }
             i += 1;
+        }
+    }
+
+    fn removeItemAt(self: *Transcript, index: usize) void {
+        if (index >= self.items.items.len) return;
+        var item = self.items.items[index];
+        if (item.tool_call_id) |id| {
+            _ = self.pending_tools.remove(id);
+        }
+        item.deinit(self.allocator);
+        _ = self.items.orderedRemove(index);
+        self.layout.removeItem(index);
+        var iter = self.pending_tools.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* > index) entry.value_ptr.* -= 1;
+        }
+        if (self.current_assistant_idx) |idx| {
+            if (idx == index) {
+                self.current_assistant_idx = null;
+            } else if (idx > index) {
+                self.current_assistant_idx = idx - 1;
+            }
+        }
+        self.clampScroll();
+    }
+
+    pub fn clearQueuedUserMessages(self: *Transcript) void {
+        var i: usize = 0;
+        while (i < self.items.items.len) {
+            if (self.items.items[i].kind == .queued_user_message) {
+                self.removeItemAt(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    pub fn syncQueuedUserMessages(
+        self: *Transcript,
+        steering: []const agent_mod.QueuedMessageText,
+        follow_up: []const agent_mod.QueuedMessageText,
+    ) void {
+        self.clearQueuedUserMessages();
+        for (steering) |entry| {
+            self.addQueuedUserMessage(.{ .text = entry.text, .footer = .queued_steering });
+        }
+        for (follow_up) |entry| {
+            self.addQueuedUserMessage(.{ .text = entry.text, .footer = .queued_follow_up });
         }
     }
 
@@ -1288,33 +1321,41 @@ pub const Transcript = struct {
         }
     }
 
-    /// Add a user message bubble.
-    pub fn addUserMessage(self: *Transcript, text: []const u8) void {
+    fn addUserMessageWithKind(self: *Transcript, props: user_message_mod.Props, kind: ItemKind) void {
         self.deactivateCurrentAssistantThinking();
         self.current_assistant_idx = null;
 
-        const md = self.allocator.create(markdown_mod.Markdown) catch return;
-        md.* = markdown_mod.Markdown.init(self.allocator);
-        md.padding_x = 1;
-        // User messages render as filled bubbles, so they need a little
-        // internal vertical padding to read as intentional chrome rather
-        // than a background paint bug.
-        md.padding_y = 1;
-        md.bg = self.theme.bg(.user_message_bg);
-        md.fg = self.theme.fg(.user_message_text);
-        md.setContent(text);
+        const msg = self.allocator.create(user_message_mod.UserMessage) catch return;
+        msg.* = user_message_mod.UserMessage.init(self.allocator);
+        msg.setTheme(self.theme);
+
+        var message_props = props;
+        message_props.status = if (kind == .queued_user_message)
+            .pending
+        else
+            .in_chat;
+        msg.setProps(message_props);
 
         if (!self.appendTranscriptItem(.{
-            .renderable = TranscriptRenderable.init(markdown_mod.Markdown, md),
-            .kind = .user_message,
+            .renderable = TranscriptRenderable.init(user_message_mod.UserMessage, msg),
+            .kind = kind,
             .extra_height = 1, // spacer before user message
-            .deinit_ctx = @ptrCast(md),
-            .deinit_fn = deinitMarkdown,
+            .deinit_ctx = @ptrCast(msg),
+            .deinit_fn = deinitUserMessage,
         })) {
-            md.deinit();
-            self.allocator.destroy(md);
+            msg.deinit();
+            self.allocator.destroy(msg);
             return;
         }
+    }
+
+    /// Add a user message bubble.
+    pub fn addUserMessage(self: *Transcript, props: user_message_mod.Props) void {
+        self.addUserMessageWithKind(props, .user_message);
+    }
+
+    pub fn addQueuedUserMessage(self: *Transcript, props: user_message_mod.Props) void {
+        self.addUserMessageWithKind(props, .queued_user_message);
     }
 
     // ── Selection ────────────────────────────────────────────────
@@ -1964,7 +2005,7 @@ test "Transcript built-in items install transcript renderables" {
 
     transcript.beginAssistantMessage();
     transcript.appendText(0, "hello from assistant");
-    transcript.addUserMessage("user msg");
+    transcript.addUserMessage(.{ .text = "user msg" });
     transcript.addToolExecution("tool-1", "bash", .{});
 
     try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
@@ -2324,7 +2365,7 @@ test "Transcript clearAll removes all items and resets state" {
 
     transcript.beginAssistantMessage();
     transcript.appendText(0, "hello");
-    transcript.addUserMessage("user msg");
+    transcript.addUserMessage(.{ .text = "user msg" });
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 

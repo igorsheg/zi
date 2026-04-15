@@ -229,10 +229,14 @@ pub fn streamCore(
         var err_body_buf: [4096]u8 = undefined;
         var n_read: usize = 0;
         while (n_read < err_body_buf.len) {
-            const data = reader.take(err_body_buf.len - n_read) catch break;
-            if (data.len == 0) break;
-            @memcpy(err_body_buf[n_read..][0..data.len], data);
-            n_read += data.len;
+            var writer: std.Io.Writer = .fixed(err_body_buf[n_read..]);
+            const n = reader.stream(&writer, .limited(err_body_buf.len - n_read)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.WriteFailed => unreachable,
+                else => break,
+            };
+            if (n == 0) break;
+            n_read += n;
         }
         const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
             emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to normalize HTTP error: {s}", .{@errorName(err)});
@@ -242,8 +246,8 @@ pub fn streamCore(
         return;
     }
 
-    const reader = response.reader(&transfer_buf);
-    processStreamMapped(allocator, reader, model, options.signal, core.provider_label, core.event_mapper, callback, callback_ctx);
+    var reader = response.reader(&transfer_buf);
+    processStreamMapped(allocator, &reader, model, options.signal, core.provider_label, core.event_mapper, callback, callback_ctx);
 }
 
 // =============================================================================
@@ -1696,37 +1700,16 @@ const test_model: protocol.Model = .{
     .max_tokens = 1024,
 };
 
-/// Test reader: single-shot line iterator over a fixed byte buffer.
-/// Mirrors the pattern in openai_completions.zig tests. Uses page_allocator
-/// for the per-line scratch since these are unit tests and allocator churn
-/// doesn't matter.
+/// Test helper: run the shared SSE processor against a fixed reader so
+/// the unit tests exercise the same `std.Io.Reader` semantics as live HTTP.
 fn runProcessWithMapper(
     arena: std.mem.Allocator,
     sse_bytes: []const u8,
     event_mapper: EventMapper,
     collector: *TestCollector,
 ) void {
-    var stream = std.io.fixedBufferStream(sse_bytes);
-    const Reader = struct {
-        s: *std.io.FixedBufferStream([]const u8),
-        fn takeDelimiterInclusive(self: *@This(), delim: u8) ![]const u8 {
-            var line: std.ArrayListUnmanaged(u8) = .empty;
-            while (true) {
-                var byte: [1]u8 = undefined;
-                const n = self.s.read(&byte) catch return error.EndOfStream;
-                if (n == 0) {
-                    if (line.items.len == 0) return error.EndOfStream;
-                    return line.toOwnedSlice(std.heap.page_allocator) catch return error.EndOfStream;
-                }
-                line.append(std.heap.page_allocator, byte[0]) catch return error.EndOfStream;
-                if (byte[0] == delim) {
-                    return line.toOwnedSlice(std.heap.page_allocator) catch return error.EndOfStream;
-                }
-            }
-        }
-    };
-    var r = Reader{ .s = &stream };
-    processStreamMapped(arena, &r, test_model, AbortSignal.none, "openai-responses", event_mapper, TestCollector.cb, collector);
+    var reader: std.Io.Reader = .fixed(sse_bytes);
+    processStreamMapped(arena, &reader, test_model, AbortSignal.none, "openai-responses", event_mapper, TestCollector.cb, collector);
 }
 
 fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestCollector) void {
