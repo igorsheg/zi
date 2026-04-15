@@ -10,12 +10,12 @@ const themes_builtin = @import("../themes/builtin.zig");
 const tool_display = @import("../tui/tool_display.zig");
 const builtin_renderers = @import("../tui/renderers/builtins.zig");
 const compactor = @import("../session/compactor.zig");
-const args = @import("args.zig");
+const plan = @import("plan.zig");
 const common = @import("common.zig");
 const context_mod = @import("context.zig");
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 
-pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
+pub fn run(ctx: context_mod.Context, options: plan.InteractivePlan) !void {
     logging.setThreadLabel(.tui);
 
     var auth_storage = auth.storage.AuthStorage.create(ctx.allocator, null) catch {
@@ -43,7 +43,7 @@ pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
         .cli_provider = null,
         .cli_model = options.model_id,
         .scoped_models = &.{},
-        .is_continuing = false,
+        .is_continuing = options.session_target != .none,
         .default_provider = settings.getDefaultProvider(),
         .default_model_id = settings.getDefaultModel(),
         .default_thinking_level = common.defaultThinkingLevel(&settings),
@@ -74,6 +74,7 @@ pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
     const provider_str = ai.json_util.providerToString(effective_model.provider);
     const api_key: []const u8 = auth_storage.getApiKey(provider_str) orelse "";
     const needs_auth = api_key.len == 0;
+    const allowlist_opt = try common.parseToolAllowlist(ctx.allocator, options.tool_allowlist_csv);
 
     var ca = try sdk.createAgentSession(ctx.allocator, .{
         .model = effective_model,
@@ -84,6 +85,9 @@ pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
         .settings_manager = &settings,
         .model_registry = &model_registry,
         .thinking_level = common.aiToAgentThinking(init_result.thinking_level),
+        .no_session = options.no_session,
+        .append_system_prompt = options.append_system_prompt,
+        .tool_allowlist = allowlist_opt,
     });
     defer ca.deinit();
 
@@ -131,6 +135,13 @@ pub fn run(ctx: context_mod.Context, options: args.RunOptions) !void {
     defer interactive.deinit();
 
     applyInteractiveTheme(&interactive, resolveSelectedTheme(&ca, &settings));
+    interactive.setStartupAction(switch (options.session_target) {
+        .none => if (options.initial_prompt) |prompt|
+            .{ .prompt = prompt }
+        else
+            .none,
+        .continue_path => |path| .{ .resume_session = path },
+    });
 
     if (needs_auth) {
         interactive.status_text.setContent("no API key — use /login to authenticate");

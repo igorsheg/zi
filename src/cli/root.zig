@@ -2,7 +2,6 @@ pub const action = @import("action.zig");
 pub const parse = @import("parse.zig");
 pub const plan = @import("plan.zig");
 pub const diagnostics = @import("diagnostics.zig");
-pub const args = @import("args.zig");
 pub const help = @import("help.zig");
 pub const context = @import("context.zig");
 pub const common = @import("common.zig");

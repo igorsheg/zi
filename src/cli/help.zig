@@ -1,5 +1,3 @@
-const args = @import("args.zig");
-
 pub fn writeGeneralHelp(writer: anytype) !void {
     try writer.writeAll(
         \\zi — AI coding agent
@@ -20,18 +18,4 @@ pub fn writeGeneralHelp(writer: anytype) !void {
         \\  -v, --version         Show version
         \\
     );
-}
-
-pub fn writeDiagnostic(writer: anytype, diagnostic: args.Diagnostic) !void {
-    switch (diagnostic) {
-        .missing_value => |flag| {
-            try writer.print("error: missing value for {s}\n", .{flag});
-        },
-        .invalid_mode => |value| {
-            try writer.print("error: unknown mode '{s}'. use 'json' or 'text'\n", .{value});
-        },
-        .unknown_flag => |flag| {
-            try writer.print("error: unknown flag '{s}'\n", .{flag});
-        },
-    }
 }

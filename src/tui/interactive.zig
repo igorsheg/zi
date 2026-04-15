@@ -310,6 +310,12 @@ const ModelPickerFlow = struct {
     }
 };
 
+const StartupAction = union(enum) {
+    none,
+    prompt: []const u8,
+    resume_session: []const u8,
+};
+
 /// Interactive mode — wires AgentSession (blocking on its thread)
 /// to the TUI (main thread) via a thread-safe event queue.
 ///
@@ -418,6 +424,7 @@ pub const Interactive = struct {
     running: bool = true,
     is_streaming: bool = false,
     request_in_flight: bool = false,
+    startup_action: StartupAction = .none,
     last_ctrl_c_ns: i128 = 0,
     tool_output_expanded: bool = false,
     hide_thinking_block: bool = false,
@@ -500,6 +507,10 @@ pub const Interactive = struct {
         // that becomes dangling after the by-value return.
         self.transcript.theme = theme;
         return self;
+    }
+
+    pub fn setStartupAction(self: *Interactive, startup_action: StartupAction) void {
+        self.startup_action = startup_action;
     }
 
     pub fn deinit(self: *Interactive) void {
@@ -632,6 +643,7 @@ pub const Interactive = struct {
         self.tui.root.focused_child_index = 5; // editorContainer for cursor y-offset
 
         self.tui.dirty = true;
+        self.performStartupAction();
 
         while (self.running) {
             // 1. Drain UI events (owned, thread-safe)
@@ -701,6 +713,28 @@ pub const Interactive = struct {
             // timer-driven UI work still wakes promptly alongside mailbox events.
             self.sleepUntilNextLoopDeadline();
         }
+    }
+
+    fn performStartupAction(self: *Interactive) void {
+        switch (self.startup_action) {
+            .none => {},
+            .prompt => |text| self.submitPrompt(text),
+            .resume_session => |path| {
+                const path_copy = self.msg_allocator.dupe(u8, path) catch {
+                    self.status_text.setContent("out of memory");
+                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.tui.dirty = true;
+                    self.startup_action = .none;
+                    return;
+                };
+                _ = self.dispatchIdleRequest(.{ .resume_session = .{ .path = path_copy } }, .{
+                    .busy_message = "cannot resume while agent is running",
+                    .loader_message = "Loading session...",
+                    .spawn_failed_message = "failed to queue resume",
+                });
+            },
+        }
+        self.startup_action = .none;
     }
 
     fn bootstrapStatusSnapshot(self: *Interactive) void {

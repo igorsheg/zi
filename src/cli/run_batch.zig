@@ -7,20 +7,17 @@ const agent = @import("../agent/root.zig");
 const coding_agent = @import("../coding_agent.zig");
 const sdk = @import("../sdk.zig");
 const agent_json = @import("../agent/json.zig");
-const args = @import("args.zig");
+const plan = @import("plan.zig");
 const common = @import("common.zig");
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
 const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 
-pub fn run(allocator: std.mem.Allocator, options: args.RunOptions) !void {
+pub fn run(allocator: std.mem.Allocator, options: plan.BatchPlan) !void {
     logging.setThreadLabel(.batch);
 
-    const is_continue = options.continue_path != null;
-    const prompt = if (is_continue) null else (options.prompt_text orelse {
-        try stderr.writeAll("error: no prompt provided\n");
-        std.process.exit(1);
-    });
+    const is_continue = options.session_target != .none;
+    const prompt = if (is_continue) null else options.prompt;
 
     var auth_storage = auth.storage.AuthStorage.create(allocator, null) catch {
         try stderr.writeAll("warning: could not load auth storage\n");
@@ -40,20 +37,23 @@ pub fn run(allocator: std.mem.Allocator, options: args.RunOptions) !void {
     var saved_session_model: ?@import("../session/context.zig").SessionContext.ModelInfo = null;
     var loaded_session: ?coding_agent.OpenSessionResult = null;
     defer if (loaded_session) |*loaded| loaded.deinit();
-    if (options.continue_path) |path| {
-        loaded_session = coding_agent.openSession(allocator, path) catch |err| {
-            try stderr.writeAll("error: could not load session: ");
-            try stderr.writeAll(@errorName(err));
-            try stderr.writeAll("\n");
-            std.process.exit(1);
-        };
-        initial_messages = loaded_session.?.messages;
-        if (initial_messages.len == 0) {
-            try stderr.writeAll("error: session file has no messages\n");
-            std.process.exit(1);
-        }
-        session_store = loaded_session.?.takeStore();
-        saved_session_model = loaded_session.?.model;
+    switch (options.session_target) {
+        .none => {},
+        .continue_path => |path| {
+            loaded_session = coding_agent.openSession(allocator, path) catch |err| {
+                try stderr.writeAll("error: could not load session: ");
+                try stderr.writeAll(@errorName(err));
+                try stderr.writeAll("\n");
+                std.process.exit(1);
+            };
+            initial_messages = loaded_session.?.messages;
+            if (initial_messages.len == 0) {
+                try stderr.writeAll("error: session file has no messages\n");
+                std.process.exit(1);
+            }
+            session_store = loaded_session.?.takeStore();
+            saved_session_model = loaded_session.?.model;
+        },
     }
 
     const custom_models = common.convertCustomModels(allocator, settings.getModels()) catch &.{};
@@ -120,10 +120,10 @@ pub fn run(allocator: std.mem.Allocator, options: args.RunOptions) !void {
         std.process.exit(1);
     };
 
-    const allowlist_opt = try common.parseToolAllowlist(allocator, options.tools_filter);
+    const allowlist_opt = try common.parseToolAllowlist(allocator, options.tool_allowlist_csv);
     var json_handler = JsonHandler{};
     var print_handler = PrintHandler{};
-    const event_handler: coding_agent.AgentSession.EventHandler = if (options.mode == .json)
+    const event_handler: coding_agent.AgentSession.EventHandler = if (options.output == .json)
         .{ .func = &JsonHandler.callback, .ctx = @ptrCast(&json_handler) }
     else
         .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) };

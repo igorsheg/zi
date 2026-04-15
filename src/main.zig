@@ -58,16 +58,26 @@ pub fn main() !void {
         try raw_args.append(allocator, arg);
     }
 
-    const command = switch (cli.args.parse(raw_args.items)) {
+    const action = cli.action.Action.detect(raw_args.items);
+    var raw_command = switch (try cli.parse.parse(allocator, action, raw_args.items)) {
         .ok => |cmd| cmd,
         .err => |diag| {
             try writeParseDiagnostic(diag);
             std.process.exit(1);
         },
     };
+    defer raw_command.deinit(allocator);
+
+    const execution_plan = switch (cli.plan.build(raw_command)) {
+        .ok => |plan| plan,
+        .err => |diag| {
+            try writePlanDiagnostic(diag);
+            std.process.exit(1);
+        },
+    };
 
     var log_session = try logging.init(allocator, .{
-        .sink_mode = sinkModeForCommand(command),
+        .sink_mode = sinkModeForPlan(execution_plan),
     });
     defer log_session.deinit();
 
@@ -78,18 +88,25 @@ pub fn main() !void {
         .agent_backing_tracker = &agent_backing_tracker,
         .tui_backing_tracker = &tui_backing_tracker,
         .msg_backing_tracker = &msg_backing_tracker,
-    }, command);
+    }, execution_plan);
 }
 
-fn writeParseDiagnostic(diag: cli.args.Diagnostic) !void {
+fn writeParseDiagnostic(diag: cli.parse.ParseDiagnostic) !void {
     var err_buf: [1024]u8 = undefined;
     var err_writer = stderr.writer(&err_buf);
-    try cli.help.writeDiagnostic(&err_writer.interface, diag);
+    try cli.diagnostics.writeParseDiagnostic(&err_writer.interface, diag);
     try err_writer.end();
 }
 
-fn sinkModeForCommand(command: cli.args.Command) logging.SinkMode {
-    return switch (command) {
+fn writePlanDiagnostic(diag: cli.plan.PlanDiagnostic) !void {
+    var err_buf: [1024]u8 = undefined;
+    var err_writer = stderr.writer(&err_buf);
+    try cli.diagnostics.writePlanDiagnostic(&err_writer.interface, diag);
+    try err_writer.end();
+}
+
+fn sinkModeForPlan(execution_plan: cli.plan.ExecutionPlan) logging.SinkMode {
+    return switch (execution_plan) {
         .help, .version, .list_models => .disabled,
         .run => .file_only,
     };
