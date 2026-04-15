@@ -150,32 +150,23 @@ pub fn streamEvents(
     defer pending.deinit(allocator);
 
     const effective_chunk_size = if (chunk_size == 0) 4096 else chunk_size;
+    const chunk_buf = try allocator.alloc(u8, effective_chunk_size);
+    defer allocator.free(chunk_buf);
 
     while (true) {
-        const chunk = reader.take(effective_chunk_size) catch |err| switch (err) {
+        var chunk_writer: std.Io.Writer = .fixed(chunk_buf);
+        const n = reader.stream(&chunk_writer, .limited(effective_chunk_size)) catch |err| switch (err) {
             error.EndOfStream => {
-                try flushPendingLines(parser, &pending, handler, true);
-                if (parser.data_buf.items.len > 0 or parser.event_len > 0) {
-                    if (try parser.feedLine("")) |evt| {
-                        try handler.call(evt);
-                    }
-                }
+                try flushPendingLines(parser, &pending, handler, false);
                 return;
             },
+            error.WriteFailed => unreachable,
             else => return err,
         };
 
-        if (chunk.len == 0) {
-            try flushPendingLines(parser, &pending, handler, true);
-            if (parser.data_buf.items.len > 0 or parser.event_len > 0) {
-                if (try parser.feedLine("")) |evt| {
-                    try handler.call(evt);
-                }
-            }
-            return;
-        }
+        if (n == 0) continue;
 
-        try pending.appendSlice(allocator, chunk);
+        try pending.appendSlice(allocator, chunk_writer.buffered());
         try flushPendingLines(parser, &pending, handler, false);
     }
 }
@@ -353,20 +344,7 @@ test "event data larger than max fails instead of truncating" {
 
 test "streamEvents feeds reader into parser" {
     const input = "event: test\ndata: hello\n\nevent: done\ndata: bye\n\n";
-    var stream = std.io.fixedBufferStream(input);
-    const Reader = struct {
-        s: *std.io.FixedBufferStream([]const u8),
-
-        fn take(self: *@This(), max_bytes: usize) ![]const u8 {
-            const remaining = self.s.buffer.len - self.s.pos;
-            if (remaining == 0) return error.EndOfStream;
-            const n = @min(max_bytes, remaining);
-            const start = self.s.pos;
-            self.s.pos += n;
-            return self.s.buffer[start .. start + n];
-        }
-    };
-    var reader = Reader{ .s = &stream };
+    var reader: std.Io.Reader = .fixed(input);
 
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
@@ -391,22 +369,23 @@ test "streamEvents feeds reader into parser" {
 }
 
 test "streamEvents handles lines longer than chunk size" {
-    const long_json = "{\"type\":\"response.output_text.delta\",\"delta\":\"" ++ ("x" ** 20000) ++ "\"}";
-    const input = "data: " ++ long_json ++ "\n\n";
-    var stream = std.io.fixedBufferStream(input);
-    const Reader = struct {
-        s: *std.io.FixedBufferStream([]const u8),
+    const SliceReader = struct {
+        input: []const u8,
+        pos: usize = 0,
 
-        fn take(self: *@This(), max_bytes: usize) ![]const u8 {
-            const remaining = self.s.buffer.len - self.s.pos;
-            if (remaining == 0) return error.EndOfStream;
-            const n = @min(max_bytes, remaining);
-            const start = self.s.pos;
-            self.s.pos += n;
-            return self.s.buffer[start .. start + n];
+        fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+            if (self.pos >= self.input.len) return error.EndOfStream;
+            const remaining = self.input.len - self.pos;
+            const n = @min(limit.minInt(remaining), remaining);
+            try w.writeAll(self.input[self.pos .. self.pos + n]);
+            self.pos += n;
+            return n;
         }
     };
-    var reader = Reader{ .s = &stream };
+
+    const long_json = "{\"type\":\"response.output_text.delta\",\"delta\":\"" ++ ("x" ** 20000) ++ "\"}";
+    const input = "data: " ++ long_json ++ "\n\n";
+    var reader = SliceReader{ .input = input };
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
 
@@ -429,4 +408,94 @@ test "streamEvents handles lines longer than chunk size" {
 
     try std.testing.expect(ctx.seen);
     try std.testing.expectEqual(long_json.len, ctx.data_len);
+}
+
+test "streamEvents retries after zero-byte read instead of treating it as EOF" {
+    const ZeroThenMoreReader = struct {
+        calls: usize = 0,
+
+        fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+            const chunk = switch (self.calls) {
+                0 => "data: hel",
+                1 => {
+                    self.calls += 1;
+                    return 0;
+                },
+                2 => "lo\n\n",
+                else => return error.EndOfStream,
+            };
+            self.calls += 1;
+            const n = @min(limit.minInt(chunk.len), chunk.len);
+            try w.writeAll(chunk[0..n]);
+            return n;
+        }
+    };
+
+    var reader = ZeroThenMoreReader{};
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    const Ctx = struct {
+        seen: bool = false,
+        data: ?[]const u8 = null,
+
+        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = true;
+            self.data = evt.data;
+        }
+    };
+
+    var ctx = Ctx{};
+    try streamEvents(std.testing.allocator, &reader, &parser, 64, .{
+        .func = &Ctx.cb,
+        .ctx = @ptrCast(&ctx),
+    });
+
+    try std.testing.expect(ctx.seen);
+    try std.testing.expectEqualStrings("hello", ctx.data.?);
+}
+
+test "streamEvents discards unterminated tail at EOF" {
+    const ZeroAtEndReader = struct {
+        input: []const u8,
+        pos: usize = 0,
+        returned_zero: bool = false,
+
+        fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+            if (self.pos < self.input.len) {
+                const remaining = self.input.len - self.pos;
+                const n = @min(limit.minInt(remaining), remaining);
+                try w.writeAll(self.input[self.pos .. self.pos + n]);
+                self.pos += n;
+                return n;
+            }
+            if (!self.returned_zero) {
+                self.returned_zero = true;
+                return 0;
+            }
+            return error.EndOfStream;
+        }
+    };
+
+    var reader = ZeroAtEndReader{ .input = "data: {\"type\":\"response.completed\"" };
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    const Ctx = struct {
+        count: usize = 0,
+
+        fn cb(_: SseEvent, ctx: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+
+    var ctx = Ctx{};
+    try streamEvents(std.testing.allocator, &reader, &parser, 64, .{
+        .func = &Ctx.cb,
+        .ctx = @ptrCast(&ctx),
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.count);
 }
