@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai/root.zig");
+const string_util = @import("lib/string_util.zig");
 
 pub const FailureClass = enum {
     none,
@@ -117,8 +118,8 @@ pub fn isContextOverflow(
 ) bool {
     if (message.stop_reason == .@"error") {
         const err = message.error_message orelse return false;
-        if (containsAnyCI(err, &non_overflow_needles)) return false;
-        return containsAnyCI(err, &overflow_needles);
+        if (string_util.containsAnyCI(err, &non_overflow_needles)) return false;
+        return string_util.containsAnyCI(err, &overflow_needles);
     }
 
     if (context_window) |limit| {
@@ -132,25 +133,7 @@ pub fn isContextOverflow(
 }
 
 pub fn isRetryableError(error_message: []const u8) bool {
-    return containsAnyCI(error_message, &retryable_needles);
-}
-
-fn containsAnyCI(haystack: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (containsCI(haystack, needle)) return true;
-    }
-    return false;
-}
-
-fn containsCI(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
+    return string_util.containsAnyCI(error_message, &retryable_needles);
 }
 
 test "classifyAssistantMessage marks overflow separately from retryable errors" {

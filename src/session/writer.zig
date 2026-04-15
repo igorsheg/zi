@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const json = @import("json.zig");
+const time_util = @import("../lib/time_util.zig");
 
 /// Manages writing session entries to a JSONL file.
 /// Tracks leafId for tree structure and generates unique entry IDs.
@@ -32,7 +33,7 @@ pub const SessionWriter = struct {
         generateUuid(&uuid_buf);
         const session_id = allocator.dupe(u8, &uuid_buf) catch @panic("OOM");
 
-        const timestamp = isoTimestamp(allocator) catch @panic("OOM");
+        const timestamp = time_util.isoTimestampNow(allocator) catch @panic("OOM");
 
         // Ensure directory exists
         std.fs.cwd().makePath(session_dir) catch {};
@@ -218,7 +219,7 @@ pub const SessionWriter = struct {
     /// Create a session entry and update tree state (leaf_id, ids).
     fn createEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) ?proto.SessionEntry {
         const entry_id = self.generateId() catch return null;
-        const entry_timestamp = isoTimestamp(self.allocator) catch return null;
+        const entry_timestamp = time_util.isoTimestampNow(self.allocator) catch return null;
 
         const entry = proto.SessionEntry{
             .id = entry_id,
@@ -288,24 +289,6 @@ pub const SessionWriter = struct {
         return try self.allocator.dupe(u8, &hex);
     }
 };
-
-/// Generate an ISO 8601 timestamp string.
-fn isoTimestamp(allocator: std.mem.Allocator) ![]const u8 {
-    const ts = std.time.timestamp();
-    const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
-    const day = epoch_secs.getDaySeconds();
-    const year_day = epoch_secs.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
-        year_day.year,
-        @intFromEnum(month_day.month),
-        month_day.day_index + 1,
-        day.getHoursIntoDay(),
-        day.getMinutesIntoHour(),
-        day.getSecondsIntoMinute(),
-    });
-}
 
 /// Generate a UUID v4-like string (lowercase hex with dashes).
 fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, session_id: []const u8) void {

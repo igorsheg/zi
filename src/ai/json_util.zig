@@ -1,16 +1,19 @@
 //! AI-protocol-specific enum↔string converters. Generic JSON
 //! helpers (clone/free/typed accessors) were moved to
-//! `src/json/value.zig`; this file re-exports them so legacy call
-//! sites keep working while the migration settles.
+//! `src/json/value.zig`, and generic text helpers now live in
+//! `src/lib/string_util.zig`; this file re-exports them so legacy
+//! call sites keep working while the migration settles.
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const json_value = @import("../json/value.zig");
+const string_util = @import("../lib/string_util.zig");
 
 // Re-exports of generic helpers — callers should prefer importing
 // from `src/json/value.zig` directly in new code.
 pub const cloneJsonValue = json_value.cloneJsonValue;
 pub const freeJsonValue = json_value.freeJsonValue;
 pub const jsonToFloat = json_value.jsonToFloat;
+pub const utf8LossyAlloc = string_util.utf8LossyAlloc;
 
 pub fn providerToString(p: protocol.Provider) []const u8 {
     return switch (p) {
@@ -100,35 +103,6 @@ pub fn stopReasonToString(r: protocol.StopReason) []const u8 {
         .@"error" => "error",
         .aborted => "aborted",
     };
-}
-
-pub fn utf8LossyAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    if (std.unicode.utf8ValidateSlice(bytes)) return allocator.dupe(u8, bytes);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
-            try out.appendSlice(allocator, "\xEF\xBF\xBD");
-            i += 1;
-            continue;
-        };
-        if (i + len > bytes.len) {
-            try out.appendSlice(allocator, "\xEF\xBF\xBD");
-            break;
-        }
-        _ = std.unicode.utf8Decode(bytes[i .. i + len]) catch {
-            try out.appendSlice(allocator, "\xEF\xBF\xBD");
-            i += 1;
-            continue;
-        };
-        try out.appendSlice(allocator, bytes[i .. i + len]);
-        i += len;
-    }
-
-    return out.toOwnedSlice(allocator);
 }
 
 pub fn parseStopReason(s: []const u8) protocol.StopReason {

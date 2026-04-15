@@ -1,5 +1,6 @@
 const std = @import("std");
 const resource_types = @import("resources/types.zig");
+const time_util = @import("lib/time_util.zig");
 
 pub const ContextFile = resource_types.AgentsFile;
 
@@ -56,7 +57,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]cons
     errdefer aw.deinit();
     const w = &aw.writer;
 
-    const date = try isoDate(allocator);
+    const date = try time_util.isoDateNow(allocator);
     defer allocator.free(date);
 
     const cwd = try normalizeCwd(allocator, options.cwd);
@@ -195,19 +196,6 @@ fn writeContextFiles(w: *std.Io.Writer, files: []const ContextFile) !void {
     for (files) |f| {
         try w.print("## {s}\n\n{s}\n\n", .{ f.path, f.content });
     }
-}
-
-/// YYYY-MM-DD from wall-clock time.
-fn isoDate(allocator: std.mem.Allocator) ![]const u8 {
-    const ts = std.time.timestamp();
-    const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(ts) };
-    const year_day = epoch_secs.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{
-        year_day.year,
-        @intFromEnum(month_day.month),
-        month_day.day_index + 1,
-    });
 }
 
 fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !void {

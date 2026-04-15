@@ -26,6 +26,8 @@ const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
+const string_util = @import("../lib/string_util.zig");
+const time_util = @import("../lib/time_util.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
@@ -189,63 +191,6 @@ test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
     try std.testing.expectEqual(@as(usize, 0), after);
 }
 
-/// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y"
-fn formatRelativeTime(iso_ts: []const u8) []const u8 {
-    // Parse "YYYY-MM-DDThh:mm:ss" → epoch seconds
-    if (iso_ts.len < 19) return iso_ts;
-    const year = std.fmt.parseInt(i64, iso_ts[0..4], 10) catch return iso_ts;
-    const month = std.fmt.parseInt(u8, iso_ts[5..7], 10) catch return iso_ts;
-    const day = std.fmt.parseInt(u8, iso_ts[8..10], 10) catch return iso_ts;
-    const hour = std.fmt.parseInt(u8, iso_ts[11..13], 10) catch return iso_ts;
-    const min = std.fmt.parseInt(u8, iso_ts[14..16], 10) catch return iso_ts;
-    const sec = std.fmt.parseInt(u8, iso_ts[17..19], 10) catch return iso_ts;
-
-    // Rough epoch calculation (no leap second precision needed for "time ago")
-    const days_in_month = [_]u16{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
-    if (month < 1 or month > 12) return iso_ts;
-    const year_days = (year - 1970) * 365 + @divTrunc(year - 1969, 4);
-    const month_days: i64 = days_in_month[month - 1];
-    const ts_epoch = (year_days + month_days + day - 1) * 86400 + @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
-
-    const now = std.time.timestamp();
-    const diff = now - ts_epoch;
-    if (diff < 0) return "now";
-
-    const diff_u: u64 = @intCast(diff);
-    if (diff_u < 60) return "now";
-    if (diff_u < 3600) {
-        const mins = diff_u / 60;
-        return switch (mins) {
-            1 => "1m",
-            2 => "2m",
-            3 => "3m",
-            5 => "5m",
-            10 => "10m",
-            15 => "15m",
-            30 => "30m",
-            else => if (mins < 5) "few min" else if (mins < 30) "<30m" else "<1h",
-        };
-    }
-    if (diff_u < 86400) {
-        const hours = diff_u / 3600;
-        return switch (hours) {
-            1 => "1h",
-            2 => "2h",
-            3 => "3h",
-            else => if (hours < 12) "<12h" else "<1d",
-        };
-    }
-    const days = diff_u / 86400;
-    if (days == 1) return "yesterday";
-    if (days < 7) return if (days == 2) "2d" else if (days < 4) "few days" else "<1w";
-    if (days < 30) return if (days < 14) "1w" else if (days < 21) "2w" else "3w";
-    if (days < 365) {
-        const months = days / 30;
-        return if (months <= 1) "1mo" else if (months <= 2) "2mo" else if (months <= 6) "<6mo" else "<1y";
-    }
-    return ">1y";
-}
-
 /// Owns all transient heap-backed data for one `/resume` overlay.
 /// The picker borrows from this flow; teardown is one arena drop.
 const ResumePickerFlow = struct {
@@ -274,7 +219,7 @@ const ResumePickerFlow = struct {
                 .label = session.first_message,
                 .description = try std.fmt.allocPrint(a, "{d} msgs \xC2\xB7 {s}", .{
                     session.message_count,
-                    formatRelativeTime(session.timestamp),
+                    time_util.relativeTimeLabel(session.timestamp),
                 }),
             };
             rows[i] = .{ .item = item, .path = session.path };
@@ -2634,23 +2579,12 @@ fn userFacingFailureMessage(
     return switch (failure_kind orelse return raw_message) {
         .auth => "authentication failed. run /login or refresh your credentials.",
         .context_overflow => "context window exceeded. compact the session or switch to a larger-context model.",
-        .invalid_request => if (containsCI(raw_message, "content_filter"))
+        .invalid_request => if (string_util.containsCI(raw_message, "content_filter"))
             "request blocked by the provider safety filter. try rephrasing and try again."
         else
             raw_message,
         else => raw_message,
     };
-}
-
-fn containsCI(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 fn cloneUserDisplayText(allocator: std.mem.Allocator, user: ai_protocol.UserMessage) ?[]u8 {

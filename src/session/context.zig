@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
+const time_util = @import("../lib/time_util.zig");
 
 /// Result of building session context from entries.
 pub const SessionContext = struct {
@@ -86,7 +87,7 @@ pub fn buildSessionContext(
         try messages.append(allocator, .{ .compaction_summary = .{
             .summary = cd.summary,
             .tokens_before = cd.tokens_before,
-            .timestamp = isoToEpochMs(entries[path_indices.items[compaction_path_pos.?]].timestamp),
+            .timestamp = time_util.isoToEpochMs(entries[path_indices.items[compaction_path_pos.?]].timestamp),
         } });
 
         const compaction_pos = compaction_path_pos.?;
@@ -133,7 +134,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 .content = cm.content,
                 .display = cm.display,
                 .details = cm.details,
-                .timestamp = isoToEpochMs(entry.timestamp),
+                .timestamp = time_util.isoToEpochMs(entry.timestamp),
             } };
         },
         .branch_summary => |bs| {
@@ -142,7 +143,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 return .{ .branch_summary = .{
                     .summary = bs.summary,
                     .from_id = bs.from_id,
-                    .timestamp = isoToEpochMs(entry.timestamp),
+                    .timestamp = time_util.isoToEpochMs(entry.timestamp),
                 } };
             }
             return null;
@@ -158,38 +159,49 @@ fn testMsg(allocator: std.mem.Allocator, id: []const u8, parent_id: ?[]const u8,
         .id = id,
         .parent_id = parent_id,
         .timestamp = "2025-01-01T00:00:00Z",
-        .entry = .{ .message = .{ .message = switch (role) {
-            .user => .{ .user = .{ .content = .{ .text = text }, .timestamp = 1 } },
-            .assistant => blk: {
-                // Allocate content block on the arena
-                const content = allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1) catch unreachable;
-                content[0] = .{ .text = .{ .text = text } };
-                break :blk .{ .assistant = .{
-                    .content = content,
-                    .api = .anthropic_messages,
-                    .provider = .anthropic,
-                    .model = "claude-test",
-                    .usage = .{
-                        .input = 1, .output = 1, .cache_read = 0, .cache_write = 0, .total_tokens = 2,
-                        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        .entry = .{
+            .message = .{
+                .message = switch (role) {
+                    .user => .{ .user = .{ .content = .{ .text = text }, .timestamp = 1 } },
+                    .assistant => blk: {
+                        // Allocate content block on the arena
+                        const content = allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1) catch unreachable;
+                        content[0] = .{ .text = .{ .text = text } };
+                        break :blk .{ .assistant = .{
+                            .content = content,
+                            .api = .anthropic_messages,
+                            .provider = .anthropic,
+                            .model = "claude-test",
+                            .usage = .{
+                                .input = 1,
+                                .output = 1,
+                                .cache_read = 0,
+                                .cache_write = 0,
+                                .total_tokens = 2,
+                                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+                            },
+                            .stop_reason = .stop,
+                            .timestamp = 1,
+                        } };
                     },
-                    .stop_reason = .stop,
-                    .timestamp = 1,
-                } };
+                },
             },
-        } } },
+        },
     };
 }
 
 fn testCompaction(id: []const u8, parent_id: ?[]const u8, summary: []const u8, first_kept: []const u8) proto.SessionEntry {
     return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{ .compaction = .{
-        .summary = summary, .first_kept_entry_id = first_kept, .tokens_before = 1000,
+        .summary = summary,
+        .first_kept_entry_id = first_kept,
+        .tokens_before = 1000,
     } } };
 }
 
 fn testBranchSummary(id: []const u8, parent_id: ?[]const u8, summary: []const u8, from_id: []const u8) proto.SessionEntry {
     return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{ .branch_summary = .{
-        .summary = summary, .from_id = from_id,
+        .summary = summary,
+        .from_id = from_id,
     } } };
 }
 
@@ -207,7 +219,10 @@ fn testModelChange(id: []const u8, parent_id: ?[]const u8, provider: []const u8,
 
 fn getUserText(msg: agent.protocol.AgentMessage) ?[]const u8 {
     switch (msg) {
-        .user => |u| return switch (u.content) { .text => |t| t, .blocks => null },
+        .user => |u| return switch (u.content) {
+            .text => |t| t,
+            .blocks => null,
+        },
         else => return null,
     }
 }
@@ -264,7 +279,7 @@ test "simple conversation preserves order" {
     const ctx = try buildSessionContext(arena.allocator(), &entries, null);
     try std.testing.expectEqual(@as(usize, 4), ctx.messages.len);
     try std.testing.expectEqualStrings("hello", getUserText(ctx.messages[0]).?);
-    
+
     try std.testing.expectEqualStrings("hi there", getAssistantText(ctx.messages[1]).?);
     try std.testing.expectEqualStrings("how are you", getUserText(ctx.messages[2]).?);
     try std.testing.expectEqualStrings("great", getAssistantText(ctx.messages[3]).?);
@@ -508,44 +523,4 @@ fn providerToString(p: ai.protocol.Provider) []const u8 {
         .kimi_coding => "kimi-coding",
         .custom => |s| s,
     };
-}
-
-/// Parse an ISO 8601 timestamp ("YYYY-MM-DDTHH:MM:SS..." format) to epoch milliseconds.
-/// Returns 0 on parse failure.
-fn isoToEpochMs(timestamp: []const u8) i64 {
-    if (timestamp.len < 19) return 0;
-    const year = std.fmt.parseInt(i64, timestamp[0..4], 10) catch return 0;
-    const month = std.fmt.parseInt(i64, timestamp[5..7], 10) catch return 0;
-    const day = std.fmt.parseInt(i64, timestamp[8..10], 10) catch return 0;
-    const hour = std.fmt.parseInt(i64, timestamp[11..13], 10) catch return 0;
-    const min = std.fmt.parseInt(i64, timestamp[14..16], 10) catch return 0;
-    const sec = std.fmt.parseInt(i64, timestamp[17..19], 10) catch return 0;
-
-    // Days from complete years (year-1 because current year days added via month/day)
-    const y = year - 1;
-    const era_days = y * 365 + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400);
-    // Cumulative days before each month (non-leap)
-    const month_days = [_]i64{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
-    const m_idx: usize = @intCast(month - 1);
-    if (m_idx >= 12) return 0;
-    var days = era_days + month_days[m_idx] + day;
-    // Leap year adjustment for months after February
-    if (month > 2) {
-        const is_leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
-        if (is_leap) days += 1;
-    }
-    // Unix epoch is Jan 1 1970 = day 719163 from year 0
-    const unix_days = days - 719163;
-    return (unix_days * 86400 + hour * 3600 + min * 60 + sec) * 1000;
-}
-
-test "isoToEpochMs parses standard ISO timestamps" {
-    // 2025-01-01T00:00:00Z = 1735689600000ms
-    try std.testing.expectEqual(@as(i64, 1735689600000), isoToEpochMs("2025-01-01T00:00:00Z"));
-    // 1970-01-01T00:00:00Z = 0ms
-    try std.testing.expectEqual(@as(i64, 0), isoToEpochMs("1970-01-01T00:00:00Z"));
-    // 2024-02-29T12:30:45Z (leap day)
-    try std.testing.expectEqual(@as(i64, 1709209845000), isoToEpochMs("2024-02-29T12:30:45Z"));
-    // Too short
-    try std.testing.expectEqual(@as(i64, 0), isoToEpochMs("2025"));
 }

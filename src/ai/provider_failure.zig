@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const string_util = @import("../lib/string_util.zig");
 
 pub const NormalizedHttpFailure = struct {
     failure: protocol.NormalizedFailure,
@@ -133,32 +134,32 @@ pub fn classifyProviderFailure(
         if (isOverflowNeedle(msg)) return .context_overflow;
     }
     if (provider_type) |provider_type_value| {
-        if (containsAnyCI(provider_type_value, &.{ "authentication_error", "permission_error", "auth_error" })) {
+        if (string_util.containsAnyCI(provider_type_value, &.{ "authentication_error", "permission_error", "auth_error" })) {
             return .auth;
         }
-        if (containsAnyCI(provider_type_value, &.{ "rate_limit_error", "throttling_error" })) {
+        if (string_util.containsAnyCI(provider_type_value, &.{ "rate_limit_error", "throttling_error" })) {
             return .rate_limited;
         }
-        if (containsAnyCI(provider_type_value, &.{ "overloaded_error", "api_error", "server_error" })) {
+        if (string_util.containsAnyCI(provider_type_value, &.{ "overloaded_error", "api_error", "server_error" })) {
             return .transient;
         }
-        if (containsAnyCI(provider_type_value, &.{ "invalid_request_error", "bad_request_error" })) {
+        if (string_util.containsAnyCI(provider_type_value, &.{ "invalid_request_error", "bad_request_error" })) {
             return .invalid_request;
         }
     }
     if (provider_message) |msg| {
-        if (containsAnyCI(msg, &.{ "rate limit", "too many requests", "throttl" })) return .rate_limited;
-        if (containsAnyCI(msg, &.{ "overloaded", "temporar", "try again", "service unavailable", "internal error" })) return .transient;
-        if (containsAnyCI(msg, &.{ "unauthorized", "forbidden", "invalid api key", "api key" })) return .auth;
+        if (string_util.containsAnyCI(msg, &.{ "rate limit", "too many requests", "throttl" })) return .rate_limited;
+        if (string_util.containsAnyCI(msg, &.{ "overloaded", "temporar", "try again", "service unavailable", "internal error" })) return .transient;
+        if (string_util.containsAnyCI(msg, &.{ "unauthorized", "forbidden", "invalid api key", "api key" })) return .auth;
     }
     return .fatal;
 }
 
 pub fn classifyTransportFailure(message: []const u8) protocol.NormalizedFailure.Kind {
-    if (containsAnyCI(message, &.{ "no api key", "accountid", "account id", "api key too long", "invalid api key", "unauthorized", "forbidden" })) {
+    if (string_util.containsAnyCI(message, &.{ "no api key", "accountid", "account id", "api key too long", "invalid api key", "unauthorized", "forbidden" })) {
         return .auth;
     }
-    if (containsAnyCI(message, &.{ "timeout", "timed out", "connection", "network", "refused", "reset", "closed", "unavailable", "failed to open connection", "request failed", "failed to send body", "stream read error" })) {
+    if (string_util.containsAnyCI(message, &.{ "timeout", "timed out", "connection", "network", "refused", "reset", "closed", "unavailable", "failed to open connection", "request failed", "failed to send body", "stream read error" })) {
         return .transient;
     }
     return .fatal;
@@ -197,7 +198,7 @@ fn httpStatusReason(status_code: u16) ?[]const u8 {
 }
 
 fn isOverflowNeedle(text: []const u8) bool {
-    return containsAnyCI(text, &.{
+    return string_util.containsAnyCI(text, &.{
         "prompt is too long",
         "input is too long for requested model",
         "exceeds the context window",
@@ -208,23 +209,6 @@ fn isOverflowNeedle(text: []const u8) bool {
         "token limit exceeded",
         "too many tokens",
     });
-}
-
-fn containsAnyCI(haystack: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (containsCI(haystack, needle)) return true;
-    }
-    return false;
-}
-
-fn containsCI(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 const testing = std.testing;
