@@ -247,6 +247,7 @@ pub const SessionController = struct {
 
     pub fn abortRetry(self: *SessionController) void {
         self.retry_abort_requested.store(true, .release);
+        self.session.agent.wakeAbortWaiters();
     }
 
     pub fn isRetrying(self: *const SessionController) bool {
@@ -399,16 +400,19 @@ pub const SessionController = struct {
     }
 
     fn waitForRetryDelay(self: *SessionController, delay_ms: u64) bool {
-        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(delay_ms));
-        while (std.time.milliTimestamp() < deadline) {
-            if (self.retry_abort_requested.load(.acquire) or self.session.agent.isAbortRequested()) {
-                return true;
-            }
-            const remaining_ms = @as(u64, @intCast(deadline - std.time.milliTimestamp()));
-            const sleep_ms: u64 = @min(remaining_ms, 100);
-            std.Thread.sleep(sleep_ms * @as(u64, std.time.ns_per_ms));
-        }
-        return self.retry_abort_requested.load(.acquire) or self.session.agent.isAbortRequested();
+        return switch (self.session.agent.abortSignal().waitUntil(
+            delay_ms * @as(u64, std.time.ns_per_ms),
+            &retryAbortRequested,
+            @ptrCast(self),
+        )) {
+            .aborted, .predicate => true,
+            .timeout, .none => self.retry_abort_requested.load(.acquire) or self.session.agent.isAbortRequested(),
+        };
+    }
+
+    fn retryAbortRequested(ctx: ?*anyopaque) bool {
+        const self: *SessionController = @ptrCast(@alignCast(ctx.?));
+        return self.retry_abort_requested.load(.acquire);
     }
 
     fn pruneTransientAssistantError(self: *SessionController) void {

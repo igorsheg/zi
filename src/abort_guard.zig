@@ -2,8 +2,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const AbortSignal = @import("abort_signal.zig").AbortSignal;
 
-/// Cooperative abort guard — spawns a watchdog thread that polls an
-/// AbortSignal every 100ms and executes cleanup actions on abort.
+/// Cooperative abort guard — blocks on an AbortSignal and executes
+/// cleanup actions when abort is requested.
 ///
 /// Covers two abort actions (independently optional):
 ///   - shutdown_fd: calls shutdown(SHUT_RDWR) to unblock blocking reads
@@ -25,6 +25,7 @@ pub const AbortGuard = struct {
     shared_done: *std.atomic.Value(bool),
     thread: ?std.Thread,
     allocator: std.mem.Allocator,
+    signal: AbortSignal,
 
     pub const Actions = struct {
         shutdown_fd: ?std.posix.fd_t = null,
@@ -38,10 +39,20 @@ pub const AbortGuard = struct {
         if (signal.isNone() or
             (actions.shutdown_fd == null and actions.kill_pid == null and actions.interrupt_process_group == null))
         {
-            return .{ .shared_done = &noop_done, .thread = null, .allocator = std.heap.page_allocator };
+            return .{
+                .shared_done = &noop_done,
+                .thread = null,
+                .allocator = std.heap.page_allocator,
+                .signal = AbortSignal.none,
+            };
         }
         const done = std.heap.page_allocator.create(std.atomic.Value(bool)) catch {
-            return .{ .shared_done = &noop_done, .thread = null, .allocator = std.heap.page_allocator };
+            return .{
+                .shared_done = &noop_done,
+                .thread = null,
+                .allocator = std.heap.page_allocator,
+                .signal = AbortSignal.none,
+            };
         };
         done.* = std.atomic.Value(bool).init(false);
         const ctx = WatchdogCtx{
@@ -52,13 +63,19 @@ pub const AbortGuard = struct {
             .interrupt_process_group = actions.interrupt_process_group,
         };
         const thread = std.Thread.spawn(.{}, watchdog, .{ctx}) catch null;
-        return .{ .shared_done = done, .thread = thread, .allocator = std.heap.page_allocator };
+        return .{
+            .shared_done = done,
+            .thread = thread,
+            .allocator = std.heap.page_allocator,
+            .signal = signal,
+        };
     }
 
     /// Signal the watchdog to exit and join it. Must be called before
     /// closing/deiniting the guarded resource (socket, child process).
     pub fn stop(self: *AbortGuard) void {
         self.shared_done.store(true, .release);
+        self.signal.notifyWaiters();
         if (self.thread) |t| t.join();
         self.thread = null;
         if (self.shared_done != &noop_done) {
@@ -77,11 +94,11 @@ pub const AbortGuard = struct {
     };
 
     fn watchdog(ctx: WatchdogCtx) void {
-        while (true) {
-            if (ctx.done.load(.acquire)) return;
-            if (ctx.signal.isAborted()) break;
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+        switch (ctx.signal.waitUntil(null, &donePredicate, @ptrCast(ctx.done))) {
+            .aborted => {},
+            .predicate, .timeout, .none => return,
         }
+
         if (ctx.done.load(.acquire)) return;
 
         if (ctx.shutdown_fd) |fd| {
@@ -94,6 +111,11 @@ pub const AbortGuard = struct {
         if (ctx.kill_pid) |pid| {
             std.posix.kill(pid, std.posix.SIG.KILL) catch {};
         }
+    }
+
+    fn donePredicate(ctx: ?*anyopaque) bool {
+        const done: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
+        return done.load(.acquire);
     }
 
     fn interruptProcessGroup(pgid: std.process.Child.Id) void {

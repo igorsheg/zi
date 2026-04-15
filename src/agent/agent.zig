@@ -341,6 +341,14 @@ pub const Agent = struct {
         return self.abort_controller.isAborted();
     }
 
+    pub fn abortSignal(self: *Agent) abort_signal_mod.AbortSignal {
+        return self.abort_controller.signal();
+    }
+
+    pub fn wakeAbortWaiters(self: *Agent) void {
+        self.abort_controller.notifyWaiters();
+    }
+
     /// Clear transcript state, runtime state, and queued messages.
     /// pi-mono source: packages/agent/src/agent.ts:299-307
     pub fn reset(self: *Agent) void {

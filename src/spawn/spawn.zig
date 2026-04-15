@@ -100,10 +100,10 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     // -- read stdout line by line, parse events --
     //
     // A watchdog thread (spawned only when there is a signal to watch
-    // and a stdout pipe to shut down) polls the abort flag every
-    // 100ms. On abort it `shutdown()`s the stdout fd, which unblocks
-    // the parent's blocking `read()` mid-call, and interrupts the
-    // child process group for good measure. The main thread sees the abort flag on
+    // and a stdout pipe to shut down) blocks on the abort signal. On
+    // abort it `shutdown()`s the stdout fd, which unblocks the
+    // parent's blocking `read()` mid-call, and interrupts the child
+    // process group for good measure. The main thread sees the abort flag on
     // its next iteration and breaks the loop. Without this, a quiet
     // child (long LLM call, sleep) would never observe the abort
     // until it next wrote to stdout.
@@ -125,6 +125,7 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
         // close pipes; then join so we know the watchdog is no
         // longer poking the fd or the child handle.
         watchdog_done.store(true, .release);
+        if (config.signal) |sig| sig.notifyWaiters();
         if (watchdog_thread) |t| t.join();
     }
 
@@ -439,10 +440,10 @@ const WatchdogCtx = struct {
     done: *std.atomic.Value(bool),
 };
 
-/// Polls `signal` every 100ms. On abort: shuts down the child's
-/// stdout fd (unblocks the parent's blocking read) and interrupts the
-/// child process group (in case it was sleeping or hung). Idempotent —
-/// the main thread also observes the abort and stop paths tolerate
+/// Blocks on `signal`. On abort: shuts down the child's stdout fd
+/// (unblocks the parent's blocking read) and interrupts the child
+/// process group (in case it was sleeping or hung). Idempotent — the
+/// main thread also observes the abort and stop paths tolerate
 /// repeated signals.
 ///
 /// Why shutdown(SHUT_RDWR) instead of close: req.deinit / pipe
@@ -450,13 +451,10 @@ const WatchdogCtx = struct {
 /// closing a fd is a use-after-free hazard. shutdown leaves the fd
 /// valid but causes pending and future reads to return.
 fn abortWatchdog(ctx: WatchdogCtx) void {
-    while (true) {
-        if (ctx.done.load(.acquire)) return;
-        if (ctx.signal.isAborted()) break;
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+    switch (ctx.signal.waitUntil(null, &watchdogDone, @ptrCast(ctx.done))) {
+        .aborted => {},
+        .predicate, .timeout, .none => return,
     }
-    // Re-check done in case the main thread finished naturally
-    // between our last poll and the abort observation.
     if (ctx.done.load(.acquire)) return;
 
     const SHUT_RDWR = 2;
@@ -466,6 +464,11 @@ fn abortWatchdog(ctx: WatchdogCtx) void {
     // thread's `child.wait()` and crash with ECHILD. Sending the
     // signal directly leaves reaping to the main thread.
     interruptProcessGroup(ctx.child.id);
+}
+
+fn watchdogDone(ctx: ?*anyopaque) bool {
+    const done: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
+    return done.load(.acquire);
 }
 
 fn interruptProcessGroup(pgid: std.process.Child.Id) void {

@@ -208,51 +208,43 @@ fn runCommand(
 }
 
 const TimeoutGuard = struct {
-    done: *std.atomic.Value(bool),
+    done: *std.Thread.ResetEvent,
     did_timeout: *std.atomic.Value(bool),
     thread: ?std.Thread,
 
     fn start(timeout_secs: ?u64, process_group_id: std.process.Child.Id) TimeoutGuard {
-        const secs = timeout_secs orelse return .{ .done = &noop_done, .did_timeout = &noop_done, .thread = null };
-        const done = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_done, .thread = null };
+        const secs = timeout_secs orelse return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
+        const done = std.heap.page_allocator.create(std.Thread.ResetEvent) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
         errdefer std.heap.page_allocator.destroy(done);
-        const did_timeout = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_done, .thread = null };
-        done.* = std.atomic.Value(bool).init(false);
+        const did_timeout = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
+        done.* = .{};
         did_timeout.* = std.atomic.Value(bool).init(false);
         const thread = std.Thread.spawn(.{}, watchdog, .{ secs, process_group_id, done, did_timeout }) catch null;
         return .{ .done = done, .did_timeout = did_timeout, .thread = thread };
     }
 
     fn markExited(self: *TimeoutGuard) void {
-        self.done.store(true, .release);
+        self.done.set();
     }
 
     fn stop(self: *TimeoutGuard) void {
-        self.done.store(true, .release);
+        self.done.set();
         if (self.thread) |t| t.join();
         if (self.done != &noop_done) std.heap.page_allocator.destroy(self.done);
-        if (self.did_timeout != &noop_done) std.heap.page_allocator.destroy(self.did_timeout);
+        if (self.did_timeout != &noop_timeout) std.heap.page_allocator.destroy(self.did_timeout);
         self.thread = null;
     }
 
-    var noop_done = std.atomic.Value(bool).init(false);
+    var noop_done: std.Thread.ResetEvent = .{};
+    var noop_timeout = std.atomic.Value(bool).init(false);
 
-    fn watchdog(timeout_secs: u64, process_group_id: std.process.Child.Id, done: *std.atomic.Value(bool), did_timeout: *std.atomic.Value(bool)) void {
-        const deadline_ns = timeout_secs * std.time.ns_per_s;
-        var elapsed_ns: u64 = 0;
-        const poll_ns = 100 * std.time.ns_per_ms;
-
-        while (elapsed_ns < deadline_ns) {
-            if (done.load(.acquire)) return;
-            const remaining_ns = deadline_ns - elapsed_ns;
-            const sleep_ns = @min(poll_ns, remaining_ns);
-            std.Thread.sleep(sleep_ns);
-            elapsed_ns += sleep_ns;
-        }
-
-        if (done.load(.acquire)) return;
-        did_timeout.store(true, .release);
-        killProcessGroup(process_group_id, std.posix.SIG.KILL);
+    fn watchdog(timeout_secs: u64, process_group_id: std.process.Child.Id, done: *std.Thread.ResetEvent, did_timeout: *std.atomic.Value(bool)) void {
+        done.timedWait(timeout_secs * std.time.ns_per_s) catch |err| switch (err) {
+            error.Timeout => {
+                did_timeout.store(true, .release);
+                killProcessGroup(process_group_id, std.posix.SIG.KILL);
+            },
+        };
     }
 };
 
