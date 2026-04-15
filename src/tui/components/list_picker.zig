@@ -4,6 +4,7 @@ const buffer_mod = @import("../buffer.zig");
 const keys_mod = @import("../keys.zig");
 const select_list_mod = @import("select_list.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const box_chrome = @import("../box_chrome.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const cell_mod = @import("../cell.zig");
@@ -385,7 +386,7 @@ fn captureSelection(selection: Selection, ctx: ?*anyopaque) void {
 }
 
 test "searchable picker selection reports original source index" {
-    const theme = Theme.dark;
+    const theme = themes_builtin.dark().*;
     const items = [_]SelectItem{
         .{ .value = "alpha", .label = "Alpha" },
         .{ .value = "beta", .label = "Beta" },
@@ -407,7 +408,7 @@ test "searchable picker selection reports original source index" {
 }
 
 test "searchable picker preserves selected value across filter changes" {
-    const theme = Theme.dark;
+    const theme = themes_builtin.dark().*;
     const items = [_]SelectItem{
         .{ .value = "alpha", .label = "Alpha" },
         .{ .value = "beta", .label = "Beta" },
@@ -429,7 +430,7 @@ test "searchable picker preserves selected value across filter changes" {
 }
 
 test "picker initial selection index and status affect list behavior and measurement" {
-    const theme = Theme.dark;
+    const theme = themes_builtin.dark().*;
     const items = [_]SelectItem{
         .{ .value = "alpha", .label = "Alpha" },
         .{ .value = "beta", .label = "Beta" },
@@ -448,7 +449,7 @@ test "picker initial selection index and status affect list behavior and measure
 }
 
 test "searchable picker renders placeholder status and custom empty text" {
-    const theme = Theme.dark;
+    const theme = themes_builtin.dark().*;
     var picker = ListPicker.init(&theme);
     picker.title = "Models";
     picker.setSearchPlaceholder("Search models");
@@ -467,7 +468,7 @@ test "searchable picker renders placeholder status and custom empty text" {
 }
 
 test "plain picker selection reports visible source index" {
-    const theme = Theme.dark;
+    const theme = themes_builtin.dark().*;
     const items = [_]SelectItem{
         .{ .value = "alpha", .label = "Alpha" },
         .{ .value = "beta", .label = "Beta" },

@@ -4,6 +4,7 @@ const buffer_mod = @import("../buffer.zig");
 const markdown_mod = @import("markdown.zig");
 const text_mod = @import("text.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const keybindings = @import("../keybindings.zig");
 
 const Component = component_mod.Component;
@@ -32,7 +33,7 @@ pub const Props = struct {
 
 pub const UserMessage = struct {
     allocator: std.mem.Allocator,
-    theme: *const Theme = &Theme.dark,
+    theme: *const Theme = undefined,
     body: markdown_mod.Markdown,
     footer: text_mod.Text,
     footer_visible: bool = false,
@@ -41,6 +42,7 @@ pub const UserMessage = struct {
     pub fn init(allocator: std.mem.Allocator) UserMessage {
         var self = UserMessage{
             .allocator = allocator,
+            .theme = themes_builtin.dark(),
             .body = markdown_mod.Markdown.init(allocator),
             .footer = text_mod.Text.init(allocator),
         };
@@ -85,8 +87,7 @@ pub const UserMessage = struct {
 
     fn applyStatusStyles(self: *UserMessage) void {
         const bg = switch (self.status) {
-            .in_chat => self.theme.bg(.user_message_bg),
-            .pending => self.theme.bg(.pending_user_message_bg),
+            .in_chat, .pending => self.theme.bg(.user_message_bg),
         };
 
         self.body.bg = bg;
@@ -234,8 +235,9 @@ test "queued user message has distinct background" {
     defer queued_buf.deinit();
     queued_msg.render(queued_buf.region());
 
-    try testing.expectEqual(Theme.dark.bg(.user_message_bg), convo_buf.get(0, 0).bg);
-    try testing.expectEqual(Theme.dark.bg(.pending_user_message_bg), queued_buf.get(0, 0).bg);
+    const theme = themes_builtin.dark();
+    try testing.expectEqual(theme.bg(.user_message_bg), convo_buf.get(0, 0).bg);
+    try testing.expectEqual(theme.bg(.user_message_bg), queued_buf.get(0, 0).bg);
 }
 
 test "user message can omit footer" {

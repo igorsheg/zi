@@ -7,6 +7,7 @@ const tool_display_mod = @import("tool_display.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const markdown_mod = @import("components/markdown.zig");
 const theme_mod = @import("theme.zig");
+const themes_builtin = @import("../themes/builtin.zig");
 const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const editor_mod = @import("components/editor.zig");
@@ -475,7 +476,7 @@ test "rebuildFromMessages reconstructs tool call rows and tool results" {
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         &messages,
-        .{ .theme = &Theme.dark },
+        .{ .theme = themes_builtin.dark() },
     );
 
     try testing.expectEqual(@as(usize, 1), editor.history.items.len);
@@ -513,7 +514,7 @@ test "rebuildFromMessages preserves assistant text thinking and tool call orderi
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         &messages,
-        .{ .theme = &Theme.dark },
+        .{ .theme = themes_builtin.dark() },
     );
 
     const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
@@ -546,7 +547,7 @@ test "rebuildFromMessages renders failed tool rows for aborted assistant" {
         tool_display_mod.empty_resolver,
         &messages,
         .{
-            .theme = &Theme.dark,
+            .theme = themes_builtin.dark(),
             .retry_attempt = 0,
         },
     );
@@ -595,7 +596,7 @@ test "rebuildFromMessages includes summaries displayable custom messages and edi
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         &messages,
-        .{ .theme = &Theme.dark },
+        .{ .theme = themes_builtin.dark() },
     );
 
     try testing.expectEqual(@as(usize, 1), editor.history.items.len);

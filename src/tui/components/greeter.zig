@@ -3,6 +3,7 @@ const cell_mod = @import("../cell.zig");
 const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -11,9 +12,13 @@ const Component = component_mod.Component;
 const Theme = theme_mod.Theme;
 
 pub const Greeter = struct {
-    theme: *const Theme = &Theme.dark,
+    theme: ?*const Theme = null,
     app_name: []const u8 = "zi",
     version: []const u8 = "",
+
+    fn activeTheme(self: *const Greeter) *const Theme {
+        return self.theme orelse themes_builtin.dark();
+    }
 
     const logo_lines = [_][]const u8{
         "░▀▀█░▀█▀",
@@ -33,24 +38,25 @@ pub const Greeter = struct {
         const text_x = left_pad + logo_w + gap;
         const text_y = top_pad;
 
+        const theme = self.activeTheme();
         var row: u32 = top_pad;
         for (logo_lines) |line| {
             if (row >= h) break;
-            _ = region.writeStr(left_pad, row, line, self.theme.fg(.accent), Color.default, .{});
+            _ = region.writeStr(left_pad, row, line, theme.fg(.accent), Color.default, .{});
             row += 1;
         }
 
         if (text_y >= h) return;
         var col: u32 = text_x;
-        col += region.writeStr(col, text_y, self.app_name, self.theme.fg(.accent), Color.default, .{ .bold = true });
+        col += region.writeStr(col, text_y, self.app_name, theme.fg(.accent), Color.default, .{ .bold = true });
         if (self.version.len > 0) {
-            col += region.writeStr(col, text_y, " v", self.theme.fg(.dim), Color.default, .{});
-            _ = region.writeStr(col, text_y, self.version, self.theme.fg(.dim), Color.default, .{});
+            col += region.writeStr(col, text_y, " v", theme.fg(.dim), Color.default, .{});
+            _ = region.writeStr(col, text_y, self.version, theme.fg(.dim), Color.default, .{});
         }
         if (text_y + 1 >= h) return;
-        _ = region.writeStr(text_x, text_y + 1, "Gets out of the way. Gets things done.", self.theme.fg(.muted), Color.default, .{});
+        _ = region.writeStr(text_x, text_y + 1, "Gets out of the way. Gets things done.", theme.fg(.muted), Color.default, .{});
         if (text_y + 2 >= h) return;
-        _ = region.writeStr(text_x, text_y + 2, "Type / for commands. Ask zi about zi if you get lost.", self.theme.fg(.dim), Color.default, .{});
+        _ = region.writeStr(text_x, text_y + 2, "Type / for commands. Ask zi about zi if you get lost.", theme.fg(.dim), Color.default, .{});
     }
 
     pub fn measure(_: *Greeter, _: u32) Measurement {

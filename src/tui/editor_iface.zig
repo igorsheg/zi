@@ -267,7 +267,7 @@ const MockEditor = struct {
     clear_count: u32 = 0,
     clear_history_count: u32 = 0,
     history_count: u32 = 0,
-    theme: *const Theme = &Theme.dark,
+    theme: ?*const Theme = null,
     status_data: ?*const StatusData = null,
     cwd: []const u8 = "",
     git_branch: ?[]const u8 = null,
@@ -398,8 +398,9 @@ test "EditorInterface routes parity surface through vtable" {
     iface.addToHistory("prompt");
     try testing.expectEqual(@as(u32, 1), mock.history_count);
 
-    iface.setTheme(&Theme.dark);
-    try testing.expectEqual(&Theme.dark, mock.theme);
+    const theme = @import("../themes/builtin.zig").dark();
+    iface.setTheme(theme);
+    try testing.expectEqual(theme, mock.theme.?);
 
     var status_data = StatusData.init(testing.allocator);
     defer status_data.deinit();

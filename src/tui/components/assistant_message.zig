@@ -4,6 +4,7 @@ const buffer_mod = @import("../buffer.zig");
 const markdown_mod = @import("markdown.zig");
 const text_mod = @import("text.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -11,7 +12,7 @@ const Region = buffer_mod.Region;
 
 pub const AssistantMessage = struct {
     allocator: std.mem.Allocator,
-    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    theme: *const theme_mod.Theme = undefined,
     hide_thinking_block: bool = false,
     hidden_thinking_label: []const u8 = "Thinking...",
 
@@ -36,7 +37,7 @@ pub const AssistantMessage = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) AssistantMessage {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .theme = themes_builtin.dark() };
     }
 
     pub fn deinit(self: *AssistantMessage) void {

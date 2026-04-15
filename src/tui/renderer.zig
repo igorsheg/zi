@@ -137,22 +137,34 @@ fn appendCursorPos(self: *Renderer, x: u32, y: u32) void {
 }
 
 fn appendFgColor(self: *Renderer, fg: Color) void {
-    if (fg.is_default) {
-        appendStr(self, ansi.default_fg);
-    } else {
-        var buf: [24]u8 = undefined;
-        const s = ansi.formatFgRgb(&buf, fg.r, fg.g, fg.b) catch return;
-        self.output.appendSlice(self.allocator, s) catch return;
+    switch (fg) {
+        .default_color => appendStr(self, ansi.default_fg),
+        .rgb24 => |rgb| {
+            var buf: [24]u8 = undefined;
+            const s = ansi.formatFgRgb(&buf, rgb.r, rgb.g, rgb.b) catch return;
+            self.output.appendSlice(self.allocator, s) catch return;
+        },
+        .index => |index| {
+            var buf: [16]u8 = undefined;
+            const s = ansi.formatFgIndex(&buf, index) catch return;
+            self.output.appendSlice(self.allocator, s) catch return;
+        },
     }
 }
 
 fn appendBgColor(self: *Renderer, bg: Color) void {
-    if (bg.is_default) {
-        appendStr(self, ansi.default_bg);
-    } else {
-        var buf: [24]u8 = undefined;
-        const s = ansi.formatBgRgb(&buf, bg.r, bg.g, bg.b) catch return;
-        self.output.appendSlice(self.allocator, s) catch return;
+    switch (bg) {
+        .default_color => appendStr(self, ansi.default_bg),
+        .rgb24 => |rgb| {
+            var buf: [24]u8 = undefined;
+            const s = ansi.formatBgRgb(&buf, rgb.r, rgb.g, rgb.b) catch return;
+            self.output.appendSlice(self.allocator, s) catch return;
+        },
+        .index => |index| {
+            var buf: [16]u8 = undefined;
+            const s = ansi.formatBgIndex(&buf, index) catch return;
+            self.output.appendSlice(self.allocator, s) catch return;
+        },
     }
 }
 

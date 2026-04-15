@@ -12,6 +12,7 @@ const agent_protocol = agent_mod.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
+const themes_builtin = @import("../themes/builtin.zig");
 const display_wrap_mod = @import("display_wrap.zig");
 const lua_renderer_mod = @import("../extensions/lua_renderer.zig");
 const runner_mod = @import("../extensions/runner.zig");
@@ -472,7 +473,7 @@ pub const ToolExecution = struct {
     renderer: tool_display_mod.ToolRenderer = .{},
     renderer_state: ?*anyopaque = null,
     allocator: std.mem.Allocator,
-    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    theme: *const theme_mod.Theme = undefined,
     measured_content_width: u32 = 0,
     measured_result_height: u32 = 0,
 
@@ -590,7 +591,8 @@ pub const ToolExecution = struct {
     // ── Rendering ─────────────────────────────────────────────────
 
     fn bgColor(self: *ToolExecution) Color {
-        return self.theme.bg(.tool_transcript_bg);
+        if (self.is_partial) return self.theme.bg(.tool_pending_bg);
+        return if (self.is_error) self.theme.bg(.tool_error_bg) else self.theme.bg(.tool_success_bg);
     }
 
     // Vertical padding inside the bg box (pi-mono: Box(paddingX=1, paddingY=1))
@@ -940,7 +942,7 @@ pub const Transcript = struct {
     layout: TranscriptLayout,
 
     allocator: std.mem.Allocator,
-    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    theme: *const theme_mod.Theme = undefined,
     hide_thinking_block: bool = false,
     /// Cached viewport height for scroll clamping / sticky-end updates.
     last_visible_height: u32 = 0,
@@ -958,6 +960,7 @@ pub const Transcript = struct {
     pub fn init(allocator: std.mem.Allocator) Transcript {
         return .{
             .allocator = allocator,
+            .theme = themes_builtin.dark(),
             .layout = TranscriptLayout.init(allocator),
         };
     }
@@ -2012,6 +2015,26 @@ test "Transcript built-in items install transcript renderables" {
     try testing.expectEqual(ItemKind.assistant_message, transcript.items.items[0].kind);
     try testing.expectEqual(ItemKind.user_message, transcript.items.items[1].kind);
     try testing.expectEqual(ItemKind.tool_execution, transcript.items.items[2].kind);
+}
+
+test "tool execution background follows pending success and error states" {
+    const theme = themes_builtin.dark();
+    var tool = ToolExecution{
+        .tool_call_id = try testing.allocator.dupe(u8, "tool-1"),
+        .tool_name = try testing.allocator.dupe(u8, "bash"),
+        .allocator = testing.allocator,
+        .theme = theme,
+    };
+    defer {
+        testing.allocator.free(tool.tool_call_id);
+        testing.allocator.free(tool.tool_name);
+    }
+
+    try testing.expectEqual(theme.bg(.tool_pending_bg), tool.bgColor());
+    tool.is_partial = false;
+    try testing.expectEqual(theme.bg(.tool_success_bg), tool.bgColor());
+    tool.is_error = true;
+    try testing.expectEqual(theme.bg(.tool_error_bg), tool.bgColor());
 }
 
 test "Transcript renders assistant text and tool execution in order" {

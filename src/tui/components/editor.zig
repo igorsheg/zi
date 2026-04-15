@@ -9,6 +9,7 @@ const status_data_mod = @import("../status_data.zig");
 const autocomplete_mod = @import("../autocomplete.zig");
 const editor_iface_mod = @import("../editor_iface.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const editor_core = @import("../editor/root.zig");
 const keybindings = @import("../keybindings.zig");
 
@@ -67,9 +68,9 @@ pub const Editor = struct {
     on_change_ctx: ?*anyopaque = null,
     disable_submit: bool = false,
     padding_x: u32 = 0,
-    prompt_fg: Color = Color.rgb(100, 100, 100),
+    prompt_fg: Color = Color.default,
     text_fg: Color = Color.default,
-    border_color: Color = Color.rgb(0x50, 0x50, 0x50),
+    border_color: Color = Color.default,
     status_data: ?*const StatusData = null,
     /// Working directory displayed in top border (borrowed, set by Interactive).
     cwd: []const u8 = "",
@@ -80,6 +81,7 @@ pub const Editor = struct {
     theme: ?*const Theme = null,
 
     pub fn init(allocator: std.mem.Allocator) Editor {
+        const default_theme = themes_builtin.dark();
         const buffer = allocator.create(PromptBuffer) catch @panic("OOM");
         buffer.* = PromptBuffer.init(allocator);
         var view = PromptView.init(allocator, buffer);
@@ -88,7 +90,10 @@ pub const Editor = struct {
             .allocator = allocator,
             .buffer = buffer,
             .view = view,
-            .autocomplete = AutocompleteSession.init(&Theme.dark),
+            .autocomplete = AutocompleteSession.init(default_theme),
+            .theme = default_theme,
+            .prompt_fg = default_theme.fg(.muted),
+            .border_color = default_theme.fg(.border_muted),
         };
     }
 
@@ -259,7 +264,7 @@ pub const Editor = struct {
     }
 
     pub fn setAutocompleteProvider(self: *Editor, provider: AutocompleteProvider) void {
-        self.autocomplete.setTheme(self.theme orelse &Theme.dark);
+        self.autocomplete.setTheme(self.theme orelse themes_builtin.dark());
         self.autocomplete.setProvider(provider);
     }
 
@@ -312,7 +317,7 @@ pub const Editor = struct {
         const h = region.height;
         if (w == 0 or h < 3) return;
 
-        self.autocomplete.setTheme(self.theme orelse &Theme.dark);
+        self.autocomplete.setTheme(self.theme orelse themes_builtin.dark());
 
         const text_row_cap = @min(self.max_visible_lines, h - 2);
         self.syncViewGeometry(w, text_row_cap);
@@ -366,7 +371,7 @@ pub const Editor = struct {
     }
 
     pub fn measure(self: *Editor, width: u32) Measurement {
-        self.autocomplete.setTheme(self.theme orelse &Theme.dark);
+        self.autocomplete.setTheme(self.theme orelse themes_builtin.dark());
         self.syncViewGeometry(width, self.max_visible_lines);
         const wrapped_line_count = self.view.totalVisualLineCount();
         const box_height = @min(wrapped_line_count, self.max_visible_lines) + 2;

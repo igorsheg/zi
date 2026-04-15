@@ -4,6 +4,7 @@ const buffer_mod = @import("../buffer.zig");
 const component_mod = @import("../component.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const parser_mod = @import("../markdown/parser.zig");
 const render_mod = @import("../markdown/render.zig");
 
@@ -24,7 +25,7 @@ pub const Markdown = struct {
     padding_x: u32 = 0,
     padding_y: u32 = 0,
     scroll_offset: u32 = 0,
-    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    theme: *const theme_mod.Theme = undefined,
     code_block_indent: []const u8 = "  ",
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -37,6 +38,7 @@ pub const Markdown = struct {
         return .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
+            .theme = themes_builtin.dark(),
         };
     }
 

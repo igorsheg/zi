@@ -6,6 +6,7 @@ const lua_runtime = @import("../extensions/lua_runtime.zig");
 const skills = @import("../skills/root.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
 const theme_json = @import("../themes/json.zig");
+const themes_builtin = @import("../themes/builtin.zig");
 const tui_theme = @import("../tui/theme.zig");
 const types = @import("types.zig");
 
@@ -210,8 +211,8 @@ pub const ResourceLoader = struct {
         var diagnostics: std.ArrayListUnmanaged(types.ResourceDiagnostic) = .empty;
         errdefer freeDiagnostics(self.allocator, diagnostics.items);
 
-        try appendBuiltinTheme(self.allocator, &themes, &diagnostics, "dark", tui_theme.Theme.dark);
-        try appendBuiltinTheme(self.allocator, &themes, &diagnostics, "light", tui_theme.Theme.light);
+        try appendBuiltinTheme(self.allocator, &themes, &diagnostics, "dark", themes_builtin.dark().*);
+        try appendBuiltinTheme(self.allocator, &themes, &diagnostics, "light", themes_builtin.light().*);
 
         const global_dir = try std.fs.path.join(self.allocator, &.{ self.agent_dir, "themes" });
         defer self.allocator.free(global_dir);

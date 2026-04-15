@@ -56,19 +56,33 @@ pub fn formatBgRgb(buf: []u8, r: u8, g: u8, b: u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x1b[48;2;{d};{d};{d}m", .{ r, g, b });
 }
 
+pub fn formatFgIndex(buf: []u8, index: u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x1b[38;5;{d}m", .{index});
+}
+
+pub fn formatBgIndex(buf: []u8, index: u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x1b[48;5;{d}m", .{index});
+}
+
 test "formatCursorPos uses zero-based inputs" {
     var buf: [32]u8 = undefined;
     const seq = try formatCursorPos(&buf, 4, 2);
     try std.testing.expectEqualStrings("\x1b[3;5H", seq);
 }
 
-test "formatRgb helpers emit truecolor sgr" {
-    var fg_buf: [24]u8 = undefined;
-    var bg_buf: [24]u8 = undefined;
+test "format color helpers emit sgr sequences" {
+    var fg_rgb_buf: [24]u8 = undefined;
+    var bg_rgb_buf: [24]u8 = undefined;
+    var fg_index_buf: [16]u8 = undefined;
+    var bg_index_buf: [16]u8 = undefined;
 
-    const fg = try formatFgRgb(&fg_buf, 1, 2, 3);
-    const bg = try formatBgRgb(&bg_buf, 4, 5, 6);
+    const fg_rgb = try formatFgRgb(&fg_rgb_buf, 1, 2, 3);
+    const bg_rgb = try formatBgRgb(&bg_rgb_buf, 4, 5, 6);
+    const fg_index = try formatFgIndex(&fg_index_buf, 42);
+    const bg_index = try formatBgIndex(&bg_index_buf, 236);
 
-    try std.testing.expectEqualStrings("\x1b[38;2;1;2;3m", fg);
-    try std.testing.expectEqualStrings("\x1b[48;2;4;5;6m", bg);
+    try std.testing.expectEqualStrings("\x1b[38;2;1;2;3m", fg_rgb);
+    try std.testing.expectEqualStrings("\x1b[48;2;4;5;6m", bg_rgb);
+    try std.testing.expectEqualStrings("\x1b[38;5;42m", fg_index);
+    try std.testing.expectEqualStrings("\x1b[48;5;236m", bg_index);
 }

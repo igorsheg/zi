@@ -2,6 +2,7 @@ const std = @import("std");
 const component_mod = @import("../component.zig");
 const buffer_mod = @import("../buffer.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const cell_mod = @import("../cell.zig");
 const box_chrome = @import("../box_chrome.zig");
 const grapheme_mod = @import("../grapheme.zig");
@@ -16,15 +17,20 @@ const Color = cell_mod.Color;
 const Key = @import("../keys.zig").Key;
 
 pub const HotkeysOverlay = struct {
-    theme: *const Theme = &Theme.dark,
+    theme: ?*const Theme = null,
     focused: bool = false,
+
+    fn activeTheme(self: *const HotkeysOverlay) *const Theme {
+        return self.theme orelse themes_builtin.dark();
+    }
 
     pub fn render(self: *HotkeysOverlay, region: Region) void {
         const w = region.width;
         const h = region.height;
         if (w < 8 or h < 4) return;
 
-        const border_color = self.theme.fg(.border);
+        const theme = self.activeTheme();
+        const border_color = theme.fg(.border);
         const style = box_chrome.Style{ .chrome = border_color, .fg = border_color, .dim = border_color };
         const frame = box_chrome.closedFrame(region);
         _ = frame.drawTop("Hotkeys", null, style);
@@ -50,7 +56,7 @@ pub const HotkeysOverlay = struct {
                     content_row += 1;
                     if (content_row >= inner.height) break;
                 }
-                _ = inner.writeStr(0, content_row, keybindings.sectionTitle(def.section), self.theme.fg(.accent), Color.default, .{});
+                _ = inner.writeStr(0, content_row, keybindings.sectionTitle(def.section), theme.fg(.accent), Color.default, .{});
                 content_row += 1;
                 last_section = def.section;
                 if (content_row >= inner.height) break;
@@ -59,7 +65,7 @@ pub const HotkeysOverlay = struct {
             var binding_buf: [64]u8 = undefined;
             const binding_text = keybindings.formatBindings(def.action, " / ", &binding_buf);
             const binding_width = grapheme_mod.strWidth(binding_text);
-            _ = inner.writeStr(0, content_row, binding_text, self.theme.fg(.text), Color.default, .{});
+            _ = inner.writeStr(0, content_row, binding_text, theme.fg(.text), Color.default, .{});
 
             const desc_col: u32 = @intCast(@min(inner.width, key_width + 2));
             if (desc_col < inner.width) {
@@ -67,7 +73,7 @@ pub const HotkeysOverlay = struct {
                 if (binding_width < key_width) {
                     col = @intCast(@min(inner.width, binding_width + (key_width - binding_width) + 2));
                 }
-                _ = inner.writeStr(col, content_row, def.description, self.theme.fg(.muted), Color.default, .{ .dim = true });
+                _ = inner.writeStr(col, content_row, def.description, theme.fg(.muted), Color.default, .{ .dim = true });
             }
             content_row += 1;
             if (content_row >= inner.height) break;

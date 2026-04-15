@@ -20,6 +20,7 @@ const container_mod = @import("container.zig");
 const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
+const themes_builtin = @import("../themes/builtin.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
@@ -390,7 +391,7 @@ pub const Interactive = struct {
     /// See `docs/runtime.md` doctrine R3.
     msg_allocator: std.mem.Allocator,
     tui: TUI,
-    theme: *const theme_mod.Theme = &theme_mod.Theme.dark,
+    theme: *const theme_mod.Theme = undefined,
     cwd: []const u8 = "",
 
     // ── Owned components ──────────────────────────────────────────
@@ -501,7 +502,7 @@ pub const Interactive = struct {
         compaction_executor: ?CompactionExecutor,
     ) !Interactive {
         _ = allocator;
-        const theme = theme_mod.Theme.defaultForTerminal();
+        const theme = themes_builtin.defaultForTerminal();
         const state_allocator = memory_diagnostics.tui.allocator();
 
         var self: Interactive = .{

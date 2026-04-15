@@ -118,14 +118,21 @@ pub fn floorStrength(raw_strength: u8, floor: u8) u8 {
 }
 
 pub fn lerpColor(from: Color, to: Color, t: u8) Color {
-    if (from.is_default) return if (t == 0) from else to;
-    if (to.is_default) return if (t == 255) to else from;
-
-    return .{
-        .r = lerpChannel(from.r, to.r, t),
-        .g = lerpChannel(from.g, to.g, t),
-        .b = lerpChannel(from.b, to.b, t),
-        .is_default = false,
+    return switch (from) {
+        .default_color => if (t == 0) from else to,
+        .rgb24 => |from_rgb| switch (to) {
+            .default_color => if (t == 255) to else from,
+            .rgb24 => |to_rgb| Color.rgb(
+                lerpChannel(from_rgb.r, to_rgb.r, t),
+                lerpChannel(from_rgb.g, to_rgb.g, t),
+                lerpChannel(from_rgb.b, to_rgb.b, t),
+            ),
+            .index => if (t < 128) from else to,
+        },
+        .index => switch (to) {
+            .default_color => if (t == 255) to else from,
+            .rgb24, .index => if (t < 128) from else to,
+        },
     };
 }
 

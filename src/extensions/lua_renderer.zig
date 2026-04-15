@@ -72,6 +72,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const tool_registry_mod = @import("registries/tool_registry.zig");
 const theme_mod = @import("../tui/theme.zig");
+const theme_tokens = @import("../themes/tokens.zig");
 const agent_protocol = @import("../agent/protocol.zig");
 
 const c = lua_runtime.c;
@@ -500,45 +501,11 @@ fn dupeLuaString(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) RenderEr
 // ─────────────────────────────────────────────────────────────────
 
 fn parseFgColor(name: []const u8) ?theme_mod.FgColor {
-    const T = theme_mod.FgColor;
-    const map = .{
-        .{ "accent", T.accent },
-        .{ "border", T.border },
-        .{ "border_accent", T.border_accent },
-        .{ "border_muted", T.border_muted },
-        .{ "success", T.success },
-        .{ "error", T.@"error" },
-        .{ "warning", T.warning },
-        .{ "muted", T.muted },
-        .{ "dim", T.dim },
-        .{ "text", T.text },
-        .{ "thinking_text", T.thinking_text },
-        .{ "user_message_text", T.user_message_text },
-        .{ "custom_message_text", T.custom_message_text },
-        .{ "custom_message_label", T.custom_message_label },
-        .{ "tool_title", T.tool_title },
-        .{ "tool_output", T.tool_output },
-        .{ "md_heading", T.md_heading },
-        .{ "md_link", T.md_link },
-        .{ "md_code", T.md_code },
-    };
-    inline for (map) |pair| {
-        if (std.mem.eql(u8, name, pair[0])) return pair[1];
-    }
-    return null;
+    return theme_tokens.parseFgWireName(name);
 }
 
 fn parseBgColor(name: []const u8) ?theme_mod.BgColor {
-    const T = theme_mod.BgColor;
-    if (std.mem.eql(u8, name, "selected_bg")) return T.selected_bg;
-    if (std.mem.eql(u8, name, "user_message_bg")) return T.user_message_bg;
-    if (std.mem.eql(u8, name, "pending_user_message_bg")) return T.pending_user_message_bg;
-    if (std.mem.eql(u8, name, "custom_message_bg")) return T.custom_message_bg;
-    if (std.mem.eql(u8, name, "tool_transcript_bg")) return T.tool_transcript_bg;
-    if (std.mem.eql(u8, name, "tool_pending_bg")) return T.tool_pending_bg;
-    if (std.mem.eql(u8, name, "tool_success_bg")) return T.tool_success_bg;
-    if (std.mem.eql(u8, name, "tool_error_bg")) return T.tool_error_bg;
-    return null;
+    return theme_tokens.parseBgWireName(name);
 }
 
 // ─────────────────────────────────────────────────────────────────

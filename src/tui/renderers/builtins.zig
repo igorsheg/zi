@@ -10,6 +10,7 @@ const excerpt_mod = @import("../excerpt.zig");
 const buffer_mod = @import("../buffer.zig");
 const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const json_util = @import("../../ai/json_util.zig");
 const diff = @import("../../lib/diff.zig");
 const diff_json = @import("../../lib/diff_json.zig");
@@ -641,7 +642,7 @@ test "bashCall renders cmd args with timeout suffix" {
         .expanded = false,
         .execution_started = false,
         .args_complete = false,
-        .theme = &theme_mod.Theme.dark,
+        .theme = themes_builtin.dark(),
         .allocator = testing.allocator,
         .state = null,
         .region = buf.region(),
@@ -671,7 +672,7 @@ test "bashCall falls back to legacy command arg for old sessions" {
         .expanded = false,
         .execution_started = false,
         .args_complete = false,
-        .theme = &theme_mod.Theme.dark,
+        .theme = themes_builtin.dark(),
         .allocator = testing.allocator,
         .state = null,
         .region = buf.region(),
@@ -739,7 +740,7 @@ test "edit renderer uses retained structured diff surface" {
         .expanded = true,
         .execution_started = true,
         .args_complete = true,
-        .theme = &theme_mod.Theme.dark,
+        .theme = themes_builtin.dark(),
         .allocator = testing.allocator,
         .state = state,
         .region = buf.region(),
@@ -806,7 +807,7 @@ test "edit renderer shows malformed result message when structured diff details 
         .expanded = true,
         .execution_started = true,
         .args_complete = true,
-        .theme = &theme_mod.Theme.dark,
+        .theme = themes_builtin.dark(),
         .allocator = testing.allocator,
         .state = state,
         .region = buf.region(),

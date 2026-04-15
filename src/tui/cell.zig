@@ -1,23 +1,38 @@
 const std = @import("std");
 
-/// 24-bit RGB color for terminal rendering.
-pub const Color = struct {
-    r: u8,
-    g: u8,
-    b: u8,
-    is_default: bool = false,
+/// Terminal color for rendering.
+pub const Color = union(enum) {
+    default_color,
+    rgb24: struct {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
+    index: u8,
 
     /// Terminal default color — renderer emits \x1b[39m / \x1b[49m.
-    pub const default: Color = .{ .r = 0, .g = 0, .b = 0, .is_default = true };
+    pub const default: Color = .default_color;
 
     pub fn eql(a: Color, b: Color) bool {
-        if (a.is_default and b.is_default) return true;
-        if (a.is_default != b.is_default) return false;
-        return a.r == b.r and a.g == b.g and a.b == b.b;
+        return switch (a) {
+            .default_color => b == .default_color,
+            .rgb24 => |a_rgb| switch (b) {
+                .rgb24 => |b_rgb| a_rgb.r == b_rgb.r and a_rgb.g == b_rgb.g and a_rgb.b == b_rgb.b,
+                else => false,
+            },
+            .index => |a_index| switch (b) {
+                .index => |b_index| a_index == b_index,
+                else => false,
+            },
+        };
     }
 
     pub fn rgb(r: u8, g: u8, b: u8) Color {
-        return .{ .r = r, .g = g, .b = b, .is_default = false };
+        return .{ .rgb24 = .{ .r = r, .g = g, .b = b } };
+    }
+
+    pub fn indexed(value: u8) Color {
+        return .{ .index = value };
     }
 };
 
@@ -99,6 +114,7 @@ test "Cell equality distinguishes all fields" {
 
     // Different fg
     try std.testing.expect(!a.eql(Cell{ .fg = Color.rgb(255, 0, 0) }));
+    try std.testing.expect(!a.eql(Cell{ .fg = Color.indexed(42) }));
     // Different grapheme
     try std.testing.expect(!a.eql(Cell{ .grapheme = .{ .codepoint = 'X' } }));
     // Grapheme union tags

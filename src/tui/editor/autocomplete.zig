@@ -4,6 +4,7 @@ const keys_mod = @import("../keys.zig");
 const theme_mod = @import("../theme.zig");
 const select_list_mod = @import("../components/select_list.zig");
 const component_mod = @import("../component.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const buffer_mod = @import("buffer.zig");
 const keybindings = @import("../keybindings.zig");
 
@@ -43,7 +44,7 @@ pub const AutocompleteSession = struct {
     submit_on_confirm: bool = false,
     auto_accept_single_on_tab: bool = false,
     max_visible: u32 = 5,
-    theme: *const Theme = &Theme.dark,
+    theme: *const Theme = undefined,
     sink_ctx: SinkCtx = .{},
 
     const SinkCtx = struct {
@@ -285,7 +286,7 @@ test "AutocompleteSession applies replacement range without borrowing mutable bu
     defer registry.deinit();
 
     var provider = SlashCommandProvider.init(&registry);
-    var session = AutocompleteSession.init(&Theme.dark);
+    var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
@@ -311,7 +312,7 @@ test "AutocompleteSession enter accepts slash command selection and requests sub
     defer registry.deinit();
 
     var provider = SlashCommandProvider.init(&registry);
-    var session = AutocompleteSession.init(&Theme.dark);
+    var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
@@ -347,7 +348,7 @@ test "AutocompleteSession enter accepts file completion without submit" {
 
     var provider = makeCombinedProvider(&registry, cwd);
     defer provider.deinit();
-    var session = AutocompleteSession.init(&Theme.dark);
+    var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
@@ -379,7 +380,7 @@ test "AutocompleteSession tab on directory completion refreshes into the expande
 
     var provider = makeCombinedProvider(&registry, cwd);
     defer provider.deinit();
-    var session = AutocompleteSession.init(&Theme.dark);
+    var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
@@ -414,7 +415,7 @@ test "AutocompleteSession tab force-completes a single at-file suggestion after 
 
     var provider = makeCombinedProvider(&registry, cwd);
     defer provider.deinit();
-    var session = AutocompleteSession.init(&Theme.dark);
+    var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);

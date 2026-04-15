@@ -5,6 +5,7 @@ const keys_mod = @import("../keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const component_mod = @import("../component.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const keybindings = @import("../keybindings.zig");
 
 const Color = cell_mod.Color;
@@ -211,7 +212,7 @@ const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
 
 fn testTheme() Theme {
-    return Theme.dark;
+    return themes_builtin.dark().*;
 }
 
 fn makeItems() [3]SelectItem {

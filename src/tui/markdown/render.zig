@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 const display_wrap_mod = @import("../display_wrap.zig");
 const grapheme_mod = @import("../grapheme.zig");
 
@@ -15,7 +16,7 @@ pub const RenderedLine = struct {
     spans: []const Span,
 };
 
-pub const code_inline_bg = ast.Color.rgb(45, 40, 60);
+pub const code_inline_bg = ast.Color.default;
 
 const FlatRun = struct {
     start: usize,
@@ -776,7 +777,7 @@ test "renderer wraps tables and preserves quote and heading styling" {
         arena.allocator(),
     );
 
-    const lines = try renderDocument(doc, 24, &theme_mod.Theme.dark, .{
+    const lines = try renderDocument(doc, 24, themes_builtin.dark(), .{
         .fg = ast.Color.default,
         .bg = ast.Color.default,
         .attrs = .{},

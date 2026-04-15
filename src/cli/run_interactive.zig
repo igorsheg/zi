@@ -6,6 +6,7 @@ const settings_mod = @import("../settings/root.zig");
 const sdk = @import("../sdk.zig");
 const interactive_mod = @import("../tui/interactive.zig");
 const theme_mod = @import("../tui/theme.zig");
+const themes_builtin = @import("../themes/builtin.zig");
 const tool_display = @import("../tui/tool_display.zig");
 const builtin_renderers = @import("../tui/renderers/builtins.zig");
 const compactor = @import("../session/compactor.zig");
@@ -154,7 +155,7 @@ fn resolveSelectedTheme(ca: *sdk.AgentSession, settings: *const settings_mod.man
         return &loaded.theme;
     }
 
-    return theme_mod.Theme.defaultForTerminal();
+    return themes_builtin.defaultForTerminal();
 }
 
 fn applyInteractiveTheme(interactive: *interactive_mod.Interactive, theme: *const theme_mod.Theme) void {
