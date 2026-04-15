@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const protocol = @import("../agent/protocol.zig");
 const json_util = @import("../ai/json_util.zig");
@@ -144,12 +145,15 @@ fn runCommand(
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        child.pgid = 0;
+    }
 
     child.spawn() catch |err| {
         return util.errorf(allocator, "command error: {s}", .{@errorName(err)});
     };
 
-    var abort_guard = AbortGuard.start(signal, .{ .kill_pid = child.id });
+    var abort_guard = AbortGuard.start(signal, .{ .interrupt_process_group = child.id });
     defer abort_guard.stop();
 
     var timeout_guard = TimeoutGuard.start(timeout_secs, child.id);
@@ -208,14 +212,14 @@ const TimeoutGuard = struct {
     did_timeout: *std.atomic.Value(bool),
     thread: ?std.Thread,
 
-    fn start(timeout_secs: ?u64, pid: std.process.Child.Id) TimeoutGuard {
+    fn start(timeout_secs: ?u64, process_group_id: std.process.Child.Id) TimeoutGuard {
         const secs = timeout_secs orelse return .{ .done = &noop_done, .did_timeout = &noop_done, .thread = null };
         const done = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_done, .thread = null };
         errdefer std.heap.page_allocator.destroy(done);
         const did_timeout = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_done, .thread = null };
         done.* = std.atomic.Value(bool).init(false);
         did_timeout.* = std.atomic.Value(bool).init(false);
-        const thread = std.Thread.spawn(.{}, watchdog, .{ secs, pid, done, did_timeout }) catch null;
+        const thread = std.Thread.spawn(.{}, watchdog, .{ secs, process_group_id, done, did_timeout }) catch null;
         return .{ .done = done, .did_timeout = did_timeout, .thread = thread };
     }
 
@@ -233,7 +237,7 @@ const TimeoutGuard = struct {
 
     var noop_done = std.atomic.Value(bool).init(false);
 
-    fn watchdog(timeout_secs: u64, pid: std.process.Child.Id, done: *std.atomic.Value(bool), did_timeout: *std.atomic.Value(bool)) void {
+    fn watchdog(timeout_secs: u64, process_group_id: std.process.Child.Id, done: *std.atomic.Value(bool), did_timeout: *std.atomic.Value(bool)) void {
         const deadline_ns = timeout_secs * std.time.ns_per_s;
         var elapsed_ns: u64 = 0;
         const poll_ns = 100 * std.time.ns_per_ms;
@@ -248,9 +252,18 @@ const TimeoutGuard = struct {
 
         if (done.load(.acquire)) return;
         did_timeout.store(true, .release);
-        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        killProcessGroup(process_group_id, std.posix.SIG.KILL);
     }
 };
+
+fn killProcessGroup(process_group_id: std.process.Child.Id, sig: u8) void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        std.posix.kill(process_group_id, sig) catch {};
+        return;
+    }
+    const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(process_group_id));
+    std.posix.kill(group_pid, sig) catch {};
+}
 
 const CompletedOutput = struct {
     output_text: []u8 = &.{},
@@ -513,6 +526,63 @@ test "runCommand emits partial updates while command is still running" {
     try testing.expect(state.count >= 1);
     try testing.expect(state.saw_partial);
     try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "second") != null);
+}
+
+test "runCommand abort kills the spawned process group, not just the shell pid" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const abort_signal = @import("../abort_signal.zig");
+    const pid_file = try std.fmt.allocPrint(testing.allocator, "/tmp/zi-bash-abort-{d}.pid", .{std.time.nanoTimestamp()});
+    defer testing.allocator.free(pid_file);
+    std.fs.deleteFileAbsolute(pid_file) catch {};
+    defer std.fs.deleteFileAbsolute(pid_file) catch {};
+
+    const cmd = try std.fmt.allocPrint(testing.allocator,
+        \\sleep 30 &
+        \\child=$!
+        \\printf '%s\n' "$child" > '{s}'
+        \\wait "$child"
+    , .{pid_file});
+    defer testing.allocator.free(cmd);
+
+    var controller = abort_signal.AbortController{};
+    const signal = controller.beginRun();
+    const Aborter = struct {
+        fn run(c: *abort_signal.AbortController) void {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            c.requestAbort();
+        }
+    };
+    const aborter = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
+    defer aborter.join();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = runCommand(arena.allocator(), cmd, "/tmp", 5, signal, null, null);
+
+    try testing.expect(result.is_error);
+    try testing.expectEqual(@as(usize, 1), result.content.len);
+    try testing.expect(result.content[0] == .text);
+    try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "command aborted") != null);
+
+    var file = try std.fs.openFileAbsolute(pid_file, .{});
+    defer file.close();
+    const pid_text = try file.readToEndAlloc(testing.allocator, 64);
+    defer testing.allocator.free(pid_text);
+    const child_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_text, " \r\n\t"), 10);
+
+    const deadline_ms = std.time.milliTimestamp() + 1_000;
+    while (true) {
+        std.posix.kill(child_pid, 0) catch |err| switch (err) {
+            error.ProcessNotFound => break,
+            else => return err,
+        };
+        if (std.time.milliTimestamp() >= deadline_ms) {
+            return error.TestUnexpectedBackgroundChildStillRunning;
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
 }
 
 fn oneText(allocator: std.mem.Allocator, text: []const u8) []protocol.AgentToolResult.ContentBlock {

@@ -165,7 +165,7 @@ pub const Agent = struct {
     get_api_key: ?protocol.GetApiKeyHook,
 
     is_running: std.atomic.Value(bool),
-    abort_requested: std.atomic.Value(bool),
+    abort_controller: abort_signal_mod.AbortController,
 
     /// Owned messages list — grows via processEvents on message_end.
     messages: std.ArrayList(protocol.AgentMessage),
@@ -234,7 +234,7 @@ pub const Agent = struct {
             .tool_execution = options.tool_execution,
             .get_api_key = options.get_api_key,
             .is_running = std.atomic.Value(bool).init(false),
-            .abort_requested = std.atomic.Value(bool).init(false),
+            .abort_controller = .{},
             .messages = messages,
             .pending_tool_call_ids = .empty,
             .history_arena = history_arena,
@@ -325,11 +325,20 @@ pub const Agent = struct {
         return self.steering_queue.hasItems() or self.follow_up_queue.hasItems();
     }
 
-    /// Set the abort flag. The loop checks this between turns.
+    /// Cross-thread-safe cancellation entrypoint for the current run.
+    ///
+    /// This is intentionally separate from mailbox request handling:
+    /// a running prompt may be blocked in provider I/O or tool
+    /// execution, so interrupt delivery must remain observable without
+    /// waiting for the next request-drain boundary.
     pub fn abort(self: *Agent) void {
         if (self.is_running.load(.acquire)) {
-            self.abort_requested.store(true, .release);
+            self.abort_controller.requestAbort();
         }
+    }
+
+    pub fn isAbortRequested(self: *const Agent) bool {
+        return self.abort_controller.isAborted();
     }
 
     /// Clear transcript state, runtime state, and queued messages.
@@ -422,7 +431,7 @@ pub const Agent = struct {
         self.state.is_streaming = true;
         self.state.streaming_message = null;
         self.state.error_message = null;
-        self.abort_requested.store(false, .release);
+        const signal = self.abort_controller.beginRun();
 
         self.resetRuntimeArena();
 
@@ -446,7 +455,7 @@ pub const Agent = struct {
                 config,
                 processEventsSink,
                 @ptrCast(self),
-                abort_signal_mod.AbortSignal{ .flag = &self.abort_requested },
+                signal,
             ) catch {};
         } else {
             loop_mod.runAgentLoop(
@@ -457,7 +466,7 @@ pub const Agent = struct {
                 config,
                 processEventsSink,
                 @ptrCast(self),
-                abort_signal_mod.AbortSignal{ .flag = &self.abort_requested },
+                signal,
             );
         }
     }

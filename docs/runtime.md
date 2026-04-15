@@ -16,6 +16,13 @@ Cross-thread communication uses only two mailbox-backed channels:
 - **request queue**: TUI -> agent for mutations, work, and I/O
 - **event queue**: agent/helper -> TUI for published results and UI events
 
+The one deliberate non-mailbox primitive is **run-scoped cancellation**:
+- the owner creates an `AbortSignal` for one in-flight run
+- foreign threads may latch abort through that dedicated controller
+- downstream provider/tool/helper code observes the signal cooperatively
+
+This is not a third general-purpose queue. It exists because abort must be observable while a run is already blocked inside provider I/O or tool execution, where waiting for the next request-drain boundary would be too late.
+
 If the TUI needs the agent to do something, enqueue a request.
 If the TUI only needs to read data to render or filter, consume a published snapshot.
 

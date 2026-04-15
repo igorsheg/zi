@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const AbortSignal = @import("abort_signal.zig").AbortSignal;
 
@@ -7,8 +8,10 @@ const AbortSignal = @import("abort_signal.zig").AbortSignal;
 /// Covers two abort actions (independently optional):
 ///   - shutdown_fd: calls shutdown(SHUT_RDWR) to unblock blocking reads
 ///     on a socket. Used by HTTP providers during streaming.
-///   - kill_pid: sends SIGKILL to a child process. Used by bash/spawn
-///     tools to terminate long-running commands.
+///   - kill_pid: sends SIGKILL to one child pid.
+///   - interrupt_process_group: sends SIGINT, waits a short grace
+///     period, then SIGKILLs the entire child process group. Used by
+///     bash/spawn so Ctrl+C semantics reach grandchildren too.
 ///
 /// Usage:
 ///   var guard = AbortGuard.start(signal, .{ .shutdown_fd = fd });
@@ -26,12 +29,15 @@ pub const AbortGuard = struct {
     pub const Actions = struct {
         shutdown_fd: ?std.posix.fd_t = null,
         kill_pid: ?std.process.Child.Id = null,
+        interrupt_process_group: ?std.process.Child.Id = null,
     };
 
     /// Spawn the watchdog. No-ops (no thread) when the signal is inert
-    /// or both actions are null.
+    /// or all actions are null.
     pub fn start(signal: AbortSignal, actions: Actions) AbortGuard {
-        if (signal.isNone() or (actions.shutdown_fd == null and actions.kill_pid == null)) {
+        if (signal.isNone() or
+            (actions.shutdown_fd == null and actions.kill_pid == null and actions.interrupt_process_group == null))
+        {
             return .{ .shared_done = &noop_done, .thread = null, .allocator = std.heap.page_allocator };
         }
         const done = std.heap.page_allocator.create(std.atomic.Value(bool)) catch {
@@ -39,10 +45,11 @@ pub const AbortGuard = struct {
         };
         done.* = std.atomic.Value(bool).init(false);
         const ctx = WatchdogCtx{
-            .signal = signal.flag,
+            .signal = signal,
             .done = done,
             .shutdown_fd = actions.shutdown_fd,
             .kill_pid = actions.kill_pid,
+            .interrupt_process_group = actions.interrupt_process_group,
         };
         const thread = std.Thread.spawn(.{}, watchdog, .{ctx}) catch null;
         return .{ .shared_done = done, .thread = thread, .allocator = std.heap.page_allocator };
@@ -62,16 +69,17 @@ pub const AbortGuard = struct {
     var noop_done = std.atomic.Value(bool).init(true);
 
     const WatchdogCtx = struct {
-        signal: *const std.atomic.Value(bool),
+        signal: AbortSignal,
         done: *std.atomic.Value(bool),
         shutdown_fd: ?std.posix.fd_t,
         kill_pid: ?std.process.Child.Id,
+        interrupt_process_group: ?std.process.Child.Id,
     };
 
     fn watchdog(ctx: WatchdogCtx) void {
         while (true) {
             if (ctx.done.load(.acquire)) return;
-            if (ctx.signal.load(.acquire)) break;
+            if (ctx.signal.isAborted()) break;
             std.Thread.sleep(100 * std.time.ns_per_ms);
         }
         if (ctx.done.load(.acquire)) return;
@@ -80,8 +88,30 @@ pub const AbortGuard = struct {
             const SHUT_RDWR = 2;
             _ = std.posix.system.shutdown(fd, SHUT_RDWR);
         }
+        if (ctx.interrupt_process_group) |pgid| {
+            interruptProcessGroup(pgid);
+        }
         if (ctx.kill_pid) |pid| {
             std.posix.kill(pid, std.posix.SIG.KILL) catch {};
         }
+    }
+
+    fn interruptProcessGroup(pgid: std.process.Child.Id) void {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            std.posix.kill(pgid, std.posix.SIG.KILL) catch {};
+            return;
+        }
+        signalProcessGroup(pgid, std.posix.SIG.INT);
+        std.Thread.sleep(150 * std.time.ns_per_ms);
+        signalProcessGroup(pgid, std.posix.SIG.KILL);
+    }
+
+    fn signalProcessGroup(pgid: std.process.Child.Id, sig: u8) void {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            std.posix.kill(pgid, sig) catch {};
+            return;
+        }
+        const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pgid));
+        std.posix.kill(group_pid, sig) catch {};
     }
 };

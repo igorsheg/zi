@@ -5,6 +5,7 @@
 /// Reads stdout line-by-line, parses each as a JSON agent event.
 /// On "message_end" with role=="assistant": extracts text, accumulates usage.
 /// stderr is collected after stdout EOF.
+const builtin = @import("builtin");
 const std = @import("std");
 const types = @import("types.zig");
 
@@ -78,6 +79,9 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        child.pgid = 0;
+    }
 
     child.spawn() catch {
         result.exit_code = 1;
@@ -98,8 +102,8 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     // A watchdog thread (spawned only when there is a signal to watch
     // and a stdout pipe to shut down) polls the abort flag every
     // 100ms. On abort it `shutdown()`s the stdout fd, which unblocks
-    // the parent's blocking `read()` mid-call, and `kill()`s the
-    // child for good measure. The main thread sees the abort flag on
+    // the parent's blocking `read()` mid-call, and interrupts the
+    // child process group for good measure. The main thread sees the abort flag on
     // its next iteration and breaks the loop. Without this, a quiet
     // child (long LLM call, sleep) would never observe the abort
     // until it next wrote to stdout.
@@ -195,7 +199,7 @@ fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config:
         // call std.process.Child.kill here because that internally
         // waitpids and would race the main wait() at the end.
         if (config.signal) |sig| {
-            if (sig.load(.acquire)) break;
+            if (sig.isAborted()) break;
         }
 
         const n = stdout_file.read(&read_buf) catch break;
@@ -425,7 +429,7 @@ fn traceLine(f: std.fs.File, line: []const u8) void {
 }
 
 const WatchdogCtx = struct {
-    signal: *const std.atomic.Value(bool),
+    signal: @import("../abort_signal.zig").AbortSignal,
     stdout_fd: std.posix.fd_t,
     child: *std.process.Child,
     /// Set true by the main thread when readAndProcess returns,
@@ -436,10 +440,10 @@ const WatchdogCtx = struct {
 };
 
 /// Polls `signal` every 100ms. On abort: shuts down the child's
-/// stdout fd (unblocks the parent's blocking read) and kills the
-/// child (in case it was sleeping or hung). Idempotent — the main
-/// thread also kills the child after seeing the signal, and
-/// posix.shutdown / kill tolerate being called twice.
+/// stdout fd (unblocks the parent's blocking read) and interrupts the
+/// child process group (in case it was sleeping or hung). Idempotent —
+/// the main thread also observes the abort and stop paths tolerate
+/// repeated signals.
 ///
 /// Why shutdown(SHUT_RDWR) instead of close: req.deinit / pipe
 /// cleanup on the main thread will close the fd later, and double
@@ -448,7 +452,7 @@ const WatchdogCtx = struct {
 fn abortWatchdog(ctx: WatchdogCtx) void {
     while (true) {
         if (ctx.done.load(.acquire)) return;
-        if (ctx.signal.load(.acquire)) break;
+        if (ctx.signal.isAborted()) break;
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
     // Re-check done in case the main thread finished naturally
@@ -461,7 +465,26 @@ fn abortWatchdog(ctx: WatchdogCtx) void {
     // reaps via waitpid internally, which would race the main
     // thread's `child.wait()` and crash with ECHILD. Sending the
     // signal directly leaves reaping to the main thread.
-    std.posix.kill(ctx.child.id, std.posix.SIG.KILL) catch {};
+    interruptProcessGroup(ctx.child.id);
+}
+
+fn interruptProcessGroup(pgid: std.process.Child.Id) void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        std.posix.kill(pgid, std.posix.SIG.KILL) catch {};
+        return;
+    }
+    signalProcessGroup(pgid, std.posix.SIG.INT);
+    std.Thread.sleep(150 * std.time.ns_per_ms);
+    signalProcessGroup(pgid, std.posix.SIG.KILL);
+}
+
+fn signalProcessGroup(pgid: std.process.Child.Id, sig: u8) void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        std.posix.kill(pgid, sig) catch {};
+        return;
+    }
+    const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pgid));
+    std.posix.kill(group_pid, sig) catch {};
 }
 
 // -- argv construction --
@@ -598,15 +621,16 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
     // We fire the abort signal from a side thread after 100ms and
     // assert ziSpawn returns promptly.
     const override = [_][]const u8{ "sh", "-c", "sleep 30" };
-    var sig = std.atomic.Value(bool).init(false);
+    var controller = @import("../abort_signal.zig").AbortController{};
+    const signal = controller.beginRun();
 
     const Aborter = struct {
-        fn run(s: *std.atomic.Value(bool)) void {
+        fn run(c: *@import("../abort_signal.zig").AbortController) void {
             std.Thread.sleep(100 * std.time.ns_per_ms);
-            s.store(true, .release);
+            c.requestAbort();
         }
     };
-    const t = try std.Thread.spawn(.{}, Aborter.run, .{&sig});
+    const t = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
     defer t.join();
 
     const start = std.time.milliTimestamp();
@@ -615,7 +639,7 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
         .cwd = ".",
         .task = "unused",
         .argv_override = &override,
-        .signal = &sig,
+        .signal = signal,
     });
     defer result.deinit(testing.allocator);
     const elapsed_ms = std.time.milliTimestamp() - start;

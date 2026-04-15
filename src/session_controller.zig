@@ -261,7 +261,7 @@ pub const SessionController = struct {
     }
 
     fn resolveRunOutcome(self: *SessionController) RunOutcome {
-        return self.last_outcome orelse if (self.session.agent.abort_requested.load(.acquire))
+        return self.last_outcome orelse if (self.session.agent.isAbortRequested())
             .aborted
         else
             .success;
@@ -401,14 +401,14 @@ pub const SessionController = struct {
     fn waitForRetryDelay(self: *SessionController, delay_ms: u64) bool {
         const deadline = std.time.milliTimestamp() + @as(i64, @intCast(delay_ms));
         while (std.time.milliTimestamp() < deadline) {
-            if (self.retry_abort_requested.load(.acquire) or self.session.agent.abort_requested.load(.acquire)) {
+            if (self.retry_abort_requested.load(.acquire) or self.session.agent.isAbortRequested()) {
                 return true;
             }
             const remaining_ms = @as(u64, @intCast(deadline - std.time.milliTimestamp()));
             const sleep_ms: u64 = @min(remaining_ms, 100);
             std.Thread.sleep(sleep_ms * @as(u64, std.time.ns_per_ms));
         }
-        return self.retry_abort_requested.load(.acquire) or self.session.agent.abort_requested.load(.acquire);
+        return self.retry_abort_requested.load(.acquire) or self.session.agent.isAbortRequested();
     }
 
     fn pruneTransientAssistantError(self: *SessionController) void {

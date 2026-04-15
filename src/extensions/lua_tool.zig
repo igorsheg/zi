@@ -259,7 +259,7 @@ fn serviceYieldedToolCoroutine(
         .model = req.model,
         .tools = req.tools,
         .append_system_prompt = req.append_system_prompt,
-        .signal = if (runner.current_signal) |s| s.flag else null,
+        .signal = runner.current_signal,
         .on_event = if (req.callbacks_ref != c.LUA_NOREF) &api.eventTrampoline else null,
         .on_event_ctx = if (req.callbacks_ref != c.LUA_NOREF) @ptrCast(&trampoline_ctx) else null,
     };

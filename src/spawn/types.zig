@@ -2,6 +2,7 @@
 /// parse JSONL events from stdout, collect output and usage stats.
 /// Zig equivalent of pi-spawn.ts.
 const std = @import("std");
+const abort_signal = @import("../abort_signal.zig");
 const ai = @import("../ai/root.zig");
 
 /// Per-event observer callback. Fires once for every parsed JSONL line
@@ -70,7 +71,7 @@ pub const SpawnConfig = struct {
     model: ?[]const u8 = null,
     tools: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
-    signal: ?*const std.atomic.Value(bool) = null,
+    signal: ?abort_signal.AbortSignal = null,
 
     /// Optional per-event observer. See `EventCallback` for the
     /// contract. `on_event_ctx` is passed through verbatim.

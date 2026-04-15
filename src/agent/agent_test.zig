@@ -137,7 +137,7 @@ test "Agent: abort sets flag, safe when not running" {
 
     // Should be a no-op when nothing is running (pi-mono guards on is_running)
     agent.abort();
-    try std.testing.expectEqual(false, agent.abort_requested.load(.acquire));
+    try std.testing.expectEqual(false, agent.isAbortRequested());
 }
 
 // ── contract 7: steering queue (agent.test.ts:253-261) ──
