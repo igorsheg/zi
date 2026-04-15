@@ -29,6 +29,7 @@ then it will rot. Put that in an issue, a PR description, or `docs/archive/` if 
 
 - `principles.md` — the doctrine that should survive refactors
 - `architecture.md` — the system shape and layer boundaries
+- `cli.md` — CLI actions, execution plans, truthful mode selection, and cutover doctrine
 - `runtime.md` — thread ownership, queues, snapshots, allocator/lifetime rules
 - `extensions.md` — what extensions are, where they run, and how they fit
 - `tui.md` — component, overlay, editor, and wrapping philosophy
