@@ -4,31 +4,12 @@ const protocol = @import("protocol.zig");
 const loop_mod = @import("loop.zig");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
+const run_control_mod = @import("../runtime/run_control.zig");
 const testing = std.testing;
 
-/// Queue mode for pending message queues.
-/// pi-mono source: packages/agent/src/agent.ts:55
-pub const QueueMode = enum {
-    all,
-    one_at_a_time,
-};
-
-pub const QueuedMessageText = struct {
-    text: []u8,
-};
-
-pub const QueuedMessageSnapshot = struct {
-    steering: []QueuedMessageText,
-    follow_up: []QueuedMessageText,
-
-    pub fn deinit(self: *QueuedMessageSnapshot, allocator: std.mem.Allocator) void {
-        for (self.steering) |entry| allocator.free(entry.text);
-        for (self.follow_up) |entry| allocator.free(entry.text);
-        allocator.free(self.steering);
-        allocator.free(self.follow_up);
-        self.* = undefined;
-    }
-};
+pub const QueueMode = run_control_mod.QueueMode;
+pub const QueuedMessageText = run_control_mod.QueuedMessageText;
+pub const QueuedMessageSnapshot = run_control_mod.QueuedMessageSnapshot;
 
 /// FIFO queue for steering or follow-up messages.
 /// Drain semantics depend on mode: `all` returns everything, `one_at_a_time` returns the first.
@@ -150,6 +131,7 @@ pub const Agent = struct {
     listeners: std.ArrayList(Listener),
     steering_queue: PendingMessageQueue,
     follow_up_queue: PendingMessageQueue,
+    external_run_control: ?*run_control_mod.RunControl = null,
 
     convert_to_llm: protocol.ConvertToLlmHook,
     transform_context: ?protocol.TransformContextHook,
@@ -222,6 +204,7 @@ pub const Agent = struct {
             .listeners = .empty,
             .steering_queue = PendingMessageQueue.init(allocator, options.steering_mode),
             .follow_up_queue = PendingMessageQueue.init(allocator, options.follow_up_mode),
+            .external_run_control = null,
             .convert_to_llm = options.convert_to_llm orelse defaultConvertToLlmHook(),
             .transform_context = options.transform_context,
             .stream_fn = options.stream_fn orelse unreachable_stream_hook,
@@ -271,30 +254,71 @@ pub const Agent = struct {
         }
     }
 
+    /// Bind an explicit run-scoped control surface for steering/follow-up.
+    /// Interactive mode uses a `msg_allocator`-backed `RunControl` so queued
+    /// messages stay observable while a prompt is already in flight without
+    /// turning the main owner inbox into a side-channel.
+    pub fn bindRunControl(self: *Agent, run_control: *run_control_mod.RunControl) void {
+        self.external_run_control = run_control;
+    }
+
+    pub fn unbindRunControl(self: *Agent, run_control: *run_control_mod.RunControl) void {
+        if (self.external_run_control == run_control) {
+            self.external_run_control = null;
+        }
+    }
+
+    pub fn runControl(self: *Agent) ?*run_control_mod.RunControl {
+        return self.external_run_control;
+    }
+
     /// Queue a steering message to be injected after the current assistant turn finishes.
     pub fn steer(self: *Agent, message: protocol.AgentMessage) void {
+        if (self.external_run_control) |run_control| {
+            _ = run_control.enqueue(.steering, message);
+            return;
+        }
         self.steering_queue.enqueue(message);
     }
 
     /// Queue a follow-up message to run only after the agent would otherwise stop.
     pub fn followUp(self: *Agent, message: protocol.AgentMessage) void {
+        if (self.external_run_control) |run_control| {
+            _ = run_control.enqueue(.follow_up, message);
+            return;
+        }
         self.follow_up_queue.enqueue(message);
     }
 
     pub fn clearSteeringQueue(self: *Agent) void {
+        if (self.external_run_control) |run_control| {
+            run_control.clearSteering();
+            return;
+        }
         self.steering_queue.clear();
     }
 
     pub fn clearFollowUpQueue(self: *Agent) void {
+        if (self.external_run_control) |run_control| {
+            run_control.clearFollowUp();
+            return;
+        }
         self.follow_up_queue.clear();
     }
 
     pub fn clearAllQueues(self: *Agent) void {
+        if (self.external_run_control) |run_control| {
+            run_control.clearAll();
+            return;
+        }
         self.clearSteeringQueue();
         self.clearFollowUpQueue();
     }
 
     pub fn snapshotQueuedMessages(self: *Agent, allocator: std.mem.Allocator) QueuedMessageSnapshot {
+        if (self.external_run_control) |run_control| {
+            return run_control.snapshot(allocator);
+        }
         return .{
             .steering = self.steering_queue.snapshotTexts(allocator),
             .follow_up = self.follow_up_queue.snapshotTexts(allocator),
@@ -302,9 +326,40 @@ pub const Agent = struct {
     }
 
     pub fn clearQueuedMessages(self: *Agent, allocator: std.mem.Allocator) QueuedMessageSnapshot {
+        if (self.external_run_control) |run_control| {
+            return run_control.clearAndSnapshot(allocator);
+        }
         const snapshot = self.snapshotQueuedMessages(allocator);
         self.clearAllQueues();
         return snapshot;
+    }
+
+    fn hasSteeringMessages(self: *Agent) bool {
+        if (self.external_run_control) |run_control| {
+            return run_control.hasSteeringMessages();
+        }
+        return self.steering_queue.hasItems();
+    }
+
+    fn hasFollowUpMessages(self: *Agent) bool {
+        if (self.external_run_control) |run_control| {
+            return run_control.hasFollowUpMessages();
+        }
+        return self.follow_up_queue.hasItems();
+    }
+
+    fn drainSteeringForContinue(self: *Agent, allocator: std.mem.Allocator) []const protocol.AgentMessage {
+        if (self.external_run_control) |run_control| {
+            return run_control.drainSteering(allocator);
+        }
+        return self.steering_queue.drain(allocator);
+    }
+
+    fn drainFollowUpForContinue(self: *Agent, allocator: std.mem.Allocator) []const protocol.AgentMessage {
+        if (self.external_run_control) |run_control| {
+            return run_control.drainFollowUp(allocator);
+        }
+        return self.follow_up_queue.drain(allocator);
     }
 
     fn resetHistoryArena(self: *Agent) void {
@@ -322,6 +377,9 @@ pub const Agent = struct {
     }
 
     pub fn hasQueuedMessages(self: *Agent) bool {
+        if (self.external_run_control) |run_control| {
+            return run_control.hasQueuedMessages();
+        }
         return self.steering_queue.hasItems() or self.follow_up_queue.hasItems();
     }
 
@@ -406,20 +464,20 @@ pub const Agent = struct {
 
         const last = self.messages.items[self.messages.items.len - 1];
         if (last == .assistant) {
-            if (self.steering_queue.hasItems()) {
+            if (self.hasSteeringMessages()) {
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
-                const queued = self.steering_queue.drain(arena.allocator());
+                const queued = self.drainSteeringForContinue(arena.allocator());
                 if (queued.len > 0) {
                     self.runWithLifecycle(queued, false, true);
                     return;
                 }
             }
 
-            if (self.follow_up_queue.hasItems()) {
+            if (self.hasFollowUpMessages()) {
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
-                const queued = self.follow_up_queue.drain(arena.allocator());
+                const queued = self.drainFollowUpForContinue(arena.allocator());
                 if (queued.len > 0) {
                     self.runWithLifecycle(queued, false, false);
                     return;
@@ -532,11 +590,17 @@ pub const Agent = struct {
 
     fn drainSteeringMessages(allocator: std.mem.Allocator, ctx: ?*anyopaque) []const protocol.AgentMessage {
         const self: *Agent = @ptrCast(@alignCast(ctx));
+        if (self.external_run_control) |run_control| {
+            return run_control.drainSteering(allocator);
+        }
         return self.steering_queue.drain(allocator);
     }
 
     fn drainFollowUpMessages(allocator: std.mem.Allocator, ctx: ?*anyopaque) []const protocol.AgentMessage {
         const self: *Agent = @ptrCast(@alignCast(ctx));
+        if (self.external_run_control) |run_control| {
+            return run_control.drainFollowUp(allocator);
+        }
         return self.follow_up_queue.drain(allocator);
     }
 

@@ -47,6 +47,7 @@ const logging = @import("../logging.zig");
 const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
 const session_controller_mod = @import("../session_controller.zig");
+const run_control_mod = @import("../runtime/run_control.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentToolResult = agent_mod.protocol.AgentToolResult;
 const AgentRequest = agent_mod.AgentRequest;
@@ -65,16 +66,6 @@ const MouseCapture = union(enum) {
     transcript_selection: void,
 };
 
-/// Discriminates what a spawned agent worker thread is doing.
-/// `prompt` is the classic path (subscribe + ca.run); `drain_only`
-/// is zi-wub.15's spawn-on-idle for request-queue work when no
-/// prompt is in flight. Both paths drain AgentRequests at the top.
-/// See oracle review on zi-wub.15 for why this is one thread fn
-/// with a work discriminator rather than two entry points.
-const AgentWork = union(enum) {
-    prompt: []const u8,
-    drain_only: void,
-};
 const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
 const SettingsAction = enum {
@@ -414,11 +405,11 @@ pub const Interactive = struct {
     login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     event_queue: UiEventQueue,
-    /// TUI → agent mutation channel. TUI thread enqueues AgentRequest
-    /// values, the agent thread drains them at turn boundaries.
-    /// Backed by `msg_allocator` per doctrine R3. See
-    /// `src/agent/request.zig` and `docs/runtime.md`.
+    /// TUI → agent owner inbox. The TUI enqueues `AgentRequest`
+    /// values; the long-lived agent thread wakes, drains, and dispatches
+    /// them on the owner thread.
     request_queue: RequestQueue,
+    run_control: run_control_mod.RunControl,
     ca: *AgentSession,
     memory_diagnostics: *const memory_debug.Diagnostics,
     session_controller: SessionController,
@@ -426,6 +417,7 @@ pub const Interactive = struct {
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
+    request_in_flight: bool = false,
     last_ctrl_c_ns: i128 = 0,
     tool_output_expanded: bool = false,
     hide_thinking_block: bool = false,
@@ -478,6 +470,7 @@ pub const Interactive = struct {
             .input = input_buffer_mod.InputBuffer.init(state_allocator),
             .event_queue = try UiEventQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
+            .run_control = try run_control_mod.RunControl.init(msg_allocator, .{}),
             .ca = ca,
             .memory_diagnostics = memory_diagnostics,
             .session_controller = SessionController.init(state_allocator, ca, .{
@@ -516,57 +509,29 @@ pub const Interactive = struct {
             if (self.login_thread) |t| t.join();
             self.login_thread = null;
         }
-        // zi-wub.28: if a prompt is mid-flight, abort + join it
-        // before doing anything else. The next steps spawn a fresh
-        // drain_only worker that rebinds the lua owner; the runner
-        // contract requires the previous thread to be fully joined.
+        // Stop the long-lived agent owner thread. Abort first if a
+        // prompt is mid-flight so the owner loop can reach its next
+        // request boundary, then enqueue an ordered shutdown, close the
+        // transport, and join.
         if (self.agent_thread) |t| {
             if (self.is_streaming) self.ca.agent.abort();
+            self.transcript.lua_runner = null;
+            self.enqueueAgentShutdown();
+            self.request_queue.close();
             t.join();
             self.agent_thread = null;
             self.is_streaming = false;
+            self.request_in_flight = false;
+        } else {
+            self.request_queue.close();
         }
-
-        // zi-wub.28: shutdown the extension runner + lua_State on
-        // the agent thread. We:
-        //   1. drain + free any stale pending requests (a queued
-        //      /resume or /model whose result event will never be
-        //      consumed — quit semantics > best-effort delivery)
-        //   2. null transcript.lua_runner so any late refresh path
-        //      can't dereference a freed runner
-        //   3. trySend `.shutdown`, spawn one final drain_only worker,
-        //      join it. The worker binds owner, drains, calls
-        //      ca.shutdownExtensionsOnAgentThread() which nulls the
-        //      ext fields so the upcoming ca.deinit() skips them.
-        //
-        // Skipped entirely if there's no extension runner (tests,
-        // extensionless mode) — nothing to tear down on the agent
-        // thread, plain ca.deinit() handles it.
-        if (self.ca.extensionRunner() != null) {
-            self.drainQueuedRequests();
-            self.transcript.lua_runner = null;
-            switch (self.request_queue.trySend(.{ .shutdown = {} })) {
-                .ok => {},
-                .dropped => unreachable,
-                .closed, .full, .oom => |rejected| {
-                    var failed_req = rejected;
-                    failed_req.deinit(self.msg_allocator);
-                    @panic("failed to enqueue final agent shutdown request");
-                },
-            }
-            const t = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
-                self.drainQueuedRequests();
-                @panic("failed to spawn final agent shutdown worker");
-            };
-            t.join();
-        }
+        self.ca.agent.unbindRunControl(&self.run_control);
 
         if (self.session_event_token) |token| {
             self.session_controller.unsubscribe(token);
             self.session_event_token = null;
         }
         self.session_controller.deinit();
-        self.request_queue.close();
         self.event_queue.close();
 
         // drain and free any remaining events
@@ -587,6 +552,7 @@ pub const Interactive = struct {
         self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
+        self.run_control.deinit();
         // Any unexpectedly undrained requests are mailbox-owned here;
         // deinit cleans them with AgentRequest.deinit.
         self.request_queue.deinit();
@@ -600,6 +566,11 @@ pub const Interactive = struct {
         self.status_text.deinit();
         self.editor.deinit();
         self.tui.deinit();
+    }
+
+    fn startAgentThread(self: *Interactive) !void {
+        if (self.agent_thread != null) return;
+        self.agent_thread = try std.Thread.spawn(.{}, agentThreadFn, .{self});
     }
 
     /// Main loop — runs on the main thread.
@@ -620,12 +591,14 @@ pub const Interactive = struct {
         self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.active_editor.setStatusData(&self.status_data);
+        self.ca.agent.bindRunControl(&self.run_control);
         self.rebuildConversationFromMessages(self.ca.agent.state.messages);
-        self.syncQueueSnapshotFromAgent();
+        self.syncQueueSnapshotFromRunControl();
         self.session_controller.wire();
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
         self.detectGitBranch();
+        try self.startAgentThread();
 
         // Prime the status chips via the agent-owned snapshot path before the
         // first frame. This keeps model/thinking/context reads off the TUI
@@ -736,11 +709,6 @@ pub const Interactive = struct {
             .dropped => unreachable,
             .closed, .full, .oom => return,
         }
-        const thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
-            self.drainQueuedRequests();
-            return;
-        };
-        thread.join();
     }
 
     // ── InputBuffer callbacks ───────────────────────────────────────
@@ -1064,8 +1032,6 @@ pub const Interactive = struct {
             },
             .prompt_worker_finished => |p| {
                 self.is_streaming = false;
-                if (self.agent_thread) |t| t.join();
-                self.agent_thread = null;
                 self.hideLoader();
                 self.tui.setFocus(self.active_editor.component());
                 switch (p.outcome) {
@@ -1083,20 +1049,18 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .request_worker_finished => {
-                // zi-wub.15: drain-only worker completed. Just join
-                // and hide the loader — do NOT touch status_text or
-                // focus here, the individual request handlers
-                // (.session_resumed / .session_resume_failed) owned
-                // that UI state already. See oracle note on why this
-                // is separate from prompt cleanup.
-                if (self.agent_thread) |t| t.join();
-                self.agent_thread = null;
-                self.hideLoader();
+                // Long-lived agent owner loop finished an idle request drain.
+                // Hide the loader only when the TUI actually has a pending
+                // request banner to unwind; individual success/failure events
+                // still own status_text and focus.
+                if (self.request_in_flight) {
+                    self.request_in_flight = false;
+                    self.hideLoader();
+                }
                 self.tui.dirty = true;
             },
             .session_resumed => |r| {
                 self.rebuildConversationFromMessages(r.messages);
-                self.syncQueueSnapshotFromAgent();
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 // Prefer the restore warning over the generic
                 // "session resumed" banner when a fallback happened
@@ -1119,7 +1083,6 @@ pub const Interactive = struct {
             },
             .session_new_started => {
                 self.rebuildConversationFromMessages(&.{});
-                self.syncQueueSnapshotFromAgent();
                 self.status_text.setContent("new session started");
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
@@ -1174,8 +1137,8 @@ pub const Interactive = struct {
         self.transcript.syncQueuedUserMessages(snapshot.steering, snapshot.follow_up);
     }
 
-    fn syncQueueSnapshotFromAgent(self: *Interactive) void {
-        var snapshot = self.ca.agent.snapshotQueuedMessages(self.allocator);
+    fn syncQueueSnapshotFromRunControl(self: *Interactive) void {
+        var snapshot = self.run_control.snapshot(self.allocator);
         defer snapshot.deinit(self.allocator);
         self.applyQueueSnapshot(snapshot);
     }
@@ -1392,9 +1355,6 @@ pub const Interactive = struct {
 
         const ready = posix.poll(&pfds, timeout_ms) catch return;
         if (ready <= 0) return;
-        if (pfds[1].revents & posix.POLL.IN != 0) {
-            self.event_queue.acknowledgeWake();
-        }
     }
 
     fn renderFrame(self: *Interactive) void {
@@ -1434,18 +1394,27 @@ pub const Interactive = struct {
             .content = .{ .text = text },
             .timestamp = std.time.milliTimestamp(),
         } };
-        switch (kind) {
-            .steering => self.ca.agent.steer(msg),
-            .follow_up => self.ca.agent.followUp(msg),
+        const result = self.run_control.enqueue(switch (kind) {
+            .steering => .steering,
+            .follow_up => .follow_up,
+        }, msg);
+        switch (result) {
+            .ok => {},
+            .closed, .oom => {
+                self.status_text.setContent("agent unavailable");
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+                return;
+            },
         }
-        self.syncQueueSnapshotFromAgent();
+        self.syncQueueSnapshotFromRunControl();
         self.active_editor.clear();
         self.refreshGreeterVisibility();
         self.tui.dirty = true;
     }
 
     fn restoreQueuedInputsToEditor(self: *Interactive) void {
-        var snapshot = self.ca.agent.clearQueuedMessages(self.allocator);
+        var snapshot = self.run_control.clearAndSnapshot(self.allocator);
         defer snapshot.deinit(self.allocator);
 
         const count = snapshot.steering.len + snapshot.follow_up.len;
@@ -1475,7 +1444,7 @@ pub const Interactive = struct {
         }
 
         self.active_editor.setText(buf.items);
-        self.syncQueueSnapshotFromAgent();
+        self.syncQueueSnapshotFromRunControl();
         self.refreshGreeterVisibility();
         self.status_text.setContent(if (count == 1) "restored 1 queued message" else "restored queued messages");
         self.status_text.fg = self.theme.fg(.success);
@@ -1483,22 +1452,34 @@ pub const Interactive = struct {
     }
 
     fn submitPrompt(self: *Interactive, text: []const u8) void {
+        if (self.request_in_flight) {
+            self.status_text.setContent("agent is busy");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        }
+
         const prompt_copy = self.msg_allocator.dupe(u8, text) catch return;
+
+        switch (self.request_queue.trySend(.{ .prompt = .{ .text = prompt_copy } })) {
+            .ok => {},
+            .dropped => unreachable,
+            .closed, .full, .oom => |rejected| {
+                var failed_req = rejected;
+                failed_req.deinit(self.msg_allocator);
+                self.tui.setFocus(self.active_editor.component());
+                self.status_text.setContent("agent unavailable");
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+                return;
+            },
+        }
 
         self.active_editor.clear();
         self.refreshGreeterVisibility();
         self.is_streaming = true;
         self.showLoader("Working…");
         self.tui.dirty = true;
-
-        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .prompt = prompt_copy } }) catch {
-            self.is_streaming = false;
-            self.tui.setFocus(self.active_editor.component());
-            self.status_text.setContent("failed to start agent");
-            self.status_text.fg = self.theme.fg(.@"error");
-            self.msg_allocator.free(prompt_copy);
-            return;
-        };
     }
 
     fn handleSubmittedText(self: *Interactive, text: []const u8, queued_kind: ?QueuedInputKind) void {
@@ -1566,7 +1547,7 @@ pub const Interactive = struct {
                 _ = self.dispatchIdleRequest(.{ .new_session = {} }, .{
                     .busy_message = "cannot start a new session while agent is running",
                     .loader_message = "Starting new session...",
-                    .spawn_failed_message = "failed to spawn new-session worker",
+                    .spawn_failed_message = "failed to queue new session",
                 });
                 return true;
             }
@@ -1725,17 +1706,8 @@ pub const Interactive = struct {
         }
     }
 
-    fn drainQueuedRequests(self: *Interactive) void {
-        var drain_buf: [16]AgentRequest = undefined;
-        while (true) {
-            const n = self.request_queue.drainInto(&drain_buf);
-            if (n == 0) return;
-            for (drain_buf[0..n]) |*r| r.deinit(self.msg_allocator);
-        }
-    }
-
     fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
-        if (self.is_streaming or self.agent_thread != null) {
+        if (self.is_streaming or self.request_in_flight) {
             var rejected = req;
             rejected.deinit(self.msg_allocator);
             self.status_text.setContent(options.busy_message);
@@ -1756,20 +1728,9 @@ pub const Interactive = struct {
                 return false;
             },
         }
+        self.request_in_flight = true;
         self.showLoader(options.loader_message);
         self.tui.dirty = true;
-
-        self.agent_thread = std.Thread.spawn(.{}, agentThreadFn, .{ self, AgentWork{ .drain_only = {} } }) catch {
-            self.hideLoader();
-            self.status_text.setContent(options.spawn_failed_message);
-            self.status_text.fg = self.theme.fg(.@"error");
-            // Request is still in the queue — drain it ourselves to
-            // avoid leaking payloads. Safe because idle-only callers
-            // guarantee no worker exists yet.
-            self.drainQueuedRequests();
-            self.tui.dirty = true;
-            return false;
-        };
         return true;
     }
 
@@ -1846,7 +1807,7 @@ pub const Interactive = struct {
         _ = self.dispatchIdleRequest(.{ .resume_session = .{ .path = path_copy } }, .{
             .busy_message = "cannot resume while agent is running",
             .loader_message = "Loading session...",
-            .spawn_failed_message = "failed to spawn resume worker",
+            .spawn_failed_message = "failed to queue resume",
         });
     }
 
@@ -1972,7 +1933,7 @@ pub const Interactive = struct {
         _ = self.dispatchIdleRequest(.{ .set_model = .{ .model = m } }, .{
             .busy_message = "cannot switch model while agent is running",
             .loader_message = "Switching model...",
-            .spawn_failed_message = "failed to spawn model-switch worker",
+            .spawn_failed_message = "failed to queue model switch",
         });
     }
 
@@ -2081,7 +2042,7 @@ pub const Interactive = struct {
         _ = self.dispatchIdleRequest(.{ .set_thinking_level = .{ .level = level } }, .{
             .busy_message = "cannot change thinking level while agent is running",
             .loader_message = "Updating thinking level...",
-            .spawn_failed_message = "failed to spawn thinking-level worker",
+            .spawn_failed_message = "failed to queue thinking-level change",
         });
     }
 
@@ -2254,100 +2215,139 @@ pub const Interactive = struct {
     }
 
     fn publishQueueSnapshot(self: *Interactive) void {
-        const snapshot = self.ca.agent.snapshotQueuedMessages(self.msg_allocator);
+        const snapshot = self.run_control.snapshot(self.msg_allocator);
         self.event_queue.push(.{ .queue_snapshot = snapshot });
     }
 
-    /// Agent worker thread entry point. Handles both streaming
-    /// prompts and drain-only request work (zi-wub.15). This is the
-    /// ONLY path that runs on the agent thread — any future work
-    /// that needs agent-thread ownership should extend `AgentWork`
-    /// rather than adding a second thread fn.
+    /// Long-lived agent owner thread entry point. This is the only
+    /// path that runs agent-owned mutations: it binds lua ownership,
+    /// blocks on the request inbox wake fd, drains queued work, and
+    /// tears down extensions on exit after an ordered shutdown request
+    /// or after the inbox has been transport-closed and fully drained.
     ///
-    /// Completion events are mode-aware:
-    ///   - prompt     → `.prompt_worker_finished` (cleanup after the
-    ///                  controller finishes the full prompt lifecycle)
-    ///   - drain_only → `.request_worker_finished` (join only; the
-    ///                  individual request handlers publish their
-    ///                  own success/failure events, so the TUI
-    ///                  state unwinds without wiping a good status)
-    fn agentThreadFn(self: *Interactive, work: AgentWork) void {
+    /// Completion events stay semantic rather than thread-shaped:
+    ///   - prompt requests publish `.prompt_worker_finished`
+    ///   - non-prompt request drains publish `.request_worker_finished`
+    fn agentThreadFn(self: *Interactive) void {
         logging.setThreadLabel(.agent);
 
-        defer switch (work) {
-            .prompt => |p| self.msg_allocator.free(p),
-            .drain_only => {},
-        };
-
-        // zi-wub.28: bind lua owner on the drain_only path too. The
-        // .15/.16 handlers don't touch lua, but `.shutdown` calls
-        // `lua_close` and we want this thread to be the bound owner
-        // when zi-wub.7 flips wrong-thread access to fatal. Safe
-        // because the previous agent_thread (if any) was joined
-        // before we were spawned (caller invariant — see deinit
-        // and the dispatch sites in handleSlashResume / setModel).
-        if (work == .drain_only) {
-            if (self.ca.extensionRunner()) |runner| {
-                runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-            }
+        if (self.ca.extensionRunner()) |runner| {
+            runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
 
-        switch (work) {
-            .prompt => |p| {
-                // zi-wub.14: drain pending TUI→agent requests at the turn
-                // boundary, before issuing the stream. This is the "safe
-                // point" the doctrine specifies — we are on the agent thread,
-                // owner of lua_state and ca.agent.state, and not yet inside
-                // a stream. Mid-stream draining is explicitly out of scope
-                // (R5: no event loop in this epic).
-                self.processAgentRequests();
+        while (true) {
+            _ = self.request_queue.waitReadable(-1) catch break;
+            if (self.request_queue.isDrained()) break;
+            if (!self.processAgentRequests()) break;
+            if (self.request_queue.isDrained()) break;
+        }
 
-                const outcome = self.session_controller.runPrompt(p) catch |err| {
-                    const err_msg = self.msg_allocator.dupe(u8, @errorName(err)) catch null;
-                    self.event_queue.push(.{ .prompt_worker_finished = .{
-                        .outcome = .assistant_error,
-                        .internal_error = err_msg,
-                    } });
-                    return;
-                };
-                self.event_queue.push(.{ .prompt_worker_finished = .{ .outcome = outcome } });
-            },
-            .drain_only => {
-                self.session_controller.beginRequestDrain();
-                self.processAgentRequests();
-                self.session_controller.finishRequestDrain();
-                self.event_queue.push(.{ .request_worker_finished = {} });
-            },
+        self.ca.shutdownExtensionsOnAgentThread();
+    }
+
+    fn enqueueAgentShutdown(self: *Interactive) void {
+        switch (self.request_queue.trySend(.{ .shutdown = {} })) {
+            .ok, .dropped => {},
+            .closed, .full, .oom => {},
         }
     }
 
-    /// Drain the AgentRequest queue and dispatch each request on the
-    /// agent thread. Runs inside `agentThreadFn` at a turn boundary.
-    ///
-    /// Drain → dispatch is split so handlers can publish UiEvents
-    /// back via the mailbox-backed event queue (and in future may take
-    /// longer than the drain critical section allows).
-    fn processAgentRequests(self: *Interactive) void {
+    fn discardAgentRequests(self: *Interactive, requests: []AgentRequest) void {
+        for (requests) |*req| req.deinit(self.msg_allocator);
+    }
+
+    fn discardQueuedAgentRequests(self: *Interactive) void {
         var buf: [16]AgentRequest = undefined;
         while (true) {
             const n = self.request_queue.drainInto(&buf);
             if (n == 0) return;
-            for (buf[0..n]) |*req| {
+            self.discardAgentRequests(buf[0..n]);
+        }
+    }
+
+    /// Drain the AgentRequest inbox and dispatch each request on the
+    /// long-lived agent owner thread. Returns `false` when an in-band
+    /// shutdown request terminates the owner loop after all earlier work.
+    fn processAgentRequests(self: *Interactive) bool {
+        var buf: [16]AgentRequest = undefined;
+        while (true) {
+            const n = self.request_queue.drainInto(&buf);
+            if (n == 0) return true;
+
+            var idle_processed = false;
+            var prompt_processed = false;
+            var request_drain_active = false;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var req = &buf[i];
                 switch (req.*) {
-                    .resume_session => |r| self.handleResumeSession(r.path),
-                    .new_session => self.handleNewSession(),
-                    .set_model => |s| self.handleSetModel(s.model),
-                    .set_thinking_level => |s| self.handleSetThinkingLevel(s.level),
-                    .refresh_status_snapshot => self.publishStatusSnapshot(),
-                    // zi-wub.28: terminal request. Tears down the
-                    // runner + lua_State on the agent thread (the
-                    // owner). After this returns, ca's extension
-                    // fields are nulled and `AgentSession.deinit`
-                    // (which still runs on the TUI thread for non-
-                    // extension teardown) will skip the lua blocks.
-                    .shutdown => self.ca.shutdownExtensionsOnAgentThread(),
+                    .prompt => |p| {
+                        prompt_processed = true;
+                        const outcome = self.session_controller.runPrompt(p.text) catch |err| {
+                            const err_msg = self.msg_allocator.dupe(u8, @errorName(err)) catch null;
+                            self.event_queue.push(.{ .prompt_worker_finished = .{
+                                .outcome = .assistant_error,
+                                .internal_error = err_msg,
+                            } });
+                            req.deinit(self.msg_allocator);
+                            continue;
+                        };
+                        self.event_queue.push(.{ .prompt_worker_finished = .{ .outcome = outcome } });
+                    },
+                    .resume_session => |r| {
+                        if (!request_drain_active) {
+                            self.session_controller.beginRequestDrain();
+                            request_drain_active = true;
+                        }
+                        idle_processed = true;
+                        self.handleResumeSession(r.path);
+                    },
+                    .new_session => {
+                        if (!request_drain_active) {
+                            self.session_controller.beginRequestDrain();
+                            request_drain_active = true;
+                        }
+                        idle_processed = true;
+                        self.handleNewSession();
+                    },
+                    .set_model => |s| {
+                        if (!request_drain_active) {
+                            self.session_controller.beginRequestDrain();
+                            request_drain_active = true;
+                        }
+                        idle_processed = true;
+                        self.handleSetModel(s.model);
+                    },
+                    .set_thinking_level => |s| {
+                        if (!request_drain_active) {
+                            self.session_controller.beginRequestDrain();
+                            request_drain_active = true;
+                        }
+                        idle_processed = true;
+                        self.handleSetThinkingLevel(s.level);
+                    },
+                    .refresh_status_snapshot => {
+                        if (!request_drain_active) {
+                            self.session_controller.beginRequestDrain();
+                            request_drain_active = true;
+                        }
+                        idle_processed = true;
+                        self.publishStatusSnapshot();
+                    },
+                    .shutdown => {
+                        req.deinit(self.msg_allocator);
+                        self.discardAgentRequests(buf[i + 1 .. n]);
+                        self.discardQueuedAgentRequests();
+                        if (request_drain_active) self.session_controller.finishRequestDrain();
+                        return false;
+                    },
                 }
                 req.deinit(self.msg_allocator);
+            }
+
+            if (request_drain_active) self.session_controller.finishRequestDrain();
+            if (idle_processed and !prompt_processed) {
+                self.event_queue.push(.{ .request_worker_finished = {} });
             }
         }
     }
@@ -2358,6 +2358,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
+        self.publishQueueSnapshot();
         self.publishStatusSnapshot();
         self.event_queue.push(.{ .session_new_started = {} });
     }
@@ -2430,6 +2431,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
+        self.publishQueueSnapshot();
         self.publishStatusSnapshot();
         self.event_queue.push(.{ .session_resumed = message_memory.SessionResumeSnapshot.initOwned(
             owned_messages,

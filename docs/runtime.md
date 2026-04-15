@@ -12,19 +12,38 @@ Short-lived helper threads may exist, but they publish through the same channels
 
 ## Two channels, no third
 
-Cross-thread communication uses only two mailbox-backed channels:
-- **request queue**: TUI -> agent for mutations, work, and I/O
+Cross-thread communication uses two long-lived mailbox-backed owner channels:
+- **request queue**: TUI -> agent owner inbox for mutations, work, and I/O
 - **event queue**: agent/helper -> TUI for published results and UI events
 
-The one deliberate non-mailbox primitive is **run-scoped cancellation**:
-- the owner creates an `AbortSignal` for one in-flight run
-- foreign threads may latch abort through that dedicated controller
-- downstream provider/tool/helper code observes the signal cooperatively
+Mailbox wakeups are **coalesced readiness**, not per-message credits. One wake means "this mailbox became readable or terminal"; the consumer drains until empty.
 
-This is not a third general-purpose queue. It exists because abort must be observable while a run is already blocked inside provider I/O or tool execution, where waiting for the next request-drain boundary would be too late.
+The agent side is a long-lived owner loop: the agent thread blocks on the request inbox wake fd, drains queued work, dispatches it on the owner thread, and shuts down after an ordered terminal request or once a transport-closed inbox has been fully drained.
 
-If the TUI needs the agent to do something, enqueue a request.
+## Run-scoped control surfaces
+
+Two controls intentionally stay outside the main request inbox because a prompt can already be in flight when they matter:
+
+- **abort** — must become observable even while the owner is blocked in provider I/O or tool execution
+- **queued steering / follow-up** — must remain enqueueable and snapshot-visible while a run is active, but only need to be consumed at the loop's steering/follow-up poll points
+
+These are not ad hoc side queues hanging off agent internals.
+They are explicit runtime primitives with narrower semantics than the owner inbox:
+
+- **abort** is a dedicated interrupt latch (`AbortSignal`)
+- **run control** is a dedicated queued-message boundary for steering/follow-up plus snapshot reads
+
+Why they are separate from the request queue:
+- a normal owner request only runs when the owner loop returns to inbox dispatch
+- steering/follow-up must be accepted during an in-flight run, before that dispatch boundary returns
+- unlike abort, they do not justify arbitrary concurrent mutation — only run-scoped queued user messages and their snapshots
+
+If the TUI needs the agent to do something outside those narrow run controls, enqueue a request.
 If the TUI only needs to read data to render or filter, consume a published snapshot.
+
+For shutdown semantics, distinguish two planes:
+- **ordered termination** — an explicit terminal request that runs in FIFO order with earlier work
+- **transport close** — stop future sends and wake an idle consumer; already-queued work may still drain
 
 ## Snapshot vs request
 
@@ -112,7 +131,7 @@ Avoid:
 
 When adding a feature, ask three questions:
 1. who owns this resource for its whole lifetime?
-2. is this a snapshot read or a mutation request?
+2. is this normal owner work (request), a run-scoped control, or a snapshot read?
 3. if it is a snapshot, is it authoritative semantic state, and which consumer reconstructs local view state from it?
 
 If those answers are unclear, the design is not done.

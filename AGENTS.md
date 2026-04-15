@@ -93,15 +93,15 @@ zi runs two long-lived threads — **TUI** and **agent** — plus short-lived he
    TUI thread                             agent thread
    ──────────                             ────────────
 
-   request_queue.push(AgentRequest)  ──▶  drain → dispatch → publish result
-   (resume_session, set_model,            via event_queue
-    shutdown)
+   request_queue.push(AgentRequest)  ──▶  wake → drain → dispatch → publish result
+   (prompt, resume_session,               via event_queue
+    set_model, ...)
 
    event_queue.drain() ──◀── push UiEvent (AgentEvent bridge, login thread,
    apply to widgets, repaint              ext runner — all via msg_allocator)
 ```
 
-`AgentRequest` variants live in `src/agent/request.zig`. Current set: `resume_session`, `new_session`, `set_model`, `set_thinking_level`, `refresh_status_snapshot`, `shutdown`. Add new variants there when the TUI needs the agent to DO something.
+`AgentRequest` variants live in `src/agent/request.zig`. Current set: `prompt`, `resume_session`, `new_session`, `set_model`, `set_thinking_level`, `refresh_status_snapshot`. Mailbox close is the terminal shutdown signal for the long-lived agent owner loop. Add new variants there when the TUI needs the agent to DO something.
 
 ### Snapshot vs request (rule of thumb)
 

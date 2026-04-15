@@ -101,18 +101,15 @@ pub const UiEvent = union(enum) {
         internal_error: ?[]u8 = null,
     },
 
-    // --- request-worker lifecycle (zi-wub.15) ---
-    // Emitted by a drain-only agent worker thread after it finishes
-    // processing AgentRequests. Separate from `agent_finished` so the
-    // TUI can run request-mode cleanup (e.g. hide the "loading session"
-    // loader) WITHOUT stomping on status_text that a successful resume
-    // just set. See oracle review for .15: `.agent_finished` already
-    // clears status_text and restores editor focus — reusing it for
-    // request work would wipe the success message.
+    // --- request drain lifecycle ---
+    // Emitted by the long-lived agent owner thread after it finishes a
+    // non-prompt AgentRequest drain. Separate from `prompt_worker_finished`
+    // so the TUI can unwind request-mode loaders without stomping on
+    // status_text or focus that the individual request handlers already set.
     request_worker_finished: void,
 
     // --- queued-message snapshot ---
-    // Authoritative snapshot of agent-owned steering/follow-up queues.
+    // Authoritative snapshot of the run-control steering/follow-up boundary.
     // Used by the TUI to render queued user-message rows and restore them
     // for amendment without maintaining a parallel semantic mirror.
     queue_snapshot: agent_root.QueuedMessageSnapshot,

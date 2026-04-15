@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
 const Agent = @import("agent.zig").Agent;
+const run_control_mod = @import("../runtime/run_control.zig");
 const faux = ai.faux;
 
 // ── helpers ─────────────────────────────────────────────────────────────
@@ -167,6 +168,27 @@ test "Agent: follow-up queue enqueue doesn't affect state.messages" {
 
     try std.testing.expectEqual(@as(usize, 0), agent.state.messages.len);
     try std.testing.expect(agent.hasQueuedMessages());
+}
+
+test "Agent: bound run control makes queued messages visible without touching state.messages" {
+    const allocator = std.testing.allocator;
+    var agent = Agent.init(allocator, .{});
+    defer agent.deinit();
+
+    var run_control = try run_control_mod.RunControl.init(allocator, .{});
+    defer run_control.deinit();
+    agent.bindRunControl(&run_control);
+
+    const msg = makeUserMessage("Steering message");
+    agent.steer(msg);
+
+    var snapshot = agent.snapshotQueuedMessages(allocator);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), agent.state.messages.len);
+    try std.testing.expect(agent.hasQueuedMessages());
+    try std.testing.expectEqual(@as(usize, 1), snapshot.steering.len);
+    try std.testing.expectEqualStrings("Steering message", snapshot.steering[0].text);
 }
 
 // ── contract: prompt emits events and updates state (agent.test.ts:84-138) ──
@@ -469,6 +491,23 @@ test "Agent: reset clears state and queues" {
 
     try std.testing.expectEqual(@as(usize, 0), agent.state.messages.len);
     try std.testing.expectEqual(false, agent.state.is_streaming);
+    try std.testing.expectEqual(false, agent.hasQueuedMessages());
+}
+
+test "Agent: reset clears a bound run-control queue" {
+    const allocator = std.testing.allocator;
+    var agent = Agent.init(allocator, .{});
+    defer agent.deinit();
+
+    var run_control = try run_control_mod.RunControl.init(allocator, .{});
+    defer run_control.deinit();
+    agent.bindRunControl(&run_control);
+
+    agent.followUp(makeUserMessage("queued"));
+    try std.testing.expect(agent.hasQueuedMessages());
+
+    agent.reset();
+
     try std.testing.expectEqual(false, agent.hasQueuedMessages());
 }
 

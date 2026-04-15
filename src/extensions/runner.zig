@@ -374,10 +374,9 @@ pub const ExtensionRunner = struct {
     /// fallback; explicit bind is the phase 2 truth).
     ///
     /// Idempotent for the same tid. Calling from a different tid is
-    /// a hard rebind — used by interactive mode where every prompt
-    /// spawns a fresh agent thread, so the owning tid changes per
-    /// prompt. The previous prompt's agent thread MUST be joined
-    /// before rebinding or you race against in-flight lua calls.
+    /// a hard rebind — used by flows that transfer ownership before
+    /// the new thread starts issuing lua calls. Interactive mode now
+    /// binds once on its long-lived agent owner thread at startup.
     ///
     pub fn bindLuaOwnerThread(self: *ExtensionRunner, tid: std.Thread.Id) void {
         self.lua_owner_thread.store(tid, .release);

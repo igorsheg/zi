@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const ai_protocol = @import("../ai/protocol.zig");
 const mailbox_mod = @import("../runtime/mailbox.zig");
 
@@ -17,6 +18,7 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 ///                                    publish result via UiEvent queue
 ///
 /// Active request variants:
+///   - prompt
 ///   - resume_session
 ///   - new_session
 ///   - set_model
@@ -24,9 +26,10 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 ///   - refresh_status_snapshot
 ///   - shutdown
 ///
-/// `shutdown` is the terminal request: `Interactive.deinit` enqueues it
-/// so the agent thread itself tears down the extension runner and
-/// lua_State on the thread that owns them.
+/// Ordered agent teardown uses `.shutdown` as the in-band terminal request.
+/// `Interactive.deinit` enqueues that sentinel first so already-queued work
+/// drains in order, then closes the mailbox transport to stop future sends and
+/// wake the owner loop if it is idle.
 ///
 /// Allocator rule (doctrine R3): every payload slice carried by an
 /// AgentRequest MUST be allocated from the thread-safe `msg_allocator`,
@@ -34,6 +37,7 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 /// agent-thread consumer frees with the same allocator after dispatch
 /// via `deinit`.
 pub const AgentRequest = union(enum) {
+    prompt: struct { text: []const u8 },
     resume_session: struct { path: []const u8 },
     new_session: void,
     set_model: struct { model: ai_protocol.Model },
@@ -43,6 +47,7 @@ pub const AgentRequest = union(enum) {
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .prompt => |p| allocator.free(p.text),
             .resume_session => |r| allocator.free(r.path),
             .new_session => {},
             .set_model => {},
@@ -56,9 +61,7 @@ pub const AgentRequest = union(enum) {
 pub const RequestQueue = mailbox_mod.Mailbox(AgentRequest, .{
     .cleanup = .deinit,
     .policy = .unbounded,
-    // The TUI explicitly decides when to spawn/drain agent workers, so
-    // this mailbox does not need an internal wake primitive.
-    .wakeup = .none,
+    .wakeup = .pipe,
 });
 
 test "RequestQueue round-trips a resume_session payload" {
@@ -76,4 +79,49 @@ test "RequestQueue round-trips a resume_session payload" {
     buf[0].deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), q.drainInto(&buf));
+}
+
+test "RequestQueue shutdown sentinel round-trips as an ordered terminal request" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    q.push(.{ .shutdown = {} });
+
+    var buf: [1]AgentRequest = undefined;
+    const n = q.drainInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    switch (buf[0]) {
+        .shutdown => {},
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "RequestQueue wake pipe stays readable until the long-lived owner drains requests" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    const text = try allocator.dupe(u8, "hello");
+    q.push(.{ .prompt = .{ .text = text } });
+
+    var pfd = [1]posix.pollfd{.{
+        .fd = q.wakeReadFd().?,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pfd, 0));
+    try std.testing.expect(try q.waitReadable(0));
+
+    pfd[0].revents = 0;
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pfd, 0));
+
+    var buf: [2]AgentRequest = undefined;
+    const n = q.drainInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("hello", buf[0].prompt.text);
+    buf[0].deinit(allocator);
+
+    pfd[0].revents = 0;
+    try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pfd, 0));
 }

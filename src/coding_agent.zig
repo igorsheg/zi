@@ -525,9 +525,10 @@ pub const AgentSession = struct {
     /// Tear down the extension runner + lua_State on whichever thread
     /// owns the lua_State. This MUST run on the agent thread (the
     /// owner per zi-wub.5/.6) so `lua_close` happens on the bound
-    /// thread. Called by `Interactive.deinit` via the
-    /// `AgentRequest.shutdown` channel (zi-wub.28); after this runs,
-    /// `AgentSession.deinit` sees null fields and skips the blocks.
+    /// thread. Called by the long-lived agent owner loop after
+    /// `Interactive.deinit` closes the request inbox (zi-wub.28);
+    /// after this runs, `AgentSession.deinit` sees null fields and
+    /// skips the blocks.
     ///
     /// Idempotent. Unsubscribes the extension bridge first so no
     /// in-flight agent event can re-enter the runner mid-teardown.
@@ -908,9 +909,9 @@ pub const AgentSession = struct {
     pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
         // zi-wub.6: this thread is now the lua owner. Bind BEFORE
         // wireSubscription because subscribe→agentEventSink calls
-        // assertOnLuaThread on the first event. Interactive mode
-        // spawns a fresh agent thread per prompt; the previous
-        // thread must already be joined (interactive does this).
+        // assertOnLuaThread on the first event. Interactive mode now
+        // uses one long-lived agent owner thread, so this bind is
+        // idempotent after startup rather than a per-prompt rebind.
         if (self._extension_runner) |runner| {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
@@ -932,7 +933,8 @@ pub const AgentSession = struct {
     /// If transcript ends with assistant (nothing to continue from),
     /// returns NeedsPrompt so the caller can provide one.
     pub fn continueSession(self: *AgentSession) !void {
-        // zi-wub.6: see `run()` for the bind rationale.
+        // zi-wub.6: see `run()` for the bind rationale; on the
+        // long-lived interactive agent owner thread this is idempotent.
         if (self._extension_runner) |runner| {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
