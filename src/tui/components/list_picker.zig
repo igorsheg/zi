@@ -143,7 +143,7 @@ pub const ListPicker = struct {
         const h = region.height;
         if (w < 4 or h < 3) return;
 
-        const border_color = self.theme.fg(.border);
+        const border_color = self.theme.fg(.border_muted);
         const style = box_chrome.Style{ .chrome = border_color, .fg = border_color, .dim = border_color };
         const frame = box_chrome.closedFrame(region);
 
@@ -465,6 +465,26 @@ test "searchable picker renders placeholder status and custom empty text" {
     try testing.expectEqual(@as(u21, 'S'), buf.get(3, 1).grapheme.codepoint);
     try testing.expectEqual(@as(u21, 'L'), buf.get(1, 3).grapheme.codepoint);
     try testing.expectEqual(@as(u21, 'N'), buf.get(3, 4).grapheme.codepoint);
+}
+
+test "picker frame uses muted border color" {
+    const theme = themes_builtin.dark().*;
+    const items = [_]SelectItem{
+        .{ .value = "alpha", .label = "Alpha" },
+    };
+
+    var picker = ListPicker.init(&theme);
+    picker.title = "Models";
+    picker.setItems(&items);
+
+    var buf = try Buffer.init(testing.allocator, 20, 5);
+    defer buf.deinit();
+
+    picker.render(buf.region());
+
+    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expect(buf.get(0, 0).fg.eql(theme.fg(.border_muted)));
+    try testing.expect(buf.get(0, 0).bg.eql(Color.default));
 }
 
 test "plain picker selection reports visible source index" {

@@ -1721,7 +1721,7 @@ pub const Interactive = struct {
             .max_height_percent = 40,
             .margin_bottom = 0,
             .margin_top = header_h,
-            .surface = .{ .fill = self.theme.bg(.tool_pending_bg) },
+            .surface = .{ .fill = Color.default },
         };
     }
 

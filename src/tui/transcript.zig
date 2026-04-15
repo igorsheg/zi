@@ -591,8 +591,8 @@ pub const ToolExecution = struct {
     // ── Rendering ─────────────────────────────────────────────────
 
     fn bgColor(self: *ToolExecution) Color {
-        if (self.is_partial) return self.theme.bg(.tool_pending_bg);
-        return if (self.is_error) self.theme.bg(.tool_error_bg) else self.theme.bg(.tool_success_bg);
+        _ = self;
+        return Color.default;
     }
 
     // Vertical padding inside the bg box (pi-mono: Box(paddingX=1, paddingY=1))
@@ -2017,7 +2017,7 @@ test "Transcript built-in items install transcript renderables" {
     try testing.expectEqual(ItemKind.tool_execution, transcript.items.items[2].kind);
 }
 
-test "tool execution background follows pending success and error states" {
+test "tool execution keeps transcript background transparent" {
     const theme = themes_builtin.dark();
     var tool = ToolExecution{
         .tool_call_id = try testing.allocator.dupe(u8, "tool-1"),
@@ -2030,11 +2030,11 @@ test "tool execution background follows pending success and error states" {
         testing.allocator.free(tool.tool_name);
     }
 
-    try testing.expectEqual(theme.bg(.tool_pending_bg), tool.bgColor());
+    try testing.expect(tool.bgColor().eql(Color.default));
     tool.is_partial = false;
-    try testing.expectEqual(theme.bg(.tool_success_bg), tool.bgColor());
+    try testing.expect(tool.bgColor().eql(Color.default));
     tool.is_error = true;
-    try testing.expectEqual(theme.bg(.tool_error_bg), tool.bgColor());
+    try testing.expect(tool.bgColor().eql(Color.default));
 }
 
 test "Transcript renders assistant text and tool execution in order" {

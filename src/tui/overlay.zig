@@ -542,6 +542,39 @@ test "overlay surface fill hides content below overlay rect" {
     try testing.expectEqual(@as(u21, 'x'), buf.get(5, 2).grapheme.codepoint);
 }
 
+test "overlay surface can fill with terminal default background" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
+    defer buf.deinit();
+    const root = buf.region();
+    root.fill(0, 0, root.width, root.height, Cell{ .grapheme = .{ .codepoint = 'x' }, .bg = Color.rgb(9, 9, 9) });
+
+    var mgr = OverlayManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const DummyComp = struct {
+        pub fn render(_: *@This(), _: Region) void {}
+        pub fn measure(_: *@This(), _: u32) Measurement {
+            return .{ .min_height = 1, .preferred_height = 2 };
+        }
+        pub fn component(self: *@This()) Component {
+            return Component.init(@This(), self);
+        }
+    };
+
+    var d = DummyComp{};
+    _ = mgr.showOverlay(d.component(), .{
+        .anchor = .top_left,
+        .width = 4,
+        .surface = .{ .fill = Color.default },
+    }, null);
+
+    mgr.renderOverlays(root);
+
+    try testing.expectEqual(@as(u21, ' '), buf.get(0, 0).grapheme.codepoint);
+    try testing.expect(buf.get(0, 0).bg.eql(Color.default));
+    try testing.expect(buf.get(5, 2).bg.eql(Color.rgb(9, 9, 9)));
+}
+
 test "OverlayManager non-capturing overlay not returned by topmostCapturing" {
     var mgr = OverlayManager.init(testing.allocator);
     defer mgr.deinit();
