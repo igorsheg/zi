@@ -18,8 +18,13 @@ const context_mod = @import("context.zig");
 const ResolvedStartupAction = union(enum) {
     none,
     prompt: []const u8,
-    resume_session: []const u8,
-    resume_picker,
+    resume_session: struct {
+        path: []const u8,
+        restore_session_model: bool = true,
+    },
+    resume_picker: struct {
+        restore_session_model: bool = true,
+    },
 };
 
 const StartupResolution = union(enum) {
@@ -131,8 +136,13 @@ pub fn run(
     interactive.setStartupAction(switch (startup_action) {
         .none => .none,
         .prompt => |prompt| .{ .prompt = prompt },
-        .resume_session => |path| .{ .resume_session = path },
-        .resume_picker => .resume_picker,
+        .resume_session => |session_resume| .{ .resume_session = .{
+            .path = session_resume.path,
+            .restore_session_model = session_resume.restore_session_model,
+        } },
+        .resume_picker => |picker| .{ .resume_picker = .{
+            .restore_session_model = picker.restore_session_model,
+        } },
     });
 
     if (needs_auth) {
@@ -151,16 +161,28 @@ fn resolveStartupAction(
 ) std.mem.Allocator.Error!StartupResolution {
     return switch (options.session_target) {
         .none => .{ .ok = if (options.initial_prompt) |prompt| .{ .prompt = prompt } else .none },
-        .picker => .{ .ok = .resume_picker },
+        .picker => .{ .ok = .{ .resume_picker = .{
+            .restore_session_model = shouldRestoreSessionModel(options),
+        } } },
         .most_recent => switch (try session_lookup_mod.resolvePath(allocator, cwd, .most_recent)) {
-            .ok => |path| .{ .ok = .{ .resume_session = path } },
+            .ok => |path| .{ .ok = .{ .resume_session = .{
+                .path = path,
+                .restore_session_model = shouldRestoreSessionModel(options),
+            } } },
             .err => |diag| .{ .err = result.fromSessionLookupDiagnostic(diag) },
         },
         .reference => |ref| switch (try session_lookup_mod.resolvePath(allocator, cwd, .{ .reference = ref })) {
-            .ok => |path| .{ .ok = .{ .resume_session = path } },
+            .ok => |path| .{ .ok = .{ .resume_session = .{
+                .path = path,
+                .restore_session_model = shouldRestoreSessionModel(options),
+            } } },
             .err => |diag| .{ .err = result.fromSessionLookupDiagnostic(diag) },
         },
     };
+}
+
+fn shouldRestoreSessionModel(options: plan.InteractivePlan) bool {
+    return options.model_id == null;
 }
 
 fn startupActionResumesSession(action: ResolvedStartupAction) bool {
@@ -168,6 +190,23 @@ fn startupActionResumesSession(action: ResolvedStartupAction) bool {
         .resume_session => true,
         .none, .prompt, .resume_picker => false,
     };
+}
+
+test "startup resume keeps explicit cli model instead of restoring session model" {
+    try std.testing.expect(shouldRestoreSessionModel(.{}));
+    try std.testing.expect(!shouldRestoreSessionModel(.{ .model_id = "claude-sonnet-4-5" }));
+
+    const from_picker = try resolveStartupAction(std.testing.allocator, "/tmp", .{
+        .session_target = .picker,
+        .model_id = "claude-sonnet-4-5",
+    });
+    switch (from_picker) {
+        .ok => |action| switch (action) {
+            .resume_picker => |picker| try std.testing.expect(!picker.restore_session_model),
+            else => return error.UnexpectedStartupAction,
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
 }
 
 fn resolveSelectedTheme(ca: *sdk.AgentSession, settings: *const @import("../settings/manager.zig").SettingsManager) *const theme_mod.Theme {

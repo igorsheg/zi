@@ -191,6 +191,7 @@ const ResumePickerFlow = struct {
     items: []SelectItem = &.{},
     picker: ListPicker,
     handle: ?tui_mod.OverlayHandle = null,
+    restore_session_model: bool = true,
 
     const Row = struct {
         item: SelectItem,
@@ -314,8 +315,13 @@ const ModelPickerFlow = struct {
 const StartupAction = union(enum) {
     none,
     prompt: []const u8,
-    resume_session: []const u8,
-    resume_picker,
+    resume_session: struct {
+        path: []const u8,
+        restore_session_model: bool = true,
+    },
+    resume_picker: struct {
+        restore_session_model: bool = true,
+    },
 };
 
 /// Interactive mode — wires AgentSession (blocking on its thread)
@@ -721,21 +727,24 @@ pub const Interactive = struct {
         switch (self.startup_action) {
             .none => {},
             .prompt => |text| self.submitPrompt(text),
-            .resume_session => |path| {
-                const path_copy = self.msg_allocator.dupe(u8, path) catch {
+            .resume_session => |session_resume| {
+                const path_copy = self.msg_allocator.dupe(u8, session_resume.path) catch {
                     self.status_text.setContent("out of memory");
                     self.status_text.fg = self.theme.fg(.@"error");
                     self.tui.dirty = true;
                     self.startup_action = .none;
                     return;
                 };
-                _ = self.dispatchIdleRequest(.{ .resume_session = .{ .path = path_copy } }, .{
+                _ = self.dispatchIdleRequest(.{ .resume_session = .{
+                    .path = path_copy,
+                    .restore_session_model = session_resume.restore_session_model,
+                } }, .{
                     .busy_message = "cannot resume while agent is running",
                     .loader_message = "Loading session...",
                     .spawn_failed_message = "failed to queue resume",
                 });
             },
-            .resume_picker => self.showSessionPicker(),
+            .resume_picker => |picker| self.showSessionPicker(picker.restore_session_model),
         }
         self.startup_action = .none;
     }
@@ -1589,7 +1598,7 @@ pub const Interactive = struct {
                 return true;
             }
             if (std.mem.eql(u8, name, "resume")) {
-                self.showSessionPicker();
+                self.showSessionPicker(true);
                 return true;
             }
             if (std.mem.eql(u8, name, "model")) {
@@ -1784,7 +1793,7 @@ pub const Interactive = struct {
         self.resume_picker_flow = null;
     }
 
-    fn showSessionPicker(self: *Interactive) void {
+    fn showSessionPicker(self: *Interactive, restore_session_model: bool) void {
         // zi-wub.26: cwd lives on the TUI side (Interactive was
         // constructed with it; editor.cwd is the canonical copy).
         // Reading from ca.session_store.writer.cwd would reach into
@@ -1810,6 +1819,7 @@ pub const Interactive = struct {
         flow.picker.on_select = &onSessionSelected;
         flow.picker.on_cancel = &onSessionPickerCancel;
         flow.picker.callback_ctx = @ptrCast(self);
+        flow.restore_session_model = restore_session_model;
         self.cancelTranscriptSelection();
         self.resume_picker_flow = flow;
         self.resume_picker_flow.?.handle = self.tui.showOverlay(
@@ -1840,8 +1850,12 @@ pub const Interactive = struct {
             self.status_text.fg = self.theme.fg(.@"error");
             return;
         };
+        const restore_session_model = self.resume_picker_flow.?.restore_session_model;
         self.closeResumePickerFlow();
-        _ = self.dispatchIdleRequest(.{ .resume_session = .{ .path = path_copy } }, .{
+        _ = self.dispatchIdleRequest(.{ .resume_session = .{
+            .path = path_copy,
+            .restore_session_model = restore_session_model,
+        } }, .{
             .busy_message = "cannot resume while agent is running",
             .loader_message = "Loading session...",
             .spawn_failed_message = "failed to queue resume",
@@ -2337,7 +2351,7 @@ pub const Interactive = struct {
                             request_drain_active = true;
                         }
                         idle_processed = true;
-                        self.handleResumeSession(r.path);
+                        self.handleResumeSession(r.path, r.restore_session_model);
                     },
                     .new_session => {
                         if (!request_drain_active) {
@@ -2408,7 +2422,7 @@ pub const Interactive = struct {
     ///
     /// Transcript rebuild stays on the TUI thread — this handler
     /// does NOT touch `self.transcript`. That's .15's whole point.
-    fn handleResumeSession(self: *Interactive, path: []const u8) void {
+    fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
         var loaded = coding_agent_mod.openSession(self.ca.allocator, path) catch {
             const msg = self.msg_allocator.dupe(u8, "failed to load session") catch return;
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
@@ -2429,32 +2443,34 @@ pub const Interactive = struct {
         self.ca.agent.loadMessages(loaded.messages);
         self.ca.agent.state.thinking_level = parseAgentThinkingLevel(loaded.thinking_level);
 
-        // pi-mono parity: if the session recorded a last model,
-        // route it through `restoreModelFromSession`. Falls back to
-        // the current model / first authed model when the saved one
-        // disappeared or lost auth. `restore_warning`, when set,
+        // pi-mono parity: when startup did not pin an explicit CLI model,
+        // restore the session's last model via `restoreModelFromSession`.
+        // Falls back to the current model / first authed model when the
+        // saved one disappeared or lost auth. `restore_warning`, when set,
         // rides along with `.session_resumed` so it survives the
         // transcript-rebuild status update on the TUI side.
         //
-        // pi-mono source: model-resolver.ts:559-628
+        // pi-mono source: sdk.ts:202-229 and model-resolver.ts:559-628
         var restore_warning: ?[]u8 = null;
-        if (loaded.model) |saved| {
-            if (self.ca.model_registry) |registry| {
-                const restore = ai_resolve.restoreModelFromSession(.{
-                    .saved_provider = saved.provider,
-                    .saved_model_id = saved.model_id,
-                    .current_model = self.ca.agent.state.model,
-                    .registry = registry,
-                    .allocator = self.msg_allocator,
-                }) catch ai_resolve.RestoreResult{ .model = null, .fallback_message = null };
-                if (restore.model) |m| {
-                    self.ca.agent.state.model = m;
-                }
-                if (restore.fallback_message) |msg| {
-                    // `restoreModelFromSession` allocates via
-                    // msg_allocator above; take ownership directly.
-                    // `UiEvent.deinit` frees with the same allocator.
-                    restore_warning = msg;
+        if (restore_session_model) {
+            if (loaded.model) |saved| {
+                if (self.ca.model_registry) |registry| {
+                    const restore = ai_resolve.restoreModelFromSession(.{
+                        .saved_provider = saved.provider,
+                        .saved_model_id = saved.model_id,
+                        .current_model = self.ca.agent.state.model,
+                        .registry = registry,
+                        .allocator = self.msg_allocator,
+                    }) catch ai_resolve.RestoreResult{ .model = null, .fallback_message = null };
+                    if (restore.model) |m| {
+                        self.ca.agent.state.model = m;
+                    }
+                    if (restore.fallback_message) |msg| {
+                        // `restoreModelFromSession` allocates via
+                        // msg_allocator above; take ownership directly.
+                        // `UiEvent.deinit` frees with the same allocator.
+                        restore_warning = msg;
+                    }
                 }
             }
         }

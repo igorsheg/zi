@@ -38,7 +38,10 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 /// via `deinit`.
 pub const AgentRequest = union(enum) {
     prompt: struct { text: []const u8 },
-    resume_session: struct { path: []const u8 },
+    resume_session: struct {
+        path: []const u8,
+        restore_session_model: bool = true,
+    },
     new_session: void,
     set_model: struct { model: ai_protocol.Model },
     set_thinking_level: struct { level: @import("protocol.zig").ThinkingLevel },
@@ -64,18 +67,22 @@ pub const RequestQueue = mailbox_mod.Mailbox(AgentRequest, .{
     .wakeup = .pipe,
 });
 
-test "RequestQueue round-trips a resume_session payload" {
+test "RequestQueue round-trips a resume_session payload and restore policy" {
     const allocator = std.testing.allocator;
     var q = try RequestQueue.init(allocator);
     defer q.deinit();
 
     const path = try allocator.dupe(u8, "/tmp/some/session.jsonl");
-    q.push(.{ .resume_session = .{ .path = path } });
+    q.push(.{ .resume_session = .{
+        .path = path,
+        .restore_session_model = false,
+    } });
 
     var buf: [4]AgentRequest = undefined;
     const n = q.drainInto(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqualStrings("/tmp/some/session.jsonl", buf[0].resume_session.path);
+    try std.testing.expect(!buf[0].resume_session.restore_session_model);
     buf[0].deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), q.drainInto(&buf));
