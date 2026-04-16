@@ -51,6 +51,10 @@ pub const ListModelsPlan = struct {
     search: ?[]const u8 = null,
 };
 
+pub const BuildOptions = struct {
+    piped_stdin: ?[]const u8 = null,
+};
+
 pub const PlanDiagnostic = union(enum) {
     too_many_positionals,
     too_many_list_models_positionals,
@@ -74,12 +78,12 @@ pub const PlanResult = union(enum) {
     err: PlanDiagnostic,
 };
 
-pub fn build(raw: RawCommand) PlanResult {
+pub fn build(allocator: std.mem.Allocator, raw: RawCommand, options: BuildOptions) std.mem.Allocator.Error!PlanResult {
     return switch (raw) {
         .help => .{ .ok = .{ .help = .{} } },
         .version => .{ .ok = .{ .version = .{} } },
         .list_models => |list_models| buildListModels(list_models),
-        .run => |run| buildRun(run),
+        .run => |run| try buildRun(allocator, run, options),
     };
 }
 
@@ -91,11 +95,11 @@ fn buildListModels(raw: RawListModelsArgs) PlanResult {
     } } };
 }
 
-fn buildRun(raw: RawRunArgs) PlanResult {
+fn buildRun(allocator: std.mem.Allocator, raw: RawRunArgs, options: BuildOptions) std.mem.Allocator.Error!PlanResult {
     if (raw.positionals.len > 1) return .{ .err = .too_many_positionals };
     if (raw.print_mode and raw.mode != null) return .{ .err = .conflicting_batch_selectors };
 
-    const prompt = if (raw.positionals.len == 1) raw.positionals[0] else null;
+    const positional_prompt = if (raw.positionals.len == 1) raw.positionals[0] else null;
     const session_selection = switch (selectSessionTarget(raw)) {
         .ok => |selection| selection,
         .err => |diag| return .{ .err = diag },
@@ -115,14 +119,14 @@ fn buildRun(raw: RawRunArgs) PlanResult {
         return .{ .err = .{ .session_target_requires_interactive = session_flag.? } };
     }
 
-    if (prompt != null and session_flag != null) {
+    if (positional_prompt != null and session_flag != null) {
         return .{ .err = .{ .prompt_not_allowed_for_session_target = session_flag.? } };
     }
 
     if (batch_selected) {
         return .{ .ok = .{ .run = .{ .batch = .{
             .output = raw.mode orelse .text,
-            .prompt = prompt orelse return .{ .err = .prompt_required_for_batch },
+            .prompt = (try mergeBatchPrompt(allocator, options.piped_stdin, positional_prompt)) orelse return .{ .err = .prompt_required_for_batch },
             .api_key = raw.api_key,
             .model_id = raw.model_id,
             .no_session = raw.no_session,
@@ -132,7 +136,7 @@ fn buildRun(raw: RawRunArgs) PlanResult {
     }
 
     return .{ .ok = .{ .run = .{ .interactive = .{
-        .initial_prompt = prompt,
+        .initial_prompt = positional_prompt,
         .api_key = raw.api_key,
         .model_id = raw.model_id,
         .session_target = session_target,
@@ -140,6 +144,16 @@ fn buildRun(raw: RawRunArgs) PlanResult {
         .tool_allowlist_csv = raw.tools_filter,
         .append_system_prompt = raw.append_system_prompt,
     } } } };
+}
+
+fn mergeBatchPrompt(
+    allocator: std.mem.Allocator,
+    piped_stdin: ?[]const u8,
+    positional_prompt: ?[]const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    if (piped_stdin == null) return positional_prompt;
+    if (positional_prompt == null) return piped_stdin;
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ piped_stdin.?, positional_prompt.? });
 }
 
 const SessionSelection = struct {
@@ -185,7 +199,10 @@ fn selectSessionTarget(raw: RawRunArgs) SessionSelectionResult {
 }
 
 test "default run plan is interactive without initial prompt or session target" {
-    const result = build(.{ .run = .{} });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try build(arena.allocator(), .{ .run = .{} }, .{});
     switch (result) {
         .ok => |plan| switch (plan) {
             .run => |run| switch (run) {
@@ -202,9 +219,12 @@ test "default run plan is interactive without initial prompt or session target" 
 }
 
 test "planner builds explicit interactive and batch plans from the chosen selectors" {
-    const continue_result = build(.{ .run = .{
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const continue_result = try build(arena.allocator(), .{ .run = .{
         .continue_session = true,
-    } });
+    } }, .{});
     switch (continue_result) {
         .ok => |plan| switch (plan) {
             .run => |run| switch (run) {
@@ -216,9 +236,9 @@ test "planner builds explicit interactive and batch plans from the chosen select
         .err => return error.UnexpectedDiagnostic,
     }
 
-    const session_result = build(.{ .run = .{
+    const session_result = try build(arena.allocator(), .{ .run = .{
         .session_ref = "session-1234",
-    } });
+    } }, .{});
     switch (session_result) {
         .ok => |plan| switch (plan) {
             .run => |run| switch (run) {
@@ -233,10 +253,10 @@ test "planner builds explicit interactive and batch plans from the chosen select
         .err => return error.UnexpectedDiagnostic,
     }
 
-    const batch_result = build(.{ .run = .{
+    const batch_result = try build(arena.allocator(), .{ .run = .{
         .mode = .json,
         .positionals = &.{"hello"},
-    } });
+    } }, .{});
     switch (batch_result) {
         .ok => |plan| switch (plan) {
             .run => |run| switch (run) {
@@ -253,7 +273,10 @@ test "planner builds explicit interactive and batch plans from the chosen select
 }
 
 test "list-models plan carries optional search and rejects extra positionals" {
-    const default_result = build(.{ .list_models = .{} });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const default_result = try build(arena.allocator(), .{ .list_models = .{} }, .{});
     switch (default_result) {
         .ok => |plan| switch (plan) {
             .list_models => |list_models| try std.testing.expect(list_models.search == null),
@@ -262,7 +285,7 @@ test "list-models plan carries optional search and rejects extra positionals" {
         .err => return error.UnexpectedDiagnostic,
     }
 
-    const search_result = build(.{ .list_models = .{ .positionals = &.{"claude"} } });
+    const search_result = try build(arena.allocator(), .{ .list_models = .{ .positionals = &.{"claude"} } }, .{});
     switch (search_result) {
         .ok => |plan| switch (plan) {
             .list_models => |list_models| try std.testing.expectEqualStrings("claude", list_models.search.?),
@@ -271,7 +294,7 @@ test "list-models plan carries optional search and rejects extra positionals" {
         .err => return error.UnexpectedDiagnostic,
     }
 
-    const too_many = build(.{ .list_models = .{ .positionals = &.{ "claude", "sonnet" } } });
+    const too_many = try build(arena.allocator(), .{ .list_models = .{ .positionals = &.{ "claude", "sonnet" } } }, .{});
     switch (too_many) {
         .err => |diag| switch (diag) {
             .too_many_list_models_positionals => {},
@@ -282,10 +305,13 @@ test "list-models plan carries optional search and rejects extra positionals" {
 }
 
 test "planner rejects conflicting or interactive-only session target combinations" {
-    const conflicting_selectors = build(.{ .run = .{
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const conflicting_selectors = try build(arena.allocator(), .{ .run = .{
         .continue_session = true,
         .resume_picker = true,
-    } });
+    } }, .{});
     switch (conflicting_selectors) {
         .err => |diag| switch (diag) {
             .conflicting_session_selectors => |combo| {
@@ -297,10 +323,10 @@ test "planner rejects conflicting or interactive-only session target combination
         .ok => return error.ExpectedDiagnostic,
     }
 
-    const prompt_and_target = build(.{ .run = .{
+    const prompt_and_target = try build(arena.allocator(), .{ .run = .{
         .session_ref = "session-1234",
         .positionals = &.{"hello"},
-    } });
+    } }, .{});
     switch (prompt_and_target) {
         .err => |diag| switch (diag) {
             .prompt_not_allowed_for_session_target => |flag| try std.testing.expectEqualStrings("--session", flag),
@@ -309,10 +335,10 @@ test "planner rejects conflicting or interactive-only session target combination
         .ok => return error.ExpectedDiagnostic,
     }
 
-    const batch_and_target = build(.{ .run = .{
+    const batch_and_target = try build(arena.allocator(), .{ .run = .{
         .print_mode = true,
         .continue_session = true,
-    } });
+    } }, .{});
     switch (batch_and_target) {
         .err => |diag| switch (diag) {
             .session_target_requires_interactive => |flag| try std.testing.expectEqualStrings("--continue", flag),

@@ -29,10 +29,12 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  {s} -p \"prompt\"         Run in batch text mode and print the final assistant text\n" ++
             "  {s} --mode json \"prompt\"\n" ++
             "                         Run in batch JSON mode and emit JSON lines\n" ++
+            "  printf 'text' | {s} -p    Use piped stdin as the batch prompt body\n" ++
             "  {s} --continue          Resume the most recent session for this project\n" ++
             "  {s} --resume            Open the interactive session picker\n" ++
             "  {s} --session <path|id> Resume a specific session by path or ID prefix\n\n",
         .{
+            app_meta.name,
             app_meta.name,
             app_meta.name,
             app_meta.name,
@@ -61,6 +63,9 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  -v, --version                Show version\n\n" ++
             "Notes:\n" ++
             "  - batch mode is explicit: use -p or --mode\n" ++
+            "  - piped stdin is read only for explicit batch mode, never to force batch selection\n" ++
+            "  - batch mode accepts a positional prompt, piped stdin, or both; stdin is concatenated first\n" ++
+            "  - empty or whitespace-only piped stdin is ignored\n" ++
             "  - batch text mode prints the final assistant text only after completion\n" ++
             "  - batch JSON mode emits a session header first when persistence is enabled\n" ++
             "  - batch text failures come from the final assistant error/abort state\n" ++
@@ -88,6 +93,8 @@ test "general help documents explicit session-target behaviors and actions" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Resume a specific session by path or ID prefix") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "prints the final assistant text only") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "session header first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Use piped stdin as the batch prompt body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "piped stdin is read only for explicit batch mode") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "List available models") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "optional fuzzy search") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "session targets are interactive-only and mutually exclusive") != null);

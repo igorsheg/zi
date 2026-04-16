@@ -68,7 +68,15 @@ pub fn main() !void {
     };
     defer raw_command.deinit(allocator);
 
-    const execution_plan = switch (cli.plan.build(raw_command)) {
+    const piped_stdin = switch (raw_command) {
+        .run => |run| if (run.print_mode or run.mode != null)
+            try cli.stdin.readPipedStdin(allocator)
+        else
+            null,
+        else => null,
+    };
+
+    const execution_plan = switch (try cli.plan.build(allocator, raw_command, .{ .piped_stdin = piped_stdin })) {
         .ok => |plan| plan,
         .err => |diag| {
             try writePlanDiagnostic(diag);

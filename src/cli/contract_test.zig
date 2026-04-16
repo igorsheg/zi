@@ -12,7 +12,7 @@ const CliOutcome = union(enum) {
     plan_diag: plan.PlanDiagnostic,
 };
 
-fn parseAndPlan(allocator: std.mem.Allocator, argv: []const []const u8) !CliOutcome {
+fn parseAndPlan(allocator: std.mem.Allocator, argv: []const []const u8, piped_stdin: ?[]const u8) !CliOutcome {
     const detected = action.Action.detect(argv);
     var raw_command = switch (try parse.parse(allocator, detected, argv)) {
         .ok => |command| command,
@@ -20,7 +20,7 @@ fn parseAndPlan(allocator: std.mem.Allocator, argv: []const []const u8) !CliOutc
     };
     defer raw_command.deinit(allocator);
 
-    return switch (plan.build(raw_command)) {
+    return switch (try plan.build(allocator, raw_command, .{ .piped_stdin = piped_stdin })) {
         .ok => |execution_plan| .{ .ok = execution_plan },
         .err => |diag| .{ .plan_diag = diag },
     };
@@ -38,7 +38,7 @@ test "cli run contract defaults to interactive and keeps a lone prompt interacti
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const default_result = try parseAndPlan(arena.allocator(), &.{});
+    const default_result = try parseAndPlan(arena.allocator(), &.{}, null);
     switch (default_result) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
@@ -53,7 +53,7 @@ test "cli run contract defaults to interactive and keeps a lone prompt interacti
         .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
     }
 
-    const prompt_result = try parseAndPlan(arena.allocator(), &.{"hello"});
+    const prompt_result = try parseAndPlan(arena.allocator(), &.{"hello"}, null);
     switch (prompt_result) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
@@ -70,7 +70,7 @@ test "cli batch contract requires explicit selectors for text and json" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const text_result = try parseAndPlan(arena.allocator(), &.{ "-p", "hello" });
+    const text_result = try parseAndPlan(arena.allocator(), &.{ "-p", "hello" }, null);
     switch (text_result) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
@@ -85,7 +85,7 @@ test "cli batch contract requires explicit selectors for text and json" {
         .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
     }
 
-    const json_result = try parseAndPlan(arena.allocator(), &.{ "--mode", "json", "hello" });
+    const json_result = try parseAndPlan(arena.allocator(), &.{ "--mode", "json", "hello" }, null);
     switch (json_result) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
@@ -101,11 +101,61 @@ test "cli batch contract requires explicit selectors for text and json" {
     }
 }
 
+test "cli batch mode uses piped stdin only when explicitly selected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const stdin_only_batch = try parseAndPlan(arena.allocator(), &.{"-p"}, "from stdin");
+    switch (stdin_only_batch) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run_plan| switch (run_plan) {
+                .batch => |batch| try std.testing.expectEqualStrings("from stdin", batch.prompt),
+                else => return error.ExpectedBatchPlan,
+            },
+            else => return error.ExpectedRunPlan,
+        },
+        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
+    }
+
+    const no_prompt_source = try parseAndPlan(arena.allocator(), &.{"-p"}, null);
+    switch (no_prompt_source) {
+        .plan_diag => |diag| switch (diag) {
+            .prompt_required_for_batch => {},
+            else => return error.ExpectedDiagnostic,
+        },
+        .ok, .parse_diag => return error.ExpectedDiagnostic,
+    }
+
+    const merged_batch = try parseAndPlan(arena.allocator(), &.{ "--mode", "json", "hello" }, "from stdin\n");
+    switch (merged_batch) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run_plan| switch (run_plan) {
+                .batch => |batch| try std.testing.expectEqualStrings("from stdin\nhello", batch.prompt),
+                else => return error.ExpectedBatchPlan,
+            },
+            else => return error.ExpectedRunPlan,
+        },
+        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
+    }
+
+    const interactive_result = try parseAndPlan(arena.allocator(), &.{"hello"}, "from stdin");
+    switch (interactive_result) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run_plan| switch (run_plan) {
+                .interactive => |interactive| try std.testing.expectEqualStrings("hello", interactive.initial_prompt.?),
+                else => return error.ExpectedInteractivePlan,
+            },
+            else => return error.ExpectedRunPlan,
+        },
+        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
+    }
+}
+
 test "cli rejects invalid session-target combinations with actionable diagnostics" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const prompt_and_continue = try parseAndPlan(arena.allocator(), &.{ "--continue", "hello" });
+    const prompt_and_continue = try parseAndPlan(arena.allocator(), &.{ "--continue", "hello" }, null);
     switch (prompt_and_continue) {
         .plan_diag => |diag| {
             const rendered = try renderPlanDiagnostic(diag);
@@ -116,7 +166,7 @@ test "cli rejects invalid session-target combinations with actionable diagnostic
         .ok, .parse_diag => return error.ExpectedDiagnostic,
     }
 
-    const batch_and_continue = try parseAndPlan(arena.allocator(), &.{ "-p", "--continue" });
+    const batch_and_continue = try parseAndPlan(arena.allocator(), &.{ "-p", "--continue" }, null);
     switch (batch_and_continue) {
         .plan_diag => |diag| {
             const rendered = try renderPlanDiagnostic(diag);
@@ -132,7 +182,7 @@ test "cli utility surfaces stay truthful for help version and list-models" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const list_models_result = try parseAndPlan(arena.allocator(), &.{ "--list-models", "claude" });
+    const list_models_result = try parseAndPlan(arena.allocator(), &.{ "--list-models", "claude" }, null);
     switch (list_models_result) {
         .ok => |execution_plan| switch (execution_plan) {
             .list_models => |list_models| try std.testing.expectEqualStrings("claude", list_models.search.?),

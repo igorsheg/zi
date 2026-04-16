@@ -56,6 +56,10 @@ Additional contract rules:
 - batch text mode prints the final assistant text only after completion
 - batch JSON mode emits a session header first when session persistence is enabled, then JSON event lines
 - batch text failures derive from the final assistant stop reason / error state, not incidental stream chatter
+- piped stdin is read only when batch mode was explicitly selected (`-p` or `--mode`)
+- piped stdin can satisfy the batch prompt requirement by itself, or be concatenated before the positional prompt
+- empty or whitespace-only piped stdin is treated as absent
+- interactive mode does not read piped stdin and does not force batch selection
 - the **default action is `run`**
 - session-targeting flags are explicit and validated
 - session targets are **interactive-only** and **mutually exclusive**
@@ -218,7 +222,7 @@ pub const ExecutionPlan = union(enum) {
 
 The exact field set may grow, but the architecture rule is fixed:
 
-- a batch plan requires a prompt
+- a batch plan requires a prompt source (positional prompt, piped stdin, or both)
 - an interactive plan may have an initial prompt
 - batch output mode is explicit
 - session targeting is explicit
@@ -390,6 +394,9 @@ Valid:
 - `zi "hello"`
 - `zi -p "hello"`
 - `zi --mode json "hello"`
+- `cat README.md | zi -p`
+- `cat README.md | zi --mode json`
+- `cat README.md | zi -p "Summarize this text"`
 - `zi --continue`
 - `zi --resume`
 - `zi --session 2a9f7c1d`
@@ -397,13 +404,14 @@ Valid:
 
 Invalid unless later given explicit semantics:
 
-- `zi -p`
-- `zi --mode json`
+- `zi -p` (without a positional prompt or piped stdin)
+- `zi --mode json` (without a positional prompt or piped stdin)
 - `zi "a" "b"`
 - `zi --continue "prompt"`
 - `zi --session 2a9f7c1d "prompt"`
 - `zi -p --continue`
 - `zi --continue --resume`
+- `cat README.md | zi`
 - any flag combination where a flag is accepted but does not affect the plan
 
 ## acceptance bar for the epic

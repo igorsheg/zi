@@ -19,7 +19,7 @@ pub fn writePlanDiagnostic(writer: anytype, diagnostic: plan.PlanDiagnostic) !vo
             "error: --list-models accepts at most one optional search term\n",
         ),
         .prompt_required_for_batch => try writer.writeAll(
-            "error: batch mode requires a prompt. use `zi -p \"prompt\"` or `zi --mode json \"prompt\"`\n",
+            "error: batch mode requires a prompt or piped stdin. use `zi -p \"prompt\"`, `zi --mode json \"prompt\"`, or `cat file | zi -p`\n",
         ),
         .prompt_not_allowed_for_session_target => |flag| try writer.print(
             "error: prompt cannot be combined with {s}. session targets start interactively without an initial prompt\n",
@@ -90,6 +90,7 @@ test "plan and execution diagnostics explain the finalized session-target contra
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
 
+    try writePlanDiagnostic(&out.writer, .prompt_required_for_batch);
     try writePlanDiagnostic(&out.writer, .{ .prompt_not_allowed_for_session_target = "--session" });
     try writePlanDiagnostic(&out.writer, .{ .session_target_requires_interactive = "--continue" });
     try writeExecutionDiagnostic(&out.writer, .no_recent_session);
@@ -97,6 +98,8 @@ test "plan and execution diagnostics explain the finalized session-target contra
     const rendered = try out.toOwnedSlice();
     defer std.testing.allocator.free(rendered);
 
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "piped stdin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cat file | zi -p") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--session") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--continue") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "zi --resume") != null);
