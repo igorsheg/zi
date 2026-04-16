@@ -1,8 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const logging = @import("../logging.zig");
-const auth = @import("../auth/root.zig");
-const settings_mod = @import("../settings/root.zig");
 const sdk = @import("../sdk.zig");
 const interactive_mod = @import("../tui/interactive.zig");
 const theme_mod = @import("../tui/theme.zig");
@@ -11,79 +9,56 @@ const tool_display = @import("../tui/tool_display.zig");
 const builtin_renderers = @import("../tui/renderers/builtins.zig");
 const compactor = @import("../session/compactor.zig");
 const plan = @import("plan.zig");
+const runtime_mod = @import("runtime.zig");
+const result = @import("result.zig");
 const common = @import("common.zig");
 const context_mod = @import("context.zig");
-const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 
-pub fn run(ctx: context_mod.Context, options: plan.InteractivePlan) !void {
+pub fn run(
+    ctx: context_mod.Context,
+    runtime: *runtime_mod.Runtime,
+    options: plan.InteractivePlan,
+) !result.ExecutionResult {
     logging.setThreadLabel(.tui);
-
-    var auth_storage = auth.storage.AuthStorage.create(ctx.allocator, null) catch {
-        try stderr.writeAll("warning: could not load auth storage\n");
-        unreachable;
-    };
-
-    const cwd_buf = std.fs.cwd().realpathAlloc(ctx.allocator, ".") catch "/unknown";
-    var settings = settings_mod.manager.SettingsManager.create(ctx.allocator, cwd_buf, null) catch {
-        try stderr.writeAll("warning: could not load settings\n");
-        unreachable;
-    };
-
-    const custom_models = common.convertCustomModels(ctx.allocator, settings.getModels()) catch &.{};
-    var model_registry = ai.model_registry.ModelRegistry.init(
-        ctx.allocator,
-        &auth_storage,
-        custom_models,
-    ) catch {
-        try stderr.writeAll("error: could not build model registry\n");
-        std.process.exit(1);
-    };
 
     const init_result = ai.resolve.findInitialModel(.{
         .cli_provider = null,
         .cli_model = options.model_id,
         .scoped_models = &.{},
         .is_continuing = options.session_target != .none,
-        .default_provider = settings.getDefaultProvider(),
-        .default_model_id = settings.getDefaultModel(),
-        .default_thinking_level = common.defaultThinkingLevel(&settings),
-        .registry = &model_registry,
+        .default_provider = runtime.settings_manager.getDefaultProvider(),
+        .default_model_id = runtime.settings_manager.getDefaultModel(),
+        .default_thinking_level = common.defaultThinkingLevel(runtime.settings_manager),
+        .registry = runtime.model_registry,
         .allocator = ctx.allocator,
     }) catch {
-        try stderr.writeAll("error: model resolution failed\n");
-        std.process.exit(1);
+        return .{ .err = .model_resolution_failed };
     };
 
     const effective_model = init_result.model orelse {
-        if (init_result.fallback_message) |msg| {
-            stderr.writeAll("error: ") catch {};
-            stderr.writeAll(msg) catch {};
-            stderr.writeAll("\n") catch {};
-        } else {
-            try stderr.writeAll(
-                "no model available — configure auth via /login or pass --api-key, then --model.\n",
-            );
+        if (init_result.fallback_message) |message| {
+            return .{ .err = .{ .resolver_message = message } };
         }
-        std.process.exit(1);
+        return .{ .err = .no_model_available };
     };
 
     if (options.api_key) |cli_key| {
         const provider_str = ai.json_util.providerToString(effective_model.provider);
-        auth_storage.setRuntimeApiKey(provider_str, cli_key);
+        runtime.auth_storage.setRuntimeApiKey(provider_str, cli_key);
     }
     const provider_str = ai.json_util.providerToString(effective_model.provider);
-    const api_key: []const u8 = auth_storage.getApiKey(provider_str) orelse "";
+    const api_key: []const u8 = runtime.auth_storage.getApiKey(provider_str) orelse "";
     const needs_auth = api_key.len == 0;
     const allowlist_opt = try common.parseToolAllowlist(ctx.allocator, options.tool_allowlist_csv);
 
     var ca = try sdk.createAgentSession(ctx.allocator, .{
         .model = effective_model,
         .api_key = api_key,
-        .cwd = cwd_buf,
+        .cwd = runtime.cwd,
         .max_tokens = 4096,
-        .auth_storage = &auth_storage,
-        .settings_manager = &settings,
-        .model_registry = &model_registry,
+        .auth_storage = runtime.auth_storage,
+        .settings_manager = runtime.settings_manager,
+        .model_registry = runtime.model_registry,
         .thinking_level = common.aiToAgentThinking(init_result.thinking_level),
         .no_session = options.no_session,
         .append_system_prompt = options.append_system_prompt,
@@ -101,8 +76,8 @@ pub fn run(ctx: context_mod.Context, options: plan.InteractivePlan) !void {
         .{ .tool_name = "ls", .renderer = builtin_renderers.ls_renderer },
     };
     const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
-    const retry_settings = settings.getRetrySettings();
-    const compaction_settings = settings.getCompactionSettings();
+    const retry_settings = runtime.settings_manager.getRetrySettings();
+    const compaction_settings = runtime.settings_manager.getCompactionSettings();
     const compaction_executor = compactor.createExecutor(&ca);
     const memory_diagnostics = @import("../debug/tracked_allocator.zig").Diagnostics{
         .root = ctx.root_tracker,
@@ -116,9 +91,9 @@ pub fn run(ctx: context_mod.Context, options: plan.InteractivePlan) !void {
         &ca,
         &memory_diagnostics,
         resolver,
-        cwd_buf,
-        &auth_storage,
-        &settings,
+        runtime.cwd,
+        runtime.auth_storage,
+        runtime.settings_manager,
         .{
             .enabled = retry_settings.enabled,
             .max_retries = @intCast(@max(retry_settings.max_retries, 0)),
@@ -134,7 +109,7 @@ pub fn run(ctx: context_mod.Context, options: plan.InteractivePlan) !void {
     );
     defer interactive.deinit();
 
-    applyInteractiveTheme(&interactive, resolveSelectedTheme(&ca, &settings));
+    applyInteractiveTheme(&interactive, resolveSelectedTheme(&ca, runtime.settings_manager));
     interactive.setStartupAction(switch (options.session_target) {
         .none => if (options.initial_prompt) |prompt|
             .{ .prompt = prompt }
@@ -149,9 +124,10 @@ pub fn run(ctx: context_mod.Context, options: plan.InteractivePlan) !void {
     }
 
     try interactive.run();
+    return .ok;
 }
 
-fn resolveSelectedTheme(ca: *sdk.AgentSession, settings: *const settings_mod.manager.SettingsManager) *const theme_mod.Theme {
+fn resolveSelectedTheme(ca: *sdk.AgentSession, settings: *const @import("../settings/manager.zig").SettingsManager) *const theme_mod.Theme {
     if (settings.getTheme()) |selected_name| {
         if (ca.resource_loader.findThemeByName(selected_name)) |loaded| {
             return &loaded.theme;

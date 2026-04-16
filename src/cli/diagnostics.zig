@@ -1,5 +1,8 @@
+const std = @import("std");
 const parse = @import("parse.zig");
 const plan = @import("plan.zig");
+const runtime = @import("runtime.zig");
+const result = @import("result.zig");
 
 pub fn writeParseDiagnostic(writer: anytype, diagnostic: parse.ParseDiagnostic) !void {
     switch (diagnostic) {
@@ -20,5 +23,43 @@ pub fn writePlanDiagnostic(writer: anytype, diagnostic: plan.PlanDiagnostic) !vo
             "error: invalid flag combination: {s} and {s}\n",
             .{ combo.first, combo.second },
         ),
+    }
+}
+
+pub fn writeRuntimeInitDiagnostic(writer: anytype, diagnostic: runtime.InitDiagnostic) !void {
+    switch (diagnostic) {
+        .auth_storage_init_failed => try writer.writeAll("error: could not load auth storage\n"),
+        .settings_init_failed => try writer.writeAll("error: could not load settings\n"),
+        .model_registry_init_failed => try writer.writeAll("error: could not build model registry\n"),
+    }
+}
+
+pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDiagnostic) !void {
+    switch (diagnostic) {
+        .resolver_message => |message| try writer.print("error: {s}\n", .{message}),
+        .session_load_failed => |err_name| try writer.print("error: could not load session: {s}\n", .{err_name}),
+        .session_file_has_no_messages => try writer.writeAll("error: session file has no messages\n"),
+        .model_resolution_failed => try writer.writeAll("error: model resolution failed\n"),
+        .no_model_found => try writer.writeAll(
+            "error: no model found. configure auth or set an API key env var.\nuse --list-models to see available models\n",
+        ),
+        .no_model_available => try writer.writeAll(
+            "error: no model available — configure auth via /login or pass --api-key, then --model.\n",
+        ),
+        .no_api_key_for_provider => |info| {
+            try writer.print("error: no API key for provider '{s}'. use /login in interactive mode or set ", .{info.provider});
+            if (info.env_hint) |env_hint| {
+                try writer.writeAll(env_hint);
+            } else if (std.mem.eql(u8, info.provider, "anthropic")) {
+                try writer.writeAll("ANTHROPIC_API_KEY");
+            } else {
+                try writer.writeAll("the provider's API key env var");
+            }
+            try writer.writeAll("\n");
+        },
+        .continue_session_needs_prompt => try writer.writeAll(
+            "session loaded but transcript ends with assistant. provide a prompt to continue.\n",
+        ),
+        .continue_session_failed => |err_name| try writer.print("error: could not continue session: {s}\n", .{err_name}),
     }
 }

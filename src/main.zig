@@ -81,14 +81,34 @@ pub fn main() !void {
     });
     defer log_session.deinit();
 
-    try cli.dispatch.run(.{
+    var cli_runtime: ?cli.runtime.Runtime = null;
+    defer if (cli_runtime) |*runtime| runtime.deinit();
+
+    if (planRequiresRuntime(execution_plan)) {
+        cli_runtime = switch (try cli.runtime.Runtime.init(allocator)) {
+            .ok => |runtime| runtime,
+            .err => |diag| {
+                try writeRuntimeInitDiagnostic(diag);
+                std.process.exit(1);
+            },
+        };
+    }
+
+    const execution_result = try cli.dispatch.run(.{
         .allocator = allocator,
         .msg_allocator = msg_allocator,
         .root_tracker = &root_tracker,
         .agent_backing_tracker = &agent_backing_tracker,
         .tui_backing_tracker = &tui_backing_tracker,
         .msg_backing_tracker = &msg_backing_tracker,
-    }, execution_plan);
+    }, if (cli_runtime) |*runtime| runtime else null, execution_plan);
+    switch (execution_result) {
+        .ok => {},
+        .err => |diag| {
+            try writeExecutionDiagnostic(diag);
+            std.process.exit(1);
+        },
+    }
 }
 
 fn writeParseDiagnostic(diag: cli.parse.ParseDiagnostic) !void {
@@ -103,6 +123,27 @@ fn writePlanDiagnostic(diag: cli.plan.PlanDiagnostic) !void {
     var err_writer = stderr.writer(&err_buf);
     try cli.diagnostics.writePlanDiagnostic(&err_writer.interface, diag);
     try err_writer.end();
+}
+
+fn writeRuntimeInitDiagnostic(diag: cli.runtime.InitDiagnostic) !void {
+    var err_buf: [1024]u8 = undefined;
+    var err_writer = stderr.writer(&err_buf);
+    try cli.diagnostics.writeRuntimeInitDiagnostic(&err_writer.interface, diag);
+    try err_writer.end();
+}
+
+fn writeExecutionDiagnostic(diag: cli.result.ExecutionDiagnostic) !void {
+    var err_buf: [1024]u8 = undefined;
+    var err_writer = stderr.writer(&err_buf);
+    try cli.diagnostics.writeExecutionDiagnostic(&err_writer.interface, diag);
+    try err_writer.end();
+}
+
+fn planRequiresRuntime(execution_plan: cli.plan.ExecutionPlan) bool {
+    return switch (execution_plan) {
+        .help, .version => false,
+        .list_models, .run => true,
+    };
 }
 
 fn sinkModeForPlan(execution_plan: cli.plan.ExecutionPlan) logging.SinkMode {
