@@ -27,7 +27,14 @@ pub const RawRunArgs = struct {
     }
 };
 
-pub const RawListModelsArgs = struct {};
+pub const RawListModelsArgs = struct {
+    positionals: []const []const u8 = &.{},
+
+    pub fn deinit(self: *RawListModelsArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.positionals);
+        self.* = undefined;
+    }
+};
 pub const RawHelpArgs = struct {};
 pub const RawVersionArgs = struct {};
 
@@ -40,7 +47,8 @@ pub const RawCommand = union(Action) {
     pub fn deinit(self: *RawCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .run => |*run| run.deinit(allocator),
-            .help, .version, .list_models => self.* = undefined,
+            .list_models => |*list_models| list_models.deinit(allocator),
+            .help, .version => self.* = undefined,
         }
     }
 };
@@ -65,7 +73,7 @@ pub fn parse(
         .run => try parseRun(allocator, argv),
         .help => .{ .ok = .{ .help = .{} } },
         .version => .{ .ok = .{ .version = .{} } },
-        .list_models => .{ .ok = .{ .list_models = .{} } },
+        .list_models => try parseListModels(allocator, argv),
     };
 }
 
@@ -135,6 +143,25 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
     return .{ .ok = .{ .run = raw } };
 }
 
+fn parseListModels(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allocator.Error!ParseResult {
+    var raw: RawListModelsArgs = .{};
+    var positionals: std.ArrayList([]const u8) = .empty;
+    defer positionals.deinit(allocator);
+
+    for (argv) |arg| {
+        if (eql(arg, "--list-models") or eql(arg, "--help") or eql(arg, "-h")) {
+            continue;
+        }
+        if (arg.len > 0 and arg[0] == '-') {
+            return .{ .err = .{ .unknown_flag = arg } };
+        }
+        try positionals.append(allocator, arg);
+    }
+
+    raw.positionals = try positionals.toOwnedSlice(allocator);
+    return .{ .ok = .{ .list_models = raw } };
+}
+
 fn consumeValue(argv: []const []const u8, index: *usize, _: []const u8) ?[]const u8 {
     if (index.* + 1 >= argv.len) return null;
     index.* += 1;
@@ -151,6 +178,32 @@ fn parseMode(value: []const u8) ?OutputMode {
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+test "list-models parsing keeps its optional search positional and rejects unrelated flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const search_result = try parse(arena.allocator(), .list_models, &.{ "--list-models", "claude" });
+    switch (search_result) {
+        .ok => |cmd| switch (cmd) {
+            .list_models => |list_models| {
+                try std.testing.expectEqual(@as(usize, 1), list_models.positionals.len);
+                try std.testing.expectEqualStrings("claude", list_models.positionals[0]);
+            },
+            else => return error.UnexpectedCommand,
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
+
+    const bad_flag = try parse(arena.allocator(), .list_models, &.{ "--list-models", "--model", "gpt-4o" });
+    switch (bad_flag) {
+        .err => |diag| switch (diag) {
+            .unknown_flag => |flag| try std.testing.expectEqualStrings("--model", flag),
+            else => return error.UnexpectedDiagnostic,
+        },
+        .ok => return error.ExpectedDiagnostic,
+    }
 }
 
 test "run parsing records batch selectors session selectors and positionals without planning them" {

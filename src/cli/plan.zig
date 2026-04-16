@@ -4,6 +4,7 @@ const parse = @import("parse.zig");
 pub const OutputMode = parse.OutputMode;
 pub const RawCommand = parse.RawCommand;
 pub const RawRunArgs = parse.RawRunArgs;
+pub const RawListModelsArgs = parse.RawListModelsArgs;
 
 pub const SessionTarget = union(enum) {
     none,
@@ -47,11 +48,12 @@ pub const ExecutionPlan = union(enum) {
 pub const HelpPlan = struct {};
 pub const VersionPlan = struct {};
 pub const ListModelsPlan = struct {
-    available_only: bool = true,
+    search: ?[]const u8 = null,
 };
 
 pub const PlanDiagnostic = union(enum) {
     too_many_positionals,
+    too_many_list_models_positionals,
     prompt_required_for_batch,
     prompt_not_allowed_for_session_target: []const u8,
     session_target_requires_interactive: []const u8,
@@ -76,9 +78,17 @@ pub fn build(raw: RawCommand) PlanResult {
     return switch (raw) {
         .help => .{ .ok = .{ .help = .{} } },
         .version => .{ .ok = .{ .version = .{} } },
-        .list_models => .{ .ok = .{ .list_models = .{} } },
+        .list_models => |list_models| buildListModels(list_models),
         .run => |run| buildRun(run),
     };
+}
+
+fn buildListModels(raw: RawListModelsArgs) PlanResult {
+    if (raw.positionals.len > 1) return .{ .err = .too_many_list_models_positionals };
+
+    return .{ .ok = .{ .list_models = .{
+        .search = if (raw.positionals.len == 1) raw.positionals[0] else null,
+    } } };
 }
 
 fn buildRun(raw: RawRunArgs) PlanResult {
@@ -242,6 +252,35 @@ test "planner builds explicit interactive and batch plans from the chosen select
     }
 }
 
+test "list-models plan carries optional search and rejects extra positionals" {
+    const default_result = build(.{ .list_models = .{} });
+    switch (default_result) {
+        .ok => |plan| switch (plan) {
+            .list_models => |list_models| try std.testing.expect(list_models.search == null),
+            else => return error.UnexpectedPlan,
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
+
+    const search_result = build(.{ .list_models = .{ .positionals = &.{"claude"} } });
+    switch (search_result) {
+        .ok => |plan| switch (plan) {
+            .list_models => |list_models| try std.testing.expectEqualStrings("claude", list_models.search.?),
+            else => return error.UnexpectedPlan,
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
+
+    const too_many = build(.{ .list_models = .{ .positionals = &.{ "claude", "sonnet" } } });
+    switch (too_many) {
+        .err => |diag| switch (diag) {
+            .too_many_list_models_positionals => {},
+            else => return error.UnexpectedDiagnostic,
+        },
+        .ok => return error.ExpectedDiagnostic,
+    }
+}
+
 test "planner rejects conflicting or interactive-only session target combinations" {
     const conflicting_selectors = build(.{ .run = .{
         .continue_session = true,
@@ -280,14 +319,5 @@ test "planner rejects conflicting or interactive-only session target combination
             else => return error.UnexpectedDiagnostic,
         },
         .ok => return error.ExpectedDiagnostic,
-    }
-
-    const list_models = build(.{ .list_models = .{} });
-    switch (list_models) {
-        .ok => |plan| switch (plan) {
-            .list_models => |lm| try std.testing.expect(lm.available_only),
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
     }
 }

@@ -9,7 +9,7 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  {s} --continue\n" ++
             "  {s} --resume\n" ++
             "  {s} --session <path|id>\n" ++
-            "  {s} --list-models\n" ++
+            "  {s} --list-models [search]\n" ++
             "  {s} --help\n" ++
             "  {s} --version\n\n",
         .{
@@ -56,7 +56,7 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  --append-system-prompt <text|path>\n" ++
             "                              Append literal text or file contents to the system prompt\n\n" ++
             "Actions:\n" ++
-            "  --list-models                List models with configured auth\n" ++
+            "  --list-models [search]       List available models (optional fuzzy search)\n" ++
             "  -h, --help                   Show help\n" ++
             "  -v, --version                Show version\n\n" ++
             "Notes:\n" ++
@@ -64,6 +64,7 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  - batch text mode prints the final assistant text only after completion\n" ++
             "  - batch JSON mode emits a session header first when persistence is enabled\n" ++
             "  - batch text failures come from the final assistant error/abort state\n" ++
+            "  - --list-models shows available models and supports an optional fuzzy search\n" ++
             "  - session targets are interactive-only and mutually exclusive\n" ++
             "  - prompts cannot be combined with --continue, --resume, or --session\n" ++
             "  - every accepted flag either affects the plan or fails during planning\n\n",
@@ -87,5 +88,7 @@ test "general help documents explicit session-target behaviors and actions" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Resume a specific session by path or ID prefix") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "prints the final assistant text only") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "session header first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "List available models") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "optional fuzzy search") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "session targets are interactive-only and mutually exclusive") != null);
 }

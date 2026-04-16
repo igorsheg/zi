@@ -15,6 +15,9 @@ pub fn writeParseDiagnostic(writer: anytype, diagnostic: parse.ParseDiagnostic) 
 pub fn writePlanDiagnostic(writer: anytype, diagnostic: plan.PlanDiagnostic) !void {
     switch (diagnostic) {
         .too_many_positionals => try writer.writeAll("error: run accepts at most one prompt positional\n"),
+        .too_many_list_models_positionals => try writer.writeAll(
+            "error: --list-models accepts at most one optional search term\n",
+        ),
         .prompt_required_for_batch => try writer.writeAll(
             "error: batch mode requires a prompt. use `zi -p \"prompt\"` or `zi --mode json \"prompt\"`\n",
         ),
@@ -63,7 +66,7 @@ pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDia
         ),
         .model_resolution_failed => try writer.writeAll("error: model resolution failed\n"),
         .no_model_found => try writer.writeAll(
-            "error: no model found. configure auth in interactive mode with /login, or set an API key env var.\nuse `zi --list-models` to see models with configured auth\n",
+            "error: no model found. configure auth in interactive mode with /login, or set an API key env var.\nuse `zi --list-models` to see available models\n",
         ),
         .no_model_available => try writer.writeAll(
             "error: no model available — configure auth via /login or pass --api-key, then --model.\n",

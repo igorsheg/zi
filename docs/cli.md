@@ -49,6 +49,7 @@ The CLI contract this refactor must preserve and clarify is:
 - `zi --continue` → interactive resume of the most recent session for the current project
 - `zi --resume` → interactive session picker
 - `zi --session <path|id>` → interactive resume of a specific session by path or ID prefix
+- `zi --list-models [search]` → list available models, optionally narrowed by fuzzy search
 
 Additional contract rules:
 
@@ -201,6 +202,10 @@ pub const BatchPlan = struct {
     no_session: bool = false,
     tool_allowlist_csv: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
+};
+
+pub const ListModelsPlan = struct {
+    search: ?[]const u8 = null,
 };
 
 pub const ExecutionPlan = union(enum) {
