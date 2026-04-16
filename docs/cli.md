@@ -46,11 +46,15 @@ The CLI contract this refactor must preserve and clarify is:
 - `zi "prompt"` → interactive with an initial prompt
 - `zi -p "prompt"` → batch text and exit
 - `zi --mode json "prompt"` → batch JSON and exit
+- `zi --continue` → interactive resume of the most recent session for the current project
+- `zi --resume` → interactive session picker
+- `zi --session <path|id>` → interactive resume of a specific session by path or ID prefix
 
 Additional contract rules:
 
 - the **default action is `run`**
 - session-targeting flags are explicit and validated
+- session targets are **interactive-only** and **mutually exclusive**
 - prompt and session-target combinations must have defined semantics or be rejected
 - no prompt/flag combination may be silently dropped, reinterpreted, or ignored
 - help/version/list-models are top-level actions, not side effects of run-mode heuristics
@@ -122,7 +126,9 @@ pub const RawRunArgs = struct {
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     positionals: []const []const u8 = &.{},
-    continue_path: ?[]const u8 = null,
+    continue_session: bool = false,
+    resume_picker: bool = false,
+    session_ref: ?[]const u8 = null,
     no_session: bool = false,
     tools_filter: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
@@ -164,7 +170,9 @@ pub const OutputMode = enum {
 
 pub const SessionTarget = union(enum) {
     none,
-    continue_path: []const u8,
+    most_recent,
+    picker,
+    reference: []const u8,
 };
 
 pub const RunPlan = union(enum) {
@@ -187,7 +195,6 @@ pub const BatchPlan = struct {
     prompt: []const u8,
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
-    session_target: SessionTarget = .none,
     no_session: bool = false,
     tool_allowlist_csv: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
@@ -207,6 +214,7 @@ The exact field set may grow, but the architecture rule is fixed:
 - an interactive plan may have an initial prompt
 - batch output mode is explicit
 - session targeting is explicit
+- session targets are interactive-only and mutually exclusive
 - unsupported or ambiguous combinations are rejected before execution
 
 ### diagnostics split
@@ -222,8 +230,10 @@ Illustrative plan diagnostics include:
 
 - `too_many_positionals`
 - `prompt_required_for_batch`
-- `prompt_not_allowed_for_this_session_target`
+- `prompt_not_allowed_for_session_target`
+- `session_target_requires_interactive`
 - `conflicting_batch_selectors`
+- `conflicting_session_selectors`
 - `unsupported_flag_for_action`
 - `invalid_flag_combination`
 
@@ -372,13 +382,20 @@ Valid:
 - `zi "hello"`
 - `zi -p "hello"`
 - `zi --mode json "hello"`
+- `zi --continue`
+- `zi --resume`
+- `zi --session 2a9f7c1d`
+- `zi --session ./session.jsonl`
 
 Invalid unless later given explicit semantics:
 
 - `zi -p`
 - `zi --mode json`
 - `zi "a" "b"`
-- `zi --continue path "prompt"`
+- `zi --continue "prompt"`
+- `zi --session 2a9f7c1d "prompt"`
+- `zi -p --continue`
+- `zi --continue --resume`
 - any flag combination where a flag is accepted but does not affect the plan
 
 ## acceptance bar for the epic

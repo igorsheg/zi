@@ -18,11 +18,20 @@ pub fn writePlanDiagnostic(writer: anytype, diagnostic: plan.PlanDiagnostic) !vo
         .prompt_required_for_batch => try writer.writeAll(
             "error: batch mode requires a prompt. use `zi -p \"prompt\"` or `zi --mode json \"prompt\"`\n",
         ),
-        .prompt_not_allowed_for_this_session_target => try writer.writeAll(
-            "error: prompt cannot be combined with --continue. use `zi --continue <path>` to resume interactively\n",
+        .prompt_not_allowed_for_session_target => |flag| try writer.print(
+            "error: prompt cannot be combined with {s}. session targets start interactively without an initial prompt\n",
+            .{flag},
+        ),
+        .session_target_requires_interactive => |flag| try writer.print(
+            "error: {s} is interactive-only. remove -p/--print or --mode\n",
+            .{flag},
         ),
         .conflicting_batch_selectors => try writer.writeAll(
             "error: choose either -p/--print or --mode, not both\n",
+        ),
+        .conflicting_session_selectors => |combo| try writer.print(
+            "error: choose only one session target: {s} or {s}\n",
+            .{ combo.first, combo.second },
         ),
         .unsupported_flag_for_action => |flag| try writer.print("error: flag '{s}' is not supported for this action\n", .{flag}),
         .invalid_flag_combination => |combo| try writer.print(
@@ -43,8 +52,15 @@ pub fn writeRuntimeInitDiagnostic(writer: anytype, diagnostic: runtime.InitDiagn
 pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDiagnostic) !void {
     switch (diagnostic) {
         .resolver_message => |message| try writer.print("error: {s}\n", .{message}),
-        .session_load_failed => |err_name| try writer.print("error: could not load session: {s}\n", .{err_name}),
-        .session_file_has_no_messages => try writer.writeAll("error: session file has no messages\n"),
+        .session_lookup_failed => |err_name| try writer.print("error: could not inspect sessions: {s}\n", .{err_name}),
+        .no_recent_session => try writer.writeAll(
+            "error: no saved session found for this project. start one with `zi`, or use `zi --resume` to browse available sessions\n",
+        ),
+        .session_target_not_found => |ref| try writer.print("error: no session found matching '{s}'\n", .{ref}),
+        .session_target_ambiguous => |ref| try writer.print(
+            "error: session reference '{s}' matches multiple sessions. pass more of the id or a full path\n",
+            .{ref},
+        ),
         .model_resolution_failed => try writer.writeAll("error: model resolution failed\n"),
         .no_model_found => try writer.writeAll(
             "error: no model found. configure auth in interactive mode with /login, or set an API key env var.\nuse `zi --list-models` to see models with configured auth\n",
@@ -63,22 +79,20 @@ pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDia
             }
             try writer.writeAll("\n");
         },
-        .continue_session_needs_prompt => try writer.writeAll(
-            "error: the resumed session already ends with an assistant message. open it with `zi --continue <path>` and send a follow-up prompt interactively.\n",
-        ),
-        .continue_session_failed => |err_name| try writer.print("error: could not continue session: {s}\n", .{err_name}),
     }
 }
 
-test "plan diagnostics explain batch and resume semantics" {
+test "plan and execution diagnostics explain the finalized session-target contract" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
 
-    try writePlanDiagnostic(&out.writer, .prompt_required_for_batch);
-    try writePlanDiagnostic(&out.writer, .prompt_not_allowed_for_this_session_target);
+    try writePlanDiagnostic(&out.writer, .{ .prompt_not_allowed_for_session_target = "--session" });
+    try writePlanDiagnostic(&out.writer, .{ .session_target_requires_interactive = "--continue" });
+    try writeExecutionDiagnostic(&out.writer, .no_recent_session);
     const rendered = try out.toOwnedSlice();
     defer std.testing.allocator.free(rendered);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "zi -p \"prompt\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "zi --continue <path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "--session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "--continue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "zi --resume") != null);
 }

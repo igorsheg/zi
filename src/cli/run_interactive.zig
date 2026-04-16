@@ -8,11 +8,29 @@ const themes_builtin = @import("../themes/builtin.zig");
 const tool_display = @import("../tui/tool_display.zig");
 const builtin_renderers = @import("../tui/renderers/builtins.zig");
 const compactor = @import("../session/compactor.zig");
+const session_store_mod = @import("../session/store.zig");
 const plan = @import("plan.zig");
 const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const common = @import("common.zig");
 const context_mod = @import("context.zig");
+
+const ResolvedStartupAction = union(enum) {
+    none,
+    prompt: []const u8,
+    resume_session: []const u8,
+    resume_picker,
+};
+
+const StartupResolution = union(enum) {
+    ok: ResolvedStartupAction,
+    err: result.ExecutionDiagnostic,
+};
+
+const SessionPathResolution = union(enum) {
+    ok: []const u8,
+    err: result.ExecutionDiagnostic,
+};
 
 pub fn run(
     ctx: context_mod.Context,
@@ -21,11 +39,16 @@ pub fn run(
 ) !result.ExecutionResult {
     logging.setThreadLabel(.tui);
 
+    const startup_action = switch (try resolveStartupAction(ctx.allocator, runtime.cwd, options)) {
+        .ok => |action| action,
+        .err => |diag| return .{ .err = diag },
+    };
+
     const init_result = ai.resolve.findInitialModel(.{
         .cli_provider = null,
         .cli_model = options.model_id,
         .scoped_models = &.{},
-        .is_continuing = options.session_target != .none,
+        .is_continuing = startupActionResumesSession(startup_action),
         .default_provider = runtime.settings_manager.getDefaultProvider(),
         .default_model_id = runtime.settings_manager.getDefaultModel(),
         .default_thinking_level = common.defaultThinkingLevel(runtime.settings_manager),
@@ -110,12 +133,11 @@ pub fn run(
     defer interactive.deinit();
 
     applyInteractiveTheme(&interactive, resolveSelectedTheme(&ca, runtime.settings_manager));
-    interactive.setStartupAction(switch (options.session_target) {
-        .none => if (options.initial_prompt) |prompt|
-            .{ .prompt = prompt }
-        else
-            .none,
-        .continue_path => |path| .{ .resume_session = path },
+    interactive.setStartupAction(switch (startup_action) {
+        .none => .none,
+        .prompt => |prompt| .{ .prompt = prompt },
+        .resume_session => |path| .{ .resume_session = path },
+        .resume_picker => .resume_picker,
     });
 
     if (needs_auth) {
@@ -125,6 +147,105 @@ pub fn run(
 
     try interactive.run();
     return .ok;
+}
+
+fn resolveStartupAction(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    options: plan.InteractivePlan,
+) std.mem.Allocator.Error!StartupResolution {
+    return switch (options.session_target) {
+        .none => .{ .ok = if (options.initial_prompt) |prompt| .{ .prompt = prompt } else .none },
+        .picker => .{ .ok = .resume_picker },
+        .most_recent => .{ .ok = .{ .resume_session = switch (try resolveMostRecentSessionPath(allocator, cwd)) {
+            .ok => |path| path,
+            .err => |diag| return .{ .err = diag },
+        } } },
+        .reference => |ref| .{ .ok = .{ .resume_session = switch (try resolveSessionReference(allocator, cwd, ref)) {
+            .ok => |path| path,
+            .err => |diag| return .{ .err = diag },
+        } } },
+    };
+}
+
+fn startupActionResumesSession(action: ResolvedStartupAction) bool {
+    return switch (action) {
+        .resume_session => true,
+        .none, .prompt, .resume_picker => false,
+    };
+}
+
+fn resolveMostRecentSessionPath(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+) std.mem.Allocator.Error!SessionPathResolution {
+    const path = session_store_mod.findMostRecentSession(allocator, cwd) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .err = .{ .session_lookup_failed = @errorName(err) } },
+    };
+    return .{ .ok = path orelse return .{ .err = .no_recent_session } };
+}
+
+fn resolveSessionReference(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    ref: []const u8,
+) std.mem.Allocator.Error!SessionPathResolution {
+    if (looksLikeSessionPath(ref)) {
+        return try resolveExplicitSessionPath(allocator, cwd, ref);
+    }
+
+    const sessions = session_store_mod.listSessions(allocator, cwd) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .err = .{ .session_lookup_failed = @errorName(err) } },
+    };
+    defer session_store_mod.freeSessionInfos(allocator, sessions);
+
+    var matched_path: ?[]const u8 = null;
+    var match_count: usize = 0;
+    for (sessions) |session| {
+        if (!std.mem.startsWith(u8, session.session_id, ref)) continue;
+        matched_path = session.path;
+        match_count += 1;
+        if (match_count > 1) break;
+    }
+
+    if (match_count == 0) return .{ .err = .{ .session_target_not_found = ref } };
+    if (match_count > 1) return .{ .err = .{ .session_target_ambiguous = ref } };
+    return .{ .ok = try allocator.dupe(u8, matched_path.?) };
+}
+
+fn resolveExplicitSessionPath(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    ref: []const u8,
+) std.mem.Allocator.Error!SessionPathResolution {
+    if (std.fs.path.isAbsolute(ref)) {
+        return resolveAbsoluteSessionPath(allocator, ref, ref);
+    }
+
+    const joined = try std.fs.path.join(allocator, &.{ cwd, ref });
+    defer allocator.free(joined);
+    return resolveAbsoluteSessionPath(allocator, joined, ref);
+}
+
+fn resolveAbsoluteSessionPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    display_ref: []const u8,
+) SessionPathResolution {
+    const resolved = std.fs.realpathAlloc(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => return .{ .err = .{ .session_target_not_found = display_ref } },
+        else => return .{ .err = .{ .session_lookup_failed = @errorName(err) } },
+    };
+    return .{ .ok = resolved };
+}
+
+fn looksLikeSessionPath(ref: []const u8) bool {
+    return std.fs.path.isAbsolute(ref) or
+        std.mem.indexOfScalar(u8, ref, '/') != null or
+        std.mem.indexOfScalar(u8, ref, '\\') != null or
+        std.mem.endsWith(u8, ref, ".jsonl");
 }
 
 fn resolveSelectedTheme(ca: *sdk.AgentSession, settings: *const @import("../settings/manager.zig").SettingsManager) *const theme_mod.Theme {

@@ -315,6 +315,7 @@ const StartupAction = union(enum) {
     none,
     prompt: []const u8,
     resume_session: []const u8,
+    resume_picker,
 };
 
 /// Interactive mode — wires AgentSession (blocking on its thread)
@@ -734,6 +735,7 @@ pub const Interactive = struct {
                     .spawn_failed_message = "failed to queue resume",
                 });
             },
+            .resume_picker => self.showSessionPicker(),
         }
         self.startup_action = .none;
     }

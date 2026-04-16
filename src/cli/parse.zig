@@ -14,7 +14,9 @@ pub const RawRunArgs = struct {
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     positionals: []const []const u8 = &.{},
-    continue_path: ?[]const u8 = null,
+    continue_session: bool = false,
+    resume_picker: bool = false,
+    session_ref: ?[]const u8 = null,
     no_session: bool = false,
     tools_filter: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
@@ -90,9 +92,17 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
             raw.model_id = value;
             continue;
         }
-        if (eql(arg, "--continue")) {
+        if (eql(arg, "--continue") or eql(arg, "-c")) {
+            raw.continue_session = true;
+            continue;
+        }
+        if (eql(arg, "--resume") or eql(arg, "-r")) {
+            raw.resume_picker = true;
+            continue;
+        }
+        if (eql(arg, "--session")) {
             const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
-            raw.continue_path = value;
+            raw.session_ref = value;
             continue;
         }
         if (eql(arg, "--mode")) {
@@ -143,7 +153,7 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-test "run parsing preserves syntax-only flags and all positionals" {
+test "run parsing records batch selectors session selectors and positionals without planning them" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -153,6 +163,10 @@ test "run parsing preserves syntax-only flags and all positionals" {
         "--model",
         "gpt-4o",
         "-p",
+        "--continue",
+        "--resume",
+        "--session",
+        "session-1234",
         "hello",
         "world",
     });
@@ -162,6 +176,9 @@ test "run parsing preserves syntax-only flags and all positionals" {
                 try std.testing.expect(run.print_mode);
                 try std.testing.expectEqual(OutputMode.json, run.mode.?);
                 try std.testing.expectEqualStrings("gpt-4o", run.model_id.?);
+                try std.testing.expect(run.continue_session);
+                try std.testing.expect(run.resume_picker);
+                try std.testing.expectEqualStrings("session-1234", run.session_ref.?);
                 try std.testing.expectEqual(@as(usize, 2), run.positionals.len);
                 try std.testing.expectEqualStrings("hello", run.positionals[0]);
                 try std.testing.expectEqualStrings("world", run.positionals[1]);

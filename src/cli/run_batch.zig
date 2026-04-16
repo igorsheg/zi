@@ -5,7 +5,6 @@ const agent = @import("../agent/root.zig");
 const coding_agent = @import("../coding_agent.zig");
 const sdk = @import("../sdk.zig");
 const agent_json = @import("../agent/json.zig");
-const session_context = @import("../session/context.zig");
 const plan = @import("plan.zig");
 const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
@@ -18,61 +17,21 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
     logging.setThreadLabel(.batch);
 
     const allocator = runtime.allocator;
-    const is_continue = options.session_target != .none;
-    const prompt = if (is_continue) null else options.prompt;
-
-    var initial_messages: []const agent.protocol.AgentMessage = &.{};
-    var session_store: ?coding_agent.SessionStore = null;
-    var saved_session_model: ?session_context.SessionContext.ModelInfo = null;
-    var loaded_session: ?coding_agent.OpenSessionResult = null;
-    defer if (loaded_session) |*loaded| loaded.deinit();
-
-    switch (options.session_target) {
-        .none => {},
-        .continue_path => |path| {
-            loaded_session = coding_agent.openSession(allocator, path) catch |err| {
-                return .{ .err = .{ .session_load_failed = @errorName(err) } };
-            };
-            initial_messages = loaded_session.?.messages;
-            if (initial_messages.len == 0) {
-                return .{ .err = .session_file_has_no_messages };
-            }
-            session_store = loaded_session.?.takeStore();
-            saved_session_model = loaded_session.?.model;
-        },
-    }
-
-    var restored_model: ?ai.protocol.Model = null;
-    if (options.model_id == null) {
-        if (saved_session_model) |saved| {
-            const restore = ai.resolve.restoreModelFromSession(.{
-                .saved_provider = saved.provider,
-                .saved_model_id = saved.model_id,
-                .current_model = null,
-                .registry = runtime.model_registry,
-                .allocator = allocator,
-            }) catch ai.resolve.RestoreResult{ .model = null, .fallback_message = null };
-            restored_model = restore.model;
-        }
-    }
-
-    const model = restored_model orelse blk: {
-        const init_result = ai.resolve.findInitialModel(.{
-            .cli_provider = null,
-            .cli_model = options.model_id,
-            .is_continuing = is_continue,
-            .default_provider = runtime.settings_manager.getDefaultProvider(),
-            .default_model_id = runtime.settings_manager.getDefaultModel(),
-            .registry = runtime.model_registry,
-            .allocator = allocator,
-        }) catch {
-            return .{ .err = .model_resolution_failed };
-        };
-        if (init_result.fallback_message) |message| {
-            return .{ .err = .{ .resolver_message = message } };
-        }
-        break :blk init_result.model orelse return .{ .err = .no_model_found };
+    const init_result = ai.resolve.findInitialModel(.{
+        .cli_provider = null,
+        .cli_model = options.model_id,
+        .is_continuing = false,
+        .default_provider = runtime.settings_manager.getDefaultProvider(),
+        .default_model_id = runtime.settings_manager.getDefaultModel(),
+        .registry = runtime.model_registry,
+        .allocator = allocator,
+    }) catch {
+        return .{ .err = .model_resolution_failed };
     };
+    if (init_result.fallback_message) |message| {
+        return .{ .err = .{ .resolver_message = message } };
+    }
+    const model = init_result.model orelse return .{ .err = .no_model_found };
 
     const provider_str = ai.json_util.providerToString(model.provider);
     if (options.api_key) |cli_key| {
@@ -102,24 +61,13 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
         .settings_manager = runtime.settings_manager,
         .model_registry = runtime.model_registry,
         .event_handler = event_handler,
-        .initial_messages = initial_messages,
-        .session_store = session_store,
         .no_session = options.no_session,
         .append_system_prompt = options.append_system_prompt,
         .tool_allowlist = allowlist_opt,
     });
     defer ca.deinit();
 
-    if (is_continue) {
-        ca.continueSession() catch |err| {
-            if (err == error.NeedsPrompt) {
-                return .{ .err = .continue_session_needs_prompt };
-            }
-            return .{ .err = .{ .continue_session_failed = @errorName(err) } };
-        };
-    } else {
-        try ca.run(prompt.?);
-    }
+    try ca.run(options.prompt);
 
     try stdout.writeAll("\n");
     if (ca.sessionFlushed()) {

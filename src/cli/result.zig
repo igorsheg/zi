@@ -1,7 +1,9 @@
 pub const ExecutionDiagnostic = union(enum) {
     resolver_message: []const u8,
-    session_load_failed: []const u8,
-    session_file_has_no_messages,
+    session_lookup_failed: []const u8,
+    no_recent_session,
+    session_target_not_found: []const u8,
+    session_target_ambiguous: []const u8,
     model_resolution_failed,
     no_model_found,
     no_model_available,
@@ -9,8 +11,6 @@ pub const ExecutionDiagnostic = union(enum) {
         provider: []const u8,
         env_hint: ?[]const u8,
     },
-    continue_session_needs_prompt,
-    continue_session_failed: []const u8,
 };
 
 pub const ExecutionResult = union(enum) {
