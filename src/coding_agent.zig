@@ -656,13 +656,15 @@ pub const AgentSession = struct {
     /// Reset the active session to a fresh header-only session while
     /// preserving the current model + thinking defaults for future resume.
     ///
+    /// Contract: this always creates a normal persisted session, even if the
+    /// current session was launched with `--no-session`. This matches
+    /// pi-mono's startup-only `--no-session` behavior: `/resume` can switch
+    /// into a persisted session, and `/new` is not an ephemeral-mode toggle.
+    ///
     /// Ownership: agent-thread only. Mutates `session_store` and
     /// `agent.state`, both owned by the agent thread per doctrine.
     pub fn startNewSession(self: *AgentSession) !void {
         var new_store = blk: {
-            if (!self.session_store.writer.persist) {
-                break :blk SessionStore.createEphemeral(self.allocator);
-            }
             const cwd = self.resource_loader.cwd;
             const session_dir = try storage.getSessionDirForCwd(self.allocator, cwd, null);
             defer self.allocator.free(session_dir);
@@ -2412,7 +2414,7 @@ test "AgentSession: startNewSession resets transcript and seeds model plus think
     try testing.expectEqualStrings("medium", buffered[2].entry.entry.thinking_level_change.thinking_level);
 }
 
-test "AgentSession: startNewSession preserves ephemeral mode" {
+test "AgentSession: startNewSession switches ephemeral sessions onto normal persistence" {
     const allocator = testing.allocator;
 
     var registry = ai.provider.Registry.init(allocator);
@@ -2431,11 +2433,12 @@ test "AgentSession: startNewSession preserves ephemeral mode" {
     try testing.expect(!ca.session_store.writer.persist);
     try ca.startNewSession();
 
-    try testing.expect(!ca.session_store.writer.persist);
-    try testing.expectEqual(@as(usize, 0), ca.session_store.sessionFile().len);
-    try testing.expectEqual(@as(usize, 2), ca.session_store.writer.buffered_entries.items.len);
-    try testing.expect(ca.session_store.writer.buffered_entries.items[0].entry.entry == .model_change);
-    try testing.expect(ca.session_store.writer.buffered_entries.items[1].entry.entry == .thinking_level_change);
+    try testing.expect(ca.session_store.writer.persist);
+    try testing.expect(ca.session_store.sessionFile().len > 0);
+    try testing.expectEqual(@as(usize, 3), ca.session_store.writer.buffered_entries.items.len);
+    try testing.expect(ca.session_store.writer.buffered_entries.items[0] == .header);
+    try testing.expect(ca.session_store.writer.buffered_entries.items[1].entry.entry == .model_change);
+    try testing.expect(ca.session_store.writer.buffered_entries.items[2].entry.entry == .thinking_level_change);
 }
 
 // --continue round-trip: write session → load → continue → verify context sent to provider

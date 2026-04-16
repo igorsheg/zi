@@ -68,6 +68,7 @@ Additional contract rules:
 - image `@file` inputs attach image blocks and also contribute `<file ...></file>` text references
 - empty or whitespace-only piped stdin is treated as absent; empty `@file` inputs are skipped
 - interactive mode does not read piped stdin and does not force batch selection
+- in interactive mode, `--no-session` applies to the startup session only; `/resume` may switch into a persisted session and `/new` starts a normal persisted session
 - current image `@file` handling is still narrower than pi-mono: extension-based detection only, no auto-resize or dimension-note text yet
 - the **default action is `run`**
 - session-targeting flags are explicit and validated
