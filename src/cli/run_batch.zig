@@ -5,13 +5,13 @@ const agent = @import("../agent/root.zig");
 const coding_agent = @import("../coding_agent.zig");
 const sdk = @import("../sdk.zig");
 const agent_json = @import("../agent/json.zig");
+const batch_contract = @import("batch_contract.zig");
 const plan = @import("plan.zig");
 const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const common = @import("common.zig");
 
 const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
-const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
 
 pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.ExecutionResult {
     logging.setThreadLabel(.batch);
@@ -46,11 +46,10 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
 
     const allowlist_opt = try common.parseToolAllowlist(allocator, options.tool_allowlist_csv);
     var json_handler = JsonHandler{};
-    var print_handler = PrintHandler{};
-    const event_handler: coding_agent.AgentSession.EventHandler = if (options.output == .json)
+    const event_handler: ?coding_agent.AgentSession.EventHandler = if (options.output == .json)
         .{ .func = &JsonHandler.callback, .ctx = @ptrCast(&json_handler) }
     else
-        .{ .func = &PrintHandler.callback, .ctx = @ptrCast(&print_handler) };
+        null;
 
     var ca = try sdk.createAgentSession(allocator, .{
         .model = model,
@@ -67,43 +66,34 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
     });
     defer ca.deinit();
 
+    if (options.output == .json) {
+        var out_buf: [4096]u8 = undefined;
+        var out_writer = stdout.writerStreaming(&out_buf);
+        try batch_contract.writeJsonSessionPreamble(&out_writer.interface, ca.session_store.header());
+        try out_writer.end();
+    }
+
     try ca.run(options.prompt);
 
-    try stdout.writeAll("\n");
-    if (ca.sessionFlushed()) {
-        stderr.writeAll("session: ") catch {};
-        stderr.writeAll(ca.getSessionFile()) catch {};
-        stderr.writeAll("\n") catch {};
-    }
-
-    return .ok;
+    return switch (options.output) {
+        .json => .ok,
+        .text => try finishTextMode(allocator, ca.agent.state.messages),
+    };
 }
 
-const PrintHandler = struct {
-    fn callback(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {
-        switch (event) {
-            .message_update => |mu| {
-                switch (mu.assistant_message_event) {
-                    .text_delta => |d| stdout.writeAll(d.delta) catch {},
-                    .@"error" => |e| {
-                        if (e.@"error".error_message) |msg| {
-                            stderr.writeAll("\nerror: ") catch {};
-                            stderr.writeAll(msg) catch {};
-                            stderr.writeAll("\n") catch {};
-                        }
-                    },
-                    else => {},
-                }
-            },
-            .tool_execution_start => |te| {
-                stderr.writeAll("⚡ ") catch {};
-                stderr.writeAll(te.tool_name) catch {};
-                stderr.writeAll("\n") catch {};
-            },
-            else => {},
-        }
+fn finishTextMode(allocator: std.mem.Allocator, messages: []const agent.protocol.AgentMessage) !result.ExecutionResult {
+    switch (try batch_contract.evaluateTextModeResult(allocator, messages)) {
+        .none => return .ok,
+        .failure => |message| return .{ .err = .{ .batch_assistant_failed = message } },
+        .success => |assistant| {
+            var out_buf: [4096]u8 = undefined;
+            var out_writer = stdout.writer(&out_buf);
+            try batch_contract.writeAssistantText(&out_writer.interface, assistant);
+            try out_writer.end();
+            return .ok;
+        },
     }
-};
+}
 
 const JsonHandler = struct {
     fn callback(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {

@@ -78,7 +78,7 @@ pub const SessionStore = struct {
         const cache_alloc = cache_arena.allocator();
 
         const data = try reader_mod.readSessionFile(cache_alloc, path);
-        const header = data.header orelse return error.InvalidSessionFile;
+        const session_header = data.header orelse return error.InvalidSessionFile;
 
         const leaf_id: ?[]const u8 = if (data.entries.len > 0)
             data.entries[data.entries.len - 1].id
@@ -90,12 +90,12 @@ pub const SessionStore = struct {
             .writer = writer_mod.SessionWriter.initContinue(
                 allocator,
                 try allocator.dupe(u8, path),
-                try allocator.dupe(u8, header.id),
+                try allocator.dupe(u8, session_header.id),
                 if (leaf_id) |id| try allocator.dupe(u8, id) else null,
             ),
             .cache_arena = cache_arena,
             .cached_entries = data.entries,
-            .cached_header = header,
+            .cached_header = session_header,
         };
     }
 
@@ -116,6 +116,15 @@ pub const SessionStore = struct {
 
     pub fn leafId(self: *const SessionStore) ?[]const u8 {
         return self.writer.leaf_id;
+    }
+
+    pub fn header(self: *const SessionStore) ?proto.SessionHeader {
+        if (self.cached_header) |session_header| return session_header;
+        if (self.writer.buffered_entries.items.len == 0) return null;
+        return switch (self.writer.buffered_entries.items[0]) {
+            .header => |session_header| session_header,
+            .entry => null,
+        };
     }
 
     // ── Append methods (delegate to writer) ──────────────────────

@@ -68,6 +68,7 @@ pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDia
         .no_model_available => try writer.writeAll(
             "error: no model available — configure auth via /login or pass --api-key, then --model.\n",
         ),
+        .batch_assistant_failed => |message| try writer.print("error: {s}\n", .{message}),
         .no_api_key_for_provider => |info| {
             try writer.print("error: no API key for provider '{s}'. use /login in interactive mode or set ", .{info.provider});
             if (info.env_hint) |env_hint| {
@@ -89,10 +90,12 @@ test "plan and execution diagnostics explain the finalized session-target contra
     try writePlanDiagnostic(&out.writer, .{ .prompt_not_allowed_for_session_target = "--session" });
     try writePlanDiagnostic(&out.writer, .{ .session_target_requires_interactive = "--continue" });
     try writeExecutionDiagnostic(&out.writer, .no_recent_session);
+    try writeExecutionDiagnostic(&out.writer, .{ .batch_assistant_failed = "Request aborted" });
     const rendered = try out.toOwnedSlice();
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--session") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--continue") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "zi --resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Request aborted") != null);
 }

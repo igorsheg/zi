@@ -26,9 +26,9 @@ pub fn writeGeneralHelp(writer: anytype) !void {
         "Behavior:\n" ++
             "  {s}                     Start interactive mode\n" ++
             "  {s} \"prompt\"            Start interactive mode with an initial prompt\n" ++
-            "  {s} -p \"prompt\"         Run in batch text mode and exit\n" ++
+            "  {s} -p \"prompt\"         Run in batch text mode and print the final assistant text\n" ++
             "  {s} --mode json \"prompt\"\n" ++
-            "                         Run in batch JSON mode and exit\n" ++
+            "                         Run in batch JSON mode and emit JSON lines\n" ++
             "  {s} --continue          Resume the most recent session for this project\n" ++
             "  {s} --resume            Open the interactive session picker\n" ++
             "  {s} --session <path|id> Resume a specific session by path or ID prefix\n\n",
@@ -44,8 +44,8 @@ pub fn writeGeneralHelp(writer: anytype) !void {
     );
     try writer.writeAll(
         "Run options:\n" ++
-            "  -p, --print                  Select batch text mode; requires a prompt\n" ++
-            "  --mode <text|json>           Select batch output mode; requires a prompt\n" ++
+            "  -p, --print                  Select batch text mode; prints the final assistant text only\n" ++
+            "  --mode <text|json>           Select batch output mode; JSON emits a session header then event lines\n" ++
             "  --continue, -c               Resume the most recent session for this project\n" ++
             "  --resume, -r                 Open the interactive session picker\n" ++
             "  --session <path|id>          Resume a specific session by path or ID prefix\n" ++
@@ -61,6 +61,9 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  -v, --version                Show version\n\n" ++
             "Notes:\n" ++
             "  - batch mode is explicit: use -p or --mode\n" ++
+            "  - batch text mode prints the final assistant text only after completion\n" ++
+            "  - batch JSON mode emits a session header first when persistence is enabled\n" ++
+            "  - batch text failures come from the final assistant error/abort state\n" ++
             "  - session targets are interactive-only and mutually exclusive\n" ++
             "  - prompts cannot be combined with --continue, --resume, or --session\n" ++
             "  - every accepted flag either affects the plan or fails during planning\n\n",
@@ -82,5 +85,7 @@ test "general help documents explicit session-target behaviors and actions" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Resume the most recent session for this project") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Open the interactive session picker") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Resume a specific session by path or ID prefix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "prints the final assistant text only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "session header first") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "session targets are interactive-only and mutually exclusive") != null);
 }

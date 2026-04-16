@@ -9,6 +9,7 @@ pub const ExecutionDiagnostic = union(enum) {
     model_resolution_failed,
     no_model_found,
     no_model_available,
+    batch_assistant_failed: []const u8,
     no_api_key_for_provider: struct {
         provider: []const u8,
         env_hint: ?[]const u8,

@@ -52,6 +52,9 @@ The CLI contract this refactor must preserve and clarify is:
 
 Additional contract rules:
 
+- batch text mode prints the final assistant text only after completion
+- batch JSON mode emits a session header first when session persistence is enabled, then JSON event lines
+- batch text failures derive from the final assistant stop reason / error state, not incidental stream chatter
 - the **default action is `run`**
 - session-targeting flags are explicit and validated
 - session targets are **interactive-only** and **mutually exclusive**
