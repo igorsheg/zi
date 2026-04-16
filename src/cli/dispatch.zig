@@ -16,7 +16,10 @@ pub const ExecutionResult = result.ExecutionResult;
 pub fn run(ctx: Context, cli_runtime: ?*runtime_mod.Runtime, execution_plan: plan.ExecutionPlan) !ExecutionResult {
     switch (execution_plan) {
         .version => {
-            try stdout.writeAll("zi v0.0.1\n");
+            var out_buf: [64]u8 = undefined;
+            var out_writer = stdout.writer(&out_buf);
+            try help.writeVersion(&out_writer.interface);
+            try out_writer.end();
             return .ok;
         },
         .help => {

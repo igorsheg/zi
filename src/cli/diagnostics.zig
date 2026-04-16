@@ -14,10 +14,16 @@ pub fn writeParseDiagnostic(writer: anytype, diagnostic: parse.ParseDiagnostic) 
 
 pub fn writePlanDiagnostic(writer: anytype, diagnostic: plan.PlanDiagnostic) !void {
     switch (diagnostic) {
-        .too_many_positionals => try writer.writeAll("error: too many positional arguments\n"),
-        .prompt_required_for_batch => try writer.writeAll("error: prompt required for batch mode\n"),
-        .prompt_not_allowed_for_this_session_target => try writer.writeAll("error: prompt is not allowed with the selected session target\n"),
-        .conflicting_batch_selectors => try writer.writeAll("error: conflicting batch selectors\n"),
+        .too_many_positionals => try writer.writeAll("error: run accepts at most one prompt positional\n"),
+        .prompt_required_for_batch => try writer.writeAll(
+            "error: batch mode requires a prompt. use `zi -p \"prompt\"` or `zi --mode json \"prompt\"`\n",
+        ),
+        .prompt_not_allowed_for_this_session_target => try writer.writeAll(
+            "error: prompt cannot be combined with --continue. use `zi --continue <path>` to resume interactively\n",
+        ),
+        .conflicting_batch_selectors => try writer.writeAll(
+            "error: choose either -p/--print or --mode, not both\n",
+        ),
         .unsupported_flag_for_action => |flag| try writer.print("error: flag '{s}' is not supported for this action\n", .{flag}),
         .invalid_flag_combination => |combo| try writer.print(
             "error: invalid flag combination: {s} and {s}\n",
@@ -41,7 +47,7 @@ pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDia
         .session_file_has_no_messages => try writer.writeAll("error: session file has no messages\n"),
         .model_resolution_failed => try writer.writeAll("error: model resolution failed\n"),
         .no_model_found => try writer.writeAll(
-            "error: no model found. configure auth or set an API key env var.\nuse --list-models to see available models\n",
+            "error: no model found. configure auth in interactive mode with /login, or set an API key env var.\nuse `zi --list-models` to see models with configured auth\n",
         ),
         .no_model_available => try writer.writeAll(
             "error: no model available — configure auth via /login or pass --api-key, then --model.\n",
@@ -58,8 +64,21 @@ pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDia
             try writer.writeAll("\n");
         },
         .continue_session_needs_prompt => try writer.writeAll(
-            "session loaded but transcript ends with assistant. provide a prompt to continue.\n",
+            "error: the resumed session already ends with an assistant message. open it with `zi --continue <path>` and send a follow-up prompt interactively.\n",
         ),
         .continue_session_failed => |err_name| try writer.print("error: could not continue session: {s}\n", .{err_name}),
     }
+}
+
+test "plan diagnostics explain batch and resume semantics" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writePlanDiagnostic(&out.writer, .prompt_required_for_batch);
+    try writePlanDiagnostic(&out.writer, .prompt_not_allowed_for_this_session_target);
+    const rendered = try out.toOwnedSlice();
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "zi -p \"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "zi --continue <path>") != null);
 }

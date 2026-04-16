@@ -21,6 +21,7 @@ const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
+const app_meta = @import("../app_meta.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
@@ -461,7 +462,7 @@ pub const Interactive = struct {
             .cwd = cwd,
             .editor = editor_mod.Editor.init(state_allocator),
             .status_text = text_mod.Text.init(state_allocator),
-            .greeter = .{ .theme = theme, .version = "0.1.0" },
+            .greeter = .{ .theme = theme, .version = app_meta.version },
             .footer = .{ .theme = theme },
             .hotkeys_overlay = .{ .theme = theme },
             .transcript = Transcript.init(state_allocator),
