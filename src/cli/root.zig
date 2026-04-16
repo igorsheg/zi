@@ -11,3 +11,7 @@ pub const list_models = @import("list_models.zig");
 pub const run_batch = @import("run_batch.zig");
 pub const run_interactive = @import("run_interactive.zig");
 pub const dispatch = @import("dispatch.zig");
+
+test {
+    _ = @import("contract_test.zig");
+}
