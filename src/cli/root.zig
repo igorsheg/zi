@@ -4,6 +4,7 @@ pub const plan = @import("plan.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const help = @import("help.zig");
 pub const stdin = @import("stdin.zig");
+pub const initial_message = @import("initial_message.zig");
 pub const context = @import("context.zig");
 pub const runtime = @import("runtime.zig");
 pub const result = @import("result.zig");

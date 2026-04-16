@@ -14,6 +14,7 @@ pub const RawRunArgs = struct {
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     positionals: []const []const u8 = &.{},
+    file_args: []const []const u8 = &.{},
     continue_session: bool = false,
     resume_picker: bool = false,
     session_ref: ?[]const u8 = null,
@@ -23,6 +24,7 @@ pub const RawRunArgs = struct {
 
     pub fn deinit(self: *RawRunArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.positionals);
+        allocator.free(self.file_args);
         self.* = undefined;
     }
 };
@@ -81,6 +83,8 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
     var raw: RawRunArgs = .{};
     var positionals: std.ArrayList([]const u8) = .empty;
     defer positionals.deinit(allocator);
+    var file_args: std.ArrayList([]const u8) = .empty;
+    defer file_args.deinit(allocator);
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -132,6 +136,10 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
             raw.append_system_prompt = value;
             continue;
         }
+        if (arg.len > 0 and arg[0] == '@') {
+            try file_args.append(allocator, arg[1..]);
+            continue;
+        }
         if (arg.len > 0 and arg[0] == '-') {
             return .{ .err = .{ .unknown_flag = arg } };
         }
@@ -140,6 +148,8 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
     }
 
     raw.positionals = try positionals.toOwnedSlice(allocator);
+    errdefer allocator.free(raw.positionals);
+    raw.file_args = try file_args.toOwnedSlice(allocator);
     return .{ .ok = .{ .run = raw } };
 }
 
@@ -206,7 +216,7 @@ test "list-models parsing keeps its optional search positional and rejects unrel
     }
 }
 
-test "run parsing records batch selectors session selectors and positionals without planning them" {
+test "run parsing records batch selectors file args session selectors and positionals without planning them" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -220,6 +230,8 @@ test "run parsing records batch selectors session selectors and positionals with
         "--resume",
         "--session",
         "session-1234",
+        "@docs/README.md",
+        "@assets/screenshot.png",
         "hello",
         "world",
     });
@@ -232,6 +244,9 @@ test "run parsing records batch selectors session selectors and positionals with
                 try std.testing.expect(run.continue_session);
                 try std.testing.expect(run.resume_picker);
                 try std.testing.expectEqualStrings("session-1234", run.session_ref.?);
+                try std.testing.expectEqual(@as(usize, 2), run.file_args.len);
+                try std.testing.expectEqualStrings("docs/README.md", run.file_args[0]);
+                try std.testing.expectEqualStrings("assets/screenshot.png", run.file_args[1]);
                 try std.testing.expectEqual(@as(usize, 2), run.positionals.len);
                 try std.testing.expectEqualStrings("hello", run.positionals[0]);
                 try std.testing.expectEqualStrings("world", run.positionals[1]);

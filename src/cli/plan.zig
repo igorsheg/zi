@@ -28,9 +28,19 @@ pub const InteractivePlan = struct {
     append_system_prompt: ?[]const u8 = null,
 };
 
+pub const BatchPromptSources = struct {
+    stdin_text: ?[]const u8 = null,
+    file_args: []const []const u8 = &.{},
+    prompt_text: ?[]const u8 = null,
+
+    pub fn hasAny(self: BatchPromptSources) bool {
+        return self.stdin_text != null or self.file_args.len > 0 or self.prompt_text != null;
+    }
+};
+
 pub const BatchPlan = struct {
     output: OutputMode,
-    prompt: []const u8,
+    prompt_sources: BatchPromptSources,
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     no_session: bool = false,
@@ -59,6 +69,7 @@ pub const PlanDiagnostic = union(enum) {
     too_many_positionals,
     too_many_list_models_positionals,
     prompt_required_for_batch,
+    file_inputs_require_batch,
     prompt_not_allowed_for_session_target: []const u8,
     session_target_requires_interactive: []const u8,
     conflicting_batch_selectors,
@@ -123,10 +134,21 @@ fn buildRun(allocator: std.mem.Allocator, raw: RawRunArgs, options: BuildOptions
         return .{ .err = .{ .prompt_not_allowed_for_session_target = session_flag.? } };
     }
 
+    if (raw.file_args.len > 0 and !batch_selected) {
+        return .{ .err = .file_inputs_require_batch };
+    }
+
     if (batch_selected) {
+        const prompt_sources: BatchPromptSources = .{
+            .stdin_text = options.piped_stdin,
+            .file_args = try allocator.dupe([]const u8, raw.file_args),
+            .prompt_text = positional_prompt,
+        };
+        if (!prompt_sources.hasAny()) return .{ .err = .prompt_required_for_batch };
+
         return .{ .ok = .{ .run = .{ .batch = .{
             .output = raw.mode orelse .text,
-            .prompt = (try mergeBatchPrompt(allocator, options.piped_stdin, positional_prompt)) orelse return .{ .err = .prompt_required_for_batch },
+            .prompt_sources = prompt_sources,
             .api_key = raw.api_key,
             .model_id = raw.model_id,
             .no_session = raw.no_session,
@@ -144,16 +166,6 @@ fn buildRun(allocator: std.mem.Allocator, raw: RawRunArgs, options: BuildOptions
         .tool_allowlist_csv = raw.tools_filter,
         .append_system_prompt = raw.append_system_prompt,
     } } } };
-}
-
-fn mergeBatchPrompt(
-    allocator: std.mem.Allocator,
-    piped_stdin: ?[]const u8,
-    positional_prompt: ?[]const u8,
-) std.mem.Allocator.Error!?[]const u8 {
-    if (piped_stdin == null) return positional_prompt;
-    if (positional_prompt == null) return piped_stdin;
-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ piped_stdin.?, positional_prompt.? });
 }
 
 const SessionSelection = struct {
@@ -262,7 +274,9 @@ test "planner builds explicit interactive and batch plans from the chosen select
             .run => |run| switch (run) {
                 .batch => |batch| {
                     try std.testing.expectEqual(OutputMode.json, batch.output);
-                    try std.testing.expectEqualStrings("hello", batch.prompt);
+                    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
+                    try std.testing.expect(batch.prompt_sources.stdin_text == null);
+                    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
                 },
                 else => return error.UnexpectedPlan,
             },
@@ -304,7 +318,7 @@ test "list-models plan carries optional search and rejects extra positionals" {
     }
 }
 
-test "planner rejects conflicting or interactive-only session target combinations" {
+test "planner rejects conflicting session selectors and batch-only file inputs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -330,6 +344,17 @@ test "planner rejects conflicting or interactive-only session target combination
     switch (prompt_and_target) {
         .err => |diag| switch (diag) {
             .prompt_not_allowed_for_session_target => |flag| try std.testing.expectEqualStrings("--session", flag),
+            else => return error.UnexpectedDiagnostic,
+        },
+        .ok => return error.ExpectedDiagnostic,
+    }
+
+    const file_args_in_interactive = try build(arena.allocator(), .{ .run = .{
+        .file_args = &.{"docs/README.md"},
+    } }, .{});
+    switch (file_args_in_interactive) {
+        .err => |diag| switch (diag) {
+            .file_inputs_require_batch => {},
             else => return error.UnexpectedDiagnostic,
         },
         .ok => return error.ExpectedDiagnostic,

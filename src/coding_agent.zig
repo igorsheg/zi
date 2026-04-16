@@ -905,8 +905,13 @@ pub const AgentSession = struct {
         return self.agent.state.system_prompt;
     }
 
-    /// Run a new prompt. Wires session persistence, then delegates to Agent.prompt.
+    /// Run a new text prompt. Wires session persistence, then delegates to Agent.prompt.
     pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
+        try self.runUserContent(.{ .text = prompt_text });
+    }
+
+    /// Run a new user message with explicit text/image content blocks.
+    pub fn runUserContent(self: *AgentSession, user_content: ai.protocol.UserMessage.UserMessageContent) !void {
         // zi-wub.6: this thread is now the lua owner. Bind BEFORE
         // wireSubscription because subscribe→agentEventSink calls
         // assertOnLuaThread on the first event. Interactive mode now
@@ -920,7 +925,7 @@ pub const AgentSession = struct {
 
         const user_msg = protocol.AgentMessage{
             .user = .{
-                .content = .{ .text = prompt_text },
+                .content = user_content,
                 .timestamp = std.time.milliTimestamp(),
             },
         };
@@ -2604,6 +2609,41 @@ test "AgentSession: context capture — provider receives user message" {
         }
     }
     try testing.expect(found_user);
+}
+
+test "AgentSession: runUserContent forwards text and image blocks to the provider" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const c = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("reply")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &c, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    var collector = EventCollector.init(allocator);
+    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
+    defer ca.deinit();
+
+    const blocks = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 2);
+    blocks[0] = .{ .text = .{ .text = "describe this image" } };
+    blocks[1] = .{ .image = .{ .data = "QUJD", .mime_type = "image/png" } };
+    try ca.runUserContent(.{ .blocks = blocks });
+
+    try testing.expectEqual(@as(usize, 1), fp.captured_contexts.items.len);
+    const ctx = fp.captured_contexts.items[0];
+    try testing.expect(ctx.messages[0] == .user);
+    switch (ctx.messages[0].user.content) {
+        .blocks => |captured| {
+            try testing.expectEqual(@as(usize, 2), captured.len);
+            try testing.expectEqualStrings("describe this image", captured[0].text.text);
+            try testing.expectEqualStrings("QUJD", captured[1].image.data);
+            try testing.expectEqualStrings("image/png", captured[1].image.mime_type);
+        },
+        .text => return error.ExpectedBlocks,
+    }
 }
 
 // pi-mono test-harness.test.ts: "streams text deltas"

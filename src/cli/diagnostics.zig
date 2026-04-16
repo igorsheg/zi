@@ -19,7 +19,10 @@ pub fn writePlanDiagnostic(writer: anytype, diagnostic: plan.PlanDiagnostic) !vo
             "error: --list-models accepts at most one optional search term\n",
         ),
         .prompt_required_for_batch => try writer.writeAll(
-            "error: batch mode requires a prompt or piped stdin. use `zi -p \"prompt\"`, `zi --mode json \"prompt\"`, or `cat file | zi -p`\n",
+            "error: batch mode requires a prompt source. use `zi -p \"prompt\"`, `zi -p @file`, `zi --mode json \"prompt\"`, or `cat file | zi -p`\n",
+        ),
+        .file_inputs_require_batch => try writer.writeAll(
+            "error: @file arguments currently require explicit batch mode. use `zi -p [@file ...] [prompt]` or `zi --mode json [@file ...] [prompt]`\n",
         ),
         .prompt_not_allowed_for_session_target => |flag| try writer.print(
             "error: prompt cannot be combined with {s}. session targets start interactively without an initial prompt\n",
@@ -71,6 +74,11 @@ pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDia
         .no_model_available => try writer.writeAll(
             "error: no model available — configure auth via /login or pass --api-key, then --model.\n",
         ),
+        .batch_prompt_sources_resolved_empty => try writer.writeAll(
+            "error: batch mode did not receive any non-empty prompt sources. empty @file inputs are ignored; provide piped stdin, a non-empty @file, or a prompt\n",
+        ),
+        .batch_file_not_found => |path| try writer.print("error: file not found: {s}\n", .{path}),
+        .batch_file_read_failed => |info| try writer.print("error: could not read file {s}: {s}\n", .{ info.path, info.err_name }),
         .batch_assistant_failed => |message| try writer.print("error: {s}\n", .{message}),
         .no_api_key_for_provider => |info| {
             try writer.print("error: no API key for provider '{s}'. use /login in interactive mode or set ", .{info.provider});
@@ -91,15 +99,19 @@ test "plan and execution diagnostics explain the finalized session-target contra
     defer out.deinit();
 
     try writePlanDiagnostic(&out.writer, .prompt_required_for_batch);
+    try writePlanDiagnostic(&out.writer, .file_inputs_require_batch);
     try writePlanDiagnostic(&out.writer, .{ .prompt_not_allowed_for_session_target = "--session" });
     try writePlanDiagnostic(&out.writer, .{ .session_target_requires_interactive = "--continue" });
     try writeExecutionDiagnostic(&out.writer, .no_recent_session);
+    try writeExecutionDiagnostic(&out.writer, .batch_prompt_sources_resolved_empty);
     try writeExecutionDiagnostic(&out.writer, .{ .batch_assistant_failed = "Request aborted" });
     const rendered = try out.toOwnedSlice();
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "piped stdin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "cat file | zi -p") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "zi -p @file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "@file arguments currently require explicit batch mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "empty @file inputs are ignored") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--session") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--continue") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "zi --resume") != null);

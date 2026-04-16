@@ -76,7 +76,9 @@ test "cli batch contract requires explicit selectors for text and json" {
             .run => |run_plan| switch (run_plan) {
                 .batch => |batch| {
                     try std.testing.expectEqual(parse.OutputMode.text, batch.output);
-                    try std.testing.expectEqualStrings("hello", batch.prompt);
+                    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
+                    try std.testing.expect(batch.prompt_sources.stdin_text == null);
+                    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
                 },
                 else => return error.ExpectedBatchPlan,
             },
@@ -91,7 +93,9 @@ test "cli batch contract requires explicit selectors for text and json" {
             .run => |run_plan| switch (run_plan) {
                 .batch => |batch| {
                     try std.testing.expectEqual(parse.OutputMode.json, batch.output);
-                    try std.testing.expectEqualStrings("hello", batch.prompt);
+                    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
+                    try std.testing.expect(batch.prompt_sources.stdin_text == null);
+                    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
                 },
                 else => return error.ExpectedBatchPlan,
             },
@@ -101,7 +105,7 @@ test "cli batch contract requires explicit selectors for text and json" {
     }
 }
 
-test "cli batch mode uses piped stdin only when explicitly selected" {
+test "cli batch mode uses stdin and @file inputs only when explicitly selected" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -109,7 +113,11 @@ test "cli batch mode uses piped stdin only when explicitly selected" {
     switch (stdin_only_batch) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
-                .batch => |batch| try std.testing.expectEqualStrings("from stdin", batch.prompt),
+                .batch => |batch| {
+                    try std.testing.expectEqualStrings("from stdin", batch.prompt_sources.stdin_text.?);
+                    try std.testing.expect(batch.prompt_sources.prompt_text == null);
+                    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
+                },
                 else => return error.ExpectedBatchPlan,
             },
             else => return error.ExpectedRunPlan,
@@ -126,16 +134,31 @@ test "cli batch mode uses piped stdin only when explicitly selected" {
         .ok, .parse_diag => return error.ExpectedDiagnostic,
     }
 
-    const merged_batch = try parseAndPlan(arena.allocator(), &.{ "--mode", "json", "hello" }, "from stdin\n");
+    const merged_batch = try parseAndPlan(arena.allocator(), &.{ "--mode", "json", "@README.md", "hello" }, "from stdin\n");
     switch (merged_batch) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
-                .batch => |batch| try std.testing.expectEqualStrings("from stdin\nhello", batch.prompt),
+                .batch => |batch| {
+                    try std.testing.expectEqualStrings("from stdin\n", batch.prompt_sources.stdin_text.?);
+                    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
+                    try std.testing.expectEqual(@as(usize, 1), batch.prompt_sources.file_args.len);
+                    try std.testing.expectEqualStrings("README.md", batch.prompt_sources.file_args[0]);
+                },
                 else => return error.ExpectedBatchPlan,
             },
             else => return error.ExpectedRunPlan,
         },
         .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
+    }
+
+    const interactive_file_result = try parseAndPlan(arena.allocator(), &.{"@README.md"}, null);
+    switch (interactive_file_result) {
+        .plan_diag => |diag| {
+            const rendered = try renderPlanDiagnostic(diag);
+            defer std.testing.allocator.free(rendered);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "@file arguments currently require explicit batch mode") != null);
+        },
+        .ok, .parse_diag => return error.ExpectedDiagnostic,
     }
 
     const interactive_result = try parseAndPlan(arena.allocator(), &.{"hello"}, "from stdin");

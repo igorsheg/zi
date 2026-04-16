@@ -45,7 +45,9 @@ The CLI contract this refactor must preserve and clarify is:
 - `zi` → interactive
 - `zi "prompt"` → interactive with an initial prompt
 - `zi -p "prompt"` → batch text and exit
+- `zi -p @README.md` → batch text using an explicit `@file` input and exit
 - `zi --mode json "prompt"` → batch JSON and exit
+- `zi --mode json @README.md` → batch JSON using an explicit `@file` input and exit
 - `zi --continue` → interactive resume of the most recent session for the current project
 - `zi --resume` → interactive session picker
 - `zi --session <path|id>` → interactive resume of a specific session by path or ID prefix
@@ -57,8 +59,11 @@ Additional contract rules:
 - batch JSON mode emits a session header first when session persistence is enabled, then JSON event lines
 - batch text failures derive from the final assistant stop reason / error state, not incidental stream chatter
 - piped stdin is read only when batch mode was explicitly selected (`-p` or `--mode`)
-- piped stdin can satisfy the batch prompt requirement by itself, or be concatenated before the positional prompt
-- empty or whitespace-only piped stdin is treated as absent
+- `@file` arguments are currently accepted only in explicit batch mode
+- batch prompt sources are assembled in pi-mono order: `stdin + @file text + first prompt positional`
+- piped stdin can satisfy the batch prompt requirement by itself, as can `@file` arguments, or they can be combined with the positional prompt
+- image `@file` inputs attach image blocks and also contribute `<file ...></file>` text references
+- empty or whitespace-only piped stdin is treated as absent; empty `@file` inputs are skipped
 - interactive mode does not read piped stdin and does not force batch selection
 - the **default action is `run`**
 - session-targeting flags are explicit and validated
@@ -134,6 +139,7 @@ pub const RawRunArgs = struct {
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     positionals: []const []const u8 = &.{},
+    file_args: []const []const u8 = &.{},
     continue_session: bool = false,
     resume_picker: bool = false,
     session_ref: ?[]const u8 = null,
@@ -198,9 +204,15 @@ pub const InteractivePlan = struct {
     append_system_prompt: ?[]const u8 = null,
 };
 
+pub const BatchPromptSources = struct {
+    stdin_text: ?[]const u8 = null,
+    file_args: []const []const u8 = &.{},
+    prompt_text: ?[]const u8 = null,
+};
+
 pub const BatchPlan = struct {
     output: OutputMode,
-    prompt: []const u8,
+    prompt_sources: BatchPromptSources,
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     no_session: bool = false,
@@ -222,7 +234,7 @@ pub const ExecutionPlan = union(enum) {
 
 The exact field set may grow, but the architecture rule is fixed:
 
-- a batch plan requires a prompt source (positional prompt, piped stdin, or both)
+- a batch plan requires a prompt source (`@file`, positional prompt, piped stdin, or any combination)
 - an interactive plan may have an initial prompt
 - batch output mode is explicit
 - session targeting is explicit
@@ -393,10 +405,12 @@ Valid:
 - `zi`
 - `zi "hello"`
 - `zi -p "hello"`
+- `zi -p @README.md`
 - `zi --mode json "hello"`
+- `zi --mode json @README.md`
 - `cat README.md | zi -p`
 - `cat README.md | zi --mode json`
-- `cat README.md | zi -p "Summarize this text"`
+- `cat README.md | zi -p @docs/guide.md "Summarize this text"`
 - `zi --continue`
 - `zi --resume`
 - `zi --session 2a9f7c1d`
@@ -404,8 +418,9 @@ Valid:
 
 Invalid unless later given explicit semantics:
 
-- `zi -p` (without a positional prompt or piped stdin)
-- `zi --mode json` (without a positional prompt or piped stdin)
+- `zi -p` (without a positional prompt, `@file`, or piped stdin)
+- `zi --mode json` (without a positional prompt, `@file`, or piped stdin)
+- `zi @README.md`
 - `zi "a" "b"`
 - `zi --continue "prompt"`
 - `zi --session 2a9f7c1d "prompt"`

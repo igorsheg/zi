@@ -6,6 +6,7 @@ const coding_agent = @import("../coding_agent.zig");
 const sdk = @import("../sdk.zig");
 const agent_json = @import("../agent/json.zig");
 const batch_contract = @import("batch_contract.zig");
+const initial_message = @import("initial_message.zig");
 const plan = @import("plan.zig");
 const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
@@ -17,6 +18,11 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
     logging.setThreadLabel(.batch);
 
     const allocator = runtime.allocator;
+    const prepared_input = switch (try initial_message.prepareBatchInput(allocator, runtime.cwd, options.prompt_sources)) {
+        .ok => |input| input,
+        .err => |diag| return .{ .err = diag },
+    };
+
     const init_result = ai.resolve.findInitialModel(.{
         .cli_provider = null,
         .cli_model = options.model_id,
@@ -73,7 +79,7 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
         try out_writer.end();
     }
 
-    try ca.run(options.prompt);
+    try ca.runUserContent(try prepared_input.toUserContent(allocator));
 
     return switch (options.output) {
         .json => .ok,
