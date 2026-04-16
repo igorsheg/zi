@@ -6,12 +6,12 @@ const tool_util = @import("../tools/util.zig");
 
 const max_batch_file_bytes = 16 * 1024 * 1024;
 
-pub const PreparedBatchInput = struct {
+pub const PreparedInitialMessage = struct {
     text: []const u8,
     images: []const ai.protocol.ImageContent = &.{},
 
     pub fn toUserContent(
-        self: PreparedBatchInput,
+        self: PreparedInitialMessage,
         allocator: std.mem.Allocator,
     ) std.mem.Allocator.Error!ai.protocol.UserMessage.UserMessageContent {
         if (self.images.len == 0) return .{ .text = self.text };
@@ -25,16 +25,21 @@ pub const PreparedBatchInput = struct {
     }
 };
 
-pub const PrepareResult = union(enum) {
-    ok: PreparedBatchInput,
+pub const PrepareInitialResult = union(enum) {
+    ok: ?PreparedInitialMessage,
     err: result.ExecutionDiagnostic,
 };
 
-pub fn prepareBatchInput(
+pub const PrepareBatchResult = union(enum) {
+    ok: PreparedInitialMessage,
+    err: result.ExecutionDiagnostic,
+};
+
+pub fn prepareInitialMessage(
     allocator: std.mem.Allocator,
     cwd: []const u8,
-    sources: plan.BatchPromptSources,
-) std.mem.Allocator.Error!PrepareResult {
+    sources: plan.PromptSources,
+) std.mem.Allocator.Error!PrepareInitialResult {
     var text_out: std.Io.Writer.Allocating = .init(allocator);
     errdefer text_out.deinit();
 
@@ -63,7 +68,7 @@ pub fn prepareBatchInput(
         wrote_text = true;
     }
 
-    if (!wrote_text) return .{ .err = .batch_prompt_sources_resolved_empty };
+    if (!wrote_text) return .{ .ok = null };
 
     const text = try text_out.toOwnedSlice();
     const owned_images = if (images.items.len == 0)
@@ -71,6 +76,20 @@ pub fn prepareBatchInput(
     else
         try images.toOwnedSlice(allocator);
     return .{ .ok = .{ .text = text, .images = owned_images } };
+}
+
+pub fn prepareBatchInput(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    sources: plan.PromptSources,
+) std.mem.Allocator.Error!PrepareBatchResult {
+    return switch (try prepareInitialMessage(allocator, cwd, sources)) {
+        .ok => |prepared| if (prepared) |input|
+            .{ .ok = input }
+        else
+            .{ .err = .batch_prompt_sources_resolved_empty },
+        .err => |diag| .{ .err = diag },
+    };
 }
 
 const AppendFileResult = union(enum) {
@@ -240,6 +259,27 @@ test "prepareBatchInput attaches image files and skips empty files" {
                 .text => return error.ExpectedBlocks,
             }
         },
+        .err => return error.UnexpectedDiagnostic,
+    }
+}
+
+test "prepareInitialMessage treats empty interactive file inputs as no startup content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "empty.txt", .data = "" });
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const prepared = try prepareInitialMessage(allocator, cwd, .{
+        .file_args = &.{"empty.txt"},
+    });
+    switch (prepared) {
+        .ok => |input| try std.testing.expect(input == null),
         .err => return error.UnexpectedDiagnostic,
     }
 }

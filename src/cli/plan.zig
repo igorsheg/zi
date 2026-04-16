@@ -18,8 +18,18 @@ pub const RunPlan = union(enum) {
     batch: BatchPlan,
 };
 
+pub const PromptSources = struct {
+    stdin_text: ?[]const u8 = null,
+    file_args: []const []const u8 = &.{},
+    prompt_text: ?[]const u8 = null,
+
+    pub fn hasAny(self: PromptSources) bool {
+        return self.stdin_text != null or self.file_args.len > 0 or self.prompt_text != null;
+    }
+};
+
 pub const InteractivePlan = struct {
-    initial_prompt: ?[]const u8 = null,
+    prompt_sources: PromptSources = .{},
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     session_target: SessionTarget = .none,
@@ -28,19 +38,9 @@ pub const InteractivePlan = struct {
     append_system_prompt: ?[]const u8 = null,
 };
 
-pub const BatchPromptSources = struct {
-    stdin_text: ?[]const u8 = null,
-    file_args: []const []const u8 = &.{},
-    prompt_text: ?[]const u8 = null,
-
-    pub fn hasAny(self: BatchPromptSources) bool {
-        return self.stdin_text != null or self.file_args.len > 0 or self.prompt_text != null;
-    }
-};
-
 pub const BatchPlan = struct {
     output: OutputMode,
-    prompt_sources: BatchPromptSources,
+    prompt_sources: PromptSources,
     api_key: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     no_session: bool = false,
@@ -69,7 +69,6 @@ pub const PlanDiagnostic = union(enum) {
     too_many_positionals,
     too_many_list_models_positionals,
     prompt_required_for_batch,
-    file_inputs_require_batch,
     prompt_not_allowed_for_session_target: []const u8,
     session_target_requires_interactive: []const u8,
     conflicting_batch_selectors,
@@ -130,16 +129,12 @@ fn buildRun(allocator: std.mem.Allocator, raw: RawRunArgs, options: BuildOptions
         return .{ .err = .{ .session_target_requires_interactive = session_flag.? } };
     }
 
-    if (positional_prompt != null and session_flag != null) {
+    if (session_flag != null and (positional_prompt != null or raw.file_args.len > 0)) {
         return .{ .err = .{ .prompt_not_allowed_for_session_target = session_flag.? } };
     }
 
-    if (raw.file_args.len > 0 and !batch_selected) {
-        return .{ .err = .file_inputs_require_batch };
-    }
-
     if (batch_selected) {
-        const prompt_sources: BatchPromptSources = .{
+        const prompt_sources: PromptSources = .{
             .stdin_text = options.piped_stdin,
             .file_args = try allocator.dupe([]const u8, raw.file_args),
             .prompt_text = positional_prompt,
@@ -158,7 +153,10 @@ fn buildRun(allocator: std.mem.Allocator, raw: RawRunArgs, options: BuildOptions
     }
 
     return .{ .ok = .{ .run = .{ .interactive = .{
-        .initial_prompt = positional_prompt,
+        .prompt_sources = .{
+            .file_args = try allocator.dupe([]const u8, raw.file_args),
+            .prompt_text = positional_prompt,
+        },
         .api_key = raw.api_key,
         .model_id = raw.model_id,
         .session_target = session_target,
@@ -219,7 +217,8 @@ test "default run plan is interactive without initial prompt or session target" 
         .ok => |plan| switch (plan) {
             .run => |run| switch (run) {
                 .interactive => |interactive| {
-                    try std.testing.expect(interactive.initial_prompt == null);
+                    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
+                    try std.testing.expectEqual(@as(usize, 0), interactive.prompt_sources.file_args.len);
                     try std.testing.expect(interactive.session_target == .none);
                 },
                 else => return error.UnexpectedPlan,
@@ -318,7 +317,7 @@ test "list-models plan carries optional search and rejects extra positionals" {
     }
 }
 
-test "planner rejects conflicting session selectors and batch-only file inputs" {
+test "planner allows interactive file inputs and rejects session-target collisions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -353,8 +352,27 @@ test "planner rejects conflicting session selectors and batch-only file inputs" 
         .file_args = &.{"docs/README.md"},
     } }, .{});
     switch (file_args_in_interactive) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run| switch (run) {
+                .interactive => |interactive| {
+                    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
+                    try std.testing.expectEqual(@as(usize, 1), interactive.prompt_sources.file_args.len);
+                    try std.testing.expectEqualStrings("docs/README.md", interactive.prompt_sources.file_args[0]);
+                },
+                else => return error.UnexpectedPlan,
+            },
+            else => return error.UnexpectedPlan,
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
+
+    const file_args_and_target = try build(arena.allocator(), .{ .run = .{
+        .continue_session = true,
+        .file_args = &.{"docs/README.md"},
+    } }, .{});
+    switch (file_args_and_target) {
         .err => |diag| switch (diag) {
-            .file_inputs_require_batch => {},
+            .prompt_not_allowed_for_session_target => |flag| try std.testing.expectEqualStrings("--continue", flag),
             else => return error.UnexpectedDiagnostic,
         },
         .ok => return error.ExpectedDiagnostic,

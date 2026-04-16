@@ -43,7 +43,8 @@ test "cli run contract defaults to interactive and keeps a lone prompt interacti
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
                 .interactive => |interactive| {
-                    try std.testing.expect(interactive.initial_prompt == null);
+                    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
+                    try std.testing.expectEqual(@as(usize, 0), interactive.prompt_sources.file_args.len);
                     try std.testing.expect(interactive.session_target == .none);
                 },
                 else => return error.ExpectedInteractivePlan,
@@ -57,7 +58,7 @@ test "cli run contract defaults to interactive and keeps a lone prompt interacti
     switch (prompt_result) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
-                .interactive => |interactive| try std.testing.expectEqualStrings("hello", interactive.initial_prompt.?),
+                .interactive => |interactive| try std.testing.expectEqualStrings("hello", interactive.prompt_sources.prompt_text.?),
                 else => return error.ExpectedInteractivePlan,
             },
             else => return error.ExpectedRunPlan,
@@ -105,7 +106,7 @@ test "cli batch contract requires explicit selectors for text and json" {
     }
 }
 
-test "cli batch mode uses stdin and @file inputs only when explicitly selected" {
+test "cli prompt source planning keeps stdin batch-only and allows interactive @file startup" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -153,19 +154,25 @@ test "cli batch mode uses stdin and @file inputs only when explicitly selected" 
 
     const interactive_file_result = try parseAndPlan(arena.allocator(), &.{"@README.md"}, null);
     switch (interactive_file_result) {
-        .plan_diag => |diag| {
-            const rendered = try renderPlanDiagnostic(diag);
-            defer std.testing.allocator.free(rendered);
-            try std.testing.expect(std.mem.indexOf(u8, rendered, "@file arguments currently require explicit batch mode") != null);
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run_plan| switch (run_plan) {
+                .interactive => |interactive| {
+                    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
+                    try std.testing.expectEqual(@as(usize, 1), interactive.prompt_sources.file_args.len);
+                    try std.testing.expectEqualStrings("README.md", interactive.prompt_sources.file_args[0]);
+                },
+                else => return error.ExpectedInteractivePlan,
+            },
+            else => return error.ExpectedRunPlan,
         },
-        .ok, .parse_diag => return error.ExpectedDiagnostic,
+        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
     }
 
     const interactive_result = try parseAndPlan(arena.allocator(), &.{"hello"}, "from stdin");
     switch (interactive_result) {
         .ok => |execution_plan| switch (execution_plan) {
             .run => |run_plan| switch (run_plan) {
-                .interactive => |interactive| try std.testing.expectEqualStrings("hello", interactive.initial_prompt.?),
+                .interactive => |interactive| try std.testing.expectEqualStrings("hello", interactive.prompt_sources.prompt_text.?),
                 else => return error.ExpectedInteractivePlan,
             },
             else => return error.ExpectedRunPlan,
@@ -183,7 +190,7 @@ test "cli rejects invalid session-target combinations with actionable diagnostic
         .plan_diag => |diag| {
             const rendered = try renderPlanDiagnostic(diag);
             defer std.testing.allocator.free(rendered);
-            try std.testing.expect(std.mem.indexOf(u8, rendered, "prompt cannot be combined with --continue") != null);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "startup prompt inputs cannot be combined with --continue") != null);
             try std.testing.expect(std.mem.indexOf(u8, rendered, "without an initial prompt") != null);
         },
         .ok, .parse_diag => return error.ExpectedDiagnostic,

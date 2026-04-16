@@ -71,6 +71,29 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: protocol.AgentMessage
     };
 }
 
+pub fn cloneUserContent(
+    allocator: std.mem.Allocator,
+    content: ai.protocol.UserMessage.UserMessageContent,
+) !ai.protocol.UserMessage.UserMessageContent {
+    return switch (content) {
+        .text => |text| .{ .text = try allocator.dupe(u8, text) },
+        .blocks => |blocks| .{ .blocks = try cloneUserBlocks(allocator, blocks) },
+    };
+}
+
+pub fn freeUserContent(
+    allocator: std.mem.Allocator,
+    content: *ai.protocol.UserMessage.UserMessageContent,
+) void {
+    switch (content.*) {
+        .text => |text| allocator.free(text),
+        .blocks => |blocks| {
+            for (blocks) |block| freeUserBlock(allocator, block);
+            allocator.free(blocks);
+        },
+    }
+}
+
 pub fn freeMessage(allocator: std.mem.Allocator, message: *protocol.AgentMessage) void {
     switch (message.*) {
         .user => |*user| freeUserMessage(allocator, user),
@@ -212,22 +235,13 @@ fn freeUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.Us
 
 fn cloneUserMessage(allocator: std.mem.Allocator, message: ai.protocol.UserMessage) !ai.protocol.UserMessage {
     return .{
-        .content = switch (message.content) {
-            .text => |text| .{ .text = try allocator.dupe(u8, text) },
-            .blocks => |blocks| .{ .blocks = try cloneUserBlocks(allocator, blocks) },
-        },
+        .content = try cloneUserContent(allocator, message.content),
         .timestamp = message.timestamp,
     };
 }
 
 fn freeUserMessage(allocator: std.mem.Allocator, message: *ai.protocol.UserMessage) void {
-    switch (message.content) {
-        .text => |text| allocator.free(text),
-        .blocks => |blocks| {
-            for (blocks) |block| freeUserBlock(allocator, block);
-            allocator.free(blocks);
-        },
-    }
+    freeUserContent(allocator, &message.content);
 }
 
 fn cloneFailure(allocator: std.mem.Allocator, failure: ai.protocol.NormalizedFailure) !ai.protocol.NormalizedFailure {

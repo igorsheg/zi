@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const ai_protocol = @import("../ai/protocol.zig");
+const message_memory = @import("message_memory.zig");
 const mailbox_mod = @import("../runtime/mailbox.zig");
 
 /// AgentRequest — mailbox payload for the TUI → agent mutation channel.
@@ -37,7 +38,7 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 /// agent-thread consumer frees with the same allocator after dispatch
 /// via `deinit`.
 pub const AgentRequest = union(enum) {
-    prompt: struct { text: []const u8 },
+    prompt: struct { content: ai_protocol.UserMessage.UserMessageContent },
     resume_session: struct {
         path: []const u8,
         restore_session_model: bool = true,
@@ -50,7 +51,7 @@ pub const AgentRequest = union(enum) {
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .prompt => |p| allocator.free(p.text),
+            .prompt => |*p| message_memory.freeUserContent(allocator, &p.content),
             .resume_session => |r| allocator.free(r.path),
             .new_session => {},
             .set_model => {},
@@ -109,8 +110,7 @@ test "RequestQueue wake pipe stays readable until the long-lived owner drains re
     var q = try RequestQueue.init(allocator);
     defer q.deinit();
 
-    const text = try allocator.dupe(u8, "hello");
-    q.push(.{ .prompt = .{ .text = text } });
+    q.push(.{ .prompt = .{ .content = .{ .text = try allocator.dupe(u8, "hello") } } });
 
     var pfd = [1]posix.pollfd{.{
         .fd = q.wakeReadFd().?,
@@ -126,7 +126,10 @@ test "RequestQueue wake pipe stays readable until the long-lived owner drains re
     var buf: [2]AgentRequest = undefined;
     const n = q.drainInto(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqualStrings("hello", buf[0].prompt.text);
+    switch (buf[0].prompt.content) {
+        .text => |text| try std.testing.expectEqualStrings("hello", text),
+        else => return error.UnexpectedResult,
+    }
     buf[0].deinit(allocator);
 
     pfd[0].revents = 0;

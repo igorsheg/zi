@@ -21,11 +21,8 @@ pub fn writePlanDiagnostic(writer: anytype, diagnostic: plan.PlanDiagnostic) !vo
         .prompt_required_for_batch => try writer.writeAll(
             "error: batch mode requires a prompt source. use `zi -p \"prompt\"`, `zi -p @file`, `zi --mode json \"prompt\"`, or `cat file | zi -p`\n",
         ),
-        .file_inputs_require_batch => try writer.writeAll(
-            "error: @file arguments currently require explicit batch mode. use `zi -p [@file ...] [prompt]` or `zi --mode json [@file ...] [prompt]`\n",
-        ),
         .prompt_not_allowed_for_session_target => |flag| try writer.print(
-            "error: prompt cannot be combined with {s}. session targets start interactively without an initial prompt\n",
+            "error: startup prompt inputs cannot be combined with {s}. session targets start interactively without an initial prompt\n",
             .{flag},
         ),
         .session_target_requires_interactive => |flag| try writer.print(
@@ -99,7 +96,6 @@ test "plan and execution diagnostics explain the finalized session-target contra
     defer out.deinit();
 
     try writePlanDiagnostic(&out.writer, .prompt_required_for_batch);
-    try writePlanDiagnostic(&out.writer, .file_inputs_require_batch);
     try writePlanDiagnostic(&out.writer, .{ .prompt_not_allowed_for_session_target = "--session" });
     try writePlanDiagnostic(&out.writer, .{ .session_target_requires_interactive = "--continue" });
     try writeExecutionDiagnostic(&out.writer, .no_recent_session);
@@ -110,7 +106,7 @@ test "plan and execution diagnostics explain the finalized session-target contra
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "piped stdin") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "zi -p @file") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "@file arguments currently require explicit batch mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "startup prompt inputs cannot be combined") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "empty @file inputs are ignored") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--session") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--continue") != null);

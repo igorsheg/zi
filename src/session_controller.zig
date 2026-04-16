@@ -161,8 +161,12 @@ pub const SessionController = struct {
     }
 
     pub fn runPrompt(self: *SessionController, prompt_text: []const u8) !RunOutcome {
+        return self.runUserContent(.{ .text = prompt_text });
+    }
+
+    pub fn runUserContent(self: *SessionController, content: ai.protocol.UserMessage.UserMessageContent) !RunOutcome {
         self.wire();
-        return self.runWithRecovery(.running_prompt, prompt_text);
+        return self.runWithRecovery(.running_prompt, content);
     }
 
     pub fn continueTurn(self: *SessionController) !RunOutcome {
@@ -268,7 +272,11 @@ pub const SessionController = struct {
             .success;
     }
 
-    fn runWithRecovery(self: *SessionController, initial_phase: Phase, prompt_text: ?[]const u8) !RunOutcome {
+    fn runWithRecovery(
+        self: *SessionController,
+        initial_phase: Phase,
+        prompt_content: ?ai.protocol.UserMessage.UserMessageContent,
+    ) !RunOutcome {
         self.last_outcome = null;
         self.retry_attempt = 0;
         self.overflow_recovery_attempted = false;
@@ -285,7 +293,7 @@ pub const SessionController = struct {
             self.last_outcome = null;
             self.setPhase(phase);
             if (phase == .running_prompt) {
-                try self.session.run(prompt_text.?);
+                try self.session.runUserContent(prompt_content.?);
             } else {
                 try self.session.continueSession();
             }

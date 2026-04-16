@@ -314,7 +314,7 @@ const ModelPickerFlow = struct {
 
 const StartupAction = union(enum) {
     none,
-    prompt: []const u8,
+    prompt: ai_protocol.UserMessage.UserMessageContent,
     resume_session: struct {
         path: []const u8,
         restore_session_model: bool = true,
@@ -726,7 +726,7 @@ pub const Interactive = struct {
     fn performStartupAction(self: *Interactive) void {
         switch (self.startup_action) {
             .none => {},
-            .prompt => |text| self.submitPrompt(text),
+            .prompt => |content| self.submitUserContent(content),
             .resume_session => |session_resume| {
                 const path_copy = self.msg_allocator.dupe(u8, session_resume.path) catch {
                     self.status_text.setContent("out of memory");
@@ -1498,6 +1498,10 @@ pub const Interactive = struct {
     }
 
     fn submitPrompt(self: *Interactive, text: []const u8) void {
+        self.submitUserContent(.{ .text = text });
+    }
+
+    fn submitUserContent(self: *Interactive, content: ai_protocol.UserMessage.UserMessageContent) void {
         if (self.request_in_flight) {
             self.status_text.setContent("agent is busy");
             self.status_text.fg = self.theme.fg(.@"error");
@@ -1505,9 +1509,9 @@ pub const Interactive = struct {
             return;
         }
 
-        const prompt_copy = self.msg_allocator.dupe(u8, text) catch return;
+        const content_copy = message_memory.cloneUserContent(self.msg_allocator, content) catch return;
 
-        switch (self.request_queue.trySend(.{ .prompt = .{ .text = prompt_copy } })) {
+        switch (self.request_queue.trySend(.{ .prompt = .{ .content = content_copy } })) {
             .ok => {},
             .dropped => unreachable,
             .closed, .full, .oom => |rejected| {
@@ -2334,7 +2338,7 @@ pub const Interactive = struct {
                 switch (req.*) {
                     .prompt => |p| {
                         prompt_processed = true;
-                        const outcome = self.session_controller.runPrompt(p.text) catch |err| {
+                        const outcome = self.session_controller.runUserContent(p.content) catch |err| {
                             const err_msg = self.msg_allocator.dupe(u8, @errorName(err)) catch null;
                             self.event_queue.push(.{ .prompt_worker_finished = .{
                                 .outcome = .assistant_error,

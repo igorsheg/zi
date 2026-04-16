@@ -9,6 +9,7 @@ const tool_display = @import("../tui/tool_display.zig");
 const builtin_renderers = @import("../tui/renderers/builtins.zig");
 const compactor = @import("../session/compactor.zig");
 const session_lookup_mod = @import("../session/lookup.zig");
+const initial_message = @import("initial_message.zig");
 const plan = @import("plan.zig");
 const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
@@ -17,7 +18,7 @@ const context_mod = @import("context.zig");
 
 const ResolvedStartupAction = union(enum) {
     none,
-    prompt: []const u8,
+    prompt: ai.protocol.UserMessage.UserMessageContent,
     resume_session: struct {
         path: []const u8,
         restore_session_model: bool = true,
@@ -160,7 +161,10 @@ fn resolveStartupAction(
     options: plan.InteractivePlan,
 ) std.mem.Allocator.Error!StartupResolution {
     return switch (options.session_target) {
-        .none => .{ .ok = if (options.initial_prompt) |prompt| .{ .prompt = prompt } else .none },
+        .none => switch (try initial_message.prepareInitialMessage(allocator, cwd, options.prompt_sources)) {
+            .ok => |prepared| .{ .ok = if (prepared) |content| .{ .prompt = try content.toUserContent(allocator) } else .none },
+            .err => |diag| .{ .err = diag },
+        },
         .picker => .{ .ok = .{ .resume_picker = .{
             .restore_session_model = shouldRestoreSessionModel(options),
         } } },
@@ -203,6 +207,40 @@ test "startup resume keeps explicit cli model instead of restoring session model
     switch (from_picker) {
         .ok => |action| switch (action) {
             .resume_picker => |picker| try std.testing.expect(!picker.restore_session_model),
+            else => return error.UnexpectedStartupAction,
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
+}
+
+test "interactive startup prepares shared @file prompt content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "notes.txt", .data = "hello from file" });
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const resolved = try resolveStartupAction(allocator, cwd, .{
+        .prompt_sources = .{
+            .file_args = &.{"notes.txt"},
+            .prompt_text = "and prompt",
+        },
+    });
+    switch (resolved) {
+        .ok => |action| switch (action) {
+            .prompt => |content| switch (content) {
+                .text => |text| {
+                    try std.testing.expect(std.mem.indexOf(u8, text, "notes.txt") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, text, "hello from file") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, text, "and prompt") != null);
+                },
+                .blocks => return error.ExpectedTextPrompt,
+            },
             else => return error.UnexpectedStartupAction,
         },
         .err => return error.UnexpectedDiagnostic,

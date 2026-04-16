@@ -5,7 +5,7 @@ pub fn writeGeneralHelp(writer: anytype) !void {
     try writer.print("{s} — {s}\n\n", .{ app_meta.name, app_meta.tagline });
     try writer.print(
         "Usage:\n" ++
-            "  {s} [run-options] [prompt]\n" ++
+            "  {s} [run-options] [@file ...] [prompt]\n" ++
             "  {s} -p [@file ...] [prompt]\n" ++
             "  {s} --mode <text|json> [@file ...] [prompt]\n" ++
             "  {s} --continue\n" ++
@@ -30,6 +30,9 @@ pub fn writeGeneralHelp(writer: anytype) !void {
         "Behavior:\n" ++
             "  {s}                     Start interactive mode\n" ++
             "  {s} \"prompt\"            Start interactive mode with an initial prompt\n" ++
+            "  {s} @README.md          Start interactive mode with @file content\n" ++
+            "  {s} @README.md \"Summarize this\"\n" ++
+            "                         Start interactive mode with @file content plus a prompt\n" ++
             "  {s} -p \"prompt\"         Run in batch text mode and print the final assistant text\n" ++
             "  {s} -p @README.md       Include a file in the batch prompt and exit\n" ++
             "  {s} --mode json \"prompt\"\n" ++
@@ -40,6 +43,8 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  {s} --resume            Open the interactive session picker\n" ++
             "  {s} --session <path|id> Resume a specific session by path or ID prefix\n\n",
         .{
+            app_meta.name,
+            app_meta.name,
             app_meta.name,
             app_meta.name,
             app_meta.name,
@@ -71,7 +76,8 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "Notes:\n" ++
             "  - batch mode is explicit: use -p or --mode\n" ++
             "  - piped stdin is read only for explicit batch mode, never to force batch selection\n" ++
-            "  - @file arguments are currently supported in explicit batch mode only\n" ++
+            "  - @file arguments are supported for interactive startup and explicit batch mode\n" ++
+            "  - interactive startup uses @file text + prompt; batch mode uses stdin + @file text + prompt\n" ++
             "  - batch mode accepts piped stdin, @file arguments, a positional prompt, or any combination\n" ++
             "  - batch prompt assembly order matches pi-mono: stdin + @file text + prompt\n" ++
             "  - image @file inputs are attached and also contribute <file ...></file> text references\n" ++
@@ -81,7 +87,7 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  - batch text failures come from the final assistant error/abort state\n" ++
             "  - --list-models shows available models and supports an optional fuzzy search\n" ++
             "  - session targets are interactive-only and mutually exclusive\n" ++
-            "  - prompts cannot be combined with --continue, --resume, or --session\n" ++
+            "  - startup prompt inputs (@file or prompt text) cannot be combined with --continue, --resume, or --session\n" ++
             "  - every accepted flag either affects the plan or fails during planning\n\n",
     );
 }
@@ -104,7 +110,8 @@ test "general help documents explicit session-target behaviors and actions" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "prints the final assistant text only") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "session header first") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Merge stdin, @file content, and the prompt in that order") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "@file arguments are currently supported in explicit batch mode only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Start interactive mode with @file content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "@file arguments are supported for interactive startup and explicit batch mode") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "image @file inputs are attached") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "List available models") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "optional fuzzy search") != null);
