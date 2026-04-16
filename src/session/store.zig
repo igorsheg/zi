@@ -203,11 +203,11 @@ pub const SessionStore = struct {
 pub fn findMostRecentSession(allocator: std.mem.Allocator, cwd: []const u8) !?[]const u8 {
     const session_dir = try storage.getSessionDirForCwd(allocator, cwd, null);
     defer allocator.free(session_dir);
-    return findMostRecentInDir(allocator, session_dir);
+    return findMostRecentSessionInDir(allocator, session_dir);
 }
 
 /// Find the most recent valid session in a specific directory.
-fn findMostRecentInDir(allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
+pub fn findMostRecentSessionInDir(allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -277,7 +277,12 @@ fn isValidSessionFile(path: []const u8) bool {
 pub fn listSessions(allocator: std.mem.Allocator, cwd: []const u8) ![]SessionInfo {
     const session_dir = try storage.getSessionDirForCwd(allocator, cwd, null);
     defer allocator.free(session_dir);
+    return listSessionsInDir(allocator, session_dir);
+}
 
+/// List all valid sessions in a specific directory.
+/// Returns metadata sorted by most recent first.
+pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) ![]SessionInfo {
     var dir = std.fs.openDirAbsolute(session_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => return err,

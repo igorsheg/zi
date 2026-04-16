@@ -1,3 +1,5 @@
+const session_lookup = @import("../session/lookup.zig");
+
 pub const ExecutionDiagnostic = union(enum) {
     resolver_message: []const u8,
     session_lookup_failed: []const u8,
@@ -17,3 +19,12 @@ pub const ExecutionResult = union(enum) {
     ok,
     err: ExecutionDiagnostic,
 };
+
+pub fn fromSessionLookupDiagnostic(diagnostic: session_lookup.Diagnostic) ExecutionDiagnostic {
+    return switch (diagnostic) {
+        .lookup_failed => |err_name| .{ .session_lookup_failed = err_name },
+        .no_recent_session => .no_recent_session,
+        .not_found => |ref| .{ .session_target_not_found = ref },
+        .ambiguous => |ref| .{ .session_target_ambiguous = ref },
+    };
+}
