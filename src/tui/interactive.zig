@@ -203,6 +203,55 @@ const LiveToolExecutionState = struct {
     }
 };
 
+const ToolResultTextDelta = struct {
+    content_index: usize,
+    bytes: []const u8,
+};
+
+fn collectToolResultTextDeltas(
+    allocator: std.mem.Allocator,
+    previous: ?AgentToolResult,
+    current_is_error: bool,
+    next: ?AgentToolResult,
+) ?std.ArrayList(ToolResultTextDelta) {
+    var deltas: std.ArrayList(ToolResultTextDelta) = .empty;
+    errdefer deltas.deinit(allocator);
+
+    const next_result = next orelse {
+        if (previous != null) return null;
+        return deltas;
+    };
+    if (current_is_error != next_result.is_error) return null;
+    if (next_result.details != .null) return null;
+
+    const previous_content = if (previous) |result| blk: {
+        if (result.details != .null) return null;
+        break :blk result.content;
+    } else &.{};
+    if (previous_content.len > next_result.content.len) return null;
+
+    for (next_result.content, 0..) |next_block, idx| {
+        if (next_block != .text) return null;
+        if (next_block.text.text_signature != null) return null;
+
+        if (idx < previous_content.len) {
+            const previous_block = previous_content[idx];
+            if (previous_block != .text) return null;
+            if (previous_block.text.text_signature != null) return null;
+            if (!std.mem.startsWith(u8, next_block.text.text, previous_block.text.text)) return null;
+
+            const delta = next_block.text.text[previous_block.text.text.len..];
+            if (delta.len == 0) continue;
+            deltas.append(allocator, .{ .content_index = idx, .bytes = delta }) catch return null;
+            continue;
+        }
+
+        deltas.append(allocator, .{ .content_index = idx, .bytes = next_block.text.text }) catch return null;
+    }
+
+    return deltas;
+}
+
 fn appendBytesOwned(allocator: std.mem.Allocator, existing: []const u8, extra: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, existing.len + extra.len);
     @memcpy(out[0..existing.len], existing);
@@ -3067,6 +3116,40 @@ pub const Interactive = struct {
         } } });
     }
 
+    fn publishToolResultContentDeltaPatch(self: *Interactive, tool_call_id: []const u8, content_index: usize, delta: []const u8) void {
+        const bytes = self.msg_allocator.dupe(u8, delta) catch return;
+        const owned_tool_call_id = self.msg_allocator.dupe(u8, tool_call_id) catch {
+            self.msg_allocator.free(bytes);
+            return;
+        };
+        self.event_queue.push(.{ .conversation_patch = .{ .append_frontier_content = .{
+            .target = .{ .tool_result_content = .{
+                .tool_call_id = owned_tool_call_id,
+                .content_index = content_index,
+            } },
+            .bytes = bytes,
+        } } });
+    }
+
+    fn publishToolExecutionUpdatePatches(
+        self: *Interactive,
+        live_tool: *const LiveToolExecutionState,
+        payload: @FieldType(AgentEvent, "tool_execution_update"),
+    ) bool {
+        var deltas = collectToolResultTextDeltas(
+            self.msg_allocator,
+            live_tool.result,
+            live_tool.is_error,
+            payload.partial_result,
+        ) orelse return false;
+        defer deltas.deinit(self.msg_allocator);
+
+        for (deltas.items) |delta| {
+            self.publishToolResultContentDeltaPatch(payload.tool_call_id, delta.content_index, delta.bytes);
+        }
+        return true;
+    }
+
     fn publishConversationPatchForAgentEvent(self: *Interactive, event: AgentEvent) void {
         switch (event) {
             .message_start => |payload| switch (payload.message) {
@@ -3088,14 +3171,11 @@ pub const Interactive = struct {
                         self.publishReplaceFrontierPatch();
                         return;
                     };
-                    const args_json_source = live_tool.args_json_source orelse {
+                    _ = live_tool.args_json_source orelse {
                         self.publishReplaceFrontierPatch();
                         return;
                     };
-                    if (args_json_source.len <= delta.delta.len) {
-                        self.publishReplaceFrontierPatch();
-                        return;
-                    }
+                    if (delta.delta.len == 0) return;
                     self.publishToolCallArgumentsDeltaPatch(tool_call.id, delta.delta);
                 },
                 .toolcall_end => self.publishReplaceFrontierPatch(),
@@ -3105,7 +3185,16 @@ pub const Interactive = struct {
                 .assistant, .tool_result => self.publishReplaceFrontierPatch(),
                 else => self.publishAppendCommittedPatch(payload.message),
             },
-            .tool_execution_start, .tool_execution_update, .tool_execution_end => self.publishReplaceFrontierPatch(),
+            .tool_execution_start, .tool_execution_end => self.publishReplaceFrontierPatch(),
+            .tool_execution_update => |payload| {
+                const live_tool = self.getLiveToolExecution(payload.tool_call_id) orelse {
+                    self.publishReplaceFrontierPatch();
+                    return;
+                };
+                if (!self.publishToolExecutionUpdatePatches(live_tool, payload)) {
+                    self.publishReplaceFrontierPatch();
+                }
+            },
             .turn_end => |payload| {
                 if (payload.message != .assistant) return;
                 self.event_queue.push(.{ .conversation_patch = .commit_frontier });
@@ -3121,9 +3210,9 @@ pub const Interactive = struct {
     /// Raw agent event callback — runs on the AGENT THREAD.
     fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.updateLiveToolExecutionFromAgentEvent(event);
         self.publishQueueSnapshotForAgentEvent(event);
         self.publishConversationPatchForAgentEvent(event);
+        self.updateLiveToolExecutionFromAgentEvent(event);
         if (convertAgentUiEvent(event, self.msg_allocator)) |ui_event| {
             self.event_queue.push(ui_event);
         }
@@ -3376,6 +3465,78 @@ fn thinkingDescription(level: agent_protocol.ThinkingLevel) []const u8 {
 }
 
 const testing = std.testing;
+
+test "collectToolResultTextDeltas emits append chunks for prefix-preserving text growth" {
+    const previous_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "$ bash\nfi" } },
+    };
+    const next_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "$ bash\nfirst\nsecond" } },
+        .{ .text = .{ .text = "tail" } },
+    };
+    const previous = AgentToolResult{ .content = &previous_blocks };
+    const next = AgentToolResult{ .content = &next_blocks };
+
+    var deltas = collectToolResultTextDeltas(testing.allocator, previous, false, next) orelse return error.ExpectedToolResultDeltas;
+    defer deltas.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), deltas.items.len);
+    try testing.expectEqual(@as(usize, 0), deltas.items[0].content_index);
+    try testing.expectEqualStrings("rst\nsecond", deltas.items[0].bytes);
+    try testing.expectEqual(@as(usize, 1), deltas.items[1].content_index);
+    try testing.expectEqualStrings("tail", deltas.items[1].bytes);
+}
+
+test "collectToolResultTextDeltas emits first text chunk from empty result" {
+    const next_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "$ bash\nhello" } },
+    };
+    const next = AgentToolResult{ .content = &next_blocks };
+
+    var deltas = collectToolResultTextDeltas(testing.allocator, null, false, next) orelse return error.ExpectedToolResultDeltas;
+    defer deltas.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), deltas.items.len);
+    try testing.expectEqual(@as(usize, 0), deltas.items[0].content_index);
+    try testing.expectEqualStrings("$ bash\nhello", deltas.items[0].bytes);
+}
+
+test "collectToolResultTextDeltas rejects non-appendable partial result changes" {
+    const previous_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "alpha" } },
+    };
+    const previous = AgentToolResult{ .content = &previous_blocks };
+
+    const changed_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "omega" } },
+    };
+    try testing.expect(collectToolResultTextDeltas(
+        testing.allocator,
+        previous,
+        false,
+        AgentToolResult{ .content = &changed_blocks },
+    ) == null);
+
+    const image_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .image = .{ .data = "abc", .mime_type = "image/png" } },
+    };
+    try testing.expect(collectToolResultTextDeltas(
+        testing.allocator,
+        null,
+        false,
+        AgentToolResult{ .content = &image_blocks },
+    ) == null);
+
+    const error_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "alpha" } },
+    };
+    try testing.expect(collectToolResultTextDeltas(
+        testing.allocator,
+        previous,
+        false,
+        AgentToolResult{ .content = &error_blocks, .is_error = true },
+    ) == null);
+}
 
 fn pngHeader(width: u32, height: u32) [24]u8 {
     return .{
