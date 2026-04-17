@@ -916,6 +916,14 @@ pub const Transcript = struct {
                 return false;
             };
         }
+        if (item.tool_call_id) |tool_call_id| {
+            self.pending_tools.put(self.allocator, tool_call_id, idx) catch {
+                if (item.snapshot_item_id) |item_id| _ = self.snapshot_items.remove(item_id);
+                _ = self.items.pop();
+                self.layout.removeItem(idx);
+                return false;
+            };
+        }
         self.noteAppendedItem();
         return true;
     }
@@ -1154,7 +1162,6 @@ pub const Transcript = struct {
             te.renderer_state = init_fn(self.allocator);
         }
 
-        const item_idx = self.items.items.len;
         if (!self.appendTranscriptItem(.{
             .renderable = TranscriptRenderable.init(ToolExecution, te),
             .kind = .tool_execution,
@@ -1166,7 +1173,6 @@ pub const Transcript = struct {
             te.deinit();
             return;
         }
-        self.pending_tools.put(self.allocator, te.tool_call_id, item_idx) catch {};
     }
 
     /// Get the ToolExecution for a pending tool by ID.

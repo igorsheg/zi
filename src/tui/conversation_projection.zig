@@ -313,7 +313,13 @@ fn appendProjectedFrontierRows(
     }
 
     if (frontier.assistant) |assistant| {
-        const row = createAssistantMessageRow(transcript.allocator, assistant, live_tool_ids.items, transcript.theme) catch return;
+        const row = createAssistantMessageRow(
+            transcript.allocator,
+            assistant,
+            live_tool_ids.items,
+            transcript.theme,
+            transcript.hide_thinking_block,
+        ) catch return;
         if (!transcript.addItem(row)) {
             var owned_row = row;
             owned_row.deinit(transcript.allocator);
@@ -341,30 +347,17 @@ pub fn rebuildFromSnapshot(
     transcript.clearAll();
     editor.clearHistory();
 
-    var live_tool_ids: std.ArrayList([]const u8) = .empty;
-    defer live_tool_ids.deinit(transcript.allocator);
-    for (snapshot.items) |item| {
-        if (item != .tool_execution) continue;
-        live_tool_ids.append(transcript.allocator, item.tool_execution.tool_call_id) catch return;
+    var desired_items = buildDesiredItems(transcript.allocator, resolver, snapshot, options, transcript.hide_thinking_block) catch return;
+    defer {
+        for (desired_items.items) |*item| item.deinit(transcript.allocator);
+        desired_items.deinit(transcript.allocator);
     }
 
-    for (snapshot.items) |item| {
-        switch (item) {
-            .committed_message => |committed| {
-                seedHistoryFromMessage(editor, committed.message);
-                appendProjectedSnapshotMessage(transcript, resolver, committed.message, options, live_tool_ids.items);
-            },
-            .active_assistant => |active| appendActiveAssistantItem(transcript, active.message.assistant, live_tool_ids.items),
-            .tool_execution => |tool_execution| appendToolExecutionItem(transcript, resolver, tool_execution),
-            .queued_user_message => |queued| {
-                transcript.addQueuedUserMessage(.{
-                    .text = queued.text,
-                    .footer = switch (queued.kind) {
-                        .steering => .queued_steering,
-                        .follow_up => .queued_follow_up,
-                    },
-                });
-            },
+    for (desired_items.items, 0..) |desired, idx| {
+        if (!transcript.addItem(desired.row)) return;
+        disarmDesiredRow(&desired_items.items[idx]);
+        if (desired.seed_editor_history) {
+            if (desired.history_text) |history_text| editor.addToHistory(history_text.slice());
         }
     }
 
@@ -378,7 +371,7 @@ pub fn reconcileFromSnapshot(
     snapshot: conversation_snapshot_mod.ConversationSnapshot,
     options: RebuildOptions,
 ) void {
-    var desired_items = buildDesiredItems(transcript.allocator, resolver, snapshot, options) catch return;
+    var desired_items = buildDesiredItems(transcript.allocator, resolver, snapshot, options, transcript.hide_thinking_block) catch return;
     defer {
         for (desired_items.items) |*item| item.deinit(transcript.allocator);
         desired_items.deinit(transcript.allocator);
@@ -393,14 +386,12 @@ pub fn reconcileFromSnapshot(
                 if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
             } else {
                 _ = transcript.replaceItemAt(current_index, desired.row);
-                desired_items.items[desired_index].row.deinit_ctx = null;
-                desired_items.items[desired_index].row.deinit_fn = null;
+                disarmDesiredRow(&desired_items.items[desired_index]);
                 if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
             }
         } else {
             _ = transcript.insertItemAt(desired_index, desired.row);
-            desired_items.items[desired_index].row.deinit_ctx = null;
-            desired_items.items[desired_index].row.deinit_fn = null;
+            disarmDesiredRow(&desired_items.items[desired_index]);
         }
 
         if (desired.seed_editor_history and existing_index == null) {
@@ -420,6 +411,7 @@ fn buildDesiredItems(
     resolver: ToolRendererResolver,
     snapshot: conversation_snapshot_mod.ConversationSnapshot,
     options: RebuildOptions,
+    hide_thinking_block: bool,
 ) !std.ArrayList(DesiredItem) {
     var desired_items: std.ArrayList(DesiredItem) = .empty;
     errdefer {
@@ -435,7 +427,7 @@ fn buildDesiredItems(
     }
 
     for (snapshot.items) |item| {
-        const desired = buildDesiredItem(allocator, resolver, item, options, live_tool_ids.items) catch |err| switch (err) {
+        const desired = buildDesiredItem(allocator, resolver, item, options, live_tool_ids.items, hide_thinking_block) catch |err| switch (err) {
             error.SkipHiddenCustomMessage,
             error.EmptyCustomMessage,
             error.EmptyUserMessage,
@@ -454,10 +446,11 @@ fn buildDesiredItem(
     item: conversation_snapshot_mod.ConversationItem,
     options: RebuildOptions,
     live_tool_ids: []const []const u8,
+    hide_thinking_block: bool,
 ) !DesiredItem {
     return switch (item) {
-        .committed_message => |committed| try buildCommittedMessageItem(allocator, resolver, committed, options, live_tool_ids),
-        .active_assistant => |active| try buildActiveAssistantDesiredItem(allocator, active, live_tool_ids, options.theme),
+        .committed_message => |committed| try buildCommittedMessageItem(allocator, resolver, committed, options, live_tool_ids, hide_thinking_block),
+        .active_assistant => |active| try buildActiveAssistantDesiredItem(allocator, active, live_tool_ids, options.theme, hide_thinking_block),
         .tool_execution => |tool_execution| try buildToolExecutionDesiredItem(allocator, resolver, tool_execution, options.theme),
         .queued_user_message => |queued| try buildQueuedUserDesiredItem(allocator, queued, options.theme),
     };
@@ -469,8 +462,9 @@ fn buildCommittedMessageItem(
     committed: conversation_snapshot_mod.CommittedMessageItem,
     options: RebuildOptions,
     live_tool_ids: []const []const u8,
+    hide_thinking_block: bool,
 ) !DesiredItem {
-    var row = try buildSnapshotMessageRow(allocator, resolver, committed.message, options, live_tool_ids);
+    var row = try buildSnapshotMessageRow(allocator, resolver, committed.message, options, live_tool_ids, hide_thinking_block);
     row.snapshot_item_id = committed.item_id;
     row.snapshot_semantic_version = committed.semantic_version;
 
@@ -489,8 +483,9 @@ fn buildActiveAssistantDesiredItem(
     active: conversation_snapshot_mod.ActiveAssistantItem,
     live_tool_ids: []const []const u8,
     theme: *const Theme,
+    hide_thinking_block: bool,
 ) !DesiredItem {
-    var row = try createAssistantMessageRow(allocator, active.message.assistant, live_tool_ids, theme);
+    var row = try createAssistantMessageRow(allocator, active.message.assistant, live_tool_ids, theme, hide_thinking_block);
     row.snapshot_item_id = active.item_id;
     row.snapshot_semantic_version = active.semantic_version;
     return .{ .item_id = active.item_id, .semantic_version = active.semantic_version, .row = row };
@@ -524,6 +519,11 @@ fn buildQueuedUserDesiredItem(
     row.snapshot_semantic_version = queued.semantic_version;
     return .{ .item_id = queued.item_id, .semantic_version = queued.semantic_version, .row = row };
 }
+fn disarmDesiredRow(item: *DesiredItem) void {
+    item.row.deinit_ctx = null;
+    item.row.deinit_fn = null;
+}
+
 fn appendAssistantBytes(
     allocator: std.mem.Allocator,
     assistant: *agent_protocol.AssistantMessage,
@@ -627,21 +627,10 @@ fn appendProjectedMessage(
     message: agent_protocol.AgentMessage,
     options: RebuildOptions,
 ) void {
-    switch (message) {
-        .user => appendUserMessage(transcript, message),
-        .assistant => |assistant| appendAssistantMessage(transcript, resolver, assistant, options.retry_attempt),
-        .tool_result => |tool_result| appendToolResultMessage(transcript, tool_result),
-        .compaction_summary => |summary| appendSummaryCard(transcript, options.theme, "Compaction summary", summary.summary),
-        .branch_summary => |summary| appendSummaryCard(transcript, options.theme, "Branch summary", summary.summary),
-        .custom => |custom| {
-            if (custom.display) {
-                appendCustomMessage(transcript, options.theme, custom) catch {};
-            }
-        },
-    }
+    appendProjectedMessageWithSkippedToolCalls(transcript, resolver, message, options, &.{});
 }
 
-fn appendProjectedSnapshotMessage(
+fn appendProjectedMessageWithSkippedToolCalls(
     transcript: *Transcript,
     resolver: ToolRendererResolver,
     message: agent_protocol.AgentMessage,
@@ -649,91 +638,67 @@ fn appendProjectedSnapshotMessage(
     live_tool_ids: []const []const u8,
 ) void {
     switch (message) {
-        .assistant => |assistant| appendAssistantMessageWithSkippedToolCalls(transcript, resolver, assistant, options.retry_attempt, live_tool_ids),
-        else => appendProjectedMessage(transcript, resolver, message, options),
+        .assistant => |assistant| appendAssistantMessageRows(transcript, resolver, assistant, options.retry_attempt, live_tool_ids, options.theme),
+        .tool_result => |tool_result| appendToolResultMessage(transcript, tool_result),
+        else => appendProjectedSingleRowMessage(transcript, resolver, message, options, live_tool_ids),
     }
 }
 
-fn appendUserMessage(transcript: *Transcript, message: agent_protocol.AgentMessage) void {
-    const text = extractUserMessageText(transcript.allocator, message) orelse return;
-    defer text.deinit(transcript.allocator);
-    transcript.addUserMessage(.{ .text = text.slice() });
-}
-
-fn appendAssistantMessage(
+fn appendProjectedSingleRowMessage(
     transcript: *Transcript,
     resolver: ToolRendererResolver,
-    assistant: agent_protocol.AssistantMessage,
-    retry_attempt: u32,
+    message: agent_protocol.AgentMessage,
+    options: RebuildOptions,
+    live_tool_ids: []const []const u8,
 ) void {
-    appendAssistantMessageWithSkippedToolCalls(transcript, resolver, assistant, retry_attempt, &.{});
+    const row = buildSnapshotMessageRow(
+        transcript.allocator,
+        resolver,
+        message,
+        options,
+        live_tool_ids,
+        transcript.hide_thinking_block,
+    ) catch |err| switch (err) {
+        error.SkipHiddenCustomMessage,
+        error.EmptyCustomMessage,
+        error.EmptyUserMessage,
+        error.UnsupportedStandaloneToolResult,
+        => return,
+        else => return,
+    };
+    _ = appendOwnedRow(transcript, row);
 }
 
-fn appendAssistantMessageWithSkippedToolCalls(
+fn appendAssistantMessageRows(
     transcript: *Transcript,
     resolver: ToolRendererResolver,
     assistant: agent_protocol.AssistantMessage,
     retry_attempt: u32,
     live_tool_ids: []const []const u8,
+    theme: *const Theme,
 ) void {
-    transcript.beginAssistantMessage();
-    for (assistant.content, 0..) |block, idx| {
-        switch (block) {
-            .text => |text| transcript.appendText(idx, text.text),
-            .thinking => |thinking| transcript.appendThinking(idx, thinking.thinking),
-            .tool_call => {},
-        }
-    }
-    transcript.endAssistantMessage();
+    const assistant_row = createAssistantMessageRow(
+        transcript.allocator,
+        assistant,
+        live_tool_ids,
+        theme,
+        transcript.hide_thinking_block,
+    ) catch return;
+    if (!appendOwnedRow(transcript, assistant_row)) return;
 
     for (assistant.content) |block| {
         if (block != .tool_call) continue;
         const tool_call = block.tool_call;
         if (containsToolCallId(live_tool_ids, tool_call.id)) continue;
-        appendToolCall(transcript, resolver, tool_call.id, tool_call.name, tool_call.arguments, true, false);
-        if (assistant.stop_reason == .aborted or assistant.stop_reason == .@"error") {
-            finalizeFailedAssistantToolCall(transcript, tool_call.id, assistant, retry_attempt);
-        }
-    }
-}
-
-fn appendActiveAssistantItem(
-    transcript: *Transcript,
-    assistant: agent_protocol.AssistantMessage,
-    live_tool_ids: []const []const u8,
-) void {
-    transcript.beginAssistantMessage();
-    for (assistant.content, 0..) |block, idx| {
-        switch (block) {
-            .text => |text| transcript.appendText(idx, text.text),
-            .thinking => |thinking| transcript.appendThinking(idx, thinking.thinking),
-            .tool_call => |tool_call| {
-                if (containsToolCallId(live_tool_ids, tool_call.id)) continue;
-            },
-        }
-    }
-}
-
-fn appendToolExecutionItem(
-    transcript: *Transcript,
-    resolver: ToolRendererResolver,
-    tool_execution: conversation_snapshot_mod.ToolExecutionItem,
-) void {
-    appendToolCall(
-        transcript,
-        resolver,
-        tool_execution.tool_call_id,
-        tool_execution.tool_name,
-        tool_execution.args,
-        tool_execution.args_complete,
-        tool_execution.execution_started,
-    );
-    if (tool_execution.result) |result| {
-        if (tool_execution.is_partial) {
-            transcript.toolSetPartialResult(tool_execution.tool_call_id, result, tool_execution.is_error);
-        } else {
-            finalizeToolResult(transcript, tool_execution.tool_call_id, result, tool_execution.is_error);
-        }
+        const tool_row = createCommittedToolCallRow(
+            transcript.allocator,
+            resolver,
+            tool_call,
+            assistant,
+            retry_attempt,
+            theme,
+        ) catch return;
+        if (!appendOwnedRow(transcript, tool_row)) return;
     }
 }
 
@@ -744,52 +709,64 @@ fn containsToolCallId(tool_call_ids: []const []const u8, tool_call_id: []const u
     return false;
 }
 
-fn appendToolCall(
-    transcript: *Transcript,
+fn createCommittedToolCallRow(
+    allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
-    tool_call_id: []const u8,
-    tool_name: []const u8,
-    args: std.json.Value,
-    args_complete: bool,
-    execution_started: bool,
-) void {
-    const renderer = resolver.resolve(tool_name);
-    transcript.addToolExecution(tool_call_id, tool_name, renderer);
-    transcript.toolSetArgs(tool_call_id, args);
-    if (args_complete) transcript.toolSetArgsComplete(tool_call_id);
-    if (execution_started) transcript.toolMarkExecutionStarted(tool_call_id);
-}
-
-fn finalizeFailedAssistantToolCall(
-    transcript: *Transcript,
-    tool_call_id: []const u8,
+    tool_call: agent_protocol.ToolCall,
     assistant: agent_protocol.AssistantMessage,
     retry_attempt: u32,
-) void {
+    theme: *const Theme,
+) !TranscriptItem {
     var owned_abort_message: ?[]u8 = null;
-    defer if (owned_abort_message) |message| transcript.allocator.free(message);
+    defer if (owned_abort_message) |message| allocator.free(message);
 
-    const error_text = switch (assistant.stop_reason) {
+    var error_content: [1]AgentToolResult.ContentBlock = undefined;
+    var result: ?AgentToolResult = null;
+    var is_error = false;
+    if (failedAssistantToolCallText(allocator, assistant, retry_attempt, &owned_abort_message)) |error_text| {
+        error_content[0] = .{ .text = .{ .text = error_text } };
+        result = .{
+            .content = &error_content,
+            .is_error = true,
+        };
+        is_error = true;
+    }
+
+    return createToolExecutionRowParts(
+        allocator,
+        resolver,
+        tool_call.id,
+        tool_call.name,
+        tool_call.arguments,
+        true,
+        false,
+        result,
+        null,
+        false,
+        is_error,
+        theme,
+    );
+}
+
+fn failedAssistantToolCallText(
+    allocator: std.mem.Allocator,
+    assistant: agent_protocol.AssistantMessage,
+    retry_attempt: u32,
+    owned_abort_message: *?[]u8,
+) ?[]const u8 {
+    return switch (assistant.stop_reason) {
         .aborted => blk: {
             if (retry_attempt == 0) break :blk "Operation aborted";
-            owned_abort_message = std.fmt.allocPrint(
-                transcript.allocator,
+            owned_abort_message.* = std.fmt.allocPrint(
+                allocator,
                 "Aborted after {d} retry attempt{s}",
                 .{ retry_attempt, if (retry_attempt == 1) "" else "s" },
             ) catch null;
-            break :blk owned_abort_message orelse "Operation aborted";
+            break :blk owned_abort_message.* orelse "Operation aborted";
         },
         .@"error" => assistant.error_message orelse "Error",
-        else => return,
+        else => null,
     };
-
-    var content = [_]AgentToolResult.ContentBlock{
-        .{ .text = .{ .text = error_text } },
-    };
-    finalizeToolResult(transcript, tool_call_id, .{
-        .content = &content,
-        .is_error = true,
-    }, true);
 }
 
 fn appendToolResultMessage(transcript: *Transcript, tool_result: agent_protocol.ToolResultMessage) void {
@@ -819,6 +796,13 @@ fn finalizeToolResult(
     transcript.toolSetFinalResult(tool_call_id, result, is_error);
 }
 
+fn appendOwnedRow(transcript: *Transcript, row: TranscriptItem) bool {
+    if (transcript.addItem(row)) return true;
+    var owned_row = row;
+    owned_row.deinit(transcript.allocator);
+    return false;
+}
+
 fn extractUserMessageText(
     allocator: std.mem.Allocator,
     message: agent_protocol.AgentMessage,
@@ -839,64 +823,17 @@ fn extractUserMessageText(
     }
 }
 
-fn appendSummaryCard(transcript: *Transcript, theme: *const Theme, label: []const u8, summary: []const u8) void {
-    const content = std.fmt.allocPrint(transcript.allocator, "**{s}**\n\n{s}", .{ label, summary }) catch return;
-    defer transcript.allocator.free(content);
-    appendMarkdownCard(transcript, theme, content, theme.fg(.muted), Color.default);
-}
-
-fn appendCustomMessage(
-    transcript: *Transcript,
-    theme: *const Theme,
-    custom: agent_protocol.AgentMessage.CustomMessage,
-) !void {
-    const body = try customContentText(transcript.allocator, custom.content);
-    defer transcript.allocator.free(body);
-    if (body.len == 0) return;
-
-    const content = try std.fmt.allocPrint(transcript.allocator, "**{s}**\n\n{s}", .{ custom.custom_type, body });
-    defer transcript.allocator.free(content);
-    appendMarkdownCard(transcript, theme, content, theme.fg(.custom_message_text), theme.bg(.custom_message_bg));
-}
-
-fn appendMarkdownCard(
-    transcript: *Transcript,
-    theme: *const Theme,
-    content: []const u8,
-    fg: Color,
-    bg: Color,
-) void {
-    const md = transcript.allocator.create(Markdown) catch return;
-    errdefer transcript.allocator.destroy(md);
-    md.* = Markdown.init(transcript.allocator);
-    md.theme = theme;
-    md.padding_x = 1;
-    md.padding_y = if (bg.eql(Color.default)) 0 else 1;
-    md.fg = fg;
-    md.bg = bg;
-    md.setContent(content);
-
-    if (!transcript.addItem(.{
-        .renderable = TranscriptRenderable.init(Markdown, md),
-        .extra_height = 1,
-        .deinit_ctx = @ptrCast(md),
-        .deinit_fn = deinitMarkdown,
-    })) {
-        md.deinit();
-        transcript.allocator.destroy(md);
-    }
-}
-
 fn buildSnapshotMessageRow(
     allocator: std.mem.Allocator,
     _: ToolRendererResolver,
     message: agent_protocol.AgentMessage,
     options: RebuildOptions,
     live_tool_ids: []const []const u8,
+    hide_thinking_block: bool,
 ) !TranscriptItem {
     return switch (message) {
         .user => try buildUserRow(allocator, message, options.theme),
-        .assistant => |assistant| try createAssistantMessageRow(allocator, assistant, live_tool_ids, options.theme),
+        .assistant => |assistant| try createAssistantMessageRow(allocator, assistant, live_tool_ids, options.theme, hide_thinking_block),
         .compaction_summary => |summary| try buildSummaryRow(allocator, options.theme, "Compaction summary", summary.summary),
         .branch_summary => |summary| try buildSummaryRow(allocator, options.theme, "Branch summary", summary.summary),
         .custom => |custom| if (custom.display)
@@ -933,12 +870,14 @@ fn createAssistantMessageRow(
     assistant: agent_protocol.AssistantMessage,
     live_tool_ids: []const []const u8,
     theme: *const Theme,
+    hide_thinking_block: bool,
 ) !TranscriptItem {
     const am = try allocator.create(assistant_message_component_mod.AssistantMessage);
     errdefer allocator.destroy(am);
     am.* = assistant_message_component_mod.AssistantMessage.init(allocator);
     errdefer am.deinit();
     am.theme = theme;
+    am.hide_thinking_block = hide_thinking_block;
     for (assistant.content, 0..) |block, idx| {
         switch (block) {
             .text => |text| am.appendText(idx, text.text),
@@ -1340,6 +1279,38 @@ test "rebuildFromMessages preserves assistant text thinking and tool call orderi
     try testing.expect(ponder_idx < tool_idx);
 }
 
+test "rebuildFromMessages respects hidden thinking labels during direct row projection" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+    transcript.setHideThinkingBlock(true);
+
+    var editor = editor_mod.Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "alpha" } },
+        .{ .thinking = .{ .thinking = "ponder" } },
+    };
+    const messages = [_]agent_protocol.AgentMessage{
+        makeAssistantMessage(&assistant_content, .stop, null),
+    };
+
+    rebuildFromMessages(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        &messages,
+        .{ .theme = themes_builtin.dark() },
+    );
+
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
+    defer testing.allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "alpha") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Thinking...") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "ponder") == null);
+}
+
 test "rebuildFromMessages renders failed tool rows for aborted assistant" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
@@ -1524,6 +1495,43 @@ test "rebuildFromSnapshot reconstructs active assistant and live tool execution 
     try testing.expect(std.mem.indexOf(u8, rendered, "bash") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "partial output") != null);
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, rendered, "tc-1 tc-1"));
+}
+
+test "rebuildFromSnapshot respects hidden thinking labels for active assistant rows" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+    transcript.setHideThinkingBlock(true);
+
+    var editor = editor_mod.Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "working" } },
+        .{ .thinking = .{ .thinking = "ponder" } },
+    };
+    const assistant = makeAssistantMessage(&assistant_content, .stop, null);
+
+    var snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 1,
+        .messages = &.{},
+        .active_assistant = assistant.assistant,
+    });
+    defer snapshot.deinit(testing.allocator);
+
+    rebuildFromSnapshot(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        snapshot,
+        .{ .theme = themes_builtin.dark() },
+    );
+
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
+    defer testing.allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "working") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Thinking...") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "ponder") == null);
 }
 
 test "reconcileFromSnapshot retains unchanged rows and appends editor history once" {
