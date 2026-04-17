@@ -107,7 +107,7 @@ pub const TranscriptRenderable = struct {
 };
 
 /// Behavior tag for transcript-owned items.
-/// Renderables remain tagged for routing updates and built-in lifecycle logic.
+/// Renderables remain tagged for routing updates and typed retained-row access.
 pub const ItemKind = enum {
     generic,
     assistant_message,
@@ -1021,6 +1021,10 @@ pub const Transcript = struct {
         self.syncScrollAfterLayout();
     }
 
+    pub fn itemMutatedAt(self: *Transcript, index: usize) void {
+        self.noteItemMutated(index);
+    }
+
     // ── External renderable API ───────────────────────────────────
 
     /// Append an arbitrary transcript item.
@@ -1138,113 +1142,20 @@ pub const Transcript = struct {
         }
     }
 
-    /// Register a new tool execution.
-    pub fn addToolExecution(
-        self: *Transcript,
-        tool_call_id: []const u8,
-        tool_name: []const u8,
-        renderer: tool_display_mod.ToolRenderer,
-    ) void {
-        if (self.pending_tools.contains(tool_call_id)) return;
-
-        const id = self.allocator.dupe(u8, tool_call_id) catch return;
-        const name = self.allocator.dupe(u8, tool_name) catch {
-            self.allocator.free(id);
-            return;
-        };
-        const te = self.allocator.create(ToolExecution) catch {
-            self.allocator.free(name);
-            self.allocator.free(id);
-            return;
-        };
-        te.* = .{
-            .tool_call_id = id,
-            .tool_name = name,
-            .allocator = self.allocator,
-            .theme = self.theme,
-            .renderer = renderer,
-        };
-        if (renderer.init_state) |init_fn| {
-            te.renderer_state = init_fn(self.allocator);
-        }
-
-        if (!self.appendTranscriptItem(.{
-            .renderable = TranscriptRenderable.init(ToolExecution, te),
-            .kind = .tool_execution,
-            .tool_call_id = te.tool_call_id,
-            .extra_height = 1, // spacer before tool (pi-mono: Spacer(1))
-            .deinit_ctx = @ptrCast(te),
-            .deinit_fn = ToolExecution.deinitItem,
-        })) {
-            te.deinit();
-            return;
-        }
-    }
-
-    /// Get the ToolExecution for a pending tool by ID.
-    fn getToolExecution(self: *Transcript, tool_call_id: []const u8) ?*ToolExecution {
-        const idx = self.pending_tools.get(tool_call_id) orelse return null;
-        if (idx >= self.items.items.len) return null;
-        const item = &self.items.items[idx];
+    pub fn toolExecutionAt(self: *Transcript, index: usize) ?*ToolExecution {
+        if (index >= self.items.items.len) return null;
+        const item = &self.items.items[index];
         if (item.kind != .tool_execution) return null;
         return @ptrCast(@alignCast(item.deinit_ctx.?));
     }
 
-    /// Set args on a projected tool execution.
-    pub fn toolSetArgs(self: *Transcript, tool_call_id: []const u8, args: std.json.Value) void {
-        const idx = self.pending_tools.get(tool_call_id) orelse return;
-        const te = self.getToolExecution(tool_call_id) orelse return;
-        te.setArgs(args);
-        self.noteItemMutated(idx);
-    }
-
-    pub fn toolAppendArgsJsonDelta(self: *Transcript, tool_call_id: []const u8, delta: []const u8) bool {
-        const idx = self.pending_tools.get(tool_call_id) orelse return false;
-        const te = self.getToolExecution(tool_call_id) orelse return false;
-        if (!te.appendArgsJsonDelta(delta)) return false;
-        self.noteItemMutated(idx);
-        return true;
-    }
-
-    /// Mark a tool execution as started.
-    pub fn toolMarkExecutionStarted(self: *Transcript, tool_call_id: []const u8) void {
-        const idx = self.pending_tools.get(tool_call_id) orelse return;
-        const te = self.getToolExecution(tool_call_id) orelse return;
-        te.markExecutionStarted();
-        self.noteItemMutated(idx);
-    }
-
-    /// Mark args as complete on a tool execution.
-    pub fn toolSetArgsComplete(self: *Transcript, tool_call_id: []const u8) void {
-        const idx = self.pending_tools.get(tool_call_id) orelse return;
-        const te = self.getToolExecution(tool_call_id) orelse return;
-        te.setArgsComplete();
-        self.noteItemMutated(idx);
-    }
-
-    /// Set partial result on a tool execution.
-    pub fn toolSetPartialResult(self: *Transcript, tool_call_id: []const u8, result: ?AgentToolResult, is_error: bool) void {
-        const idx = self.pending_tools.get(tool_call_id) orelse return;
-        const te = self.getToolExecution(tool_call_id) orelse return;
-        te.setPartialResult(result, is_error);
-        self.noteItemMutated(idx);
-    }
-
-    pub fn toolAppendPartialResultText(self: *Transcript, tool_call_id: []const u8, content_index: usize, delta: []const u8, is_error: bool) bool {
-        const idx = self.pending_tools.get(tool_call_id) orelse return false;
-        const te = self.getToolExecution(tool_call_id) orelse return false;
-        if (!te.appendPartialResultText(content_index, delta, is_error)) return false;
-        self.noteItemMutated(idx);
-        return true;
-    }
-
-    /// Set final result on a tool execution and remove from pending.
-    pub fn toolSetFinalResult(self: *Transcript, tool_call_id: []const u8, result: ?AgentToolResult, is_error: bool) void {
-        const idx = self.pending_tools.get(tool_call_id) orelse return;
-        const te = self.getToolExecution(tool_call_id) orelse return;
-        te.setFinalResult(result, is_error);
-        _ = self.pending_tools.remove(tool_call_id);
-        self.noteItemMutated(idx);
+    pub fn clearToolRoutingAt(self: *Transcript, index: usize) void {
+        if (index >= self.items.items.len) return;
+        const item = &self.items.items[index];
+        if (item.tool_call_id) |tool_call_id| {
+            _ = self.pending_tools.remove(tool_call_id);
+            item.tool_call_id = null;
+        }
     }
 
     fn reindexMaps(self: *Transcript, start_index: usize) void {
@@ -1264,7 +1175,7 @@ pub const Transcript = struct {
         }
     }
 
-    fn findToolExecutionIndex(self: *Transcript, tool_call_id: []const u8) ?usize {
+    pub fn findToolExecutionIndex(self: *Transcript, tool_call_id: []const u8) ?usize {
         for (self.items.items, 0..) |item, idx| {
             if (item.tool_call_id) |candidate| {
                 if (std.mem.eql(u8, candidate, tool_call_id)) return idx;
@@ -1804,17 +1715,14 @@ fn appendTestAssistantRow(transcript: *Transcript) !usize {
     assistant.theme = transcript.theme;
     assistant.hide_thinking_block = transcript.hide_thinking_block;
 
-    var item: TranscriptItem = .{
+    const item: TranscriptItem = .{
         .renderable = TranscriptRenderable.init(assistant_message_mod.AssistantMessage, assistant),
         .kind = .assistant_message,
         .extra_height = 1,
         .deinit_ctx = @ptrCast(assistant),
         .deinit_fn = deinitAssistantMessage,
     };
-    if (!transcript.addItem(item)) {
-        item.deinit(transcript.allocator);
-        return error.AppendFailed;
-    }
+    if (!transcript.addItem(item)) return error.AppendFailed;
     return transcript.items.items.len - 1;
 }
 
@@ -1830,13 +1738,49 @@ fn appendTestAssistantThinking(transcript: *Transcript, text: []const u8) !usize
     return idx;
 }
 
+fn appendTestToolExecutionRow(
+    transcript: *Transcript,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    renderer: tool_display_mod.ToolRenderer,
+) !usize {
+    const id = try transcript.allocator.dupe(u8, tool_call_id);
+    errdefer transcript.allocator.free(id);
+    const name = try transcript.allocator.dupe(u8, tool_name);
+    errdefer transcript.allocator.free(name);
+    const tool = try transcript.allocator.create(ToolExecution);
+    errdefer transcript.allocator.destroy(tool);
+    tool.* = .{
+        .tool_call_id = id,
+        .tool_name = name,
+        .allocator = transcript.allocator,
+        .theme = transcript.theme,
+        .renderer = renderer,
+    };
+    errdefer tool.deinit();
+    if (renderer.init_state) |init_fn| {
+        tool.renderer_state = init_fn(transcript.allocator);
+    }
+
+    const item: TranscriptItem = .{
+        .renderable = TranscriptRenderable.init(ToolExecution, tool),
+        .kind = .tool_execution,
+        .tool_call_id = tool.tool_call_id,
+        .extra_height = 1,
+        .deinit_ctx = @ptrCast(tool),
+        .deinit_fn = ToolExecution.deinitItem,
+    };
+    if (!transcript.addItem(item)) return error.AppendFailed;
+    return transcript.items.items.len - 1;
+}
+
 test "Transcript retained items install transcript renderables" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
     _ = try appendTestAssistantText(&transcript, "hello from assistant");
     transcript.addUserMessage(.{ .text = "user msg" });
-    transcript.addToolExecution("tool-1", "bash", .{});
+    _ = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
 
     try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
     try testing.expectEqual(ItemKind.assistant_message, transcript.items.items[0].kind);
@@ -1870,15 +1814,18 @@ test "Transcript renders assistant text and tool execution in order" {
 
     _ = try appendTestAssistantText(&transcript, "hello from assistant");
 
-    transcript.addToolExecution("tool-1", "bash", .{});
-    transcript.toolSetArgs("tool-1", .null);
-    transcript.toolSetArgsComplete("tool-1");
-    transcript.toolMarkExecutionStarted("tool-1");
+    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
+    const tool = transcript.toolExecutionAt(tool_idx).?;
+    tool.setArgs(.null);
+    tool.setArgsComplete();
+    tool.markExecutionStarted();
 
     var content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "hi" } },
     };
-    transcript.toolSetFinalResult("tool-1", .{ .content = &content, .is_error = false }, false);
+    tool.setFinalResult(.{ .content = &content, .is_error = false }, false);
+    transcript.clearToolRoutingAt(tool_idx);
+    transcript.itemMutatedAt(tool_idx);
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 
@@ -1928,12 +1875,14 @@ test "ToolExecution does not invoke result renderers before any result exists" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.addToolExecution("tool-1", "edit", .{
+    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "edit", .{
         .render_call = &S.renderCall,
         .render_result_slice = &S.renderResult,
         .measure_result = &S.measureResult,
     });
-    transcript.toolMarkExecutionStarted("tool-1");
+    const tool = transcript.toolExecutionAt(tool_idx).?;
+    tool.markExecutionStarted();
+    transcript.itemMutatedAt(tool_idx);
 
     var buf = try Buffer.init(testing.allocator, 30, 6);
     defer buf.deinit();
@@ -1947,7 +1896,8 @@ test "ToolExecution keeps transcript surface transparent across pending partial 
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.addToolExecution("tool-1", "bash", .{});
+    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
+    const tool = transcript.toolExecutionAt(tool_idx).?;
 
     var pending = try Buffer.init(testing.allocator, 20, 6);
     defer pending.deinit();
@@ -1957,7 +1907,8 @@ test "ToolExecution keeps transcript surface transparent across pending partial 
     var partial_content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "running" } },
     };
-    transcript.toolSetPartialResult("tool-1", .{ .content = &partial_content, .is_error = false }, false);
+    tool.setPartialResult(.{ .content = &partial_content, .is_error = false }, false);
+    transcript.itemMutatedAt(tool_idx);
 
     var partial = try Buffer.init(testing.allocator, 20, 6);
     defer partial.deinit();
@@ -1968,7 +1919,9 @@ test "ToolExecution keeps transcript surface transparent across pending partial 
     var error_content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "boom" } },
     };
-    transcript.toolSetFinalResult("tool-1", .{ .content = &error_content, .is_error = true }, true);
+    tool.setFinalResult(.{ .content = &error_content, .is_error = true }, true);
+    transcript.clearToolRoutingAt(tool_idx);
+    transcript.itemMutatedAt(tool_idx);
 
     var final = try Buffer.init(testing.allocator, 20, 6);
     defer final.deinit();
@@ -1981,12 +1934,15 @@ test "Transcript scrolls through tool output without repeating the first rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.addToolExecution("tool-1", "bash", .{});
+    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
+    const tool = transcript.toolExecutionAt(tool_idx).?;
 
     var content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "line1\nline2\nline3\nline4\nline5\nline6" } },
     };
-    transcript.toolSetFinalResult("tool-1", .{ .content = &content, .is_error = false }, false);
+    tool.setFinalResult(.{ .content = &content, .is_error = false }, false);
+    transcript.clearToolRoutingAt(tool_idx);
+    transcript.itemMutatedAt(tool_idx);
     transcript.scrollBy(20, 3, 4);
 
     var buf = try Buffer.init(testing.allocator, 20, 3);
@@ -2049,12 +2005,15 @@ test "ToolExecution collapsed plain text renderer shows overflow hint row" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.addToolExecution("tool-1", "unknown", .{});
+    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "unknown", .{});
+    const tool = transcript.toolExecutionAt(tool_idx).?;
 
     var content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "line1\nline2\nline3\nline4\nline5\nline6" } },
     };
-    transcript.toolSetFinalResult("tool-1", .{ .content = &content, .is_error = false }, false);
+    tool.setFinalResult(.{ .content = &content, .is_error = false }, false);
+    transcript.clearToolRoutingAt(tool_idx);
+    transcript.itemMutatedAt(tool_idx);
 
     var buf = try Buffer.init(testing.allocator, 20, 10);
     defer buf.deinit();

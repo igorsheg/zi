@@ -246,12 +246,18 @@ pub const ProjectionState = struct {
             .tool_call_arguments => |tool_target| {
                 const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
                 if (!appendLiveToolArgumentsBytes(self.allocator, tool, bytes)) return false;
-                return transcript.toolAppendArgsJsonDelta(tool_target.tool_call_id, bytes);
+                const row = toolExecutionRowRef(transcript, tool_target.tool_call_id) orelse return false;
+                if (!row.tool.appendArgsJsonDelta(bytes)) return false;
+                transcript.itemMutatedAt(row.index);
+                return true;
             },
             .tool_result_content => |tool_target| {
                 const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
                 if (!appendLiveToolResultTextBytes(self.allocator, tool, tool_target.content_index, bytes)) return false;
-                return transcript.toolAppendPartialResultText(tool_target.tool_call_id, tool_target.content_index, bytes, tool.is_error);
+                const row = toolExecutionRowRef(transcript, tool_target.tool_call_id) orelse return false;
+                if (!row.tool.appendPartialResultText(tool_target.content_index, bytes, tool.is_error)) return false;
+                transcript.itemMutatedAt(row.index);
+                return true;
             },
         }
     }
@@ -884,13 +890,27 @@ fn appendToolResultMessage(transcript: *Transcript, tool_result: agent_protocol.
     }, tool_result.is_error);
 }
 
+const ToolExecutionRowRef = struct {
+    index: usize,
+    tool: *transcript_mod.ToolExecution,
+};
+
+fn toolExecutionRowRef(transcript: *Transcript, tool_call_id: []const u8) ?ToolExecutionRowRef {
+    const index = transcript.findToolExecutionIndex(tool_call_id) orelse return null;
+    const tool = transcript.toolExecutionAt(index) orelse return null;
+    return .{ .index = index, .tool = tool };
+}
+
 fn finalizeToolResult(
     transcript: *Transcript,
     tool_call_id: []const u8,
     result: ?AgentToolResult,
     is_error: bool,
 ) void {
-    transcript.toolSetFinalResult(tool_call_id, result, is_error);
+    const row = toolExecutionRowRef(transcript, tool_call_id) orelse return;
+    row.tool.setFinalResult(result, is_error);
+    transcript.clearToolRoutingAt(row.index);
+    transcript.itemMutatedAt(row.index);
 }
 
 fn appendOwnedRow(transcript: *Transcript, row: TranscriptItem) bool {
