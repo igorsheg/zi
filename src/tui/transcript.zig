@@ -11,7 +11,6 @@ const agent_mod = @import("../agent/root.zig");
 const agent_protocol = agent_mod.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const json_util = @import("../ai/json_util.zig");
-const partial_json = @import("../json/partial.zig");
 const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const display_wrap_mod = @import("display_wrap.zig");
@@ -454,24 +453,11 @@ const TranscriptLayout = struct {
     }
 };
 
-fn appendBytesOwned(allocator: std.mem.Allocator, existing: []const u8, extra: []const u8) ![]u8 {
-    const out = try allocator.alloc(u8, existing.len + extra.len);
-    @memcpy(out[0..existing.len], existing);
-    @memcpy(out[existing.len..], extra);
-    return out;
-}
-
 // ── Tool Execution ────────────────────────────────────────────────
 
-/// State for a single tool execution within the transcript.
-/// Owns all data (deep-cloned from events). Handles its own rendering
-/// with a theme-resolved surface, call summary, and result display.
-///
-/// Rendering uses optional ToolRenderer functions for per-tool formatting.
-/// Falls back to: bold(tool_name) for call, truncated text for result.
-pub const ToolExecution = struct {
-    tool_call_id: []u8,
-    tool_name: []u8,
+pub const ToolExecutionRowModel = struct {
+    tool_call_id: ?[]u8 = null,
+    tool_name: ?[]u8 = null,
     args: std.json.Value = .null,
     args_json_source: ?[]u8 = null,
     result: ?AgentToolResult = null,
@@ -479,6 +465,66 @@ pub const ToolExecution = struct {
     is_error: bool = false,
     execution_started: bool = false,
     args_complete: bool = false,
+
+    pub fn clone(self: ToolExecutionRowModel, allocator: std.mem.Allocator) !ToolExecutionRowModel {
+        const tool_call_id = if (self.tool_call_id) |tool_call_id|
+            try allocator.dupe(u8, tool_call_id)
+        else
+            null;
+        errdefer if (tool_call_id) |owned| allocator.free(owned);
+
+        const tool_name = if (self.tool_name) |tool_name|
+            try allocator.dupe(u8, tool_name)
+        else
+            null;
+        errdefer if (tool_name) |owned| allocator.free(owned);
+
+        const args = try json_util.cloneJsonValue(allocator, self.args);
+        errdefer json_util.freeJsonValue(allocator, args);
+
+        const args_json_source = if (self.args_json_source) |source|
+            try allocator.dupe(u8, source)
+        else
+            null;
+        errdefer if (args_json_source) |source| allocator.free(source);
+
+        const result = if (self.result) |result|
+            try result.clone(allocator)
+        else
+            null;
+        errdefer if (result) |owned| owned.free(allocator);
+
+        return .{
+            .tool_call_id = tool_call_id,
+            .tool_name = tool_name,
+            .args = args,
+            .args_json_source = args_json_source,
+            .result = result,
+            .is_partial = self.is_partial,
+            .is_error = self.is_error,
+            .execution_started = self.execution_started,
+            .args_complete = self.args_complete,
+        };
+    }
+
+    pub fn deinit(self: *ToolExecutionRowModel, allocator: std.mem.Allocator) void {
+        if (self.result) |result| result.free(allocator);
+        json_util.freeJsonValue(allocator, self.args);
+        if (self.args_json_source) |source| allocator.free(source);
+        if (self.tool_name) |tool_name| allocator.free(tool_name);
+        if (self.tool_call_id) |tool_call_id| allocator.free(tool_call_id);
+        self.* = .{};
+    }
+};
+
+/// State for a single tool execution within the transcript.
+/// Owns a stable row model plus presentation-local state (expansion,
+/// renderer caches, and retained renderer state).
+///
+/// Rendering uses optional ToolRenderer functions for per-tool formatting.
+/// Falls back to: bold(tool_name) for call, truncated text for result.
+pub const ToolExecution = struct {
+    model: ToolExecutionRowModel = .{},
     expanded: bool = false,
     renderer: tool_display_mod.ToolRenderer = .{},
     renderer_state: ?*anyopaque = null,
@@ -491,11 +537,7 @@ pub const ToolExecution = struct {
         if (self.renderer.deinit_state) |deinit_fn| {
             if (self.renderer_state) |state| deinit_fn(state, self.allocator);
         }
-        if (self.result) |r| r.free(self.allocator);
-        json_util.freeJsonValue(self.allocator, self.args);
-        if (self.args_json_source) |source| self.allocator.free(source);
-        self.allocator.free(self.tool_name);
-        self.allocator.free(self.tool_call_id);
+        self.model.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -504,49 +546,41 @@ pub const ToolExecution = struct {
         self.deinit();
     }
 
-    /// Set args from snapshot-projected tool execution state. Deep-clones the value.
-    pub fn setArgs(self: *ToolExecution, args: std.json.Value) void {
-        self.setArgsWithJsonSource(args, null);
-    }
-
-    pub fn setArgsWithJsonSource(self: *ToolExecution, args: std.json.Value, args_json_source: ?[]const u8) void {
-        json_util.freeJsonValue(self.allocator, self.args);
-        self.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
-        if (self.args_json_source) |source| self.allocator.free(source);
-        self.args_json_source = if (args_json_source) |source|
-            self.allocator.dupe(u8, source) catch null
-        else
-            null;
-        self.notifyArgsChanged();
-    }
-
-    pub fn appendArgsJsonDelta(self: *ToolExecution, delta: []const u8) bool {
-        const combined = if (self.args_json_source) |source|
-            appendBytesOwned(self.allocator, source, delta) catch return false
-        else
-            self.allocator.dupe(u8, delta) catch return false;
-        if (self.args_json_source) |source| self.allocator.free(source);
-        self.args_json_source = combined;
-        if (delta.len != 0 or combined.len != 0) {
-            json_util.freeJsonValue(self.allocator, self.args);
-            self.args = partial_json.parseStreaming(self.allocator, combined) catch .null;
+    pub fn setOwnedModel(self: *ToolExecution, model: *ToolExecutionRowModel) !void {
+        const incoming_tool_call_id = model.tool_call_id orelse return error.InvalidToolExecutionRowModel;
+        const incoming_tool_name = model.tool_name orelse return error.InvalidToolExecutionRowModel;
+        if (self.model.tool_call_id) |current| {
+            if (!std.mem.eql(u8, current, incoming_tool_call_id)) {
+                return error.ToolExecutionIdentityMismatch;
+            }
         }
-        self.notifyArgsChanged();
-        return true;
-    }
-
-    /// Mark that execution has started in projected tool execution state.
-    pub fn markExecutionStarted(self: *ToolExecution) void {
-        self.execution_started = true;
-    }
-
-    /// Mark that projected tool arguments are complete.
-    pub fn setArgsComplete(self: *ToolExecution) void {
-        self.args_complete = true;
-        if (self.args_json_source) |source| {
-            self.allocator.free(source);
-            self.args_json_source = null;
+        if (self.model.tool_name) |current| {
+            if (!std.mem.eql(u8, current, incoming_tool_name)) {
+                return error.ToolExecutionIdentityMismatch;
+            }
         }
+
+        var owned_model = model.*;
+        model.* = .{};
+        const had_result = self.model.result != null;
+
+        if (self.model.tool_call_id) |current| {
+            self.allocator.free(owned_model.tool_call_id.?);
+            owned_model.tool_call_id = current;
+            self.model.tool_call_id = null;
+        }
+        if (self.model.tool_name) |current| {
+            self.allocator.free(owned_model.tool_name.?);
+            owned_model.tool_name = current;
+            self.model.tool_name = null;
+        }
+
+        self.model.deinit(self.allocator);
+        self.model = owned_model;
+        self.measured_content_width = 0;
+        self.measured_result_height = 0;
+        self.notifyArgsChanged();
+        if (had_result or self.model.result != null) self.notifyResultChanged();
     }
 
     pub fn setExpanded(self: *ToolExecution, expanded: bool) void {
@@ -558,83 +592,6 @@ pub const ToolExecution = struct {
             var ctx = self.makeStateContext();
             changed_fn(&ctx);
         }
-    }
-
-    /// Set partial result from projected tool execution state. Deep-clones.
-    pub fn setPartialResult(self: *ToolExecution, result: ?AgentToolResult, is_error: bool) void {
-        if (self.result) |old| old.free(self.allocator);
-        self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
-        self.is_error = is_error;
-        self.is_partial = true;
-        self.measured_content_width = 0;
-        self.measured_result_height = 0;
-        self.notifyResultChanged();
-    }
-
-    /// Set final result from projected tool execution state. Deep-clones.
-    pub fn setFinalResult(self: *ToolExecution, result: ?AgentToolResult, is_error: bool) void {
-        if (self.result) |old| old.free(self.allocator);
-        self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
-        self.is_error = is_error;
-        self.is_partial = false;
-        self.measured_content_width = 0;
-        self.measured_result_height = 0;
-        self.notifyResultChanged();
-    }
-
-    pub fn appendPartialResultText(self: *ToolExecution, content_index: usize, delta: []const u8, is_error: bool) bool {
-        const block = self.ensureResultTextBlock(content_index, delta) orelse return false;
-        if (block.preexisting) {
-            const old = block.block.text.text;
-            const combined = appendBytesOwned(self.allocator, old, delta) catch return false;
-            self.allocator.free(old);
-            block.block.text.text = combined;
-        }
-        if (self.result) |*result| result.is_error = is_error;
-        self.is_error = is_error;
-        self.is_partial = true;
-        self.measured_content_width = 0;
-        self.measured_result_height = 0;
-        self.notifyResultChanged();
-        return true;
-    }
-
-    const ResultTextBlockRef = struct {
-        block: *AgentToolResult.ContentBlock,
-        preexisting: bool,
-    };
-
-    fn ensureResultTextBlock(self: *ToolExecution, content_index: usize, delta: []const u8) ?ResultTextBlockRef {
-        if (self.result) |*result| {
-            if (content_index < result.content.len) {
-                const block: *AgentToolResult.ContentBlock = @constCast(&result.content[content_index]);
-                if (block.* != .text) return null;
-                return .{ .block = block, .preexisting = true };
-            }
-            if (content_index != result.content.len) return null;
-
-            const grown = self.allocator.alloc(AgentToolResult.ContentBlock, result.content.len + 1) catch return null;
-            @memcpy(grown[0..result.content.len], result.content);
-            grown[content_index] = .{ .text = .{ .text = self.allocator.dupe(u8, delta) catch {
-                self.allocator.free(grown);
-                return null;
-            } } };
-            self.allocator.free(result.content);
-            result.content = grown;
-            return .{ .block = @constCast(&result.content[content_index]), .preexisting = false };
-        }
-        if (content_index != 0) return null;
-
-        const content = self.allocator.alloc(AgentToolResult.ContentBlock, 1) catch return null;
-        content[0] = .{ .text = .{ .text = self.allocator.dupe(u8, delta) catch {
-            self.allocator.free(content);
-            return null;
-        } } };
-        self.result = .{
-            .content = content,
-            .is_error = self.is_error,
-        };
-        return .{ .block = @constCast(&self.result.?.content[0]), .preexisting = false };
     }
 
     fn notifyArgsChanged(self: *ToolExecution) void {
@@ -742,7 +699,7 @@ pub const ToolExecution = struct {
     }
 
     fn renderCallDefault(self: *ToolExecution, region: Region) void {
-        _ = region.writeStr(0, 0, self.tool_name, self.theme.fg(.tool_title), Color.default, .{ .bold = true });
+        _ = region.writeStr(0, 0, self.model.tool_name orelse "", self.theme.fg(.tool_title), Color.default, .{ .bold = true });
     }
 
     fn renderResultFromOffset(self: *ToolExecution, region: Region, skip_rows: u32) void {
@@ -753,7 +710,7 @@ pub const ToolExecution = struct {
         // actually produced a result. Keep the same contract here so
         // pending tools do not render placeholder/malformed result
         // states before projected args/results are complete.
-        if (self.result == null) return;
+        if (self.model.result == null) return;
 
         if (self.renderer.render_result_slice) |render_fn| {
             var ctx = self.makeRenderContext(region);
@@ -768,7 +725,7 @@ pub const ToolExecution = struct {
         const result_text = self.getResultText() orelse return;
         defer self.allocator.free(result_text);
 
-        const fg = if (self.is_error) self.theme.fg(.@"error") else self.theme.fg(.tool_output);
+        const fg = if (self.model.is_error) self.theme.fg(.@"error") else self.theme.fg(.tool_output);
         const w: usize = @intCast(region.width);
         const lines = display_wrap_mod.wordWrap(result_text, w, self.allocator) catch return;
         defer self.allocator.free(lines);
@@ -793,7 +750,7 @@ pub const ToolExecution = struct {
     }
 
     fn measureResult(self: *ToolExecution, width: u32) u32 {
-        if (self.result == null) return 0;
+        if (self.model.result == null) return 0;
         if (self.renderer.measure_result) |measure_fn| {
             var ctx = self.makeMeasureContext(width);
             return measure_fn(&ctx);
@@ -817,7 +774,7 @@ pub const ToolExecution = struct {
 
     /// Extract joined text from result content blocks.
     fn getResultText(self: *ToolExecution) ?[]u8 {
-        const result = self.result orelse return null;
+        const result = self.model.result orelse return null;
         var total_len: usize = 0;
         for (result.content) |block| {
             switch (block) {
@@ -850,15 +807,15 @@ pub const ToolExecution = struct {
 
     fn makeStateContext(self: *ToolExecution) tool_display_mod.ToolStateContext {
         return .{
-            .tool_name = self.tool_name,
-            .tool_call_id = self.tool_call_id,
-            .args = self.args,
-            .result = self.result,
-            .is_partial = self.is_partial,
-            .is_error = self.is_error,
+            .tool_name = self.model.tool_name orelse "",
+            .tool_call_id = self.model.tool_call_id orelse "",
+            .args = self.model.args,
+            .result = self.model.result,
+            .is_partial = self.model.is_partial,
+            .is_error = self.model.is_error,
             .expanded = self.expanded,
-            .execution_started = self.execution_started,
-            .args_complete = self.args_complete,
+            .execution_started = self.model.execution_started,
+            .args_complete = self.model.args_complete,
             .allocator = self.allocator,
             .state = self.renderer_state,
         };
@@ -866,15 +823,15 @@ pub const ToolExecution = struct {
 
     fn makeMeasureContext(self: *ToolExecution, width: u32) tool_display_mod.ToolMeasureContext {
         return .{
-            .tool_name = self.tool_name,
-            .tool_call_id = self.tool_call_id,
-            .args = self.args,
-            .result = self.result,
-            .is_partial = self.is_partial,
-            .is_error = self.is_error,
+            .tool_name = self.model.tool_name orelse "",
+            .tool_call_id = self.model.tool_call_id orelse "",
+            .args = self.model.args,
+            .result = self.model.result,
+            .is_partial = self.model.is_partial,
+            .is_error = self.model.is_error,
             .expanded = self.expanded,
-            .execution_started = self.execution_started,
-            .args_complete = self.args_complete,
+            .execution_started = self.model.execution_started,
+            .args_complete = self.model.args_complete,
             .allocator = self.allocator,
             .state = self.renderer_state,
             .width = width,
@@ -883,15 +840,15 @@ pub const ToolExecution = struct {
 
     fn makeRenderContext(self: *ToolExecution, region: Region) tool_display_mod.ToolRenderContext {
         return .{
-            .tool_name = self.tool_name,
-            .tool_call_id = self.tool_call_id,
-            .args = self.args,
-            .result = self.result,
-            .is_partial = self.is_partial,
-            .is_error = self.is_error,
+            .tool_name = self.model.tool_name orelse "",
+            .tool_call_id = self.model.tool_call_id orelse "",
+            .args = self.model.args,
+            .result = self.model.result,
+            .is_partial = self.model.is_partial,
+            .is_error = self.model.is_error,
             .expanded = self.expanded,
-            .execution_started = self.execution_started,
-            .args_complete = self.args_complete,
+            .execution_started = self.model.execution_started,
+            .args_complete = self.model.args_complete,
             .theme = self.theme,
             .allocator = self.allocator,
             .state = self.renderer_state,
@@ -1676,21 +1633,52 @@ fn appendTestAssistantThinking(transcript: *Transcript, text: []const u8) !usize
     return idx;
 }
 
+fn buildTestToolExecutionModel(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+) !ToolExecutionRowModel {
+    return .{
+        .tool_call_id = try allocator.dupe(u8, tool_call_id),
+        .tool_name = try allocator.dupe(u8, tool_name),
+    };
+}
+
+fn setTestToolExecutionState(
+    transcript: *Transcript,
+    tool: *ToolExecution,
+    args_complete: bool,
+    execution_started: bool,
+    result: ?AgentToolResult,
+    is_partial: bool,
+    is_error: bool,
+) !void {
+    var model = try tool.model.clone(transcript.allocator);
+    defer model.deinit(transcript.allocator);
+
+    if (model.result) |owned| owned.free(transcript.allocator);
+    model.result = if (result) |value| try value.clone(transcript.allocator) else null;
+    if (model.result) |*owned| owned.is_error = is_error;
+    model.args_complete = args_complete;
+    if (args_complete and model.args_json_source != null) {
+        transcript.allocator.free(model.args_json_source.?);
+        model.args_json_source = null;
+    }
+    model.execution_started = execution_started;
+    model.is_partial = is_partial;
+    model.is_error = is_error;
+    try tool.setOwnedModel(&model);
+}
+
 fn appendTestToolExecutionRow(
     transcript: *Transcript,
     tool_call_id: []const u8,
     tool_name: []const u8,
     renderer: tool_display_mod.ToolRenderer,
 ) !usize {
-    const id = try transcript.allocator.dupe(u8, tool_call_id);
-    errdefer transcript.allocator.free(id);
-    const name = try transcript.allocator.dupe(u8, tool_name);
-    errdefer transcript.allocator.free(name);
     const tool = try transcript.allocator.create(ToolExecution);
     errdefer transcript.allocator.destroy(tool);
     tool.* = .{
-        .tool_call_id = id,
-        .tool_name = name,
         .allocator = transcript.allocator,
         .theme = transcript.theme,
         .renderer = renderer,
@@ -1700,10 +1688,14 @@ fn appendTestToolExecutionRow(
         tool.renderer_state = init_fn(transcript.allocator);
     }
 
+    var model = try buildTestToolExecutionModel(transcript.allocator, tool_call_id, tool_name);
+    defer model.deinit(transcript.allocator);
+    try tool.setOwnedModel(&model);
+
     const item: TranscriptItem = .{
         .renderable = TranscriptRenderable.init(ToolExecution, tool),
         .kind = .tool_execution,
-        .tool_call_id = tool.tool_call_id,
+        .tool_call_id = tool.model.tool_call_id.?,
         .extra_height = 1,
         .deinit_ctx = @ptrCast(tool),
         .deinit_fn = ToolExecution.deinitItem,
@@ -1750,21 +1742,21 @@ test "Transcript retained items install transcript renderables" {
 
 test "tool execution keeps transcript background transparent" {
     const theme = themes_builtin.dark();
+    var model = try buildTestToolExecutionModel(testing.allocator, "tool-1", "bash");
+    defer model.deinit(testing.allocator);
+
     var tool = ToolExecution{
-        .tool_call_id = try testing.allocator.dupe(u8, "tool-1"),
-        .tool_name = try testing.allocator.dupe(u8, "bash"),
+        .model = model,
         .allocator = testing.allocator,
         .theme = theme,
     };
-    defer {
-        testing.allocator.free(tool.tool_call_id);
-        testing.allocator.free(tool.tool_name);
-    }
+    model = .{};
+    defer tool.model.deinit(testing.allocator);
 
     try testing.expect(tool.bgColor().eql(Color.default));
-    tool.is_partial = false;
+    tool.model.is_partial = false;
     try testing.expect(tool.bgColor().eql(Color.default));
-    tool.is_error = true;
+    tool.model.is_error = true;
     try testing.expect(tool.bgColor().eql(Color.default));
 }
 
@@ -1776,14 +1768,11 @@ test "Transcript renders assistant text and tool execution in order" {
 
     const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
     const tool = transcript.toolExecutionAt(tool_idx).?;
-    tool.setArgs(.null);
-    tool.setArgsComplete();
-    tool.markExecutionStarted();
 
     var content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "hi" } },
     };
-    tool.setFinalResult(.{ .content = &content, .is_error = false }, false);
+    try setTestToolExecutionState(&transcript, tool, true, true, .{ .content = &content, .is_error = false }, false, false);
     transcript.clearToolRoutingAt(tool_idx);
     transcript.itemMutatedAt(tool_idx);
 
@@ -1794,6 +1783,22 @@ test "Transcript renders assistant text and tool execution in order" {
     transcript.render(buf.region());
 
     try testing.expectEqual(@as(u21, 'h'), buf.get(1, 0).grapheme.codepoint);
+}
+
+test "tool execution model replacement preserves pending routing by tool_call_id" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
+    const tool = transcript.toolExecutionAt(tool_idx).?;
+    try testing.expectEqual(tool_idx, transcript.findToolExecutionIndex("tool-1").?);
+
+    var partial_content = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "running" } },
+    };
+    try setTestToolExecutionState(&transcript, tool, false, true, .{ .content = &partial_content, .is_error = false }, true, false);
+
+    try testing.expectEqual(tool_idx, transcript.findToolExecutionIndex("tool-1").?);
 }
 
 test "Transcript preserves manual scroll when assistant content grows" {
@@ -1843,7 +1848,7 @@ test "ToolExecution does not invoke result renderers before any result exists" {
         .measure_result = &S.measureResult,
     });
     const tool = transcript.toolExecutionAt(tool_idx).?;
-    tool.markExecutionStarted();
+    try setTestToolExecutionState(&transcript, tool, false, true, null, true, false);
     transcript.itemMutatedAt(tool_idx);
 
     var buf = try Buffer.init(testing.allocator, 30, 6);
@@ -1869,7 +1874,7 @@ test "ToolExecution keeps transcript surface transparent across pending partial 
     var partial_content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "running" } },
     };
-    tool.setPartialResult(.{ .content = &partial_content, .is_error = false }, false);
+    try setTestToolExecutionState(&transcript, tool, false, false, .{ .content = &partial_content, .is_error = false }, true, false);
     transcript.itemMutatedAt(tool_idx);
 
     var partial = try Buffer.init(testing.allocator, 20, 6);
@@ -1881,7 +1886,7 @@ test "ToolExecution keeps transcript surface transparent across pending partial 
     var error_content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "boom" } },
     };
-    tool.setFinalResult(.{ .content = &error_content, .is_error = true }, true);
+    try setTestToolExecutionState(&transcript, tool, false, false, .{ .content = &error_content, .is_error = true }, false, true);
     transcript.clearToolRoutingAt(tool_idx);
     transcript.itemMutatedAt(tool_idx);
 
@@ -1902,7 +1907,7 @@ test "Transcript scrolls through tool output without repeating the first rows" {
     var content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "line1\nline2\nline3\nline4\nline5\nline6" } },
     };
-    tool.setFinalResult(.{ .content = &content, .is_error = false }, false);
+    try setTestToolExecutionState(&transcript, tool, false, false, .{ .content = &content, .is_error = false }, false, false);
     transcript.clearToolRoutingAt(tool_idx);
     transcript.itemMutatedAt(tool_idx);
     transcript.scrollBy(20, 3, 4);
@@ -1973,7 +1978,7 @@ test "ToolExecution collapsed plain text renderer shows overflow hint row" {
     var content = [_]AgentToolResult.ContentBlock{
         .{ .text = .{ .text = "line1\nline2\nline3\nline4\nline5\nline6" } },
     };
-    tool.setFinalResult(.{ .content = &content, .is_error = false }, false);
+    try setTestToolExecutionState(&transcript, tool, false, false, .{ .content = &content, .is_error = false }, false, false);
     transcript.clearToolRoutingAt(tool_idx);
     transcript.itemMutatedAt(tool_idx);
 

@@ -255,7 +255,9 @@ pub const ProjectionState = struct {
                 const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
                 if (!appendLiveToolArgumentsBytes(self.allocator, tool, bytes)) return false;
                 const row = toolExecutionRowRef(transcript, tool_target.tool_call_id) orelse return false;
-                if (!row.tool.appendArgsJsonDelta(bytes)) return false;
+                var model = buildLiveToolExecutionRowModel(self.allocator, tool.*) catch return false;
+                defer model.deinit(self.allocator);
+                row.tool.setOwnedModel(&model) catch return false;
                 transcript.itemMutatedAt(row.index);
                 return true;
             },
@@ -263,7 +265,9 @@ pub const ProjectionState = struct {
                 const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
                 if (!appendLiveToolResultTextBytes(self.allocator, tool, tool_target.content_index, bytes)) return false;
                 const row = toolExecutionRowRef(transcript, tool_target.tool_call_id) orelse return false;
-                if (!row.tool.appendPartialResultText(tool_target.content_index, bytes, tool.is_error)) return false;
+                var model = buildLiveToolExecutionRowModel(self.allocator, tool.*) catch return false;
+                defer model.deinit(self.allocator);
+                row.tool.setOwnedModel(&model) catch return false;
                 transcript.itemMutatedAt(row.index);
                 return true;
             },
@@ -842,9 +846,8 @@ fn createCommittedToolCallRow(
         is_error = true;
     }
 
-    return createToolExecutionRowParts(
+    var model = try buildToolExecutionRowModel(
         allocator,
-        resolver,
         tool_call.id,
         tool_call.name,
         tool_call.arguments,
@@ -855,8 +858,9 @@ fn createCommittedToolCallRow(
         null,
         false,
         is_error,
-        theme,
     );
+    defer model.deinit(allocator);
+    return createToolExecutionRowParts(allocator, resolver, &model, theme);
 }
 
 fn failedAssistantToolCallText(
@@ -916,7 +920,18 @@ fn finalizeToolResult(
     is_error: bool,
 ) void {
     const row = toolExecutionRowRef(transcript, tool_call_id) orelse return;
-    row.tool.setFinalResult(result, is_error);
+    var model = row.tool.model.clone(transcript.allocator) catch return;
+    defer model.deinit(transcript.allocator);
+
+    if (model.result) |owned| owned.free(transcript.allocator);
+    model.result = null;
+    if (result) |value| {
+        model.result = value.clone(transcript.allocator) catch return;
+    }
+    if (model.result) |*owned| owned.is_error = is_error;
+    model.is_error = is_error;
+    model.is_partial = false;
+    row.tool.setOwnedModel(&model) catch return;
     transcript.clearToolRoutingAt(row.index);
     transcript.itemMutatedAt(row.index);
 }
@@ -1065,9 +1080,8 @@ fn createToolExecutionRow(
     tool_execution: conversation_snapshot_mod.ToolExecutionItem,
     theme: *const Theme,
 ) !TranscriptItem {
-    return createToolExecutionRowParts(
+    var model = try buildToolExecutionRowModel(
         allocator,
-        resolver,
         tool_execution.tool_call_id,
         tool_execution.tool_name,
         tool_execution.args,
@@ -1078,8 +1092,9 @@ fn createToolExecutionRow(
         null,
         tool_execution.is_partial,
         tool_execution.is_error,
-        theme,
     );
+    defer model.deinit(allocator);
+    return createToolExecutionRowParts(allocator, resolver, &model, theme);
 }
 
 fn createLiveToolExecutionRow(
@@ -1088,9 +1103,17 @@ fn createLiveToolExecutionRow(
     tool: conversation_mod.LiveToolExecution,
     theme: *const Theme,
 ) !TranscriptItem {
-    return createToolExecutionRowParts(
+    var model = try buildLiveToolExecutionRowModel(allocator, tool);
+    defer model.deinit(allocator);
+    return createToolExecutionRowParts(allocator, resolver, &model, theme);
+}
+
+fn buildLiveToolExecutionRowModel(
+    allocator: std.mem.Allocator,
+    tool: conversation_mod.LiveToolExecution,
+) !transcript_mod.ToolExecutionRowModel {
+    return buildToolExecutionRowModel(
         allocator,
-        resolver,
         tool.tool_call_id,
         tool.tool_name,
         tool.args,
@@ -1101,13 +1124,11 @@ fn createLiveToolExecutionRow(
         tool.result_message,
         tool.is_partial,
         tool.is_error,
-        theme,
     );
 }
 
-fn createToolExecutionRowParts(
+fn buildToolExecutionRowModel(
     allocator: std.mem.Allocator,
-    resolver: ToolRendererResolver,
     tool_call_id_src: []const u8,
     tool_name_src: []const u8,
     args: std.json.Value,
@@ -1118,42 +1139,54 @@ fn createToolExecutionRowParts(
     result_message: ?agent_protocol.ToolResultMessage,
     is_partial: bool,
     is_error: bool,
+) !transcript_mod.ToolExecutionRowModel {
+    var model: transcript_mod.ToolExecutionRowModel = .{};
+    errdefer model.deinit(allocator);
+
+    model.tool_call_id = try allocator.dupe(u8, tool_call_id_src);
+    model.tool_name = try allocator.dupe(u8, tool_name_src);
+    model.args = try json_util.cloneJsonValue(allocator, args);
+    model.args_json_source = if (!args_complete)
+        if (args_json_source) |source| try allocator.dupe(u8, source) else null
+    else
+        null;
+    model.args_complete = args_complete;
+    model.execution_started = execution_started;
+    model.is_partial = is_partial;
+    model.is_error = is_error;
+
+    if (result_message) |message| {
+        model.result = try toolResultMessageAsAgentToolResult(allocator, message);
+        model.is_partial = false;
+        model.is_error = message.is_error;
+    } else if (result) |value| {
+        model.result = try value.clone(allocator);
+    }
+    if (model.result) |*owned| owned.is_error = model.is_error;
+    return model;
+}
+
+fn createToolExecutionRowParts(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    model: *transcript_mod.ToolExecutionRowModel,
     theme: *const Theme,
 ) !TranscriptItem {
-    const renderer = resolver.resolve(tool_name_src);
-    const tool_call_id = try allocator.dupe(u8, tool_call_id_src);
-    errdefer allocator.free(tool_call_id);
-    const tool_name = try allocator.dupe(u8, tool_name_src);
-    errdefer allocator.free(tool_name);
+    const renderer = resolver.resolve(model.tool_name orelse return error.InvalidToolExecutionRowModel);
     const te = try allocator.create(transcript_mod.ToolExecution);
     errdefer allocator.destroy(te);
     te.* = .{
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
         .allocator = allocator,
         .theme = theme,
         .renderer = renderer,
     };
     errdefer te.deinit();
     if (renderer.init_state) |init_fn| te.renderer_state = init_fn(allocator);
-    te.setArgsWithJsonSource(args, args_json_source);
-    if (args_complete) te.setArgsComplete();
-    if (execution_started) te.markExecutionStarted();
-    if (result_message) |message| {
-        const rendered_result = try toolResultMessageAsAgentToolResult(allocator, message);
-        defer rendered_result.free(allocator);
-        te.setFinalResult(rendered_result, message.is_error);
-    } else if (result) |value| {
-        if (is_partial) {
-            te.setPartialResult(value, is_error);
-        } else {
-            te.setFinalResult(value, is_error);
-        }
-    }
+    try te.setOwnedModel(model);
     return .{
         .renderable = TranscriptRenderable.init(transcript_mod.ToolExecution, te),
         .kind = .tool_execution,
-        .tool_call_id = te.tool_call_id,
+        .tool_call_id = te.model.tool_call_id.?,
         .extra_height = 1,
         .deinit_ctx = @ptrCast(te),
         .deinit_fn = deinitToolExecutionRow,
@@ -1165,18 +1198,38 @@ fn toolResultMessageAsAgentToolResult(
     tool_result: agent_protocol.ToolResultMessage,
 ) !AgentToolResult {
     const blocks = try allocator.alloc(AgentToolResult.ContentBlock, tool_result.content.len);
-    errdefer allocator.free(blocks);
+    var initialized: usize = 0;
+    errdefer {
+        for (blocks[0..initialized]) |block| switch (block) {
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        };
+        allocator.free(blocks);
+    }
 
     for (tool_result.content, 0..) |block, i| {
         blocks[i] = switch (block) {
-            .text => |text| .{ .text = text },
-            .image => |image| .{ .image = image },
+            .text => |text| .{ .text = .{
+                .text = try allocator.dupe(u8, text.text),
+                .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+            } },
+            .image => |image| .{ .image = .{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            } },
         };
+        initialized += 1;
     }
 
     return .{
         .content = blocks,
-        .details = if (tool_result.details) |details| details else .null,
+        .details = if (tool_result.details) |details| try json_util.cloneJsonValue(allocator, details) else .null,
         .is_error = tool_result.is_error,
     };
 }
