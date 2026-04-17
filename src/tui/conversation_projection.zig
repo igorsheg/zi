@@ -235,11 +235,11 @@ pub const ProjectionState = struct {
             .assistant_content => |assistant_target| {
                 const assistant = if (frontier.assistant) |*assistant| assistant else return false;
                 if (!appendAssistantBytes(self.allocator, assistant, assistant_target, bytes)) return false;
-                switch (assistant_target.kind) {
-                    .text => transcript.appendText(assistant_target.content_index, bytes),
-                    .thinking => transcript.appendThinking(assistant_target.content_index, bytes),
-                }
-                return true;
+                if (self.frontier_item_start >= transcript.items.items.len) return false;
+                return switch (assistant_target.kind) {
+                    .text => transcript.appendAssistantTextAt(self.frontier_item_start, assistant_target.content_index, bytes),
+                    .thinking => transcript.appendAssistantThinkingAt(self.frontier_item_start, assistant_target.content_index, bytes),
+                };
             },
             .tool_call_arguments, .tool_result_content => return false,
         }
@@ -297,38 +297,36 @@ pub const ProjectionState = struct {
         transcript.truncateFrom(self.frontier_item_start);
         const snapshot = self.snapshot orelse return;
         const frontier = snapshot.frontier orelse return;
-        appendProjectedFrontier(transcript, resolver, frontier);
+        appendProjectedFrontierRows(transcript, resolver, frontier);
     }
 };
 
-fn appendProjectedFrontier(
+fn appendProjectedFrontierRows(
     transcript: *Transcript,
     resolver: ToolRendererResolver,
     frontier: conversation_mod.ConversationFrontier,
 ) void {
+    var live_tool_ids: std.ArrayList([]const u8) = .empty;
+    defer live_tool_ids.deinit(transcript.allocator);
+    for (frontier.live_tools) |tool| {
+        live_tool_ids.append(transcript.allocator, tool.tool_call_id) catch return;
+    }
+
     if (frontier.assistant) |assistant| {
-        transcript.beginAssistantMessage();
-        for (assistant.content, 0..) |block, idx| {
-            switch (block) {
-                .text => |text| transcript.appendText(idx, text.text),
-                .thinking => |thinking| transcript.appendThinking(idx, thinking.thinking),
-                .tool_call => {},
-            }
+        const row = createAssistantMessageRow(transcript.allocator, assistant, live_tool_ids.items, transcript.theme) catch return;
+        if (!transcript.addItem(row)) {
+            var owned_row = row;
+            owned_row.deinit(transcript.allocator);
+            return;
         }
     }
 
     for (frontier.live_tools) |tool| {
-        appendToolCall(transcript, resolver, tool.tool_call_id, tool.tool_name, tool.args, tool.args_complete, tool.execution_started);
-        if (tool.result_message) |result_message| {
-            appendToolResultMessage(transcript, result_message);
-            continue;
-        }
-        if (tool.result) |result| {
-            if (tool.is_partial) {
-                transcript.toolSetPartialResult(tool.tool_call_id, result, tool.is_error);
-            } else {
-                transcript.toolSetFinalResult(tool.tool_call_id, result, tool.is_error);
-            }
+        const row = createLiveToolExecutionRow(transcript.allocator, resolver, tool, transcript.theme) catch return;
+        if (!transcript.addItem(row)) {
+            var owned_row = row;
+            owned_row.deinit(transcript.allocator);
+            return;
         }
     }
 }
@@ -987,10 +985,62 @@ fn createToolExecutionRow(
     tool_execution: conversation_snapshot_mod.ToolExecutionItem,
     theme: *const Theme,
 ) !TranscriptItem {
-    const renderer = resolver.resolve(tool_execution.tool_name);
-    const tool_call_id = try allocator.dupe(u8, tool_execution.tool_call_id);
+    return createToolExecutionRowParts(
+        allocator,
+        resolver,
+        tool_execution.tool_call_id,
+        tool_execution.tool_name,
+        tool_execution.args,
+        tool_execution.args_complete,
+        tool_execution.execution_started,
+        tool_execution.result,
+        null,
+        tool_execution.is_partial,
+        tool_execution.is_error,
+        theme,
+    );
+}
+
+fn createLiveToolExecutionRow(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    tool: conversation_mod.LiveToolExecution,
+    theme: *const Theme,
+) !TranscriptItem {
+    return createToolExecutionRowParts(
+        allocator,
+        resolver,
+        tool.tool_call_id,
+        tool.tool_name,
+        tool.args,
+        tool.args_complete,
+        tool.execution_started,
+        tool.result,
+        tool.result_message,
+        tool.is_partial,
+        tool.is_error,
+        theme,
+    );
+}
+
+fn createToolExecutionRowParts(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    tool_call_id_src: []const u8,
+    tool_name_src: []const u8,
+    args: std.json.Value,
+    args_complete: bool,
+    execution_started: bool,
+    result: ?AgentToolResult,
+    result_message: ?agent_protocol.ToolResultMessage,
+    is_partial: bool,
+    is_error: bool,
+    theme: *const Theme,
+) !TranscriptItem {
+    const renderer = resolver.resolve(tool_name_src);
+    const tool_call_id = try allocator.dupe(u8, tool_call_id_src);
     errdefer allocator.free(tool_call_id);
-    const tool_name = try allocator.dupe(u8, tool_execution.tool_name);
+    const tool_name = try allocator.dupe(u8, tool_name_src);
     errdefer allocator.free(tool_name);
     const te = try allocator.create(transcript_mod.ToolExecution);
     errdefer allocator.destroy(te);
@@ -1003,14 +1053,18 @@ fn createToolExecutionRow(
     };
     errdefer te.deinit();
     if (renderer.init_state) |init_fn| te.renderer_state = init_fn(allocator);
-    te.setArgs(tool_execution.args);
-    if (tool_execution.args_complete) te.setArgsComplete();
-    if (tool_execution.execution_started) te.markExecutionStarted();
-    if (tool_execution.result) |result| {
-        if (tool_execution.is_partial) {
-            te.setPartialResult(result, tool_execution.is_error);
+    te.setArgs(args);
+    if (args_complete) te.setArgsComplete();
+    if (execution_started) te.markExecutionStarted();
+    if (result_message) |message| {
+        const rendered_result = try toolResultMessageAsAgentToolResult(allocator, message);
+        defer rendered_result.free(allocator);
+        te.setFinalResult(rendered_result, message.is_error);
+    } else if (result) |value| {
+        if (is_partial) {
+            te.setPartialResult(value, is_error);
         } else {
-            te.setFinalResult(result, tool_execution.is_error);
+            te.setFinalResult(value, is_error);
         }
     }
     return .{
@@ -1020,6 +1074,27 @@ fn createToolExecutionRow(
         .extra_height = 1,
         .deinit_ctx = @ptrCast(te),
         .deinit_fn = deinitToolExecutionRow,
+    };
+}
+
+fn toolResultMessageAsAgentToolResult(
+    allocator: std.mem.Allocator,
+    tool_result: agent_protocol.ToolResultMessage,
+) !AgentToolResult {
+    const blocks = try allocator.alloc(AgentToolResult.ContentBlock, tool_result.content.len);
+    errdefer allocator.free(blocks);
+
+    for (tool_result.content, 0..) |block, i| {
+        blocks[i] = switch (block) {
+            .text => |text| .{ .text = text },
+            .image => |image| .{ .image = image },
+        };
+    }
+
+    return .{
+        .content = blocks,
+        .details = if (tool_result.details) |details| details else .null,
+        .is_error = tool_result.is_error,
     };
 }
 

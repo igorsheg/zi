@@ -1062,12 +1062,16 @@ pub const Transcript = struct {
         return am;
     }
 
-    fn currentAssistant(self: *Transcript) ?*assistant_message_mod.AssistantMessage {
-        const idx = self.current_assistant_idx orelse return null;
-        if (idx >= self.items.items.len) return null;
-        const item = &self.items.items[idx];
+    fn assistantMessageAt(self: *Transcript, index: usize) ?*assistant_message_mod.AssistantMessage {
+        if (index >= self.items.items.len) return null;
+        const item = &self.items.items[index];
         if (item.kind != .assistant_message) return null;
         return @ptrCast(@alignCast(item.deinit_ctx.?));
+    }
+
+    fn currentAssistant(self: *Transcript) ?*assistant_message_mod.AssistantMessage {
+        const idx = self.current_assistant_idx orelse return null;
+        return self.assistantMessageAt(idx);
     }
 
     /// Append streaming text content to the current assistant message.
@@ -1090,6 +1094,20 @@ pub const Transcript = struct {
             const idx = self.current_assistant_idx orelse return;
             self.noteItemMutated(idx);
         }
+    }
+
+    pub fn appendAssistantTextAt(self: *Transcript, index: usize, content_index: usize, delta: []const u8) bool {
+        const assistant = self.assistantMessageAt(index) orelse return false;
+        assistant.appendText(content_index, delta);
+        self.noteItemMutated(index);
+        return true;
+    }
+
+    pub fn appendAssistantThinkingAt(self: *Transcript, index: usize, content_index: usize, delta: []const u8) bool {
+        const assistant = self.assistantMessageAt(index) orelse return false;
+        assistant.appendThinking(content_index, delta);
+        self.noteItemMutated(index);
+        return true;
     }
 
     pub fn setHideThinkingBlock(self: *Transcript, hide: bool) void {
