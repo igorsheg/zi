@@ -28,7 +28,6 @@ const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const diff_mod = @import("../lib/diff.zig");
 const diff_unified = @import("../lib/diff_unified.zig");
-const diff_json = @import("../lib/diff_json.zig");
 const lock_registry = @import("../agent/lock_registry.zig");
 const json_value = @import("../json/value.zig");
 
@@ -271,42 +270,17 @@ fn execute(
 
     const unified = diff_unified.toUnified(allocator, doc) catch
         return util.errorResult(allocator, "diff serialize failed");
-    const structured = diff_json.toJsonValue(allocator, doc) catch {
-        allocator.free(unified);
-        return util.errorResult(allocator, "diff details failed");
-    };
 
-    var details_obj = std.json.ObjectMap.init(allocator);
-    errdefer json_value.freeJsonValue(allocator, .{ .object = details_obj });
-    const structured_key = allocator.dupe(u8, "structuredDiff") catch
-        return allocFailureWithOwnedDiff(allocator, unified, structured);
-    details_obj.put(structured_key, structured) catch {
-        allocator.free(structured_key);
+    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch {
         allocator.free(unified);
-        json_value.freeJsonValue(allocator, structured);
-        return util.errorResult(allocator, "diff details failed");
+        return util.errorResult(allocator, "alloc failed");
     };
-
-    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
-        return allocFailureWithOwnedDiffAndDetails(allocator, unified, .{ .object = details_obj });
     blocks[0] = .{ .text = .{ .text = unified } };
     return .{
         .content = blocks,
-        .details = .{ .object = details_obj },
+        .details = .null,
         .is_error = false,
     };
-}
-
-fn allocFailureWithOwnedDiff(allocator: std.mem.Allocator, unified: []u8, structured: std.json.Value) protocol.AgentToolResult {
-    allocator.free(unified);
-    json_value.freeJsonValue(allocator, structured);
-    return util.errorResult(allocator, "alloc failed");
-}
-
-fn allocFailureWithOwnedDiffAndDetails(allocator: std.mem.Allocator, unified: []u8, details: std.json.Value) protocol.AgentToolResult {
-    allocator.free(unified);
-    json_value.freeJsonValue(allocator, details);
-    return util.errorResult(allocator, "alloc failed");
 }
 
 // ── line ending handling ────────────────────────────────────────────
@@ -959,7 +933,7 @@ test "prepareArguments leaves non-canonical input unchanged when it cannot fold 
     try std.testing.expect(prepared == input);
 }
 
-test "execute returns unified diff in content and structuredDiff in details for a real file edit" {
+test "execute returns unified diff in content without structured diff details" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1010,17 +984,7 @@ test "execute returns unified diff in content and structuredDiff in details for 
     try testing.expect(std.mem.indexOf(u8, unified, "-two\n") != null);
     try testing.expect(std.mem.indexOf(u8, unified, "+TWO\n") != null);
 
-    const details = switch (result.details) {
-        .object => |o| o,
-        else => return error.TestUnexpectedResult,
-    };
-    const structured = details.get("structuredDiff") orelse return error.TestUnexpectedResult;
-    var document = try diff_json.fromJsonValue(testing.allocator, structured);
-    defer document.deinit();
-
-    const regenerated = try diff_unified.toUnified(testing.allocator, document);
-    defer testing.allocator.free(regenerated);
-    try testing.expectEqualStrings(unified, regenerated);
+    try testing.expect(result.details == .null);
 
     const final_contents = try tmp.dir.readFileAlloc(testing.allocator, "note.txt", 1024);
     defer testing.allocator.free(final_contents);

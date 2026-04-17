@@ -12,9 +12,6 @@ const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const json_util = @import("../../ai/json_util.zig");
-const diff = @import("../../lib/diff.zig");
-const diff_json = @import("../../lib/diff_json.zig");
-const diff_view = @import("../../lib/diff_view.zig");
 const agent_protocol = @import("../../agent/root.zig").protocol;
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
@@ -219,96 +216,15 @@ fn rebuildLiteralSurface(surface: *OwnedSurface, text: []const u8, collapsed_exc
 }
 
 fn rebuildEditSurface(surface: *OwnedSurface, ctx: *const ToolStateContext) !void {
-    if (ctx.is_error) {
-        try rebuildTextSurface(surface, ctx.result, .plain, &TAIL_5);
-        return;
-    }
-
-    const result = ctx.result orelse {
+    if (ctx.result == null) {
         try rebuildLiteralSurface(surface, "malformed edit result: missing tool result", &TAIL_5);
         return;
-    };
-    const details = switch (result.details) {
-        .object => |object| object,
-        else => {
-            try rebuildLiteralSurface(surface, "malformed edit result: missing structuredDiff details", &TAIL_5);
-            return;
-        },
-    };
-    const structured = details.get("structuredDiff") orelse {
-        try rebuildLiteralSurface(surface, "malformed edit result: missing structuredDiff details", &TAIL_5);
-        return;
-    };
-
-    var document = diff_json.fromJsonValue(surface.allocator, structured) catch {
-        try rebuildLiteralSurface(surface, "malformed edit result: invalid structuredDiff details", &TAIL_5);
-        return;
-    };
-    defer document.deinit();
-
-    var view = diff_view.buildView(surface.allocator, document) catch {
-        try rebuildLiteralSurface(surface, "malformed edit result: failed to build diff view", &TAIL_5);
-        return;
-    };
-    defer view.deinit();
-
-    try rebuildSurfaceFromDiffView(surface, view);
-    try surface.setCollapsedExcerpts(&DIFF_COLLAPSED);
-}
-
-fn rebuildSurfaceFromDiffView(surface: *OwnedSurface, view: diff_view.DiffView) !void {
-    if (view.files.len > 0) {
-        surface.setHeaderOwned(try surface.allocator.dupe(u8, view.files[0].path));
     }
-    surface.stats = .{ .added = view.stats.added, .removed = view.stats.removed };
 
-    var max_gutter: usize = 0;
-    for (view.files, 0..) |file, file_index| {
-        if (file_index > 0) {
-            const owned_path = try surface.allocator.dupe(u8, file.path);
-            try surface.owned_texts.append(surface.allocator, owned_path);
-            try surface.rows.append(surface.allocator, .{ .text = "" });
-            try surface.rows.append(surface.allocator, .{ .text = owned_path, .highlight = false });
-        }
-
-        for (file.rows) |row| {
-            switch (row.kind) {
-                .gap => try surface.rows.append(surface.allocator, .{
-                    .is_elision = true,
-                    .elision_count = row.gap_count,
-                }),
-                .context, .added, .removed => {
-                    const owned_text = try surface.allocator.dupe(u8, row.text);
-                    try surface.owned_texts.append(surface.allocator, owned_text);
-
-                    var surface_row = boxed_surface.Row{
-                        .text = owned_text,
-                        .style = switch (row.kind) {
-                            .context => .context,
-                            .added => .added,
-                            .removed => .removed,
-                            else => unreachable,
-                        },
-                        .highlight = row.kind != .context,
-                    };
-                    const gutter_no = switch (row.kind) {
-                        .context => row.new_lineno,
-                        .added => row.new_lineno,
-                        .removed => row.old_lineno,
-                        else => null,
-                    };
-                    if (gutter_no) |line_no| {
-                        const gutter = try std.fmt.allocPrint(surface.allocator, "{d}", .{line_no});
-                        try surface.owned_gutters.append(surface.allocator, gutter);
-                        if (gutter.len > max_gutter) max_gutter = gutter.len;
-                        surface_row.gutter = gutter;
-                    }
-                    try surface.rows.append(surface.allocator, surface_row);
-                },
-            }
-        }
-    }
-    surface.gutter_width = @intCast(max_gutter);
+    // Diagnostic mode: bypass structured diff decoding/render prep and
+    // render the unified diff text directly so we can isolate whether the
+    // structuredDiff payload/path is causing the TUI stall.
+    try rebuildTextSurface(surface, ctx.result, .plain, &DIFF_COLLAPSED);
 }
 
 fn renderTitle(
@@ -685,43 +601,23 @@ test "bashCall falls back to legacy command arg for old sessions" {
     try testing.expectEqualStrings("$ ls -la", rowAscii(&buf, 0, &line));
 }
 
-test "edit renderer uses retained structured diff surface" {
+test "edit renderer renders unified diff text without structured diff details" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 12);
     defer buf.deinit();
-
-    const inputs = [_]diff.Input{.{
-        .old_path = "a.txt",
-        .new_path = "a.txt",
-        .old_text =
-        \\one
-        \\two
-        \\three
-        ,
-        .new_text =
-        \\one
-        \\TWO
-        \\three
-        ,
-    }};
-    var doc = try diff.buildDocument(testing.allocator, &inputs, .{});
-    defer doc.deinit();
-    const diff_value = try diff_json.toJsonValue(testing.allocator, doc);
-    defer json_util.freeJsonValue(testing.allocator, diff_value);
-
-    var details = std.json.ObjectMap.init(testing.allocator);
-    defer json_util.freeJsonValue(testing.allocator, .{ .object = details });
-    try details.put(try testing.allocator.dupe(u8, "structuredDiff"), try json_util.cloneJsonValue(testing.allocator, diff_value));
 
     const content = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
     defer {
         testing.allocator.free(content[0].text.text);
         testing.allocator.free(content);
     }
-    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(u8, "ignored text payload") } };
+    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(
+        u8,
+        "--- a.txt\n+++ a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n",
+    ) } };
 
     const result = agent_protocol.AgentToolResult{
         .content = content,
-        .details = .{ .object = details },
+        .details = .null,
         .is_error = false,
     };
 
@@ -753,39 +649,45 @@ test "edit renderer uses retained structured diff surface" {
     var row2: [80]u8 = undefined;
     var row3: [80]u8 = undefined;
     var row4: [80]u8 = undefined;
-    try testing.expectEqualStrings("+1 -1", rowAscii(&buf, 0, &row0));
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 2, &row2), "a.txt") != null);
+    var row5: [80]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 0, &row0), "--- a.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 2, &row2), "@@ -1,3 +1,3 @@") != null);
     try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 3, &row3), "one") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "two") != null or std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "TWO") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "-two") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 5, &row5), "+TWO") != null);
 }
 
-test "edit renderer shows malformed result message when structured diff details are missing" {
+test "edit renderer shows malformed result message when tool result is missing" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 8);
     defer buf.deinit();
 
-    const content = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
-    defer {
-        testing.allocator.free(content[0].text.text);
-        testing.allocator.free(content);
-    }
-    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(u8, "ignored text payload") } };
-
-    const result = agent_protocol.AgentToolResult{
-        .content = content,
-        .details = .null,
-        .is_error = false,
-    };
-
-    const state = try prepareRendererStateForTest(testing.allocator, edit_renderer, result, false);
+    const state = if (edit_renderer.init_state) |init_fn| init_fn(testing.allocator) else null;
     defer if (state) |resolved| {
         if (edit_renderer.deinit_state) |deinit_fn| deinit_fn(resolved, testing.allocator);
     };
+
+    if (edit_renderer.result_changed) |changed_fn| {
+        var state_ctx = ToolStateContext{
+            .tool_name = "edit",
+            .tool_call_id = "call-2",
+            .args = .null,
+            .result = null,
+            .is_partial = false,
+            .is_error = false,
+            .expanded = true,
+            .execution_started = true,
+            .args_complete = true,
+            .allocator = testing.allocator,
+            .state = state,
+        };
+        changed_fn(&state_ctx);
+    }
 
     const measure_ctx = ToolMeasureContext{
         .tool_name = "edit",
         .tool_call_id = "call-2",
         .args = .null,
-        .result = result,
+        .result = null,
         .is_partial = false,
         .is_error = false,
         .expanded = true,
@@ -801,7 +703,7 @@ test "edit renderer shows malformed result message when structured diff details 
         .tool_name = "edit",
         .tool_call_id = "call-2",
         .args = .null,
-        .result = result,
+        .result = null,
         .is_partial = false,
         .is_error = false,
         .expanded = true,

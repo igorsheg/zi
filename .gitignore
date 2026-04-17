@@ -3,4 +3,7 @@ zig-out/
 .references/
 .forks/
 node_modules/
-
+.zi/hf-sessions
+.zi/specs
+.standup/
+scripts/standup.ts
