@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai_protocol = @import("ai/protocol.zig");
 const protocol = @import("agent/protocol.zig");
+const agent_conversation = @import("agent/conversation.zig");
 const message_memory = @import("agent/message_memory.zig");
 const json_util = @import("ai/json_util.zig");
 const run_control = @import("runtime/run_control.zig");
@@ -365,24 +366,8 @@ pub fn build(allocator: std.mem.Allocator, inputs: BuildInputs) !ConversationSna
             (if (inputs.active_assistant != null) @as(usize, 1) else 0),
     );
 
-    for (inputs.messages, 0..) |message, idx| {
-        try items.append(allocator, .{ .committed_message = try CommittedMessageItem.initClone(
-            allocator,
-            committedMessageId(idx, message),
-            committedMessageSemanticVersion(message),
-            message,
-        ) });
-    }
-
-    if (inputs.active_assistant) |assistant| {
-        try items.append(allocator, .{ .active_assistant = try ActiveAssistantItem.initClone(
-            allocator,
-            activeAssistantId(assistant),
-            activeAssistantSemanticVersion(assistant),
-            assistant,
-        ) });
-    }
-
+    try appendCommittedMessageItems(allocator, &items, inputs.messages);
+    try appendActiveAssistantItem(allocator, &items, inputs.active_assistant);
     try appendToolExecutionItems(allocator, &items, inputs.tool_executions);
     try appendQueuedItems(allocator, &items, .steering, inputs.steering);
     try appendQueuedItems(allocator, &items, .follow_up, inputs.follow_up);
@@ -393,18 +378,104 @@ pub fn build(allocator: std.mem.Allocator, inputs: BuildInputs) !ConversationSna
     };
 }
 
+pub const BuildFromAgentConversationInputs = struct {
+    version: u64,
+    snapshot: agent_conversation.ConversationSnapshot,
+    steering: []const run_control.QueuedMessageText = &.{},
+    follow_up: []const run_control.QueuedMessageText = &.{},
+};
+
+pub fn buildFromAgentConversationSnapshot(
+    allocator: std.mem.Allocator,
+    inputs: BuildFromAgentConversationInputs,
+) !ConversationSnapshot {
+    var items: std.ArrayList(ConversationItem) = .empty;
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit(allocator);
+    }
+
+    const live_item_count = if (inputs.snapshot.frontier) |frontier|
+        frontier.live_tools.len + (if (frontier.assistant != null) @as(usize, 1) else 0)
+    else
+        0;
+
+    try items.ensureTotalCapacity(
+        allocator,
+        inputs.snapshot.committed.len +
+            live_item_count +
+            inputs.steering.len +
+            inputs.follow_up.len,
+    );
+
+    try appendCommittedMessageItems(allocator, &items, inputs.snapshot.committed);
+    if (inputs.snapshot.frontier) |frontier| {
+        try appendActiveAssistantItem(allocator, &items, frontier.assistant);
+        try appendToolExecutionItemsFromAgentFrontier(allocator, &items, frontier.live_tools);
+    }
+    try appendQueuedItems(allocator, &items, .steering, inputs.steering);
+    try appendQueuedItems(allocator, &items, .follow_up, inputs.follow_up);
+
+    return .{
+        .version = inputs.version,
+        .items = try items.toOwnedSlice(allocator),
+    };
+}
+
+fn appendCommittedMessageItems(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(ConversationItem),
+    messages: []const protocol.AgentMessage,
+) !void {
+    for (messages, 0..) |message, idx| {
+        try items.append(allocator, .{ .committed_message = try initCommittedMessageItem(allocator, idx, message) });
+    }
+}
+
+fn appendActiveAssistantItem(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(ConversationItem),
+    assistant: ?protocol.AssistantMessage,
+) !void {
+    const active_assistant = assistant orelse return;
+    try items.append(allocator, .{ .active_assistant = try initActiveAssistantItem(allocator, active_assistant) });
+}
+
 fn appendToolExecutionItems(
     allocator: std.mem.Allocator,
     items: *std.ArrayList(ConversationItem),
     tool_executions: []const ToolExecutionInput,
 ) !void {
     for (tool_executions) |tool_execution| {
-        try items.append(allocator, .{ .tool_execution = try ToolExecutionItem.initClone(
-            allocator,
-            toolExecutionId(tool_execution.tool_call_id),
-            toolExecutionSemanticVersion(tool_execution),
-            tool_execution,
-        ) });
+        try items.append(allocator, .{ .tool_execution = try initToolExecutionItem(allocator, tool_execution) });
+    }
+}
+
+fn appendToolExecutionItemsFromAgentFrontier(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(ConversationItem),
+    live_tools: []const agent_conversation.LiveToolExecution,
+) !void {
+    for (live_tools) |tool| {
+        const result = if (tool.result_message) |result_message|
+            try toolResultMessageAsAgentToolResult(allocator, result_message)
+        else if (tool.result) |partial_result|
+            try partial_result.clone(allocator)
+        else
+            null;
+        defer if (result) |owned| owned.free(allocator);
+
+        try items.append(allocator, .{ .tool_execution = try initToolExecutionItem(allocator, .{
+            .tool_call_id = tool.tool_call_id,
+            .tool_name = tool.tool_name,
+            .args = tool.args,
+            .args_json_source = tool.args_json_source,
+            .args_complete = tool.args_complete,
+            .execution_started = tool.execution_started,
+            .result = result,
+            .is_error = if (tool.result_message) |result_message| result_message.is_error else tool.is_error,
+            .is_partial = if (tool.result_message != null) false else tool.is_partial,
+        }) });
     }
 }
 
@@ -415,14 +486,54 @@ fn appendQueuedItems(
     entries: []const run_control.QueuedMessageText,
 ) !void {
     for (entries, 0..) |entry, idx| {
-        try items.append(allocator, .{ .queued_user_message = try QueuedUserMessageItem.initClone(
+        try items.append(allocator, .{ .queued_user_message = try initQueuedUserMessageItem(
             allocator,
-            queuedUserMessageId(kind, idx),
-            queuedUserMessageSemanticVersion(entry.text),
             kind,
+            idx,
             entry.text,
         ) });
     }
+}
+
+fn toolResultMessageAsAgentToolResult(
+    allocator: std.mem.Allocator,
+    tool_result: protocol.ToolResultMessage,
+) !protocol.AgentToolResult {
+    const blocks = try allocator.alloc(protocol.AgentToolResult.ContentBlock, tool_result.content.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (blocks[0..initialized]) |block| switch (block) {
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        };
+        allocator.free(blocks);
+    }
+
+    for (tool_result.content, 0..) |block, i| {
+        blocks[i] = switch (block) {
+            .text => |text| .{ .text = .{
+                .text = try allocator.dupe(u8, text.text),
+                .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+            } },
+            .image => |image| .{ .image = .{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            } },
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .content = blocks,
+        .details = if (tool_result.details) |details| try json_util.cloneJsonValue(allocator, details) else .null,
+        .is_error = tool_result.is_error,
+    };
 }
 
 fn committedMessageSemanticVersion(message: protocol.AgentMessage) SemanticVersion {
@@ -862,6 +973,79 @@ test "build includes active assistant and live tool execution items" {
     try testing.expectEqualStrings("{\"cmd\":\"he", snapshot.items[2].tool_execution.args_json_source.?);
     try testing.expect(snapshot.items[2].tool_execution.result != null);
     try testing.expectEqualStrings("partial", snapshot.items[2].tool_execution.result.?.content[0].text.text);
+}
+
+test "buildFromAgentConversationSnapshot preserves frontier-only live rows and queued inputs" {
+    const assistant_content = [_]protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "working" } },
+        .{ .tool_call = .{ .id = "tool-1", .name = "bash", .arguments = .null } },
+    };
+    const tool_result_content = [_]protocol.ToolResultMessage.ContentBlock{
+        .{ .text = .{ .text = "done" } },
+    };
+    var steering = [_]run_control.QueuedMessageText{
+        .{ .text = try testing.allocator.dupe(u8, "steer") },
+    };
+    defer freeQueuedInputs(testing.allocator, &steering);
+    var follow_up = [_]run_control.QueuedMessageText{
+        .{ .text = try testing.allocator.dupe(u8, "follow") },
+    };
+    defer freeQueuedInputs(testing.allocator, &follow_up);
+
+    const live_tools = try testing.allocator.dupe(agent_conversation.LiveToolExecution, &.{.{
+        .tool_call_id = try testing.allocator.dupe(u8, "tool-1"),
+        .tool_name = try testing.allocator.dupe(u8, "bash"),
+        .args = .null,
+        .args_json_source = try testing.allocator.dupe(u8, "{\"cmd\":\"echo hi"),
+        .args_complete = false,
+        .execution_started = true,
+        .result_message = .{
+            .tool_call_id = "tool-1",
+            .tool_name = "bash",
+            .content = &tool_result_content,
+            .is_error = false,
+            .timestamp = 3,
+        },
+    }});
+    defer {
+        for (live_tools) |tool| {
+            testing.allocator.free(tool.tool_call_id);
+            testing.allocator.free(tool.tool_name);
+            if (tool.args_json_source) |source| testing.allocator.free(source);
+        }
+        testing.allocator.free(live_tools);
+    }
+
+    var committed = [_]protocol.AgentMessage{makeUserMessage("hello", 1)};
+
+    var snapshot = try buildFromAgentConversationSnapshot(testing.allocator, .{
+        .version = 11,
+        .snapshot = .{
+            .committed = &committed,
+            .frontier = .{
+                .assistant = makeAssistantMessage(&assistant_content, .toolUse, 2),
+                .live_tools = live_tools,
+            },
+        },
+        .steering = &steering,
+        .follow_up = &follow_up,
+    });
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 5), snapshot.items.len);
+    try testing.expect(snapshot.items[0] == .committed_message);
+    try testing.expect(snapshot.items[1] == .active_assistant);
+    try testing.expect(snapshot.items[2] == .tool_execution);
+    try testing.expect(snapshot.items[3] == .queued_user_message);
+    try testing.expect(snapshot.items[4] == .queued_user_message);
+    try testing.expectEqualStrings("working", snapshot.items[1].active_assistant.message.assistant.content[0].text.text);
+    try testing.expectEqualStrings("tool-1", snapshot.items[2].tool_execution.tool_call_id);
+    try testing.expect(snapshot.items[2].tool_execution.result != null);
+    try testing.expectEqualStrings("done", snapshot.items[2].tool_execution.result.?.content[0].text.text);
+    try testing.expect(snapshot.items[2].tool_execution.args_json_source != null);
+    try testing.expectEqualStrings("{\"cmd\":\"echo hi", snapshot.items[2].tool_execution.args_json_source.?);
+    try testing.expectEqualStrings("steer", snapshot.items[3].queued_user_message.text);
+    try testing.expectEqualStrings("follow", snapshot.items[4].queued_user_message.text);
 }
 
 test "conversation snapshot clone deep copies items" {

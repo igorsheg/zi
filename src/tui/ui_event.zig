@@ -2,17 +2,13 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_root = @import("../agent/root.zig");
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
-const message_memory = agent_root.message_memory;
 const session_controller_mod = @import("../session_controller.zig");
 const RunOutcome = session_controller_mod.RunOutcome;
 
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
-/// mailbox-owned. Conversation changes cross either as full semantic
-/// snapshots (resync / resume / reset) or as incremental semantic patches
-/// for the live hot path.
+/// mailbox-owned. Conversation changes cross as full semantic snapshots.
 pub const UiEvent = union(enum) {
     // --- conversation transport ---
-    conversation_patch: agent_root.conversation.ConversationPatch,
     conversation_snapshot: conversation_snapshot_mod.ConversationSnapshot,
 
     // --- errors / status side effects ---
@@ -124,7 +120,6 @@ pub const UiEvent = union(enum) {
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .conversation_patch => |*patch| patch.deinit(allocator),
             .conversation_snapshot => |*snapshot| snapshot.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
             .assistant_run_finished => |m| {
@@ -163,14 +158,6 @@ pub const UiEvent = union(enum) {
 };
 
 const testing = std.testing;
-
-test "UiEvent deinit frees conversation patch payloads" {
-    var ev = UiEvent{ .conversation_patch = .{ .append_frontier_content = .{
-        .target = .{ .assistant_content = .{ .content_index = 0, .kind = .text } },
-        .bytes = try testing.allocator.dupe(u8, "hello"),
-    } } };
-    ev.deinit(testing.allocator);
-}
 
 test "UiEvent deinit frees conversation snapshot payload" {
     const snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
