@@ -1049,7 +1049,7 @@ pub const Transcript = struct {
         }
     }
 
-    fn removeItemAt(self: *Transcript, index: usize) void {
+    pub fn removeItemAt(self: *Transcript, index: usize) void {
         if (index >= self.items.items.len) return;
         var item = self.items.items[index];
         if (item.tool_call_id) |id| {
@@ -1069,17 +1069,6 @@ pub const Transcript = struct {
         if (start_index >= self.items.items.len) return;
         while (self.items.items.len > start_index) {
             self.removeItemAt(start_index);
-        }
-    }
-
-    pub fn clearQueuedUserMessages(self: *Transcript) void {
-        var i: usize = 0;
-        while (i < self.items.items.len) {
-            if (self.items.items[i].kind == .queued_user_message) {
-                self.removeItemAt(i);
-                continue;
-            }
-            i += 1;
         }
     }
 

@@ -1363,7 +1363,14 @@ pub const Interactive = struct {
     }
 
     fn applyQueueSnapshot(self: *Interactive, snapshot: agent_mod.QueuedMessageSnapshot) void {
-        self.transcript.clearQueuedUserMessages();
+        var idx: usize = 0;
+        while (idx < self.transcript.items.items.len) {
+            if (self.transcript.items.items[idx].kind == .queued_user_message) {
+                self.transcript.removeItemAt(idx);
+                continue;
+            }
+            idx += 1;
+        }
         for (snapshot.steering) |entry| {
             const row = conversation_projection_mod.createUserMessageRow(
                 self.transcript.allocator,
