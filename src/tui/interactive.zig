@@ -1372,9 +1372,17 @@ pub const Interactive = struct {
             idx += 1;
         }
         for (snapshot.steering) |entry| {
+            var model = conversation_projection_mod.buildUserRowModel(
+                self.transcript.allocator,
+                entry.text,
+                .queued_steering,
+                .pending,
+            ) catch return;
+            defer model.deinit(self.transcript.allocator);
+
             const row = conversation_projection_mod.createUserMessageRow(
                 self.transcript.allocator,
-                .{ .text = entry.text, .footer = .queued_steering },
+                &model,
                 .queued_user_message,
                 self.transcript.theme,
             ) catch return;
@@ -1385,9 +1393,17 @@ pub const Interactive = struct {
             }
         }
         for (snapshot.follow_up) |entry| {
+            var model = conversation_projection_mod.buildUserRowModel(
+                self.transcript.allocator,
+                entry.text,
+                .queued_follow_up,
+                .pending,
+            ) catch return;
+            defer model.deinit(self.transcript.allocator);
+
             const row = conversation_projection_mod.createUserMessageRow(
                 self.transcript.allocator,
-                .{ .text = entry.text, .footer = .queued_follow_up },
+                &model,
                 .queued_user_message,
                 self.transcript.theme,
             ) catch return;

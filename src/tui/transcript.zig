@@ -1704,16 +1704,39 @@ fn appendTestToolExecutionRow(
     return transcript.items.items.len - 1;
 }
 
-fn appendTestUserRow(transcript: *Transcript, props: user_message_mod.Props, kind: ItemKind) !usize {
+fn buildTestUserModel(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    footer: user_message_mod.Footer,
+    status: user_message_mod.Status,
+) !user_message_mod.UserRowModel {
+    return .{
+        .text = try allocator.dupe(u8, text),
+        .footer = try footer.clone(allocator),
+        .status = status,
+    };
+}
+
+fn appendTestUserRow(
+    transcript: *Transcript,
+    text: []const u8,
+    footer: user_message_mod.Footer,
+    kind: ItemKind,
+) !usize {
     const msg = try transcript.allocator.create(user_message_mod.UserMessage);
     errdefer transcript.allocator.destroy(msg);
     msg.* = user_message_mod.UserMessage.init(transcript.allocator);
     errdefer msg.deinit();
     msg.setTheme(transcript.theme);
 
-    var message_props = props;
-    message_props.status = if (kind == .queued_user_message) .pending else .in_chat;
-    msg.setProps(message_props);
+    var model = try buildTestUserModel(
+        transcript.allocator,
+        text,
+        footer,
+        if (kind == .queued_user_message) .pending else .in_chat,
+    );
+    defer model.deinit(transcript.allocator);
+    msg.setOwnedModel(&model);
 
     const item: TranscriptItem = .{
         .renderable = TranscriptRenderable.init(user_message_mod.UserMessage, msg),
@@ -1731,7 +1754,7 @@ test "Transcript retained items install transcript renderables" {
     defer transcript.deinit();
 
     _ = try appendTestAssistantText(&transcript, "hello from assistant");
-    _ = try appendTestUserRow(&transcript, .{ .text = "user msg" }, .user_message);
+    _ = try appendTestUserRow(&transcript, "user msg", .none, .user_message);
     _ = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
 
     try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
@@ -2134,7 +2157,7 @@ test "Transcript clearAll removes all items and resets state" {
     defer transcript.deinit();
 
     _ = try appendTestAssistantText(&transcript, "hello");
-    _ = try appendTestUserRow(&transcript, .{ .text = "user msg" }, .user_message);
+    _ = try appendTestUserRow(&transcript, "user msg", .none, .user_message);
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 

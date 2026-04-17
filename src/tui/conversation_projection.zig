@@ -537,13 +537,18 @@ fn buildQueuedUserDesiredItem(
     queued: conversation_snapshot_mod.QueuedUserMessageItem,
     theme: *const Theme,
 ) !DesiredItem {
-    var row = try createUserMessageRow(allocator, .{
-        .text = queued.text,
-        .footer = switch (queued.kind) {
+    var model = try buildUserRowModel(
+        allocator,
+        queued.text,
+        switch (queued.kind) {
             .steering => .queued_steering,
             .follow_up => .queued_follow_up,
         },
-    }, .queued_user_message, theme);
+        .pending,
+    );
+    defer model.deinit(allocator);
+
+    var row = try createUserMessageRow(allocator, &model, .queued_user_message, theme);
     row.snapshot_item_id = queued.item_id;
     row.snapshot_semantic_version = queued.semantic_version;
     return .{ .item_id = queued.item_id, .semantic_version = queued.semantic_version, .row = row };
@@ -987,7 +992,10 @@ fn buildSnapshotMessageRow(
 fn buildUserRow(allocator: std.mem.Allocator, message: agent_protocol.AgentMessage, theme: *const Theme) !TranscriptItem {
     const text = extractUserMessageText(allocator, message) orelse return error.EmptyUserMessage;
     defer text.deinit(allocator);
-    return createUserMessageRow(allocator, .{ .text = text.slice() }, .user_message, theme);
+
+    var model = try buildUserRowModel(allocator, text.slice(), .none, .in_chat);
+    defer model.deinit(allocator);
+    return createUserMessageRow(allocator, &model, .user_message, theme);
 }
 
 fn buildSummaryRow(allocator: std.mem.Allocator, theme: *const Theme, label: []const u8, summary: []const u8) !TranscriptItem {
@@ -1050,9 +1058,22 @@ fn createAssistantMessageRow(
     };
 }
 
+pub fn buildUserRowModel(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    footer: user_message_component_mod.Footer,
+    status: user_message_component_mod.Status,
+) !user_message_component_mod.UserRowModel {
+    return .{
+        .text = try allocator.dupe(u8, text),
+        .footer = try footer.clone(allocator),
+        .status = status,
+    };
+}
+
 pub fn createUserMessageRow(
     allocator: std.mem.Allocator,
-    props: user_message_component_mod.Props,
+    model: *user_message_component_mod.UserRowModel,
     kind: transcript_mod.ItemKind,
     theme: *const Theme,
 ) !TranscriptItem {
@@ -1061,10 +1082,7 @@ pub fn createUserMessageRow(
     msg.* = user_message_component_mod.UserMessage.init(allocator);
     errdefer msg.deinit();
     msg.setTheme(theme);
-
-    var message_props = props;
-    message_props.status = if (kind == .queued_user_message) .pending else .in_chat;
-    msg.setProps(message_props);
+    msg.setOwnedModel(model);
     return .{
         .renderable = TranscriptRenderable.init(user_message_component_mod.UserMessage, msg),
         .kind = kind,

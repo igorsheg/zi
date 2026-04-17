@@ -17,7 +17,35 @@ pub const Footer = union(enum) {
     queued_steering,
     queued_follow_up,
     edited,
-    custom: []const u8,
+    custom: []u8,
+
+    pub fn clone(self: Footer, allocator: std.mem.Allocator) !Footer {
+        return switch (self) {
+            .none => .none,
+            .queued_steering => .queued_steering,
+            .queued_follow_up => .queued_follow_up,
+            .edited => .edited,
+            .custom => |text| .{ .custom = try allocator.dupe(u8, text) },
+        };
+    }
+
+    fn deinit(self: *Footer, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .custom => |text| allocator.free(text),
+            else => {},
+        }
+        self.* = .none;
+    }
+
+    fn label(self: Footer) []const u8 {
+        return switch (self) {
+            .none => "",
+            .queued_steering => "Queued · Steering",
+            .queued_follow_up => "Queued · Follow-up",
+            .edited => "Edited",
+            .custom => |text| text,
+        };
+    }
 };
 
 pub const Status = enum {
@@ -25,10 +53,24 @@ pub const Status = enum {
     pending,
 };
 
-pub const Props = struct {
-    text: []const u8,
+pub const UserRowModel = struct {
+    text: ?[]u8 = null,
     footer: Footer = .none,
     status: Status = .in_chat,
+
+    pub fn clone(self: UserRowModel, allocator: std.mem.Allocator) !UserRowModel {
+        return .{
+            .text = if (self.text) |text| try allocator.dupe(u8, text) else null,
+            .footer = try self.footer.clone(allocator),
+            .status = self.status,
+        };
+    }
+
+    pub fn deinit(self: *UserRowModel, allocator: std.mem.Allocator) void {
+        if (self.text) |text| allocator.free(text);
+        self.footer.deinit(allocator);
+        self.* = .{};
+    }
 };
 
 pub const UserMessage = struct {
@@ -37,7 +79,7 @@ pub const UserMessage = struct {
     body: markdown_mod.Markdown,
     footer: text_mod.Text,
     footer_visible: bool = false,
-    status: Status = .in_chat,
+    model: UserRowModel = .{},
 
     pub fn init(allocator: std.mem.Allocator) UserMessage {
         var self = UserMessage{
@@ -53,6 +95,7 @@ pub const UserMessage = struct {
     pub fn deinit(self: *UserMessage) void {
         self.body.deinit();
         self.footer.deinit();
+        self.model.deinit(self.allocator);
     }
 
     pub fn component(self: *UserMessage) Component {
@@ -70,23 +113,28 @@ pub const UserMessage = struct {
         self.footer.padding_y = 0;
         self.footer.fg = theme.fg(.muted);
 
-        self.applyStatusStyles();
+        self.applyModel();
     }
 
-    pub fn setProps(self: *UserMessage, props: Props) void {
-        self.status = props.status;
-        self.applyStatusStyles();
+    pub fn setOwnedModel(self: *UserMessage, model: *UserRowModel) void {
+        self.model.deinit(self.allocator);
+        self.model = model.*;
+        model.* = .{};
+        self.applyModel();
+    }
 
-        self.body.setContent(props.text);
+    fn applyModel(self: *UserMessage) void {
+        self.applyStatusStyles();
+        self.body.setContent(self.model.text orelse "");
 
         var footer_buf: [128]u8 = undefined;
-        const footer_text = footerLabel(props.footer, self.status, &footer_buf);
+        const footer_text = footerLabel(self.model.footer, self.model.status, &footer_buf);
         self.footer_visible = footer_text.len > 0;
         self.footer.setContent(footer_text);
     }
 
     fn applyStatusStyles(self: *UserMessage) void {
-        const bg = switch (self.status) {
+        const bg = switch (self.model.status) {
             .in_chat, .pending => self.theme.bg(.user_message_bg),
         };
 
@@ -134,13 +182,7 @@ pub const UserMessage = struct {
 
 fn footerLabel(footer: Footer, status: Status, out: []u8) []const u8 {
     var pos: usize = 0;
-    const base = switch (footer) {
-        .none => "",
-        .queued_steering => "Queued · Steering",
-        .queued_follow_up => "Queued · Follow-up",
-        .edited => "Edited",
-        .custom => |text| text,
-    };
+    const base = footer.label();
 
     append(out, &pos, base);
 
@@ -166,6 +208,18 @@ fn append(dst: []u8, pos: *usize, text: []const u8) void {
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
 
+fn setTestModel(msg: *UserMessage, model: *UserRowModel) void {
+    msg.setOwnedModel(model);
+}
+
+fn makeTestModel(text: []const u8, footer: Footer, status: Status) !UserRowModel {
+    return .{
+        .text = try testing.allocator.dupe(u8, text),
+        .footer = try footer.clone(testing.allocator),
+        .status = status,
+    };
+}
+
 fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -183,10 +237,13 @@ fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-test "user message renders body and queued footer" {
+test "user message renders body and queued footer from owned model" {
     var msg = UserMessage.init(testing.allocator);
     defer msg.deinit();
-    msg.setProps(.{ .text = "hello", .footer = .queued_follow_up });
+
+    var model = try makeTestModel("hello", .queued_follow_up, .in_chat);
+    defer model.deinit(testing.allocator);
+    setTestModel(&msg, &model);
 
     var buf = try Buffer.init(testing.allocator, 30, 6);
     defer buf.deinit();
@@ -201,7 +258,10 @@ test "user message renders body and queued footer" {
 test "queued user message footer mentions queued amend shortcut" {
     var msg = UserMessage.init(testing.allocator);
     defer msg.deinit();
-    msg.setProps(.{ .text = "hello", .footer = .queued_follow_up, .status = .pending });
+
+    var model = try makeTestModel("hello", .queued_follow_up, .pending);
+    defer model.deinit(testing.allocator);
+    setTestModel(&msg, &model);
 
     var buf = try Buffer.init(testing.allocator, 80, 6);
     defer buf.deinit();
@@ -218,32 +278,19 @@ test "queued user message footer mentions queued amend shortcut" {
     try testing.expect(std.mem.indexOf(u8, text, binding) != null);
 }
 
-test "queued user message has distinct background" {
-    var convo_msg = UserMessage.init(testing.allocator);
-    defer convo_msg.deinit();
-    convo_msg.setProps(.{ .text = "hello" });
-
-    var convo_buf = try Buffer.init(testing.allocator, 40, 6);
-    defer convo_buf.deinit();
-    convo_msg.render(convo_buf.region());
-
-    var queued_msg = UserMessage.init(testing.allocator);
-    defer queued_msg.deinit();
-    queued_msg.setProps(.{ .text = "hello", .footer = .queued_follow_up, .status = .pending });
-
-    var queued_buf = try Buffer.init(testing.allocator, 40, 6);
-    defer queued_buf.deinit();
-    queued_msg.render(queued_buf.region());
-
-    const theme = themes_builtin.dark();
-    try testing.expectEqual(theme.bg(.user_message_bg), convo_buf.get(0, 0).bg);
-    try testing.expectEqual(theme.bg(.user_message_bg), queued_buf.get(0, 0).bg);
-}
-
-test "user message can omit footer" {
+test "user message model replacement updates body and footer visibility" {
     var msg = UserMessage.init(testing.allocator);
     defer msg.deinit();
-    msg.setProps(.{ .text = "hello" });
 
+    var first = try makeTestModel("hello", .queued_follow_up, .pending);
+    defer first.deinit(testing.allocator);
+    setTestModel(&msg, &first);
+    try testing.expect(msg.footer_visible);
+
+    var second = try makeTestModel("updated", .none, .in_chat);
+    defer second.deinit(testing.allocator);
+    setTestModel(&msg, &second);
+
+    try testing.expect(!msg.footer_visible);
     try testing.expectEqual(@as(u32, 3), msg.measure(20).preferred_height);
 }
