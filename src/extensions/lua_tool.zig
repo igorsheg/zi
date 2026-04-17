@@ -27,7 +27,6 @@ const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const agent_protocol = @import("../agent/protocol.zig");
 const abort_signal_mod = @import("../abort_signal.zig");
-const lua_renderer = @import("lua_renderer.zig");
 const api = @import("api.zig");
 const context_mod = @import("context.zig");
 const spawn_mod = @import("../spawn/spawn.zig");
@@ -104,19 +103,15 @@ fn execute(
     tctx.runner.assertOnLuaThread();
 
     // Stash per-call state so host functions invoked from inside
-    // the Lua handler can forward abort, partial updates, and
-    // precomputed renders for the right tool. Cleared on return.
+    // the Lua handler can forward abort and partial updates for the
+    // right tool. Cleared on return.
     tctx.runner.current_signal = signal;
     tctx.runner.current_update_callback = on_update;
     tctx.runner.current_update_ctx = update_ctx;
-    tctx.runner.current_tool_call_id = tool_call_id;
-    tctx.runner.current_tool_name = tctx.name;
     defer {
         tctx.runner.current_signal = null;
         tctx.runner.current_update_callback = null;
         tctx.runner.current_update_ctx = null;
-        tctx.runner.current_tool_call_id = null;
-        tctx.runner.current_tool_name = null;
     }
 
     const result = runHandler(allocator, state, tctx.runner, tctx.lua_ref, args) catch |err| {
@@ -124,64 +119,9 @@ fn execute(
         return errorResult(allocator, @errorName(err));
     };
 
-    // Precompute the FINAL render now, while we're still on the
-    // agent thread (single owner of `lua_state`). The TUI thread
-    // will pick this up via
-    // `runner.takePendingRender(tool_call_id)` when it processes
-    // `tool_execution_end`. Without this, the final tree wouldn't
-    // appear until the next time something invalidated the cache.
-    precomputeRender(tctx.runner, tctx.name, tool_call_id, args, result);
-
+    _ = tool_call_id;
+    _ = tctx.name;
     return result;
-}
-
-/// Run the Lua render hook for `tool_name` against `(args, result)`
-/// and stash the resulting `LuaRenderState` in the runner's
-/// cross-thread inbox keyed by `tool_call_id`. No-op if the tool
-/// has no render hook or the dispatch fails. Caller must be on
-/// the agent thread (the lua_state owner).
-fn precomputeRender(
-    runner: *runner_mod.ExtensionRunner,
-    tool_name: []const u8,
-    tool_call_id: []const u8,
-    args: std.json.Value,
-    result: AgentToolResult,
-) void {
-    precomputeRenderOn(runner, tool_name, tool_call_id, args, result, null);
-}
-
-/// Same as `precomputeRender`, but `current_L` lets the caller pin
-/// the *currently running* lua_State. Required when called from a
-/// host C function that's executing on a coroutine (e.g. ctx.update
-/// fired from inside zi.spawn's event trampoline).
-fn precomputeRenderOn(
-    runner: *runner_mod.ExtensionRunner,
-    tool_name: []const u8,
-    tool_call_id: []const u8,
-    args: std.json.Value,
-    result: AgentToolResult,
-    current_L: ?*c.lua_State,
-) void {
-    const tool = runner.tool_registry.get(tool_name) orelse return;
-    if (tool.render_result_ref == null) return;
-
-    const state = lua_renderer.dispatchRenderResultFromResultOn(
-        runner.allocator,
-        runner,
-        .{
-            .tool_name = tool_name,
-            .args = args,
-            .result = result,
-            .width = 80, // TODO: thread real width through; spans are width-agnostic anyway
-            .is_error = result.is_error,
-        },
-        current_L,
-    ) orelse return;
-
-    runner.stashPendingRender(tool_call_id, .{
-        .state = @ptrCast(state),
-        .deinit = &lua_renderer.LuaRenderState.deinitOpaque,
-    });
 }
 
 fn runHandler(
@@ -493,21 +433,6 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
     // needs synchronously, so when this returns the arena can
     // safely free everything.
     cb(partial, runner.current_update_ctx);
-
-    // Precompute the render NOW on this same thread (still on the
-    // agent thread, the sole lua_state owner) so the TUI can pick
-    // up the fresh tree without needing to touch Lua at all. The
-    // TUI thread reads from `runner.pending_renders` during
-    // `toolSetPartialResult` and never reaches into lua_state.
-    if (runner.current_tool_call_id) |id| {
-        if (runner.current_tool_name) |name| {
-            // Pass our `L` (the currently executing thread) so the
-            // render coroutine is allocated off the right state. We
-            // may be running inside `zi.spawn`'s event trampoline,
-            // which means `L` is the tool's coroutine, not main.
-            precomputeRenderOn(runner, name, id, .null, partial, L);
-        }
-    }
 
     return 0;
 }

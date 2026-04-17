@@ -14,8 +14,7 @@ const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const display_wrap_mod = @import("display_wrap.zig");
-const lua_renderer_mod = @import("../extensions/lua_renderer.zig");
-const runner_mod = @import("../extensions/runner.zig");
+const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
@@ -128,6 +127,8 @@ pub const DeinitFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) v
 pub const TranscriptItem = struct {
     renderable: TranscriptRenderable,
     kind: ItemKind = .generic,
+    snapshot_item_id: ?conversation_snapshot_mod.ItemId = null,
+    snapshot_semantic_version: ?conversation_snapshot_mod.SemanticVersion = null,
     /// For tool_execution: route updates by ID via pending_tools HashMap.
     tool_call_id: ?[]const u8 = null,
     /// Owned cleanup context. Called on item removal/transcript clear.
@@ -477,25 +478,10 @@ pub const ToolExecution = struct {
     measured_content_width: u32 = 0,
     measured_result_height: u32 = 0,
 
-    /// Optional pre-computed span tree from a Lua render_result hook.
-    /// When present, `renderResult` paints from these spans instead
-    /// of the zig-native vtable or the built-in plain-text renderer.
-    /// Computed by `Transcript.lua_renderer_ctx` dispatch at
-    /// `setFinalResult`/`setPartialResult`/`setArgs` time.
-    lua_render_state: ?*lua_renderer_mod.LuaRenderState = null,
-    /// Lua render states are produced on the agent thread using the
-    /// runner's allocator, then consumed and eventually retired on the
-    /// TUI thread. Keep the typed deinit callback + original allocator
-    /// so teardown happens against the allocation owner, not the
-    /// transcript's allocator.
-    lua_render_deinit: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
-    lua_render_allocator: ?std.mem.Allocator = null,
-
     pub fn deinit(self: *ToolExecution) void {
         if (self.renderer.deinit_state) |deinit_fn| {
             if (self.renderer_state) |state| deinit_fn(state, self.allocator);
         }
-        self.invalidateLuaRender();
         if (self.result) |r| r.free(self.allocator);
         json_util.freeJsonValue(self.allocator, self.args);
         self.allocator.free(self.tool_name);
@@ -503,38 +489,24 @@ pub const ToolExecution = struct {
         self.allocator.destroy(self);
     }
 
-    /// Clear the cached lua render state. Called from any mutator
-    /// that invalidates what the hook would have produced.
-    fn invalidateLuaRender(self: *ToolExecution) void {
-        if (self.lua_render_state) |s| {
-            const deinit_fn = self.lua_render_deinit orelse lua_renderer_mod.LuaRenderState.deinitOpaque;
-            const alloc = self.lua_render_allocator orelse self.allocator;
-            deinit_fn(@ptrCast(s), alloc);
-            self.lua_render_state = null;
-            self.lua_render_deinit = null;
-            self.lua_render_allocator = null;
-        }
-    }
-
     fn deinitItem(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *ToolExecution = @ptrCast(@alignCast(ctx));
         self.deinit();
     }
 
-    /// Set args (from tool_call_streaming or tool_start). Deep-clones the value.
+    /// Set args from snapshot-projected tool execution state. Deep-clones the value.
     pub fn setArgs(self: *ToolExecution, args: std.json.Value) void {
         json_util.freeJsonValue(self.allocator, self.args);
         self.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
-        self.invalidateLuaRender();
         self.notifyArgsChanged();
     }
 
-    /// Mark that execution has started (tool_start received).
+    /// Mark that execution has started in projected tool execution state.
     pub fn markExecutionStarted(self: *ToolExecution) void {
         self.execution_started = true;
     }
 
-    /// Mark that args are complete (tool_call_streaming finished).
+    /// Mark that projected tool arguments are complete.
     pub fn setArgsComplete(self: *ToolExecution) void {
         self.args_complete = true;
     }
@@ -550,25 +522,23 @@ pub const ToolExecution = struct {
         }
     }
 
-    /// Set partial result (from tool_update). Deep-clones.
+    /// Set partial result from projected tool execution state. Deep-clones.
     pub fn setPartialResult(self: *ToolExecution, result: ?AgentToolResult, is_error: bool) void {
         if (self.result) |old| old.free(self.allocator);
         self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
         self.is_error = is_error;
         self.is_partial = true;
-        self.invalidateLuaRender();
         self.measured_content_width = 0;
         self.measured_result_height = 0;
         self.notifyResultChanged();
     }
 
-    /// Set final result (from tool_end). Deep-clones.
+    /// Set final result from projected tool execution state. Deep-clones.
     pub fn setFinalResult(self: *ToolExecution, result: ?AgentToolResult, is_error: bool) void {
         if (self.result) |old| old.free(self.allocator);
         self.result = if (result) |r| (r.clone(self.allocator) catch null) else null;
         self.is_error = is_error;
         self.is_partial = false;
-        self.invalidateLuaRender();
         self.measured_content_width = 0;
         self.measured_result_height = 0;
         self.notifyResultChanged();
@@ -670,17 +640,6 @@ pub const ToolExecution = struct {
     }
 
     fn renderCall(self: *ToolExecution, region: Region) void {
-        // When a Lua render hook owns this tool, `lines[0]` of the
-        // precomputed spans is the title line (e.g. "Task <desc>").
-        // Paint it here instead of the built-in bold tool-title
-        // renderer so we don't double up.
-        if (self.lua_render_state) |s| {
-            const lines = if (self.expanded) s.expanded else s.collapsed;
-            if (lines.len > 0) {
-                self.renderSpanLine(region, 0, lines[0]);
-                return;
-            }
-        }
         if (self.renderer.render_call) |render_fn| {
             var ctx = self.makeRenderContext(region);
             render_fn(&ctx);
@@ -697,19 +656,10 @@ pub const ToolExecution = struct {
         const total_rows = self.ensureMeasuredResultHeight(region.width);
         if (skip_rows >= total_rows) return;
 
-        if (self.lua_render_state) |s| {
-            const lines = if (self.expanded) s.expanded else s.collapsed;
-            if (lines.len > 1) {
-                const first: usize = @intCast(@min(skip_rows + 1, @as(u32, @intCast(lines.len))));
-                if (first < lines.len) self.renderSpanLines(region, lines[first..]);
-            }
-            return;
-        }
-
         // pi-mono only invokes result renderers once a tool has
         // actually produced a result. Keep the same contract here so
         // pending tools do not render placeholder/malformed result
-        // states during tool_start / args streaming.
+        // states before projected args/results are complete.
         if (self.result == null) return;
 
         if (self.renderer.render_result_slice) |render_fn| {
@@ -719,41 +669,6 @@ pub const ToolExecution = struct {
         }
 
         self.renderResultPlainTextFromOffset(region, skip_rows);
-    }
-
-    /// Paint a single span-line at `row` inside `region`. Used for
-    /// both the call row (1 line) and individual result rows.
-    fn renderSpanLine(self: *ToolExecution, region: Region, row: u32, line: lua_renderer_mod.Line) void {
-        if (row >= region.height) return;
-        var col: u32 = 0;
-        for (line) |span| {
-            if (col >= region.width) break;
-            const fg = if (span.fg) |role| self.theme.fg(role) else Color.default;
-            const bg = if (span.bg) |role| self.theme.bg(role) else Color.default;
-            const attrs = cell_mod.Attributes{
-                .bold = span.bold,
-                .dim = span.dim,
-                .italic = span.italic,
-                .underline = span.underline,
-            };
-            const written = region.writeStr(col, row, span.text, fg, bg, attrs);
-            col += written;
-        }
-    }
-
-    /// Paint pre-computed styled lines into the region. Used by
-    /// Lua renderers; strings and roles are arena-owned by
-    /// `lua_render_state`. Each span resolves its theme role to
-    /// concrete colors at paint time so theme swaps work without
-    /// re-dispatching the Lua hook.
-    fn renderSpanLines(self: *ToolExecution, region: Region, lines: []const lua_renderer_mod.Line) void {
-        const max_h = region.height;
-        var row: u32 = 0;
-        for (lines) |line| {
-            if (row >= max_h) break;
-            self.renderSpanLine(region, row, line);
-            row += 1;
-        }
     }
 
     fn renderResultPlainTextFromOffset(self: *ToolExecution, region: Region, skip_rows: u32) void {
@@ -785,12 +700,6 @@ pub const ToolExecution = struct {
     }
 
     fn measureResult(self: *ToolExecution, width: u32) u32 {
-        if (self.lua_render_state) |s| {
-            // lines[0] is painted in the call row; the rest is
-            // the result region's height.
-            const lines = if (self.expanded) s.expanded else s.collapsed;
-            return if (lines.len > 0) @intCast(lines.len - 1) else 0;
-        }
         if (self.result == null) return 0;
         if (self.renderer.measure_result) |measure_fn| {
             var ctx = self.makeMeasureContext(width);
@@ -937,6 +846,8 @@ pub const Transcript = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
     /// Fast lookup: tool_call_id → item index for routing updates.
     pending_tools: std.StringHashMapUnmanaged(usize) = .{},
+    /// Fast lookup: snapshot item_id → item index for retained reconciliation.
+    snapshot_items: std.AutoHashMapUnmanaged(conversation_snapshot_mod.ItemId, usize) = .empty,
     /// Current assistant message item being appended to (index into items).
     current_assistant_idx: ?usize = null,
     layout: TranscriptLayout,
@@ -951,12 +862,6 @@ pub const Transcript = struct {
 
     selection: SelectionState = .inactive,
 
-    /// Optional runner pointer used to dispatch Lua `render_result`
-    /// hooks at tool_execution_end time. When null (tests, headless
-    /// modes, no-extensions build), Lua renderers are never invoked
-    /// and the transcript falls back to its default formatting.
-    lua_runner: ?*runner_mod.ExtensionRunner = null,
-
     pub fn init(allocator: std.mem.Allocator) Transcript {
         return .{
             .allocator = allocator,
@@ -970,6 +875,7 @@ pub const Transcript = struct {
         for (self.items.items) |*item| item.deinit(self.allocator);
         self.items.deinit(self.allocator);
         self.pending_tools.deinit(self.allocator);
+        self.snapshot_items.deinit(self.allocator);
         self.layout.deinit();
     }
 
@@ -1002,6 +908,14 @@ pub const Transcript = struct {
         self.items.append(self.allocator, item) catch return false;
         errdefer self.items.items.len -= 1;
         self.layout.appendItem() catch return false;
+        const idx = self.items.items.len - 1;
+        if (item.snapshot_item_id) |item_id| {
+            self.snapshot_items.put(self.allocator, item_id, idx) catch {
+                _ = self.items.pop();
+                self.layout.removeItem(idx);
+                return false;
+            };
+        }
         self.noteAppendedItem();
         return true;
     }
@@ -1054,13 +968,13 @@ pub const Transcript = struct {
         if (item.tool_call_id) |id| {
             _ = self.pending_tools.remove(id);
         }
+        if (item.snapshot_item_id) |item_id| {
+            _ = self.snapshot_items.remove(item_id);
+        }
         item.deinit(self.allocator);
         _ = self.items.orderedRemove(index);
         self.layout.removeItem(index);
-        var iter = self.pending_tools.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.* > index) entry.value_ptr.* -= 1;
-        }
+        self.reindexMaps(index);
         if (self.current_assistant_idx) |idx| {
             if (idx == index) {
                 self.current_assistant_idx = null;
@@ -1102,6 +1016,7 @@ pub const Transcript = struct {
         for (self.items.items) |*item| item.deinit(self.allocator);
         self.items.items.len = 0;
         self.pending_tools.clearRetainingCapacity();
+        self.snapshot_items.clearRetainingCapacity();
         self.current_assistant_idx = null;
         self.last_visible_height = 0;
         self.layout.clear();
@@ -1238,7 +1153,7 @@ pub const Transcript = struct {
         return @ptrCast(@alignCast(item.deinit_ctx.?));
     }
 
-    /// Set args on a tool execution (from tool_call_streaming or tool_start).
+    /// Set args on a projected tool execution.
     pub fn toolSetArgs(self: *Transcript, tool_call_id: []const u8, args: std.json.Value) void {
         const idx = self.pending_tools.get(tool_call_id) orelse return;
         const te = self.getToolExecution(tool_call_id) orelse return;
@@ -1267,10 +1182,6 @@ pub const Transcript = struct {
         const idx = self.pending_tools.get(tool_call_id) orelse return;
         const te = self.getToolExecution(tool_call_id) orelse return;
         te.setPartialResult(result, is_error);
-        // Re-dispatch the render hook so the tree view reflects
-        // the new partial state. Tools without a render hook
-        // no-op gracefully.
-        self.refreshLuaRender(te);
         self.noteItemMutated(idx);
     }
 
@@ -1280,32 +1191,127 @@ pub const Transcript = struct {
         const te = self.getToolExecution(tool_call_id) orelse return;
         te.setFinalResult(result, is_error);
         _ = self.pending_tools.remove(tool_call_id);
-        // Kick off the Lua render_result hook (if any) now that we
-        // have a final result in hand. `refreshLuaRender` is a
-        // no-op for tools without a registered render hook.
-        self.refreshLuaRender(te);
         self.noteItemMutated(idx);
     }
 
-    /// Pick up any precomputed render that the agent thread
-    /// stashed for this tool call and assign it to the
-    /// ToolExecution. Pure data move — does not touch the Lua
-    /// state, so this is safe to call from the TUI thread without
-    /// reaching into `lua_state` (which the agent thread owns since
-    /// zi-wub.5/.6).
-    ///
-    /// The render itself is computed on the agent thread inside
-    /// `lua_tool.precomputeRender`, which fires once on each
-    /// `ctx.update(...)` call and once on tool completion. See
-    /// `runner.zig` `pending_renders` for the cross-thread inbox
-    /// rationale.
-    fn refreshLuaRender(self: *Transcript, te: *ToolExecution) void {
-        const runner = self.lua_runner orelse return;
-        const pending = runner.takePendingRender(te.tool_call_id) orelse return;
-        te.invalidateLuaRender();
-        te.lua_render_state = @ptrCast(@alignCast(pending.state));
-        te.lua_render_deinit = pending.deinit;
-        te.lua_render_allocator = runner.allocator;
+    fn reindexMaps(self: *Transcript, start_index: usize) void {
+        var tool_iter = self.pending_tools.iterator();
+        while (tool_iter.next()) |entry| {
+            if (entry.value_ptr.* >= start_index) {
+                const tool_index = self.findToolExecutionIndex(entry.key_ptr.*) orelse continue;
+                entry.value_ptr.* = tool_index;
+            }
+        }
+        var snapshot_iter = self.snapshot_items.iterator();
+        while (snapshot_iter.next()) |entry| {
+            if (entry.value_ptr.* >= start_index) {
+                const snapshot_index = self.findSnapshotItemIndex(entry.key_ptr.*) orelse continue;
+                entry.value_ptr.* = snapshot_index;
+            }
+        }
+    }
+
+    fn findToolExecutionIndex(self: *Transcript, tool_call_id: []const u8) ?usize {
+        for (self.items.items, 0..) |item, idx| {
+            if (item.tool_call_id) |candidate| {
+                if (std.mem.eql(u8, candidate, tool_call_id)) return idx;
+            }
+        }
+        return null;
+    }
+
+    pub fn findSnapshotItemIndex(self: *Transcript, item_id: conversation_snapshot_mod.ItemId) ?usize {
+        const idx = self.snapshot_items.get(item_id) orelse return null;
+        if (idx >= self.items.items.len) return null;
+        const item = self.items.items[idx];
+        if (item.snapshot_item_id != null and item.snapshot_item_id.? == item_id) return idx;
+        for (self.items.items, 0..) |candidate, search_idx| {
+            if (candidate.snapshot_item_id != null and candidate.snapshot_item_id.? == item_id) return search_idx;
+        }
+        return null;
+    }
+
+    pub fn insertItemAt(self: *Transcript, index: usize, item: TranscriptItem) bool {
+        self.deactivateCurrentAssistantThinking();
+        self.current_assistant_idx = null;
+        const insert_index = @min(index, self.items.items.len);
+        self.items.insert(self.allocator, insert_index, item) catch return false;
+        errdefer _ = self.items.orderedRemove(insert_index);
+        self.layout.items.insert(self.layout.allocator, insert_index, .{}) catch {
+            _ = self.items.orderedRemove(insert_index);
+            return false;
+        };
+        self.layout.heights.rebuild(self.layout.items.items) catch {
+            _ = self.layout.items.orderedRemove(insert_index);
+            _ = self.items.orderedRemove(insert_index);
+            return false;
+        };
+        self.layout.dirty_count += 1;
+        if (item.snapshot_item_id) |item_id| {
+            self.snapshot_items.put(self.allocator, item_id, insert_index) catch {
+                _ = self.layout.items.orderedRemove(insert_index);
+                self.layout.heights.rebuild(self.layout.items.items) catch {};
+                if (self.layout.dirty_count > 0) self.layout.dirty_count -= 1;
+                _ = self.items.orderedRemove(insert_index);
+                return false;
+            };
+        }
+        self.reindexMaps(insert_index);
+        if (item.tool_call_id) |tool_call_id| {
+            self.pending_tools.put(self.allocator, tool_call_id, insert_index) catch {};
+        }
+        self.remeasureItem(insert_index);
+        self.syncScrollAfterLayout();
+        return true;
+    }
+
+    pub fn replaceItemAt(self: *Transcript, index: usize, item: TranscriptItem) bool {
+        if (index >= self.items.items.len) return false;
+        self.deactivateCurrentAssistantThinking();
+        self.current_assistant_idx = null;
+        var old_item = self.items.items[index];
+        if (old_item.tool_call_id) |id| _ = self.pending_tools.remove(id);
+        if (old_item.snapshot_item_id) |item_id| _ = self.snapshot_items.remove(item_id);
+        self.items.items[index] = item;
+        if (item.snapshot_item_id) |item_id| {
+            self.snapshot_items.put(self.allocator, item_id, index) catch {
+                self.items.items[index] = old_item;
+                if (old_item.tool_call_id) |id| self.pending_tools.put(self.allocator, id, index) catch {};
+                if (old_item.snapshot_item_id) |old_item_id| self.snapshot_items.put(self.allocator, old_item_id, index) catch {};
+                return false;
+            };
+        }
+        if (item.tool_call_id) |tool_call_id| self.pending_tools.put(self.allocator, tool_call_id, index) catch {};
+        old_item.deinit(self.allocator);
+        self.noteItemMutated(index);
+        return true;
+    }
+
+    pub fn moveItem(self: *Transcript, from_index: usize, to_index: usize) void {
+        if (from_index >= self.items.items.len or to_index >= self.items.items.len or from_index == to_index) return;
+        const item = self.items.orderedRemove(from_index);
+        self.items.insert(self.allocator, to_index, item) catch {
+            self.items.insert(self.allocator, from_index, item) catch unreachable;
+            return;
+        };
+        const layout_item = self.layout.items.orderedRemove(from_index);
+        self.layout.items.insert(self.layout.allocator, to_index, layout_item) catch {
+            _ = self.layout.items.orderedRemove(to_index);
+            self.layout.items.insert(self.layout.allocator, from_index, layout_item) catch unreachable;
+            return;
+        };
+        self.layout.heights.rebuild(self.layout.items.items) catch return;
+        self.reindexMaps(@min(from_index, to_index));
+        self.clampScroll();
+    }
+
+    pub fn snapshotItemSemanticVersionAt(self: *Transcript, index: usize) ?conversation_snapshot_mod.SemanticVersion {
+        if (index >= self.items.items.len) return null;
+        return self.items.items[index].snapshot_semantic_version;
+    }
+
+    pub fn isFollowingBottom(self: *Transcript) bool {
+        return self.layout.follow_bottom;
     }
 
     /// Clear any pending tool-result routing state.

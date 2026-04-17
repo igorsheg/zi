@@ -243,7 +243,7 @@ test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
     var q = try UiEventQueue.init(std.testing.allocator);
     defer q.deinit();
 
-    q.push(.{ .message_start_user = .{ .text = try std.testing.allocator.dupe(u8, "hello") } });
+    q.push(.{ .request_worker_finished = {} });
 
     var pfd = [1]posix.pollfd{.{
         .fd = q.wakeReadFd().?,
@@ -257,7 +257,7 @@ test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
     const count = q.drainInto(&out);
     try std.testing.expectEqual(@as(usize, 1), count);
     switch (out[0]) {
-        .message_start_user => {},
+        .request_worker_finished => {},
         else => return error.UnexpectedResult,
     }
     out[0].deinit(std.testing.allocator);
@@ -590,12 +590,6 @@ pub const Interactive = struct {
             .settings_manager = settings_manager,
             .model_catalog = if (ca.model_registry) |mr| mr.getAll() else &.{},
         };
-        // Wire the extension runner into the transcript so
-        // tool_execution_end can dispatch Lua render_result hooks
-        // for tools that registered one. Null in tests or
-        // extensionless modes; the transcript no-ops gracefully.
-        self.transcript.lua_runner = ca.extensionRunner();
-
         self.editor.setTheme(theme);
         self.loader.shimmer_edge_fg = theme.fg(.muted);
         self.loader.message_fg = theme.fg(.dim);
@@ -630,7 +624,6 @@ pub const Interactive = struct {
         // transport, and join.
         if (self.agent_thread) |t| {
             if (self.is_streaming) self.ca.agent.abort();
-            self.transcript.lua_runner = null;
             self.enqueueAgentShutdown();
             self.request_queue.close();
             t.join();
@@ -1085,17 +1078,8 @@ pub const Interactive = struct {
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {
-            .message_start_assistant,
-            .message_start_user,
-            .assistant_text_delta,
-            .assistant_thinking_delta,
-            .tool_call_streaming,
-            .tool_start,
-            .tool_update,
             .tool_end => {
-                // Projection refactor: live transcript mutation no longer
-                // consumes delta UiEvents. Keep these tags inert until the
-                // dead variants are deleted from UiEvent entirely.
+                // Tool finalization still has banner/status side effects only.
             },
             .error_message => |e| {
                 self.status_text.setContent(e.message);
@@ -1196,8 +1180,11 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .conversation_snapshot => |snapshot| {
-                self.rebuildConversationFromSnapshot(snapshot);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                const was_following_bottom = self.transcript.isFollowingBottom();
+                self.reconcileConversationFromSnapshot(snapshot);
+                if (was_following_bottom) {
+                    self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                }
                 self.tui.dirty = true;
             },
             .session_resumed => |r| {
@@ -1296,11 +1283,11 @@ pub const Interactive = struct {
         );
     }
 
-    fn rebuildConversationFromSnapshot(
+    fn reconcileConversationFromSnapshot(
         self: *Interactive,
         snapshot: conversation_snapshot_mod.ConversationSnapshot,
     ) void {
-        conversation_projection_mod.rebuildFromSnapshot(
+        conversation_projection_mod.reconcileFromSnapshot(
             &self.transcript,
             self.active_editor,
             self.resolver,

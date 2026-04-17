@@ -92,15 +92,6 @@ pub const ExtensionRunnerRef = struct {
     current: ?*ExtensionRunner = null,
 };
 
-/// Cross-thread render slot value. The state pointer is owned
-/// (caller of `takePendingRender` must invoke `deinit`). Stored
-/// as `*anyopaque` to keep `runner.zig` from importing
-/// `lua_renderer.zig` (which already imports `runner.zig`).
-pub const PendingRender = struct {
-    state: *anyopaque,
-    deinit: *const fn (*anyopaque, std.mem.Allocator) void,
-};
-
 pub const SpawnRequest = struct {
     task: []const u8,
     model: ?[]const u8 = null,
@@ -219,17 +210,6 @@ pub const ExtensionRunner = struct {
     /// session bootstrap; static for the runner generation.
     cwd: []const u8 = ".",
 
-    /// Tool call id of the currently executing Lua tool. Stashed
-    /// by `lua_tool.execute` so the `ctx.update` host function
-    /// can route precomputed renders into the right
-    /// `pending_renders` slot. Null when no Lua tool is running.
-    current_tool_call_id: ?[]const u8 = null,
-
-    /// Tool name of the currently executing Lua tool. Stashed
-    /// alongside `current_tool_call_id` so render dispatch can
-    /// look up `tool_registry.get(name)` for the render hook ref.
-    current_tool_name: ?[]const u8 = null,
-
     /// Minimal scheduler state for one in-flight yieldable host call.
     ///
     /// Phase zi-0br / smallest zi-5w4 slice: only Lua tool execution may
@@ -243,29 +223,6 @@ pub const ExtensionRunner = struct {
     current_spawn_result: ?SpawnOutcome = null,
 
     load_context: ?LoadContext = null,
-
-    /// Cross-thread inbox for precomputed render spans, keyed by
-    /// `tool_call_id`.
-    ///
-    /// Why this exists: render hooks for Lua tools used to fire
-    /// from the TUI render path. Back then a runner-level lua mutex
-    /// existed and the TUI thread had to acquire it on every paint;
-    /// long-running tools (Task with a multi-second child process)
-    /// would freeze the TUI for their entire lifetime. zi-wub.5/.6
-    /// removed the lua mutex entirely and made the agent thread the
-    /// single owner of `lua_state`. The agent thread (which is
-    /// already inside Lua and already has the partial result in
-    /// hand) now runs the render hook itself and stashes the result
-    /// here. The TUI thread reads from this map under a small fast
-    /// mutex during `toolSetPartialResult` / `toolSetFinalResult`.
-    /// No Lua state access required from the TUI thread.
-    ///
-    /// Pointers are `*anyopaque` to avoid a circular import on
-    /// `lua_renderer.LuaRenderState`. Each entry carries a deinit
-    /// fn pointer so the consumer can release the right type
-    /// without runner.zig knowing the layout.
-    pending_renders: std.StringHashMapUnmanaged(PendingRender) = .empty,
-    pending_renders_mutex: std.Thread.Mutex = .{},
 
     /// Identity of the thread that owns the `lua_state`.
     ///
@@ -284,10 +241,7 @@ pub const ExtensionRunner = struct {
     ///     into Lua. That thread "owns" the lua_State for the
     ///     entire runner generation.
     ///
-    ///   - the TUI thread NEVER calls Lua. When it needs render
-    ///     output, it reads from `pending_renders` — a typed
-    ///     cross-thread inbox populated by the agent thread on
-    ///     each tool update.
+    ///   - the TUI thread NEVER calls Lua.
     ///
     ///   - every Lua entry point (lua_tool.execute, event_bridge
     ///     dispatch, before/afterToolCall hooks, render hook
@@ -442,47 +396,6 @@ pub const ExtensionRunner = struct {
         }
     }
 
-    /// Store a precomputed render for `tool_call_id`. Replaces any
-    /// pending entry for the same id (the new render supersedes
-    /// the old one) and frees the old state via its deinit fn.
-    /// Called from the agent thread, which is the single owner of
-    /// `lua_state` (zi-wub.5/.6 — no lua mutex; ownership is enforced
-    /// by `bindLuaOwnerThread`).
-    pub fn stashPendingRender(
-        self: *ExtensionRunner,
-        tool_call_id: []const u8,
-        render: PendingRender,
-    ) void {
-        self.pending_renders_mutex.lock();
-        defer self.pending_renders_mutex.unlock();
-
-        if (self.pending_renders.fetchRemove(tool_call_id)) |old| {
-            old.value.deinit(old.value.state, self.allocator);
-            self.allocator.free(old.key);
-        }
-        const key = self.allocator.dupe(u8, tool_call_id) catch return;
-        self.pending_renders.put(self.allocator, key, render) catch {
-            self.allocator.free(key);
-            render.deinit(render.state, self.allocator);
-        };
-    }
-
-    /// Atomically remove and return the pending render for
-    /// `tool_call_id`. Caller takes ownership and must call the
-    /// returned deinit fn when done. Returns null if no render
-    /// is queued for that id.
-    pub fn takePendingRender(
-        self: *ExtensionRunner,
-        tool_call_id: []const u8,
-    ) ?PendingRender {
-        self.pending_renders_mutex.lock();
-        defer self.pending_renders_mutex.unlock();
-
-        const entry = self.pending_renders.fetchRemove(tool_call_id) orelse return null;
-        self.allocator.free(entry.key);
-        return entry.value;
-    }
-
     pub fn deinit(self: *ExtensionRunner) void {
         // Tear down in REVERSE construction order. The provider
         // queue holds Lua registry refs that the lua_state (when
@@ -492,12 +405,6 @@ pub const ExtensionRunner = struct {
         // memory safety. Order matters only when v2 adds tool ctx
         // wrappers that hold zig pointers into runner state; D9
         // will revisit this.
-        var prit = self.pending_renders.iterator();
-        while (prit.next()) |kv| {
-            kv.value_ptr.deinit(kv.value_ptr.state, self.allocator);
-            self.allocator.free(kv.key_ptr.*);
-        }
-        self.pending_renders.deinit(self.allocator);
         self.provider_queue.deinit();
         self.command_registry.deinit();
         self.event_registry.deinit();

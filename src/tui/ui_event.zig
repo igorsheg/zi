@@ -1,6 +1,5 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const json_util = @import("../ai/json_util.zig");
 const agent_root = @import("../agent/root.zig");
 const agent_protocol = agent_root.protocol;
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
@@ -13,35 +12,8 @@ const RunOutcome = session_controller_mod.RunOutcome;
 /// pushing to the mailbox-backed event queue, ensuring no borrowed
 /// pointers cross the thread boundary.
 pub const UiEvent = union(enum) {
-    // --- message lifecycle ---
-    message_start_assistant: void,
-    message_start_user: struct { text: []u8 },
-
-    // --- streaming content ---
-    assistant_text_delta: struct {
-        content_index: usize,
-        delta: []u8,
-    },
-    assistant_thinking_delta: struct {
-        content_index: usize,
-        delta: []u8,
-    },
-
     // --- errors ---
     error_message: struct { message: []u8 },
-
-    // --- tool call streaming (from assistant message content, before execution) ---
-    // Emitted both for in-progress deltas (`is_complete = false`) and
-    // the final toolcall_end (`is_complete = true`). The transcript
-    // only marks args as "complete" (which freezes the renderer cache)
-    // on the terminal event; intermediate events keep args mutable so
-    // incremental parses can overwrite them as the model types.
-    tool_call_streaming: struct {
-        tool_call_id: []u8,
-        tool_name: []u8,
-        args: std.json.Value,
-        is_complete: bool,
-    },
 
     // --- assistant message finalization ---
     message_end_assistant: struct {
@@ -51,16 +23,6 @@ pub const UiEvent = union(enum) {
     },
 
     // --- tool execution lifecycle ---
-    tool_start: struct {
-        tool_call_id: []u8,
-        tool_name: []u8,
-        args: std.json.Value,
-    },
-    tool_update: struct {
-        tool_call_id: []u8,
-        result: ?AgentToolResult,
-        is_error: bool,
-    },
     tool_end: struct {
         tool_call_id: []u8,
         result: ?AgentToolResult,
@@ -171,25 +133,9 @@ pub const UiEvent = union(enum) {
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .assistant_text_delta => |d| allocator.free(d.delta),
-            .assistant_thinking_delta => |d| allocator.free(d.delta),
             .error_message => |e| allocator.free(e.message),
-            .tool_call_streaming => |t| {
-                allocator.free(t.tool_call_id);
-                allocator.free(t.tool_name);
-                json_util.freeJsonValue(allocator, t.args);
-            },
             .message_end_assistant => |m| {
                 if (m.error_message) |msg| allocator.free(msg);
-            },
-            .tool_start => |t| {
-                allocator.free(t.tool_call_id);
-                allocator.free(t.tool_name);
-                json_util.freeJsonValue(allocator, t.args);
-            },
-            .tool_update => |t| {
-                allocator.free(t.tool_call_id);
-                if (t.result) |r| r.free(allocator);
             },
             .tool_end => |t| {
                 allocator.free(t.tool_call_id);
@@ -204,7 +150,6 @@ pub const UiEvent = union(enum) {
             .retry_end => |r| {
                 if (r.final_error) |msg| allocator.free(msg);
             },
-            .message_start_user => |u| allocator.free(u.text),
             .queue_snapshot => |*q| q.deinit(allocator),
             .conversation_snapshot => |*s| s.deinit(allocator),
             .session_resumed => |s| {
@@ -223,7 +168,7 @@ pub const UiEvent = union(enum) {
             .prompt_worker_finished => |p| {
                 if (p.internal_error) |msg| allocator.free(msg);
             },
-            .message_start_assistant, .retry_wait_finished, .request_worker_finished, .model_switched, .thinking_level_changed => {},
+            .retry_wait_finished, .request_worker_finished, .model_switched, .thinking_level_changed => {},
         }
     }
 };
@@ -231,24 +176,6 @@ pub const UiEvent = union(enum) {
 // --- tests ---
 
 const testing = std.testing;
-
-test "UiEvent deinit frees owned fields" {
-    var ev = UiEvent{ .assistant_text_delta = .{
-        .content_index = 0,
-        .delta = try testing.allocator.dupe(u8, "hello"),
-    } };
-    ev.deinit(testing.allocator);
-    // no leak = pass (allocator detects leaks)
-}
-
-test "UiEvent deinit handles tool_start fields" {
-    var ev = UiEvent{ .tool_start = .{
-        .tool_call_id = try testing.allocator.dupe(u8, "id-1"),
-        .tool_name = try testing.allocator.dupe(u8, "bash"),
-        .args = .null,
-    } };
-    ev.deinit(testing.allocator);
-}
 
 test "UiEvent deinit handles null result" {
     var ev = UiEvent{ .tool_end = .{

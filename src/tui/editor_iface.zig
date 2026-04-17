@@ -259,7 +259,7 @@ const testing = std.testing;
 const buffer_mod = @import("buffer.zig");
 const Region = buffer_mod.Region;
 
-const MockEditor = struct {
+pub const MockEditor = struct {
     text: []const u8 = "",
     expanded_text: []const u8 = "",
     insert_count: u32 = 0,

@@ -1,41 +1,14 @@
 //! Lua-driven tool renderers.
 //!
 //! Bridges `zi.register_tool({ render_result = fn(result, ctx) ... })`
-//! to the TUI's cell-painting transcript. Since zi-wub.5/.6 the agent
-//! thread is the single owner of `lua_state`, so render dispatch runs
-//! on the agent thread (inside `lua_tool.execute` and inside the
-//! `ctx.update` host trampoline) and stashes the resulting
-//! `LuaRenderState` into `runner.pending_renders`. The TUI thread
-//! consumes that snapshot via `runner.takePendingRender` — it never
-//! reaches into `lua_state`.
+//! to an owned, width-agnostic span tree.
 //!
-//! ## Flow
-//!
-//! ```text
-//! agent thread: tool finishes (or ctx.update fires)
-//!   │
-//!   ▼
-//! lua_tool.precomputeRender(runner, name, id, args, result)
-//!   │
-//!   ├─► lua_renderer.dispatchRenderResultFromResultOn(...)
-//!   │    ├─ spawns a fresh Coroutine on runner.lua_state
-//!   │    ├─ pushes ref'd render_result fn + restricted ctx table
-//!   │    ├─ resumeWith(2), parses the returned span tree
-//!   │    ├─ deep-copies strings into an arena we own
-//!   │    └─ returns owned *LuaRenderState (or null on any failure)
-//!   │
-//!   ▼
-//! runner.stashPendingRender(id, state)   ◀── cross-thread inbox
-//!   │
-//!   ▼  (TUI thread, no lua access)
-//! transcript.refreshLuaRender → runner.takePendingRender(id)
-//!   │
-//!   ▼
-//! ToolExecution.lua_render_state = state
-//!   │
-//!   ▼
-//! Next render frame: transcript paints spans from state.lines[expanded]
-//! ```
+//! Since zi-wub.5/.6 the agent thread is the single owner of
+//! `lua_state`, so any `render_result` dispatch must happen there.
+//! This module builds a `LuaRenderState` by running the hook against a
+//! tool result and deep-copying the returned spans into arena-owned
+//! Zig data. Callers decide whether to render immediately, cache, or
+//! discard the result.
 //!
 //! ## Restricted render environment
 //!

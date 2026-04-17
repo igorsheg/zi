@@ -6,16 +6,18 @@ const transcript_mod = @import("transcript.zig");
 const tool_display_mod = @import("tool_display.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const markdown_mod = @import("components/markdown.zig");
+const assistant_message_component_mod = @import("components/assistant_message.zig");
+const user_message_component_mod = @import("components/user_message.zig");
 const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const editor_mod = @import("components/editor.zig");
-const ui_event_mod = @import("ui_event.zig");
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 const run_control_mod = @import("../runtime/run_control.zig");
 
 const Transcript = transcript_mod.Transcript;
+const TranscriptItem = transcript_mod.TranscriptItem;
 const TranscriptRenderable = transcript_mod.TranscriptRenderable;
 const ToolRendererResolver = tool_display_mod.ToolRendererResolver;
 const EditorInterface = editor_iface_mod.EditorInterface;
@@ -23,12 +25,25 @@ const Theme = theme_mod.Theme;
 const Markdown = markdown_mod.Markdown;
 const Buffer = buffer_mod.Buffer;
 const Color = cell_mod.Color;
-const UiEvent = ui_event_mod.UiEvent;
 const testing = std.testing;
 
 pub const RebuildOptions = struct {
     theme: *const Theme,
     retry_attempt: u32 = 0,
+};
+
+const DesiredItem = struct {
+    item_id: conversation_snapshot_mod.ItemId,
+    semantic_version: conversation_snapshot_mod.SemanticVersion,
+    row: TranscriptItem,
+    seed_editor_history: bool = false,
+    history_text: ?ExtractedText = null,
+
+    fn deinit(self: *DesiredItem, allocator: std.mem.Allocator) void {
+        if (self.history_text) |text| text.deinit(allocator);
+        self.row.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 const ExtractedText = union(enum) {
@@ -108,54 +123,161 @@ pub fn rebuildFromSnapshot(
     transcript.clearPendingToolRouting();
 }
 
-pub fn applyLiveEvent(
+pub fn reconcileFromSnapshot(
     transcript: *Transcript,
+    editor: EditorInterface,
     resolver: ToolRendererResolver,
-    event: UiEvent,
-) bool {
-    switch (event) {
-        .message_start_assistant => {
-            transcript.beginAssistantMessage();
-            return true;
-        },
-        .message_start_user => |u| {
-            transcript.addUserMessage(.{ .text = u.text });
-            return true;
-        },
-        .assistant_text_delta => |d| {
-            transcript.appendText(d.content_index, d.delta);
-            return true;
-        },
-        .assistant_thinking_delta => |d| {
-            transcript.appendThinking(d.content_index, d.delta);
-            return true;
-        },
-        .tool_call_streaming => |t| {
-            appendToolCall(transcript, resolver, t.tool_call_id, t.tool_name, t.args, t.is_complete, false);
-            return true;
-        },
-        .tool_start => |t| {
-            appendToolCall(transcript, resolver, t.tool_call_id, t.tool_name, t.args, false, true);
-            return true;
-        },
-        .tool_update => |t| {
-            transcript.toolSetPartialResult(t.tool_call_id, t.result, t.is_error);
-            return true;
-        },
-        .tool_end => |t| {
-            finalizeToolResult(transcript, t.tool_call_id, t.result, t.is_error);
-            return true;
-        },
-        .message_end_assistant => {
-            transcript.endAssistantMessage();
-            return true;
-        },
-        else => return false,
+    snapshot: conversation_snapshot_mod.ConversationSnapshot,
+    options: RebuildOptions,
+) void {
+    var desired_items = buildDesiredItems(transcript.allocator, resolver, snapshot, options) catch return;
+    defer {
+        for (desired_items.items) |*item| item.deinit(transcript.allocator);
+        desired_items.deinit(transcript.allocator);
     }
+
+    var desired_index: usize = 0;
+    while (desired_index < desired_items.items.len) : (desired_index += 1) {
+        const desired = desired_items.items[desired_index];
+        const existing_index = transcript.findSnapshotItemIndex(desired.item_id);
+        if (existing_index) |current_index| {
+            if (transcript.snapshotItemSemanticVersionAt(current_index) == desired.semantic_version) {
+                if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
+            } else {
+                _ = transcript.replaceItemAt(current_index, desired.row);
+                desired_items.items[desired_index].row.deinit_ctx = null;
+                desired_items.items[desired_index].row.deinit_fn = null;
+                if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
+            }
+        } else {
+            _ = transcript.insertItemAt(desired_index, desired.row);
+            desired_items.items[desired_index].row.deinit_ctx = null;
+            desired_items.items[desired_index].row.deinit_fn = null;
+        }
+
+        if (desired.seed_editor_history and existing_index == null) {
+            if (desired.history_text) |history_text| editor.addToHistory(history_text.slice());
+        }
+    }
+
+    while (transcript.items.items.len > desired_items.items.len) {
+        transcript.removeRenderable(transcript.items.items[transcript.items.items.len - 1].renderable);
+    }
+
+    transcript.clearPendingToolRouting();
 }
 
+fn buildDesiredItems(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    snapshot: conversation_snapshot_mod.ConversationSnapshot,
+    options: RebuildOptions,
+) !std.ArrayList(DesiredItem) {
+    var desired_items: std.ArrayList(DesiredItem) = .empty;
+    errdefer {
+        for (desired_items.items) |*item| item.deinit(allocator);
+        desired_items.deinit(allocator);
+    }
+
+    var live_tool_ids: std.ArrayList([]const u8) = .empty;
+    defer live_tool_ids.deinit(allocator);
+    for (snapshot.items) |item| {
+        if (item != .tool_execution) continue;
+        try live_tool_ids.append(allocator, item.tool_execution.tool_call_id);
+    }
+
+    for (snapshot.items) |item| {
+        const desired = buildDesiredItem(allocator, resolver, item, options, live_tool_ids.items) catch |err| switch (err) {
+            error.SkipHiddenCustomMessage,
+            error.EmptyCustomMessage,
+            error.EmptyUserMessage,
+            error.UnsupportedStandaloneToolResult,
+            => continue,
+            else => return err,
+        };
+        try desired_items.append(allocator, desired);
+    }
+    return desired_items;
+}
+
+fn buildDesiredItem(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    item: conversation_snapshot_mod.ConversationItem,
+    options: RebuildOptions,
+    live_tool_ids: []const []const u8,
+) !DesiredItem {
+    return switch (item) {
+        .committed_message => |committed| try buildCommittedMessageItem(allocator, resolver, committed, options, live_tool_ids),
+        .active_assistant => |active| try buildActiveAssistantDesiredItem(allocator, active, live_tool_ids, options.theme),
+        .tool_execution => |tool_execution| try buildToolExecutionDesiredItem(allocator, resolver, tool_execution, options.theme),
+        .queued_user_message => |queued| try buildQueuedUserDesiredItem(allocator, queued, options.theme),
+    };
+}
+
+fn buildCommittedMessageItem(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    committed: conversation_snapshot_mod.CommittedMessageItem,
+    options: RebuildOptions,
+    live_tool_ids: []const []const u8,
+) !DesiredItem {
+    var row = try buildSnapshotMessageRow(allocator, resolver, committed.message, options, live_tool_ids);
+    row.snapshot_item_id = committed.item_id;
+    row.snapshot_semantic_version = committed.semantic_version;
+
+    const history_text = extractUserMessageText(allocator, committed.message);
+    return .{
+        .item_id = committed.item_id,
+        .semantic_version = committed.semantic_version,
+        .row = row,
+        .seed_editor_history = history_text != null,
+        .history_text = history_text,
+    };
+}
+
+fn buildActiveAssistantDesiredItem(
+    allocator: std.mem.Allocator,
+    active: conversation_snapshot_mod.ActiveAssistantItem,
+    live_tool_ids: []const []const u8,
+    theme: *const Theme,
+) !DesiredItem {
+    var row = try createAssistantMessageRow(allocator, active.message.assistant, live_tool_ids, theme);
+    row.snapshot_item_id = active.item_id;
+    row.snapshot_semantic_version = active.semantic_version;
+    return .{ .item_id = active.item_id, .semantic_version = active.semantic_version, .row = row };
+}
+
+fn buildToolExecutionDesiredItem(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    tool_execution: conversation_snapshot_mod.ToolExecutionItem,
+    theme: *const Theme,
+) !DesiredItem {
+    var row = try createToolExecutionRow(allocator, resolver, tool_execution, theme);
+    row.snapshot_item_id = tool_execution.item_id;
+    row.snapshot_semantic_version = tool_execution.semantic_version;
+    return .{ .item_id = tool_execution.item_id, .semantic_version = tool_execution.semantic_version, .row = row };
+}
+
+fn buildQueuedUserDesiredItem(
+    allocator: std.mem.Allocator,
+    queued: conversation_snapshot_mod.QueuedUserMessageItem,
+    theme: *const Theme,
+) !DesiredItem {
+    var row = try createUserMessageRow(allocator, .{
+        .text = queued.text,
+        .footer = switch (queued.kind) {
+            .steering => .queued_steering,
+            .follow_up => .queued_follow_up,
+        },
+    }, .queued_user_message, theme);
+    row.snapshot_item_id = queued.item_id;
+    row.snapshot_semantic_version = queued.semantic_version;
+    return .{ .item_id = queued.item_id, .semantic_version = queued.semantic_version, .row = row };
+}
 // Legacy resume-only wrappers. New callers should use
-// `rebuildFromMessages` / `applyLiveEvent`.
+// `rebuildFromMessages` / `rebuildFromSnapshot`.
 pub fn seedEditorHistory(editor: EditorInterface, messages: []const agent_protocol.AgentMessage) void {
     editor.clearHistory();
     for (messages) |message| seedHistoryFromMessage(editor, message);
@@ -444,6 +566,182 @@ fn appendMarkdownCard(
         md.deinit();
         transcript.allocator.destroy(md);
     }
+}
+
+fn buildSnapshotMessageRow(
+    allocator: std.mem.Allocator,
+    _: ToolRendererResolver,
+    message: agent_protocol.AgentMessage,
+    options: RebuildOptions,
+    live_tool_ids: []const []const u8,
+) !TranscriptItem {
+    return switch (message) {
+        .user => try buildUserRow(allocator, message, options.theme),
+        .assistant => |assistant| try createAssistantMessageRow(allocator, assistant, live_tool_ids, options.theme),
+        .compaction_summary => |summary| try buildSummaryRow(allocator, options.theme, "Compaction summary", summary.summary),
+        .branch_summary => |summary| try buildSummaryRow(allocator, options.theme, "Branch summary", summary.summary),
+        .custom => |custom| if (custom.display)
+            try buildCustomRow(allocator, options.theme, custom)
+        else
+            error.SkipHiddenCustomMessage,
+        .tool_result => error.UnsupportedStandaloneToolResult,
+    };
+}
+
+fn buildUserRow(allocator: std.mem.Allocator, message: agent_protocol.AgentMessage, theme: *const Theme) !TranscriptItem {
+    const text = extractUserMessageText(allocator, message) orelse return error.EmptyUserMessage;
+    defer text.deinit(allocator);
+    return createUserMessageRow(allocator, .{ .text = text.slice() }, .user_message, theme);
+}
+
+fn buildSummaryRow(allocator: std.mem.Allocator, theme: *const Theme, label: []const u8, summary: []const u8) !TranscriptItem {
+    const content = try std.fmt.allocPrint(allocator, "**{s}**\n\n{s}", .{ label, summary });
+    defer allocator.free(content);
+    return createMarkdownRow(allocator, theme, content, theme.fg(.muted), Color.default);
+}
+
+fn buildCustomRow(allocator: std.mem.Allocator, theme: *const Theme, custom: agent_protocol.AgentMessage.CustomMessage) !TranscriptItem {
+    const body = try customContentText(allocator, custom.content);
+    defer allocator.free(body);
+    if (body.len == 0) return error.EmptyCustomMessage;
+    const content = try std.fmt.allocPrint(allocator, "**{s}**\n\n{s}", .{ custom.custom_type, body });
+    defer allocator.free(content);
+    return createMarkdownRow(allocator, theme, content, theme.fg(.custom_message_text), theme.bg(.custom_message_bg));
+}
+
+fn createAssistantMessageRow(
+    allocator: std.mem.Allocator,
+    assistant: agent_protocol.AssistantMessage,
+    live_tool_ids: []const []const u8,
+    theme: *const Theme,
+) !TranscriptItem {
+    const am = try allocator.create(assistant_message_component_mod.AssistantMessage);
+    errdefer allocator.destroy(am);
+    am.* = assistant_message_component_mod.AssistantMessage.init(allocator);
+    errdefer am.deinit();
+    am.theme = theme;
+    for (assistant.content, 0..) |block, idx| {
+        switch (block) {
+            .text => |text| am.appendText(idx, text.text),
+            .thinking => |thinking| am.appendThinking(idx, thinking.thinking),
+            .tool_call => |tool_call| if (containsToolCallId(live_tool_ids, tool_call.id)) continue,
+        }
+    }
+    return .{
+        .renderable = TranscriptRenderable.init(assistant_message_component_mod.AssistantMessage, am),
+        .kind = .assistant_message,
+        .extra_height = 1,
+        .deinit_ctx = @ptrCast(am),
+        .deinit_fn = deinitAssistantMessageRow,
+    };
+}
+
+fn createUserMessageRow(
+    allocator: std.mem.Allocator,
+    props: user_message_component_mod.Props,
+    kind: transcript_mod.ItemKind,
+    theme: *const Theme,
+) !TranscriptItem {
+    const msg = try allocator.create(user_message_component_mod.UserMessage);
+    errdefer allocator.destroy(msg);
+    msg.* = user_message_component_mod.UserMessage.init(allocator);
+    errdefer msg.deinit();
+    msg.setTheme(theme);
+
+    var message_props = props;
+    message_props.status = if (kind == .queued_user_message) .pending else .in_chat;
+    msg.setProps(message_props);
+    return .{
+        .renderable = TranscriptRenderable.init(user_message_component_mod.UserMessage, msg),
+        .kind = kind,
+        .extra_height = 1,
+        .deinit_ctx = @ptrCast(msg),
+        .deinit_fn = deinitUserMessageRow,
+    };
+}
+
+fn createToolExecutionRow(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    tool_execution: conversation_snapshot_mod.ToolExecutionItem,
+    theme: *const Theme,
+) !TranscriptItem {
+    const renderer = resolver.resolve(tool_execution.tool_name);
+    const tool_call_id = try allocator.dupe(u8, tool_execution.tool_call_id);
+    errdefer allocator.free(tool_call_id);
+    const tool_name = try allocator.dupe(u8, tool_execution.tool_name);
+    errdefer allocator.free(tool_name);
+    const te = try allocator.create(transcript_mod.ToolExecution);
+    errdefer allocator.destroy(te);
+    te.* = .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .allocator = allocator,
+        .theme = theme,
+        .renderer = renderer,
+    };
+    errdefer te.deinit();
+    if (renderer.init_state) |init_fn| te.renderer_state = init_fn(allocator);
+    te.setArgs(tool_execution.args);
+    if (tool_execution.args_complete) te.setArgsComplete();
+    if (tool_execution.execution_started) te.markExecutionStarted();
+    if (tool_execution.result) |result| {
+        if (tool_execution.is_partial) {
+            te.setPartialResult(result, tool_execution.is_error);
+        } else {
+            te.setFinalResult(result, tool_execution.is_error);
+        }
+    }
+    return .{
+        .renderable = TranscriptRenderable.init(transcript_mod.ToolExecution, te),
+        .kind = .tool_execution,
+        .tool_call_id = te.tool_call_id,
+        .extra_height = 1,
+        .deinit_ctx = @ptrCast(te),
+        .deinit_fn = deinitToolExecutionRow,
+    };
+}
+
+fn createMarkdownRow(
+    allocator: std.mem.Allocator,
+    theme: *const Theme,
+    content: []const u8,
+    fg: Color,
+    bg: Color,
+) !TranscriptItem {
+    const md = try allocator.create(Markdown);
+    errdefer allocator.destroy(md);
+    md.* = Markdown.init(allocator);
+    errdefer md.deinit();
+    md.theme = theme;
+    md.padding_x = 1;
+    md.padding_y = if (bg.eql(Color.default)) 0 else 1;
+    md.fg = fg;
+    md.bg = bg;
+    md.setContent(content);
+    return .{
+        .renderable = TranscriptRenderable.init(Markdown, md),
+        .extra_height = 1,
+        .deinit_ctx = @ptrCast(md),
+        .deinit_fn = deinitMarkdown,
+    };
+}
+
+fn deinitAssistantMessageRow(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const am: *assistant_message_component_mod.AssistantMessage = @ptrCast(@alignCast(ctx));
+    am.deinit();
+    allocator.destroy(am);
+}
+
+fn deinitUserMessageRow(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const msg: *user_message_component_mod.UserMessage = @ptrCast(@alignCast(ctx));
+    msg.deinit();
+    allocator.destroy(msg);
+}
+
+fn deinitToolExecutionRow(ctx: *anyopaque, _: std.mem.Allocator) void {
+    const te: *transcript_mod.ToolExecution = @ptrCast(@alignCast(ctx));
+    te.deinit();
 }
 
 fn deinitMarkdown(ctx: *anyopaque, allocator: std.mem.Allocator) void {
@@ -739,7 +1037,7 @@ test "rebuildFromSnapshot reconstructs committed messages and queued rows" {
     defer editor.deinit();
 
     const messages = [_]agent_protocol.AgentMessage{
-        makeUserMessage("hello", 1),
+        makeUserMessage("hello"),
         .{ .compaction_summary = .{ .summary = "kept the recent turns", .tokens_before = 42, .timestamp = 2 } },
     };
     var steering = [_]run_control_mod.QueuedMessageText{
@@ -832,41 +1130,80 @@ test "rebuildFromSnapshot reconstructs active assistant and live tool execution 
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, rendered, "tc-1 tc-1"));
 }
 
-test "applyLiveEvent shares tool projection across streaming and final result events" {
+test "reconcileFromSnapshot retains unchanged rows and appends editor history once" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    try testing.expect(applyLiveEvent(&transcript, tool_display_mod.empty_resolver, .message_start_assistant));
-    try testing.expect(applyLiveEvent(&transcript, tool_display_mod.empty_resolver, .{ .assistant_text_delta = .{
-        .content_index = 0,
-        .delta = "running bash",
-    } }));
-    try testing.expect(applyLiveEvent(&transcript, tool_display_mod.empty_resolver, .{ .tool_call_streaming = .{
-        .tool_call_id = "tc-1",
-        .tool_name = "bash",
-        .args = .null,
-        .is_complete = true,
-    } }));
-    try testing.expect(applyLiveEvent(&transcript, tool_display_mod.empty_resolver, .{ .tool_end = .{
-        .tool_call_id = "tc-1",
-        .result = .{
-            .content = &[_]AgentToolResult.ContentBlock{.{ .text = .{ .text = "done" } }},
-            .is_error = false,
-        },
-        .is_error = false,
-    } }));
-    try testing.expect(applyLiveEvent(&transcript, tool_display_mod.empty_resolver, .{ .message_end_assistant = .{
-        .is_aborted = false,
-        .error_message = null,
-    } }));
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
 
-    try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
-    try testing.expectEqual(@as(usize, 0), transcript.pending_tools.count());
+    var snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 1,
+        .messages = &.{makeUserMessage("hello")},
+    });
+    defer snapshot.deinit(testing.allocator);
 
-    const tool_item = transcript.items.items[1];
-    const tool: *transcript_mod.ToolExecution = @ptrCast(@alignCast(tool_item.deinit_ctx.?));
-    try testing.expect(tool.args_complete);
-    try testing.expect(!tool.is_error);
-    try testing.expect(tool.result != null);
-    try testing.expectEqualStrings("done", tool.result.?.content[0].text.text);
+    reconcileFromSnapshot(&transcript, editor, tool_display_mod.empty_resolver, snapshot, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(usize, 1), transcript.items.items.len);
+    const first_ptr = transcript.items.items[0].deinit_ctx;
+    try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
+
+    reconcileFromSnapshot(&transcript, editor, tool_display_mod.empty_resolver, snapshot, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(first_ptr, transcript.items.items[0].deinit_ctx);
+    try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
+}
+
+test "reconcileFromSnapshot replaces only changed semantic rows" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var snapshot_a = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 1,
+        .messages = &.{ makeUserMessage("one"), makeUserMessage("two") },
+    });
+    defer snapshot_a.deinit(testing.allocator);
+    reconcileFromSnapshot(&transcript, editor, tool_display_mod.empty_resolver, snapshot_a, .{ .theme = themes_builtin.dark() });
+
+    const first_ptr = transcript.items.items[0].deinit_ctx;
+    const second_ptr = transcript.items.items[1].deinit_ctx;
+
+    var snapshot_b = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 2,
+        .messages = &.{ makeUserMessage("one"), makeUserMessage("two updated") },
+    });
+    defer snapshot_b.deinit(testing.allocator);
+    reconcileFromSnapshot(&transcript, editor, tool_display_mod.empty_resolver, snapshot_b, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(first_ptr, transcript.items.items[0].deinit_ctx);
+    try testing.expect(second_ptr != transcript.items.items[1].deinit_ctx);
+}
+
+test "reconcileFromSnapshot reorders rows and preserves scroll offset when not following bottom" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var snapshot_a = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 1,
+        .messages = &.{ makeUserMessage("one"), makeUserMessage("two"), makeUserMessage("three") },
+    });
+    defer snapshot_a.deinit(testing.allocator);
+    reconcileFromSnapshot(&transcript, editor, tool_display_mod.empty_resolver, snapshot_a, .{ .theme = themes_builtin.dark() });
+    _ = transcript.totalHeight(40);
+    transcript.scrollBy(40, 2, -1);
+    const scroll_before = transcript.scrollOffset();
+
+    var snapshot_b = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 2,
+        .messages = &.{ makeUserMessage("three"), makeUserMessage("one"), makeUserMessage("two") },
+    });
+    defer snapshot_b.deinit(testing.allocator);
+    reconcileFromSnapshot(&transcript, editor, tool_display_mod.empty_resolver, snapshot_b, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(scroll_before, transcript.scrollOffset());
 }
