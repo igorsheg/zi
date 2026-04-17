@@ -8,6 +8,7 @@ pub const std_options: std.Options = .{
 test {
     logging.setThreadLabel(.@"test");
     _ = @import("abort_signal.zig");
+    _ = @import("conversation_snapshot.zig");
     _ = @import("storage.zig");
     _ = @import("debug/tracked_allocator.zig");
     _ = @import("logging.zig");
