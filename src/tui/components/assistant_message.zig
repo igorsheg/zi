@@ -10,29 +10,78 @@ const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
 
+pub const AssistantRowModel = struct {
+    blocks: std.ArrayListUnmanaged(Block) = .empty,
+
+    pub const Block = union(enum) {
+        text: []u8,
+        thinking: []u8,
+
+        fn clone(self: Block, allocator: std.mem.Allocator) !Block {
+            return switch (self) {
+                .text => |text| .{ .text = try allocator.dupe(u8, text) },
+                .thinking => |thinking| .{ .thinking = try allocator.dupe(u8, thinking) },
+            };
+        }
+
+        fn deinit(self: *Block, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .text => |text| allocator.free(text),
+                .thinking => |thinking| allocator.free(thinking),
+            }
+            self.* = undefined;
+        }
+
+        fn content(self: Block) []const u8 {
+            return switch (self) {
+                .text => |text| text,
+                .thinking => |thinking| thinking,
+            };
+        }
+    };
+
+    pub fn clone(self: AssistantRowModel, allocator: std.mem.Allocator) !AssistantRowModel {
+        var out: AssistantRowModel = .{};
+        errdefer out.deinit(allocator);
+
+        for (self.blocks.items) |block| {
+            try out.blocks.append(allocator, try block.clone(allocator));
+        }
+        return out;
+    }
+
+    pub fn deinit(self: *AssistantRowModel, allocator: std.mem.Allocator) void {
+        for (self.blocks.items) |*block| block.deinit(allocator);
+        self.blocks.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 pub const AssistantMessage = struct {
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = undefined,
     hide_thinking_block: bool = false,
     hidden_thinking_label: []const u8 = "Thinking...",
 
-    blocks: std.ArrayListUnmanaged(Block) = .empty,
+    model: AssistantRowModel = .{},
+    render_blocks: std.ArrayListUnmanaged(RenderBlock) = .empty,
 
-    const BlockKind = enum { text, thinking };
-    const RenderKind = enum { markdown, label };
-
-    const Block = struct {
-        kind: BlockKind,
-        content_index: usize,
+    const RenderBlock = union(enum) {
         markdown: *markdown_mod.Markdown,
         label: *text_mod.Text,
-        render_kind: RenderKind,
 
-        fn deinit(self: *Block, allocator: std.mem.Allocator) void {
-            self.markdown.deinit();
-            allocator.destroy(self.markdown);
-            self.label.deinit();
-            allocator.destroy(self.label);
+        fn deinit(self: *RenderBlock, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .markdown => |md| {
+                    md.deinit();
+                    allocator.destroy(md);
+                },
+                .label => |label| {
+                    label.deinit();
+                    allocator.destroy(label);
+                },
+            }
+            self.* = undefined;
         }
     };
 
@@ -41,25 +90,90 @@ pub const AssistantMessage = struct {
     }
 
     pub fn deinit(self: *AssistantMessage) void {
-        for (self.blocks.items) |*block| block.deinit(self.allocator);
-        self.blocks.deinit(self.allocator);
+        self.deinitRenderBlocks();
+        self.model.deinit(self.allocator);
     }
 
     pub fn component(self: *AssistantMessage) Component {
         return Component.init(AssistantMessage, self);
     }
 
-    pub fn appendText(self: *AssistantMessage, content_index: usize, delta: []const u8) void {
-        const block = self.ensureBlock(content_index, .text) orelse return;
-        block.markdown.appendContent(delta);
-        block.markdown.invalidate();
+    pub fn setOwnedModel(self: *AssistantMessage, model: *AssistantRowModel) !void {
+        var new_render_blocks: std.ArrayListUnmanaged(RenderBlock) = .empty;
+        errdefer deinitRenderBlocksList(&new_render_blocks, self.allocator);
+        try self.buildRenderBlocks(&new_render_blocks, model.*, self.hide_thinking_block);
+
+        self.deinitRenderBlocks();
+        self.model.deinit(self.allocator);
+        self.model = model.*;
+        model.* = .{};
+        self.render_blocks = new_render_blocks;
     }
 
-    pub fn appendThinking(self: *AssistantMessage, content_index: usize, delta: []const u8) void {
-        const block = self.ensureBlock(content_index, .thinking) orelse return;
-        block.markdown.appendContent(delta);
-        block.markdown.invalidate();
-        if (self.hide_thinking_block) self.refreshThinkingVisibility(block);
+    pub fn setHideThinkingBlock(self: *AssistantMessage, hide: bool) !void {
+        if (self.hide_thinking_block == hide) return;
+
+        var new_render_blocks: std.ArrayListUnmanaged(RenderBlock) = .empty;
+        errdefer deinitRenderBlocksList(&new_render_blocks, self.allocator);
+        try self.buildRenderBlocks(&new_render_blocks, self.model, hide);
+
+        self.deinitRenderBlocks();
+        self.hide_thinking_block = hide;
+        self.render_blocks = new_render_blocks;
+    }
+
+    fn buildRenderBlocks(
+        self: *AssistantMessage,
+        out: *std.ArrayListUnmanaged(RenderBlock),
+        model: AssistantRowModel,
+        hide_thinking_block: bool,
+    ) !void {
+        for (model.blocks.items) |block| {
+            switch (block) {
+                .text => try out.append(self.allocator, .{ .markdown = try self.createMarkdown(block.content(), false) }),
+                .thinking => {
+                    if (hide_thinking_block) {
+                        const label = if (block.content().len == 0) "" else self.hidden_thinking_label;
+                        try out.append(self.allocator, .{ .label = try self.createThinkingLabel(label) });
+                    } else {
+                        try out.append(self.allocator, .{ .markdown = try self.createMarkdown(block.content(), true) });
+                    }
+                },
+            }
+        }
+    }
+
+    fn createMarkdown(self: *AssistantMessage, content: []const u8, thinking: bool) !*markdown_mod.Markdown {
+        const md = try self.allocator.create(markdown_mod.Markdown);
+        errdefer self.allocator.destroy(md);
+
+        md.* = markdown_mod.Markdown.init(self.allocator);
+        errdefer md.deinit();
+        md.padding_x = 1;
+        md.theme = self.theme;
+        if (thinking) {
+            md.fg = self.theme.fg(.thinking_text);
+            md.attrs = .{ .italic = true };
+        }
+        md.setContent(content);
+        return md;
+    }
+
+    fn createThinkingLabel(self: *AssistantMessage, content: []const u8) !*text_mod.Text {
+        const label = try self.allocator.create(text_mod.Text);
+        errdefer self.allocator.destroy(label);
+
+        label.* = text_mod.Text.init(self.allocator);
+        errdefer label.deinit();
+        label.padding_x = 1;
+        label.fg = self.theme.fg(.thinking_text);
+        label.attrs = .{ .italic = true };
+        label.setContent(content);
+        return label;
+    }
+
+    fn deinitRenderBlocks(self: *AssistantMessage) void {
+        deinitRenderBlocksList(&self.render_blocks, self.allocator);
     }
 
     // Kept as no-op compatibility hooks so transcript animation plumbing can
@@ -76,92 +190,11 @@ pub const AssistantMessage = struct {
         return false;
     }
 
-    pub fn setHideThinkingBlock(self: *AssistantMessage, hide: bool) void {
-        if (self.hide_thinking_block == hide) return;
-        self.hide_thinking_block = hide;
-        for (self.blocks.items) |*block| {
-            if (block.kind == .thinking) self.refreshThinkingVisibility(block);
-        }
-    }
-
-    fn ensureBlock(self: *AssistantMessage, content_index: usize, kind: BlockKind) ?*Block {
-        if (self.findBlock(content_index)) |idx| {
-            const block = &self.blocks.items[idx];
-            if (block.kind != kind) return null;
-            return block;
-        }
-
-        const md = self.allocator.create(markdown_mod.Markdown) catch return null;
-        errdefer self.allocator.destroy(md);
-        md.* = markdown_mod.Markdown.init(self.allocator);
-        md.padding_x = 1;
-        md.theme = self.theme;
-        if (kind == .thinking) {
-            md.fg = self.theme.fg(.thinking_text);
-            md.attrs = .{ .italic = true };
-        }
-
-        const label = self.allocator.create(text_mod.Text) catch {
-            md.deinit();
-            return null;
-        };
-        errdefer self.allocator.destroy(label);
-        label.* = text_mod.Text.init(self.allocator);
-        label.padding_x = 1;
-        label.fg = self.theme.fg(.thinking_text);
-        label.attrs = .{ .italic = true };
-        label.setContent(self.hidden_thinking_label);
-
-        const insert_idx = self.findInsertIndex(content_index);
-        self.blocks.insert(self.allocator, insert_idx, .{
-            .kind = kind,
-            .content_index = content_index,
-            .markdown = md,
-            .label = label,
-            .render_kind = if (kind == .thinking and self.hide_thinking_block) .label else .markdown,
-        }) catch {
-            md.deinit();
-            self.allocator.destroy(md);
-            label.deinit();
-            self.allocator.destroy(label);
-            return null;
-        };
-        return &self.blocks.items[insert_idx];
-    }
-
-    fn refreshThinkingVisibility(self: *AssistantMessage, block: *Block) void {
-        if (block.kind != .thinking) return;
-        if (self.hide_thinking_block) {
-            block.render_kind = .label;
-            if (block.markdown.content.len == 0) {
-                block.label.setContent("");
-            } else {
-                block.label.setContent(self.hidden_thinking_label);
-            }
-        } else {
-            block.render_kind = .markdown;
-        }
-    }
-
-    fn findBlock(self: *AssistantMessage, content_index: usize) ?usize {
-        for (self.blocks.items, 0..) |block, idx| {
-            if (block.content_index == content_index) return idx;
-        }
-        return null;
-    }
-
-    fn findInsertIndex(self: *AssistantMessage, content_index: usize) usize {
-        for (self.blocks.items, 0..) |block, idx| {
-            if (content_index < block.content_index) return idx;
-        }
-        return self.blocks.items.len;
-    }
-
     pub fn measure(self: *AssistantMessage, width: u32) Measurement {
         if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
         var total: u32 = 0;
         var seen_visible = false;
-        for (self.blocks.items) |*block| {
+        for (self.render_blocks.items) |*block| {
             const h = self.blockHeight(block, width);
             if (h == 0) continue;
             if (seen_visible) total += 1;
@@ -183,7 +216,7 @@ pub const AssistantMessage = struct {
         var screen_y: u32 = 0;
         var virtual_y: u32 = 0;
         var seen_visible = false;
-        for (self.blocks.items) |*block| {
+        for (self.render_blocks.items) |*block| {
             const block_h = self.blockHeight(block, w);
             if (block_h == 0) continue;
             const separator_h: u32 = if (seen_visible) 1 else 0;
@@ -207,7 +240,7 @@ pub const AssistantMessage = struct {
         }
     }
 
-    fn renderBlock(self: *AssistantMessage, block: *Block, row_region: Region, skipped: u32, w: u32, separator_h: u32) void {
+    fn renderBlock(self: *AssistantMessage, block: *RenderBlock, row_region: Region, skipped: u32, w: u32, separator_h: u32) void {
         const comp = self.blockComponent(block);
         const row_skip = skipped;
         if (separator_h > 0 and row_skip < separator_h) {
@@ -221,22 +254,28 @@ pub const AssistantMessage = struct {
         }
     }
 
-    fn blockComponent(self: *AssistantMessage, block: *Block) Component {
+    fn blockComponent(self: *AssistantMessage, block: *RenderBlock) Component {
         _ = self;
-        return switch (block.render_kind) {
-            .markdown => block.markdown.component(),
-            .label => block.label.component(),
+        return switch (block.*) {
+            .markdown => |md| md.component(),
+            .label => |label| label.component(),
         };
     }
 
-    fn blockHeight(self: *AssistantMessage, block: *Block, width: u32) u32 {
+    fn blockHeight(self: *AssistantMessage, block: *RenderBlock, width: u32) u32 {
         _ = self;
-        return switch (block.render_kind) {
-            .markdown => block.markdown.measure(width).preferred_height,
-            .label => block.label.measure(width).preferred_height,
+        return switch (block.*) {
+            .markdown => |md| md.measure(width).preferred_height,
+            .label => |label| label.measure(width).preferred_height,
         };
     }
 };
+
+fn deinitRenderBlocksList(blocks: *std.ArrayListUnmanaged(AssistantMessage.RenderBlock), allocator: std.mem.Allocator) void {
+    for (blocks.items) |*block| block.deinit(allocator);
+    blocks.deinit(allocator);
+    blocks.* = .empty;
+}
 
 fn renderComponentSlice(comp: Component, region: Region, first_row: u32) void {
     if (first_row == 0) {
@@ -247,12 +286,71 @@ fn renderComponentSlice(comp: Component, region: Region, first_row: u32) void {
 }
 
 const testing = std.testing;
+const Buffer = buffer_mod.Buffer;
 
-test "assistant message animation hooks are static" {
+fn appendModelBlock(model: *AssistantRowModel, block: AssistantRowModel.Block) !void {
+    try model.blocks.append(testing.allocator, try block.clone(testing.allocator));
+}
+
+fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (0..buf.height) |row| {
+        if (row > 0) try out.append(allocator, '\n');
+        var end = buf.width;
+        while (end > 0 and buf.get(end - 1, @intCast(row)).grapheme.codepoint == ' ') : (end -= 1) {}
+        for (0..end) |col| {
+            const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
+            try out.append(allocator, @intCast(cp));
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+test "assistant message renders stable row model and hidden thinking label" {
+    var model: AssistantRowModel = .{};
+    defer model.deinit(testing.allocator);
+    try appendModelBlock(&model, .{ .text = @constCast("hello") });
+    try appendModelBlock(&model, .{ .thinking = @constCast("ponder") });
+    try appendModelBlock(&model, .{ .text = @constCast("world") });
+
     var msg = AssistantMessage.init(testing.allocator);
     defer msg.deinit();
+    try msg.setOwnedModel(&model);
 
-    msg.appendThinking(0, "ponder");
+    var visible_buf = try Buffer.init(testing.allocator, 40, 8);
+    defer visible_buf.deinit();
+    msg.render(visible_buf.region());
+
+    const visible_text = try bufferText(&visible_buf, testing.allocator);
+    defer testing.allocator.free(visible_text);
+    try testing.expect(std.mem.indexOf(u8, visible_text, "hello") != null);
+    try testing.expect(std.mem.indexOf(u8, visible_text, "ponder") != null);
+    try testing.expect(std.mem.indexOf(u8, visible_text, "world") != null);
+
+    try msg.setHideThinkingBlock(true);
+
+    var hidden_buf = try Buffer.init(testing.allocator, 40, 8);
+    defer hidden_buf.deinit();
+    msg.render(hidden_buf.region());
+
+    const hidden_text = try bufferText(&hidden_buf, testing.allocator);
+    defer testing.allocator.free(hidden_text);
+    try testing.expect(std.mem.indexOf(u8, hidden_text, "Thinking...") != null);
+    try testing.expect(std.mem.indexOf(u8, hidden_text, "ponder") == null);
+}
+
+test "assistant message animation hooks are static" {
+    var model: AssistantRowModel = .{};
+    defer model.deinit(testing.allocator);
+    try appendModelBlock(&model, .{ .thinking = @constCast("ponder") });
+
+    var msg = AssistantMessage.init(testing.allocator);
+    defer msg.deinit();
+    try msg.setOwnedModel(&model);
+
     try testing.expectEqual(@as(?i128, null), msg.nextAnimationDeadline(0));
     try testing.expect(!msg.tickAnimation(0));
     try testing.expect(!msg.deactivateThinkingShimmer());

@@ -1642,10 +1642,28 @@ fn appendTestAssistantRow(transcript: *Transcript) !usize {
     return transcript.items.items.len - 1;
 }
 
+fn setTestAssistantModel(
+    transcript: *Transcript,
+    assistant: *assistant_message_mod.AssistantMessage,
+    blocks: []const assistant_message_mod.AssistantRowModel.Block,
+) !void {
+    var model: assistant_message_mod.AssistantRowModel = .{};
+    defer model.deinit(transcript.allocator);
+
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| try model.blocks.append(transcript.allocator, .{ .text = try transcript.allocator.dupe(u8, text) }),
+            .thinking => |thinking| try model.blocks.append(transcript.allocator, .{ .thinking = try transcript.allocator.dupe(u8, thinking) }),
+        }
+    }
+
+    try assistant.setOwnedModel(&model);
+}
+
 fn appendTestAssistantText(transcript: *Transcript, text: []const u8) !usize {
     const idx = try appendTestAssistantRow(transcript);
     const assistant = transcript.assistantMessageAt(idx) orelse return error.MissingAssistantRow;
-    assistant.appendText(0, text);
+    try setTestAssistantModel(transcript, assistant, &.{.{ .text = @constCast(text) }});
     transcript.itemMutatedAt(idx);
     return idx;
 }
@@ -1653,7 +1671,7 @@ fn appendTestAssistantText(transcript: *Transcript, text: []const u8) !usize {
 fn appendTestAssistantThinking(transcript: *Transcript, text: []const u8) !usize {
     const idx = try appendTestAssistantRow(transcript);
     const assistant = transcript.assistantMessageAt(idx) orelse return error.MissingAssistantRow;
-    assistant.appendThinking(0, text);
+    try setTestAssistantModel(transcript, assistant, &.{.{ .thinking = @constCast(text) }});
     transcript.itemMutatedAt(idx);
     return idx;
 }
@@ -1788,7 +1806,7 @@ test "Transcript preserves manual scroll when assistant content grows" {
     const before = transcript.scrollOffset();
 
     const assistant = transcript.assistantMessageAt(assistant_idx).?;
-    assistant.appendText(0, " eleven twelve thirteen fourteen");
+    try setTestAssistantModel(&transcript, assistant, &.{.{ .text = @constCast("one two three four five six seven eight nine ten eleven twelve thirteen fourteen") }});
     transcript.itemMutatedAt(assistant_idx);
 
     try testing.expectEqual(before, transcript.scrollOffset());

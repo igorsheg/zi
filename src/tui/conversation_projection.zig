@@ -238,10 +238,16 @@ pub const ProjectionState = struct {
                 const assistant = if (frontier.assistant) |*assistant| assistant else return false;
                 if (!appendAssistantBytes(self.allocator, assistant, assistant_target, bytes)) return false;
                 const row = transcript.assistantMessageAt(self.frontier_item_start) orelse return false;
-                switch (assistant_target.kind) {
-                    .text => row.appendText(assistant_target.content_index, bytes),
-                    .thinking => row.appendThinking(assistant_target.content_index, bytes),
+
+                var live_tool_ids: std.ArrayList([]const u8) = .empty;
+                defer live_tool_ids.deinit(self.allocator);
+                for (frontier.live_tools) |tool| {
+                    live_tool_ids.append(self.allocator, tool.tool_call_id) catch return false;
                 }
+
+                var model = buildAssistantRowModel(self.allocator, assistant.*, live_tool_ids.items) catch return false;
+                defer model.deinit(self.allocator);
+                row.setOwnedModel(&model) catch return false;
                 transcript.itemMutatedAt(self.frontier_item_start);
                 return true;
             },
@@ -984,6 +990,25 @@ fn buildCustomRow(allocator: std.mem.Allocator, theme: *const Theme, custom: age
     return createMarkdownRow(allocator, theme, content, theme.fg(.custom_message_text), theme.bg(.custom_message_bg));
 }
 
+fn buildAssistantRowModel(
+    allocator: std.mem.Allocator,
+    assistant: agent_protocol.AssistantMessage,
+    live_tool_ids: []const []const u8,
+) !assistant_message_component_mod.AssistantRowModel {
+    var model: assistant_message_component_mod.AssistantRowModel = .{};
+    errdefer model.deinit(allocator);
+
+    for (assistant.content) |block| {
+        switch (block) {
+            .text => |text| try model.blocks.append(allocator, .{ .text = try allocator.dupe(u8, text.text) }),
+            .thinking => |thinking| try model.blocks.append(allocator, .{ .thinking = try allocator.dupe(u8, thinking.thinking) }),
+            .tool_call => |tool_call| if (containsToolCallId(live_tool_ids, tool_call.id)) continue,
+        }
+    }
+
+    return model;
+}
+
 fn createAssistantMessageRow(
     allocator: std.mem.Allocator,
     assistant: agent_protocol.AssistantMessage,
@@ -991,19 +1016,16 @@ fn createAssistantMessageRow(
     theme: *const Theme,
     hide_thinking_block: bool,
 ) !TranscriptItem {
+    var model = try buildAssistantRowModel(allocator, assistant, live_tool_ids);
+    errdefer model.deinit(allocator);
+
     const am = try allocator.create(assistant_message_component_mod.AssistantMessage);
     errdefer allocator.destroy(am);
     am.* = assistant_message_component_mod.AssistantMessage.init(allocator);
     errdefer am.deinit();
     am.theme = theme;
     am.hide_thinking_block = hide_thinking_block;
-    for (assistant.content, 0..) |block, idx| {
-        switch (block) {
-            .text => |text| am.appendText(idx, text.text),
-            .thinking => |thinking| am.appendThinking(idx, thinking.thinking),
-            .tool_call => |tool_call| if (containsToolCallId(live_tool_ids, tool_call.id)) continue,
-        }
-    }
+    try am.setOwnedModel(&model);
     return .{
         .renderable = TranscriptRenderable.init(assistant_message_component_mod.AssistantMessage, am),
         .kind = .assistant_message,

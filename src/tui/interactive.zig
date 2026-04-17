@@ -1403,7 +1403,7 @@ pub const Interactive = struct {
         self.transcript.hide_thinking_block = self.hide_thinking_block;
         for (self.transcript.items.items, 0..) |_, idx| {
             const assistant = self.transcript.assistantMessageAt(idx) orelse continue;
-            assistant.setHideThinkingBlock(self.hide_thinking_block);
+            assistant.setHideThinkingBlock(self.hide_thinking_block) catch continue;
             self.transcript.itemMutatedAt(idx);
         }
     }
