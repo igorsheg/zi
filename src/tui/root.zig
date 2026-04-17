@@ -14,7 +14,6 @@ pub const ui_event = @import("ui_event.zig");
 pub const tool_display = @import("tool_display.zig");
 pub const transcript = @import("transcript.zig");
 pub const conversation_projection = @import("conversation_projection.zig");
-pub const session_resume_render = @import("session_resume_render.zig");
 pub const container = @import("container.zig");
 pub const overlay = @import("overlay.zig");
 pub const tui = @import("tui.zig");

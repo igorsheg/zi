@@ -1159,10 +1159,6 @@ pub const Interactive = struct {
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {
             .conversation_patch => |*patch| {
-                const needs_queue_resync = switch (patch.*) {
-                    .append_frontier_content => false,
-                    else => true,
-                };
                 if (self.conversation_projection.applyOwnedPatch(
                     &self.transcript,
                     self.active_editor,
@@ -1173,7 +1169,6 @@ pub const Interactive = struct {
                         .retry_attempt = self.retry_attempt,
                     },
                 )) {
-                    if (needs_queue_resync) self.syncQueueSnapshotFromRunControl();
                     self.tui.dirty = true;
                 }
             },
@@ -1266,8 +1261,18 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .queue_snapshot => |q| {
-                self.applyQueueSnapshot(q);
-                self.tui.dirty = true;
+                if (self.conversation_projection.syncOwnedQueueSnapshot(
+                    &self.transcript,
+                    self.active_editor,
+                    self.resolver,
+                    q,
+                    .{
+                        .theme = self.theme,
+                        .retry_attempt = self.retry_attempt,
+                    },
+                )) {
+                    self.tui.dirty = true;
+                }
             },
             .request_worker_finished => {
                 // Long-lived agent owner loop finished an idle request drain.
@@ -1280,10 +1285,18 @@ pub const Interactive = struct {
                 }
                 self.tui.dirty = true;
             },
-            .conversation_snapshot => |snapshot| {
+            .conversation_snapshot => |*snapshot| {
                 const was_following_bottom = self.transcript.isFollowingBottom();
-                self.reconcileConversationFromSnapshot(snapshot);
-                self.syncPatchProjectionFromSnapshot(snapshot);
+                self.conversation_projection.replaceAllOwnedSnapshot(
+                    &self.transcript,
+                    self.active_editor,
+                    self.resolver,
+                    snapshot,
+                    .{
+                        .theme = self.theme,
+                        .retry_attempt = self.retry_attempt,
+                    },
+                );
                 if (was_following_bottom) {
                     self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 }
@@ -1362,58 +1375,6 @@ pub const Interactive = struct {
         self.status_data.context_window = snapshot.context_window;
     }
 
-    fn applyQueueSnapshot(self: *Interactive, snapshot: agent_mod.QueuedMessageSnapshot) void {
-        var idx: usize = 0;
-        while (idx < self.transcript.items.items.len) {
-            if (self.transcript.items.items[idx].kind == .queued_user_message) {
-                self.transcript.removeItemAt(idx);
-                continue;
-            }
-            idx += 1;
-        }
-        for (snapshot.steering) |entry| {
-            var model = conversation_projection_mod.buildUserRowModel(
-                self.transcript.allocator,
-                entry.text,
-                .queued_steering,
-                .pending,
-            ) catch return;
-            defer model.deinit(self.transcript.allocator);
-
-            const row = conversation_projection_mod.createUserMessageRow(
-                self.transcript.allocator,
-                &model,
-                .queued_user_message,
-                self.transcript.theme,
-            ) catch return;
-            if (!self.transcript.addItem(row)) {
-                var owned_row = row;
-                owned_row.deinit(self.transcript.allocator);
-                return;
-            }
-        }
-        for (snapshot.follow_up) |entry| {
-            var model = conversation_projection_mod.buildUserRowModel(
-                self.transcript.allocator,
-                entry.text,
-                .queued_follow_up,
-                .pending,
-            ) catch return;
-            defer model.deinit(self.transcript.allocator);
-
-            const row = conversation_projection_mod.createUserMessageRow(
-                self.transcript.allocator,
-                &model,
-                .queued_user_message,
-                self.transcript.theme,
-            ) catch return;
-            if (!self.transcript.addItem(row)) {
-                var owned_row = row;
-                owned_row.deinit(self.transcript.allocator);
-                return;
-            }
-        }
-    }
 
     fn applyTranscriptHideThinkingBlock(self: *Interactive) void {
         self.transcript.hide_thinking_block = self.hide_thinking_block;
@@ -1427,7 +1388,16 @@ pub const Interactive = struct {
     fn syncQueueSnapshotFromRunControl(self: *Interactive) void {
         var snapshot = self.run_control.snapshot(self.allocator);
         defer snapshot.deinit(self.allocator);
-        self.applyQueueSnapshot(snapshot);
+        _ = self.conversation_projection.syncOwnedQueueSnapshot(
+            &self.transcript,
+            self.active_editor,
+            self.resolver,
+            snapshot,
+            .{
+                .theme = self.theme,
+                .retry_attempt = self.retry_attempt,
+            },
+        );
     }
 
     fn rebuildConversationFromMessages(self: *Interactive, messages: []const agent_protocol.AgentMessage) void {
@@ -1443,65 +1413,6 @@ pub const Interactive = struct {
         );
     }
 
-    fn reconcileConversationFromSnapshot(
-        self: *Interactive,
-        snapshot: conversation_snapshot_mod.ConversationSnapshot,
-    ) void {
-        conversation_projection_mod.reconcileFromSnapshot(
-            &self.transcript,
-            self.active_editor,
-            self.resolver,
-            snapshot,
-            .{
-                .theme = self.theme,
-                .retry_attempt = self.retry_attempt,
-            },
-        );
-    }
-
-    fn syncPatchProjectionFromSnapshot(
-        self: *Interactive,
-        snapshot: conversation_snapshot_mod.ConversationSnapshot,
-    ) void {
-        var messages: std.ArrayList(agent_protocol.AgentMessage) = .empty;
-        defer {
-            for (messages.items) |*message| message_memory.freeMessage(self.msg_allocator, message);
-            messages.deinit(self.msg_allocator);
-        }
-
-        for (snapshot.items) |item| {
-            switch (item) {
-                .committed_message => |committed| {
-                    const owned = message_memory.cloneMessage(self.msg_allocator, committed.message) catch {
-                        self.conversation_projection.clear();
-                        return;
-                    };
-                    messages.append(self.msg_allocator, owned) catch {
-                        var mutable = owned;
-                        message_memory.freeMessage(self.msg_allocator, &mutable);
-                        self.conversation_projection.clear();
-                        return;
-                    };
-                },
-                .active_assistant, .tool_execution => {
-                    self.conversation_projection.clear();
-                    return;
-                },
-                .queued_user_message => {},
-            }
-        }
-
-        self.conversation_projection.clear();
-        self.conversation_projection.snapshot = .{
-            .committed = messages.toOwnedSlice(self.msg_allocator) catch {
-                self.conversation_projection.clear();
-                return;
-            },
-            .frontier = null,
-        };
-        messages = .empty;
-        self.conversation_projection.frontier_item_start = self.transcript.items.items.len;
-    }
 
     const TranscriptMouseZone = struct {
         zone: transcript_mod.DragZone,
@@ -2999,6 +2910,7 @@ pub const Interactive = struct {
                 .tool_call_id = tool_execution.tool_call_id,
                 .tool_name = tool_execution.tool_name,
                 .args = tool_execution.args,
+                .args_json_source = tool_execution.args_json_source,
                 .args_complete = tool_execution.args_complete,
                 .execution_started = tool_execution.execution_started,
                 .result = tool_execution.result,
@@ -3110,19 +3022,6 @@ pub const Interactive = struct {
             .message_start => |ms| switch (ms.message) {
                 .user => self.publishQueueSnapshot(),
                 else => {},
-            },
-            else => {},
-        }
-    }
-
-    fn publishConversationSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
-        switch (event) {
-            .message_start => |ms| switch (ms.message) {
-                .assistant => _ = self.publishConversationSnapshot(),
-                else => {},
-            },
-            .message_update, .message_end, .tool_execution_start, .tool_execution_update, .tool_execution_end => {
-                _ = self.publishConversationSnapshot();
             },
             else => {},
         }

@@ -90,8 +90,7 @@ pub fn rebuildFromMessages(
 
 pub const ProjectionState = struct {
     allocator: std.mem.Allocator,
-    snapshot: ?conversation_mod.ConversationSnapshot = null,
-    frontier_item_start: usize = 0,
+    snapshot: ?conversation_snapshot_mod.ConversationSnapshot = null,
 
     pub fn init(allocator: std.mem.Allocator) ProjectionState {
         return .{ .allocator = allocator };
@@ -106,7 +105,6 @@ pub const ProjectionState = struct {
             snapshot.deinit(self.allocator);
             self.snapshot = null;
         }
-        self.frontier_item_start = 0;
     }
 
     pub fn replaceAllFromMessages(
@@ -117,13 +115,40 @@ pub const ProjectionState = struct {
         messages: []const agent_protocol.AgentMessage,
         options: RebuildOptions,
     ) void {
-        const committed = message_memory.cloneMessages(self.allocator, messages) catch return;
+        var snapshot = conversation_snapshot_mod.build(self.allocator, .{
+            .version = 1,
+            .messages = messages,
+        }) catch return;
+        self.replaceAllOwnedSnapshot(transcript, editor, resolver, &snapshot, options);
+    }
+
+    pub fn replaceAllOwnedSnapshot(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        snapshot: *conversation_snapshot_mod.ConversationSnapshot,
+        options: RebuildOptions,
+    ) void {
+        const owned_snapshot = snapshot.*;
+        snapshot.* = undefined;
         self.clear();
-        self.snapshot = .{
-            .committed = committed,
-            .frontier = null,
-        };
-        self.rebuildTranscript(transcript, editor, resolver, options);
+        self.snapshot = owned_snapshot;
+        reconcileFromSnapshot(transcript, editor, resolver, self.snapshot.?, options);
+    }
+
+    pub fn syncOwnedQueueSnapshot(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        queue_snapshot: run_control_mod.QueuedMessageSnapshot,
+        options: RebuildOptions,
+    ) bool {
+        const snapshot = self.ensureSnapshot() orelse return false;
+        if (!self.replaceQueuedItems(snapshot, queue_snapshot)) return false;
+        reconcileFromSnapshot(transcript, editor, resolver, snapshot.*, options);
+        return true;
     }
 
     pub fn applyOwnedPatch(
@@ -135,235 +160,332 @@ pub const ProjectionState = struct {
         options: RebuildOptions,
     ) bool {
         switch (patch.*) {
-            .replace_all => |*snapshot| {
-                self.replaceAllOwnedSnapshot(transcript, editor, resolver, snapshot, options);
+            .replace_all => |*legacy_snapshot| {
+                var owned_legacy = legacy_snapshot.*;
+                legacy_snapshot.* = undefined;
                 patch.* = .commit_frontier;
-                return true;
+                defer owned_legacy.deinit(self.allocator);
+                if (!self.replaceAllFromLegacySnapshot(owned_legacy)) return false;
             },
             .append_committed => |*message| {
                 const owned_message = message.*;
                 message.* = undefined;
                 patch.* = .commit_frontier;
-                return self.appendCommittedOwned(transcript, editor, resolver, owned_message, options);
+                defer {
+                    var mutable = owned_message;
+                    message_memory.freeMessage(self.allocator, &mutable);
+                }
+                if (!self.appendCommittedMessage(owned_message)) return false;
             },
             .replace_frontier => |*frontier| {
-                const owned_frontier = frontier.*;
+                var owned_frontier = frontier.*;
                 frontier.* = null;
                 patch.* = .commit_frontier;
-                return self.replaceFrontierOwned(transcript, resolver, owned_frontier);
+                defer if (owned_frontier) |*frontier_value| frontier_value.deinit(self.allocator);
+                if (!self.replaceLiveItemsFromFrontier(owned_frontier)) return false;
             },
             .append_frontier_content => |append| {
-                return self.appendFrontierContent(transcript, append.target, append.bytes);
+                if (!self.applyFrontierContentDelta(append.target, append.bytes)) return false;
             },
             .commit_frontier => {
-                return self.commitFrontier(transcript);
+                if (!self.clearLiveItems()) return false;
             },
         }
+
+        const snapshot = self.snapshot orelse return false;
+        reconcileFromSnapshot(transcript, editor, resolver, snapshot, options);
+        return true;
     }
 
-    fn replaceAllOwnedSnapshot(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        snapshot: *conversation_mod.ConversationSnapshot,
-        options: RebuildOptions,
-    ) void {
-        const owned_snapshot = snapshot.*;
-        snapshot.* = undefined;
-        self.clear();
-        self.snapshot = owned_snapshot;
-        self.rebuildTranscript(transcript, editor, resolver, options);
-    }
-
-    fn appendCommittedOwned(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        message: agent_protocol.AgentMessage,
-        options: RebuildOptions,
-    ) bool {
-        const snapshot = self.ensureSnapshot() orelse {
-            var mutable = message;
-            message_memory.freeMessage(self.allocator, &mutable);
-            return false;
+    fn replaceAllFromLegacySnapshot(self: *ProjectionState, legacy: conversation_mod.ConversationSnapshot) bool {
+        var replacement: std.ArrayList(conversation_snapshot_mod.ConversationItem) = .empty;
+        var success = false;
+        defer if (!success) {
+            for (replacement.items) |*item| item.deinit(self.allocator);
+            replacement.deinit(self.allocator);
         };
 
-        const grown = self.allocator.alloc(agent_protocol.AgentMessage, snapshot.committed.len + 1) catch {
-            var mutable = message;
-            message_memory.freeMessage(self.allocator, &mutable);
-            return false;
-        };
-        @memcpy(grown[0..snapshot.committed.len], snapshot.committed);
-        grown[snapshot.committed.len] = message;
-        self.allocator.free(snapshot.committed);
-        snapshot.committed = grown;
-
-        seedHistoryFromMessage(editor, message);
-        appendProjectedMessage(transcript, resolver, message, options);
-        if (snapshot.frontier == null) {
-            self.frontier_item_start = transcript.items.items.len;
+        for (legacy.committed, 0..) |message, idx| {
+            replacement.append(self.allocator, .{ .committed_message = conversation_snapshot_mod.initCommittedMessageItem(self.allocator, idx, message) catch return false }) catch return false;
         }
+        if (!appendLiveItemsFromFrontier(self.allocator, &replacement, legacy.frontier)) return false;
+        if (!appendQueuedItemsFromSnapshot(self.allocator, &replacement, self.snapshot)) return false;
+
+        const owned_items = replacement.toOwnedSlice(self.allocator) catch return false;
+        success = true;
+        replacement = .empty;
+        self.replaceOwnedItems(nextSnapshotVersion(self.snapshot), owned_items);
         return true;
     }
 
-    fn replaceFrontierOwned(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        resolver: ToolRendererResolver,
-        frontier: ?conversation_mod.ConversationFrontier,
-    ) bool {
-        var owned_frontier = frontier;
-        const snapshot = self.ensureSnapshot() orelse {
-            if (owned_frontier) |*owned| owned.deinit(self.allocator);
-            return false;
+    fn appendCommittedMessage(self: *ProjectionState, message: agent_protocol.AgentMessage) bool {
+        const snapshot = self.ensureSnapshot() orelse return false;
+        var item = conversation_snapshot_mod.ConversationItem{ .committed_message = conversation_snapshot_mod.initCommittedMessageItem(
+            self.allocator,
+            committedMessageCount(snapshot.items),
+            message,
+        ) catch return false };
+        errdefer item.deinit(self.allocator);
+        return self.insertOwnedItem(snapshot, committedMessageCount(snapshot.items), item);
+    }
+
+    fn replaceLiveItemsFromFrontier(self: *ProjectionState, frontier: ?conversation_mod.ConversationFrontier) bool {
+        const snapshot = self.ensureSnapshot() orelse return false;
+        var replacement: std.ArrayList(conversation_snapshot_mod.ConversationItem) = .empty;
+        var success = false;
+        defer if (!success) {
+            for (replacement.items) |*item| item.deinit(self.allocator);
+            replacement.deinit(self.allocator);
         };
-        if (snapshot.frontier) |*old| old.deinit(self.allocator);
-        snapshot.frontier = owned_frontier;
-        self.syncFrontierTail(transcript, resolver);
-        return true;
+
+        if (!appendLiveItemsFromFrontier(self.allocator, &replacement, frontier)) return false;
+        const owned_items = replacement.toOwnedSlice(self.allocator) catch return false;
+        success = true;
+        replacement = .empty;
+
+        const range = liveItemRange(snapshot.items);
+        return self.replaceOwnedRange(snapshot, range.start, range.end, owned_items);
     }
 
-    fn appendFrontierContent(
+    fn applyFrontierContentDelta(
         self: *ProjectionState,
-        transcript: *Transcript,
         target: conversation_mod.FrontierAppendTarget,
         bytes: []const u8,
     ) bool {
         const snapshot = if (self.snapshot) |*snapshot| snapshot else return false;
-        const frontier = if (snapshot.frontier) |*frontier| frontier else return false;
         switch (target) {
             .assistant_content => |assistant_target| {
-                const assistant = if (frontier.assistant) |*assistant| assistant else return false;
-                if (!appendAssistantBytes(self.allocator, assistant, assistant_target, bytes)) return false;
-                const row = transcript.assistantMessageAt(self.frontier_item_start) orelse return false;
-
-                var live_tool_ids: std.ArrayList([]const u8) = .empty;
-                defer live_tool_ids.deinit(self.allocator);
-                for (frontier.live_tools) |tool| {
-                    live_tool_ids.append(self.allocator, tool.tool_call_id) catch return false;
-                }
-
-                var model = buildAssistantRowModel(self.allocator, assistant.*, live_tool_ids.items) catch return false;
-                defer model.deinit(self.allocator);
-                row.setOwnedModel(&model) catch return false;
-                transcript.itemMutatedAt(self.frontier_item_start);
+                const assistant = activeAssistantItem(snapshot.items) orelse return false;
+                if (assistant.message != .assistant) return false;
+                if (!appendAssistantBytes(self.allocator, &assistant.message.assistant, assistant_target, bytes)) return false;
+                conversation_snapshot_mod.refreshActiveAssistantItemIdentity(assistant);
+                bumpSnapshotVersion(snapshot);
                 return true;
             },
             .tool_call_arguments => |tool_target| {
-                const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
-                if (!appendLiveToolArgumentsBytes(self.allocator, tool, bytes)) return false;
-                const row = toolExecutionRowRef(transcript, tool_target.tool_call_id) orelse return false;
-                var model = buildLiveToolExecutionRowModel(self.allocator, tool.*) catch return false;
-                defer model.deinit(self.allocator);
-                row.tool.setOwnedModel(&model) catch return false;
-                transcript.itemMutatedAt(row.index);
+                const tool = toolExecutionItem(snapshot.items, tool_target.tool_call_id) orelse return false;
+                if (!appendToolExecutionArgumentsBytes(self.allocator, tool, bytes)) return false;
+                conversation_snapshot_mod.refreshToolExecutionItemIdentity(tool);
+                bumpSnapshotVersion(snapshot);
                 return true;
             },
             .tool_result_content => |tool_target| {
-                const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
-                if (!appendLiveToolResultTextBytes(self.allocator, tool, tool_target.content_index, bytes)) return false;
-                const row = toolExecutionRowRef(transcript, tool_target.tool_call_id) orelse return false;
-                var model = buildLiveToolExecutionRowModel(self.allocator, tool.*) catch return false;
-                defer model.deinit(self.allocator);
-                row.tool.setOwnedModel(&model) catch return false;
-                transcript.itemMutatedAt(row.index);
+                const tool = toolExecutionItem(snapshot.items, tool_target.tool_call_id) orelse return false;
+                if (!appendToolExecutionResultTextBytes(self.allocator, tool, tool_target.content_index, bytes)) return false;
+                conversation_snapshot_mod.refreshToolExecutionItemIdentity(tool);
+                bumpSnapshotVersion(snapshot);
                 return true;
             },
         }
     }
 
-    fn commitFrontier(self: *ProjectionState, transcript: *Transcript) bool {
-        const snapshot = self.snapshot orelse return false;
-        if (snapshot.frontier == null) return false;
-        if (self.snapshot) |*owned| {
-            if (owned.frontier) |*frontier| frontier.deinit(self.allocator);
-            owned.frontier = null;
-        }
-        transcript.truncateFrom(self.frontier_item_start);
-        self.frontier_item_start = transcript.items.items.len;
-        return true;
+    fn clearLiveItems(self: *ProjectionState) bool {
+        const snapshot = if (self.snapshot) |*snapshot| snapshot else return false;
+        const range = liveItemRange(snapshot.items);
+        if (range.start == range.end) return false;
+        const empty = self.allocator.alloc(conversation_snapshot_mod.ConversationItem, 0) catch return false;
+        return self.replaceOwnedRange(snapshot, range.start, range.end, empty);
     }
 
-    fn ensureSnapshot(self: *ProjectionState) ?*conversation_mod.ConversationSnapshot {
+    fn replaceQueuedItems(
+        self: *ProjectionState,
+        snapshot: *conversation_snapshot_mod.ConversationSnapshot,
+        queue_snapshot: run_control_mod.QueuedMessageSnapshot,
+    ) bool {
+        var replacement: std.ArrayList(conversation_snapshot_mod.ConversationItem) = .empty;
+        var success = false;
+        defer if (!success) {
+            for (replacement.items) |*item| item.deinit(self.allocator);
+            replacement.deinit(self.allocator);
+        };
+
+        for (queue_snapshot.steering, 0..) |entry, idx| {
+            replacement.append(self.allocator, .{ .queued_user_message = conversation_snapshot_mod.initQueuedUserMessageItem(
+                self.allocator,
+                .steering,
+                idx,
+                entry.text,
+            ) catch return false }) catch return false;
+        }
+        for (queue_snapshot.follow_up, 0..) |entry, idx| {
+            replacement.append(self.allocator, .{ .queued_user_message = conversation_snapshot_mod.initQueuedUserMessageItem(
+                self.allocator,
+                .follow_up,
+                idx,
+                entry.text,
+            ) catch return false }) catch return false;
+        }
+
+        const owned_items = replacement.toOwnedSlice(self.allocator) catch return false;
+        success = true;
+        replacement = .empty;
+        return self.replaceOwnedRange(snapshot, firstQueueIndex(snapshot.items), snapshot.items.len, owned_items);
+    }
+
+    fn ensureSnapshot(self: *ProjectionState) ?*conversation_snapshot_mod.ConversationSnapshot {
         if (self.snapshot == null) {
-            const committed = self.allocator.alloc(agent_protocol.AgentMessage, 0) catch return null;
-            self.snapshot = .{
-                .committed = committed,
-                .frontier = null,
-            };
+            const items = self.allocator.alloc(conversation_snapshot_mod.ConversationItem, 0) catch return null;
+            self.snapshot = .{ .version = 1, .items = items };
         }
         return &self.snapshot.?;
     }
 
-    fn rebuildTranscript(
+    fn insertOwnedItem(
         self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        options: RebuildOptions,
-    ) void {
-        const snapshot = self.snapshot orelse {
-            transcript.clearAll();
-            editor.clearHistory();
-            self.frontier_item_start = 0;
-            return;
-        };
-
-        transcript.clearAll();
-        editor.clearHistory();
-        for (snapshot.committed) |message| {
-            seedHistoryFromMessage(editor, message);
-            appendProjectedMessage(transcript, resolver, message, options);
-        }
-        transcript.clearPendingToolRouting();
-        self.frontier_item_start = transcript.items.items.len;
-        self.syncFrontierTail(transcript, resolver);
+        snapshot: *conversation_snapshot_mod.ConversationSnapshot,
+        index: usize,
+        item: conversation_snapshot_mod.ConversationItem,
+    ) bool {
+        const old_items = snapshot.items;
+        const new_items = self.allocator.alloc(conversation_snapshot_mod.ConversationItem, old_items.len + 1) catch return false;
+        @memcpy(new_items[0..index], old_items[0..index]);
+        new_items[index] = item;
+        @memcpy(new_items[index + 1 ..], old_items[index..]);
+        self.allocator.free(old_items);
+        snapshot.items = new_items;
+        bumpSnapshotVersion(snapshot);
+        return true;
     }
 
-    fn syncFrontierTail(self: *ProjectionState, transcript: *Transcript, resolver: ToolRendererResolver) void {
-        transcript.truncateFrom(self.frontier_item_start);
-        const snapshot = self.snapshot orelse return;
-        const frontier = snapshot.frontier orelse return;
-        appendProjectedFrontierRows(transcript, resolver, frontier);
+    fn replaceOwnedRange(
+        self: *ProjectionState,
+        snapshot: *conversation_snapshot_mod.ConversationSnapshot,
+        start: usize,
+        end: usize,
+        replacement: []conversation_snapshot_mod.ConversationItem,
+    ) bool {
+        const old_items = snapshot.items;
+        const new_len = old_items.len - (end - start) + replacement.len;
+        const new_items = self.allocator.alloc(conversation_snapshot_mod.ConversationItem, new_len) catch return false;
+
+        @memcpy(new_items[0..start], old_items[0..start]);
+        @memcpy(new_items[start .. start + replacement.len], replacement);
+        @memcpy(new_items[start + replacement.len ..], old_items[end..]);
+
+        for (old_items[start..end]) |*item| item.deinit(self.allocator);
+        self.allocator.free(old_items);
+        self.allocator.free(replacement);
+
+        snapshot.items = new_items;
+        bumpSnapshotVersion(snapshot);
+        return true;
+    }
+
+    fn replaceOwnedItems(
+        self: *ProjectionState,
+        version: u64,
+        items: []conversation_snapshot_mod.ConversationItem,
+    ) void {
+        self.clear();
+        self.snapshot = .{ .version = version, .items = items };
     }
 };
 
-fn appendProjectedFrontierRows(
-    transcript: *Transcript,
-    resolver: ToolRendererResolver,
-    frontier: conversation_mod.ConversationFrontier,
-) void {
-    var live_tool_ids: std.ArrayList([]const u8) = .empty;
-    defer live_tool_ids.deinit(transcript.allocator);
-    for (frontier.live_tools) |tool| {
-        live_tool_ids.append(transcript.allocator, tool.tool_call_id) catch return;
-    }
+const LiveRange = struct {
+    start: usize,
+    end: usize,
+};
 
-    if (frontier.assistant) |assistant| {
-        const row = createAssistantMessageRow(
-            transcript.allocator,
-            assistant,
-            live_tool_ids.items,
-            transcript.theme,
-            transcript.hide_thinking_block,
-        ) catch return;
-        if (!transcript.addItem(row)) {
-            var owned_row = row;
-            owned_row.deinit(transcript.allocator);
-            return;
+fn appendLiveItemsFromFrontier(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(conversation_snapshot_mod.ConversationItem),
+    frontier: ?conversation_mod.ConversationFrontier,
+) bool {
+    const owned_frontier = frontier orelse return true;
+    if (owned_frontier.assistant) |assistant| {
+        out.append(allocator, .{ .active_assistant = conversation_snapshot_mod.initActiveAssistantItem(allocator, assistant) catch return false }) catch return false;
+    }
+    for (owned_frontier.live_tools) |tool| {
+        var tool_result: ?AgentToolResult = null;
+        defer if (tool_result) |result| result.free(allocator);
+        if (tool.result_message) |result_message| {
+            tool_result = toolResultMessageAsAgentToolResult(allocator, result_message) catch return false;
+        } else if (tool.result) |result| {
+            tool_result = result.clone(allocator) catch return false;
+        }
+        out.append(allocator, .{ .tool_execution = conversation_snapshot_mod.initToolExecutionItem(allocator, .{
+            .tool_call_id = tool.tool_call_id,
+            .tool_name = tool.tool_name,
+            .args = tool.args,
+            .args_json_source = tool.args_json_source,
+            .args_complete = tool.args_complete,
+            .execution_started = tool.execution_started,
+            .result = tool_result,
+            .is_error = if (tool.result_message) |result_message| result_message.is_error else tool.is_error,
+            .is_partial = if (tool.result_message != null) false else tool.is_partial,
+        }) catch return false }) catch return false;
+    }
+    return true;
+}
+
+fn appendQueuedItemsFromSnapshot(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(conversation_snapshot_mod.ConversationItem),
+    snapshot: ?conversation_snapshot_mod.ConversationSnapshot,
+) bool {
+    const owned_snapshot = snapshot orelse return true;
+    for (owned_snapshot.items) |item| {
+        if (item != .queued_user_message) continue;
+        out.append(allocator, .{ .queued_user_message = item.queued_user_message.clone(allocator) catch return false }) catch return false;
+    }
+    return true;
+}
+
+fn committedMessageCount(items: []const conversation_snapshot_mod.ConversationItem) usize {
+    var count: usize = 0;
+    while (count < items.len and items[count] == .committed_message) : (count += 1) {}
+    return count;
+}
+
+fn firstQueueIndex(items: []const conversation_snapshot_mod.ConversationItem) usize {
+    for (items, 0..) |item, idx| {
+        if (item == .queued_user_message) return idx;
+    }
+    return items.len;
+}
+
+fn liveItemRange(items: []const conversation_snapshot_mod.ConversationItem) LiveRange {
+    const start = committedMessageCount(items);
+    var end = start;
+    while (end < items.len) : (end += 1) {
+        switch (items[end]) {
+            .active_assistant, .tool_execution => {},
+            else => break,
         }
     }
+    return .{ .start = start, .end = end };
+}
 
-    for (frontier.live_tools) |tool| {
-        const row = createLiveToolExecutionRow(transcript.allocator, resolver, tool, transcript.theme) catch return;
-        if (!transcript.addItem(row)) {
-            var owned_row = row;
-            owned_row.deinit(transcript.allocator);
-            return;
-        }
+fn activeAssistantItem(items: []conversation_snapshot_mod.ConversationItem) ?*conversation_snapshot_mod.ActiveAssistantItem {
+    for (items) |*item| {
+        if (item.* == .active_assistant) return &item.active_assistant;
     }
+    return null;
+}
+
+fn toolExecutionItem(
+    items: []conversation_snapshot_mod.ConversationItem,
+    tool_call_id: []const u8,
+) ?*conversation_snapshot_mod.ToolExecutionItem {
+    for (items) |*item| {
+        if (item.* != .tool_execution) continue;
+        if (std.mem.eql(u8, item.tool_execution.tool_call_id, tool_call_id)) return &item.tool_execution;
+    }
+    return null;
+}
+
+fn bumpSnapshotVersion(snapshot: *conversation_snapshot_mod.ConversationSnapshot) void {
+    snapshot.version +%= 1;
+    if (snapshot.version == 0) snapshot.version = 1;
+}
+
+fn nextSnapshotVersion(snapshot: ?conversation_snapshot_mod.ConversationSnapshot) u64 {
+    if (snapshot) |existing| {
+        var next = existing.version +% 1;
+        if (next == 0) next = 1;
+        return next;
+    }
+    return 1;
 }
 
 pub fn rebuildFromSnapshot(
@@ -558,16 +680,9 @@ fn disarmDesiredRow(item: *DesiredItem) void {
     item.row.deinit_fn = null;
 }
 
-fn findLiveToolExecution(live_tools: []conversation_mod.LiveToolExecution, tool_call_id: []const u8) ?*conversation_mod.LiveToolExecution {
-    for (live_tools) |*tool| {
-        if (std.mem.eql(u8, tool.tool_call_id, tool_call_id)) return tool;
-    }
-    return null;
-}
-
-fn appendLiveToolArgumentsBytes(
+fn appendToolExecutionArgumentsBytes(
     allocator: std.mem.Allocator,
-    tool: *conversation_mod.LiveToolExecution,
+    tool: *conversation_snapshot_mod.ToolExecutionItem,
     bytes: []const u8,
 ) bool {
     const combined = if (tool.args_json_source) |source|
@@ -583,9 +698,9 @@ fn appendLiveToolArgumentsBytes(
     return true;
 }
 
-fn appendLiveToolResultTextBytes(
+fn appendToolExecutionResultTextBytes(
     allocator: std.mem.Allocator,
-    tool: *conversation_mod.LiveToolExecution,
+    tool: *conversation_snapshot_mod.ToolExecutionItem,
     content_index: usize,
     bytes: []const u8,
 ) bool {
@@ -607,7 +722,7 @@ const LiveToolResultBlockRef = struct {
 
 fn ensureLiveToolResultTextBlock(
     allocator: std.mem.Allocator,
-    tool: *conversation_mod.LiveToolExecution,
+    tool: *conversation_snapshot_mod.ToolExecutionItem,
     content_index: usize,
     bytes: []const u8,
 ) ?LiveToolResultBlockRef {
@@ -712,25 +827,6 @@ fn appendBytesOwned(allocator: std.mem.Allocator, existing: []const u8, extra: [
     @memcpy(out[0..existing.len], existing);
     @memcpy(out[existing.len..], extra);
     return out;
-}
-
-// Legacy resume-only wrappers. New callers should use
-// `rebuildFromMessages` / `rebuildFromSnapshot` / `ProjectionState.applyOwnedPatch`.
-pub fn seedEditorHistory(editor: EditorInterface, messages: []const agent_protocol.AgentMessage) void {
-    editor.clearHistory();
-    for (messages) |message| seedHistoryFromMessage(editor, message);
-}
-
-pub fn applySessionMessages(
-    transcript: *Transcript,
-    resolver: ToolRendererResolver,
-    messages: []const agent_protocol.AgentMessage,
-    options: RebuildOptions,
-) void {
-    for (messages) |message| {
-        appendProjectedMessage(transcript, resolver, message, options);
-    }
-    transcript.clearPendingToolRouting();
 }
 
 fn seedHistoryFromMessage(editor: EditorInterface, message: agent_protocol.AgentMessage) void {
@@ -1103,7 +1199,7 @@ fn createToolExecutionRow(
         tool_execution.tool_call_id,
         tool_execution.tool_name,
         tool_execution.args,
-        null,
+        tool_execution.args_json_source,
         tool_execution.args_complete,
         tool_execution.execution_started,
         tool_execution.result,
@@ -1871,8 +1967,8 @@ test "ProjectionState applies assistant text frontier deltas" {
     ));
 
     try testing.expect(projection.snapshot != null);
-    try testing.expect(projection.snapshot.?.frontier != null);
-    try testing.expectEqualStrings("running bash", projection.snapshot.?.frontier.?.assistant.?.content[0].text.text);
+    const active_assistant = activeAssistantItem(projection.snapshot.?.items) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("running bash", active_assistant.message.assistant.content[0].text.text);
 
     const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
     defer testing.allocator.free(rendered);
@@ -1932,7 +2028,7 @@ test "ProjectionState applies tool argument frontier deltas" {
         .{ .theme = themes_builtin.dark() },
     ));
 
-    const frontier_tool = projection.snapshot.?.frontier.?.live_tools[0];
+    const frontier_tool = toolExecutionItem(projection.snapshot.?.items, "tc-1") orelse return error.TestUnexpectedResult;
     try testing.expect(frontier_tool.args == .object);
     try testing.expectEqualStrings("hello", frontier_tool.args.object.get("cmd").?.string);
     try testing.expect(frontier_tool.args_json_source != null);
@@ -1999,7 +2095,7 @@ test "ProjectionState applies tool result frontier deltas" {
         .{ .theme = themes_builtin.dark() },
     ));
 
-    const frontier_tool = projection.snapshot.?.frontier.?.live_tools[0];
+    const frontier_tool = toolExecutionItem(projection.snapshot.?.items, "tc-1") orelse return error.TestUnexpectedResult;
     try testing.expect(frontier_tool.result != null);
     try testing.expectEqualStrings("partial output", frontier_tool.result.?.content[0].text.text);
 
@@ -2093,8 +2189,8 @@ test "ProjectionState commits frontier then appends final assistant and tool-res
     ));
 
     try testing.expect(projection.snapshot != null);
-    try testing.expect(projection.snapshot.?.frontier == null);
-    try testing.expectEqual(@as(usize, 2), projection.snapshot.?.committed.len);
+    try testing.expect(activeAssistantItem(projection.snapshot.?.items) == null);
+    try testing.expectEqual(@as(usize, 2), committedMessageCount(projection.snapshot.?.items));
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
     try testing.expectEqual(@as(usize, 0), transcript.pending_tools.count());
 

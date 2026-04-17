@@ -17,6 +17,7 @@ pub const ToolExecutionInput = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     args: std.json.Value = .null,
+    args_json_source: ?[]const u8 = null,
     args_complete: bool = false,
     execution_started: bool = false,
     result: ?protocol.AgentToolResult = null,
@@ -26,9 +27,8 @@ pub const ToolExecutionInput = struct {
 
 /// Owned semantic snapshot of the transcript-visible conversation state.
 ///
-/// Phase 1 of the projection refactor snapshots committed messages plus
-/// queued user rows. Live active-assistant / tool-execution items land in
-/// the cutover slices that remove delta-driven transcript mutation.
+/// This is the authoritative TUI semantic contract for committed messages,
+/// active assistant state, live tool execution rows, and queued user input.
 pub const ConversationSnapshot = struct {
     version: u64,
     items: []ConversationItem,
@@ -165,6 +165,7 @@ pub const ToolExecutionItem = struct {
     tool_call_id: []u8,
     tool_name: []u8,
     args: std.json.Value = .null,
+    args_json_source: ?[]u8 = null,
     args_complete: bool = false,
     execution_started: bool = false,
     result: ?protocol.AgentToolResult = null,
@@ -183,6 +184,11 @@ pub const ToolExecutionItem = struct {
         errdefer allocator.free(tool_name);
         const args = try json_util.cloneJsonValue(allocator, input.args);
         errdefer json_util.freeJsonValue(allocator, args);
+        const args_json_source = if (input.args_json_source) |source|
+            try allocator.dupe(u8, source)
+        else
+            null;
+        errdefer if (args_json_source) |source| allocator.free(source);
         const result = if (input.result) |result| try result.clone(allocator) else null;
         errdefer if (result) |owned| owned.free(allocator);
 
@@ -192,6 +198,7 @@ pub const ToolExecutionItem = struct {
             .tool_call_id = tool_call_id,
             .tool_name = tool_name,
             .args = args,
+            .args_json_source = args_json_source,
             .args_complete = input.args_complete,
             .execution_started = input.execution_started,
             .result = result,
@@ -205,6 +212,7 @@ pub const ToolExecutionItem = struct {
             .tool_call_id = self.tool_call_id,
             .tool_name = self.tool_name,
             .args = self.args,
+            .args_json_source = self.args_json_source,
             .args_complete = self.args_complete,
             .execution_started = self.execution_started,
             .result = self.result,
@@ -217,6 +225,7 @@ pub const ToolExecutionItem = struct {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
         json_util.freeJsonValue(allocator, self.args);
+        if (self.args_json_source) |source| allocator.free(source);
         if (self.result) |result| result.free(allocator);
         self.* = undefined;
     }
@@ -261,6 +270,84 @@ pub const BuildInputs = struct {
     steering: []const run_control.QueuedMessageText = &.{},
     follow_up: []const run_control.QueuedMessageText = &.{},
 };
+
+pub fn initCommittedMessageItem(
+    allocator: std.mem.Allocator,
+    index: usize,
+    message: protocol.AgentMessage,
+) !CommittedMessageItem {
+    return CommittedMessageItem.initClone(
+        allocator,
+        committedMessageId(index, message),
+        committedMessageSemanticVersion(message),
+        message,
+    );
+}
+
+pub fn initActiveAssistantItem(
+    allocator: std.mem.Allocator,
+    message: protocol.AssistantMessage,
+) !ActiveAssistantItem {
+    return ActiveAssistantItem.initClone(
+        allocator,
+        activeAssistantId(message),
+        activeAssistantSemanticVersion(message),
+        message,
+    );
+}
+
+pub fn initToolExecutionItem(
+    allocator: std.mem.Allocator,
+    input: ToolExecutionInput,
+) !ToolExecutionItem {
+    return ToolExecutionItem.initClone(
+        allocator,
+        toolExecutionId(input.tool_call_id),
+        toolExecutionSemanticVersion(input),
+        input,
+    );
+}
+
+pub fn initQueuedUserMessageItem(
+    allocator: std.mem.Allocator,
+    kind: QueuedUserMessageKind,
+    ordinal: usize,
+    text: []const u8,
+) !QueuedUserMessageItem {
+    return QueuedUserMessageItem.initClone(
+        allocator,
+        queuedUserMessageId(kind, ordinal),
+        queuedUserMessageSemanticVersion(text),
+        kind,
+        text,
+    );
+}
+
+pub fn refreshActiveAssistantItemIdentity(item: *ActiveAssistantItem) void {
+    std.debug.assert(item.message == .assistant);
+    item.item_id = activeAssistantId(item.message.assistant);
+    item.semantic_version = activeAssistantSemanticVersion(item.message.assistant);
+}
+
+pub fn refreshToolExecutionItemIdentity(item: *ToolExecutionItem) void {
+    item.item_id = toolExecutionId(item.tool_call_id);
+    item.semantic_version = toolExecutionSemanticVersion(.{
+        .tool_call_id = item.tool_call_id,
+        .tool_name = item.tool_name,
+        .args = item.args,
+        .args_json_source = item.args_json_source,
+        .args_complete = item.args_complete,
+        .execution_started = item.execution_started,
+        .result = item.result,
+        .is_error = item.is_error,
+        .is_partial = item.is_partial,
+    });
+}
+
+pub fn refreshQueuedUserMessageItemIdentity(item: *QueuedUserMessageItem, ordinal: usize) void {
+    item.item_id = queuedUserMessageId(item.kind, ordinal);
+    item.semantic_version = queuedUserMessageSemanticVersion(item.text);
+}
 
 pub fn build(allocator: std.mem.Allocator, inputs: BuildInputs) !ConversationSnapshot {
     var items: std.ArrayList(ConversationItem) = .empty;
@@ -395,6 +482,12 @@ fn toolExecutionSemanticVersion(input: ToolExecutionInput) SemanticVersion {
     hasher.update(input.tool_call_id);
     hasher.update(input.tool_name);
     hashJsonValue(&hasher, input.args);
+    if (input.args_json_source) |source| {
+        std.hash.autoHash(&hasher, true);
+        hasher.update(source);
+    } else {
+        std.hash.autoHash(&hasher, false);
+    }
     std.hash.autoHash(&hasher, input.args_complete);
     std.hash.autoHash(&hasher, input.execution_started);
     std.hash.autoHash(&hasher, input.is_error);
@@ -750,7 +843,8 @@ test "build includes active assistant and live tool execution items" {
             .tool_call_id = "tool-1",
             .tool_name = "bash",
             .args = .null,
-            .args_complete = true,
+            .args_json_source = "{\"cmd\":\"he",
+            .args_complete = false,
             .execution_started = true,
             .result = tool_result,
             .is_error = false,
@@ -764,6 +858,8 @@ test "build includes active assistant and live tool execution items" {
     try testing.expect(snapshot.items[2] == .tool_execution);
     try testing.expectEqualStrings("working", snapshot.items[1].active_assistant.message.assistant.content[0].text.text);
     try testing.expectEqualStrings("tool-1", snapshot.items[2].tool_execution.tool_call_id);
+    try testing.expect(snapshot.items[2].tool_execution.args_json_source != null);
+    try testing.expectEqualStrings("{\"cmd\":\"he", snapshot.items[2].tool_execution.args_json_source.?);
     try testing.expect(snapshot.items[2].tool_execution.result != null);
     try testing.expectEqualStrings("partial", snapshot.items[2].tool_execution.result.?.content[0].text.text);
 }
