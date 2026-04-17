@@ -1083,20 +1083,6 @@ pub const Transcript = struct {
         }
     }
 
-    pub fn syncQueuedUserMessages(
-        self: *Transcript,
-        steering: []const agent_mod.QueuedMessageText,
-        follow_up: []const agent_mod.QueuedMessageText,
-    ) void {
-        self.clearQueuedUserMessages();
-        for (steering) |entry| {
-            self.addQueuedUserMessage(.{ .text = entry.text, .footer = .queued_steering });
-        }
-        for (follow_up) |entry| {
-            self.addQueuedUserMessage(.{ .text = entry.text, .footer = .queued_follow_up });
-        }
-    }
-
     /// Remove all items and reset state. Used on session reset / /clear.
     pub fn clearAll(self: *Transcript) void {
         self.cancelSelection();
@@ -1288,40 +1274,6 @@ pub const Transcript = struct {
                 self.noteItemMutated(idx);
             }
         }
-    }
-
-    fn addUserMessageWithKind(self: *Transcript, props: user_message_mod.Props, kind: ItemKind) void {
-        const msg = self.allocator.create(user_message_mod.UserMessage) catch return;
-        msg.* = user_message_mod.UserMessage.init(self.allocator);
-        msg.setTheme(self.theme);
-
-        var message_props = props;
-        message_props.status = if (kind == .queued_user_message)
-            .pending
-        else
-            .in_chat;
-        msg.setProps(message_props);
-
-        if (!self.appendTranscriptItem(.{
-            .renderable = TranscriptRenderable.init(user_message_mod.UserMessage, msg),
-            .kind = kind,
-            .extra_height = 1, // spacer before user message
-            .deinit_ctx = @ptrCast(msg),
-            .deinit_fn = deinitUserMessage,
-        })) {
-            msg.deinit();
-            self.allocator.destroy(msg);
-            return;
-        }
-    }
-
-    /// Add a user message bubble.
-    pub fn addUserMessage(self: *Transcript, props: user_message_mod.Props) void {
-        self.addUserMessageWithKind(props, .user_message);
-    }
-
-    pub fn addQueuedUserMessage(self: *Transcript, props: user_message_mod.Props) void {
-        self.addUserMessageWithKind(props, .queued_user_message);
     }
 
     // ── Selection ────────────────────────────────────────────────
@@ -1774,12 +1726,34 @@ fn appendTestToolExecutionRow(
     return transcript.items.items.len - 1;
 }
 
+fn appendTestUserRow(transcript: *Transcript, props: user_message_mod.Props, kind: ItemKind) !usize {
+    const msg = try transcript.allocator.create(user_message_mod.UserMessage);
+    errdefer transcript.allocator.destroy(msg);
+    msg.* = user_message_mod.UserMessage.init(transcript.allocator);
+    errdefer msg.deinit();
+    msg.setTheme(transcript.theme);
+
+    var message_props = props;
+    message_props.status = if (kind == .queued_user_message) .pending else .in_chat;
+    msg.setProps(message_props);
+
+    const item: TranscriptItem = .{
+        .renderable = TranscriptRenderable.init(user_message_mod.UserMessage, msg),
+        .kind = kind,
+        .extra_height = 1,
+        .deinit_ctx = @ptrCast(msg),
+        .deinit_fn = deinitUserMessage,
+    };
+    if (!transcript.addItem(item)) return error.AppendFailed;
+    return transcript.items.items.len - 1;
+}
+
 test "Transcript retained items install transcript renderables" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
     _ = try appendTestAssistantText(&transcript, "hello from assistant");
-    transcript.addUserMessage(.{ .text = "user msg" });
+    _ = try appendTestUserRow(&transcript, .{ .text = "user msg" }, .user_message);
     _ = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
 
     try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
@@ -2167,7 +2141,7 @@ test "Transcript clearAll removes all items and resets state" {
     defer transcript.deinit();
 
     _ = try appendTestAssistantText(&transcript, "hello");
-    transcript.addUserMessage(.{ .text = "user msg" });
+    _ = try appendTestUserRow(&transcript, .{ .text = "user msg" }, .user_message);
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 

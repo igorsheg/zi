@@ -1011,7 +1011,7 @@ fn createAssistantMessageRow(
     };
 }
 
-fn createUserMessageRow(
+pub fn createUserMessageRow(
     allocator: std.mem.Allocator,
     props: user_message_component_mod.Props,
     kind: transcript_mod.ItemKind,

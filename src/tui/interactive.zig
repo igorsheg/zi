@@ -1363,7 +1363,33 @@ pub const Interactive = struct {
     }
 
     fn applyQueueSnapshot(self: *Interactive, snapshot: agent_mod.QueuedMessageSnapshot) void {
-        self.transcript.syncQueuedUserMessages(snapshot.steering, snapshot.follow_up);
+        self.transcript.clearQueuedUserMessages();
+        for (snapshot.steering) |entry| {
+            const row = conversation_projection_mod.createUserMessageRow(
+                self.transcript.allocator,
+                .{ .text = entry.text, .footer = .queued_steering },
+                .queued_user_message,
+                self.transcript.theme,
+            ) catch return;
+            if (!self.transcript.addItem(row)) {
+                var owned_row = row;
+                owned_row.deinit(self.transcript.allocator);
+                return;
+            }
+        }
+        for (snapshot.follow_up) |entry| {
+            const row = conversation_projection_mod.createUserMessageRow(
+                self.transcript.allocator,
+                .{ .text = entry.text, .footer = .queued_follow_up },
+                .queued_user_message,
+                self.transcript.theme,
+            ) catch return;
+            if (!self.transcript.addItem(row)) {
+                var owned_row = row;
+                owned_row.deinit(self.transcript.allocator);
+                return;
+            }
+        }
     }
 
     fn syncQueueSnapshotFromRunControl(self: *Interactive) void {
