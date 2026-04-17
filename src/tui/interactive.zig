@@ -141,6 +141,52 @@ const PublishedStatusSnapshot = struct {
     }
 };
 
+const LiveToolExecutionState = struct {
+    tool_call_id: []u8,
+    tool_name: []u8,
+    args: std.json.Value = .null,
+    args_complete: bool = false,
+    execution_started: bool = false,
+    result: ?AgentToolResult = null,
+    is_error: bool = false,
+    is_partial: bool = true,
+
+    fn init(allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8) !LiveToolExecutionState {
+        return .{
+            .tool_call_id = try allocator.dupe(u8, tool_call_id),
+            .tool_name = try allocator.dupe(u8, tool_name),
+        };
+    }
+
+    fn deinit(self: *LiveToolExecutionState, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        allocator.free(self.tool_name);
+        json_util.freeJsonValue(allocator, self.args);
+        if (self.result) |result| result.free(allocator);
+        self.* = undefined;
+    }
+
+    fn setArgs(self: *LiveToolExecutionState, allocator: std.mem.Allocator, args: std.json.Value, complete: bool) !void {
+        json_util.freeJsonValue(allocator, self.args);
+        self.args = try json_util.cloneJsonValue(allocator, args);
+        if (complete) self.args_complete = true;
+    }
+
+    fn setPartialResult(self: *LiveToolExecutionState, allocator: std.mem.Allocator, result: ?AgentToolResult) !void {
+        if (self.result) |old| old.free(allocator);
+        self.result = if (result) |owned| try owned.clone(allocator) else null;
+        self.is_partial = true;
+        self.is_error = if (result) |owned| owned.is_error else false;
+    }
+
+    fn setFinalResult(self: *LiveToolExecutionState, allocator: std.mem.Allocator, result: AgentToolResult, is_error: bool) !void {
+        if (self.result) |old| old.free(allocator);
+        self.result = try result.clone(allocator);
+        self.is_partial = false;
+        self.is_error = is_error;
+    }
+};
+
 /// Mailbox-backed agent/helper → TUI event channel.
 ///
 /// The queue shape remains part of zi's runtime doctrine, but wakeup
@@ -403,6 +449,8 @@ pub const Interactive = struct {
     /// Owned storage lives in `msg_allocator` so teardown can free it on
     /// the TUI thread after all workers are joined.
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
+    /// Agent-thread tracked live tool executions for semantic snapshot publication.
+    live_tool_executions: std.ArrayList(LiveToolExecutionState) = .empty,
     /// Agent-thread publication counter for semantic conversation snapshots.
     next_conversation_snapshot_version: u64 = 1,
     loader: Loader = .{},
@@ -618,6 +666,10 @@ pub const Interactive = struct {
             snapshot.deinit(self.msg_allocator);
             self.last_published_status_snapshot = null;
         }
+        for (self.live_tool_executions.items) |*tool_execution| {
+            tool_execution.deinit(self.msg_allocator);
+        }
+        self.live_tool_executions.deinit(self.msg_allocator);
         self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
@@ -1033,30 +1085,24 @@ pub const Interactive = struct {
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {
-            .assistant_text_delta, .assistant_thinking_delta => {
-                _ = self.applyConversationLiveEvent(ev.*);
-                self.tui.dirty = true;
+            .message_start_assistant,
+            .message_start_user,
+            .assistant_text_delta,
+            .assistant_thinking_delta,
+            .tool_call_streaming,
+            .tool_start,
+            .tool_update,
+            .tool_end => {
+                // Projection refactor: live transcript mutation no longer
+                // consumes delta UiEvents. Keep these tags inert until the
+                // dead variants are deleted from UiEvent entirely.
             },
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
-            .message_start_assistant => {
-                _ = self.applyConversationLiveEvent(ev.*);
-                self.tui.dirty = true;
-            },
-            .message_start_user => {
-                _ = self.applyConversationLiveEvent(ev.*);
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                self.tui.dirty = true;
-            },
-            .tool_call_streaming => {
-                _ = self.applyConversationLiveEvent(ev.*);
-                self.tui.dirty = true;
-            },
             .message_end_assistant => |m| {
-                _ = self.applyConversationLiveEvent(ev.*);
                 self.tui.dirty = true;
                 if (m.is_aborted) {
                     self.status_text.setContent(m.error_message orelse "aborted");
@@ -1065,20 +1111,6 @@ pub const Interactive = struct {
                     self.status_text.setContent(userFacingFailureMessage(m.failure_kind, msg));
                     self.status_text.fg = self.theme.fg(.@"error");
                 }
-            },
-            .tool_start => |t| {
-                _ = self.applyConversationLiveEvent(ev.*);
-                self.status_text.setContent(t.tool_name);
-                self.status_text.fg = self.theme.fg(.accent);
-                self.tui.dirty = true;
-            },
-            .tool_update => {
-                _ = self.applyConversationLiveEvent(ev.*);
-                self.tui.dirty = true;
-            },
-            .tool_end => {
-                _ = self.applyConversationLiveEvent(ev.*);
-                self.tui.dirty = true;
             },
             .login_progress => |l| {
                 self.status_text.setContent(l.message);
@@ -1165,6 +1197,7 @@ pub const Interactive = struct {
             },
             .conversation_snapshot => |snapshot| {
                 self.rebuildConversationFromSnapshot(snapshot);
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.tui.dirty = true;
             },
             .session_resumed => |r| {
@@ -1277,10 +1310,6 @@ pub const Interactive = struct {
                 .retry_attempt = self.retry_attempt,
             },
         );
-    }
-
-    fn applyConversationLiveEvent(self: *Interactive, ev: UiEvent) bool {
-        return conversation_projection_mod.applyLiveEvent(&self.transcript, self.resolver, ev);
     }
 
     const TranscriptMouseZone = struct {
@@ -2576,12 +2605,103 @@ pub const Interactive = struct {
         }
     }
 
+    fn clearLiveToolExecutions(self: *Interactive) void {
+        for (self.live_tool_executions.items) |*tool_execution| {
+            tool_execution.deinit(self.msg_allocator);
+        }
+        self.live_tool_executions.clearRetainingCapacity();
+    }
+
+    fn findLiveToolExecutionIndex(self: *Interactive, tool_call_id: []const u8) ?usize {
+        for (self.live_tool_executions.items, 0..) |tool_execution, idx| {
+            if (std.mem.eql(u8, tool_execution.tool_call_id, tool_call_id)) return idx;
+        }
+        return null;
+    }
+
+    fn getOrCreateLiveToolExecution(self: *Interactive, tool_call_id: []const u8, tool_name: []const u8) ?*LiveToolExecutionState {
+        if (self.findLiveToolExecutionIndex(tool_call_id)) |idx| return &self.live_tool_executions.items[idx];
+
+        const state = LiveToolExecutionState.init(self.msg_allocator, tool_call_id, tool_name) catch return null;
+        self.live_tool_executions.append(self.msg_allocator, state) catch {
+            var owned = state;
+            owned.deinit(self.msg_allocator);
+            return null;
+        };
+        return &self.live_tool_executions.items[self.live_tool_executions.items.len - 1];
+    }
+
+    fn removeLiveToolExecution(self: *Interactive, tool_call_id: []const u8) void {
+        const idx = self.findLiveToolExecutionIndex(tool_call_id) orelse return;
+        var removed = self.live_tool_executions.orderedRemove(idx);
+        removed.deinit(self.msg_allocator);
+    }
+
+    fn removeLiveToolExecutionsForAssistant(self: *Interactive, assistant: agent_protocol.AssistantMessage) void {
+        for (assistant.content) |block| {
+            if (block != .tool_call) continue;
+            self.removeLiveToolExecution(block.tool_call.id);
+        }
+    }
+
+    fn updateLiveToolCallFromAssistantEvent(self: *Interactive, event: agent_protocol.AssistantMessageEvent) void {
+        switch (event) {
+            .toolcall_delta => |tc| {
+                if (tc.content_index >= tc.partial.content.len) return;
+                const block = tc.partial.content[tc.content_index];
+                if (block != .tool_call) return;
+                const call = block.tool_call;
+                const tool_execution = self.getOrCreateLiveToolExecution(call.id, call.name) orelse return;
+                tool_execution.setArgs(self.msg_allocator, call.arguments, false) catch return;
+            },
+            .toolcall_end => |tc| {
+                const call = tc.tool_call;
+                const tool_execution = self.getOrCreateLiveToolExecution(call.id, call.name) orelse return;
+                tool_execution.setArgs(self.msg_allocator, call.arguments, true) catch return;
+            },
+            else => {},
+        }
+    }
+
+    fn updateLiveToolExecutionFromAgentEvent(self: *Interactive, event: AgentEvent) void {
+        switch (event) {
+            .message_update => |mu| self.updateLiveToolCallFromAssistantEvent(mu.assistant_message_event),
+            .message_end => |me| switch (me.message) {
+                .assistant => |assistant| switch (assistant.stop_reason) {
+                    .aborted, .@"error" => self.removeLiveToolExecutionsForAssistant(assistant),
+                    else => {},
+                },
+                .tool_result => |tool_result| self.removeLiveToolExecution(tool_result.tool_call_id),
+                else => {},
+            },
+            .tool_execution_start => |te| {
+                const tool_execution = self.getOrCreateLiveToolExecution(te.tool_call_id, te.tool_name) orelse return;
+                tool_execution.setArgs(self.msg_allocator, te.args, true) catch return;
+                tool_execution.execution_started = true;
+            },
+            .tool_execution_update => |te| {
+                const tool_execution = self.getOrCreateLiveToolExecution(te.tool_call_id, te.tool_name) orelse return;
+                tool_execution.setArgs(self.msg_allocator, te.args, true) catch return;
+                tool_execution.execution_started = true;
+                tool_execution.setPartialResult(self.msg_allocator, te.partial_result) catch return;
+            },
+            .tool_execution_end => |te| {
+                const tool_execution = self.getOrCreateLiveToolExecution(te.tool_call_id, te.tool_name) orelse return;
+                tool_execution.execution_started = true;
+                tool_execution.setFinalResult(self.msg_allocator, te.result, te.is_error) catch return;
+            },
+            .agent_end => self.clearLiveToolExecutions(),
+            else => {},
+        }
+    }
+
     fn handleNewSession(self: *Interactive) void {
         self.ca.startNewSession() catch |err| {
             const msg = std.fmt.allocPrint(self.msg_allocator, "failed to start new session: {s}", .{@errorName(err)}) catch return;
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
+        self.clearLiveToolExecutions();
         self.publishQueueSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationSnapshot()) {
@@ -2652,6 +2772,7 @@ pub const Interactive = struct {
             }
         }
 
+        self.clearLiveToolExecutions();
         self.publishQueueSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationSnapshot()) {
@@ -2669,9 +2790,35 @@ pub const Interactive = struct {
         var queue_snapshot = self.run_control.snapshot(self.msg_allocator);
         defer queue_snapshot.deinit(self.msg_allocator);
 
+        var tool_inputs: std.ArrayList(conversation_snapshot_mod.ToolExecutionInput) = .empty;
+        defer tool_inputs.deinit(self.msg_allocator);
+        tool_inputs.ensureTotalCapacity(self.msg_allocator, self.live_tool_executions.items.len) catch return false;
+        for (self.live_tool_executions.items) |tool_execution| {
+            tool_inputs.append(self.msg_allocator, .{
+                .tool_call_id = tool_execution.tool_call_id,
+                .tool_name = tool_execution.tool_name,
+                .args = tool_execution.args,
+                .args_complete = tool_execution.args_complete,
+                .execution_started = tool_execution.execution_started,
+                .result = tool_execution.result,
+                .is_error = tool_execution.is_error,
+                .is_partial = tool_execution.is_partial,
+            }) catch return false;
+        }
+
+        const active_assistant = if (self.ca.agent.state.streaming_message) |streaming_message|
+            switch (streaming_message) {
+                .assistant => |assistant| assistant,
+                else => null,
+            }
+        else
+            null;
+
         const snapshot = conversation_snapshot_mod.build(self.msg_allocator, .{
             .version = self.next_conversation_snapshot_version,
             .messages = self.ca.agent.state.messages,
+            .active_assistant = active_assistant,
+            .tool_executions = tool_inputs.items,
             .steering = queue_snapshot.steering,
             .follow_up = queue_snapshot.follow_up,
         }) catch return false;
@@ -2767,6 +2914,19 @@ pub const Interactive = struct {
         }
     }
 
+    fn publishConversationSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
+        switch (event) {
+            .message_start => |ms| switch (ms.message) {
+                .assistant => _ = self.publishConversationSnapshot(),
+                else => {},
+            },
+            .message_update, .message_end, .tool_execution_start, .tool_execution_update, .tool_execution_end => {
+                _ = self.publishConversationSnapshot();
+            },
+            else => {},
+        }
+    }
+
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         _ = self.ca.trySetThinkingLevel(level);
         self.publishStatusSnapshot();
@@ -2778,7 +2938,9 @@ pub const Interactive = struct {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         switch (event) {
             .agent_event => |agent_event| {
+                self.updateLiveToolExecutionFromAgentEvent(agent_event);
                 self.publishQueueSnapshotForAgentEvent(agent_event);
+                self.publishConversationSnapshotForAgentEvent(agent_event);
                 if (convertAgentEvent(agent_event, self.msg_allocator)) |ui_event| {
                     self.event_queue.push(ui_event);
                 }
@@ -2812,6 +2974,7 @@ pub const Interactive = struct {
             .compaction_start => {},
             .compaction_end => {
                 self.publishStatusSnapshot();
+                _ = self.publishConversationSnapshot();
             },
         }
     }
@@ -2952,133 +3115,40 @@ fn cloneUserDisplayText(allocator: std.mem.Allocator, user: ai_protocol.UserMess
 }
 
 /// Convert an AgentEvent to a TUI-owned UiEvent with deep-copied data.
-/// Runs on the agent thread. Returns null for events the TUI doesn't need.
+/// Runs on the agent thread. Conversation transcript mutation no longer
+/// flows through delta UiEvents; semantic transcript state crosses via
+/// `conversation_snapshot`. This bridge now only preserves banner-only
+/// outcomes that are not part of transcript reconstruction.
 fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
     switch (event) {
-        .message_start => |ms| {
-            return switch (ms.message) {
-                .assistant => .message_start_assistant,
-                .user => |user| blk: {
-                    const text = cloneUserDisplayText(allocator, user) orelse break :blk null;
-                    break :blk .{ .message_start_user = .{ .text = text } };
-                },
-                else => null,
-            };
+        .message_update => |mu| switch (mu.assistant_message_event) {
+            .@"error" => |e| {
+                if (e.@"error".error_message) |msg| {
+                    const owned = allocator.dupe(u8, msg) catch return null;
+                    return .{ .error_message = .{ .message = owned } };
+                }
+                return null;
+            },
+            else => return null,
         },
-        .message_update => |mu| {
-            switch (mu.assistant_message_event) {
-                .text_delta => |d| {
-                    const delta = allocator.dupe(u8, d.delta) catch return null;
-                    return .{ .assistant_text_delta = .{
-                        .content_index = d.content_index,
-                        .delta = delta,
+        .message_end => |me| switch (me.message) {
+            .assistant => |am| {
+                if (am.stop_reason == .aborted or am.stop_reason == .@"error") {
+                    const err_msg = if (am.error_message) |msg|
+                        (allocator.dupe(u8, msg) catch null)
+                    else
+                        null;
+                    return .{ .message_end_assistant = .{
+                        .is_aborted = am.stop_reason == .aborted,
+                        .error_message = err_msg,
+                        .failure_kind = if (am.failure) |failure| failure.kind else null,
                     } };
-                },
-                .thinking_delta => |d| {
-                    const delta = allocator.dupe(u8, d.delta) catch return null;
-                    return .{ .assistant_thinking_delta = .{
-                        .content_index = d.content_index,
-                        .delta = delta,
-                    } };
-                },
-                .@"error" => |e| {
-                    if (e.@"error".error_message) |msg| {
-                        const owned = allocator.dupe(u8, msg) catch return null;
-                        return .{ .error_message = .{ .message = owned } };
-                    }
-                    return null;
-                },
-                .toolcall_delta => |tc| {
-                    // Mid-stream tool-call progress. `partial.content`
-                    // is refreshed by anthropic.zig before each delta
-                    // callback, so the in-progress tool_call is at
-                    // `partial.content[content_index]`. Args are the
-                    // incrementally parsed partial JSON — the TUI
-                    // renders them without marking them complete.
-                    if (tc.content_index >= tc.partial.content.len) return null;
-                    const block = tc.partial.content[tc.content_index];
-                    if (block != .tool_call) return null;
-                    const call = block.tool_call;
-                    const id = allocator.dupe(u8, call.id) catch return null;
-                    errdefer allocator.free(id);
-                    const name = allocator.dupe(u8, call.name) catch return null;
-                    errdefer allocator.free(name);
-                    const args = json_util.cloneJsonValue(allocator, call.arguments) catch return null;
-                    return .{ .tool_call_streaming = .{
-                        .tool_call_id = id,
-                        .tool_name = name,
-                        .args = args,
-                        .is_complete = false,
-                    } };
-                },
-                .toolcall_end => |tc| {
-                    const id = allocator.dupe(u8, tc.tool_call.id) catch return null;
-                    errdefer allocator.free(id);
-                    const name = allocator.dupe(u8, tc.tool_call.name) catch return null;
-                    errdefer allocator.free(name);
-                    const args = json_util.cloneJsonValue(allocator, tc.tool_call.arguments) catch return null;
-                    return .{ .tool_call_streaming = .{
-                        .tool_call_id = id,
-                        .tool_name = name,
-                        .args = args,
-                        .is_complete = true,
-                    } };
-                },
-                else => return null,
-            }
+                }
+                return null;
+            },
+            else => return null,
         },
-        .tool_execution_start => |te| {
-            const id = allocator.dupe(u8, te.tool_call_id) catch return null;
-            errdefer allocator.free(id);
-            const name = allocator.dupe(u8, te.tool_name) catch return null;
-            errdefer allocator.free(name);
-            const args = json_util.cloneJsonValue(allocator, te.args) catch return null;
-            return .{ .tool_start = .{
-                .tool_call_id = id,
-                .tool_name = name,
-                .args = args,
-            } };
-        },
-        .tool_execution_update => |te| {
-            const id = allocator.dupe(u8, te.tool_call_id) catch return null;
-            errdefer allocator.free(id);
-            const result = if (te.partial_result) |r| (r.clone(allocator) catch return null) else null;
-            return .{ .tool_update = .{
-                .tool_call_id = id,
-                .result = result,
-                .is_error = if (te.partial_result) |r| r.is_error else false,
-            } };
-        },
-        .tool_execution_end => |te| {
-            const id = allocator.dupe(u8, te.tool_call_id) catch return null;
-            errdefer allocator.free(id);
-            const result = te.result.clone(allocator) catch return null;
-            return .{ .tool_end = .{
-                .tool_call_id = id,
-                .result = result,
-                .is_error = te.is_error,
-            } };
-        },
-        .message_end => |me| {
-            switch (me.message) {
-                .assistant => |am| {
-                    if (am.stop_reason == .aborted or am.stop_reason == .@"error") {
-                        const err_msg = if (am.error_message) |msg|
-                            (allocator.dupe(u8, msg) catch null)
-                        else
-                            null;
-                        return .{ .message_end_assistant = .{
-                            .is_aborted = am.stop_reason == .aborted,
-                            .error_message = err_msg,
-                            .failure_kind = if (am.failure) |failure| failure.kind else null,
-                        } };
-                    }
-                    return null;
-                },
-                else => return null,
-            }
-        },
-        .agent_end, .agent_start, .turn_start, .turn_end => return null,
+        .agent_end, .agent_start, .message_start, .turn_start, .turn_end, .tool_execution_start, .tool_execution_update, .tool_execution_end => return null,
     }
 }
 

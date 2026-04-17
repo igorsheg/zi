@@ -78,12 +78,21 @@ pub fn rebuildFromSnapshot(
     transcript.clearAll();
     editor.clearHistory();
 
+    var live_tool_ids: std.ArrayList([]const u8) = .empty;
+    defer live_tool_ids.deinit(transcript.allocator);
+    for (snapshot.items) |item| {
+        if (item != .tool_execution) continue;
+        live_tool_ids.append(transcript.allocator, item.tool_execution.tool_call_id) catch return;
+    }
+
     for (snapshot.items) |item| {
         switch (item) {
             .committed_message => |committed| {
                 seedHistoryFromMessage(editor, committed.message);
-                appendProjectedMessage(transcript, resolver, committed.message, options);
+                appendProjectedSnapshotMessage(transcript, resolver, committed.message, options, live_tool_ids.items);
             },
+            .active_assistant => |active| appendActiveAssistantItem(transcript, active.message.assistant, live_tool_ids.items),
+            .tool_execution => |tool_execution| appendToolExecutionItem(transcript, resolver, tool_execution),
             .queued_user_message => |queued| {
                 transcript.addQueuedUserMessage(.{
                     .text = queued.text,
@@ -191,6 +200,19 @@ fn appendProjectedMessage(
     }
 }
 
+fn appendProjectedSnapshotMessage(
+    transcript: *Transcript,
+    resolver: ToolRendererResolver,
+    message: agent_protocol.AgentMessage,
+    options: RebuildOptions,
+    live_tool_ids: []const []const u8,
+) void {
+    switch (message) {
+        .assistant => |assistant| appendAssistantMessageWithSkippedToolCalls(transcript, resolver, assistant, options.retry_attempt, live_tool_ids),
+        else => appendProjectedMessage(transcript, resolver, message, options),
+    }
+}
+
 fn appendUserMessage(transcript: *Transcript, message: agent_protocol.AgentMessage) void {
     const text = extractUserMessageText(transcript.allocator, message) orelse return;
     defer text.deinit(transcript.allocator);
@@ -202,6 +224,16 @@ fn appendAssistantMessage(
     resolver: ToolRendererResolver,
     assistant: agent_protocol.AssistantMessage,
     retry_attempt: u32,
+) void {
+    appendAssistantMessageWithSkippedToolCalls(transcript, resolver, assistant, retry_attempt, &.{});
+}
+
+fn appendAssistantMessageWithSkippedToolCalls(
+    transcript: *Transcript,
+    resolver: ToolRendererResolver,
+    assistant: agent_protocol.AssistantMessage,
+    retry_attempt: u32,
+    live_tool_ids: []const []const u8,
 ) void {
     transcript.beginAssistantMessage();
     for (assistant.content, 0..) |block, idx| {
@@ -216,11 +248,59 @@ fn appendAssistantMessage(
     for (assistant.content) |block| {
         if (block != .tool_call) continue;
         const tool_call = block.tool_call;
+        if (containsToolCallId(live_tool_ids, tool_call.id)) continue;
         appendToolCall(transcript, resolver, tool_call.id, tool_call.name, tool_call.arguments, true, false);
         if (assistant.stop_reason == .aborted or assistant.stop_reason == .@"error") {
             finalizeFailedAssistantToolCall(transcript, tool_call.id, assistant, retry_attempt);
         }
     }
+}
+
+fn appendActiveAssistantItem(
+    transcript: *Transcript,
+    assistant: agent_protocol.AssistantMessage,
+    live_tool_ids: []const []const u8,
+) void {
+    transcript.beginAssistantMessage();
+    for (assistant.content, 0..) |block, idx| {
+        switch (block) {
+            .text => |text| transcript.appendText(idx, text.text),
+            .thinking => |thinking| transcript.appendThinking(idx, thinking.thinking),
+            .tool_call => |tool_call| {
+                if (containsToolCallId(live_tool_ids, tool_call.id)) continue;
+            },
+        }
+    }
+}
+
+fn appendToolExecutionItem(
+    transcript: *Transcript,
+    resolver: ToolRendererResolver,
+    tool_execution: conversation_snapshot_mod.ToolExecutionItem,
+) void {
+    appendToolCall(
+        transcript,
+        resolver,
+        tool_execution.tool_call_id,
+        tool_execution.tool_name,
+        tool_execution.args,
+        tool_execution.args_complete,
+        tool_execution.execution_started,
+    );
+    if (tool_execution.result) |result| {
+        if (tool_execution.is_partial) {
+            transcript.toolSetPartialResult(tool_execution.tool_call_id, result, tool_execution.is_error);
+        } else {
+            finalizeToolResult(transcript, tool_execution.tool_call_id, result, tool_execution.is_error);
+        }
+    }
+}
+
+fn containsToolCallId(tool_call_ids: []const []const u8, tool_call_id: []const u8) bool {
+    for (tool_call_ids) |candidate| {
+        if (std.mem.eql(u8, candidate, tool_call_id)) return true;
+    }
+    return false;
 }
 
 fn appendToolCall(
@@ -699,6 +779,57 @@ test "rebuildFromSnapshot reconstructs committed messages and queued rows" {
     try testing.expect(std.mem.indexOf(u8, rendered, "steer me") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "Queued · Follow-up") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "follow me") != null);
+}
+
+test "rebuildFromSnapshot reconstructs active assistant and live tool execution rows" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var editor = editor_mod.Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "working" } },
+        .{ .tool_call = .{ .id = "tc-1", .name = "bash", .arguments = .null } },
+    };
+    const assistant = makeAssistantMessage(&assistant_content, .toolUse, null);
+    const partial_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "partial output" } },
+    };
+    const partial_result = AgentToolResult{ .content = &partial_blocks, .is_error = false };
+
+    var snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 2,
+        .messages = &.{makeUserMessage("hello")},
+        .active_assistant = assistant.assistant,
+        .tool_executions = &.{.{
+            .tool_call_id = "tc-1",
+            .tool_name = "bash",
+            .args = .null,
+            .args_complete = true,
+            .execution_started = true,
+            .result = partial_result,
+            .is_error = false,
+            .is_partial = true,
+        }},
+    });
+    defer snapshot.deinit(testing.allocator);
+
+    rebuildFromSnapshot(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        snapshot,
+        .{ .theme = themes_builtin.dark() },
+    );
+
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60);
+    defer testing.allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "working") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "bash") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "partial output") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, rendered, "tc-1 tc-1"));
 }
 
 test "applyLiveEvent shares tool projection across streaming and final result events" {

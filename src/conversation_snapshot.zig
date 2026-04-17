@@ -1,6 +1,8 @@
 const std = @import("std");
+const ai_protocol = @import("ai/protocol.zig");
 const protocol = @import("agent/protocol.zig");
 const message_memory = @import("agent/message_memory.zig");
+const json_util = @import("ai/json_util.zig");
 const run_control = @import("runtime/run_control.zig");
 
 pub const ItemId = enum(u64) { _ };
@@ -9,6 +11,17 @@ pub const SemanticVersion = u64;
 pub const QueuedUserMessageKind = enum {
     steering,
     follow_up,
+};
+
+pub const ToolExecutionInput = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args: std.json.Value = .null,
+    args_complete: bool = false,
+    execution_started: bool = false,
+    result: ?protocol.AgentToolResult = null,
+    is_error: bool = false,
+    is_partial: bool = true,
 };
 
 /// Owned semantic snapshot of the transcript-visible conversation state.
@@ -48,11 +61,15 @@ pub const ConversationSnapshot = struct {
 
 pub const ConversationItem = union(enum) {
     committed_message: CommittedMessageItem,
+    active_assistant: ActiveAssistantItem,
+    tool_execution: ToolExecutionItem,
     queued_user_message: QueuedUserMessageItem,
 
     pub fn clone(self: ConversationItem, allocator: std.mem.Allocator) !ConversationItem {
         return switch (self) {
             .committed_message => |item| .{ .committed_message = try item.clone(allocator) },
+            .active_assistant => |item| .{ .active_assistant = try item.clone(allocator) },
+            .tool_execution => |item| .{ .tool_execution = try item.clone(allocator) },
             .queued_user_message => |item| .{ .queued_user_message = try item.clone(allocator) },
         };
     }
@@ -60,6 +77,8 @@ pub const ConversationItem = union(enum) {
     pub fn deinit(self: *ConversationItem, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .committed_message => |*item| item.deinit(allocator),
+            .active_assistant => |*item| item.deinit(allocator),
+            .tool_execution => |*item| item.deinit(allocator),
             .queued_user_message => |*item| item.deinit(allocator),
         }
     }
@@ -67,6 +86,8 @@ pub const ConversationItem = union(enum) {
     pub fn itemId(self: ConversationItem) ItemId {
         return switch (self) {
             .committed_message => |item| item.item_id,
+            .active_assistant => |item| item.item_id,
+            .tool_execution => |item| item.item_id,
             .queued_user_message => |item| item.item_id,
         };
     }
@@ -74,6 +95,8 @@ pub const ConversationItem = union(enum) {
     pub fn semanticVersion(self: ConversationItem) SemanticVersion {
         return switch (self) {
             .committed_message => |item| item.semantic_version,
+            .active_assistant => |item| item.semantic_version,
+            .tool_execution => |item| item.semantic_version,
             .queued_user_message => |item| item.semantic_version,
         };
     }
@@ -103,6 +126,98 @@ pub const CommittedMessageItem = struct {
 
     pub fn deinit(self: *CommittedMessageItem, allocator: std.mem.Allocator) void {
         message_memory.freeMessage(allocator, &self.message);
+        self.* = undefined;
+    }
+};
+
+pub const ActiveAssistantItem = struct {
+    item_id: ItemId,
+    semantic_version: SemanticVersion,
+    message: protocol.AgentMessage,
+
+    fn initClone(
+        allocator: std.mem.Allocator,
+        item_id: ItemId,
+        semantic_version: SemanticVersion,
+        message: protocol.AssistantMessage,
+    ) !ActiveAssistantItem {
+        return .{
+            .item_id = item_id,
+            .semantic_version = semantic_version,
+            .message = try message_memory.cloneMessage(allocator, .{ .assistant = message }),
+        };
+    }
+
+    pub fn clone(self: ActiveAssistantItem, allocator: std.mem.Allocator) !ActiveAssistantItem {
+        std.debug.assert(self.message == .assistant);
+        return initClone(allocator, self.item_id, self.semantic_version, self.message.assistant);
+    }
+
+    pub fn deinit(self: *ActiveAssistantItem, allocator: std.mem.Allocator) void {
+        message_memory.freeMessage(allocator, &self.message);
+        self.* = undefined;
+    }
+};
+
+pub const ToolExecutionItem = struct {
+    item_id: ItemId,
+    semantic_version: SemanticVersion,
+    tool_call_id: []u8,
+    tool_name: []u8,
+    args: std.json.Value = .null,
+    args_complete: bool = false,
+    execution_started: bool = false,
+    result: ?protocol.AgentToolResult = null,
+    is_error: bool = false,
+    is_partial: bool = true,
+
+    fn initClone(
+        allocator: std.mem.Allocator,
+        item_id: ItemId,
+        semantic_version: SemanticVersion,
+        input: ToolExecutionInput,
+    ) !ToolExecutionItem {
+        const tool_call_id = try allocator.dupe(u8, input.tool_call_id);
+        errdefer allocator.free(tool_call_id);
+        const tool_name = try allocator.dupe(u8, input.tool_name);
+        errdefer allocator.free(tool_name);
+        const args = try json_util.cloneJsonValue(allocator, input.args);
+        errdefer json_util.freeJsonValue(allocator, args);
+        const result = if (input.result) |result| try result.clone(allocator) else null;
+        errdefer if (result) |owned| owned.free(allocator);
+
+        return .{
+            .item_id = item_id,
+            .semantic_version = semantic_version,
+            .tool_call_id = tool_call_id,
+            .tool_name = tool_name,
+            .args = args,
+            .args_complete = input.args_complete,
+            .execution_started = input.execution_started,
+            .result = result,
+            .is_error = input.is_error,
+            .is_partial = input.is_partial,
+        };
+    }
+
+    pub fn clone(self: ToolExecutionItem, allocator: std.mem.Allocator) !ToolExecutionItem {
+        return initClone(allocator, self.item_id, self.semantic_version, .{
+            .tool_call_id = self.tool_call_id,
+            .tool_name = self.tool_name,
+            .args = self.args,
+            .args_complete = self.args_complete,
+            .execution_started = self.execution_started,
+            .result = self.result,
+            .is_error = self.is_error,
+            .is_partial = self.is_partial,
+        });
+    }
+
+    pub fn deinit(self: *ToolExecutionItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        allocator.free(self.tool_name);
+        json_util.freeJsonValue(allocator, self.args);
+        if (self.result) |result| result.free(allocator);
         self.* = undefined;
     }
 };
@@ -141,6 +256,8 @@ pub const QueuedUserMessageItem = struct {
 pub const BuildInputs = struct {
     version: u64,
     messages: []const protocol.AgentMessage,
+    active_assistant: ?protocol.AssistantMessage = null,
+    tool_executions: []const ToolExecutionInput = &.{},
     steering: []const run_control.QueuedMessageText = &.{},
     follow_up: []const run_control.QueuedMessageText = &.{},
 };
@@ -154,7 +271,11 @@ pub fn build(allocator: std.mem.Allocator, inputs: BuildInputs) !ConversationSna
 
     try items.ensureTotalCapacity(
         allocator,
-        inputs.messages.len + inputs.steering.len + inputs.follow_up.len,
+        inputs.messages.len +
+            inputs.tool_executions.len +
+            inputs.steering.len +
+            inputs.follow_up.len +
+            (if (inputs.active_assistant != null) @as(usize, 1) else 0),
     );
 
     for (inputs.messages, 0..) |message, idx| {
@@ -166,6 +287,16 @@ pub fn build(allocator: std.mem.Allocator, inputs: BuildInputs) !ConversationSna
         ) });
     }
 
+    if (inputs.active_assistant) |assistant| {
+        try items.append(allocator, .{ .active_assistant = try ActiveAssistantItem.initClone(
+            allocator,
+            activeAssistantId(assistant),
+            activeAssistantSemanticVersion(assistant),
+            assistant,
+        ) });
+    }
+
+    try appendToolExecutionItems(allocator, &items, inputs.tool_executions);
     try appendQueuedItems(allocator, &items, .steering, inputs.steering);
     try appendQueuedItems(allocator, &items, .follow_up, inputs.follow_up);
 
@@ -173,6 +304,21 @@ pub fn build(allocator: std.mem.Allocator, inputs: BuildInputs) !ConversationSna
         .version = inputs.version,
         .items = try items.toOwnedSlice(allocator),
     };
+}
+
+fn appendToolExecutionItems(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(ConversationItem),
+    tool_executions: []const ToolExecutionInput,
+) !void {
+    for (tool_executions) |tool_execution| {
+        try items.append(allocator, .{ .tool_execution = try ToolExecutionItem.initClone(
+            allocator,
+            toolExecutionId(tool_execution.tool_call_id),
+            toolExecutionSemanticVersion(tool_execution),
+            tool_execution,
+        ) });
+    }
 }
 
 fn appendQueuedItems(
@@ -193,8 +339,24 @@ fn appendQueuedItems(
 }
 
 fn committedMessageSemanticVersion(message: protocol.AgentMessage) SemanticVersion {
-    _ = message;
-    return 1;
+    var hasher = std.hash.Wyhash.init(0x434f_4d4d_56455231);
+    hasher.update("committed_message_semantic");
+    hashAgentMessage(&hasher, message);
+    return hasher.final();
+}
+
+fn activeAssistantId(message: protocol.AssistantMessage) ItemId {
+    var hasher = std.hash.Wyhash.init(0x41435449_56454944);
+    hasher.update("active_assistant");
+    std.hash.autoHash(&hasher, message.timestamp);
+    return @enumFromInt(hasher.final());
+}
+
+fn activeAssistantSemanticVersion(message: protocol.AssistantMessage) SemanticVersion {
+    var hasher = std.hash.Wyhash.init(0x41435449_56455652);
+    hasher.update("active_assistant_semantic");
+    hashAssistantMessage(&hasher, message);
+    return hasher.final();
 }
 
 fn committedMessageId(index: usize, message: protocol.AgentMessage) ItemId {
@@ -220,6 +382,32 @@ fn queuedUserMessageSemanticVersion(text: []const u8) SemanticVersion {
     return hasher.final();
 }
 
+fn toolExecutionId(tool_call_id: []const u8) ItemId {
+    var hasher = std.hash.Wyhash.init(0x544f4f4c_45584944);
+    hasher.update("tool_execution");
+    hasher.update(tool_call_id);
+    return @enumFromInt(hasher.final());
+}
+
+fn toolExecutionSemanticVersion(input: ToolExecutionInput) SemanticVersion {
+    var hasher = std.hash.Wyhash.init(0x544f4f4c_45585652);
+    hasher.update("tool_execution_semantic");
+    hasher.update(input.tool_call_id);
+    hasher.update(input.tool_name);
+    hashJsonValue(&hasher, input.args);
+    std.hash.autoHash(&hasher, input.args_complete);
+    std.hash.autoHash(&hasher, input.execution_started);
+    std.hash.autoHash(&hasher, input.is_error);
+    std.hash.autoHash(&hasher, input.is_partial);
+    if (input.result) |result| {
+        std.hash.autoHash(&hasher, true);
+        hashAgentToolResult(&hasher, result);
+    } else {
+        std.hash.autoHash(&hasher, false);
+    }
+    return hasher.final();
+}
+
 fn messageTagCode(message: protocol.AgentMessage) u8 {
     return switch (message) {
         .user => 1,
@@ -242,6 +430,175 @@ fn messageTimestamp(message: protocol.AgentMessage) i64 {
     };
 }
 
+fn hashAgentMessage(hasher: *std.hash.Wyhash, message: protocol.AgentMessage) void {
+    std.hash.autoHash(hasher, messageTagCode(message));
+    std.hash.autoHash(hasher, messageTimestamp(message));
+    switch (message) {
+        .user => |user| hashUserContent(hasher, user.content),
+        .assistant => |assistant| hashAssistantMessage(hasher, assistant),
+        .tool_result => |tool_result| {
+            hasher.update(tool_result.tool_call_id);
+            hasher.update(tool_result.tool_name);
+            std.hash.autoHash(hasher, tool_result.is_error);
+            for (tool_result.content) |block| hashToolResultContentBlock(hasher, block);
+            if (tool_result.details) |details| hashJsonValue(hasher, details) else hashJsonValue(hasher, .null);
+        },
+        .compaction_summary => |summary| {
+            hasher.update(summary.summary);
+            std.hash.autoHash(hasher, summary.tokens_before);
+        },
+        .branch_summary => |summary| {
+            hasher.update(summary.summary);
+            hasher.update(summary.from_id);
+        },
+        .custom => |custom| {
+            hasher.update(custom.custom_type);
+            std.hash.autoHash(hasher, custom.display);
+            hashCustomContent(hasher, custom.content);
+            if (custom.details) |details| hashJsonValue(hasher, details) else hashJsonValue(hasher, .null);
+        },
+    }
+}
+
+fn hashAssistantMessage(hasher: *std.hash.Wyhash, assistant: protocol.AssistantMessage) void {
+    std.hash.autoHash(hasher, @intFromEnum(assistant.api));
+    std.hash.autoHash(hasher, @intFromEnum(assistant.provider));
+    hasher.update(assistant.model);
+    std.hash.autoHash(hasher, assistant.timestamp);
+    std.hash.autoHash(hasher, @intFromEnum(assistant.stop_reason));
+    if (assistant.error_message) |msg| {
+        std.hash.autoHash(hasher, true);
+        hasher.update(msg);
+    } else {
+        std.hash.autoHash(hasher, false);
+    }
+    for (assistant.content) |block| switch (block) {
+        .text => |text| hasher.update(text.text),
+        .thinking => |thinking| {
+            hasher.update(thinking.thinking);
+            if (thinking.thinking_signature) |sig| {
+                std.hash.autoHash(hasher, true);
+                hasher.update(sig);
+            } else {
+                std.hash.autoHash(hasher, false);
+            }
+            std.hash.autoHash(hasher, thinking.redacted != null);
+            if (thinking.redacted) |redacted| std.hash.autoHash(hasher, redacted);
+        },
+        .tool_call => |tool_call| {
+            hasher.update(tool_call.id);
+            hasher.update(tool_call.name);
+            hashJsonValue(hasher, tool_call.arguments);
+        },
+    };
+}
+
+fn hashUserContent(hasher: *std.hash.Wyhash, content: ai_protocol.UserMessage.UserMessageContent) void {
+    switch (content) {
+        .text => |text| hasher.update(text),
+        .blocks => |blocks| for (blocks) |block| switch (block) {
+            .text => |text| hasher.update(text.text),
+            .image => |image| {
+                hasher.update(image.mime_type);
+                hasher.update(image.data);
+            },
+        },
+    }
+}
+
+fn hashCustomContent(hasher: *std.hash.Wyhash, content: protocol.AgentMessage.CustomContent) void {
+    switch (content) {
+        .text => |text| hasher.update(text),
+        .blocks => |blocks| for (blocks) |block| switch (block) {
+            .text => |text| hasher.update(text.text),
+            .image => |image| {
+                hasher.update(image.mime_type);
+                hasher.update(image.data);
+            },
+        },
+    }
+}
+
+fn hashAgentToolResult(hasher: *std.hash.Wyhash, result: protocol.AgentToolResult) void {
+    std.hash.autoHash(hasher, result.is_error);
+    for (result.content) |block| hashAgentToolResultContentBlock(hasher, block);
+    hashJsonValue(hasher, result.details);
+}
+
+fn hashAgentToolResultContentBlock(hasher: *std.hash.Wyhash, block: protocol.AgentToolResult.ContentBlock) void {
+    switch (block) {
+        .text => |text| {
+            hasher.update(text.text);
+            if (text.text_signature) |sig| {
+                std.hash.autoHash(hasher, true);
+                hasher.update(sig);
+            } else {
+                std.hash.autoHash(hasher, false);
+            }
+        },
+        .image => |image| {
+            hasher.update(image.mime_type);
+            hasher.update(image.data);
+        },
+    }
+}
+
+fn hashToolResultContentBlock(hasher: *std.hash.Wyhash, block: protocol.ToolResultMessage.ContentBlock) void {
+    switch (block) {
+        .text => |text| {
+            hasher.update(text.text);
+            if (text.text_signature) |sig| {
+                std.hash.autoHash(hasher, true);
+                hasher.update(sig);
+            } else {
+                std.hash.autoHash(hasher, false);
+            }
+        },
+        .image => |image| {
+            hasher.update(image.mime_type);
+            hasher.update(image.data);
+        },
+    }
+}
+
+fn hashJsonValue(hasher: *std.hash.Wyhash, value: std.json.Value) void {
+    switch (value) {
+        .null => std.hash.autoHash(hasher, @as(u8, 0)),
+        .bool => |bool_value| {
+            std.hash.autoHash(hasher, @as(u8, 1));
+            std.hash.autoHash(hasher, bool_value);
+        },
+        .integer => |integer| {
+            std.hash.autoHash(hasher, @as(u8, 2));
+            std.hash.autoHash(hasher, integer);
+        },
+        .float => |float_value| {
+            std.hash.autoHash(hasher, @as(u8, 3));
+            hasher.update(std.mem.asBytes(&float_value));
+        },
+        .number_string => |number_string| {
+            std.hash.autoHash(hasher, @as(u8, 4));
+            hasher.update(number_string);
+        },
+        .string => |string| {
+            std.hash.autoHash(hasher, @as(u8, 5));
+            hasher.update(string);
+        },
+        .array => |array| {
+            std.hash.autoHash(hasher, @as(u8, 6));
+            for (array.items) |entry| hashJsonValue(hasher, entry);
+        },
+        .object => |object| {
+            std.hash.autoHash(hasher, @as(u8, 7));
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                hasher.update(entry.key_ptr.*);
+                hashJsonValue(hasher, entry.value_ptr.*);
+            }
+        },
+    }
+}
+
 const testing = std.testing;
 
 fn makeUserMessage(text: []const u8, timestamp: i64) protocol.AgentMessage {
@@ -257,6 +614,29 @@ fn makeCompactionSummary(summary: []const u8, timestamp: i64) protocol.AgentMess
         .tokens_before = 123,
         .timestamp = timestamp,
     } };
+}
+
+fn makeAssistantMessage(
+    content: []const protocol.AssistantMessage.AssistantContentBlock,
+    stop_reason: protocol.StopReason,
+    timestamp: i64,
+) protocol.AssistantMessage {
+    return .{
+        .content = content,
+        .api = .anthropic_messages,
+        .provider = .anthropic,
+        .model = "claude-test",
+        .usage = .{
+            .input = 1,
+            .output = 1,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 2,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = stop_reason,
+        .timestamp = timestamp,
+    };
 }
 
 fn freeQueuedInputs(allocator: std.mem.Allocator, entries: []run_control.QueuedMessageText) void {
@@ -345,6 +725,47 @@ test "build keeps stable ids for repeated inputs and bumps queued semantic versi
 
     try testing.expectEqual(@intFromEnum(snapshot_a.items[1].itemId()), @intFromEnum(snapshot_c.items[1].itemId()));
     try testing.expect(snapshot_a.items[1].semanticVersion() != snapshot_c.items[1].semanticVersion());
+}
+
+test "build includes active assistant and live tool execution items" {
+    const assistant_content = [_]protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "working" } },
+        .{ .tool_call = .{ .id = "tool-1", .name = "bash", .arguments = .null } },
+    };
+    const assistant = makeAssistantMessage(&assistant_content, .toolUse, 3);
+
+    const tool_blocks = [_]protocol.AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "partial" } },
+    };
+    const tool_result = protocol.AgentToolResult{
+        .content = &tool_blocks,
+        .is_error = false,
+    };
+
+    var snapshot = try build(testing.allocator, .{
+        .version = 4,
+        .messages = &.{makeUserMessage("hello", 1)},
+        .active_assistant = assistant,
+        .tool_executions = &.{.{
+            .tool_call_id = "tool-1",
+            .tool_name = "bash",
+            .args = .null,
+            .args_complete = true,
+            .execution_started = true,
+            .result = tool_result,
+            .is_error = false,
+            .is_partial = true,
+        }},
+    });
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), snapshot.items.len);
+    try testing.expect(snapshot.items[1] == .active_assistant);
+    try testing.expect(snapshot.items[2] == .tool_execution);
+    try testing.expectEqualStrings("working", snapshot.items[1].active_assistant.message.assistant.content[0].text.text);
+    try testing.expectEqualStrings("tool-1", snapshot.items[2].tool_execution.tool_call_id);
+    try testing.expect(snapshot.items[2].tool_execution.result != null);
+    try testing.expectEqualStrings("partial", snapshot.items[2].tool_execution.result.?.content[0].text.text);
 }
 
 test "conversation snapshot clone deep copies items" {
