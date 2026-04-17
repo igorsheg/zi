@@ -27,6 +27,7 @@ const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
+const image_mod = @import("../image/root.zig");
 const string_util = @import("../lib/string_util.zig");
 const time_util = @import("../lib/time_util.zig");
 
@@ -153,6 +154,42 @@ const UiEventQueue = mailbox_mod.Mailbox(UiEvent, .{
 const QueuedInputKind = enum {
     steering,
     follow_up,
+};
+
+const ClipboardImageReader = *const fn (allocator: std.mem.Allocator) ?[]u8;
+
+const PendingImageAttachment = struct {
+    image: ai_protocol.ImageContent,
+    dimensions: ?image_mod.Dimensions = null,
+
+    fn deinit(self: *PendingImageAttachment, allocator: std.mem.Allocator) void {
+        allocator.free(self.image.data);
+        allocator.free(self.image.mime_type);
+        self.* = undefined;
+    }
+};
+
+const PreparedClipboardImageResult = union(enum) {
+    attach: PendingImageAttachment,
+    rejected: []u8,
+
+    fn deinit(self: *PreparedClipboardImageResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .attach => |*attachment| attachment.deinit(allocator),
+            .rejected => |message| allocator.free(message),
+        }
+    }
+};
+
+const BuiltSubmitContent = struct {
+    content: ai_protocol.UserMessage.UserMessageContent,
+
+    fn deinit(self: *BuiltSubmitContent, allocator: std.mem.Allocator) void {
+        switch (self.content) {
+            .text => {},
+            .blocks => |blocks| allocator.free(blocks),
+        }
+    }
 };
 
 test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
@@ -355,6 +392,7 @@ pub const Interactive = struct {
     /// Initialized in init() after self.editor is set up.
     active_editor: EditorInterface = undefined,
     status_text: text_mod.Text,
+    pending_image_banner: text_mod.Text,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
@@ -370,6 +408,9 @@ pub const Interactive = struct {
     retry_waiting: bool = false,
     retry_attempt: u32 = 0,
     retry_max_attempts: u32 = 0,
+
+    pending_images: std.ArrayListUnmanaged(PendingImageAttachment) = .empty,
+    clipboard_image_reader: ClipboardImageReader = clipboard_mod.readImage,
 
     // ── Container slots (pi-mono parity) ──────────────────────────
     header_container: container_mod.Container,
@@ -469,6 +510,7 @@ pub const Interactive = struct {
             .cwd = cwd,
             .editor = editor_mod.Editor.init(state_allocator),
             .status_text = text_mod.Text.init(state_allocator),
+            .pending_image_banner = text_mod.Text.init(state_allocator),
             .greeter = .{ .theme = theme, .version = app_meta.version },
             .footer = .{ .theme = theme },
             .hotkeys_overlay = .{ .theme = theme },
@@ -507,6 +549,9 @@ pub const Interactive = struct {
         self.loader.shimmer_edge_fg = theme.fg(.muted);
         self.loader.message_fg = theme.fg(.dim);
         self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
+        self.pending_image_banner.fg = theme.fg(.accent);
+        self.pending_image_banner.bg = theme.bg(.tool_pending_bg);
+        self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
         self.transcript.setHideThinkingBlock(self.hide_thinking_block);
@@ -562,6 +607,8 @@ pub const Interactive = struct {
         }
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
+        self.clearPendingImages();
+        self.pending_images.deinit(self.allocator);
         if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
         self.command_registry.deinit();
         if (self.last_published_status_snapshot) |*snapshot| {
@@ -582,6 +629,7 @@ pub const Interactive = struct {
         self.pending_container.deinit();
         self.header_container.deinit();
         self.transcript.deinit();
+        self.pending_image_banner.deinit();
         self.status_text.deinit();
         self.editor.deinit();
         self.tui.deinit();
@@ -631,6 +679,7 @@ pub const Interactive = struct {
 
         // Populate container slots with their initial children.
         self.refreshGreeterVisibility();
+        self.refreshPendingImageBanner();
         self.status_container.addChild(self.status_text.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
@@ -726,7 +775,9 @@ pub const Interactive = struct {
     fn performStartupAction(self: *Interactive) void {
         switch (self.startup_action) {
             .none => {},
-            .prompt => |content| self.submitUserContent(content),
+            .prompt => |content| {
+                _ = self.submitUserContent(content);
+            },
             .resume_session => |session_resume| {
                 const path_copy = self.msg_allocator.dupe(u8, session_resume.path) catch {
                     self.status_text.setContent("out of memory");
@@ -836,20 +887,19 @@ pub const Interactive = struct {
             }
             const now = std.time.nanoTimestamp();
             const double_tap_ns: i128 = 500 * std.time.ns_per_ms;
-            if (now - self.last_ctrl_c_ns < double_tap_ns) {
+            if (!self.composerHasPendingInput() and now - self.last_ctrl_c_ns < double_tap_ns) {
                 self.running = false;
                 return;
             }
-            self.active_editor.clear();
-            self.refreshGreeterVisibility();
+            self.clearComposerDraft();
             self.last_ctrl_c_ns = now;
             self.tui.dirty = true;
             return;
         }
 
-        // Ctrl+D: exit only when editor is empty (pi-mono parity)
+        // Ctrl+D: exit only when the composer is empty (pi-mono parity)
         if (keybindings.matches(.app_exit, key)) {
-            if (self.active_editor.getText().len == 0) {
+            if (!self.composerHasPendingInput()) {
                 self.running = false;
                 return;
             }
@@ -877,6 +927,11 @@ pub const Interactive = struct {
 
         if (keybindings.matches(.app_restore_queued, key)) {
             self.restoreQueuedInputsToEditor();
+            return;
+        }
+
+        if (keybindings.matches(.app_paste_image, key)) {
+            self.handlePasteImageShortcut();
             return;
         }
 
@@ -1276,6 +1331,88 @@ pub const Interactive = struct {
         self.status_text.fg = self.theme.fg(.success);
     }
 
+    fn composerHasPendingInput(self: *Interactive) bool {
+        return self.active_editor.getText().len > 0 or self.pending_images.items.len > 0;
+    }
+
+    fn clearComposerDraft(self: *Interactive) void {
+        self.active_editor.clear();
+        self.clearPendingImages();
+        self.refreshGreeterVisibility();
+    }
+
+    fn clearPendingImages(self: *Interactive) void {
+        for (self.pending_images.items) |*attachment| attachment.deinit(self.allocator);
+        self.pending_images.clearRetainingCapacity();
+        self.refreshPendingImageBanner();
+    }
+
+    fn refreshPendingImageBanner(self: *Interactive) void {
+        self.pending_container.clear();
+        if (self.pending_images.items.len == 0) return;
+
+        const banner = pendingImageBannerText(self.allocator, self.pending_images.items) catch return;
+        defer self.allocator.free(banner);
+        self.pending_image_banner.setContent(banner);
+        self.pending_container.addChild(self.pending_image_banner.component());
+    }
+
+    fn handlePasteImageShortcut(self: *Interactive) void {
+        if (self.is_streaming or self.request_in_flight) {
+            self.status_text.setContent("cannot paste image while agent is running");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        }
+
+        const raw = self.clipboard_image_reader(self.allocator) orelse {
+            self.status_text.setContent("clipboard has no image");
+            self.status_text.fg = self.theme.fg(.muted);
+            self.tui.dirty = true;
+            return;
+        };
+        defer self.allocator.free(raw);
+
+        const prepared = prepareClipboardImageAttachment(self.allocator, raw, .{
+            .auto_resize = self.settings_manager.getImageAutoResize(),
+        }) catch {
+            self.status_text.setContent("out of memory");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        };
+
+        switch (prepared) {
+            .rejected => |message| {
+                defer self.allocator.free(message);
+                self.status_text.setContent(message);
+                self.status_text.fg = self.theme.fg(.warning);
+            },
+            .attach => |attachment| {
+                self.pending_images.append(self.allocator, attachment) catch {
+                    var failed_attachment = attachment;
+                    failed_attachment.deinit(self.allocator);
+                    self.status_text.setContent("out of memory");
+                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.tui.dirty = true;
+                    return;
+                };
+                self.refreshPendingImageBanner();
+                self.refreshGreeterVisibility();
+
+                var status_buf: [96]u8 = undefined;
+                const pending_count = self.pending_images.items.len;
+                const status = if (pending_count == 1)
+                    "attached clipboard image"
+                else
+                    std.fmt.bufPrint(&status_buf, "attached clipboard image ({d} pending)", .{pending_count}) catch "attached clipboard image";
+                self.status_text.setContent(status);
+                self.status_text.fg = self.theme.fg(.success);
+            },
+        }
+        self.tui.dirty = true;
+    }
+
     fn outputHeight(self: *Interactive) u32 {
         const h = self.tui.height();
         const w = self.tui.width();
@@ -1293,7 +1430,7 @@ pub const Interactive = struct {
     }
 
     fn refreshGreeterVisibility(self: *Interactive) void {
-        if (!self.greeter_dismissed and self.active_editor.getText().len > 0) {
+        if (!self.greeter_dismissed and self.composerHasPendingInput()) {
             self.greeter_dismissed = true;
         }
         self.widget_above_container.clear();
@@ -1497,19 +1634,15 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn submitPrompt(self: *Interactive, text: []const u8) void {
-        self.submitUserContent(.{ .text = text });
-    }
-
-    fn submitUserContent(self: *Interactive, content: ai_protocol.UserMessage.UserMessageContent) void {
+    fn submitUserContent(self: *Interactive, content: ai_protocol.UserMessage.UserMessageContent) bool {
         if (self.request_in_flight) {
             self.status_text.setContent("agent is busy");
             self.status_text.fg = self.theme.fg(.@"error");
             self.tui.dirty = true;
-            return;
+            return false;
         }
 
-        const content_copy = message_memory.cloneUserContent(self.msg_allocator, content) catch return;
+        const content_copy = message_memory.cloneUserContent(self.msg_allocator, content) catch return false;
 
         switch (self.request_queue.trySend(.{ .prompt = .{ .content = content_copy } })) {
             .ok => {},
@@ -1521,36 +1654,50 @@ pub const Interactive = struct {
                 self.status_text.setContent("agent unavailable");
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
-                return;
+                return false;
             },
         }
 
-        self.active_editor.clear();
-        self.refreshGreeterVisibility();
+        self.clearComposerDraft();
         self.is_streaming = true;
         self.showLoader("Working…");
         self.tui.dirty = true;
+        return true;
     }
 
     fn handleSubmittedText(self: *Interactive, text: []const u8, queued_kind: ?QueuedInputKind) void {
-        if (text.len == 0) return;
+        if (text.len == 0 and self.pending_images.items.len == 0) return;
 
         self.active_editor.addToHistory(text);
 
-        if (text[0] == '/' and self.dispatchSlashCommand(text)) return;
+        if (text.len > 0 and text[0] == '/' and self.dispatchSlashCommand(text)) return;
 
         if (queued_kind) |kind| {
+            if (self.pending_images.items.len > 0) {
+                self.status_text.setContent("cannot queue images while agent is streaming");
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+                return;
+            }
             self.queueMessageWhileStreaming(kind, text);
             return;
         }
 
-        self.submitPrompt(text);
+        var built = buildSubmittedUserContent(self.allocator, text, self.pending_images.items) catch {
+            self.status_text.setContent("out of memory");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        };
+        defer built.deinit(self.allocator);
+
+        _ = self.submitUserContent(built.content);
     }
 
     fn handleFollowUpShortcut(self: *Interactive) void {
         const expanded = self.active_editor.getExpandedText();
         const text = std.mem.trim(u8, expanded, " \t\r\n");
-        if (text.len == 0) return;
+        if (text.len == 0 and self.pending_images.items.len == 0) return;
 
         if (self.is_streaming) {
             self.handleSubmittedText(text, .follow_up);
@@ -2631,6 +2778,102 @@ pub const Interactive = struct {
     }
 };
 
+fn buildSubmittedUserContent(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    pending_images: []const PendingImageAttachment,
+) !BuiltSubmitContent {
+    if (pending_images.len == 0) return .{ .content = .{ .text = text } };
+
+    const text_block_count: usize = if (text.len > 0) 1 else 0;
+    const blocks = try allocator.alloc(ai_protocol.UserMessage.UserMessageContent.Block, pending_images.len + text_block_count);
+
+    var next_index: usize = 0;
+    if (text.len > 0) {
+        blocks[next_index] = .{ .text = .{ .text = text } };
+        next_index += 1;
+    }
+    for (pending_images) |attachment| {
+        blocks[next_index] = .{ .image = attachment.image };
+        next_index += 1;
+    }
+
+    return .{ .content = .{ .blocks = blocks } };
+}
+
+fn prepareClipboardImageAttachment(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    policy: image_mod.InlinePolicy,
+) !PreparedClipboardImageResult {
+    const mime = image_mod.sniffMime(raw) orelse {
+        return .{ .rejected = try allocator.dupe(u8, "clipboard image format unsupported") };
+    };
+    const dimensions = image_mod.sniffDimensions(raw, mime);
+    switch (image_mod.evaluateInlineImage(raw.len, dimensions, policy)) {
+        .needs_resize => return .{ .rejected = try std.fmt.allocPrint(
+            allocator,
+            "clipboard image not attached: {s}",
+            .{image_mod.omittedInlineNote()},
+        ) },
+        .attach_original => {
+            const encoded = try encodeBase64Owned(allocator, raw);
+            errdefer allocator.free(encoded);
+            const mime_owned = try allocator.dupe(u8, image_mod.mimeString(mime));
+            return .{ .attach = .{
+                .image = .{
+                    .data = encoded,
+                    .mime_type = mime_owned,
+                },
+                .dimensions = dimensions,
+            } };
+        },
+    }
+}
+
+fn pendingImageBannerText(
+    allocator: std.mem.Allocator,
+    pending_images: []const PendingImageAttachment,
+) ![]u8 {
+    var clear_binding_buf: [32]u8 = undefined;
+    const clear_binding = keybindings.formatBindings(.app_clear, " / ", &clear_binding_buf);
+    const last = pending_images[pending_images.len - 1];
+
+    if (pending_images.len == 1) {
+        if (last.dimensions) |dimensions| {
+            return std.fmt.allocPrint(
+                allocator,
+                "1 clipboard image pending ({s}, {d}x{d}) · {s} to clear",
+                .{ last.image.mime_type, dimensions.width, dimensions.height, clear_binding },
+            );
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "1 clipboard image pending ({s}) · {s} to clear",
+            .{ last.image.mime_type, clear_binding },
+        );
+    }
+
+    if (last.dimensions) |dimensions| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{d} clipboard images pending (latest {s}, {d}x{d}) · {s} to clear",
+            .{ pending_images.len, last.image.mime_type, dimensions.width, dimensions.height, clear_binding },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{d} clipboard images pending (latest {s}) · {s} to clear",
+        .{ pending_images.len, last.image.mime_type, clear_binding },
+    );
+}
+
+fn encodeBase64Owned(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+    _ = std.base64.standard.Encoder.encode(encoded, raw);
+    return encoded;
+}
+
 fn userFacingFailureMessage(
     failure_kind: ?ai_protocol.NormalizedFailure.Kind,
     raw_message: []const u8,
@@ -2652,10 +2895,15 @@ fn cloneUserDisplayText(allocator: std.mem.Allocator, user: ai_protocol.UserMess
         .blocks => |blocks| blk: {
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(allocator);
+
+            var image_index: usize = 0;
             for (blocks) |block| {
                 switch (block) {
                     .text => |text| out.appendSlice(allocator, text.text) catch return null,
-                    .image => {},
+                    .image => {
+                        image_index += 1;
+                        out.writer(allocator).print("[image{d}]", .{image_index}) catch return null;
+                    },
                 }
             }
             if (out.items.len == 0) break :blk null;
@@ -2852,4 +3100,109 @@ fn thinkingDescription(level: agent_protocol.ThinkingLevel) []const u8 {
         .high => "Deep reasoning (~16k tokens)",
         .xhigh => "Maximum reasoning (~32k tokens)",
     };
+}
+
+const testing = std.testing;
+
+fn pngHeader(width: u32, height: u32) [24]u8 {
+    return .{
+        0x89,                                    0x50,                                    0x4E,                                   0x47,                            0x0D,                                     0x0A,                                     0x1A,                                    0x0A,
+        0x00,                                    0x00,                                    0x00,                                   0x0D,                            0x49,                                     0x48,                                     0x44,                                    0x52,
+        @as(u8, @intCast((width >> 24) & 0xFF)), @as(u8, @intCast((width >> 16) & 0xFF)), @as(u8, @intCast((width >> 8) & 0xFF)), @as(u8, @intCast(width & 0xFF)), @as(u8, @intCast((height >> 24) & 0xFF)), @as(u8, @intCast((height >> 16) & 0xFF)), @as(u8, @intCast((height >> 8) & 0xFF)), @as(u8, @intCast(height & 0xFF)),
+    };
+}
+
+test "prepareClipboardImageAttachment accepts clipboard png within inline policy" {
+    const png = pngHeader(64, 32);
+    var prepared = try prepareClipboardImageAttachment(testing.allocator, &png, .{});
+    defer prepared.deinit(testing.allocator);
+
+    switch (prepared) {
+        .attach => |attachment| {
+            try testing.expectEqualStrings("image/png", attachment.image.mime_type);
+            try testing.expectEqual(image_mod.Dimensions{ .width = 64, .height = 32 }, attachment.dimensions.?);
+        },
+        .rejected => return error.ExpectedClipboardAttachment,
+    }
+}
+
+test "prepareClipboardImageAttachment rejects oversized clipboard image when auto resize is enabled" {
+    const png = pngHeader(640, 480);
+    var prepared = try prepareClipboardImageAttachment(testing.allocator, &png, .{
+        .auto_resize = true,
+        .max_width = 100,
+        .max_height = 100,
+        .max_base64_bytes = 1024,
+    });
+    defer prepared.deinit(testing.allocator);
+
+    switch (prepared) {
+        .rejected => |message| try testing.expect(std.mem.indexOf(u8, message, image_mod.omittedInlineNote()) != null),
+        .attach => return error.ExpectedClipboardRejection,
+    }
+}
+
+test "buildSubmittedUserContent places text before pending images" {
+    const data = try testing.allocator.dupe(u8, "ZGF0YQ==");
+    defer testing.allocator.free(data);
+    const mime_type = try testing.allocator.dupe(u8, "image/png");
+    defer testing.allocator.free(mime_type);
+
+    const pending = [_]PendingImageAttachment{.{
+        .image = .{ .data = data, .mime_type = mime_type },
+        .dimensions = .{ .width = 10, .height = 20 },
+    }};
+
+    var built = try buildSubmittedUserContent(testing.allocator, "describe this", &pending);
+    defer built.deinit(testing.allocator);
+
+    switch (built.content) {
+        .blocks => |blocks| {
+            try testing.expectEqual(@as(usize, 2), blocks.len);
+            try testing.expectEqualStrings("describe this", blocks[0].text.text);
+            try testing.expectEqualStrings("image/png", blocks[1].image.mime_type);
+        },
+        .text => return error.ExpectedBlockContent,
+    }
+}
+
+test "cloneUserDisplayText includes numbered image markers for user block messages" {
+    const blocks = [_]ai_protocol.UserMessage.UserMessageContent.Block{
+        .{ .text = .{ .text = "look" } },
+        .{ .image = .{ .data = "aaa", .mime_type = "image/png" } },
+        .{ .text = .{ .text = " here" } },
+        .{ .image = .{ .data = "bbb", .mime_type = "image/jpeg" } },
+    };
+
+    const text = cloneUserDisplayText(testing.allocator, .{
+        .content = .{ .blocks = &blocks },
+        .timestamp = 1,
+    }) orelse return error.ExpectedDisplayText;
+    defer testing.allocator.free(text);
+
+    try testing.expectEqualStrings("look[image1] here[image2]", text);
+}
+
+test "pendingImageBannerText includes latest image details and clear shortcut" {
+    const data1 = try testing.allocator.dupe(u8, "aaa");
+    defer testing.allocator.free(data1);
+    const mime1 = try testing.allocator.dupe(u8, "image/png");
+    defer testing.allocator.free(mime1);
+    const data2 = try testing.allocator.dupe(u8, "bbb");
+    defer testing.allocator.free(data2);
+    const mime2 = try testing.allocator.dupe(u8, "image/jpeg");
+    defer testing.allocator.free(mime2);
+
+    const pending = [_]PendingImageAttachment{
+        .{ .image = .{ .data = data1, .mime_type = mime1 }, .dimensions = .{ .width = 10, .height = 20 } },
+        .{ .image = .{ .data = data2, .mime_type = mime2 }, .dimensions = .{ .width = 30, .height = 40 } },
+    };
+
+    const banner = try pendingImageBannerText(testing.allocator, &pending);
+    defer testing.allocator.free(banner);
+
+    try testing.expect(std.mem.indexOf(u8, banner, "2 clipboard images pending") != null);
+    try testing.expect(std.mem.indexOf(u8, banner, "image/jpeg") != null);
+    try testing.expect(std.mem.indexOf(u8, banner, "30x40") != null);
+    try testing.expect(std.mem.indexOf(u8, banner, "ctrl+c") != null);
 }

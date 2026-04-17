@@ -27,6 +27,7 @@ pub const box_chrome = @import("box_chrome.zig");
 pub const status_data = @import("status_data.zig");
 pub const autocomplete = @import("autocomplete.zig");
 pub const keybindings = @import("keybindings.zig");
+pub const interactive = @import("interactive.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

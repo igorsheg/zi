@@ -3,6 +3,7 @@ const ai = @import("../ai/root.zig");
 const plan = @import("plan.zig");
 const result = @import("result.zig");
 const tool_util = @import("../tools/util.zig");
+const image_mod = @import("../image/root.zig");
 
 const max_batch_file_bytes = 16 * 1024 * 1024;
 
@@ -35,10 +36,15 @@ pub const PrepareBatchResult = union(enum) {
     err: result.ExecutionDiagnostic,
 };
 
+pub const PrepareOptions = struct {
+    inline_image_policy: image_mod.InlinePolicy = .{},
+};
+
 pub fn prepareInitialMessage(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     sources: plan.PromptSources,
+    options: PrepareOptions,
 ) std.mem.Allocator.Error!PrepareInitialResult {
     var text_out: std.Io.Writer.Allocating = .init(allocator);
     errdefer text_out.deinit();
@@ -55,7 +61,7 @@ pub fn prepareInitialMessage(
     }
 
     for (sources.file_args) |file_arg| {
-        switch (try appendFileInput(allocator, cwd, file_arg, &text_out.writer, &images)) {
+        switch (try appendFileInput(allocator, cwd, file_arg, &text_out.writer, &images, options)) {
             .ok => |appended| {
                 if (appended) wrote_text = true;
             },
@@ -82,8 +88,9 @@ pub fn prepareBatchInput(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     sources: plan.PromptSources,
+    options: PrepareOptions,
 ) std.mem.Allocator.Error!PrepareBatchResult {
-    return switch (try prepareInitialMessage(allocator, cwd, sources)) {
+    return switch (try prepareInitialMessage(allocator, cwd, sources, options)) {
         .ok => |prepared| if (prepared) |input|
             .{ .ok = input }
         else
@@ -103,6 +110,7 @@ fn appendFileInput(
     file_arg: []const u8,
     writer: *std.Io.Writer,
     images: *std.ArrayList(ai.protocol.ImageContent),
+    options: PrepareOptions,
 ) std.mem.Allocator.Error!AppendFileResult {
     const resolved_path = try tool_util.resolvePath(allocator, file_arg, cwd);
     defer allocator.free(resolved_path);
@@ -128,26 +136,6 @@ fn appendFileInput(
     };
     if (file_stat.size == 0) return .{ .ok = false };
 
-    if (imageMime(resolved_path)) |mime| {
-        const raw = file.readToEndAlloc(allocator, max_batch_file_bytes) catch |err| {
-            return .{ .err = .{ .batch_file_read_failed = .{
-                .path = try allocator.dupe(u8, resolved_path),
-                .err_name = @errorName(err),
-            } } };
-        };
-        defer allocator.free(raw);
-
-        const encoded = try encodeBase64Owned(allocator, raw);
-        errdefer allocator.free(encoded);
-
-        const mime_owned = try allocator.dupe(u8, mime);
-        errdefer allocator.free(mime_owned);
-
-        try images.append(allocator, .{ .data = encoded, .mime_type = mime_owned });
-        printAllocating(writer, "<file name=\"{s}\"></file>\n", .{resolved_path});
-        return .{ .ok = true };
-    }
-
     const raw = file.readToEndAlloc(allocator, max_batch_file_bytes) catch |err| {
         return .{ .err = .{ .batch_file_read_failed = .{
             .path = try allocator.dupe(u8, resolved_path),
@@ -155,6 +143,31 @@ fn appendFileInput(
         } } };
     };
     defer allocator.free(raw);
+
+    if (image_mod.sniffMime(raw)) |mime| {
+        const decision = image_mod.evaluateInlineImage(
+            raw.len,
+            image_mod.sniffDimensions(raw, mime),
+            options.inline_image_policy,
+        );
+        switch (decision) {
+            .attach_original => {
+                const encoded = try encodeBase64Owned(allocator, raw);
+                errdefer allocator.free(encoded);
+
+                const mime_owned = try allocator.dupe(u8, image_mod.mimeString(mime));
+                errdefer allocator.free(mime_owned);
+
+                try images.append(allocator, .{ .data = encoded, .mime_type = mime_owned });
+                printAllocating(writer, "<file name=\"{s}\"></file>\n", .{resolved_path});
+                return .{ .ok = true };
+            },
+            .needs_resize => {
+                printAllocating(writer, "<file name=\"{s}\">{s}</file>\n", .{ resolved_path, image_mod.omittedInlineNote() });
+                return .{ .ok = true };
+            },
+        }
+    }
 
     printAllocating(writer, "<file name=\"{s}\">\n", .{resolved_path});
     writeAllocating(writer, raw);
@@ -170,18 +183,6 @@ fn printAllocating(writer: *std.Io.Writer, comptime fmt: []const u8, args: anyty
     writer.print(fmt, args) catch unreachable;
 }
 
-fn imageMime(path: []const u8) ?[]const u8 {
-    const ext = std.fs.path.extension(path);
-    if (ext.len == 0 or ext.len > 5) return null;
-    var lower_buf: [5]u8 = undefined;
-    const lower = std.ascii.lowerString(lower_buf[0..ext.len], ext);
-    if (std.mem.eql(u8, lower, ".jpg") or std.mem.eql(u8, lower, ".jpeg")) return "image/jpeg";
-    if (std.mem.eql(u8, lower, ".png")) return "image/png";
-    if (std.mem.eql(u8, lower, ".gif")) return "image/gif";
-    if (std.mem.eql(u8, lower, ".webp")) return "image/webp";
-    return null;
-}
-
 fn encodeBase64Owned(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     const Encoder = std.base64.standard.Encoder;
     const encoded = try allocator.alloc(u8, Encoder.calcSize(raw.len));
@@ -194,6 +195,14 @@ fn freeImages(allocator: std.mem.Allocator, images: []const ai.protocol.ImageCon
         allocator.free(image.data);
         allocator.free(image.mime_type);
     }
+}
+
+fn pngHeader(width: u32, height: u32) [24]u8 {
+    return .{
+        0x89,                                    0x50,                                    0x4E,                                   0x47,                            0x0D,                                     0x0A,                                     0x1A,                                    0x0A,
+        0x00,                                    0x00,                                    0x00,                                   0x0D,                            0x49,                                     0x48,                                     0x44,                                    0x52,
+        @as(u8, @intCast((width >> 24) & 0xFF)), @as(u8, @intCast((width >> 16) & 0xFF)), @as(u8, @intCast((width >> 8) & 0xFF)), @as(u8, @intCast(width & 0xFF)), @as(u8, @intCast((height >> 24) & 0xFF)), @as(u8, @intCast((height >> 16) & 0xFF)), @as(u8, @intCast((height >> 8) & 0xFF)), @as(u8, @intCast(height & 0xFF)),
+    };
 }
 
 test "prepareBatchInput merges stdin file text and prompt in pi order" {
@@ -212,7 +221,7 @@ test "prepareBatchInput merges stdin file text and prompt in pi order" {
         .stdin_text = "from stdin\n",
         .file_args = &.{"notes.txt"},
         .prompt_text = "and prompt",
-    });
+    }, .{});
     switch (prepared) {
         .ok => |input| {
             const expected = try std.fmt.allocPrint(
@@ -237,19 +246,20 @@ test "prepareBatchInput attaches image files and skips empty files" {
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(.{ .sub_path = "empty.txt", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "shot.png", .data = "PNGDATA" });
+    const png = pngHeader(64, 32);
+    try tmp.dir.writeFile(.{ .sub_path = "shot.bin", .data = &png });
     const cwd = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
     const prepared = try prepareBatchInput(allocator, cwd, .{
-        .file_args = &.{ "empty.txt", "shot.png" },
-    });
+        .file_args = &.{ "empty.txt", "shot.bin" },
+    }, .{});
     switch (prepared) {
         .ok => |input| {
             try std.testing.expectEqual(@as(usize, 1), input.images.len);
             try std.testing.expectEqualStrings("image/png", input.images[0].mime_type);
             try std.testing.expect(std.mem.indexOf(u8, input.text, "empty.txt") == null);
-            try std.testing.expect(std.mem.indexOf(u8, input.text, "shot.png") != null);
+            try std.testing.expect(std.mem.indexOf(u8, input.text, "shot.bin") != null);
             const content = try input.toUserContent(allocator);
             switch (content) {
                 .blocks => |blocks| {
@@ -258,6 +268,36 @@ test "prepareBatchInput attaches image files and skips empty files" {
                 },
                 .text => return error.ExpectedBlocks,
             }
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
+}
+
+test "prepareBatchInput omits oversized images when auto-resize is enabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const png = pngHeader(640, 480);
+    try tmp.dir.writeFile(.{ .sub_path = "large.bin", .data = &png });
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const prepared = try prepareBatchInput(allocator, cwd, .{
+        .file_args = &.{"large.bin"},
+    }, .{ .inline_image_policy = .{
+        .auto_resize = true,
+        .max_width = 100,
+        .max_height = 100,
+        .max_base64_bytes = 1024,
+    } });
+    switch (prepared) {
+        .ok => |input| {
+            try std.testing.expectEqual(@as(usize, 0), input.images.len);
+            try std.testing.expect(std.mem.indexOf(u8, input.text, image_mod.omittedInlineNote()) != null);
         },
         .err => return error.UnexpectedDiagnostic,
     }
@@ -277,7 +317,7 @@ test "prepareInitialMessage treats empty interactive file inputs as no startup c
 
     const prepared = try prepareInitialMessage(allocator, cwd, .{
         .file_args = &.{"empty.txt"},
-    });
+    }, .{});
     switch (prepared) {
         .ok => |input| try std.testing.expect(input == null),
         .err => return error.UnexpectedDiagnostic,
@@ -297,7 +337,7 @@ test "prepareBatchInput reports missing file arguments" {
 
     const prepared = try prepareBatchInput(allocator, cwd, .{
         .file_args = &.{"missing.txt"},
-    });
+    }, .{});
     switch (prepared) {
         .err => |diag| switch (diag) {
             .batch_file_not_found => |path| try std.testing.expect(std.mem.endsWith(u8, path, "/missing.txt")),

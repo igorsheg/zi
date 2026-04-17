@@ -26,13 +26,17 @@ pub const Bundle = struct {
     }
 };
 
+pub const BuildOptions = struct {
+    image_auto_resize: bool = true,
+};
+
 /// Build the default tool definitions. Caller owns the returned
 /// `Bundle` and must call `deinit` on session teardown. The `cwd`
 /// slice is borrowed, not duped — the AgentSession's `options.cwd`
 /// outlives the bundle.
-pub fn build(allocator: std.mem.Allocator, cwd: []const u8) !Bundle {
+pub fn build(allocator: std.mem.Allocator, cwd: []const u8, options: BuildOptions) !Bundle {
     const ctx = try allocator.create(util.BuiltinCtx);
-    ctx.* = .{ .cwd = cwd };
+    ctx.* = .{ .cwd = cwd, .image_auto_resize = options.image_auto_resize };
 
     var definitions = try allocator.alloc(tool_def.ToolDefinition, 7);
     definitions[0] = bash_tool.definition(ctx);

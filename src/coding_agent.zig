@@ -190,10 +190,15 @@ pub const AgentSession = struct {
         // The bundle owns a per-session BuiltinCtx (cwd + session id)
         // that every tool ctx pointer references for the session
         // lifetime.
+        const image_auto_resize = if (options.settings_manager) |settings|
+            settings.getImageAutoResize()
+        else
+            true;
         var builtin_ctx: ?*builtin_util.BuiltinCtx = null;
         const builtin_definitions = options.tools orelse blk: {
-            var bundle = builtin_tools_mod.build(allocator, options.cwd) catch
-                break :blk @as([]const tool_def.ToolDefinition, &.{});
+            var bundle = builtin_tools_mod.build(allocator, options.cwd, .{
+                .image_auto_resize = image_auto_resize,
+            }) catch break :blk @as([]const tool_def.ToolDefinition, &.{});
             bundle.ctx.session_id = store.sessionId();
             builtin_ctx = bundle.ctx;
             break :blk @as([]const tool_def.ToolDefinition, bundle.definitions);

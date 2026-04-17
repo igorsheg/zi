@@ -18,7 +18,17 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
     logging.setThreadLabel(.batch);
 
     const allocator = runtime.allocator;
-    const prepared_input = switch (try initial_message.prepareBatchInput(allocator, runtime.cwd, options.prompt_sources)) {
+    const prepare_options: initial_message.PrepareOptions = .{
+        .inline_image_policy = .{
+            .auto_resize = runtime.settings_manager.getImageAutoResize(),
+        },
+    };
+    const prepared_input = switch (try initial_message.prepareBatchInput(
+        allocator,
+        runtime.cwd,
+        options.prompt_sources,
+        prepare_options,
+    )) {
         .ok => |input| input,
         .err => |diag| return .{ .err = diag },
     };

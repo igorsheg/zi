@@ -40,7 +40,12 @@ pub fn run(
 ) !result.ExecutionResult {
     logging.setThreadLabel(.tui);
 
-    const startup_action = switch (try resolveStartupAction(ctx.allocator, runtime.cwd, options)) {
+    const prepare_options: initial_message.PrepareOptions = .{
+        .inline_image_policy = .{
+            .auto_resize = runtime.settings_manager.getImageAutoResize(),
+        },
+    };
+    const startup_action = switch (try resolveStartupAction(ctx.allocator, runtime.cwd, options, prepare_options)) {
         .ok => |action| action,
         .err => |diag| return .{ .err = diag },
     };
@@ -159,9 +164,10 @@ fn resolveStartupAction(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     options: plan.InteractivePlan,
+    prepare_options: initial_message.PrepareOptions,
 ) std.mem.Allocator.Error!StartupResolution {
     return switch (options.session_target) {
-        .none => switch (try initial_message.prepareInitialMessage(allocator, cwd, options.prompt_sources)) {
+        .none => switch (try initial_message.prepareInitialMessage(allocator, cwd, options.prompt_sources, prepare_options)) {
             .ok => |prepared| .{ .ok = if (prepared) |content| .{ .prompt = try content.toUserContent(allocator) } else .none },
             .err => |diag| .{ .err = diag },
         },
@@ -203,7 +209,7 @@ test "startup resume keeps explicit cli model instead of restoring session model
     const from_picker = try resolveStartupAction(std.testing.allocator, "/tmp", .{
         .session_target = .picker,
         .model_id = "claude-sonnet-4-5",
-    });
+    }, .{});
     switch (from_picker) {
         .ok => |action| switch (action) {
             .resume_picker => |picker| try std.testing.expect(!picker.restore_session_model),
@@ -230,7 +236,7 @@ test "interactive startup prepares shared @file prompt content" {
             .file_args = &.{"notes.txt"},
             .prompt_text = "and prompt",
         },
-    });
+    }, .{});
     switch (resolved) {
         .ok => |action| switch (action) {
             .prompt => |content| switch (content) {

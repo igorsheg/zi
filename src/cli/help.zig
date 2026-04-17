@@ -80,7 +80,9 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             "  - interactive startup uses @file text + prompt; batch mode uses stdin + @file text + prompt\n" ++
             "  - batch mode accepts piped stdin, @file arguments, a positional prompt, or any combination\n" ++
             "  - batch prompt assembly order matches pi-mono: stdin + @file text + prompt\n" ++
-            "  - image @file inputs are attached and also contribute <file ...></file> text references\n" ++
+            "  - image @file inputs are detected from file bytes, attached when within inline limits, and also contribute <file ...></file> text references\n" ++
+            "  - with images.autoResize enabled, oversized image @file inputs contribute the standard omission note until a resize backend lands\n" ++
+            "  - with images.autoResize disabled, original image bytes attach as-is\n" ++
             "  - empty or whitespace-only piped stdin is ignored; empty @file inputs are skipped\n" ++
             "  - batch text mode prints the final assistant text only after completion\n" ++
             "  - batch JSON mode emits a session header first when persistence is enabled\n" ++
@@ -113,7 +115,8 @@ test "general help documents explicit session-target behaviors and actions" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Merge stdin, @file content, and the prompt in that order") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Start interactive mode with @file content") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "@file arguments are supported for interactive startup and explicit batch mode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "image @file inputs are attached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "image @file inputs are detected from file bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "oversized image @file inputs contribute the standard omission note") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--no-session only affects the startup session") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "List available models") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "optional fuzzy search") != null);

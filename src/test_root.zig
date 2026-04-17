@@ -16,6 +16,9 @@ test {
     _ = @import("auth/root.zig");
     _ = @import("settings/root.zig");
     _ = @import("cli/root.zig");
+    _ = @import("cli/help.zig");
+    _ = @import("cli/initial_message.zig");
+    _ = @import("cli/run_interactive.zig");
     _ = @import("agent/root.zig");
     _ = @import("session/root.zig");
     _ = @import("coding_agent.zig");
@@ -24,6 +27,7 @@ test {
     _ = @import("search/root.zig");
     _ = @import("skills/root.zig");
     _ = @import("tools/bash.zig");
+    _ = @import("tools/read.zig");
     _ = @import("tui/root.zig");
     _ = @import("themes/root.zig");
     _ = @import("tui/editor/root.zig");

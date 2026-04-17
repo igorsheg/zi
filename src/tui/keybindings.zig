@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const keys_mod = @import("keys.zig");
 
 const Key = keys_mod.Key;
@@ -31,6 +32,7 @@ pub const Action = enum {
     app_toggle_thinking,
     app_queue_follow_up,
     app_restore_queued,
+    app_paste_image,
     app_scroll_page_up,
     app_scroll_page_down,
     app_scroll_line_up,
@@ -78,6 +80,8 @@ const key_ctrl_c = KeySpec{ .key = .{ .code = .char, .char = 'c', .ctrl = true }
 const key_ctrl_d = KeySpec{ .key = .{ .code = .char, .char = 'd', .ctrl = true }, .display = "ctrl+d" };
 const key_ctrl_o = KeySpec{ .key = .{ .code = .char, .char = 'o', .ctrl = true }, .display = "ctrl+o" };
 const key_ctrl_t = KeySpec{ .key = .{ .code = .char, .char = 't', .ctrl = true }, .display = "ctrl+t" };
+const key_ctrl_v = KeySpec{ .key = .{ .code = .char, .char = 'v', .ctrl = true }, .display = "ctrl+v" };
+const key_alt_v = KeySpec{ .key = .{ .code = .char, .char = 'v', .alt = true }, .display = "alt+v" };
 const key_alt_enter = KeySpec{ .key = .{ .code = .enter, .alt = true }, .display = "alt+enter" };
 const key_alt_up = KeySpec{ .key = .{ .code = .up, .alt = true }, .display = "alt+up" };
 const key_page_up = KeySpec{ .key = .{ .code = .page_up }, .display = "page up" };
@@ -114,6 +118,7 @@ const app_toggle_tools_bindings = [_]KeySpec{key_ctrl_o};
 const app_toggle_thinking_bindings = [_]KeySpec{key_ctrl_t};
 const app_queue_follow_up_bindings = [_]KeySpec{key_alt_enter};
 const app_restore_queued_bindings = [_]KeySpec{key_alt_up};
+const app_paste_image_bindings = [_]KeySpec{if (builtin.os.tag == .windows) key_alt_v else key_ctrl_v};
 const app_scroll_page_up_bindings = [_]KeySpec{key_page_up};
 const app_scroll_page_down_bindings = [_]KeySpec{key_page_down};
 const app_scroll_line_up_bindings = [_]KeySpec{key_shift_up};
@@ -295,6 +300,12 @@ const definitions = [_]Definition{
         .bindings = &app_restore_queued_bindings,
     },
     .{
+        .action = .app_paste_image,
+        .section = .app,
+        .description = "Paste image from clipboard",
+        .bindings = &app_paste_image_bindings,
+    },
+    .{
         .action = .app_scroll_page_up,
         .section = .app,
         .description = "Scroll transcript up by page",
@@ -418,6 +429,13 @@ test "keybindings match defaults across editor picker and app actions" {
     try testing.expect(matches(.app_toggle_tools, .{ .code = .char, .char = 'o', .ctrl = true }));
     try testing.expect(matches(.app_queue_follow_up, .{ .code = .enter, .alt = true }));
     try testing.expect(matches(.app_restore_queued, .{ .code = .up, .alt = true }));
+    if (builtin.os.tag == .windows) {
+        try testing.expect(matches(.app_paste_image, .{ .code = .char, .char = 'v', .alt = true }));
+        try testing.expect(!matches(.app_paste_image, .{ .code = .char, .char = 'v', .ctrl = true }));
+    } else {
+        try testing.expect(matches(.app_paste_image, .{ .code = .char, .char = 'v', .ctrl = true }));
+        try testing.expect(!matches(.app_paste_image, .{ .code = .char, .char = 'v', .alt = true }));
+    }
     try testing.expect(!matches(.app_toggle_tools, .{ .code = .char, .char = 'o' }));
 }
 

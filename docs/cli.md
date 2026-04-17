@@ -65,11 +65,12 @@ Additional contract rules:
 - interactive startup prompt sources are assembled as `@file text + first prompt positional`
 - batch prompt sources are assembled in pi-mono order: `stdin + @file text + first prompt positional`
 - piped stdin can satisfy the batch prompt requirement by itself, as can `@file` arguments, or they can be combined with the positional prompt
-- image `@file` inputs attach image blocks and also contribute `<file ...></file>` text references
+- image `@file` inputs detect MIME from file bytes, attach image blocks, and also contribute `<file ...></file>` text references
+- when `images.autoResize = true`, images already within inline limits attach normally; oversized images contribute the standard omission note until a resize backend lands
+- when `images.autoResize = false`, original image bytes attach as-is
 - empty or whitespace-only piped stdin is treated as absent; empty `@file` inputs are skipped
 - interactive mode does not read piped stdin and does not force batch selection
 - in interactive mode, `--no-session` applies to the startup session only; `/resume` may switch into a persisted session and `/new` starts a normal persisted session
-- current image `@file` handling is still narrower than pi-mono: extension-based detection only, no auto-resize or dimension-note text yet
 - the **default action is `run`**
 - session-targeting flags are explicit and validated
 - session targets are **interactive-only** and **mutually exclusive**

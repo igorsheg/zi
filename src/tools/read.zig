@@ -15,6 +15,7 @@ const protocol = @import("../agent/protocol.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("../lib/output_buffer.zig");
+const image = @import("../image/root.zig");
 
 const MAX_LINES: usize = 500;
 const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -84,28 +85,30 @@ fn execute(
         return readDirectory(allocator, resolved);
     }
 
-    // Image fast path — file extension determines mime.
-    if (imageMime(resolved)) |mime| {
-        return readImage(allocator, resolved, mime);
+    const maybe_image_mime = sniffImageMime(resolved) catch |err|
+        return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
+    if (maybe_image_mime) |mime| {
+        return readImage(allocator, resolved, mime, .{ .auto_resize = ctx.image_auto_resize });
     }
 
     return readTextFile(allocator, resolved, util.getIntPair(args, "read_range"));
 }
 
-fn imageMime(path: []const u8) ?[]const u8 {
-    const ext = std.fs.path.extension(path);
-    if (ext.len == 0) return null;
-    var lower_buf: [16]u8 = undefined;
-    if (ext.len > lower_buf.len) return null;
-    const lower = std.ascii.lowerString(lower_buf[0..ext.len], ext);
-    if (std.mem.eql(u8, lower, ".jpg") or std.mem.eql(u8, lower, ".jpeg")) return "image/jpeg";
-    if (std.mem.eql(u8, lower, ".png")) return "image/png";
-    if (std.mem.eql(u8, lower, ".gif")) return "image/gif";
-    if (std.mem.eql(u8, lower, ".webp")) return "image/webp";
-    return null;
+fn sniffImageMime(path: []const u8) !?image.Mime {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    var header_buf: [64]u8 = undefined;
+    const header_len = try file.readAll(&header_buf);
+    return image.sniffMime(header_buf[0..header_len]);
 }
 
-fn readImage(allocator: std.mem.Allocator, path: []const u8, mime: []const u8) protocol.AgentToolResult {
+fn readImage(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    mime: image.Mime,
+    policy: image.InlinePolicy,
+) protocol.AgentToolResult {
     const file = std.fs.cwd().openFile(path, .{}) catch |err|
         return util.errorf(allocator, "failed to open image: {s}", .{@errorName(err)});
     defer file.close();
@@ -114,36 +117,47 @@ fn readImage(allocator: std.mem.Allocator, path: []const u8, mime: []const u8) p
         return util.errorf(allocator, "failed to read image: {s}", .{@errorName(err)});
     defer allocator.free(raw);
 
-    const Encoder = std.base64.standard.Encoder;
-    const encoded_len = Encoder.calcSize(raw.len);
-    const encoded = allocator.alloc(u8, encoded_len) catch
-        return util.errorResult(allocator, "image alloc failed");
-    _ = Encoder.encode(encoded, raw);
+    const mime_str = image.mimeString(mime);
+    const dims = image.sniffDimensions(raw, mime);
+    const decision = image.evaluateInlineImage(raw.len, dims, policy);
 
-    const mime_owned = allocator.dupe(u8, mime) catch
-        return util.errorResult(allocator, "image mime alloc failed");
-
-    // Pair the image with a small text companion block. The renderer
-    // path (`collectText` in tui/renderers/builtins.zig) only walks
-    // text blocks, so an image-only result would render blank in the
-    // TUI even though the LLM receives the image. The companion text
-    // is also useful as a fallback for log/print modes that don't
-    // know how to display inline images.
-    const companion = std.fmt.allocPrint(
-        allocator,
-        "[image: {s}, {d} bytes ({d} bytes base64)]",
-        .{ mime, raw.len, encoded.len },
-    ) catch {
-        allocator.free(encoded);
-        allocator.free(mime_owned);
-        return util.errorResult(allocator, "image companion alloc failed");
+    const companion = switch (decision) {
+        .attach_original => std.fmt.allocPrint(allocator, "Read image file [{s}]", .{mime_str}) catch
+            return util.errorResult(allocator, "image companion alloc failed"),
+        .needs_resize => std.fmt.allocPrint(
+            allocator,
+            "Read image file [{s}]\n{s}",
+            .{ mime_str, image.omittedInlineNote() },
+        ) catch return util.errorResult(allocator, "image companion alloc failed"),
     };
+    errdefer allocator.free(companion);
 
-    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 2) catch
-        return util.errorResult(allocator, "image alloc failed");
-    blocks[0] = .{ .image = .{ .data = encoded, .mime_type = mime_owned } };
-    blocks[1] = .{ .text = .{ .text = companion } };
-    return .{ .content = blocks };
+    switch (decision) {
+        .needs_resize => {
+            const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+                return util.errorResult(allocator, "image alloc failed");
+            blocks[0] = .{ .text = .{ .text = companion } };
+            return .{ .content = blocks };
+        },
+        .attach_original => {
+            const Encoder = std.base64.standard.Encoder;
+            const encoded_len = Encoder.calcSize(raw.len);
+            const encoded = allocator.alloc(u8, encoded_len) catch
+                return util.errorResult(allocator, "image alloc failed");
+            errdefer allocator.free(encoded);
+            _ = Encoder.encode(encoded, raw);
+
+            const mime_owned = allocator.dupe(u8, mime_str) catch
+                return util.errorResult(allocator, "image mime alloc failed");
+            errdefer allocator.free(mime_owned);
+
+            const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 2) catch
+                return util.errorResult(allocator, "image alloc failed");
+            blocks[0] = .{ .text = .{ .text = companion } };
+            blocks[1] = .{ .image = .{ .data = encoded, .mime_type = mime_owned } };
+            return .{ .content = blocks };
+        },
+    }
 }
 
 fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentToolResult {
@@ -277,4 +291,99 @@ fn readTextFile(
 fn usizeFromI64(v: i64) usize {
     if (v < 0) return 0;
     return @intCast(v);
+}
+
+fn pngHeader(width: u32, height: u32) [24]u8 {
+    return .{
+        0x89,                                    0x50,                                    0x4E,                                   0x47,                            0x0D,                                     0x0A,                                     0x1A,                                    0x0A,
+        0x00,                                    0x00,                                    0x00,                                   0x0D,                            0x49,                                     0x48,                                     0x44,                                    0x52,
+        @as(u8, @intCast((width >> 24) & 0xFF)), @as(u8, @intCast((width >> 16) & 0xFF)), @as(u8, @intCast((width >> 8) & 0xFF)), @as(u8, @intCast(width & 0xFF)), @as(u8, @intCast((height >> 24) & 0xFF)), @as(u8, @intCast((height >> 16) & 0xFF)), @as(u8, @intCast((height >> 8) & 0xFF)), @as(u8, @intCast(height & 0xFF)),
+    };
+}
+
+test "sniffImageMime detects supported image bytes regardless of extension" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const png = pngHeader(16, 32);
+    try tmp.dir.writeFile(.{ .sub_path = "mystery.txt", .data = &png });
+
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const path = try std.fs.path.join(allocator, &.{ cwd, "mystery.txt" });
+    defer allocator.free(path);
+
+    try std.testing.expectEqual(image.Mime.png, (try sniffImageMime(path)).?);
+}
+
+test "readImage omits oversized inline images when auto-resize is enabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const png = pngHeader(300, 200);
+    try tmp.dir.writeFile(.{ .sub_path = "large.png", .data = &png });
+
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const path = try std.fs.path.join(allocator, &.{ cwd, "large.png" });
+    defer allocator.free(path);
+
+    const result = readImage(allocator, path, .png, .{
+        .auto_resize = true,
+        .max_width = 100,
+        .max_height = 100,
+        .max_base64_bytes = 1024,
+    });
+    defer result.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    switch (result.content[0]) {
+        .text => |text| try std.testing.expectEqualStrings(
+            "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]",
+            text.text,
+        ),
+        else => return error.ExpectedTextBlock,
+    }
+}
+
+test "readImage attaches original when auto-resize is disabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const png = pngHeader(300, 200);
+    try tmp.dir.writeFile(.{ .sub_path = "large.png", .data = &png });
+
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const path = try std.fs.path.join(allocator, &.{ cwd, "large.png" });
+    defer allocator.free(path);
+
+    const result = readImage(allocator, path, .png, .{
+        .auto_resize = false,
+        .max_width = 100,
+        .max_height = 100,
+        .max_base64_bytes = 8,
+    });
+    defer result.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.content.len);
+    switch (result.content[0]) {
+        .text => |text| try std.testing.expectEqualStrings("Read image file [image/png]", text.text),
+        else => return error.ExpectedTextBlock,
+    }
+    switch (result.content[1]) {
+        .image => |img| {
+            try std.testing.expectEqualStrings("image/png", img.mime_type);
+            const Encoder = std.base64.standard.Encoder;
+            const expected_len = Encoder.calcSize(png.len);
+            const expected = try allocator.alloc(u8, expected_len);
+            defer allocator.free(expected);
+            _ = Encoder.encode(expected, &png);
+            try std.testing.expectEqualStrings(expected, img.data);
+        },
+        else => return error.ExpectedImageBlock,
+    }
 }

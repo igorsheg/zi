@@ -366,10 +366,15 @@ fn joinUserBlocksText(
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
+
+    var image_index: usize = 0;
     for (blocks) |block| {
         switch (block) {
             .text => |text| try out.appendSlice(allocator, text.text),
-            .image => {},
+            .image => {
+                image_index += 1;
+                try out.writer(allocator).print("[image{d}]", .{image_index});
+            },
         }
     }
     return out.toOwnedSlice(allocator);
@@ -601,11 +606,12 @@ test "rebuildFromMessages includes summaries displayable custom messages and edi
     );
 
     try testing.expectEqual(@as(usize, 1), editor.history.items.len);
-    try testing.expectEqualStrings("hello world", editor.history.items[0]);
+    try testing.expectEqualStrings("hello[image1] world", editor.history.items[0]);
 
     const rendered = try renderTranscriptText(testing.allocator, &transcript, 60);
     defer testing.allocator.free(rendered);
 
+    try testing.expect(std.mem.indexOf(u8, rendered, "hello[image1] world") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "kept the recent turns") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "previous branch summary") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "shown custom") != null);
