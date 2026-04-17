@@ -6,6 +6,7 @@ const message_memory = @import("message_memory.zig");
 const loop_mod = @import("loop.zig");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
+const partial_json = @import("../json/partial.zig");
 const run_control_mod = @import("../runtime/run_control.zig");
 const testing = std.testing;
 
@@ -175,10 +176,25 @@ const FrontierState = struct {
         return &self.live_tools.items[self.live_tools.items.len - 1];
     }
 
-    fn syncToolCall(self: *FrontierState, tool_call: ai.protocol.ToolCall, args_complete: bool) void {
+    fn syncToolCall(self: *FrontierState, tool_call: ai.protocol.ToolCall, args_complete: bool, delta: ?[]const u8) void {
         const tool = self.ensureTool(tool_call.id, tool_call.name) orelse return;
         json_util.freeJsonValue(self.allocator, tool.args);
         tool.args = json_util.cloneJsonValue(self.allocator, tool_call.arguments) catch .null;
+        if (delta) |bytes| {
+            const combined = if (tool.args_json_source) |source|
+                appendBytesOwned(self.allocator, source, bytes) catch return
+            else
+                self.allocator.dupe(u8, bytes) catch return;
+            if (tool.args_json_source) |source| self.allocator.free(source);
+            tool.args_json_source = combined;
+            if (bytes.len != 0 or combined.len != 0) {
+                json_util.freeJsonValue(self.allocator, tool.args);
+                tool.args = partial_json.parseStreaming(self.allocator, combined) catch .null;
+            }
+        } else if (args_complete) {
+            if (tool.args_json_source) |source| self.allocator.free(source);
+            tool.args_json_source = null;
+        }
         tool.args_complete = tool.args_complete or args_complete;
     }
 
@@ -186,6 +202,8 @@ const FrontierState = struct {
         const tool = self.ensureTool(tool_call_id, tool_name) orelse return;
         json_util.freeJsonValue(self.allocator, tool.args);
         tool.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
+        if (tool.args_json_source) |source| self.allocator.free(source);
+        tool.args_json_source = null;
         tool.execution_started = true;
     }
 
@@ -242,6 +260,13 @@ const FrontierState = struct {
         };
     }
 };
+
+fn appendBytesOwned(allocator: std.mem.Allocator, existing: []const u8, extra: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, existing.len + extra.len);
+    @memcpy(out[0..existing.len], existing);
+    @memcpy(out[existing.len..], extra);
+    return out;
+}
 
 /// Stateful wrapper around the low-level agent loop.
 ///
@@ -801,10 +826,10 @@ pub const Agent = struct {
                         switch (payload.assistant_message_event) {
                             .toolcall_delta => |tc| {
                                 if (tc.content_index < tc.partial.content.len and tc.partial.content[tc.content_index] == .tool_call) {
-                                    self.conversation_frontier.syncToolCall(tc.partial.content[tc.content_index].tool_call, false);
+                                    self.conversation_frontier.syncToolCall(tc.partial.content[tc.content_index].tool_call, false, tc.delta);
                                 }
                             },
-                            .toolcall_end => |tc| self.conversation_frontier.syncToolCall(tc.tool_call, true),
+                            .toolcall_end => |tc| self.conversation_frontier.syncToolCall(tc.tool_call, true, null),
                             else => {},
                         }
                     },
@@ -823,7 +848,7 @@ pub const Agent = struct {
                         self.conversation_frontier.replaceAssistant(assistant);
                         if (assistant.stop_reason != .aborted and assistant.stop_reason != .@"error") {
                             for (assistant.content) |block| switch (block) {
-                                .tool_call => |tool_call| self.conversation_frontier.syncToolCall(tool_call, true),
+                                .tool_call => |tool_call| self.conversation_frontier.syncToolCall(tool_call, true, null),
                                 else => {},
                             };
                         }

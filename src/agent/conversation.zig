@@ -72,6 +72,7 @@ pub const LiveToolExecution = struct {
     tool_call_id: []u8,
     tool_name: []u8,
     args: std.json.Value,
+    args_json_source: ?[]u8 = null,
     args_complete: bool = false,
     execution_started: bool = false,
     result: ?protocol.AgentToolResult = null,
@@ -86,6 +87,11 @@ pub const LiveToolExecution = struct {
         errdefer allocator.free(tool_name);
         const args = try json_util.cloneJsonValue(allocator, self.args);
         errdefer json_util.freeJsonValue(allocator, args);
+        const args_json_source = if (self.args_json_source) |source|
+            try allocator.dupe(u8, source)
+        else
+            null;
+        errdefer if (args_json_source) |source| allocator.free(source);
         const result = if (self.result) |result|
             try result.clone(allocator)
         else
@@ -101,6 +107,7 @@ pub const LiveToolExecution = struct {
             .tool_call_id = tool_call_id,
             .tool_name = tool_name,
             .args = args,
+            .args_json_source = args_json_source,
             .args_complete = self.args_complete,
             .execution_started = self.execution_started,
             .result = result,
@@ -114,6 +121,7 @@ pub const LiveToolExecution = struct {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
         json_util.freeJsonValue(allocator, self.args);
+        if (self.args_json_source) |source| allocator.free(source);
         if (self.result) |result| result.free(allocator);
         if (self.result_message) |*result_message| freeToolResultMessage(allocator, result_message);
         self.* = undefined;

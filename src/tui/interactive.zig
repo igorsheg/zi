@@ -71,6 +71,7 @@ const MouseCapture = union(enum) {
 
 const AgentSession = coding_agent_mod.AgentSession;
 const json_util = @import("../ai/json_util.zig");
+const partial_json = @import("../json/partial.zig");
 const SettingsAction = enum {
     open_thinking,
     toggle_hide_thinking,
@@ -145,6 +146,7 @@ const LiveToolExecutionState = struct {
     tool_call_id: []u8,
     tool_name: []u8,
     args: std.json.Value = .null,
+    args_json_source: ?[]u8 = null,
     args_complete: bool = false,
     execution_started: bool = false,
     result: ?AgentToolResult = null,
@@ -162,6 +164,7 @@ const LiveToolExecutionState = struct {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
         json_util.freeJsonValue(allocator, self.args);
+        if (self.args_json_source) |source| allocator.free(source);
         if (self.result) |result| result.free(allocator);
         self.* = undefined;
     }
@@ -169,7 +172,20 @@ const LiveToolExecutionState = struct {
     fn setArgs(self: *LiveToolExecutionState, allocator: std.mem.Allocator, args: std.json.Value, complete: bool) !void {
         json_util.freeJsonValue(allocator, self.args);
         self.args = try json_util.cloneJsonValue(allocator, args);
+        if (self.args_json_source) |source| allocator.free(source);
+        self.args_json_source = null;
         if (complete) self.args_complete = true;
+    }
+
+    fn appendArgsJsonDelta(self: *LiveToolExecutionState, allocator: std.mem.Allocator, delta: []const u8) !void {
+        const combined = if (self.args_json_source) |source|
+            try appendBytesOwned(allocator, source, delta)
+        else
+            try allocator.dupe(u8, delta);
+        if (self.args_json_source) |source| allocator.free(source);
+        self.args_json_source = combined;
+        json_util.freeJsonValue(allocator, self.args);
+        self.args = try partial_json.parseStreaming(allocator, combined);
     }
 
     fn setPartialResult(self: *LiveToolExecutionState, allocator: std.mem.Allocator, result: ?AgentToolResult) !void {
@@ -186,6 +202,13 @@ const LiveToolExecutionState = struct {
         self.is_error = is_error;
     }
 };
+
+fn appendBytesOwned(allocator: std.mem.Allocator, existing: []const u8, extra: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, existing.len + extra.len);
+    @memcpy(out[0..existing.len], existing);
+    @memcpy(out[existing.len..], extra);
+    return out;
+}
 
 /// Mailbox-backed agent/helper → TUI event channel.
 ///
@@ -2680,6 +2703,11 @@ pub const Interactive = struct {
         return null;
     }
 
+    fn getLiveToolExecution(self: *Interactive, tool_call_id: []const u8) ?*LiveToolExecutionState {
+        const idx = self.findLiveToolExecutionIndex(tool_call_id) orelse return null;
+        return &self.live_tool_executions.items[idx];
+    }
+
     fn getOrCreateLiveToolExecution(self: *Interactive, tool_call_id: []const u8, tool_name: []const u8) ?*LiveToolExecutionState {
         if (self.findLiveToolExecutionIndex(tool_call_id)) |idx| return &self.live_tool_executions.items[idx];
 
@@ -2713,7 +2741,12 @@ pub const Interactive = struct {
                 if (block != .tool_call) return;
                 const call = block.tool_call;
                 const tool_execution = self.getOrCreateLiveToolExecution(call.id, call.name) orelse return;
-                tool_execution.setArgs(self.msg_allocator, call.arguments, false) catch return;
+                if (tc.delta.len == 0) {
+                    tool_execution.setArgs(self.msg_allocator, call.arguments, false) catch return;
+                    tool_execution.args_json_source = self.msg_allocator.dupe(u8, "") catch null;
+                    return;
+                }
+                tool_execution.appendArgsJsonDelta(self.msg_allocator, tc.delta) catch return;
             },
             .toolcall_end => |tc| {
                 const call = tc.tool_call;
@@ -3020,6 +3053,20 @@ pub const Interactive = struct {
         } } });
     }
 
+    fn publishToolCallArgumentsDeltaPatch(self: *Interactive, tool_call_id: []const u8, delta: []const u8) void {
+        const bytes = self.msg_allocator.dupe(u8, delta) catch return;
+        const owned_tool_call_id = self.msg_allocator.dupe(u8, tool_call_id) catch {
+            self.msg_allocator.free(bytes);
+            return;
+        };
+        self.event_queue.push(.{ .conversation_patch = .{ .append_frontier_content = .{
+            .target = .{ .tool_call_arguments = .{
+                .tool_call_id = owned_tool_call_id,
+            } },
+            .bytes = bytes,
+        } } });
+    }
+
     fn publishConversationPatchForAgentEvent(self: *Interactive, event: AgentEvent) void {
         switch (event) {
             .message_start => |payload| switch (payload.message) {
@@ -3029,7 +3076,29 @@ pub const Interactive = struct {
             .message_update => |payload| switch (payload.assistant_message_event) {
                 .text_delta => |delta| self.publishAssistantContentDeltaPatch(delta.content_index, .text, delta.delta),
                 .thinking_delta => |delta| self.publishAssistantContentDeltaPatch(delta.content_index, .thinking, delta.delta),
-                .toolcall_delta, .toolcall_end => self.publishReplaceFrontierPatch(),
+                .toolcall_delta => |delta| {
+                    if (delta.content_index >= delta.partial.content.len) return;
+                    const block = delta.partial.content[delta.content_index];
+                    if (block != .tool_call) {
+                        self.publishReplaceFrontierPatch();
+                        return;
+                    }
+                    const tool_call = block.tool_call;
+                    const live_tool = self.getLiveToolExecution(tool_call.id) orelse {
+                        self.publishReplaceFrontierPatch();
+                        return;
+                    };
+                    const args_json_source = live_tool.args_json_source orelse {
+                        self.publishReplaceFrontierPatch();
+                        return;
+                    };
+                    if (args_json_source.len <= delta.delta.len) {
+                        self.publishReplaceFrontierPatch();
+                        return;
+                    }
+                    self.publishToolCallArgumentsDeltaPatch(tool_call.id, delta.delta);
+                },
+                .toolcall_end => self.publishReplaceFrontierPatch(),
                 else => {},
             },
             .message_end => |payload| switch (payload.message) {

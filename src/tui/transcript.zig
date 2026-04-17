@@ -11,6 +11,7 @@ const agent_mod = @import("../agent/root.zig");
 const agent_protocol = agent_mod.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const json_util = @import("../ai/json_util.zig");
+const partial_json = @import("../json/partial.zig");
 const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const display_wrap_mod = @import("display_wrap.zig");
@@ -453,6 +454,13 @@ const TranscriptLayout = struct {
     }
 };
 
+fn appendBytesOwned(allocator: std.mem.Allocator, existing: []const u8, extra: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, existing.len + extra.len);
+    @memcpy(out[0..existing.len], existing);
+    @memcpy(out[existing.len..], extra);
+    return out;
+}
+
 // ── Tool Execution ────────────────────────────────────────────────
 
 /// State for a single tool execution within the transcript.
@@ -465,6 +473,7 @@ pub const ToolExecution = struct {
     tool_call_id: []u8,
     tool_name: []u8,
     args: std.json.Value = .null,
+    args_json_source: ?[]u8 = null,
     result: ?AgentToolResult = null,
     is_partial: bool = true,
     is_error: bool = false,
@@ -484,6 +493,7 @@ pub const ToolExecution = struct {
         }
         if (self.result) |r| r.free(self.allocator);
         json_util.freeJsonValue(self.allocator, self.args);
+        if (self.args_json_source) |source| self.allocator.free(source);
         self.allocator.free(self.tool_name);
         self.allocator.free(self.tool_call_id);
         self.allocator.destroy(self);
@@ -496,9 +506,33 @@ pub const ToolExecution = struct {
 
     /// Set args from snapshot-projected tool execution state. Deep-clones the value.
     pub fn setArgs(self: *ToolExecution, args: std.json.Value) void {
+        self.setArgsWithJsonSource(args, null);
+    }
+
+    pub fn setArgsWithJsonSource(self: *ToolExecution, args: std.json.Value, args_json_source: ?[]const u8) void {
         json_util.freeJsonValue(self.allocator, self.args);
         self.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
+        if (self.args_json_source) |source| self.allocator.free(source);
+        self.args_json_source = if (args_json_source) |source|
+            self.allocator.dupe(u8, source) catch null
+        else
+            null;
         self.notifyArgsChanged();
+    }
+
+    pub fn appendArgsJsonDelta(self: *ToolExecution, delta: []const u8) bool {
+        const combined = if (self.args_json_source) |source|
+            appendBytesOwned(self.allocator, source, delta) catch return false
+        else
+            self.allocator.dupe(u8, delta) catch return false;
+        if (self.args_json_source) |source| self.allocator.free(source);
+        self.args_json_source = combined;
+        if (delta.len != 0 or combined.len != 0) {
+            json_util.freeJsonValue(self.allocator, self.args);
+            self.args = partial_json.parseStreaming(self.allocator, combined) catch .null;
+        }
+        self.notifyArgsChanged();
+        return true;
     }
 
     /// Mark that execution has started in projected tool execution state.
@@ -509,6 +543,10 @@ pub const ToolExecution = struct {
     /// Mark that projected tool arguments are complete.
     pub fn setArgsComplete(self: *ToolExecution) void {
         self.args_complete = true;
+        if (self.args_json_source) |source| {
+            self.allocator.free(source);
+            self.args_json_source = null;
+        }
     }
 
     pub fn setExpanded(self: *ToolExecution, expanded: bool) void {
@@ -542,6 +580,61 @@ pub const ToolExecution = struct {
         self.measured_content_width = 0;
         self.measured_result_height = 0;
         self.notifyResultChanged();
+    }
+
+    pub fn appendPartialResultText(self: *ToolExecution, content_index: usize, delta: []const u8, is_error: bool) bool {
+        const block = self.ensureResultTextBlock(content_index, delta) orelse return false;
+        if (block.preexisting) {
+            const old = block.block.text.text;
+            const combined = appendBytesOwned(self.allocator, old, delta) catch return false;
+            self.allocator.free(old);
+            block.block.text.text = combined;
+        }
+        if (self.result) |*result| result.is_error = is_error;
+        self.is_error = is_error;
+        self.is_partial = true;
+        self.measured_content_width = 0;
+        self.measured_result_height = 0;
+        self.notifyResultChanged();
+        return true;
+    }
+
+    const ResultTextBlockRef = struct {
+        block: *AgentToolResult.ContentBlock,
+        preexisting: bool,
+    };
+
+    fn ensureResultTextBlock(self: *ToolExecution, content_index: usize, delta: []const u8) ?ResultTextBlockRef {
+        if (self.result) |*result| {
+            if (content_index < result.content.len) {
+                const block: *AgentToolResult.ContentBlock = @constCast(&result.content[content_index]);
+                if (block.* != .text) return null;
+                return .{ .block = block, .preexisting = true };
+            }
+            if (content_index != result.content.len) return null;
+
+            const grown = self.allocator.alloc(AgentToolResult.ContentBlock, result.content.len + 1) catch return null;
+            @memcpy(grown[0..result.content.len], result.content);
+            grown[content_index] = .{ .text = .{ .text = self.allocator.dupe(u8, delta) catch {
+                self.allocator.free(grown);
+                return null;
+            } } };
+            self.allocator.free(result.content);
+            result.content = grown;
+            return .{ .block = @constCast(&result.content[content_index]), .preexisting = false };
+        }
+        if (content_index != 0) return null;
+
+        const content = self.allocator.alloc(AgentToolResult.ContentBlock, 1) catch return null;
+        content[0] = .{ .text = .{ .text = self.allocator.dupe(u8, delta) catch {
+            self.allocator.free(content);
+            return null;
+        } } };
+        self.result = .{
+            .content = content,
+            .is_error = self.is_error,
+        };
+        return .{ .block = @constCast(&self.result.?.content[0]), .preexisting = false };
     }
 
     fn notifyArgsChanged(self: *ToolExecution) void {
@@ -1192,6 +1285,14 @@ pub const Transcript = struct {
         self.noteItemMutated(idx);
     }
 
+    pub fn toolAppendArgsJsonDelta(self: *Transcript, tool_call_id: []const u8, delta: []const u8) bool {
+        const idx = self.pending_tools.get(tool_call_id) orelse return false;
+        const te = self.getToolExecution(tool_call_id) orelse return false;
+        if (!te.appendArgsJsonDelta(delta)) return false;
+        self.noteItemMutated(idx);
+        return true;
+    }
+
     /// Mark a tool execution as started.
     pub fn toolMarkExecutionStarted(self: *Transcript, tool_call_id: []const u8) void {
         const idx = self.pending_tools.get(tool_call_id) orelse return;
@@ -1214,6 +1315,14 @@ pub const Transcript = struct {
         const te = self.getToolExecution(tool_call_id) orelse return;
         te.setPartialResult(result, is_error);
         self.noteItemMutated(idx);
+    }
+
+    pub fn toolAppendPartialResultText(self: *Transcript, tool_call_id: []const u8, content_index: usize, delta: []const u8, is_error: bool) bool {
+        const idx = self.pending_tools.get(tool_call_id) orelse return false;
+        const te = self.getToolExecution(tool_call_id) orelse return false;
+        if (!te.appendPartialResultText(content_index, delta, is_error)) return false;
+        self.noteItemMutated(idx);
+        return true;
     }
 
     /// Set final result on a tool execution and remove from pending.

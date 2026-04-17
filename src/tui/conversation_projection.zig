@@ -18,6 +18,8 @@ const cell_mod = @import("cell.zig");
 const editor_mod = @import("components/editor.zig");
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 const run_control_mod = @import("../runtime/run_control.zig");
+const json_util = @import("../ai/json_util.zig");
+const partial_json = @import("../json/partial.zig");
 
 const Transcript = transcript_mod.Transcript;
 const TranscriptItem = transcript_mod.TranscriptItem;
@@ -241,7 +243,16 @@ pub const ProjectionState = struct {
                     .thinking => transcript.appendAssistantThinkingAt(self.frontier_item_start, assistant_target.content_index, bytes),
                 };
             },
-            .tool_call_arguments, .tool_result_content => return false,
+            .tool_call_arguments => |tool_target| {
+                const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
+                if (!appendLiveToolArgumentsBytes(self.allocator, tool, bytes)) return false;
+                return transcript.toolAppendArgsJsonDelta(tool_target.tool_call_id, bytes);
+            },
+            .tool_result_content => |tool_target| {
+                const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;
+                if (!appendLiveToolResultTextBytes(self.allocator, tool, tool_target.content_index, bytes)) return false;
+                return transcript.toolAppendPartialResultText(tool_target.tool_call_id, tool_target.content_index, bytes, tool.is_error);
+            },
         }
     }
 
@@ -524,6 +535,91 @@ fn disarmDesiredRow(item: *DesiredItem) void {
     item.row.deinit_fn = null;
 }
 
+fn findLiveToolExecution(live_tools: []conversation_mod.LiveToolExecution, tool_call_id: []const u8) ?*conversation_mod.LiveToolExecution {
+    for (live_tools) |*tool| {
+        if (std.mem.eql(u8, tool.tool_call_id, tool_call_id)) return tool;
+    }
+    return null;
+}
+
+fn appendLiveToolArgumentsBytes(
+    allocator: std.mem.Allocator,
+    tool: *conversation_mod.LiveToolExecution,
+    bytes: []const u8,
+) bool {
+    const combined = if (tool.args_json_source) |source|
+        appendBytesOwned(allocator, source, bytes) catch return false
+    else
+        allocator.dupe(u8, bytes) catch return false;
+    if (tool.args_json_source) |source| allocator.free(source);
+    tool.args_json_source = combined;
+    if (bytes.len != 0 or combined.len != 0) {
+        json_util.freeJsonValue(allocator, tool.args);
+        tool.args = partial_json.parseStreaming(allocator, combined) catch .null;
+    }
+    return true;
+}
+
+fn appendLiveToolResultTextBytes(
+    allocator: std.mem.Allocator,
+    tool: *conversation_mod.LiveToolExecution,
+    content_index: usize,
+    bytes: []const u8,
+) bool {
+    const block = ensureLiveToolResultTextBlock(allocator, tool, content_index, bytes) orelse return false;
+    if (block.preexisting) {
+        const old = block.block.text.text;
+        const combined = appendBytesOwned(allocator, old, bytes) catch return false;
+        allocator.free(old);
+        block.block.text.text = combined;
+    }
+    tool.is_partial = true;
+    return true;
+}
+
+const LiveToolResultBlockRef = struct {
+    block: *AgentToolResult.ContentBlock,
+    preexisting: bool,
+};
+
+fn ensureLiveToolResultTextBlock(
+    allocator: std.mem.Allocator,
+    tool: *conversation_mod.LiveToolExecution,
+    content_index: usize,
+    bytes: []const u8,
+) ?LiveToolResultBlockRef {
+    if (tool.result) |*result| {
+        if (content_index < result.content.len) {
+            const block: *AgentToolResult.ContentBlock = @constCast(&result.content[content_index]);
+            if (block.* != .text) return null;
+            return .{ .block = block, .preexisting = true };
+        }
+        if (content_index != result.content.len) return null;
+
+        const grown = allocator.alloc(AgentToolResult.ContentBlock, result.content.len + 1) catch return null;
+        @memcpy(grown[0..result.content.len], result.content);
+        grown[content_index] = .{ .text = .{ .text = allocator.dupe(u8, bytes) catch {
+            allocator.free(grown);
+            return null;
+        } } };
+        allocator.free(result.content);
+        result.content = grown;
+        return .{ .block = @constCast(&result.content[content_index]), .preexisting = false };
+    }
+    if (content_index != 0) return null;
+
+    const content = allocator.alloc(AgentToolResult.ContentBlock, 1) catch return null;
+    content[0] = .{ .text = .{ .text = allocator.dupe(u8, bytes) catch {
+        allocator.free(content);
+        return null;
+    } } };
+    tool.result = .{
+        .content = content,
+        .is_error = tool.is_error,
+    };
+    return .{ .block = @constCast(&tool.result.?.content[0]), .preexisting = false };
+}
+
 fn appendAssistantBytes(
     allocator: std.mem.Allocator,
     assistant: *agent_protocol.AssistantMessage,
@@ -738,6 +834,7 @@ fn createCommittedToolCallRow(
         tool_call.id,
         tool_call.name,
         tool_call.arguments,
+        null,
         true,
         false,
         result,
@@ -930,6 +1027,7 @@ fn createToolExecutionRow(
         tool_execution.tool_call_id,
         tool_execution.tool_name,
         tool_execution.args,
+        null,
         tool_execution.args_complete,
         tool_execution.execution_started,
         tool_execution.result,
@@ -952,6 +1050,7 @@ fn createLiveToolExecutionRow(
         tool.tool_call_id,
         tool.tool_name,
         tool.args,
+        tool.args_json_source,
         tool.args_complete,
         tool.execution_started,
         tool.result,
@@ -968,6 +1067,7 @@ fn createToolExecutionRowParts(
     tool_call_id_src: []const u8,
     tool_name_src: []const u8,
     args: std.json.Value,
+    args_json_source: ?[]const u8,
     args_complete: bool,
     execution_started: bool,
     result: ?AgentToolResult,
@@ -992,7 +1092,7 @@ fn createToolExecutionRowParts(
     };
     errdefer te.deinit();
     if (renderer.init_state) |init_fn| te.renderer_state = init_fn(allocator);
-    te.setArgs(args);
+    te.setArgsWithJsonSource(args, args_json_source);
     if (args_complete) te.setArgsComplete();
     if (execution_started) te.markExecutionStarted();
     if (result_message) |message| {
@@ -1662,6 +1762,136 @@ test "ProjectionState applies assistant text frontier deltas" {
     const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
     defer testing.allocator.free(rendered);
     try testing.expect(std.mem.indexOf(u8, rendered, "running bash") != null);
+}
+
+test "ProjectionState applies tool argument frontier deltas" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var editor = editor_mod.Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    const first_args_delta = "{\"cmd\":\"he";
+    const second_args_delta = "llo\"}";
+    const initial_args = try partial_json.parseStreaming(testing.allocator, first_args_delta);
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .tool_call = .{ .id = "tc-1", .name = "bash", .arguments = initial_args } },
+    };
+    const assistant = try conversation_mod.cloneAssistantMessage(
+        testing.allocator,
+        makeAssistantMessage(&assistant_content, .toolUse, null).assistant,
+    );
+    var replace_frontier = conversation_mod.ConversationPatch{ .replace_frontier = .{
+        .assistant = assistant,
+        .live_tools = try testing.allocator.dupe(conversation_mod.LiveToolExecution, &.{.{
+            .tool_call_id = try testing.allocator.dupe(u8, "tc-1"),
+            .tool_name = try testing.allocator.dupe(u8, "bash"),
+            .args = initial_args,
+            .args_json_source = try testing.allocator.dupe(u8, first_args_delta),
+        }}),
+    } };
+    defer replace_frontier.deinit(testing.allocator);
+
+    try testing.expect(projection.applyOwnedPatch(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        &replace_frontier,
+        .{ .theme = themes_builtin.dark() },
+    ));
+
+    var delta_patch = conversation_mod.ConversationPatch{ .append_frontier_content = .{
+        .target = .{ .tool_call_arguments = .{ .tool_call_id = try testing.allocator.dupe(u8, "tc-1") } },
+        .bytes = try testing.allocator.dupe(u8, second_args_delta),
+    } };
+    defer delta_patch.deinit(testing.allocator);
+
+    try testing.expect(projection.applyOwnedPatch(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        &delta_patch,
+        .{ .theme = themes_builtin.dark() },
+    ));
+
+    const frontier_tool = projection.snapshot.?.frontier.?.live_tools[0];
+    try testing.expect(frontier_tool.args == .object);
+    try testing.expectEqualStrings("hello", frontier_tool.args.object.get("cmd").?.string);
+    try testing.expect(frontier_tool.args_json_source != null);
+    try testing.expectEqualStrings("{\"cmd\":\"hello\"}", frontier_tool.args_json_source.?);
+
+    const tool: *transcript_mod.ToolExecution = @ptrCast(@alignCast(transcript.items.items[1].deinit_ctx.?));
+    try testing.expect(tool.args == .object);
+    try testing.expectEqualStrings("hello", tool.args.object.get("cmd").?.string);
+    try testing.expect(tool.args_json_source != null);
+    try testing.expectEqualStrings("{\"cmd\":\"hello\"}", tool.args_json_source.?);
+}
+
+test "ProjectionState applies tool result frontier deltas" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var editor = editor_mod.Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .tool_call = .{ .id = "tc-1", .name = "bash", .arguments = .null } },
+    };
+    const assistant = try conversation_mod.cloneAssistantMessage(
+        testing.allocator,
+        makeAssistantMessage(&assistant_content, .toolUse, null).assistant,
+    );
+    var replace_frontier = conversation_mod.ConversationPatch{ .replace_frontier = .{
+        .assistant = assistant,
+        .live_tools = try testing.allocator.dupe(conversation_mod.LiveToolExecution, &.{.{
+            .tool_call_id = try testing.allocator.dupe(u8, "tc-1"),
+            .tool_name = try testing.allocator.dupe(u8, "bash"),
+            .args = .null,
+            .args_complete = true,
+            .execution_started = true,
+        }}),
+    } };
+    defer replace_frontier.deinit(testing.allocator);
+
+    try testing.expect(projection.applyOwnedPatch(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        &replace_frontier,
+        .{ .theme = themes_builtin.dark() },
+    ));
+
+    var delta_patch = conversation_mod.ConversationPatch{ .append_frontier_content = .{
+        .target = .{ .tool_result_content = .{
+            .tool_call_id = try testing.allocator.dupe(u8, "tc-1"),
+            .content_index = 0,
+        } },
+        .bytes = try testing.allocator.dupe(u8, "partial output"),
+    } };
+    defer delta_patch.deinit(testing.allocator);
+
+    try testing.expect(projection.applyOwnedPatch(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        &delta_patch,
+        .{ .theme = themes_builtin.dark() },
+    ));
+
+    const frontier_tool = projection.snapshot.?.frontier.?.live_tools[0];
+    try testing.expect(frontier_tool.result != null);
+    try testing.expectEqualStrings("partial output", frontier_tool.result.?.content[0].text.text);
+
+    const tool: *transcript_mod.ToolExecution = @ptrCast(@alignCast(transcript.items.items[1].deinit_ctx.?));
+    try testing.expect(tool.result != null);
+    try testing.expect(tool.is_partial);
+    try testing.expectEqualStrings("partial output", tool.result.?.content[0].text.text);
 }
 
 test "ProjectionState commits frontier then appends final assistant and tool-result messages" {
