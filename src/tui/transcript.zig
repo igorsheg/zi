@@ -1103,17 +1103,6 @@ pub const Transcript = struct {
         return @ptrCast(@alignCast(item.deinit_ctx.?));
     }
 
-    pub fn setHideThinkingBlock(self: *Transcript, hide: bool) void {
-        self.hide_thinking_block = hide;
-        for (self.items.items, 0..) |*item, idx| {
-            if (item.kind == .assistant_message) {
-                const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
-                am.setHideThinkingBlock(hide);
-                self.noteItemMutated(idx);
-            }
-        }
-    }
-
     pub fn toolExecutionAt(self: *Transcript, index: usize) ?*ToolExecution {
         if (index >= self.items.items.len) return null;
         const item = &self.items.items[index];

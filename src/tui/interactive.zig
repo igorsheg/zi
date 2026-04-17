@@ -674,7 +674,7 @@ pub const Interactive = struct {
         self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
-        self.transcript.setHideThinkingBlock(self.hide_thinking_block);
+        self.applyTranscriptHideThinkingBlock();
         // NOTE: active_editor is bound in run() where self is at its final
         // address. Binding it here would capture a pointer to the local `self`
         // that becomes dangling after the by-value return.
@@ -1043,7 +1043,7 @@ pub const Interactive = struct {
         if (keybindings.matches(.app_toggle_thinking, key)) {
             self.hide_thinking_block = !self.hide_thinking_block;
             self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
-            self.transcript.setHideThinkingBlock(self.hide_thinking_block);
+            self.applyTranscriptHideThinkingBlock();
             self.tui.dirty = true;
             return;
         }
@@ -1389,6 +1389,15 @@ pub const Interactive = struct {
                 owned_row.deinit(self.transcript.allocator);
                 return;
             }
+        }
+    }
+
+    fn applyTranscriptHideThinkingBlock(self: *Interactive) void {
+        self.transcript.hide_thinking_block = self.hide_thinking_block;
+        for (self.transcript.items.items, 0..) |_, idx| {
+            const assistant = self.transcript.assistantMessageAt(idx) orelse continue;
+            assistant.setHideThinkingBlock(self.hide_thinking_block);
+            self.transcript.itemMutatedAt(idx);
         }
     }
 
@@ -2392,7 +2401,7 @@ pub const Interactive = struct {
             .toggle_hide_thinking => {
                 self.hide_thinking_block = !self.hide_thinking_block;
                 self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
-                self.transcript.setHideThinkingBlock(self.hide_thinking_block);
+                self.applyTranscriptHideThinkingBlock();
                 self.status_text.setContent(if (self.hide_thinking_block) "thinking hidden" else "thinking shown");
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;

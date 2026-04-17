@@ -1404,7 +1404,7 @@ test "rebuildFromMessages preserves assistant text thinking and tool call orderi
 test "rebuildFromMessages respects hidden thinking labels during direct row projection" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
-    transcript.setHideThinkingBlock(true);
+    transcript.hide_thinking_block = true;
 
     var editor = editor_mod.Editor.init(testing.allocator);
     defer editor.deinit();
@@ -1622,7 +1622,7 @@ test "rebuildFromSnapshot reconstructs active assistant and live tool execution 
 test "rebuildFromSnapshot respects hidden thinking labels for active assistant rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
-    transcript.setHideThinkingBlock(true);
+    transcript.hide_thinking_block = true;
 
     var editor = editor_mod.Editor.init(testing.allocator);
     defer editor.deinit();
