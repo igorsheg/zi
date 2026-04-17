@@ -237,11 +237,13 @@ pub const ProjectionState = struct {
             .assistant_content => |assistant_target| {
                 const assistant = if (frontier.assistant) |*assistant| assistant else return false;
                 if (!appendAssistantBytes(self.allocator, assistant, assistant_target, bytes)) return false;
-                if (self.frontier_item_start >= transcript.items.items.len) return false;
-                return switch (assistant_target.kind) {
-                    .text => transcript.appendAssistantTextAt(self.frontier_item_start, assistant_target.content_index, bytes),
-                    .thinking => transcript.appendAssistantThinkingAt(self.frontier_item_start, assistant_target.content_index, bytes),
-                };
+                const row = transcript.assistantMessageAt(self.frontier_item_start) orelse return false;
+                switch (assistant_target.kind) {
+                    .text => row.appendText(assistant_target.content_index, bytes),
+                    .thinking => row.appendThinking(assistant_target.content_index, bytes),
+                }
+                transcript.itemMutatedAt(self.frontier_item_start);
+                return true;
             },
             .tool_call_arguments => |tool_target| {
                 const tool = findLiveToolExecution(frontier.live_tools, tool_target.tool_call_id) orelse return false;

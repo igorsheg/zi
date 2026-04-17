@@ -1096,25 +1096,11 @@ pub const Transcript = struct {
 
     // ── Built-in retained row mutators ────────────────────────────
 
-    fn assistantMessageAt(self: *Transcript, index: usize) ?*assistant_message_mod.AssistantMessage {
+    pub fn assistantMessageAt(self: *Transcript, index: usize) ?*assistant_message_mod.AssistantMessage {
         if (index >= self.items.items.len) return null;
         const item = &self.items.items[index];
         if (item.kind != .assistant_message) return null;
         return @ptrCast(@alignCast(item.deinit_ctx.?));
-    }
-
-    pub fn appendAssistantTextAt(self: *Transcript, index: usize, content_index: usize, delta: []const u8) bool {
-        const assistant = self.assistantMessageAt(index) orelse return false;
-        assistant.appendText(content_index, delta);
-        self.noteItemMutated(index);
-        return true;
-    }
-
-    pub fn appendAssistantThinkingAt(self: *Transcript, index: usize, content_index: usize, delta: []const u8) bool {
-        const assistant = self.assistantMessageAt(index) orelse return false;
-        assistant.appendThinking(content_index, delta);
-        self.noteItemMutated(index);
-        return true;
     }
 
     pub fn setHideThinkingBlock(self: *Transcript, hide: bool) void {
@@ -1680,13 +1666,17 @@ fn appendTestAssistantRow(transcript: *Transcript) !usize {
 
 fn appendTestAssistantText(transcript: *Transcript, text: []const u8) !usize {
     const idx = try appendTestAssistantRow(transcript);
-    try testing.expect(transcript.appendAssistantTextAt(idx, 0, text));
+    const assistant = transcript.assistantMessageAt(idx) orelse return error.MissingAssistantRow;
+    assistant.appendText(0, text);
+    transcript.itemMutatedAt(idx);
     return idx;
 }
 
 fn appendTestAssistantThinking(transcript: *Transcript, text: []const u8) !usize {
     const idx = try appendTestAssistantRow(transcript);
-    try testing.expect(transcript.appendAssistantThinkingAt(idx, 0, text));
+    const assistant = transcript.assistantMessageAt(idx) orelse return error.MissingAssistantRow;
+    assistant.appendThinking(0, text);
+    transcript.itemMutatedAt(idx);
     return idx;
 }
 
@@ -1819,7 +1809,9 @@ test "Transcript preserves manual scroll when assistant content grows" {
     transcript.scrollBy(12, 3, -1);
     const before = transcript.scrollOffset();
 
-    try testing.expect(transcript.appendAssistantTextAt(assistant_idx, 0, " eleven twelve thirteen fourteen"));
+    const assistant = transcript.assistantMessageAt(assistant_idx).?;
+    assistant.appendText(0, " eleven twelve thirteen fourteen");
+    transcript.itemMutatedAt(assistant_idx);
 
     try testing.expectEqual(before, transcript.scrollOffset());
 }
