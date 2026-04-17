@@ -985,6 +985,13 @@ pub const Transcript = struct {
         self.clampScroll();
     }
 
+    pub fn truncateFrom(self: *Transcript, start_index: usize) void {
+        if (start_index >= self.items.items.len) return;
+        while (self.items.items.len > start_index) {
+            self.removeItemAt(start_index);
+        }
+    }
+
     pub fn clearQueuedUserMessages(self: *Transcript) void {
         var i: usize = 0;
         while (i < self.items.items.len) {

@@ -1,32 +1,29 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_root = @import("../agent/root.zig");
-const agent_protocol = agent_root.protocol;
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
+const message_memory = agent_root.message_memory;
 const session_controller_mod = @import("../session_controller.zig");
-const AgentToolResult = agent_protocol.AgentToolResult;
 const RunOutcome = session_controller_mod.RunOutcome;
 
-/// TUI-owned event type. All fields are deep-copied and owned by the
-/// main thread. The agent thread converts AgentEvent → UiEvent before
-/// pushing to the mailbox-backed event queue, ensuring no borrowed
-/// pointers cross the thread boundary.
+/// TUI-owned event type. All cross-thread payloads are deep-copied and
+/// mailbox-owned. Conversation changes cross either as full semantic
+/// snapshots (resync / resume / reset) or as incremental semantic patches
+/// for the live hot path.
 pub const UiEvent = union(enum) {
-    // --- errors ---
-    error_message: struct { message: []u8 },
+    // --- conversation transport ---
+    conversation_patch: agent_root.conversation.ConversationPatch,
+    conversation_snapshot: conversation_snapshot_mod.ConversationSnapshot,
 
-    // --- assistant message finalization ---
-    message_end_assistant: struct {
+    // --- errors / status side effects ---
+    error_message: struct { message: []u8 },
+    assistant_run_finished: struct {
         is_aborted: bool,
         error_message: ?[]u8,
         failure_kind: ?ai.protocol.NormalizedFailure.Kind = null,
     },
-
-    // --- tool execution lifecycle ---
-    tool_end: struct {
-        tool_call_id: []u8,
-        result: ?AgentToolResult,
-        is_error: bool,
+    tool_running: struct {
+        tool_name: []u8,
     },
 
     // --- login lifecycle ---
@@ -75,12 +72,6 @@ pub const UiEvent = union(enum) {
     // Used by the TUI to render queued user-message rows and restore them
     // for amendment without maintaining a parallel semantic mirror.
     queue_snapshot: agent_root.QueuedMessageSnapshot,
-
-    // --- conversation snapshot ---
-    // Owned semantic snapshot of transcript-visible conversation state.
-    // The agent/composition side publishes authoritative semantics;
-    // the TUI rebuilds its retained transcript/editor state locally.
-    conversation_snapshot: conversation_snapshot_mod.ConversationSnapshot,
 
     // --- /resume outcomes ---
     // Banner-only outcome. Transcript state now crosses separately via
@@ -133,14 +124,13 @@ pub const UiEvent = union(enum) {
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .conversation_patch => |*patch| patch.deinit(allocator),
+            .conversation_snapshot => |*snapshot| snapshot.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
-            .message_end_assistant => |m| {
+            .assistant_run_finished => |m| {
                 if (m.error_message) |msg| allocator.free(msg);
             },
-            .tool_end => |t| {
-                allocator.free(t.tool_call_id);
-                if (t.result) |r| r.free(allocator);
-            },
+            .tool_running => |t| allocator.free(t.tool_name),
             .login_progress => |l| allocator.free(l.message),
             .login_complete => |l| {
                 allocator.free(l.provider_id);
@@ -151,7 +141,6 @@ pub const UiEvent = union(enum) {
                 if (r.final_error) |msg| allocator.free(msg);
             },
             .queue_snapshot => |*q| q.deinit(allocator),
-            .conversation_snapshot => |*s| s.deinit(allocator),
             .session_resumed => |s| {
                 if (s.restore_warning) |warning| allocator.free(warning);
             },
@@ -173,16 +162,13 @@ pub const UiEvent = union(enum) {
     }
 };
 
-// --- tests ---
-
 const testing = std.testing;
 
-test "UiEvent deinit handles null result" {
-    var ev = UiEvent{ .tool_end = .{
-        .tool_call_id = try testing.allocator.dupe(u8, "id-2"),
-        .result = null,
-        .is_error = false,
-    } };
+test "UiEvent deinit frees conversation patch payloads" {
+    var ev = UiEvent{ .conversation_patch = .{ .append_frontier_content = .{
+        .target = .{ .assistant_content = .{ .content_index = 0, .kind = .text } },
+        .bytes = try testing.allocator.dupe(u8, "hello"),
+    } } };
     ev.deinit(testing.allocator);
 }
 
@@ -192,5 +178,20 @@ test "UiEvent deinit frees conversation snapshot payload" {
         .messages = &.{},
     });
     var ev = UiEvent{ .conversation_snapshot = snapshot };
+    ev.deinit(testing.allocator);
+}
+
+test "UiEvent deinit frees tool-running label" {
+    var ev = UiEvent{ .tool_running = .{
+        .tool_name = try testing.allocator.dupe(u8, "bash"),
+    } };
+    ev.deinit(testing.allocator);
+}
+
+test "UiEvent deinit handles assistant failure without message" {
+    var ev = UiEvent{ .assistant_run_finished = .{
+        .is_aborted = false,
+        .error_message = null,
+    } };
     ev.deinit(testing.allocator);
 }

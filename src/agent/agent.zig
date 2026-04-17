@@ -1,6 +1,8 @@
 const abort_signal_mod = @import("../abort_signal.zig");
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const conversation_mod = @import("conversation.zig");
+const message_memory = @import("message_memory.zig");
 const loop_mod = @import("loop.zig");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
@@ -120,6 +122,127 @@ pub const SubscriptionToken = struct {
     index: usize,
 };
 
+const FrontierState = struct {
+    allocator: std.mem.Allocator,
+    assistant: ?protocol.AssistantMessage = null,
+    live_tools: std.ArrayList(conversation_mod.LiveToolExecution) = .empty,
+
+    fn init(allocator: std.mem.Allocator) FrontierState {
+        return .{
+            .allocator = allocator,
+            .live_tools = .empty,
+        };
+    }
+
+    fn deinit(self: *FrontierState) void {
+        self.clear();
+        self.live_tools.deinit(self.allocator);
+    }
+
+    fn clear(self: *FrontierState) void {
+        if (self.assistant) |*assistant| conversation_mod.freeAssistantMessage(self.allocator, assistant);
+        self.assistant = null;
+        for (self.live_tools.items) |*tool| tool.deinit(self.allocator);
+        self.live_tools.clearRetainingCapacity();
+    }
+
+    fn replaceAssistant(self: *FrontierState, assistant: protocol.AssistantMessage) void {
+        if (self.assistant) |*old| conversation_mod.freeAssistantMessage(self.allocator, old);
+        self.assistant = conversation_mod.cloneAssistantMessage(self.allocator, assistant) catch null;
+    }
+
+    fn findToolIndex(self: *const FrontierState, tool_call_id: []const u8) ?usize {
+        for (self.live_tools.items, 0..) |tool, idx| {
+            if (std.mem.eql(u8, tool.tool_call_id, tool_call_id)) return idx;
+        }
+        return null;
+    }
+
+    fn ensureTool(self: *FrontierState, tool_call_id: []const u8, tool_name: []const u8) ?*conversation_mod.LiveToolExecution {
+        if (self.findToolIndex(tool_call_id)) |idx| return &self.live_tools.items[idx];
+
+        const owned_id = self.allocator.dupe(u8, tool_call_id) catch return null;
+        errdefer self.allocator.free(owned_id);
+        const owned_name = self.allocator.dupe(u8, tool_name) catch return null;
+        errdefer self.allocator.free(owned_name);
+
+        self.live_tools.append(self.allocator, .{
+            .tool_call_id = owned_id,
+            .tool_name = owned_name,
+            .args = .null,
+        }) catch return null;
+
+        return &self.live_tools.items[self.live_tools.items.len - 1];
+    }
+
+    fn syncToolCall(self: *FrontierState, tool_call: ai.protocol.ToolCall, args_complete: bool) void {
+        const tool = self.ensureTool(tool_call.id, tool_call.name) orelse return;
+        json_util.freeJsonValue(self.allocator, tool.args);
+        tool.args = json_util.cloneJsonValue(self.allocator, tool_call.arguments) catch .null;
+        tool.args_complete = tool.args_complete or args_complete;
+    }
+
+    fn markExecutionStarted(self: *FrontierState, tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value) void {
+        const tool = self.ensureTool(tool_call_id, tool_name) orelse return;
+        json_util.freeJsonValue(self.allocator, tool.args);
+        tool.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
+        tool.execution_started = true;
+    }
+
+    fn setPartialResult(self: *FrontierState, tool_call_id: []const u8, result: ?protocol.AgentToolResult, is_error: bool) void {
+        const idx = self.findToolIndex(tool_call_id) orelse return;
+        const tool = &self.live_tools.items[idx];
+        if (tool.result) |old| old.free(self.allocator);
+        tool.result = if (result) |owned| (owned.clone(self.allocator) catch null) else null;
+        tool.is_partial = true;
+        tool.is_error = if (result) |owned| owned.is_error else is_error;
+    }
+
+    fn setFinalResult(self: *FrontierState, tool_call_id: []const u8, result: ?protocol.AgentToolResult, is_error: bool) void {
+        const idx = self.findToolIndex(tool_call_id) orelse return;
+        const tool = &self.live_tools.items[idx];
+        if (tool.result) |old| old.free(self.allocator);
+        tool.result = if (result) |owned| (owned.clone(self.allocator) catch null) else null;
+        tool.is_partial = false;
+        tool.is_error = if (result) |owned| owned.is_error else is_error;
+    }
+
+    fn setResultMessage(self: *FrontierState, result_message: protocol.ToolResultMessage) void {
+        const tool = self.ensureTool(result_message.tool_call_id, result_message.tool_name) orelse return;
+        if (tool.result_message) |*old| conversation_mod.freeToolResultMessage(self.allocator, old);
+        tool.result_message = conversation_mod.cloneToolResultMessage(self.allocator, result_message) catch null;
+        tool.is_error = result_message.is_error;
+    }
+
+    fn freeze(self: *const FrontierState, allocator: std.mem.Allocator) !conversation_mod.ConversationFrontier {
+        var assistant = if (self.assistant) |assistant|
+            try conversation_mod.cloneAssistantMessage(allocator, assistant)
+        else
+            null;
+        errdefer if (assistant) |*owned| conversation_mod.freeAssistantMessage(allocator, owned);
+
+        const live_tools = try allocator.alloc(conversation_mod.LiveToolExecution, self.live_tools.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < initialized) : (i += 1) {
+                live_tools[i].deinit(allocator);
+            }
+            allocator.free(live_tools);
+        }
+
+        for (self.live_tools.items, 0..) |tool, i| {
+            live_tools[i] = try tool.clone(allocator);
+            initialized += 1;
+        }
+
+        return .{
+            .assistant = assistant,
+            .live_tools = live_tools,
+        };
+    }
+};
+
 /// Stateful wrapper around the low-level agent loop.
 ///
 /// Owns the current transcript, emits lifecycle events, executes tools,
@@ -153,6 +276,10 @@ pub const Agent = struct {
     messages: std.ArrayList(protocol.AgentMessage),
     /// Pending tool call IDs tracked during execution.
     pending_tool_call_ids: std.ArrayList([]const u8),
+    /// Agent-owned hot conversation frontier for the current turn.
+    conversation_frontier: FrontierState,
+    frontier_active: bool = false,
+    frontier_committed_prefix_len: usize = 0,
 
     /// Arena for transcript/history that must survive across runs.
     /// Replaced wholesale on reset/load/compaction so history memory can be reclaimed.
@@ -220,6 +347,9 @@ pub const Agent = struct {
             .abort_controller = .{},
             .messages = messages,
             .pending_tool_call_ids = .empty,
+            .conversation_frontier = FrontierState.init(allocator),
+            .frontier_active = false,
+            .frontier_committed_prefix_len = messages.items.len,
             .history_arena = history_arena,
             .runtime_arena = runtime_arena,
             .allocator = allocator,
@@ -230,6 +360,7 @@ pub const Agent = struct {
         self.listeners.deinit(self.allocator);
         self.steering_queue.deinit();
         self.follow_up_queue.deinit();
+        self.conversation_frontier.deinit();
         self.runtime_arena.deinit();
         self.history_arena.deinit();
         if (self.session_id) |sid| self.allocator.free(sid);
@@ -367,6 +498,20 @@ pub const Agent = struct {
         self.history_arena = std.heap.ArenaAllocator.init(self.allocator);
         self.messages = .empty;
         self.state.messages = &.{};
+        self.frontier_committed_prefix_len = 0;
+    }
+
+    fn clearConversationFrontier(self: *Agent) void {
+        self.conversation_frontier.clear();
+        self.frontier_active = false;
+        self.frontier_committed_prefix_len = self.messages.items.len;
+    }
+
+    fn activateConversationFrontier(self: *Agent) void {
+        if (self.frontier_active) return;
+        self.frontier_active = true;
+        self.frontier_committed_prefix_len = self.messages.items.len;
+        self.conversation_frontier.clear();
     }
 
     fn resetRuntimeArena(self: *Agent) void {
@@ -374,6 +519,7 @@ pub const Agent = struct {
         self.runtime_arena = std.heap.ArenaAllocator.init(self.allocator);
         self.pending_tool_call_ids = .empty;
         self.state.pending_tool_calls = &.{};
+        self.clearConversationFrontier();
     }
 
     pub fn hasQueuedMessages(self: *Agent) bool {
@@ -440,11 +586,34 @@ pub const Agent = struct {
         }
 
         self.resetHistoryArena();
+        self.clearConversationFrontier();
         const aa = self.history_arena.allocator();
         for (staged.items) |m| {
             self.messages.append(aa, dupeAgentMessage(aa, m)) catch {};
         }
         self.state.messages = self.messages.items;
+        self.frontier_committed_prefix_len = self.messages.items.len;
+    }
+
+    pub fn cloneConversationSnapshot(self: *const Agent, allocator: std.mem.Allocator) !conversation_mod.ConversationSnapshot {
+        const committed_end = if (self.frontier_active)
+            self.frontier_committed_prefix_len
+        else
+            self.messages.items.len;
+        const committed = try message_memory.cloneMessages(allocator, self.messages.items[0..committed_end]);
+        errdefer message_memory.freeMessages(allocator, committed);
+
+        const frontier = try self.cloneConversationFrontier(allocator);
+
+        return .{
+            .committed = committed,
+            .frontier = frontier,
+        };
+    }
+
+    pub fn cloneConversationFrontier(self: *const Agent, allocator: std.mem.Allocator) !?conversation_mod.ConversationFrontier {
+        if (!self.frontier_active) return null;
+        return try self.conversation_frontier.freeze(allocator);
     }
 
     /// Start a new prompt. Blocks until loop completes.
@@ -615,21 +784,71 @@ pub const Agent = struct {
         switch (event) {
             .message_start => |payload| {
                 self.state.streaming_message = payload.message;
+                switch (payload.message) {
+                    .assistant => |assistant| {
+                        self.activateConversationFrontier();
+                        self.conversation_frontier.replaceAssistant(assistant);
+                    },
+                    else => {},
+                }
             },
             .message_update => |payload| {
                 self.state.streaming_message = payload.message;
+                switch (payload.message) {
+                    .assistant => |assistant| {
+                        self.activateConversationFrontier();
+                        self.conversation_frontier.replaceAssistant(assistant);
+                        switch (payload.assistant_message_event) {
+                            .toolcall_delta => |tc| {
+                                if (tc.content_index < tc.partial.content.len and tc.partial.content[tc.content_index] == .tool_call) {
+                                    self.conversation_frontier.syncToolCall(tc.partial.content[tc.content_index].tool_call, false);
+                                }
+                            },
+                            .toolcall_end => |tc| self.conversation_frontier.syncToolCall(tc.tool_call, true),
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
             },
             .message_end => |payload| {
                 self.state.streaming_message = null;
                 const owned = dupeAgentMessage(self.history_arena.allocator(), payload.message);
                 self.messages.append(self.history_arena.allocator(), owned) catch {};
                 self.state.messages = self.messages.items;
+
+                switch (payload.message) {
+                    .assistant => |assistant| {
+                        self.activateConversationFrontier();
+                        self.conversation_frontier.replaceAssistant(assistant);
+                        if (assistant.stop_reason != .aborted and assistant.stop_reason != .@"error") {
+                            for (assistant.content) |block| switch (block) {
+                                .tool_call => |tool_call| self.conversation_frontier.syncToolCall(tool_call, true),
+                                else => {},
+                            };
+                        }
+                    },
+                    .tool_result => |tool_result| {
+                        if (self.frontier_active) {
+                            self.conversation_frontier.setResultMessage(tool_result);
+                        }
+                    },
+                    else => {},
+                }
             },
             .tool_execution_start => |payload| {
                 if (self.runtime_arena.allocator().dupe(u8, payload.tool_call_id)) |owned_id| {
                     self.pending_tool_call_ids.append(self.runtime_arena.allocator(), owned_id) catch {};
                     self.state.pending_tool_calls = self.pending_tool_call_ids.items;
                 } else |_| {}
+                if (self.frontier_active) {
+                    self.conversation_frontier.markExecutionStarted(payload.tool_call_id, payload.tool_name, payload.args);
+                }
+            },
+            .tool_execution_update => |payload| {
+                if (self.frontier_active) {
+                    self.conversation_frontier.setPartialResult(payload.tool_call_id, payload.partial_result, if (payload.partial_result) |result| result.is_error else false);
+                }
             },
             .tool_execution_end => |payload| {
                 for (self.pending_tool_call_ids.items, 0..) |id, i| {
@@ -639,18 +858,22 @@ pub const Agent = struct {
                     }
                 }
                 self.state.pending_tool_calls = self.pending_tool_call_ids.items;
+                if (self.frontier_active) {
+                    self.conversation_frontier.setFinalResult(payload.tool_call_id, payload.result, payload.is_error);
+                }
             },
             .turn_end => |payload| {
                 if (payload.message == .assistant) {
                     if (payload.message.assistant.error_message) |err_msg| {
                         self.state.error_message = self.history_arena.allocator().dupe(u8, err_msg) catch err_msg;
                     }
+                    self.clearConversationFrontier();
                 }
             },
             .agent_end => {
                 self.state.streaming_message = null;
             },
-            .agent_start, .turn_start, .tool_execution_update => {},
+            .agent_start, .turn_start => {},
         }
 
         for (self.listeners.items) |listener| {
@@ -950,6 +1173,48 @@ fn unreachableStreamFn(
     @panic("Agent: no stream function configured");
 }
 
+fn testAssistantWithToolCall() protocol.AssistantMessage {
+    return .{
+        .content = &.{
+            .{ .text = .{ .text = "working" } },
+            .{ .tool_call = .{
+                .id = "tool-1",
+                .name = "read",
+                .arguments = .null,
+            } },
+        },
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "gpt-test",
+        .usage = .{
+            .input = 1,
+            .output = 2,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 3,
+            .cost = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total = 0,
+            },
+        },
+        .stop_reason = .toolUse,
+        .timestamp = 2,
+    };
+}
+
+fn testToolResultMessage() protocol.ToolResultMessage {
+    return .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .content = &.{.{ .text = .{ .text = "done" } }},
+        .is_error = false,
+        .timestamp = 3,
+    };
+}
+
 test "tool_execution_start copies ids into runtime scratch" {
     var agent = Agent.init(testing.allocator, .{});
     defer agent.deinit();
@@ -974,6 +1239,54 @@ test "tool_execution_start copies ids into runtime scratch" {
     } });
 
     try testing.expectEqual(@as(usize, 0), agent.state.pending_tool_calls.len);
+}
+
+test "conversation snapshot keeps current turn in frontier until turn_end" {
+    var agent = Agent.init(testing.allocator, .{});
+    defer agent.deinit();
+
+    agent.processEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .text = "prompt" },
+        .timestamp = 1,
+    } } } });
+
+    const assistant = testAssistantWithToolCall();
+    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    agent.processEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+    } });
+    agent.processEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .result = .{ .content = &.{.{ .text = .{ .text = "done" } }}, .is_error = false },
+        .is_error = false,
+    } });
+    agent.processEvent(.{ .message_end = .{ .message = .{ .tool_result = testToolResultMessage() } } });
+
+    var snapshot = try agent.cloneConversationSnapshot(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), snapshot.committed.len);
+    try testing.expect(snapshot.frontier != null);
+    try testing.expect(snapshot.frontier.?.assistant != null);
+    try testing.expectEqual(@as(usize, 1), snapshot.frontier.?.live_tools.len);
+    try testing.expectEqualStrings("tool-1", snapshot.frontier.?.live_tools[0].tool_call_id);
+    try testing.expect(snapshot.frontier.?.live_tools[0].result_message != null);
+    try testing.expectEqualStrings("done", snapshot.frontier.?.live_tools[0].result_message.?.content[0].text.text);
+
+    agent.processEvent(.{ .turn_end = .{
+        .message = .{ .assistant = assistant },
+        .tool_results = &.{testToolResultMessage()},
+    } });
+
+    var committed_snapshot = try agent.cloneConversationSnapshot(testing.allocator);
+    defer committed_snapshot.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), committed_snapshot.committed.len);
+    try testing.expect(committed_snapshot.frontier == null);
 }
 
 test "loadMessages accepts state-backed subslices" {

@@ -443,6 +443,7 @@ pub const Interactive = struct {
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
+    conversation_projection: conversation_projection_mod.ProjectionState,
     resolver: ToolRendererResolver,
     status_data: StatusData,
     /// Agent-thread dedupe cache for semantic status publication.
@@ -566,6 +567,7 @@ pub const Interactive = struct {
             .footer = .{ .theme = theme },
             .hotkeys_overlay = .{ .theme = theme },
             .transcript = Transcript.init(state_allocator),
+            .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
             .status_data = StatusData.init(state_allocator),
             .header_container = container_mod.Container.init(state_allocator),
@@ -676,6 +678,7 @@ pub const Interactive = struct {
         self.status_container.deinit();
         self.pending_container.deinit();
         self.header_container.deinit();
+        self.conversation_projection.deinit();
         self.transcript.deinit();
         self.pending_image_banner.deinit();
         self.status_text.deinit();
@@ -1078,15 +1081,31 @@ pub const Interactive = struct {
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
         switch (ev.*) {
-            .tool_end => {
-                // Tool finalization still has banner/status side effects only.
+            .conversation_patch => |*patch| {
+                const needs_queue_resync = switch (patch.*) {
+                    .append_frontier_content => false,
+                    else => true,
+                };
+                if (self.conversation_projection.applyOwnedPatch(
+                    &self.transcript,
+                    self.active_editor,
+                    self.resolver,
+                    patch,
+                    .{
+                        .theme = self.theme,
+                        .retry_attempt = self.retry_attempt,
+                    },
+                )) {
+                    if (needs_queue_resync) self.syncQueueSnapshotFromRunControl();
+                    self.tui.dirty = true;
+                }
             },
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
-            .message_end_assistant => |m| {
+            .assistant_run_finished => |m| {
                 self.tui.dirty = true;
                 if (m.is_aborted) {
                     self.status_text.setContent(m.error_message orelse "aborted");
@@ -1095,6 +1114,11 @@ pub const Interactive = struct {
                     self.status_text.setContent(userFacingFailureMessage(m.failure_kind, msg));
                     self.status_text.fg = self.theme.fg(.@"error");
                 }
+            },
+            .tool_running => |t| {
+                self.status_text.setContent(t.tool_name);
+                self.status_text.fg = self.theme.fg(.accent);
+                self.tui.dirty = true;
             },
             .login_progress => |l| {
                 self.status_text.setContent(l.message);
@@ -1182,6 +1206,7 @@ pub const Interactive = struct {
             .conversation_snapshot => |snapshot| {
                 const was_following_bottom = self.transcript.isFollowingBottom();
                 self.reconcileConversationFromSnapshot(snapshot);
+                self.syncPatchProjectionFromSnapshot(snapshot);
                 if (was_following_bottom) {
                     self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 }
@@ -1271,7 +1296,7 @@ pub const Interactive = struct {
     }
 
     fn rebuildConversationFromMessages(self: *Interactive, messages: []const agent_protocol.AgentMessage) void {
-        conversation_projection_mod.rebuildFromMessages(
+        self.conversation_projection.replaceAllFromMessages(
             &self.transcript,
             self.active_editor,
             self.resolver,
@@ -1297,6 +1322,50 @@ pub const Interactive = struct {
                 .retry_attempt = self.retry_attempt,
             },
         );
+    }
+
+    fn syncPatchProjectionFromSnapshot(
+        self: *Interactive,
+        snapshot: conversation_snapshot_mod.ConversationSnapshot,
+    ) void {
+        var messages: std.ArrayList(agent_protocol.AgentMessage) = .empty;
+        defer {
+            for (messages.items) |*message| message_memory.freeMessage(self.msg_allocator, message);
+            messages.deinit(self.msg_allocator);
+        }
+
+        for (snapshot.items) |item| {
+            switch (item) {
+                .committed_message => |committed| {
+                    const owned = message_memory.cloneMessage(self.msg_allocator, committed.message) catch {
+                        self.conversation_projection.clear();
+                        return;
+                    };
+                    messages.append(self.msg_allocator, owned) catch {
+                        var mutable = owned;
+                        message_memory.freeMessage(self.msg_allocator, &mutable);
+                        self.conversation_projection.clear();
+                        return;
+                    };
+                },
+                .active_assistant, .tool_execution => {
+                    self.conversation_projection.clear();
+                    return;
+                },
+                .queued_user_message => {},
+            }
+        }
+
+        self.conversation_projection.clear();
+        self.conversation_projection.snapshot = .{
+            .committed = messages.toOwnedSlice(self.msg_allocator) catch {
+                self.conversation_projection.clear();
+                return;
+            },
+            .frontier = null,
+        };
+        messages = .empty;
+        self.conversation_projection.frontier_item_start = self.transcript.items.items.len;
     }
 
     const TranscriptMouseZone = struct {
@@ -2920,6 +2989,61 @@ pub const Interactive = struct {
         self.event_queue.push(.{ .thinking_level_changed = {} });
     }
 
+    fn publishReplaceFrontierPatch(self: *Interactive) void {
+        const frontier = self.ca.agent.cloneConversationFrontier(self.msg_allocator) catch return;
+        self.event_queue.push(.{ .conversation_patch = .{ .replace_frontier = frontier } });
+    }
+
+    fn publishAppendCommittedPatch(self: *Interactive, message: agent_protocol.AgentMessage) void {
+        const owned = message_memory.cloneMessage(self.msg_allocator, message) catch return;
+        self.event_queue.push(.{ .conversation_patch = .{ .append_committed = owned } });
+    }
+
+    fn publishAssistantContentDeltaPatch(
+        self: *Interactive,
+        content_index: usize,
+        kind: @FieldType(agent_mod.conversation.AssistantAppendTarget, "kind"),
+        delta: []const u8,
+    ) void {
+        const bytes = self.msg_allocator.dupe(u8, delta) catch return;
+        self.event_queue.push(.{ .conversation_patch = .{ .append_frontier_content = .{
+            .target = .{ .assistant_content = .{
+                .content_index = content_index,
+                .kind = kind,
+            } },
+            .bytes = bytes,
+        } } });
+    }
+
+    fn publishConversationPatchForAgentEvent(self: *Interactive, event: AgentEvent) void {
+        switch (event) {
+            .message_start => |payload| switch (payload.message) {
+                .assistant => self.publishReplaceFrontierPatch(),
+                else => {},
+            },
+            .message_update => |payload| switch (payload.assistant_message_event) {
+                .text_delta => |delta| self.publishAssistantContentDeltaPatch(delta.content_index, .text, delta.delta),
+                .thinking_delta => |delta| self.publishAssistantContentDeltaPatch(delta.content_index, .thinking, delta.delta),
+                .toolcall_delta, .toolcall_end => self.publishReplaceFrontierPatch(),
+                else => {},
+            },
+            .message_end => |payload| switch (payload.message) {
+                .assistant, .tool_result => self.publishReplaceFrontierPatch(),
+                else => self.publishAppendCommittedPatch(payload.message),
+            },
+            .tool_execution_start, .tool_execution_update, .tool_execution_end => self.publishReplaceFrontierPatch(),
+            .turn_end => |payload| {
+                if (payload.message != .assistant) return;
+                self.event_queue.push(.{ .conversation_patch = .commit_frontier });
+                self.publishAppendCommittedPatch(payload.message);
+                for (payload.tool_results) |tool_result| {
+                    self.publishAppendCommittedPatch(.{ .tool_result = tool_result });
+                }
+            },
+            .agent_start, .agent_end, .turn_start => {},
+        }
+    }
+
     /// Session event callback — runs on the AGENT THREAD.
     fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
@@ -2927,8 +3051,8 @@ pub const Interactive = struct {
             .agent_event => |agent_event| {
                 self.updateLiveToolExecutionFromAgentEvent(agent_event);
                 self.publishQueueSnapshotForAgentEvent(agent_event);
-                self.publishConversationSnapshotForAgentEvent(agent_event);
-                if (convertAgentEvent(agent_event, self.msg_allocator)) |ui_event| {
+                self.publishConversationPatchForAgentEvent(agent_event);
+                if (convertAgentUiEvent(agent_event, self.msg_allocator)) |ui_event| {
                     self.event_queue.push(ui_event);
                 }
                 self.publishStatusSnapshotForAgentEvent(agent_event);
@@ -3078,35 +3202,9 @@ fn userFacingFailureMessage(
     };
 }
 
-fn cloneUserDisplayText(allocator: std.mem.Allocator, user: ai_protocol.UserMessage) ?[]u8 {
-    return switch (user.content) {
-        .text => |text| if (text.len == 0) null else allocator.dupe(u8, text) catch null,
-        .blocks => |blocks| blk: {
-            var out: std.ArrayList(u8) = .empty;
-            defer out.deinit(allocator);
-
-            var image_index: usize = 0;
-            for (blocks) |block| {
-                switch (block) {
-                    .text => |text| out.appendSlice(allocator, text.text) catch return null,
-                    .image => {
-                        image_index += 1;
-                        out.writer(allocator).print("[image{d}]", .{image_index}) catch return null;
-                    },
-                }
-            }
-            if (out.items.len == 0) break :blk null;
-            break :blk out.toOwnedSlice(allocator) catch null;
-        },
-    };
-}
-
-/// Convert an AgentEvent to a TUI-owned UiEvent with deep-copied data.
-/// Runs on the agent thread. Conversation transcript mutation no longer
-/// flows through delta UiEvents; semantic transcript state crosses via
-/// `conversation_snapshot`. This bridge now only preserves banner-only
-/// outcomes that are not part of transcript reconstruction.
-fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
+/// Convert an AgentEvent to a small TUI side-effect event.
+/// Conversation semantics cross separately as `conversation_patch`.
+fn convertAgentUiEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
     switch (event) {
         .message_update => |mu| switch (mu.assistant_message_event) {
             .@"error" => |e| {
@@ -3118,24 +3216,26 @@ fn convertAgentEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
             },
             else => return null,
         },
+        .tool_execution_start => |te| {
+            const tool_name = allocator.dupe(u8, te.tool_name) catch return null;
+            return .{ .tool_running = .{ .tool_name = tool_name } };
+        },
         .message_end => |me| switch (me.message) {
-            .assistant => |am| {
-                if (am.stop_reason == .aborted or am.stop_reason == .@"error") {
-                    const err_msg = if (am.error_message) |msg|
-                        (allocator.dupe(u8, msg) catch null)
-                    else
-                        null;
-                    return .{ .message_end_assistant = .{
-                        .is_aborted = am.stop_reason == .aborted,
-                        .error_message = err_msg,
-                        .failure_kind = if (am.failure) |failure| failure.kind else null,
-                    } };
-                }
-                return null;
+            .assistant => |assistant| {
+                if (assistant.stop_reason != .aborted and assistant.stop_reason != .@"error") return null;
+                const err_msg = if (assistant.error_message) |msg|
+                    (allocator.dupe(u8, msg) catch null)
+                else
+                    null;
+                return .{ .assistant_run_finished = .{
+                    .is_aborted = assistant.stop_reason == .aborted,
+                    .error_message = err_msg,
+                    .failure_kind = if (assistant.failure) |failure| failure.kind else null,
+                } };
             },
             else => return null,
         },
-        .agent_end, .agent_start, .message_start, .turn_start, .turn_end, .tool_execution_start, .tool_execution_update, .tool_execution_end => return null,
+        .agent_start, .agent_end, .turn_start, .turn_end, .message_start, .tool_execution_update, .tool_execution_end => return null,
     }
 }
 
@@ -3260,23 +3360,6 @@ test "buildSubmittedUserContent places text before pending images" {
         },
         .text => return error.ExpectedBlockContent,
     }
-}
-
-test "cloneUserDisplayText includes numbered image markers for user block messages" {
-    const blocks = [_]ai_protocol.UserMessage.UserMessageContent.Block{
-        .{ .text = .{ .text = "look" } },
-        .{ .image = .{ .data = "aaa", .mime_type = "image/png" } },
-        .{ .text = .{ .text = " here" } },
-        .{ .image = .{ .data = "bbb", .mime_type = "image/jpeg" } },
-    };
-
-    const text = cloneUserDisplayText(testing.allocator, .{
-        .content = .{ .blocks = &blocks },
-        .timestamp = 1,
-    }) orelse return error.ExpectedDisplayText;
-    defer testing.allocator.free(text);
-
-    try testing.expectEqualStrings("look[image1] here[image2]", text);
 }
 
 test "pendingImageBannerText includes latest image details and clear shortcut" {

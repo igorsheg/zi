@@ -1,4 +1,5 @@
 pub const protocol = @import("protocol.zig");
+pub const conversation = @import("conversation.zig");
 pub const json = @import("json.zig");
 pub const loop = @import("loop.zig");
 pub const run_control = @import("../runtime/run_control.zig");
