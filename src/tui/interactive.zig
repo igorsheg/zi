@@ -521,6 +521,7 @@ pub const Interactive = struct {
     memory_diagnostics: *const memory_debug.Diagnostics,
     session_controller: SessionController,
     session_event_token: ?SessionController.SubscriptionToken = null,
+    agent_event_token: ?AgentSession.EventSubscriptionToken = null,
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
@@ -637,6 +638,10 @@ pub const Interactive = struct {
         }
         self.ca.agent.unbindRunControl(&self.run_control);
 
+        if (self.agent_event_token) |token| {
+            self.ca.unsubscribeEvents(token);
+            self.agent_event_token = null;
+        }
         if (self.session_event_token) |token| {
             self.session_controller.unsubscribe(token);
             self.session_event_token = null;
@@ -712,7 +717,7 @@ pub const Interactive = struct {
         self.ca.agent.bindRunControl(&self.run_control);
         self.rebuildConversationFromMessages(self.ca.agent.state.messages);
         self.syncQueueSnapshotFromRunControl();
-        self.session_controller.wire();
+        self.agent_event_token = self.ca.subscribeEvents(&agentEventCallback, @ptrCast(self));
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
 
         self.detectGitBranch();
@@ -3044,19 +3049,22 @@ pub const Interactive = struct {
         }
     }
 
-    /// Session event callback — runs on the AGENT THREAD.
+    /// Raw agent event callback — runs on the AGENT THREAD.
+    fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.updateLiveToolExecutionFromAgentEvent(event);
+        self.publishQueueSnapshotForAgentEvent(event);
+        self.publishConversationPatchForAgentEvent(event);
+        if (convertAgentUiEvent(event, self.msg_allocator)) |ui_event| {
+            self.event_queue.push(ui_event);
+        }
+        self.publishStatusSnapshotForAgentEvent(event);
+    }
+
+    /// Session controller callback — runs on the AGENT THREAD.
     fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         switch (event) {
-            .agent_event => |agent_event| {
-                self.updateLiveToolExecutionFromAgentEvent(agent_event);
-                self.publishQueueSnapshotForAgentEvent(agent_event);
-                self.publishConversationPatchForAgentEvent(agent_event);
-                if (convertAgentUiEvent(agent_event, self.msg_allocator)) |ui_event| {
-                    self.event_queue.push(ui_event);
-                }
-                self.publishStatusSnapshotForAgentEvent(agent_event);
-            },
             .phase_changed => |pc| {
                 if (pc.from == .waiting_to_retry and pc.to == .running_continue) {
                     self.event_queue.push(.retry_wait_finished);

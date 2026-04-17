@@ -7,7 +7,6 @@ const resources = @import("resources/root.zig");
 const classifier = @import("session_error_classifier.zig");
 
 const AgentSession = coding_agent.AgentSession;
-const AgentEvent = agent_mod.protocol.AgentEvent;
 
 pub const Phase = enum {
     idle,
@@ -55,7 +54,6 @@ pub const CompactionEnd = struct {
 };
 
 pub const SessionEvent = union(enum) {
-    agent_event: AgentEvent,
     phase_changed: struct {
         from: Phase,
         to: Phase,
@@ -98,8 +96,6 @@ pub const SessionController = struct {
     compaction_executor: ?CompactionExecutor = null,
     phase: Phase = .idle,
     listeners: std.ArrayList(Listener),
-    raw_event_token: ?AgentSession.EventSubscriptionToken = null,
-    last_outcome: ?RunOutcome = null,
     retry_attempt: u32 = 0,
     overflow_recovery_attempted: bool = false,
     retry_abort_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -131,17 +127,7 @@ pub const SessionController = struct {
     }
 
     pub fn deinit(self: *SessionController) void {
-        if (self.raw_event_token) |tok| {
-            self.session.unsubscribeEvents(tok);
-            self.raw_event_token = null;
-        }
         self.listeners.deinit(self.allocator);
-    }
-
-    pub fn wire(self: *SessionController) void {
-        if (self.raw_event_token == null) {
-            self.raw_event_token = self.session.subscribeEvents(&onAgentEvent, @ptrCast(self));
-        }
     }
 
     pub fn subscribe(
@@ -165,12 +151,10 @@ pub const SessionController = struct {
     }
 
     pub fn runUserContent(self: *SessionController, content: ai.protocol.UserMessage.UserMessageContent) !RunOutcome {
-        self.wire();
         return self.runWithRecovery(.running_prompt, content);
     }
 
     pub fn continueTurn(self: *SessionController) !RunOutcome {
-        self.wire();
         return self.runWithRecovery(.running_continue, null);
     }
 
@@ -266,10 +250,13 @@ pub const SessionController = struct {
     }
 
     fn resolveRunOutcome(self: *SessionController) RunOutcome {
-        return self.last_outcome orelse if (self.session.agent.isAbortRequested())
-            .aborted
-        else
-            .success;
+        if (self.session.agent.isAbortRequested()) return .aborted;
+        const assistant = self.latestAssistantMessage() orelse return .success;
+        return switch (assistant.stop_reason) {
+            .aborted => .aborted,
+            .@"error" => .assistant_error,
+            else => .success,
+        };
     }
 
     fn runWithRecovery(
@@ -277,7 +264,6 @@ pub const SessionController = struct {
         initial_phase: Phase,
         prompt_content: ?ai.protocol.UserMessage.UserMessageContent,
     ) !RunOutcome {
-        self.last_outcome = null;
         self.retry_attempt = 0;
         self.overflow_recovery_attempted = false;
         self.retry_abort_requested.store(false, .release);
@@ -290,7 +276,6 @@ pub const SessionController = struct {
 
         var phase = initial_phase;
         while (true) {
-            self.last_outcome = null;
             self.setPhase(phase);
             if (phase == .running_prompt) {
                 try self.session.runUserContent(prompt_content.?);
@@ -432,26 +417,6 @@ pub const SessionController = struct {
         self.session.agent.loadMessages(messages[0 .. messages.len - 1]);
         self.session.agent.state.error_message = null;
     }
-
-    fn onAgentEvent(event: AgentEvent, ctx: ?*anyopaque) void {
-        const self: *SessionController = @ptrCast(@alignCast(ctx));
-        self.emit(.{ .agent_event = event });
-        switch (event) {
-            .turn_end => |payload| {
-                if (payload.message == .assistant) {
-                    self.last_outcome = switch (payload.message.assistant.stop_reason) {
-                        .aborted => .aborted,
-                        .@"error" => .assistant_error,
-                        else => self.last_outcome,
-                    };
-                }
-            },
-            .agent_end => {
-                if (self.last_outcome == null) self.last_outcome = .success;
-            },
-            else => {},
-        }
-    }
 };
 
 const testing = std.testing;
@@ -463,7 +428,6 @@ const SessionEventCollector = struct {
     retry_ends: std.ArrayListUnmanaged(RetryEnd) = .empty,
     compaction_starts: std.ArrayListUnmanaged(CompactionStart) = .empty,
     compaction_ends: std.ArrayListUnmanaged(CompactionEnd) = .empty,
-    saw_agent_end: bool = false,
     allocator: std.mem.Allocator,
 
     fn callback(event: SessionEvent, ctx: ?*anyopaque) void {
@@ -474,9 +438,6 @@ const SessionEventCollector = struct {
             .retry_end => |re| self.retry_ends.append(self.allocator, re) catch {},
             .compaction_start => |cs| self.compaction_starts.append(self.allocator, cs) catch {},
             .compaction_end => |ce| self.compaction_ends.append(self.allocator, ce) catch {},
-            .agent_event => |ae| {
-                if (ae == .agent_end) self.saw_agent_end = true;
-            },
         }
     }
 
@@ -533,7 +494,7 @@ fn createTestAgentSession(
     });
 }
 
-test "SessionController forwards raw agent events and phase transitions for prompt runs" {
+test "SessionController reports phase transitions for prompt runs" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -559,7 +520,7 @@ test "SessionController forwards raw agent events and phase transitions for prom
 
     try testing.expectEqual(RunOutcome.success, outcome);
     try testing.expectEqual(Phase.idle, controller.phase);
-    try testing.expect(collector.saw_agent_end);
+    try testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
     try testing.expectEqual(@as(usize, 2), collector.phase_changes.items.len);
     try testing.expectEqual(Phase.idle, collector.phase_changes.items[0].from);
     try testing.expectEqual(Phase.running_prompt, collector.phase_changes.items[0].to);
