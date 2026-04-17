@@ -923,26 +923,19 @@ fn deinitUserMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 
 // ── Transcript ────────────────────────────────────────────────────
 
-/// Scrollable conversation transcript with slice-native item storage.
+/// Scrollable retained transcript container with slice-native item storage.
 ///
-/// Items are transcript renderables with optional metadata (kind, tool_call_id).
-/// The transcript handles:
-/// - Appending items in event order
-/// - Streaming assistant message merge (current_assistant_idx for content deltas)
-/// - Tool update routing by tool_call_id (O(1) HashMap lookup)
-/// - Measuring total height for scroll calculations
-/// - Rendering visible items into a Region given a scroll offset
-///
-/// Built-in types (assistant, tool, user) are convenience methods.
-/// Extensions add arbitrary transcript renderables via addRenderable().
+/// Items are owned transcript renderables plus optional metadata used for
+/// retained reconciliation (`snapshot_item_id`) and keyed tool-row lookup
+/// (`tool_call_id`). The transcript owns retained item order, layout, scroll,
+/// selection, and viewport rendering. Conversation semantics are projected into
+/// retained rows before they reach this container.
 pub const Transcript = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
-    /// Fast lookup: tool_call_id → item index for routing updates.
+    /// Fast lookup: tool_call_id → item index for retained tool-row updates.
     pending_tools: std.StringHashMapUnmanaged(usize) = .{},
     /// Fast lookup: snapshot item_id → item index for retained reconciliation.
     snapshot_items: std.AutoHashMapUnmanaged(conversation_snapshot_mod.ItemId, usize) = .empty,
-    /// Current assistant message item being appended to (index into items).
-    current_assistant_idx: ?usize = null,
     layout: TranscriptLayout,
 
     allocator: std.mem.Allocator,
@@ -1028,21 +1021,10 @@ pub const Transcript = struct {
         self.syncScrollAfterLayout();
     }
 
-    fn deactivateCurrentAssistantThinking(self: *Transcript) void {
-        const idx = self.current_assistant_idx orelse return;
-        if (idx >= self.items.items.len) return;
-        const item = &self.items.items[idx];
-        if (item.kind != .assistant_message) return;
-        const am: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
-        if (am.deactivateThinkingShimmer()) self.noteItemMutated(idx);
-    }
-
     // ── External renderable API ───────────────────────────────────
 
     /// Append an arbitrary transcript item.
     pub fn addItem(self: *Transcript, item: TranscriptItem) bool {
-        self.deactivateCurrentAssistantThinking();
-        self.current_assistant_idx = null;
         return self.appendTranscriptItem(item);
     }
 
@@ -1076,13 +1058,6 @@ pub const Transcript = struct {
         _ = self.items.orderedRemove(index);
         self.layout.removeItem(index);
         self.reindexMaps(index);
-        if (self.current_assistant_idx) |idx| {
-            if (idx == index) {
-                self.current_assistant_idx = null;
-            } else if (idx > index) {
-                self.current_assistant_idx = idx - 1;
-            }
-        }
         self.clampScroll();
     }
 
@@ -1125,76 +1100,17 @@ pub const Transcript = struct {
         self.items.items.len = 0;
         self.pending_tools.clearRetainingCapacity();
         self.snapshot_items.clearRetainingCapacity();
-        self.current_assistant_idx = null;
         self.last_visible_height = 0;
         self.layout.clear();
     }
 
-    // ── Built-in convenience methods ──────────────────────────────
-
-    /// Start a new assistant message.
-    pub fn beginAssistantMessage(self: *Transcript) void {
-        self.deactivateCurrentAssistantThinking();
-        self.current_assistant_idx = null;
-    }
-
-    pub fn endAssistantMessage(self: *Transcript) void {
-        self.deactivateCurrentAssistantThinking();
-        self.current_assistant_idx = null;
-    }
-
-    fn createAssistantMessage(self: *Transcript) ?*assistant_message_mod.AssistantMessage {
-        const am = self.allocator.create(assistant_message_mod.AssistantMessage) catch return null;
-        am.* = assistant_message_mod.AssistantMessage.init(self.allocator);
-        am.theme = self.theme;
-        am.hide_thinking_block = self.hide_thinking_block;
-        if (!self.appendTranscriptItem(.{
-            .renderable = TranscriptRenderable.init(assistant_message_mod.AssistantMessage, am),
-            .kind = .assistant_message,
-            .extra_height = 1,
-            .deinit_ctx = @ptrCast(am),
-            .deinit_fn = deinitAssistantMessage,
-        })) {
-            am.deinit();
-            self.allocator.destroy(am);
-            return null;
-        }
-        self.current_assistant_idx = self.items.items.len - 1;
-        return am;
-    }
+    // ── Built-in retained row mutators ────────────────────────────
 
     fn assistantMessageAt(self: *Transcript, index: usize) ?*assistant_message_mod.AssistantMessage {
         if (index >= self.items.items.len) return null;
         const item = &self.items.items[index];
         if (item.kind != .assistant_message) return null;
         return @ptrCast(@alignCast(item.deinit_ctx.?));
-    }
-
-    fn currentAssistant(self: *Transcript) ?*assistant_message_mod.AssistantMessage {
-        const idx = self.current_assistant_idx orelse return null;
-        return self.assistantMessageAt(idx);
-    }
-
-    /// Append streaming text content to the current assistant message.
-    pub fn appendText(self: *Transcript, content_index: usize, delta: []const u8) void {
-        var am = self.currentAssistant();
-        if (am == null) am = self.createAssistantMessage();
-        if (am) |assistant| {
-            assistant.appendText(content_index, delta);
-            const idx = self.current_assistant_idx orelse return;
-            self.noteItemMutated(idx);
-        }
-    }
-
-    /// Append streaming thinking content to the current assistant message.
-    pub fn appendThinking(self: *Transcript, content_index: usize, delta: []const u8) void {
-        var am = self.currentAssistant();
-        if (am == null) am = self.createAssistantMessage();
-        if (am) |assistant| {
-            assistant.appendThinking(content_index, delta);
-            const idx = self.current_assistant_idx orelse return;
-            self.noteItemMutated(idx);
-        }
     }
 
     pub fn appendAssistantTextAt(self: *Transcript, index: usize, content_index: usize, delta: []const u8) bool {
@@ -1230,9 +1146,6 @@ pub const Transcript = struct {
         renderer: tool_display_mod.ToolRenderer,
     ) void {
         if (self.pending_tools.contains(tool_call_id)) return;
-
-        self.deactivateCurrentAssistantThinking();
-        self.current_assistant_idx = null;
 
         const id = self.allocator.dupe(u8, tool_call_id) catch return;
         const name = self.allocator.dupe(u8, tool_name) catch {
@@ -1372,8 +1285,6 @@ pub const Transcript = struct {
     }
 
     pub fn insertItemAt(self: *Transcript, index: usize, item: TranscriptItem) bool {
-        self.deactivateCurrentAssistantThinking();
-        self.current_assistant_idx = null;
         const insert_index = @min(index, self.items.items.len);
         self.items.insert(self.allocator, insert_index, item) catch return false;
         errdefer _ = self.items.orderedRemove(insert_index);
@@ -1407,8 +1318,6 @@ pub const Transcript = struct {
 
     pub fn replaceItemAt(self: *Transcript, index: usize, item: TranscriptItem) bool {
         if (index >= self.items.items.len) return false;
-        self.deactivateCurrentAssistantThinking();
-        self.current_assistant_idx = null;
         var old_item = self.items.items[index];
         if (old_item.tool_call_id) |id| _ = self.pending_tools.remove(id);
         if (old_item.snapshot_item_id) |item_id| _ = self.snapshot_items.remove(item_id);
@@ -1471,9 +1380,6 @@ pub const Transcript = struct {
     }
 
     fn addUserMessageWithKind(self: *Transcript, props: user_message_mod.Props, kind: ItemKind) void {
-        self.deactivateCurrentAssistantThinking();
-        self.current_assistant_idx = null;
-
         const msg = self.allocator.create(user_message_mod.UserMessage) catch return;
         msg.* = user_message_mod.UserMessage.init(self.allocator);
         msg.setTheme(self.theme);
@@ -1889,271 +1795,46 @@ fn appendRowColumns(out: *std.ArrayList(u8), allocator: std.mem.Allocator, regio
 
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
-const agent_root = @import("../agent/root.zig");
-const agent_loop = @import("../agent/loop.zig");
-const ai_root = @import("../ai/root.zig");
-const faux = @import("../ai/faux.zig");
-const builtin_renderers = @import("renderers/builtins.zig");
 
-fn makeUserMessage(text: []const u8) agent_protocol.AgentMessage {
-    return .{ .user = .{
-        .content = .{ .text = text },
-        .timestamp = std.time.milliTimestamp(),
-    } };
-}
+fn appendTestAssistantRow(transcript: *Transcript) !usize {
+    const assistant = try transcript.allocator.create(assistant_message_mod.AssistantMessage);
+    errdefer transcript.allocator.destroy(assistant);
+    assistant.* = assistant_message_mod.AssistantMessage.init(transcript.allocator);
+    errdefer assistant.deinit();
+    assistant.theme = transcript.theme;
+    assistant.hide_thinking_block = transcript.hide_thinking_block;
 
-fn fauxStreamFn(
-    ctx: ?*anyopaque,
-    allocator: std.mem.Allocator,
-    model: ai_root.protocol.Model,
-    context: ai_root.protocol.Context,
-    options: ai_root.protocol.SimpleStreamOptions,
-    callback: ai_root.provider.EventCallback,
-    callback_ctx: ?*anyopaque,
-) void {
-    const fp: *faux.FauxProvider = @ptrCast(@alignCast(ctx.?));
-    const prov = fp.provider();
-    prov.streamSimple(allocator, model, context, options, callback, callback_ctx);
-}
-
-fn makeLoopConfig(fp: *faux.FauxProvider) agent_protocol.AgentLoopConfig {
-    return .{
-        .model = faux.fauxModel(),
-        .stream = .{ .func = fauxStreamFn, .ctx = @ptrCast(fp) },
-        .convert_to_llm = .{ .func = agent_root.defaultConvertToLlm },
+    var item: TranscriptItem = .{
+        .renderable = TranscriptRenderable.init(assistant_message_mod.AssistantMessage, assistant),
+        .kind = .assistant_message,
+        .extra_height = 1,
+        .deinit_ctx = @ptrCast(assistant),
+        .deinit_fn = deinitAssistantMessage,
     };
-}
-
-fn makeCommandArgs(allocator: std.mem.Allocator, command: []const u8) !std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
-    try obj.put("cmd", .{ .string = command });
-    return .{ .object = obj };
-}
-
-fn bashTallExecute(
-    _: ?*anyopaque,
-    allocator: std.mem.Allocator,
-    _: []const u8,
-    _: std.json.Value,
-    _: agent_protocol.AbortSignal,
-    _: ?agent_protocol.AgentToolUpdateCallback,
-    _: ?*anyopaque,
-) agent_protocol.AgentToolResult {
-    const content = allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1) catch {
-        return .{ .content = &.{}, .is_error = true };
-    };
-    content[0] = .{ .text = .{ .text = "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha" } };
-    return .{ .content = content };
-}
-
-const TranscriptLoopHarness = struct {
-    transcript: Transcript,
-    resolver: tool_display_mod.ToolRendererResolver,
-
-    fn init(allocator: std.mem.Allocator, resolver: tool_display_mod.ToolRendererResolver) TranscriptLoopHarness {
-        return .{
-            .transcript = Transcript.init(allocator),
-            .resolver = resolver,
-        };
+    if (!transcript.addItem(item)) {
+        item.deinit(transcript.allocator);
+        return error.AppendFailed;
     }
-
-    fn deinit(self: *TranscriptLoopHarness) void {
-        self.transcript.deinit();
-    }
-
-    fn sink(event: agent_protocol.AgentEvent, ctx: ?*anyopaque) void {
-        const self: *TranscriptLoopHarness = @ptrCast(@alignCast(ctx.?));
-        self.apply(event);
-    }
-
-    fn apply(self: *TranscriptLoopHarness, event: agent_protocol.AgentEvent) void {
-        switch (event) {
-            .message_start => |ms| switch (ms.message) {
-                .assistant => self.transcript.beginAssistantMessage(),
-                else => {},
-            },
-            .message_update => |mu| switch (mu.assistant_message_event) {
-                .text_delta => |d| self.transcript.appendText(d.content_index, d.delta),
-                .thinking_delta => |d| self.transcript.appendThinking(d.content_index, d.delta),
-                .toolcall_delta => |tc| {
-                    if (tc.content_index >= tc.partial.content.len) return;
-                    const block = tc.partial.content[tc.content_index];
-                    if (block != .tool_call) return;
-                    const call = block.tool_call;
-                    const renderer = self.resolver.resolve(call.name);
-                    self.transcript.addToolExecution(call.id, call.name, renderer);
-                    self.transcript.toolSetArgs(call.id, call.arguments);
-                },
-                .toolcall_end => |tc| {
-                    const renderer = self.resolver.resolve(tc.tool_call.name);
-                    self.transcript.addToolExecution(tc.tool_call.id, tc.tool_call.name, renderer);
-                    self.transcript.toolSetArgs(tc.tool_call.id, tc.tool_call.arguments);
-                    self.transcript.toolSetArgsComplete(tc.tool_call.id);
-                },
-                else => {},
-            },
-            .tool_execution_start => |te| {
-                const renderer = self.resolver.resolve(te.tool_name);
-                self.transcript.addToolExecution(te.tool_call_id, te.tool_name, renderer);
-                self.transcript.toolSetArgs(te.tool_call_id, te.args);
-                self.transcript.toolMarkExecutionStarted(te.tool_call_id);
-            },
-            .tool_execution_update => |te| {
-                self.transcript.toolSetPartialResult(te.tool_call_id, te.partial_result, if (te.partial_result) |r| r.is_error else false);
-            },
-            .tool_execution_end => |te| {
-                self.transcript.toolSetFinalResult(te.tool_call_id, te.result, te.is_error);
-            },
-            else => {},
-        }
-    }
-};
-
-fn expectAsciiAt(buf: *const Buffer, x: u32, y: u32, ch: u8) !void {
-    try testing.expectEqual(@as(u21, ch), buf.get(x, y).grapheme.codepoint);
+    return transcript.items.items.len - 1;
 }
 
-test "Transcript faux loop keeps scrolled assistant visible across width reflow after builtin bash tool" {
-    var response_arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer response_arena.deinit();
-    const response_alloc = response_arena.allocator();
-
-    var fp = faux.FauxProvider.init(response_alloc);
-    defer fp.deinit();
-
-    const call_args = try makeCommandArgs(response_alloc, "printf '%s\\n' alpha");
-    const tool_call_content = [_]ai_root.protocol.AssistantMessage.AssistantContentBlock{
-        faux.fauxToolCall("bash", "tc-1", call_args),
-    };
-    const tail_content = [_]ai_root.protocol.AssistantMessage.AssistantContentBlock{
-        faux.fauxText("done"),
-    };
-    fp.setResponses(&.{
-        faux.fauxAssistantMessage(response_alloc, &tool_call_content, .toolUse),
-        faux.fauxAssistantMessage(response_alloc, &tail_content, .stop),
-    });
-
-    const bash_tool = agent_protocol.AgentTool{
-        .name = "bash",
-        .description = "bash",
-        .label = "Bash",
-        .parameters = .null,
-        .execute = bashTallExecute,
-    };
-    const tools = [_]agent_protocol.AgentTool{bash_tool};
-    const prompts = [_]agent_protocol.AgentMessage{makeUserMessage("run bash")};
-    const context = agent_protocol.AgentContext{
-        .system_prompt = "",
-        .messages = &.{},
-        .tools = &tools,
-    };
-
-    const static_entries: []const tool_display_mod.Registration = &.{
-        .{ .tool_name = "bash", .renderer = builtin_renderers.bash_renderer },
-    };
-    var harness = TranscriptLoopHarness.init(testing.allocator, tool_display_mod.ToolRendererResolver.fromStatic(&static_entries));
-    defer harness.deinit();
-
-    var loop_arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer loop_arena.deinit();
-    const config = makeLoopConfig(&fp);
-    agent_loop.runAgentLoop(
-        loop_arena.allocator(),
-        testing.allocator,
-        &prompts,
-        context,
-        config,
-        TranscriptLoopHarness.sink,
-        @ptrCast(&harness),
-        .none,
-    );
-
-    const FixedLines = struct {
-        lines: []const []const u8,
-
-        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
-            var row: u32 = 0;
-            var line_idx: usize = @intCast(first_row);
-            while (row < region.height and line_idx < self.lines.len) : ({
-                row += 1;
-                line_idx += 1;
-            }) {
-                _ = region.writeStr(0, row, self.lines[line_idx], Color.default, Color.default, .{});
-            }
-        }
-
-        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
-            const h: u32 = @intCast(self.lines.len);
-            return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
-        }
-
-        pub fn renderable(self: *@This()) TranscriptRenderable {
-            return TranscriptRenderable.init(@This(), self);
-        }
-    };
-
-    const WidthSensitive = struct {
-        pub fn renderSlice(_: *@This(), region: Region, first_row: u32) void {
-            const rows: u32 = if (region.width >= 40) 1 else 5;
-            if (first_row >= rows) return;
-            var row: u32 = 0;
-            var virtual_row = first_row;
-            while (row < region.height and virtual_row < rows) : ({
-                row += 1;
-                virtual_row += 1;
-            }) {
-                _ = region.writeStr(0, row, "grow", Color.default, Color.default, .{});
-            }
-        }
-
-        pub fn measure(_: *@This(), width: u32) component_mod.Measurement {
-            const h: u32 = if (width >= 40) 1 else 5;
-            return .{ .min_height = 1, .preferred_height = h };
-        }
-
-        pub fn renderable(self: *@This()) TranscriptRenderable {
-            return TranscriptRenderable.init(@This(), self);
-        }
-    };
-
-    var grow = WidthSensitive{};
-    harness.transcript.addRenderable(grow.renderable());
-
-    var fixed = FixedLines{ .lines = &.{ "anchor 1", "anchor 2", "anchor 3", "anchor 4", "anchor 5", "anchor 6" } };
-    harness.transcript.addRenderable(fixed.renderable());
-
-    const wide_total = harness.transcript.totalHeight(80);
-    try testing.expectEqual(@as(usize, 4), harness.transcript.items.items.len);
-    try testing.expectEqual(@as(u32, 16), wide_total);
-    try testing.expectEqualStrings("tc-1", harness.transcript.items.items[0].tool_call_id.?);
-
-    harness.transcript.scrollToBottom(80, 2);
-    harness.transcript.scrollBy(80, 2, -4);
-
-    var before = try Buffer.init(testing.allocator, 80, 2);
-    defer before.deinit();
-    harness.transcript.render(before.region());
-    try expectAsciiAt(&before, 0, 0, 'a');
-    try expectAsciiAt(&before, 7, 0, '1');
-    try expectAsciiAt(&before, 0, 1, 'a');
-    try expectAsciiAt(&before, 7, 1, '2');
-
-    var after = try Buffer.init(testing.allocator, 24, 2);
-    defer after.deinit();
-    harness.transcript.render(after.region());
-    try testing.expect(harness.transcript.totalHeight(24) > wide_total);
-    try expectAsciiAt(&after, 0, 0, 'a');
-    try expectAsciiAt(&after, 7, 0, '1');
-    try expectAsciiAt(&after, 0, 1, 'a');
-    try expectAsciiAt(&after, 7, 1, '2');
+fn appendTestAssistantText(transcript: *Transcript, text: []const u8) !usize {
+    const idx = try appendTestAssistantRow(transcript);
+    try testing.expect(transcript.appendAssistantTextAt(idx, 0, text));
+    return idx;
 }
 
-test "Transcript built-in items install transcript renderables" {
+fn appendTestAssistantThinking(transcript: *Transcript, text: []const u8) !usize {
+    const idx = try appendTestAssistantRow(transcript);
+    try testing.expect(transcript.appendAssistantThinkingAt(idx, 0, text));
+    return idx;
+}
+
+test "Transcript retained items install transcript renderables" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.beginAssistantMessage();
-    transcript.appendText(0, "hello from assistant");
+    _ = try appendTestAssistantText(&transcript, "hello from assistant");
     transcript.addUserMessage(.{ .text = "user msg" });
     transcript.addToolExecution("tool-1", "bash", .{});
 
@@ -2187,8 +1868,7 @@ test "Transcript renders assistant text and tool execution in order" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.beginAssistantMessage();
-    transcript.appendText(0, "hello from assistant");
+    _ = try appendTestAssistantText(&transcript, "hello from assistant");
 
     transcript.addToolExecution("tool-1", "bash", .{});
     transcript.toolSetArgs("tool-1", .null);
@@ -2213,13 +1893,12 @@ test "Transcript preserves manual scroll when assistant content grows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.beginAssistantMessage();
-    transcript.appendText(0, "one two three four five six seven eight nine ten");
+    const assistant_idx = try appendTestAssistantText(&transcript, "one two three four five six seven eight nine ten");
     transcript.scrollToBottom(12, 3);
     transcript.scrollBy(12, 3, -1);
     const before = transcript.scrollOffset();
 
-    transcript.appendText(0, " eleven twelve thirteen fourteen");
+    try testing.expect(transcript.appendAssistantTextAt(assistant_idx, 0, " eleven twelve thirteen fourteen"));
 
     try testing.expectEqual(before, transcript.scrollOffset());
 }
@@ -2433,14 +2112,10 @@ test "Transcript animation hooks stay static for assistant thinking blocks" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.beginAssistantMessage();
-    transcript.appendThinking(0, "ponder");
+    _ = try appendTestAssistantThinking(&transcript, "ponder");
 
     try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(0));
     try testing.expect(!transcript.tickAnimation(0));
-
-    transcript.endAssistantMessage();
-
     try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(0));
 }
 
@@ -2532,8 +2207,7 @@ test "Transcript clearAll removes all items and resets state" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    transcript.beginAssistantMessage();
-    transcript.appendText(0, "hello");
+    _ = try appendTestAssistantText(&transcript, "hello");
     transcript.addUserMessage(.{ .text = "user msg" });
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
@@ -2541,6 +2215,5 @@ test "Transcript clearAll removes all items and resets state" {
     transcript.clearAll();
 
     try testing.expectEqual(@as(usize, 0), transcript.items.items.len);
-    try testing.expectEqual(@as(?usize, null), transcript.current_assistant_idx);
     try testing.expectEqual(@as(u32, 0), transcript.scrollOffset());
 }
