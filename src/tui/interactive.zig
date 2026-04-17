@@ -3131,21 +3131,23 @@ pub const Interactive = struct {
         } } });
     }
 
-    fn publishToolExecutionUpdatePatches(
+    fn publishToolExecutionTextDeltaPatches(
         self: *Interactive,
-        live_tool: *const LiveToolExecutionState,
-        payload: @FieldType(AgentEvent, "tool_execution_update"),
+        tool_call_id: []const u8,
+        previous: ?AgentToolResult,
+        current_is_error: bool,
+        next: ?AgentToolResult,
     ) bool {
         var deltas = collectToolResultTextDeltas(
             self.msg_allocator,
-            live_tool.result,
-            live_tool.is_error,
-            payload.partial_result,
+            previous,
+            current_is_error,
+            next,
         ) orelse return false;
         defer deltas.deinit(self.msg_allocator);
 
         for (deltas.items) |delta| {
-            self.publishToolResultContentDeltaPatch(payload.tool_call_id, delta.content_index, delta.bytes);
+            self.publishToolResultContentDeltaPatch(tool_call_id, delta.content_index, delta.bytes);
         }
         return true;
     }
@@ -3185,13 +3187,32 @@ pub const Interactive = struct {
                 .assistant, .tool_result => self.publishReplaceFrontierPatch(),
                 else => self.publishAppendCommittedPatch(payload.message),
             },
-            .tool_execution_start, .tool_execution_end => self.publishReplaceFrontierPatch(),
+            .tool_execution_start => self.publishReplaceFrontierPatch(),
             .tool_execution_update => |payload| {
                 const live_tool = self.getLiveToolExecution(payload.tool_call_id) orelse {
                     self.publishReplaceFrontierPatch();
                     return;
                 };
-                if (!self.publishToolExecutionUpdatePatches(live_tool, payload)) {
+                if (!self.publishToolExecutionTextDeltaPatches(
+                    payload.tool_call_id,
+                    live_tool.result,
+                    live_tool.is_error,
+                    payload.partial_result,
+                )) {
+                    self.publishReplaceFrontierPatch();
+                }
+            },
+            .tool_execution_end => |payload| {
+                const live_tool = self.getLiveToolExecution(payload.tool_call_id) orelse {
+                    self.publishReplaceFrontierPatch();
+                    return;
+                };
+                if (!self.publishToolExecutionTextDeltaPatches(
+                    payload.tool_call_id,
+                    live_tool.result,
+                    live_tool.is_error,
+                    payload.result,
+                )) {
                     self.publishReplaceFrontierPatch();
                 }
             },
@@ -3536,6 +3557,25 @@ test "collectToolResultTextDeltas rejects non-appendable partial result changes"
         false,
         AgentToolResult{ .content = &error_blocks, .is_error = true },
     ) == null);
+}
+
+test "collectToolResultTextDeltas allows final append-only tool result with unchanged error state" {
+    const previous_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "partial" } },
+    };
+    const previous = AgentToolResult{ .content = &previous_blocks };
+
+    const next_blocks = [_]AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = "partial done" } },
+    };
+    const next = AgentToolResult{ .content = &next_blocks };
+
+    var deltas = collectToolResultTextDeltas(testing.allocator, previous, false, next) orelse return error.ExpectedToolResultDeltas;
+    defer deltas.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), deltas.items.len);
+    try testing.expectEqual(@as(usize, 0), deltas.items[0].content_index);
+    try testing.expectEqualStrings(" done", deltas.items[0].bytes);
 }
 
 fn pngHeader(width: u32, height: u32) [24]u8 {
