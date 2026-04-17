@@ -30,6 +30,7 @@ const clipboard_mod = @import("clipboard.zig");
 const image_mod = @import("../image/root.zig");
 const string_util = @import("../lib/string_util.zig");
 const time_util = @import("../lib/time_util.zig");
+const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
@@ -402,6 +403,8 @@ pub const Interactive = struct {
     /// Owned storage lives in `msg_allocator` so teardown can free it on
     /// the TUI thread after all workers are joined.
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
+    /// Agent-thread publication counter for semantic conversation snapshots.
+    next_conversation_snapshot_version: u64 = 1,
     loader: Loader = .{},
     loader_active: bool = false,
     retry_active: bool = false,
@@ -1160,8 +1163,11 @@ pub const Interactive = struct {
                 }
                 self.tui.dirty = true;
             },
+            .conversation_snapshot => |snapshot| {
+                self.rebuildConversationFromSnapshot(snapshot);
+                self.tui.dirty = true;
+            },
             .session_resumed => |r| {
-                self.rebuildConversationFromMessages(r.messages);
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 // Prefer the restore warning over the generic
                 // "session resumed" banner when a fallback happened
@@ -1183,7 +1189,7 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .session_new_started => {
-                self.rebuildConversationFromMessages(&.{});
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.status_text.setContent("new session started");
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
@@ -1250,6 +1256,22 @@ pub const Interactive = struct {
             self.active_editor,
             self.resolver,
             messages,
+            .{
+                .theme = self.theme,
+                .retry_attempt = self.retry_attempt,
+            },
+        );
+    }
+
+    fn rebuildConversationFromSnapshot(
+        self: *Interactive,
+        snapshot: conversation_snapshot_mod.ConversationSnapshot,
+    ) void {
+        conversation_projection_mod.rebuildFromSnapshot(
+            &self.transcript,
+            self.active_editor,
+            self.resolver,
+            snapshot,
             .{
                 .theme = self.theme,
                 .retry_attempt = self.retry_attempt,
@@ -2562,14 +2584,18 @@ pub const Interactive = struct {
         };
         self.publishQueueSnapshot();
         self.publishStatusSnapshot();
+        if (!self.publishConversationSnapshot()) {
+            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation snapshot") catch return;
+            self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
+            return;
+        }
         self.event_queue.push(.{ .session_new_started = {} });
     }
 
     /// Agent-thread handler for `AgentRequest.resume_session`.
     /// Loads the session via `openSession` (agent_arena allocated),
-    /// deep-clones the resolved AgentMessage snapshot into
-    /// `msg_allocator` (doctrine R3), and publishes either
-    /// `.session_resumed` or `.session_resume_failed` back to the TUI.
+    /// binds the authoritative session state on the agent thread, and
+    /// then publishes semantic snapshots back to the TUI.
     ///
     /// Transcript rebuild stays on the TUI thread — this handler
     /// does NOT touch `self.transcript`. That's .15's whole point.
@@ -2626,21 +2652,34 @@ pub const Interactive = struct {
             }
         }
 
-        // Clone the resolved AgentMessage snapshot into msg_allocator
-        // so the TUI can reconstruct transcript state without any
-        // borrowed pointers crossing the queue boundary.
-        const owned_messages = message_memory.cloneMessages(self.msg_allocator, loaded.messages) catch {
-            if (restore_warning) |warning| self.msg_allocator.free(warning);
-            const msg = self.msg_allocator.dupe(u8, "out of memory building resume snapshot") catch return;
-            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
-            return;
-        };
         self.publishQueueSnapshot();
         self.publishStatusSnapshot();
-        self.event_queue.push(.{ .session_resumed = message_memory.SessionResumeSnapshot.initOwned(
-            owned_messages,
-            restore_warning,
-        ) });
+        if (!self.publishConversationSnapshot()) {
+            if (restore_warning) |warning| self.msg_allocator.free(warning);
+            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation snapshot") catch return;
+            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
+            return;
+        }
+        self.event_queue.push(.{ .session_resumed = .{
+            .restore_warning = restore_warning,
+        } });
+    }
+
+    fn publishConversationSnapshot(self: *Interactive) bool {
+        var queue_snapshot = self.run_control.snapshot(self.msg_allocator);
+        defer queue_snapshot.deinit(self.msg_allocator);
+
+        const snapshot = conversation_snapshot_mod.build(self.msg_allocator, .{
+            .version = self.next_conversation_snapshot_version,
+            .messages = self.ca.agent.state.messages,
+            .steering = queue_snapshot.steering,
+            .follow_up = queue_snapshot.follow_up,
+        }) catch return false;
+        self.next_conversation_snapshot_version +%= 1;
+        if (self.next_conversation_snapshot_version == 0) self.next_conversation_snapshot_version = 1;
+
+        self.event_queue.push(.{ .conversation_snapshot = snapshot });
+        return true;
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).

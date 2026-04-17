@@ -3,7 +3,7 @@ const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const agent_root = @import("../agent/root.zig");
 const agent_protocol = agent_root.protocol;
-const message_memory = agent_root.message_memory;
+const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 const session_controller_mod = @import("../session_controller.zig");
 const AgentToolResult = agent_protocol.AgentToolResult;
 const RunOutcome = session_controller_mod.RunOutcome;
@@ -114,17 +114,19 @@ pub const UiEvent = union(enum) {
     // for amendment without maintaining a parallel semantic mirror.
     queue_snapshot: agent_root.QueuedMessageSnapshot,
 
-    // --- /resume outcomes (zi-wub.15) ---
-    // Published by the agent thread after processing a
-    // resume_session AgentRequest. The TUI rebuilds the transcript
-    // from an owned AgentMessage snapshot and frees it after apply.
-    //
-    // Payload is a full deep-cloned semantic snapshot allocated from
-    // `msg_allocator`. This is intentionally not a transcript-row
-    // projection: the agent owns authoritative session messages, and
-    // the TUI reconstructs its local transcript and editor state
-    // without re-reading agent-owned session state.
-    session_resumed: message_memory.SessionResumeSnapshot,
+    // --- conversation snapshot ---
+    // Owned semantic snapshot of transcript-visible conversation state.
+    // The agent/composition side publishes authoritative semantics;
+    // the TUI rebuilds its retained transcript/editor state locally.
+    conversation_snapshot: conversation_snapshot_mod.ConversationSnapshot,
+
+    // --- /resume outcomes ---
+    // Banner-only outcome. Transcript state now crosses separately via
+    // `conversation_snapshot` so resume no longer ships raw AgentMessage[]
+    // through this event.
+    session_resumed: struct {
+        restore_warning: ?[]u8 = null,
+    },
     session_resume_failed: struct {
         message: []u8,
     },
@@ -204,7 +206,10 @@ pub const UiEvent = union(enum) {
             },
             .message_start_user => |u| allocator.free(u.text),
             .queue_snapshot => |*q| q.deinit(allocator),
-            .session_resumed => |*s| s.deinit(allocator),
+            .conversation_snapshot => |*s| s.deinit(allocator),
+            .session_resumed => |s| {
+                if (s.restore_warning) |warning| allocator.free(warning);
+            },
             .session_resume_failed => |f| allocator.free(f.message),
             .session_new_started => {},
             .session_new_failed => |f| allocator.free(f.message),
@@ -251,5 +256,14 @@ test "UiEvent deinit handles null result" {
         .result = null,
         .is_error = false,
     } };
+    ev.deinit(testing.allocator);
+}
+
+test "UiEvent deinit frees conversation snapshot payload" {
+    const snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 1,
+        .messages = &.{},
+    });
+    var ev = UiEvent{ .conversation_snapshot = snapshot };
     ev.deinit(testing.allocator);
 }

@@ -12,6 +12,8 @@ const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const editor_mod = @import("components/editor.zig");
 const ui_event_mod = @import("ui_event.zig");
+const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
+const run_control_mod = @import("../runtime/run_control.zig");
 
 const Transcript = transcript_mod.Transcript;
 const TranscriptRenderable = transcript_mod.TranscriptRenderable;
@@ -61,6 +63,37 @@ pub fn rebuildFromMessages(
     for (messages) |message| {
         seedHistoryFromMessage(editor, message);
         appendProjectedMessage(transcript, resolver, message, options);
+    }
+
+    transcript.clearPendingToolRouting();
+}
+
+pub fn rebuildFromSnapshot(
+    transcript: *Transcript,
+    editor: EditorInterface,
+    resolver: ToolRendererResolver,
+    snapshot: conversation_snapshot_mod.ConversationSnapshot,
+    options: RebuildOptions,
+) void {
+    transcript.clearAll();
+    editor.clearHistory();
+
+    for (snapshot.items) |item| {
+        switch (item) {
+            .committed_message => |committed| {
+                seedHistoryFromMessage(editor, committed.message);
+                appendProjectedMessage(transcript, resolver, committed.message, options);
+            },
+            .queued_user_message => |queued| {
+                transcript.addQueuedUserMessage(.{
+                    .text = queued.text,
+                    .footer = switch (queued.kind) {
+                        .steering => .queued_steering,
+                        .follow_up => .queued_follow_up,
+                    },
+                });
+            },
+        }
     }
 
     transcript.clearPendingToolRouting();
@@ -616,6 +649,56 @@ test "rebuildFromMessages includes summaries displayable custom messages and edi
     try testing.expect(std.mem.indexOf(u8, rendered, "previous branch summary") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "shown custom") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "do not show") == null);
+}
+
+test "rebuildFromSnapshot reconstructs committed messages and queued rows" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var editor = editor_mod.Editor.init(testing.allocator);
+    defer editor.deinit();
+
+    const messages = [_]agent_protocol.AgentMessage{
+        makeUserMessage("hello", 1),
+        .{ .compaction_summary = .{ .summary = "kept the recent turns", .tokens_before = 42, .timestamp = 2 } },
+    };
+    var steering = [_]run_control_mod.QueuedMessageText{
+        .{ .text = try testing.allocator.dupe(u8, "steer me") },
+    };
+    defer testing.allocator.free(steering[0].text);
+    var follow_up = [_]run_control_mod.QueuedMessageText{
+        .{ .text = try testing.allocator.dupe(u8, "follow me") },
+    };
+    defer testing.allocator.free(follow_up[0].text);
+
+    var snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 1,
+        .messages = &messages,
+        .steering = &steering,
+        .follow_up = &follow_up,
+    });
+    defer snapshot.deinit(testing.allocator);
+
+    rebuildFromSnapshot(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        snapshot,
+        .{ .theme = themes_builtin.dark() },
+    );
+
+    try testing.expectEqual(@as(usize, 1), editor.history.items.len);
+    try testing.expectEqualStrings("hello", editor.history.items[0]);
+
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60);
+    defer testing.allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "hello") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "kept the recent turns") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Queued · Steering") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "steer me") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Queued · Follow-up") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "follow me") != null);
 }
 
 test "applyLiveEvent shares tool projection across streaming and final result events" {
