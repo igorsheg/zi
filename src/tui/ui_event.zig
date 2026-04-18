@@ -8,6 +8,8 @@ const RunOutcome = session_controller_mod.RunOutcome;
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
 /// mailbox-owned. Conversation changes cross as full semantic snapshots.
 pub const UiEvent = union(enum) {
+    consumed: void,
+
     // --- conversation transport ---
     conversation_snapshot: conversation_snapshot_mod.ConversationSnapshot,
 
@@ -117,9 +119,20 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
+    pub fn takeConversationSnapshot(self: *UiEvent) ?conversation_snapshot_mod.ConversationSnapshot {
+        return switch (self.*) {
+            .conversation_snapshot => |snapshot| blk: {
+                self.* = .{ .consumed = {} };
+                break :blk snapshot;
+            },
+            else => null,
+        };
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .consumed => {},
             .conversation_snapshot => |*snapshot| snapshot.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
             .assistant_run_finished => |m| {
@@ -165,6 +178,17 @@ test "UiEvent deinit frees conversation snapshot payload" {
         .messages = &.{},
     });
     var ev = UiEvent{ .conversation_snapshot = snapshot };
+    ev.deinit(testing.allocator);
+}
+
+test "UiEvent takeConversationSnapshot disarms later cleanup" {
+    var ev = UiEvent{ .conversation_snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
+        .version = 1,
+        .messages = &.{},
+    }) };
+    var snapshot = ev.takeConversationSnapshot().?;
+    defer snapshot.deinit(testing.allocator);
+
     ev.deinit(testing.allocator);
 }
 

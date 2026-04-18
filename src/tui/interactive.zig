@@ -1032,7 +1032,29 @@ pub const Interactive = struct {
     }
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
+        if (ev.takeConversationSnapshot()) |snapshot| {
+            var owned_snapshot = snapshot;
+            const was_following_bottom = self.transcript.isFollowingBottom();
+            self.conversation_projection.replaceAllOwnedSnapshot(
+                &self.transcript,
+                self.active_editor,
+                self.resolver,
+                &owned_snapshot,
+                .{
+                    .theme = self.theme,
+                    .retry_attempt = self.retry_attempt,
+                },
+            );
+            if (was_following_bottom) {
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+            }
+            self.tui.dirty = true;
+            return;
+        }
+
         switch (ev.*) {
+            .consumed => {},
+            .conversation_snapshot => unreachable,
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
@@ -1143,23 +1165,6 @@ pub const Interactive = struct {
                 if (self.request_in_flight) {
                     self.request_in_flight = false;
                     self.hideLoader();
-                }
-                self.tui.dirty = true;
-            },
-            .conversation_snapshot => |*snapshot| {
-                const was_following_bottom = self.transcript.isFollowingBottom();
-                self.conversation_projection.replaceAllOwnedSnapshot(
-                    &self.transcript,
-                    self.active_editor,
-                    self.resolver,
-                    snapshot,
-                    .{
-                        .theme = self.theme,
-                        .retry_attempt = self.retry_attempt,
-                    },
-                );
-                if (was_following_bottom) {
-                    self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 }
                 self.tui.dirty = true;
             },
