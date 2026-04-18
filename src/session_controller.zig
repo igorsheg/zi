@@ -1,6 +1,6 @@
 const std = @import("std");
 const coding_agent = @import("coding_agent.zig");
-const agent_mod = @import("agent/root.zig");
+const agent_mod = @import("agent2/root.zig");
 const ai = @import("ai/root.zig");
 const json_util = @import("ai/json_util.zig");
 const resources = @import("resources/root.zig");
@@ -298,7 +298,7 @@ pub const SessionController = struct {
             const assistant = self.latestAssistantMessage() orelse return outcome;
             const classification = classifier.classifyAssistantMessage(
                 &assistant,
-                self.session.agent.state.model.context_window,
+                self.session.agent.modelValue().context_window,
             );
             switch (classification.class) {
                 .retryable_transient => {
@@ -341,15 +341,11 @@ pub const SessionController = struct {
     }
 
     fn latestAssistantMessage(self: *SessionController) ?ai.protocol.AssistantMessage {
-        const messages = self.session.agent.state.messages;
-        if (messages.len == 0) return null;
-        const last = messages[messages.len - 1];
-        if (last != .assistant) return null;
-        return last.assistant;
+        return self.session.agent.latestAssistant();
     }
 
     fn isLatestAssistantFromCurrentModel(self: *const SessionController, assistant: ai.protocol.AssistantMessage) bool {
-        const model = self.session.agent.state.model;
+        const model = self.session.agent.modelValue();
         return std.mem.eql(u8, json_util.providerToString(assistant.provider), json_util.providerToString(model.provider)) and
             std.mem.eql(u8, assistant.model, model.id);
     }
@@ -409,13 +405,13 @@ pub const SessionController = struct {
     }
 
     fn pruneTransientAssistantError(self: *SessionController) void {
-        const messages = self.session.agent.state.messages;
+        const messages = self.session.agent.messages();
         if (messages.len == 0) return;
         const last = messages[messages.len - 1];
         if (last != .assistant) return;
         if (last.assistant.stop_reason != .@"error") return;
-        self.session.agent.loadMessages(messages[0 .. messages.len - 1]);
-        self.session.agent.state.error_message = null;
+        self.session.agent.truncateCommitted(messages.len - 1);
+        self.session.agent.clearError();
     }
 };
 
@@ -433,7 +429,7 @@ const SessionEventCollector = struct {
     fn callback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *SessionEventCollector = @ptrCast(@alignCast(ctx));
         switch (event) {
-            .phase_changed => |pc| self.phase_changes.append(self.allocator, pc) catch {},
+            .phase_changed => |pc| self.phase_changes.append(self.allocator, .{ .from = pc.from, .to = pc.to }) catch {},
             .retry_start => |rs| self.retry_starts.append(self.allocator, rs) catch {},
             .retry_end => |re| self.retry_ends.append(self.allocator, re) catch {},
             .compaction_start => |cs| self.compaction_starts.append(self.allocator, cs) catch {},
@@ -520,7 +516,7 @@ test "SessionController reports phase transitions for prompt runs" {
 
     try testing.expectEqual(RunOutcome.success, outcome);
     try testing.expectEqual(Phase.idle, controller.phase);
-    try testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
+    try testing.expectEqual(@as(usize, 2), session.agent.messages().len);
     try testing.expectEqual(@as(usize, 2), collector.phase_changes.items.len);
     try testing.expectEqual(Phase.idle, collector.phase_changes.items[0].from);
     try testing.expectEqual(Phase.running_prompt, collector.phase_changes.items[0].to);
@@ -550,8 +546,8 @@ test "SessionController reports assistant error outcome without changing raw ses
 
     try testing.expectEqual(RunOutcome.assistant_error, outcome);
     try testing.expectEqual(Phase.idle, controller.phase);
-    try testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
-    try testing.expectEqual(agent_mod.protocol.StopReason.@"error", session.agent.state.messages[1].assistant.stop_reason);
+    try testing.expectEqual(@as(usize, 2), session.agent.messages().len);
+    try testing.expectEqual(agent_mod.protocol.StopReason.@"error", session.agent.messages()[1].assistant.stop_reason);
 }
 
 test "SessionController retries transient assistant failures and prunes the failed assistant turn before continue" {
@@ -594,8 +590,8 @@ test "SessionController retries transient assistant failures and prunes the fail
     try testing.expectEqual(@as(u32, 1), collector.retry_starts.items[0].attempt);
     try testing.expectEqual(@as(u32, 1), collector.retry_ends.items[0].attempt);
     try testing.expect(collector.retry_ends.items[0].success);
-    try testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
-    try testing.expectEqualStrings("recovered", session.agent.state.messages[1].assistant.content[0].text.text);
+    try testing.expectEqual(@as(usize, 2), session.agent.messages().len);
+    try testing.expectEqualStrings("recovered", session.agent.messages()[1].assistant.content[0].text.text);
     try testing.expectEqual(@as(usize, 4), collector.phase_changes.items.len);
     try testing.expectEqual(Phase.idle, collector.phase_changes.items[0].from);
     try testing.expectEqual(Phase.running_prompt, collector.phase_changes.items[0].to);
@@ -650,8 +646,8 @@ test "SessionController recovers overflow with one compaction pass before retryi
     try testing.expect(collector.compaction_ends.items[0].success);
     try testing.expect(collector.compaction_ends.items[0].will_retry);
     try testing.expectEqual(@as(usize, 0), collector.retry_starts.items.len);
-    try testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
-    try testing.expectEqualStrings("after compaction", session.agent.state.messages[1].assistant.content[0].text.text);
+    try testing.expectEqual(@as(usize, 2), session.agent.messages().len);
+    try testing.expectEqualStrings("after compaction", session.agent.messages()[1].assistant.content[0].text.text);
     try testing.expectEqual(@as(usize, 5), collector.phase_changes.items.len);
     try testing.expectEqual(Phase.idle, collector.phase_changes.items[0].from);
     try testing.expectEqual(Phase.running_prompt, collector.phase_changes.items[0].to);

@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_root = @import("../agent/root.zig");
+const agent_root = @import("../agent2/root.zig");
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 const session_controller_mod = @import("../session_controller.zig");
 const RunOutcome = session_controller_mod.RunOutcome;

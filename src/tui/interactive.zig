@@ -47,10 +47,10 @@ const SessionStore = session_store_mod.SessionStore;
 const storage = @import("../storage.zig");
 const logging = @import("../logging.zig");
 
-const agent_mod = @import("../agent/root.zig");
+const agent_mod = @import("../agent2/root.zig");
 const coding_agent_mod = @import("../coding_agent.zig");
 const session_controller_mod = @import("../session_controller.zig");
-const run_control_mod = @import("../runtime/run_control.zig");
+const run_control_mod = @import("../agent2/control.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentRequest = agent_mod.AgentRequest;
 const RequestQueue = agent_mod.RequestQueue;
@@ -662,7 +662,7 @@ pub const Interactive = struct {
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.active_editor.setStatusData(&self.status_data);
         self.ca.agent.bindRunControl(&self.run_control);
-        self.rebuildConversationFromMessages(self.ca.agent.state.messages);
+        self.rebuildConversationFromMessages(self.ca.agent.messages());
         self.syncQueueSnapshotFromRunControl();
         self.agent_event_token = self.ca.subscribeEvents(&agentEventCallback, @ptrCast(self));
         self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
@@ -1236,7 +1236,6 @@ pub const Interactive = struct {
         self.status_data.context_window = snapshot.context_window;
     }
 
-
     fn applyTranscriptHideThinkingBlock(self: *Interactive) void {
         self.transcript.hide_thinking_block = self.hide_thinking_block;
         for (self.transcript.items.items, 0..) |_, idx| {
@@ -1273,7 +1272,6 @@ pub const Interactive = struct {
             },
         );
     }
-
 
     const TranscriptMouseZone = struct {
         zone: transcript_mod.DragZone,
@@ -2609,8 +2607,12 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
-        self.ca.agent.loadMessages(loaded.messages);
-        self.ca.agent.state.thinking_level = parseAgentThinkingLevel(loaded.thinking_level);
+        self.ca.agent.setMessages(loaded.messages) catch {
+            const msg = self.msg_allocator.dupe(u8, "failed to restore session messages") catch return;
+            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
+            return;
+        };
+        self.ca.agent.setThinkingLevel(parseAgentThinkingLevel(loaded.thinking_level));
 
         // pi-mono parity: when startup did not pin an explicit CLI model,
         // restore the session's last model via `restoreModelFromSession`.
@@ -2627,12 +2629,12 @@ pub const Interactive = struct {
                     const restore = ai_resolve.restoreModelFromSession(.{
                         .saved_provider = saved.provider,
                         .saved_model_id = saved.model_id,
-                        .current_model = self.ca.agent.state.model,
+                        .current_model = self.ca.agent.modelValue(),
                         .registry = registry,
                         .allocator = self.msg_allocator,
                     }) catch ai_resolve.RestoreResult{ .model = null, .fallback_message = null };
                     if (restore.model) |m| {
-                        self.ca.agent.state.model = m;
+                        self.ca.agent.setModel(m);
                     }
                     if (restore.fallback_message) |msg| {
                         // `restoreModelFromSession` allocates via
@@ -2661,12 +2663,12 @@ pub const Interactive = struct {
         var queue_snapshot = self.run_control.snapshot(self.msg_allocator);
         defer queue_snapshot.deinit(self.msg_allocator);
 
-        var legacy_snapshot = self.ca.agent.cloneConversationSnapshot(self.msg_allocator) catch return false;
-        defer legacy_snapshot.deinit(self.msg_allocator);
+        var agent_view = self.ca.agent.cloneConversationView(self.msg_allocator) catch return false;
+        defer agent_view.deinit(self.msg_allocator);
 
-        const snapshot = conversation_snapshot_mod.buildFromAgentConversationSnapshot(self.msg_allocator, .{
+        const snapshot = conversation_snapshot_mod.buildFromAgentConversationView(self.msg_allocator, .{
             .version = self.next_conversation_snapshot_version,
-            .snapshot = legacy_snapshot,
+            .view = agent_view,
             .steering = queue_snapshot.steering,
             .follow_up = queue_snapshot.follow_up,
         }) catch return false;

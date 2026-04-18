@@ -1,7 +1,7 @@
 const std = @import("std");
-const mailbox_mod = @import("mailbox.zig");
-const protocol = @import("../agent/protocol.zig");
-const message_memory = @import("../agent/message_memory.zig");
+const mailbox_mod = @import("../runtime/mailbox.zig");
+const protocol = @import("protocol.zig");
+const message_memory = @import("message_memory.zig");
 
 pub const QueueMode = enum {
     all,

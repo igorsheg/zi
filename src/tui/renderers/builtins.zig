@@ -12,7 +12,7 @@ const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const json_util = @import("../../ai/json_util.zig");
-const agent_protocol = @import("../../agent/root.zig").protocol;
+const agent_protocol = @import("../../agent2/root.zig").protocol;
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
 const ToolStateContext = tool_display_mod.ToolStateContext;

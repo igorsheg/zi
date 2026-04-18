@@ -2,7 +2,7 @@
 //!
 //! Home for JSON conveniences that are NOT tied to any particular
 //! domain (AI providers, sessions, settings). Domain-specific wire
-//! serializers live next to their types (`src/agent/json.zig`,
+//! serializers live next to their types (`src/agent2/json.zig`,
 //! `src/session/json.zig`, `src/settings/json.zig`).
 //!
 //! Exposed via `src/json/root.zig` as `json.value.*`. Also re-exported
@@ -150,7 +150,7 @@ test "cloneJsonValue dupes strings and keys" {
         std.json.Value,
         arena.allocator(),
         \\{"k":"v","n":[1,2]}
-        ,
+    ,
         .{},
     );
     const cloned = try cloneJsonValue(testing.allocator, parsed);
@@ -168,7 +168,7 @@ test "typed accessors return null on type mismatch" {
         std.json.Value,
         arena.allocator(),
         \\{"s":"hi","n":42,"b":true,"f":1.5,"o":{},"a":[],"nil":null}
-        ,
+    ,
         .{},
     );
     const obj = parsed.object;

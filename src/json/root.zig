@@ -5,7 +5,7 @@
 //!   - `partial` — streaming partial-JSON parser (pi-mono partial-json parity)
 //!
 //! Domain-specific wire serializers stay in their domain directory
-//! (`src/agent/json.zig`, `src/session/json.zig`, `src/settings/json.zig`).
+//! (`src/agent2/json.zig`, `src/session/json.zig`, `src/settings/json.zig`).
 //! This module is the right place for anything that works on raw
 //! `std.json.Value` without knowing what it represents.
 

@@ -258,7 +258,7 @@ fn freeProvider(allocator: std.mem.Allocator, provider: *ai.protocol.Provider) v
     }
 }
 
-fn cloneAssistantMessage(allocator: std.mem.Allocator, message: ai.protocol.AssistantMessage) !ai.protocol.AssistantMessage {
+pub fn cloneAssistantMessage(allocator: std.mem.Allocator, message: ai.protocol.AssistantMessage) !ai.protocol.AssistantMessage {
     const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, message.content.len);
     var initialized: usize = 0;
     errdefer {
@@ -313,7 +313,7 @@ fn freeAssistantContentBlock(allocator: std.mem.Allocator, block: ai.protocol.As
     }
 }
 
-fn freeAssistantMessage(allocator: std.mem.Allocator, message: *ai.protocol.AssistantMessage) void {
+pub fn freeAssistantMessage(allocator: std.mem.Allocator, message: *ai.protocol.AssistantMessage) void {
     for (message.content) |block| freeAssistantContentBlock(allocator, block);
     allocator.free(message.content);
     freeApi(allocator, &message.api);
@@ -324,7 +324,7 @@ fn freeAssistantMessage(allocator: std.mem.Allocator, message: *ai.protocol.Assi
     if (message.failure) |failure| freeFailure(allocator, failure);
 }
 
-fn cloneToolResultMessage(allocator: std.mem.Allocator, message: ai.protocol.ToolResultMessage) !ai.protocol.ToolResultMessage {
+pub fn cloneToolResultMessage(allocator: std.mem.Allocator, message: ai.protocol.ToolResultMessage) !ai.protocol.ToolResultMessage {
     const content = try allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, message.content.len);
     var initialized: usize = 0;
     errdefer {
@@ -367,7 +367,7 @@ fn freeToolResultContentBlock(allocator: std.mem.Allocator, block: ai.protocol.T
     }
 }
 
-fn freeToolResultMessage(allocator: std.mem.Allocator, message: *ai.protocol.ToolResultMessage) void {
+pub fn freeToolResultMessage(allocator: std.mem.Allocator, message: *ai.protocol.ToolResultMessage) void {
     allocator.free(message.tool_call_id);
     allocator.free(message.tool_name);
     for (message.content) |block| freeToolResultContentBlock(allocator, block);

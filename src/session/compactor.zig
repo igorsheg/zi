@@ -1,5 +1,5 @@
 const std = @import("std");
-const agent = @import("../agent/root.zig");
+const agent = @import("../agent2/root.zig");
 const ai = @import("../ai/root.zig");
 const coding_agent = @import("../coding_agent.zig");
 const context_mod = @import("context.zig");
@@ -63,9 +63,9 @@ fn execute(reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque)
 
     session.session_store.appendCompaction(summary, prep.first_kept_entry_id, prep.tokens_before);
     const new_context = try session.session_store.buildContext(session.session_store.leafId());
-    session.agent.loadMessages(new_context.messages);
+    try session.agent.setMessages(new_context.messages);
     session.noteCompactionApplied();
-    session.agent.state.error_message = null;
+    session.agent.clearError();
 
     return .{
         .summary = summary,

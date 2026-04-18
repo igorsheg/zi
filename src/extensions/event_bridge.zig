@@ -12,7 +12,7 @@
 //!
 //! Why a separate file from `runner.zig`: the runner has zero
 //! upward dependencies (only `std`, `registries`, `lua_runtime`).
-//! Routing AgentEvent requires importing `agent/protocol.zig`,
+//! Routing AgentEvent requires importing `agent2/protocol.zig`,
 //! which would pollute the runner's import graph. Keeping the
 //! bridge in its own module preserves that isolation — any code
 //! that wants the runner without the agent can just import
@@ -26,7 +26,7 @@
 //! follow-up; out of scope here.
 
 const std = @import("std");
-const agent_protocol = @import("../agent/protocol.zig");
+const agent_protocol = @import("../agent2/protocol.zig");
 const ai_protocol = @import("../ai/protocol.zig");
 const abort_signal_mod = @import("../abort_signal.zig");
 const lua_runtime = @import("lua_runtime.zig");

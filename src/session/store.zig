@@ -4,7 +4,7 @@ const writer_mod = @import("writer.zig");
 const reader_mod = @import("reader.zig");
 const context_mod = @import("context.zig");
 const storage = @import("../storage.zig");
-const agent_mod = @import("../agent/root.zig");
+const agent_mod = @import("../agent2/root.zig");
 
 /// Metadata about a session file, for listing.
 pub const SessionInfo = struct {

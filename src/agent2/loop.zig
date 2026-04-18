@@ -2,7 +2,9 @@ const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("protocol.zig");
+const bridge_mod = @import("stream_bridge.zig");
 const json_util = @import("../ai/json_util.zig");
+const message_memory = @import("message_memory.zig");
 
 /// Start an agent loop with new prompt messages.
 /// Prompts are added to the context and events are emitted for them.
@@ -299,12 +301,12 @@ fn streamAssistantResponse(
         }
     }
 
-    var bridge = StreamBridge{
+    var bridge = bridge_mod.StreamBridge{
         .sink = event_sink,
         .sink_ctx = event_ctx,
         .owned_allocator = run_allocator,
     };
-    config.stream.call(turn_allocator, config.model, llm_context, stream_options, &StreamBridge.callback, @ptrCast(&bridge));
+    config.stream.call(turn_allocator, config.model, llm_context, stream_options, &bridge_mod.StreamBridge.callback, @ptrCast(&bridge));
 
     const assistant_msg = bridge.final_message orelse return null;
 
@@ -313,26 +315,6 @@ fn streamAssistantResponse(
 
     return assistant_msg;
 }
-
-/// Bridge for streaming tool execution updates to the event sink.
-/// Passed as opaque context to AgentToolUpdateCallback.
-const UpdateBridge = struct {
-    sink: protocol.AgentEventSink,
-    sink_ctx: ?*anyopaque,
-    tool_call_id: []const u8,
-    tool_name: []const u8,
-    args: std.json.Value,
-
-    fn callback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
-        const self: *const UpdateBridge = @ptrCast(@alignCast(ctx));
-        self.sink(.{ .tool_execution_update = .{
-            .tool_call_id = self.tool_call_id,
-            .tool_name = self.tool_name,
-            .args = self.args,
-            .partial_result = partial_result,
-        } }, self.sink_ctx);
-    }
-};
 
 /// Emit a synthetic tool_execution_end for a tool that was started but not
 /// finished due to abort. Ensures balanced start/end lifecycle events.
@@ -440,7 +422,7 @@ fn executeToolCalls(
 
                 // --- Phase 2: executePreparedToolCall (pi-mono agent-loop.ts:524-559) ---
 
-                var update_bridge = UpdateBridge{
+                var update_bridge = bridge_mod.UpdateBridge{
                     .sink = event_sink,
                     .sink_ctx = event_ctx,
                     .tool_call_id = tc.id,
@@ -454,7 +436,7 @@ fn executeToolCalls(
                     tc.id,
                     effective_args,
                     signal,
-                    &UpdateBridge.callback,
+                    &bridge_mod.UpdateBridge.callback,
                     @ptrCast(&update_bridge),
                 );
 
@@ -510,14 +492,15 @@ fn executeToolCalls(
                     }
                 }
 
-                const tool_result_msg = cloneToolResultMessage(run_allocator, .{
+                const unowned_tool_result_msg: ai.protocol.ToolResultMessage = .{
                     .tool_call_id = tc.id,
                     .tool_name = tc.name,
                     .content = trm_content.items,
                     .details = final_details,
                     .is_error = final_is_error,
                     .timestamp = std.time.milliTimestamp(),
-                });
+                };
+                const tool_result_msg = message_memory.cloneToolResultMessage(run_allocator, unowned_tool_result_msg) catch unowned_tool_result_msg;
 
                 emitToolResult(event_sink, event_ctx, tc, tool_result_msg, final_is_error, final_agent_result);
                 started_current = false;
@@ -577,68 +560,6 @@ fn findTool(tools: []const protocol.AgentTool, name: []const u8) ?protocol.Agent
         if (std.mem.eql(u8, t.name, name)) return t;
     }
     return null;
-}
-
-fn cloneJson(allocator: std.mem.Allocator, value: std.json.Value) std.json.Value {
-    return json_util.cloneJsonValue(allocator, value) catch value;
-}
-
-fn cloneOptionalJson(allocator: std.mem.Allocator, value: ?std.json.Value) ?std.json.Value {
-    const v = value orelse return null;
-    return json_util.cloneJsonValue(allocator, v) catch v;
-}
-
-fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: ai.protocol.AssistantMessage) ai.protocol.AssistantMessage {
-    const content = allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, msg.content.len) catch return msg;
-    for (msg.content, 0..) |block, i| {
-        content[i] = switch (block) {
-            .text => |t| .{ .text = .{
-                .text = allocator.dupe(u8, t.text) catch t.text,
-                .text_signature = if (t.text_signature) |s| allocator.dupe(u8, s) catch s else null,
-            } },
-            .thinking => |t| .{ .thinking = .{
-                .thinking = allocator.dupe(u8, t.thinking) catch t.thinking,
-                .thinking_signature = if (t.thinking_signature) |s| allocator.dupe(u8, s) catch s else null,
-                .redacted = t.redacted,
-            } },
-            .tool_call => |tc| .{ .tool_call = .{
-                .id = allocator.dupe(u8, tc.id) catch tc.id,
-                .name = allocator.dupe(u8, tc.name) catch tc.name,
-                .arguments = cloneJson(allocator, tc.arguments),
-                .thought_signature = if (tc.thought_signature) |s| allocator.dupe(u8, s) catch s else null,
-            } },
-        };
-    }
-    var result = msg;
-    result.content = content;
-    result.model = allocator.dupe(u8, msg.model) catch msg.model;
-    if (msg.api == .custom) result.api = .{ .custom = allocator.dupe(u8, msg.api.custom) catch msg.api.custom };
-    if (msg.provider == .custom) result.provider = .{ .custom = allocator.dupe(u8, msg.provider.custom) catch msg.provider.custom };
-    if (msg.error_message) |em| result.error_message = allocator.dupe(u8, em) catch em;
-    if (msg.response_id) |rid| result.response_id = allocator.dupe(u8, rid) catch rid;
-    return result;
-}
-
-fn cloneToolResultMessage(allocator: std.mem.Allocator, msg: ai.protocol.ToolResultMessage) ai.protocol.ToolResultMessage {
-    const content = allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, msg.content.len) catch return msg;
-    for (msg.content, 0..) |block, i| {
-        content[i] = switch (block) {
-            .text => |t| .{ .text = .{
-                .text = allocator.dupe(u8, t.text) catch t.text,
-                .text_signature = if (t.text_signature) |s| allocator.dupe(u8, s) catch s else null,
-            } },
-            .image => |img| .{ .image = .{
-                .data = allocator.dupe(u8, img.data) catch img.data,
-                .mime_type = allocator.dupe(u8, img.mime_type) catch img.mime_type,
-            } },
-        };
-    }
-    var result = msg;
-    result.content = content;
-    result.tool_call_id = allocator.dupe(u8, msg.tool_call_id) catch msg.tool_call_id;
-    result.tool_name = allocator.dupe(u8, msg.tool_name) catch msg.tool_name;
-    result.details = cloneOptionalJson(allocator, msg.details);
-    return result;
 }
 
 fn makeAgentToolTextResult(allocator: std.mem.Allocator, text: []const u8, is_error: bool) protocol.AgentToolResult {
@@ -734,65 +655,3 @@ fn traceWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
     file.writeAll(slice) catch {};
 }
-/// Bridge between provider events and agent events.
-/// Translates AssistantMessageEvent → AgentEvent.
-const StreamBridge = struct {
-    sink: protocol.AgentEventSink,
-    sink_ctx: ?*anyopaque,
-    owned_allocator: std.mem.Allocator,
-    final_message: ?ai.protocol.AssistantMessage = null,
-    added_partial: bool = false,
-
-    fn callback(event: ai.protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
-        const self: *StreamBridge = @ptrCast(@alignCast(ctx));
-
-        switch (event) {
-            .start => |s| {
-                self.added_partial = true;
-                self.sink(.{ .message_start = .{ .message = .{ .assistant = s.partial } } }, self.sink_ctx);
-            },
-
-            .done => |d| {
-                const owned = cloneAssistantMessage(self.owned_allocator, d.message);
-                self.final_message = owned;
-                if (!self.added_partial) {
-                    self.sink(.{ .message_start = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
-                }
-                self.sink(.{ .message_end = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
-            },
-
-            .@"error" => |e| {
-                const owned = cloneAssistantMessage(self.owned_allocator, e.@"error");
-                self.final_message = owned;
-                if (!self.added_partial) {
-                    self.sink(.{ .message_start = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
-                }
-                self.sink(.{ .message_end = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
-            },
-
-            else => |_| {
-                const partial = extractPartial(event);
-                if (partial) |p| {
-                    self.sink(.{ .message_update = .{ .message = .{ .assistant = p }, .assistant_message_event = event } }, self.sink_ctx);
-                }
-            },
-        }
-    }
-
-    fn extractPartial(event: ai.protocol.AssistantMessageEvent) ?ai.protocol.AssistantMessage {
-        return switch (event) {
-            .start => |s| s.partial,
-            .text_start => |s| s.partial,
-            .text_delta => |s| s.partial,
-            .text_end => |s| s.partial,
-            .thinking_start => |s| s.partial,
-            .thinking_delta => |s| s.partial,
-            .thinking_end => |s| s.partial,
-            .toolcall_start => |s| s.partial,
-            .toolcall_delta => |s| s.partial,
-            .toolcall_end => |s| s.partial,
-            .done => |d| d.message,
-            .@"error" => |e| e.@"error",
-        };
-    }
-};

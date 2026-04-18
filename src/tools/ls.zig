@@ -3,7 +3,7 @@
 //! second round-trip and steers them toward `read` for future calls.
 
 const std = @import("std");
-const protocol = @import("../agent/protocol.zig");
+const protocol = @import("../agent2/protocol.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("../lib/output_buffer.zig");

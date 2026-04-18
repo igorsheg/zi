@@ -47,7 +47,7 @@ const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
 const tool_def = @import("../tools/definition.zig");
-const agent_protocol = @import("../agent/protocol.zig");
+const agent_protocol = @import("../agent2/protocol.zig");
 const spawn_mod = @import("../spawn/spawn.zig");
 const spawn_types = @import("../spawn/types.zig");
 

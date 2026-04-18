@@ -20,7 +20,7 @@ test {
     _ = @import("cli/help.zig");
     _ = @import("cli/initial_message.zig");
     _ = @import("cli/run_interactive.zig");
-    _ = @import("agent/root.zig");
+    _ = @import("agent2/root.zig");
     _ = @import("session/root.zig");
     _ = @import("coding_agent.zig");
     _ = @import("system_prompt.zig");

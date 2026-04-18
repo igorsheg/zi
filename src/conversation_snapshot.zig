@@ -1,10 +1,10 @@
 const std = @import("std");
 const ai_protocol = @import("ai/protocol.zig");
-const protocol = @import("agent/protocol.zig");
-const agent_conversation = @import("agent/conversation.zig");
-const message_memory = @import("agent/message_memory.zig");
+const protocol = @import("agent2/protocol.zig");
+const agent_conversation = @import("agent2/conversation_state.zig");
+const message_memory = @import("agent2/message_memory.zig");
 const json_util = @import("ai/json_util.zig");
-const run_control = @import("runtime/run_control.zig");
+const run_control = @import("agent2/control.zig");
 
 pub const ItemId = enum(u64) { _ };
 pub const SemanticVersion = u64;
@@ -380,12 +380,12 @@ pub fn build(allocator: std.mem.Allocator, inputs: BuildInputs) !ConversationSna
 
 pub const BuildFromAgentConversationInputs = struct {
     version: u64,
-    snapshot: agent_conversation.ConversationSnapshot,
+    view: agent_conversation.ConversationView,
     steering: []const run_control.QueuedMessageText = &.{},
     follow_up: []const run_control.QueuedMessageText = &.{},
 };
 
-pub fn buildFromAgentConversationSnapshot(
+pub fn buildFromAgentConversationView(
     allocator: std.mem.Allocator,
     inputs: BuildFromAgentConversationInputs,
 ) !ConversationSnapshot {
@@ -395,23 +395,23 @@ pub fn buildFromAgentConversationSnapshot(
         items.deinit(allocator);
     }
 
-    const live_item_count = if (inputs.snapshot.frontier) |frontier|
-        frontier.live_tools.len + (if (frontier.assistant != null) @as(usize, 1) else 0)
+    const live_item_count = if (inputs.view.in_flight) |turn|
+        turn.tool_executions.len + (if (turn.assistant != null) @as(usize, 1) else 0)
     else
         0;
 
     try items.ensureTotalCapacity(
         allocator,
-        inputs.snapshot.committed.len +
+        inputs.view.committed.len +
             live_item_count +
             inputs.steering.len +
             inputs.follow_up.len,
     );
 
-    try appendCommittedMessageItems(allocator, &items, inputs.snapshot.committed);
-    if (inputs.snapshot.frontier) |frontier| {
-        try appendActiveAssistantItem(allocator, &items, frontier.assistant);
-        try appendToolExecutionItemsFromAgentFrontier(allocator, &items, frontier.live_tools);
+    try appendCommittedMessageItems(allocator, &items, inputs.view.committed);
+    if (inputs.view.in_flight) |turn| {
+        try appendActiveAssistantItem(allocator, &items, turn.assistant);
+        try appendToolExecutionItemsFromAgentView(allocator, &items, turn.tool_executions);
     }
     try appendQueuedItems(allocator, &items, .steering, inputs.steering);
     try appendQueuedItems(allocator, &items, .follow_up, inputs.follow_up);
@@ -451,10 +451,10 @@ fn appendToolExecutionItems(
     }
 }
 
-fn appendToolExecutionItemsFromAgentFrontier(
+fn appendToolExecutionItemsFromAgentView(
     allocator: std.mem.Allocator,
     items: *std.ArrayList(ConversationItem),
-    live_tools: []const agent_conversation.LiveToolExecution,
+    live_tools: []const agent_conversation.ToolExecution,
 ) !void {
     for (live_tools) |tool| {
         const result = if (tool.result_message) |result_message|
@@ -975,7 +975,7 @@ test "build includes active assistant and live tool execution items" {
     try testing.expectEqualStrings("partial", snapshot.items[2].tool_execution.result.?.content[0].text.text);
 }
 
-test "buildFromAgentConversationSnapshot preserves frontier-only live rows and queued inputs" {
+test "buildFromAgentConversationView preserves in-flight rows and queued inputs" {
     const assistant_content = [_]protocol.AssistantMessage.AssistantContentBlock{
         .{ .text = .{ .text = "working" } },
         .{ .tool_call = .{ .id = "tool-1", .name = "bash", .arguments = .null } },
@@ -992,7 +992,7 @@ test "buildFromAgentConversationSnapshot preserves frontier-only live rows and q
     };
     defer freeQueuedInputs(testing.allocator, &follow_up);
 
-    const live_tools = try testing.allocator.dupe(agent_conversation.LiveToolExecution, &.{.{
+    const live_tools = try testing.allocator.dupe(agent_conversation.ToolExecution, &.{.{
         .tool_call_id = try testing.allocator.dupe(u8, "tool-1"),
         .tool_name = try testing.allocator.dupe(u8, "bash"),
         .args = .null,
@@ -1018,13 +1018,13 @@ test "buildFromAgentConversationSnapshot preserves frontier-only live rows and q
 
     var committed = [_]protocol.AgentMessage{makeUserMessage("hello", 1)};
 
-    var snapshot = try buildFromAgentConversationSnapshot(testing.allocator, .{
+    var snapshot = try buildFromAgentConversationView(testing.allocator, .{
         .version = 11,
-        .snapshot = .{
+        .view = .{
             .committed = &committed,
-            .frontier = .{
+            .in_flight = .{
                 .assistant = makeAssistantMessage(&assistant_content, .toolUse, 2),
-                .live_tools = live_tools,
+                .tool_executions = live_tools,
             },
         },
         .steering = &steering,

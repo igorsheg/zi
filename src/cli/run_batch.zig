@@ -1,10 +1,10 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const logging = @import("../logging.zig");
-const agent = @import("../agent/root.zig");
+const agent = @import("../agent2/root.zig");
 const coding_agent = @import("../coding_agent.zig");
 const sdk = @import("../sdk.zig");
-const agent_json = @import("../agent/json.zig");
+const agent_json = @import("../agent2/json.zig");
 const batch_contract = @import("batch_contract.zig");
 const initial_message = @import("initial_message.zig");
 const plan = @import("plan.zig");
@@ -93,7 +93,7 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
 
     return switch (options.output) {
         .json => .ok,
-        .text => try finishTextMode(allocator, ca.agent.state.messages),
+        .text => try finishTextMode(allocator, ca.agent.messages()),
     };
 }
 

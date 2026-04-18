@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const ai = @import("ai/root.zig");
-const agent_mod = @import("agent/root.zig");
+const agent_mod = @import("agent2/root.zig");
 const coding_agent = @import("coding_agent.zig");
 const storage = @import("storage.zig");
 const resources = @import("resources/root.zig");

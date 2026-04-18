@@ -17,7 +17,7 @@ key decisions already made:
 ## what exists
 
 ```
-src/agent/          — Agent struct, dual loop, tool pipeline (36 tests)
+src/agent2/         — Agent struct, dual loop, tool pipeline (36 tests)
 src/session/        — JSONL protocol, reader, writer, context builder (27 tests)
 src/coding_agent.zig — composition root, 16 e2e tests with faux provider
 src/system_prompt.zig — buildSystemPrompt matching pi-mono (4 tests)

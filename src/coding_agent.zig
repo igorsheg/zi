@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("ai/root.zig");
-const agent_mod = @import("agent/root.zig");
+const agent_mod = @import("agent2/root.zig");
 const session_mod = @import("session/root.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
 const tool_def = @import("tools/definition.zig");
@@ -388,20 +388,18 @@ pub const AgentSession = struct {
         } else null;
 
         const a = Agent.init(allocator, .{
-            .initial_state = .{
-                .system_prompt = sys_prompt,
-                .model = options.model,
-                .tools = filtered_tools,
-                .messages = options.initial_messages,
-                .thinking_level = options.thinking_level orelse .off,
-            },
+            .system_prompt = sys_prompt,
+            .model = options.model,
+            .tools = filtered_tools,
+            .messages = options.initial_messages,
+            .thinking_level = options.thinking_level orelse .off,
             .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
             .stream_fn = stream_hook,
             .session_id = store.sessionId(),
             .get_api_key = get_api_key_hook,
             .before_tool_call = before_tool_hook,
             .after_tool_call = after_tool_hook,
-        });
+        }) catch @panic("OOM");
         const context_usage_unknown_after_compaction = contextUsageUnknownFromStore(allocator, &store);
 
         const self = AgentSession{
@@ -563,12 +561,12 @@ pub const AgentSession = struct {
             return .{ .no_auth = model };
         }
 
-        const previous_thinking = self.agent.state.thinking_level;
+        const previous_thinking = self.agent.thinkingLevel();
         const next_thinking = clampThinkingLevelForModel(previous_thinking, model);
         const thinking_changed = next_thinking != previous_thinking;
 
-        self.agent.state.model = model;
-        self.agent.state.thinking_level = next_thinking;
+        self.agent.setModel(model);
+        self.agent.setThinkingLevel(next_thinking);
         const provider_str = ai.json_util.providerToString(model.provider);
         self.session_store.appendModelChange(provider_str, model.id);
         if (self.settings_manager) |settings| {
@@ -586,13 +584,13 @@ pub const AgentSession = struct {
     }
 
     pub fn trySetThinkingLevel(self: *AgentSession, level: protocol.ThinkingLevel) ThinkingLevelChangeResult {
-        const effective = clampThinkingLevelForModel(level, self.agent.state.model);
-        const changed = effective != self.agent.state.thinking_level;
-        self.agent.state.thinking_level = effective;
+        const effective = clampThinkingLevelForModel(level, self.agent.modelValue());
+        const changed = effective != self.agent.thinkingLevel();
+        self.agent.setThinkingLevel(effective);
         if (changed) {
             self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(effective));
             if (self.settings_manager) |settings| {
-                persistDefaultThinkingLevel(settings, self.agent.state.model, effective);
+                persistDefaultThinkingLevel(settings, self.agent.modelValue(), effective);
             }
         }
         return .{ .level = effective, .changed = changed };
@@ -679,8 +677,9 @@ pub const AgentSession = struct {
 
         try self.replaceSessionStore(new_store);
         self.agent.reset();
-        self.session_store.appendModelChange(ai.json_util.providerToString(self.agent.state.model.provider), self.agent.state.model.id);
-        self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(self.agent.state.thinking_level));
+        const current_model = self.agent.modelValue();
+        self.session_store.appendModelChange(ai.json_util.providerToString(current_model.provider), current_model.id);
+        self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(self.agent.thinkingLevel()));
     }
 
     /// Current context usage for the active model.
@@ -696,7 +695,7 @@ pub const AgentSession = struct {
     /// session file. The compaction boundary is tracked on the agent thread and
     /// refreshed only when the active session store changes.
     pub fn getContextUsage(self: *const AgentSession) ?ContextUsage {
-        const model = self.agent.state.model;
+        const model = self.agent.modelValue();
         if (model.context_window == 0) return null;
 
         if (self.context_usage_unknown_after_compaction) {
@@ -707,17 +706,17 @@ pub const AgentSession = struct {
             };
         }
 
-        return contextUsageFromMessages(model.context_window, self.agent.state.messages);
+        return contextUsageFromMessages(model.context_window, self.agent.messages());
     }
 
     pub fn statusSnapshot(self: *const AgentSession) StatusSnapshot {
         const usage = self.getContextUsage();
         return .{
-            .model_provider = ai.json_util.providerToString(self.agent.state.model.provider),
-            .model_id = self.agent.state.model.id,
-            .thinking_level = self.agent.state.thinking_level,
+            .model_provider = ai.json_util.providerToString(self.agent.modelValue().provider),
+            .model_id = self.agent.modelValue().id,
+            .thinking_level = self.agent.thinkingLevel(),
             .context_tokens = if (usage) |u| u.tokens else null,
-            .context_window = if (usage) |u| u.context_window else self.agent.state.model.context_window,
+            .context_window = if (usage) |u| u.context_window else self.agent.modelValue().context_window,
         };
     }
 
@@ -884,12 +883,12 @@ pub const AgentSession = struct {
 
     fn runtimeGetModel(session_ptr: *anyopaque) protocol.Model {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        return self.agent.state.model;
+        return self.agent.modelValue();
     }
 
     fn runtimeIsIdle(session_ptr: *anyopaque) bool {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        return !self.agent.state.is_streaming;
+        return !self.agent.isStreaming();
     }
 
     fn runtimeAbort(session_ptr: *anyopaque) void {
@@ -909,7 +908,7 @@ pub const AgentSession = struct {
 
     fn runtimeGetSystemPrompt(session_ptr: *anyopaque) []const u8 {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        return self.agent.state.system_prompt;
+        return self.agent.systemPrompt();
     }
 
     /// Run a new text prompt. Wires session persistence, then delegates to Agent.prompt.
@@ -952,7 +951,7 @@ pub const AgentSession = struct {
         }
         self.bindExtensionRuntimeIfNeeded();
         self.wireSubscription();
-        self.agent.@"continue"() catch |err| switch (err) {
+        self.agent.continueTurn() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
             else => return err,
         };
@@ -965,7 +964,8 @@ pub const AgentSession = struct {
         prompt_text: []const u8,
         max_tokens: u64,
     ) ![]u8 {
-        const provider = self._stream_closure.registry.get(ai.provider.apiToString(self.agent.state.model.api)) orelse return error.ProviderUnavailable;
+        const current_model = self.agent.modelValue();
+        const provider = self._stream_closure.registry.get(ai.provider.apiToString(current_model.api)) orelse return error.ProviderUnavailable;
 
         const user_messages = [_]ai.protocol.Message{.{ .user = .{
             .content = .{ .text = prompt_text },
@@ -979,14 +979,14 @@ pub const AgentSession = struct {
         var collector = CompletionCollector{ .allocator = allocator };
         provider.streamSimple(
             allocator,
-            self.agent.state.model,
+            current_model,
             context,
             .{
                 .base = .{
-                    .api_key = self._stream_closure.resolveApiKey(self.agent.state.model),
+                    .api_key = self._stream_closure.resolveApiKey(current_model),
                     .max_tokens = max_tokens,
                 },
-                .reasoning = if (self.agent.state.model.reasoning) .high else null,
+                .reasoning = if (current_model.reasoning) .high else null,
             },
             &CompletionCollector.callback,
             @ptrCast(&collector),
@@ -1294,7 +1294,7 @@ test "trySetModel updates session state and appends model change when auth exist
     try testing.expectEqualStrings(target.id, result.success.model.id);
     try testing.expectEqual(.off, result.success.thinking_level);
     try testing.expect(!result.success.thinking_level_changed);
-    try testing.expectEqualStrings(target.id, ca.agent.state.model.id);
+    try testing.expectEqualStrings(target.id, ca.agent.modelValue().id);
     try testing.expectEqual(@as(usize, 1), ca.session_store.writer.buffered_entries.items.len);
     const entry = ca.session_store.writer.buffered_entries.items[0].entry;
     try testing.expect(entry.entry == .model_change);
@@ -1335,7 +1335,7 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
     try testing.expect(result == .success);
     try testing.expectEqual(.high, result.success.thinking_level);
     try testing.expect(result.success.thinking_level_changed);
-    try testing.expectEqual(.high, ca.agent.state.thinking_level);
+    try testing.expectEqual(.high, ca.agent.thinkingLevel());
     try testing.expectEqual(@as(usize, 2), ca.session_store.writer.buffered_entries.items.len);
     const thinking_entry = ca.session_store.writer.buffered_entries.items[1].entry;
     try testing.expect(thinking_entry.entry == .thinking_level_change);
@@ -1449,7 +1449,7 @@ test "trySetModel rejects unauthed model without mutating state or session" {
 
     const result = ca.trySetModel(blocked);
     try testing.expect(result == .no_auth);
-    try testing.expectEqualStrings(initial.id, ca.agent.state.model.id);
+    try testing.expectEqualStrings(initial.id, ca.agent.modelValue().id);
     try testing.expectEqual(@as(usize, 0), ca.session_store.writer.buffered_entries.items.len);
 }
 
@@ -1696,7 +1696,7 @@ fn testAssistantMessageWithUsage(
 
 fn syncMessagesFromStore(session: *AgentSession) !void {
     const context = try session.session_store.buildContext(session.session_store.leafId());
-    session.agent.loadMessages(context.messages);
+    try session.agent.setMessages(context.messages);
     session.refreshContextUsageStateFromStore();
 }
 
@@ -1815,7 +1815,7 @@ test "AgentSession: getContextUsage falls back to in-memory messages for no-sess
         testUserMessage("hello", 1),
         testAssistantMessageWithUsage(allocator, "hi", 200, 2),
     };
-    session.agent.loadMessages(&messages);
+    try session.agent.setMessages(&messages);
 
     const usage = session.getContextUsage().?;
     try testing.expectEqual(@as(?u64, 200), usage.tokens);
@@ -1881,7 +1881,7 @@ test "AgentSession: in-memory compaction state clears on the first successful po
         .{ .compaction_summary = .{ .summary = "summary", .tokens_before = 195_000, .timestamp = 1 } },
         testUserMessage("third", 2),
     };
-    session.agent.loadMessages(&before);
+    try session.agent.setMessages(&before);
     session.noteCompactionApplied();
 
     const unknown_usage = session.getContextUsage().?;
@@ -1894,7 +1894,7 @@ test "AgentSession: in-memory compaction state clears on the first successful po
         before[1],
         post,
     };
-    session.agent.loadMessages(&after);
+    try session.agent.setMessages(&after);
     session.noteMessageForContextUsage(post);
 
     const known_usage = session.getContextUsage().?;
@@ -1973,9 +1973,9 @@ test "AgentSession: tool_allowlist filters the post-precedence tool set" {
 
     try testing.expectEqual(@as(usize, 1), ca.tools.len);
     try testing.expectEqualStrings("read", ca.tools[0].name);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Allowlisted override snippet") != null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Read file contents") == null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "- bash:") == null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Allowlisted override snippet") != null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Read file contents") == null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "- bash:") == null);
 }
 
 test "AgentSession: user extension overrides builtin tool at execution time" {
@@ -2027,9 +2027,9 @@ test "AgentSession: user extension overrides builtin tool at execution time" {
     try ca.run("use read");
 
     try testing.expectEqual(@as(usize, 2), fp.call_count);
-    try testing.expectEqual(@as(usize, 4), ca.agent.state.messages.len);
-    try testing.expect(ca.agent.state.messages[2] == .tool_result);
-    const tr = ca.agent.state.messages[2].tool_result;
+    try testing.expectEqual(@as(usize, 4), ca.agent.messages().len);
+    try testing.expect(ca.agent.messages()[2] == .tool_result);
+    const tr = ca.agent.messages()[2].tool_result;
     try testing.expectEqualStrings("read", tr.tool_name);
     try testing.expectEqual(@as(usize, 1), tr.content.len);
     switch (tr.content[0]) {
@@ -2070,10 +2070,10 @@ test "AgentSession: final prompt metadata comes from the winning tool definition
     });
     defer ca.deinit();
 
-    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Winning read snippet") != null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Winning read guideline") != null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Read file contents") == null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.state.system_prompt, "Use read to examine files instead of cat or sed.") == null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Winning read snippet") != null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Winning read guideline") != null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Read file contents") == null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Use read to examine files instead of cat or sed.") == null);
 }
 
 // pi-mono test-harness.test.ts: "simple text response"
@@ -2099,11 +2099,11 @@ test "AgentSession: simple text response" {
     try ca.run("hi");
 
     try testing.expectEqual(@as(usize, 1), fp.call_count);
-    try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
-    try testing.expect(ca.agent.state.messages[0] == .user);
-    try testing.expect(ca.agent.state.messages[1] == .assistant);
+    try testing.expectEqual(@as(usize, 2), ca.agent.messages().len);
+    try testing.expect(ca.agent.messages()[0] == .user);
+    try testing.expect(ca.agent.messages()[1] == .assistant);
 
-    const assistant = ca.agent.state.messages[1].assistant;
+    const assistant = ca.agent.messages()[1].assistant;
     try testing.expectEqual(@as(usize, 1), assistant.content.len);
     switch (assistant.content[0]) {
         .text => |t| try testing.expectEqualStrings("hello world", t.text),
@@ -2131,8 +2131,8 @@ test "AgentSession: error response sets stop_reason" {
     try ca.run("hi");
 
     try testing.expectEqual(@as(usize, 1), fp.call_count);
-    try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
-    const assistant = ca.agent.state.messages[1].assistant;
+    try testing.expectEqual(@as(usize, 2), ca.agent.messages().len);
+    const assistant = ca.agent.messages()[1].assistant;
     try testing.expectEqual(ai.protocol.StopReason.@"error", assistant.stop_reason);
 }
 
@@ -2190,14 +2190,14 @@ test "AgentSession: response sequence across multiple prompts" {
     try ca.run("b");
 
     try testing.expectEqual(@as(usize, 2), fp.call_count);
-    try testing.expectEqual(@as(usize, 4), ca.agent.state.messages.len);
+    try testing.expectEqual(@as(usize, 4), ca.agent.messages().len);
     // user, assistant("first"), user, assistant("second")
-    const a1 = ca.agent.state.messages[1].assistant;
+    const a1 = ca.agent.messages()[1].assistant;
     switch (a1.content[0]) {
         .text => |t| try testing.expectEqualStrings("first", t.text),
         else => return error.ExpectedText,
     }
-    const a2 = ca.agent.state.messages[3].assistant;
+    const a2 = ca.agent.messages()[3].assistant;
     switch (a2.content[0]) {
         .text => |t| try testing.expectEqualStrings("second", t.text),
         else => return error.ExpectedText,
@@ -2312,14 +2312,14 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     try testing.expectEqual(@as(usize, 2), fp.call_count);
 
     // Messages: user, assistant(tool_call), tool_result, assistant(text)
-    try testing.expectEqual(@as(usize, 4), ca.agent.state.messages.len);
-    try testing.expect(ca.agent.state.messages[0] == .user);
-    try testing.expect(ca.agent.state.messages[1] == .assistant);
-    try testing.expect(ca.agent.state.messages[2] == .tool_result);
-    try testing.expect(ca.agent.state.messages[3] == .assistant);
+    try testing.expectEqual(@as(usize, 4), ca.agent.messages().len);
+    try testing.expect(ca.agent.messages()[0] == .user);
+    try testing.expect(ca.agent.messages()[1] == .assistant);
+    try testing.expect(ca.agent.messages()[2] == .tool_result);
+    try testing.expect(ca.agent.messages()[3] == .assistant);
 
     // Verify tool result content
-    const tr = ca.agent.state.messages[2].tool_result;
+    const tr = ca.agent.messages()[2].tool_result;
     try testing.expectEqualStrings("echo", tr.tool_name);
     try testing.expectEqual(@as(usize, 1), tr.content.len);
 
@@ -2394,16 +2394,16 @@ test "AgentSession: startNewSession resets transcript and seeds model plus think
     const existing = [_]protocol.AgentMessage{
         .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } },
     };
-    ca.agent.loadMessages(&existing);
+    try ca.agent.setMessages(&existing);
     const old_session_id = try allocator.dupe(u8, ca.session_store.sessionId());
     defer allocator.free(old_session_id);
 
     try ca.startNewSession();
 
     try testing.expect(!std.mem.eql(u8, old_session_id, ca.session_store.sessionId()));
-    try testing.expectEqual(@as(usize, 0), ca.agent.state.messages.len);
-    try testing.expect(ca.agent.session_id != null);
-    try testing.expectEqualStrings(ca.session_store.sessionId(), ca.agent.session_id.?);
+    try testing.expectEqual(@as(usize, 0), ca.agent.messages().len);
+    try testing.expect(ca.agent.sessionId() != null);
+    try testing.expectEqualStrings(ca.session_store.sessionId(), ca.agent.sessionId().?);
     try testing.expect(ca._builtin_ctx != null);
     try testing.expectEqualStrings(ca.session_store.sessionId(), ca._builtin_ctx.?.session_id);
 
@@ -2761,8 +2761,8 @@ test "resumed session context is sent to LLM" {
     defer ca.deinit();
 
     // Simulate /resume: load prior messages into agent
-    ca.agent.loadMessages(prior_messages);
-    try testing.expectEqual(@as(usize, 2), ca.agent.state.messages.len);
+    try ca.agent.setMessages(prior_messages);
+    try testing.expectEqual(@as(usize, 2), ca.agent.messages().len);
 
     // Send a new prompt (the "follow-up" after resume)
     try ca.run("now explain Y");

@@ -6,10 +6,10 @@
 //! - file-tracker change record for undo_edit (undo tool not yet ported)
 
 const std = @import("std");
-const protocol = @import("../agent/protocol.zig");
+const protocol = @import("../agent2/protocol.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
-const lock_registry = @import("../agent/lock_registry.zig");
+const lock_registry = @import("lock_registry.zig");
 
 const SCHEMA =
     \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path of the file to be created (must be absolute, not relative)."},"content":{"type":"string","description":"The content for the file."}},"required":["path","content"]}

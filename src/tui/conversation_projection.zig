@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai_protocol = @import("../ai/protocol.zig");
-const agent_root = @import("../agent/root.zig");
+const agent_root = @import("../agent2/root.zig");
 const agent_protocol = agent_root.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const transcript_mod = @import("transcript.zig");
@@ -15,7 +15,7 @@ const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const editor_mod = @import("components/editor.zig");
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
-const run_control_mod = @import("../runtime/run_control.zig");
+const run_control_mod = @import("../agent2/control.zig");
 const json_util = @import("../ai/json_util.zig");
 
 const Transcript = transcript_mod.Transcript;
@@ -1477,4 +1477,3 @@ test "reconcileFromSnapshot reorders rows and preserves scroll offset when not f
 
     try testing.expectEqual(scroll_before, transcript.scrollOffset());
 }
-

@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai_protocol = @import("../ai/protocol.zig");
-const agent_protocol = @import("../agent/protocol.zig");
+const agent_protocol = @import("../agent2/protocol.zig");
 const session_protocol = @import("../session/protocol.zig");
 
 pub const TextModeResult = union(enum) {

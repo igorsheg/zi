@@ -101,7 +101,7 @@ zi runs two long-lived threads — **TUI** and **agent** — plus short-lived he
    apply to widgets, repaint              ext runner — all via msg_allocator)
 ```
 
-`AgentRequest` variants live in `src/agent/request.zig`. Current set: `prompt`, `resume_session`, `new_session`, `set_model`, `set_thinking_level`, `refresh_status_snapshot`. Mailbox close is the terminal shutdown signal for the long-lived agent owner loop. Add new variants there when the TUI needs the agent to DO something.
+`AgentRequest` variants live in `src/agent2/request.zig`. Current set: `prompt`, `resume_session`, `new_session`, `set_model`, `set_thinking_level`, `refresh_status_snapshot`. Mailbox close is the terminal shutdown signal for the long-lived agent owner loop. Add new variants there when the TUI needs the agent to DO something.
 
 ### Snapshot vs request (rule of thumb)
 
@@ -123,7 +123,7 @@ Suspicious patterns:
 
 ### Adding a new cross-thread action
 
-1. Add a variant to `AgentRequest` in `src/agent/request.zig`; extend `deinit` to free any payload slices.
+1. Add a variant to `AgentRequest` in `src/agent2/request.zig`; extend `deinit` to free any payload slices.
 2. On the TUI side, `dupe` payload slices into `self.msg_allocator`, then `self.request_queue.push(.{ .your_variant = ... })`.
 3. On the agent side, add a `handle*` method in `interactive.zig` that runs on the agent thread. Mutate agent-owned state directly. Publish results via `self.event_queue.push(.{ .your_event = ... })` with `msg_allocator`-cloned fields.
 4. On the TUI side, handle the resulting `UiEvent` in the event drain and update widgets.

@@ -1,7 +1,7 @@
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const json_util = @import("../ai/json_util.zig");
-const agent_protocol = @import("../agent/protocol.zig");
+const agent_protocol = @import("../agent2/protocol.zig");
 const session_mod = @import("../session/root.zig");
 
 const c = lua_runtime.c;
