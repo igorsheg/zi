@@ -104,6 +104,7 @@ pub fn toAgentTool(def: ToolDefinition) protocol.AgentTool {
             .label = def.label,
             .parameters = def.parameters,
             .ctx = impl.ctx,
+            .affinity = .worker_thread,
             .prepare_arguments = impl.prepare_arguments,
             .execute = impl.execute,
         },

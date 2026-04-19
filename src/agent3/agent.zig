@@ -11,12 +11,13 @@ const testing = std.testing;
 pub const QueueMode = control_mod.QueueMode;
 
 const Listener = struct {
+    id: u64,
     func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
     ctx: ?*anyopaque,
 };
 
 pub const SubscriptionToken = struct {
-    index: usize,
+    id: u64,
 };
 
 pub const QueueMutationAction = enum {
@@ -36,6 +37,7 @@ pub const Agent = struct {
     runtime_arena: std.heap.ArenaAllocator,
 
     listeners: std.ArrayList(Listener),
+    next_listener_id: u64,
     committed: std.ArrayList(protocol.AgentMessage),
     in_flight: conversation_state.InFlightState,
 
@@ -52,12 +54,17 @@ pub const Agent = struct {
     stream_fn: protocol.StreamHook,
     before_tool_call: ?protocol.BeforeToolCallHook,
     after_tool_call: ?protocol.AfterToolCallHook,
+    on_payload: ?protocol.OnPayloadHook,
     get_api_key: ?protocol.GetApiKeyHook,
 
     session_id: ?[]const u8,
     thinking_budgets: ?ai.protocol.ThinkingBudgets,
     transport: ?ai.protocol.Transport,
     max_retry_delay_ms: ?u64,
+    tool_execution: protocol.ToolExecutionMode,
+    default_stream_bundle: ?*ai.provider_defaults.Bundle,
+    default_stream_closure: ?*DefaultStreamClosure,
+    state_pending_tool_calls: std.ArrayList([]const u8),
 
     is_running: std.atomic.Value(bool),
     is_streaming: bool = false,
@@ -75,12 +82,14 @@ pub const Agent = struct {
         stream_fn: ?protocol.StreamHook = null,
         before_tool_call: ?protocol.BeforeToolCallHook = null,
         after_tool_call: ?protocol.AfterToolCallHook = null,
+        on_payload: ?protocol.OnPayloadHook = null,
         steering_mode: QueueMode = .one_at_a_time,
         follow_up_mode: QueueMode = .one_at_a_time,
         session_id: ?[]const u8 = null,
         thinking_budgets: ?ai.protocol.ThinkingBudgets = null,
         transport: ?ai.protocol.Transport = null,
         max_retry_delay_ms: ?u64 = null,
+        tool_execution: protocol.ToolExecutionMode = .parallel,
         get_api_key: ?protocol.GetApiKeyHook = null,
     };
 
@@ -112,11 +121,33 @@ pub const Agent = struct {
             null;
         errdefer if (owned_session_id) |session_id| allocator.free(session_id);
 
+        var default_stream_bundle: ?*ai.provider_defaults.Bundle = null;
+        errdefer if (default_stream_bundle) |bundle| bundle.deinit();
+        var default_stream_closure: ?*DefaultStreamClosure = null;
+        errdefer if (default_stream_closure) |closure| allocator.destroy(closure);
+
+        const stream_fn = if (options.stream_fn) |stream_fn|
+            stream_fn
+        else blk: {
+            const bundle = try ai.provider_defaults.Bundle.init(allocator);
+            default_stream_bundle = bundle;
+
+            const closure = try allocator.create(DefaultStreamClosure);
+            closure.* = .{ .registry = bundle.registry };
+            default_stream_closure = closure;
+
+            break :blk protocol.StreamHook{
+                .func = &DefaultStreamClosure.streamFn,
+                .ctx = @ptrCast(closure),
+            };
+        };
+
         return .{
             .allocator = allocator,
             .history_arena = history_arena,
             .runtime_arena = runtime_arena,
             .listeners = .empty,
+            .next_listener_id = 1,
             .committed = committed,
             .in_flight = conversation_state.InFlightState.init(allocator),
             .run_control = run_control,
@@ -126,14 +157,19 @@ pub const Agent = struct {
             .thinking_level = options.thinking_level,
             .convert_to_llm = options.convert_to_llm orelse defaultConvertToLlmHook(),
             .transform_context = options.transform_context,
-            .stream_fn = options.stream_fn orelse unreachable_stream_hook,
+            .stream_fn = stream_fn,
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
+            .on_payload = options.on_payload,
             .get_api_key = options.get_api_key,
             .session_id = owned_session_id,
             .thinking_budgets = options.thinking_budgets,
             .transport = options.transport,
             .max_retry_delay_ms = options.max_retry_delay_ms,
+            .tool_execution = options.tool_execution,
+            .default_stream_bundle = default_stream_bundle,
+            .default_stream_closure = default_stream_closure,
+            .state_pending_tool_calls = .empty,
             .is_running = std.atomic.Value(bool).init(false),
             .abort_controller = .{},
         };
@@ -141,11 +177,14 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         self.listeners.deinit(self.allocator);
+        self.state_pending_tool_calls.deinit(self.allocator);
         self.in_flight.deinit();
         self.run_control.deinit();
         self.runtime_arena.deinit();
         self.history_arena.deinit();
         if (self.session_id) |session_id| self.allocator.free(session_id);
+        if (self.default_stream_closure) |closure| self.allocator.destroy(closure);
+        if (self.default_stream_bundle) |bundle| bundle.deinit();
         self.* = undefined;
     }
 
@@ -154,14 +193,19 @@ pub const Agent = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque,
     ) SubscriptionToken {
-        const index = self.listeners.items.len;
-        self.listeners.append(self.allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
-        return .{ .index = index };
+        const id = self.next_listener_id;
+        self.next_listener_id +%= 1;
+        self.listeners.append(self.allocator, .{ .id = id, .func = func, .ctx = ctx }) catch return .{ .id = 0 };
+        return .{ .id = id };
     }
 
     pub fn unsubscribe(self: *Agent, token: SubscriptionToken) void {
-        if (token.index < self.listeners.items.len) {
-            _ = self.listeners.orderedRemove(token.index);
+        if (token.id == 0) return;
+        for (self.listeners.items, 0..) |listener, index| {
+            if (listener.id == token.id) {
+                _ = self.listeners.orderedRemove(index);
+                return;
+            }
         }
     }
 
@@ -270,6 +314,23 @@ pub const Agent = struct {
         self.error_message = null;
     }
 
+    pub fn state(self: *Agent) protocol.AgentState {
+        return .{
+            .system_prompt = self.system_prompt,
+            .model = self.model,
+            .thinking_level = self.thinking_level,
+            .tools = self.tools,
+            .messages = self.committed.items,
+            .is_streaming = self.is_streaming,
+            .streaming_message = if (self.in_flight.assistant_streaming and self.in_flight.assistant != null)
+                .{ .assistant = self.in_flight.assistant.? }
+            else
+                null,
+            .pending_tool_calls = self.rebuildPendingToolCalls(),
+            .error_message = self.error_message,
+        };
+    }
+
     pub fn setSessionId(self: *Agent, session_id: ?[]const u8) !void {
         const owned = if (session_id) |value| try self.allocator.dupe(u8, value) else null;
         if (self.session_id) |old| self.allocator.free(old);
@@ -353,6 +414,16 @@ pub const Agent = struct {
         }
 
         self.runWithLifecycle(null, true, false);
+    }
+
+    fn rebuildPendingToolCalls(self: *Agent) []const []const u8 {
+        self.state_pending_tool_calls.clearRetainingCapacity();
+        for (self.in_flight.tool_executions.items) |*tool| {
+            if (!tool.execution_started) continue;
+            if (tool.result != null and !tool.is_partial) continue;
+            self.state_pending_tool_calls.append(self.allocator, tool.tool_call_id) catch break;
+        }
+        return self.state_pending_tool_calls.items;
     }
 
     fn resetHistoryArena(self: *Agent) void {
@@ -444,9 +515,10 @@ pub const Agent = struct {
                 .ctx = @ptrCast(self),
             },
             .skip_initial_steering_poll = skip_initial_steering_poll,
-            .tool_execution = .sequential,
+            .tool_execution = self.tool_execution,
             .before_tool_call = self.before_tool_call,
             .after_tool_call = self.after_tool_call,
+            .on_payload = self.on_payload,
             .session_id = self.session_id,
             .max_retry_delay_ms = self.max_retry_delay_ms,
             .thinking_budgets = self.thinking_budgets,
@@ -564,21 +636,62 @@ pub fn defaultConvertToLlmHook() protocol.ConvertToLlmHook {
     return .{ .func = &defaultConvertToLlm, .ctx = null };
 }
 
-const unreachable_stream_hook: protocol.StreamHook = .{
-    .func = &unreachableStreamFn,
-    .ctx = null,
+const DefaultStreamClosure = struct {
+    registry: *ai.provider.Registry,
+
+    fn streamFn(
+        ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        model: protocol.Model,
+        context: ai.protocol.Context,
+        options: ai.protocol.SimpleStreamOptions,
+        callback: ai.provider.EventCallback,
+        callback_ctx: ?*anyopaque,
+    ) void {
+        const self: *const DefaultStreamClosure = @ptrCast(@alignCast(ctx.?));
+        const api_str = ai.provider.apiToString(model.api);
+        const prov = self.registry.get(api_str) orelse {
+            emitMissingProviderError(allocator, model, api_str, callback, callback_ctx);
+            return;
+        };
+        prov.streamSimple(allocator, model, context, options, callback, callback_ctx);
+    }
 };
 
-fn unreachableStreamFn(
-    _: ?*anyopaque,
-    _: std.mem.Allocator,
-    _: protocol.Model,
-    _: ai.protocol.Context,
-    _: ai.protocol.SimpleStreamOptions,
-    _: ai.provider.EventCallback,
-    _: ?*anyopaque,
+fn emitMissingProviderError(
+    allocator: std.mem.Allocator,
+    model: protocol.Model,
+    api_str: []const u8,
+    callback: ai.provider.EventCallback,
+    callback_ctx: ?*anyopaque,
 ) void {
-    @panic("Agent: no stream function configured");
+    const err_message = std.fmt.allocPrint(allocator, "No provider registered for API {s}", .{api_str}) catch "No provider registered for requested API";
+    callback(.{ .@"error" = .{
+        .reason = .@"error",
+        .@"error" = .{
+            .content = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total_tokens = 0,
+                .cost = .{
+                    .input = 0,
+                    .output = 0,
+                    .cache_read = 0,
+                    .cache_write = 0,
+                    .total = 0,
+                },
+            },
+            .stop_reason = .@"error",
+            .error_message = err_message,
+            .timestamp = std.time.milliTimestamp(),
+        },
+    } }, callback_ctx);
 }
 
 fn makeAssistantMessage() protocol.AssistantMessage {
@@ -727,4 +840,187 @@ test "truncateCommitted drops tail without rebuilding history" {
 
     try testing.expectEqual(@as(usize, 1), agent.messages().len);
     try testing.expect(agent.messages()[0] == .user);
+}
+
+test "unsubscribe tokens stay valid after earlier listeners are removed" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "unknown",
+            .name = "unknown",
+            .api = .{ .custom = "unknown" },
+            .provider = .{ .custom = "unknown" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    const Counter = struct {
+        fn onEvent(_: protocol.AgentEvent, raw_ctx: ?*anyopaque) void {
+            const count: *u32 = @ptrCast(@alignCast(raw_ctx.?));
+            count.* += 1;
+        }
+    };
+
+    var first_count: u32 = 0;
+    var second_count: u32 = 0;
+    const first = agent.subscribe(Counter.onEvent, @ptrCast(&first_count));
+    const second = agent.subscribe(Counter.onEvent, @ptrCast(&second_count));
+
+    agent.unsubscribe(first);
+    agent.processEvent(.agent_start);
+    try testing.expectEqual(@as(u32, 0), first_count);
+    try testing.expectEqual(@as(u32, 1), second_count);
+
+    agent.unsubscribe(second);
+    agent.processEvent(.agent_start);
+    try testing.expectEqual(@as(u32, 0), first_count);
+    try testing.expectEqual(@as(u32, 1), second_count);
+}
+
+test "state exposes streaming assistant only during assistant streaming" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "unknown",
+            .name = "unknown",
+            .api = .{ .custom = "unknown" },
+            .provider = .{ .custom = "unknown" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    const assistant = makeAssistantMessage();
+    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    var state = agent.state();
+    try testing.expect(state.streaming_message != null);
+    try testing.expect(state.streaming_message.? == .assistant);
+
+    agent.processEvent(.{ .message_update = .{
+        .message = .{ .assistant = assistant },
+        .assistant_message_event = .{ .text_start = .{
+            .content_index = 0,
+            .partial = assistant,
+        } },
+    } });
+    state = agent.state();
+    try testing.expect(state.streaming_message != null);
+    try testing.expect(state.streaming_message.? == .assistant);
+
+    agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    state = agent.state();
+    try testing.expect(state.streaming_message == null);
+}
+
+test "state pending tool calls follow pi-mono execution lifecycle" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "unknown",
+            .name = "unknown",
+            .api = .{ .custom = "unknown" },
+            .provider = .{ .custom = "unknown" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    const assistant = makeAssistantMessage();
+    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    agent.processEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+    } });
+
+    var state = agent.state();
+    try testing.expectEqual(@as(usize, 1), state.pending_tool_calls.len);
+    try testing.expectEqualStrings("tool-1", state.pending_tool_calls[0]);
+
+    agent.processEvent(.{ .tool_execution_update = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+        .partial_result = .{ .content = &.{}, .is_error = false },
+    } });
+    state = agent.state();
+    try testing.expectEqual(@as(usize, 1), state.pending_tool_calls.len);
+    try testing.expectEqualStrings("tool-1", state.pending_tool_calls[0]);
+
+    agent.processEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .result = .{ .content = &.{}, .is_error = false },
+        .is_error = false,
+    } });
+    state = agent.state();
+    try testing.expectEqual(@as(usize, 0), state.pending_tool_calls.len);
+}
+
+test "default stream fallback emits assistant error lifecycle without panic" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "missing-model",
+            .name = "missing-model",
+            .api = .{ .custom = "missing-api" },
+            .provider = .{ .custom = "missing-provider" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    const Collector = struct {
+        saw_assistant_start: bool = false,
+        saw_assistant_end: bool = false,
+        saw_agent_end: bool = false,
+
+        fn onEvent(event: protocol.AgentEvent, raw_ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            switch (event) {
+                .message_start => |payload| {
+                    if (payload.message == .assistant) self.saw_assistant_start = true;
+                },
+                .message_end => |payload| {
+                    if (payload.message == .assistant) self.saw_assistant_end = true;
+                },
+                .agent_end => self.saw_agent_end = true,
+                else => {},
+            }
+        }
+    };
+
+    var collector = Collector{};
+    _ = agent.subscribe(Collector.onEvent, @ptrCast(&collector));
+
+    const prompt = [_]protocol.AgentMessage{
+        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } },
+    };
+    try agent.prompt(&prompt);
+
+    const state = agent.state();
+    try testing.expect(collector.saw_assistant_start);
+    try testing.expect(collector.saw_assistant_end);
+    try testing.expect(collector.saw_agent_end);
+    try testing.expectEqual(@as(usize, 2), state.messages.len);
+    try testing.expect(state.messages[1] == .assistant);
+    try testing.expectEqual(ai.protocol.StopReason.@"error", state.messages[1].assistant.stop_reason);
+    try testing.expect(state.error_message != null);
 }

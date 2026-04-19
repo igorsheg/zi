@@ -5,4 +5,5 @@ pub const Agent = @import("agent.zig").Agent;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("loop.zig");
 }

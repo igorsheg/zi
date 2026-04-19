@@ -106,6 +106,12 @@ pub const ToolExecutionMode = enum {
     parallel,
 };
 
+/// Which thread may execute a tool implementation.
+pub const ToolExecutionAffinity = enum {
+    agent_thread,
+    worker_thread,
+};
+
 /// Alias for ToolCall when used in agent context.
 /// pi-mono source: packages/agent/src/types.ts:38
 pub const AgentToolCall = ToolCall;
@@ -233,6 +239,7 @@ pub const AgentTool = struct {
     parameters: std.json.Value,
     /// Opaque context pointer for tool state (cwd, config, etc).
     ctx: ?*anyopaque = null,
+    affinity: ToolExecutionAffinity = .agent_thread,
     /// Optional compatibility shim for raw tool-call arguments before hooks and execution.
     /// Returned JSON must either alias `args` or be allocated from the supplied allocator.
     prepare_arguments: ?*const fn (allocator: std.mem.Allocator, args: std.json.Value) anyerror!std.json.Value = null,
@@ -348,13 +355,9 @@ pub const AfterToolCallHook = struct {
 
 /// Hook: transforms the raw provider request payload before HTTP send.
 ///
-/// Reserves the seam for v2's `before_provider_request` event. pi-mono
-/// intercepts the JSON payload inside the provider stream wrapper, not in
-/// the agent loop itself — the zig call site will follow suit when the
-/// provider layer grows a pre-send hook. v1 keeps the type and the
-/// AgentLoopConfig slot so extensions (and tests) can register handlers
-/// against a stable shape; until the provider-layer wiring lands, the
-/// field is unused at runtime.
+/// Mirrors pi-mono's `onPayload` seam. The hook runs at the provider
+/// request boundary, after the agent loop has built stream options but
+/// before the HTTP payload is sent.
 ///
 /// See `docs/extensions.md`.
 pub const OnPayloadHook = struct {

@@ -114,6 +114,7 @@ pub const ToolExecution = struct {
 pub const InFlightState = struct {
     allocator: std.mem.Allocator,
     assistant: ?protocol.AssistantMessage = null,
+    assistant_streaming: bool = false,
     tool_executions: std.ArrayList(ToolExecution) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) InFlightState {
@@ -132,12 +133,16 @@ pub const InFlightState = struct {
     pub fn applyEvent(self: *InFlightState, event: protocol.AgentEvent) ApplyEventResult {
         switch (event) {
             .message_start => |payload| switch (payload.message) {
-                .assistant => |assistant| self.replaceAssistant(assistant),
+                .assistant => |assistant| {
+                    self.replaceAssistant(assistant);
+                    self.assistant_streaming = true;
+                },
                 else => {},
             },
             .message_update => |payload| switch (payload.message) {
                 .assistant => |assistant| {
                     self.replaceAssistant(assistant);
+                    self.assistant_streaming = true;
                     switch (payload.assistant_message_event) {
                         .toolcall_delta => |tc| {
                             if (tc.content_index < tc.partial.content.len and tc.partial.content[tc.content_index] == .tool_call) {
@@ -153,6 +158,7 @@ pub const InFlightState = struct {
             .message_end => |payload| switch (payload.message) {
                 .assistant => |assistant| {
                     self.replaceAssistant(assistant);
+                    self.assistant_streaming = false;
                     if (assistant.stop_reason != .aborted and assistant.stop_reason != .@"error") {
                         for (assistant.content) |block| switch (block) {
                             .tool_call => |tool_call| self.syncToolCall(tool_call, true, null),
@@ -200,7 +206,8 @@ pub const InFlightState = struct {
                 },
                 else => {},
             },
-            .agent_start, .agent_end, .turn_start => {},
+            .agent_start, .turn_start => {},
+            .agent_end => self.assistant_streaming = false,
         }
 
         return .{};
@@ -209,6 +216,7 @@ pub const InFlightState = struct {
     pub fn clear(self: *InFlightState) void {
         if (self.assistant) |*assistant| message_memory.freeAssistantMessage(self.allocator, assistant);
         self.assistant = null;
+        self.assistant_streaming = false;
         for (self.tool_executions.items) |*tool| tool.deinit(self.allocator);
         self.tool_executions.clearRetainingCapacity();
     }
