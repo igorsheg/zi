@@ -5,22 +5,17 @@ const agent_impl = @import("../agent3/agent.zig");
 const control_mod = @import("../agent3/control.zig");
 const session_runtime = @import("session/root.zig");
 const session_core = @import("../session/root.zig");
-const builtin_tools_mod = @import("tools/builtins.zig");
 const tool_def = @import("tools/definition.zig");
 const builtin_util = @import("tools/util.zig");
-const system_prompt_mod = @import("system_prompt.zig");
 const resources = @import("resources/root.zig");
-const skills = @import("skills/root.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const settings_manager_mod = @import("settings/manager.zig");
 const settings_types_mod = @import("settings/types.zig");
 const model_registry_mod = @import("model_registry.zig");
-const storage = @import("../storage.zig");
-const extension_api = @import("extensions/api.zig");
+const session_bootstrap = @import("session_bootstrap.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
-const lua_tool_mod = @import("extensions/lua_tool.zig");
 const session_event_mod = @import("session_event.zig");
 
 const protocol = agent_mod.protocol;
@@ -138,17 +133,8 @@ pub const AgentSession = struct {
         context_window: u64,
     };
 
-    pub const PreparedDeps = struct {
-        session_store: SessionStore,
-        resource_loader: resources.ResourceLoader,
-        stream_closure: *StreamClosure,
-        system_prompt: []const u8,
-        tools: []const protocol.AgentTool,
-        owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
-        builtin_ctx: ?*builtin_util.BuiltinCtx = null,
-        extension_runner: ?*ExtensionRunner = null,
-        extension_lua_state: ?*lua_runtime.LuaState = null,
-    };
+    pub const PreparedDeps = session_bootstrap.PreparedDeps;
+    pub const StreamClosure = session_bootstrap.StreamClosure;
 
     pub const Options = struct {
         model: ai.protocol.Model,
@@ -217,12 +203,12 @@ pub const AgentSession = struct {
         };
     }
 
-    /// Test-only raw bootstrap path.
+    /// Test-only convenience wrapper around the shared bootstrap path.
     ///
-    /// Keep this in sync with `sdk.prepareSessionDeps`. Production
-    /// construction must flow through sdk; this helper exists so the
-    /// in-file tests can build sessions without importing sdk and
-    /// creating an import cycle back into AgentSession.
+    /// Production construction flows through `sdk.createAgentSession`.
+    /// In-file tests call the same bootstrap assembler via
+    /// `session_bootstrap.prepareSessionDeps`, then hand the prepared
+    /// deps to `AgentSession.init`.
     const TestInitOptions = struct {
         model: ai.protocol.Model,
         api_key: []const u8 = "",
@@ -243,7 +229,19 @@ pub const AgentSession = struct {
     };
 
     pub fn initTestSession(allocator: std.mem.Allocator, options: TestInitOptions) AgentSession {
-        const prepared = prepareTestDeps(allocator, options);
+        const prepared = session_bootstrap.prepareSessionDeps(allocator, .{
+            .api_key = options.api_key,
+            .cwd = options.cwd,
+            .resource_loader = options.resource_loader,
+            .max_tokens = options.max_tokens,
+            .tools = options.tools,
+            .registry = options.registry,
+            .auth_storage = options.auth_storage,
+            .settings_manager = options.settings_manager,
+            .session_store = options.session_store,
+            .no_session = options.no_session,
+            .tool_allowlist = options.tool_allowlist,
+        }) catch @panic("OOM");
         return AgentSession.init(allocator, .{
             .model = options.model,
             .prepared = prepared,
@@ -254,283 +252,6 @@ pub const AgentSession = struct {
             .initial_messages = options.initial_messages,
             .thinking_level = options.thinking_level,
         });
-    }
-
-    fn prepareTestDeps(allocator: std.mem.Allocator, options: TestInitOptions) PreparedDeps {
-        var store = options.session_store orelse if (options.no_session)
-            SessionStore.createEphemeral(allocator)
-        else
-            SessionStore.createForCwd(allocator, options.cwd) catch @panic("OOM");
-
-        const image_auto_resize = if (options.settings_manager) |settings|
-            settings.getImageAutoResize()
-        else
-            true;
-        var builtin_ctx: ?*builtin_util.BuiltinCtx = null;
-        const builtin_definitions = options.tools orelse blk: {
-            var bundle = builtin_tools_mod.build(allocator, options.cwd, .{
-                .image_auto_resize = image_auto_resize,
-            }) catch break :blk @as([]const tool_def.ToolDefinition, &.{});
-            bundle.ctx.session_id = store.sessionId();
-            builtin_ctx = bundle.ctx;
-            break :blk @as([]const tool_def.ToolDefinition, bundle.definitions);
-        };
-
-        var owned_bundle: ?*ai.provider_defaults.Bundle = null;
-        const registry: *ai.provider.Registry = options.registry orelse blk: {
-            const bundle = ai.provider_defaults.Bundle.init(allocator) catch @panic("OOM");
-            owned_bundle = bundle;
-            break :blk bundle.registry;
-        };
-
-        const closure = allocator.create(StreamClosure) catch @panic("OOM");
-        closure.* = .{
-            .registry = registry,
-            .auth_storage = options.auth_storage,
-            .api_key = options.api_key,
-            .max_tokens = options.max_tokens,
-        };
-
-        var resource_loader = options.resource_loader;
-        const prompt_inputs = resource_loader.getPromptInputs();
-        const loaded_extensions = resource_loader.getExtensions();
-
-        var ext_state: ?*lua_runtime.LuaState = null;
-        var ext_runner: ?*ExtensionRunner = null;
-        ext_setup: {
-            const state_ptr = allocator.create(lua_runtime.LuaState) catch break :ext_setup;
-            state_ptr.* = lua_runtime.LuaState.init(allocator) catch {
-                allocator.destroy(state_ptr);
-                break :ext_setup;
-            };
-            const runner_ptr = allocator.create(ExtensionRunner) catch {
-                state_ptr.deinit();
-                allocator.destroy(state_ptr);
-                break :ext_setup;
-            };
-            runner_ptr.* = ExtensionRunner.init(allocator, 0);
-            runner_ptr.cwd = options.cwd;
-            runner_ptr.attachLuaState(state_ptr);
-            extension_api.installZiTable(state_ptr, runner_ptr);
-            ext_state = state_ptr;
-            ext_runner = runner_ptr;
-
-            const agent_dir = storage.getAgentDir(allocator, null) catch null;
-            defer if (agent_dir) |dir| allocator.free(dir);
-            const project_dir = storage.getProjectDir(allocator, options.cwd) catch null;
-            defer if (project_dir) |dir| allocator.free(dir);
-            const agent_ext = if (agent_dir) |dir| std.fs.path.join(allocator, &.{ dir, "extensions" }) catch null else null;
-            defer if (agent_ext) |dir| allocator.free(dir);
-            const project_ext = if (project_dir) |dir| std.fs.path.join(allocator, &.{ dir, "extensions" }) catch null else null;
-            defer if (project_ext) |dir| allocator.free(dir);
-            var dirs_buf: [2][]const u8 = .{ "", "" };
-            var dirs_n: usize = 0;
-            if (project_ext) |dir| {
-                dirs_buf[dirs_n] = dir;
-                dirs_n += 1;
-            }
-            if (agent_ext) |dir| {
-                dirs_buf[dirs_n] = dir;
-                dirs_n += 1;
-            }
-            state_ptr.setPackagePath(dirs_buf[0..dirs_n]) catch {};
-
-            runner_ptr.bindLuaOwnerThread(std.Thread.getCurrentId());
-            if (loaded_extensions.extensions.len > 0) {
-                const stats = resource_loader.loadExtensionsInto(state_ptr, runner_ptr);
-                std.log.scoped(.extensions).info(
-                    "extensions: {d} loaded, {d} failed of {d} discovered",
-                    .{ stats.loaded, stats.failed, stats.attempted },
-                );
-            }
-
-            registerBaseToolDefinitions(runner_ptr, builtin_definitions);
-        }
-
-        const definitions: []const tool_def.ToolDefinition = if (ext_runner) |runner|
-            runner.tool_registry.items()
-        else
-            builtin_definitions;
-
-        const filtered_definitions: []const tool_def.ToolDefinition = if (options.tool_allowlist) |allow| blk_f: {
-            const filtered = allocator.alloc(tool_def.ToolDefinition, definitions.len) catch break :blk_f definitions;
-            var fi: usize = 0;
-            for (definitions) |definition| {
-                for (allow) |want| {
-                    const trimmed = std.mem.trim(u8, want, &std.ascii.whitespace);
-                    if (trimmed.len == 0) continue;
-                    if (std.ascii.eqlIgnoreCase(trimmed, definition.name) or std.ascii.eqlIgnoreCase(trimmed, definition.label)) {
-                        filtered[fi] = definition;
-                        fi += 1;
-                        break;
-                    }
-                }
-            }
-            break :blk_f filtered[0..fi];
-        } else definitions;
-
-        const filtered_tools: []const protocol.AgentTool = blk: {
-            const out = allocator.alloc(protocol.AgentTool, filtered_definitions.len) catch break :blk &.{};
-            var n: usize = 0;
-            for (filtered_definitions) |definition| {
-                const tool = switch (definition.impl) {
-                    .builtin => tool_def.toAgentTool(definition),
-                    .lua => if (ext_runner) |runner|
-                        lua_tool_mod.buildAgentTool(allocator, runner, definition) catch |err| {
-                            std.log.scoped(.extensions).warn(
-                                "failed to build agent tool for {s}: {s}",
-                                .{ definition.name, @errorName(err) },
-                            );
-                            continue;
-                        }
-                    else
-                        continue,
-                };
-                out[n] = tool;
-                n += 1;
-            }
-            break :blk out[0..n];
-        };
-
-        const tool_name_slice = toolNameSlice(allocator, filtered_definitions) catch &.{};
-        const tool_snippets = collectToolSnippets(allocator, filtered_definitions) catch &.{};
-        const prompt_guidelines = collectGuidelines(allocator, filtered_definitions) catch &.{};
-        const skills_section: ?[]const u8 = if (hasToolNamed(filtered_definitions, "read"))
-            skills.format.formatSkillsForPrompt(allocator, resource_loader.getSkills().skills) catch null
-        else
-            null;
-        defer if (skills_section) |section| allocator.free(section);
-
-        const system_prompt = blk: {
-            if (prompt_inputs.system_prompt) |custom| {
-                break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
-                    .custom_prompt = custom,
-                    .cwd = options.cwd,
-                    .context_files = prompt_inputs.agents_files,
-                    .tool_names = tool_name_slice,
-                    .tool_snippets = tool_snippets,
-                    .guidelines = prompt_guidelines,
-                    .skills_section = skills_section,
-                    .append_system_prompt = prompt_inputs.append_system_prompt,
-                }) catch custom;
-            }
-            break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
-                .cwd = options.cwd,
-                .tool_names = tool_name_slice,
-                .tool_snippets = tool_snippets,
-                .guidelines = prompt_guidelines,
-                .skills_section = skills_section,
-                .context_files = prompt_inputs.agents_files,
-                .append_system_prompt = prompt_inputs.append_system_prompt,
-            }) catch "You are a helpful coding assistant.";
-        };
-
-        return .{
-            .session_store = store,
-            .resource_loader = resource_loader,
-            .stream_closure = closure,
-            .system_prompt = system_prompt,
-            .tools = filtered_tools,
-            .owned_provider_bundle = owned_bundle,
-            .builtin_ctx = builtin_ctx,
-            .extension_runner = ext_runner,
-            .extension_lua_state = ext_state,
-        };
-    }
-
-    fn registerBaseToolDefinitions(
-        runner: *ExtensionRunner,
-        defs: []const tool_def.ToolDefinition,
-    ) void {
-        for (defs) |def| {
-            registerBaseToolDefinition(runner, def);
-        }
-    }
-
-    fn registerBaseToolDefinition(runner: *ExtensionRunner, def: tool_def.ToolDefinition) void {
-        var cloned = tool_def.cloneOwned(runner.allocator, def) catch |err| {
-            std.log.scoped(.extensions).warn(
-                "failed to clone base tool '{s}' for registry: {s}",
-                .{ def.name, @errorName(err) },
-            );
-            return;
-        };
-
-        const accepted = runner.tool_registry.register(cloned) catch |err| {
-            std.log.scoped(.extensions).warn(
-                "failed to register base tool '{s}': {s}",
-                .{ def.name, @errorName(err) },
-            );
-            tool_def.freeOwned(runner.allocator, &cloned);
-            return;
-        };
-        if (!accepted) {
-            const winner = runner.tool_registry.get(def.name) orelse unreachable;
-            std.log.scoped(.extensions).info(
-                "base tool '{s}' from {s} ignored; already registered by {s}:{s}",
-                .{ def.name, def.source.kind, winner.source.kind, winner.source.id },
-            );
-            tool_def.freeOwned(runner.allocator, &cloned);
-        }
-    }
-
-    fn toolNameSlice(
-        allocator: std.mem.Allocator,
-        defs: []const tool_def.ToolDefinition,
-    ) ![]const []const u8 {
-        const names = try allocator.alloc([]const u8, defs.len);
-        for (defs, 0..) |def, i| names[i] = def.name;
-        return names;
-    }
-
-    fn collectToolSnippets(
-        allocator: std.mem.Allocator,
-        defs: []const tool_def.ToolDefinition,
-    ) ![]const system_prompt_mod.ToolSnippet {
-        var count: usize = 0;
-        for (defs) |def| {
-            if (def.prompt_snippet != null) count += 1;
-        }
-        const snippets = try allocator.alloc(system_prompt_mod.ToolSnippet, count);
-        var i: usize = 0;
-        for (defs) |def| {
-            const snippet = def.prompt_snippet orelse continue;
-            snippets[i] = .{ .name = def.name, .snippet = snippet };
-            i += 1;
-        }
-        return snippets;
-    }
-
-    fn hasToolNamed(defs: []const tool_def.ToolDefinition, wanted: []const u8) bool {
-        for (defs) |def| {
-            if (std.mem.eql(u8, def.name, wanted)) return true;
-        }
-        return false;
-    }
-
-    fn collectGuidelines(
-        allocator: std.mem.Allocator,
-        defs: []const tool_def.ToolDefinition,
-    ) ![]const []const u8 {
-        var total: usize = 0;
-        for (defs) |def| total += def.prompt_guidelines.len;
-        const guidelines = try allocator.alloc([]const u8, total);
-        var i: usize = 0;
-        for (defs) |def| {
-            for (def.prompt_guidelines) |guideline| {
-                var dup = false;
-                for (guidelines[0..i]) |existing| {
-                    if (std.mem.eql(u8, existing, guideline)) {
-                        dup = true;
-                        break;
-                    }
-                }
-                if (dup) continue;
-                guidelines[i] = guideline;
-                i += 1;
-            }
-        }
-        return guidelines[0..i];
     }
 
     /// Tear down the extension runner + lua_State on whichever thread
@@ -1065,52 +786,6 @@ pub const AgentSession = struct {
         const auth: *auth_storage_mod.AuthStorage = @ptrCast(@alignCast(ctx.?));
         return auth.getApiKey(provider_str);
     }
-
-    /// Captured at session construction. The api key is resolved
-    /// LIVE on every stream — the closure prefers `auth_storage`
-    /// (so post-`/login` token refresh is picked up without
-    /// rebuilding the session) and falls back to the static
-    /// `api_key` snapshot only when no auth storage is attached
-    /// (the test path). See beads zi-yjc for the bug this fixes.
-    pub const StreamClosure = struct {
-        registry: *ai.provider.Registry,
-        auth_storage: ?*auth_storage_mod.AuthStorage,
-        api_key: []const u8,
-        max_tokens: ?u64,
-
-        fn streamFn(
-            ctx: ?*anyopaque,
-            stream_alloc: std.mem.Allocator,
-            model: ai.protocol.Model,
-            stream_context: ai.protocol.Context,
-            options: ai.protocol.SimpleStreamOptions,
-            callback: ai.provider.EventCallback,
-            callback_ctx: ?*anyopaque,
-        ) void {
-            const self: *const StreamClosure = @ptrCast(@alignCast(ctx.?));
-            const api_str = ai.provider.apiToString(model.api);
-            const prov = self.registry.get(api_str) orelse return;
-            var opts = options;
-            if (opts.base.api_key == null or opts.base.api_key.?.len == 0) {
-                opts.base.api_key = self.resolveApiKey(model);
-            }
-            if (self.max_tokens) |mt| opts.base.max_tokens = mt;
-            prov.streamSimple(stream_alloc, model, stream_context, opts, callback, callback_ctx);
-        }
-
-        /// Live key lookup. Auth storage wins so /login + token
-        /// refresh take effect without restart; the static snapshot
-        /// is the test fallback.
-        fn resolveApiKey(self: *const StreamClosure, model: ai.protocol.Model) []const u8 {
-            if (self.auth_storage) |as| {
-                const provider_str = ai.json_util.providerToString(model.provider);
-                if (as.getApiKey(provider_str)) |k| {
-                    if (k.len > 0) return k;
-                }
-            }
-            return self.api_key;
-        }
-    };
 
     const CompletionCollector = struct {
         allocator: std.mem.Allocator,
