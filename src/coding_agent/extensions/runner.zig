@@ -3,7 +3,7 @@ const registries = @import("registries/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../abort_signal.zig");
 const agent_protocol = @import("../../agent3/types.zig");
-const session_mod = @import("../session/root.zig");
+const session_core = @import("../../session/root.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 ///
@@ -49,7 +49,7 @@ pub const ExtensionRuntime = union(enum) {
         abort: *const fn (session: *anyopaque) void,
         has_pending_messages: *const fn (session: *anyopaque) bool,
         shutdown: ?*const fn (session: *anyopaque) void = null,
-        get_context_usage: *const fn (session: *anyopaque) ?session_mod.context_usage.ContextUsage,
+        get_context_usage: *const fn (session: *anyopaque) ?session_core.context_usage.ContextUsage,
         get_system_prompt: *const fn (session: *anyopaque) []const u8,
     };
 };
@@ -467,7 +467,7 @@ fn testHasPendingMessages(_: *anyopaque) bool {
     return false;
 }
 
-fn testGetContextUsage(_: *anyopaque) ?session_mod.context_usage.ContextUsage {
+fn testGetContextUsage(_: *anyopaque) ?session_core.context_usage.ContextUsage {
     return .{ .tokens = 64, .context_window = 1024, .percent = 6.25 };
 }
 

@@ -56,14 +56,14 @@ fn execute(reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque)
     const allocator = arena.allocator();
 
     const entries = try session.session_store.readEntries();
-    const prep = try prepareCompaction(allocator, entries, session.session_store.leafId(), policy);
+    const prep = try prepareCompaction(allocator, entries, .current, policy);
 
     const prompt_text = try buildPrompt(allocator, prep.messages_to_summarize, prep.previous_summary);
     const max_tokens = @max(@divTrunc(policy.reserve_tokens * 4, 5), 1024);
     const summary = try session.completeUserText(session.allocator, summarization_system_prompt, prompt_text, max_tokens);
 
     session.session_store.appendCompaction(summary, prep.first_kept_entry_id, prep.tokens_before);
-    const new_context = try session.session_store.buildContext(session.session_store.leafId());
+    const new_context = try session.session_store.buildCurrentContext();
     try session.agent.setMessages(new_context.messages);
     session.noteCompactionApplied();
     session.agent.clearError();
@@ -85,14 +85,14 @@ const Preparation = struct {
 fn prepareCompaction(
     allocator: std.mem.Allocator,
     entries: []const proto.SessionEntry,
-    leaf_id: ?[]const u8,
+    selection: context_mod.LeafSelection,
     policy: CompactionPolicy,
 ) !Preparation {
-    const path = try buildPath(allocator, entries, leaf_id);
+    const path = try context_mod.buildBranchEntries(allocator, entries, selection);
     if (path.len == 0) return error.NothingToCompact;
     if (path[path.len - 1].entry == .compaction) return error.AlreadyCompacted;
 
-    const current_context = try context_mod.buildSessionContext(allocator, entries, leaf_id);
+    const current_context = try context_mod.buildSessionContext(allocator, entries, selection);
     const tokens_before = context_usage.estimateContextTokens(current_context.messages).tokens;
 
     var boundary_start: usize = 0;
@@ -122,38 +122,6 @@ fn prepareCompaction(
         .previous_summary = previous_summary,
         .messages_to_summarize = messages.items,
     };
-}
-
-fn buildPath(
-    allocator: std.mem.Allocator,
-    entries: []const proto.SessionEntry,
-    leaf_id: ?[]const u8,
-) ![]const proto.SessionEntry {
-    var by_id = std.StringHashMap(usize).init(allocator);
-    defer by_id.deinit();
-    for (entries, 0..) |*entry, idx| try by_id.put(entry.id, idx);
-
-    var leaf_idx: ?usize = null;
-    if (leaf_id) |lid| leaf_idx = by_id.get(lid);
-    if (leaf_idx == null and entries.len > 0) leaf_idx = entries.len - 1;
-    const idx = leaf_idx orelse return &.{};
-
-    var rev = std.ArrayList(proto.SessionEntry).empty;
-    var current: ?usize = idx;
-    while (current) |cur| {
-        try rev.append(allocator, entries[cur]);
-        current = if (entries[cur].parent_id) |pid| by_id.get(pid) else null;
-    }
-
-    const result = try allocator.alloc(proto.SessionEntry, rev.items.len);
-    var out_i: usize = 0;
-    var src_i = rev.items.len;
-    while (src_i > 0) {
-        src_i -= 1;
-        result[out_i] = rev.items[src_i];
-        out_i += 1;
-    }
-    return result;
 }
 
 fn findEntryIndexById(entries: []const proto.SessionEntry, id: []const u8) ?usize {
@@ -360,7 +328,7 @@ test "prepareCompaction stops at user boundaries even when an assistant-heavy ta
         try testAssistantEntry(allocator, "a2", "u2", "this assistant tail is intentionally long enough to exceed the keep recent token budget by itself"),
     };
 
-    try testing.expectError(error.NothingToCompact, prepareCompaction(allocator, &entries, "a2", .{
+    try testing.expectError(error.NothingToCompact, prepareCompaction(allocator, &entries, .{ .entry_id = "a2" }, .{
         .keep_recent_tokens = 8,
     }));
 }

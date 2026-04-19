@@ -226,7 +226,7 @@ pub const RuntimeHost = struct {
         defer loaded.deinit();
 
         var create_options = self.create_options;
-        create_options.cwd = loaded.store.?.writer.cwd;
+        create_options.cwd = loaded.store.?.cwd();
         create_options.initial_messages = loaded.messages;
         create_options.thinking_level = parseThinkingLevel(loaded.thinking_level);
 

@@ -881,8 +881,8 @@ test "assistant message round-trips normalized failure metadata" {
 
     const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     defer allocator.free(json_str);
-    const parsed = try parseEntry(allocator, json_str);
-    switch (parsed.entry) {
+    const parsed = try parseFileEntry(allocator, json_str);
+    switch (parsed.entry.entry) {
         .message => |m| switch (m.message) {
             .assistant => |assistant| {
                 try std.testing.expectEqual(ai.protocol.NormalizedFailure.Kind.rate_limited, assistant.failure.?.kind);
@@ -1031,7 +1031,7 @@ test "session write-read-buildContext round-trip" {
         parsed_entries[i] = fe.entry;
     }
 
-    const ctx = try context.buildSessionContext(aa, &parsed_entries, null);
+    const ctx = try context.buildSessionContext(aa, &parsed_entries, .current);
 
     try std.testing.expectEqual(@as(usize, 3), ctx.messages.len);
 

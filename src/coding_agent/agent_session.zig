@@ -3,7 +3,8 @@ const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent3/root.zig");
 const agent_impl = @import("../agent3/agent.zig");
 const control_mod = @import("../agent3/control.zig");
-const session_mod = @import("session/root.zig");
+const session_runtime = @import("session/root.zig");
+const session_core = @import("../session/root.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
 const tool_def = @import("tools/definition.zig");
 const builtin_util = @import("tools/util.zig");
@@ -25,10 +26,10 @@ const session_event_mod = @import("session_event.zig");
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
 const SubscriptionToken = agent_impl.SubscriptionToken;
-pub const SessionStore = session_mod.store.SessionStore;
+pub const SessionStore = session_runtime.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
-pub const ContextUsage = session_mod.context_usage.ContextUsage;
+pub const ContextUsage = session_core.context_usage.ContextUsage;
 
 /// Composition root: wires Agent + SessionStore + tools + model resolution.
 ///
@@ -193,7 +194,7 @@ pub const AgentSession = struct {
         // runs `resolveSessionDir` up front (v2 hook point). Direct
         // `AgentSession.init` callers — tests, the odd standalone — get
         // the default directory here without the extension hook.
-        const store = options.session_store orelse if (options.no_session)
+        var store = options.session_store orelse if (options.no_session)
             SessionStore.createEphemeral(allocator)
         else blk: {
             const default_dir = storage.getSessionDirForCwd(allocator, options.cwd, null) catch @panic("OOM");
@@ -748,7 +749,7 @@ pub const AgentSession = struct {
             .assistant => |assistant| switch (assistant.stop_reason) {
                 .aborted, .@"error" => {},
                 else => {
-                    if (session_mod.context_usage.calculateContextTokens(assistant.usage) > 0) {
+                    if (session_core.context_usage.calculateContextTokens(assistant.usage) > 0) {
                         self.context_usage_unknown_after_compaction = false;
                     }
                 },
@@ -759,21 +760,17 @@ pub const AgentSession = struct {
 
     fn contextUsageUnknownFromStore(
         allocator: std.mem.Allocator,
-        store: *const SessionStore,
+        store: *SessionStore,
     ) bool {
-        const entries = store.cached_entries orelse return false;
+        if (store.cached_entries == null) return false;
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const branch = session_mod.context_usage.buildBranchEntries(
-            arena.allocator(),
-            entries,
-            store.leafId(),
-        ) catch return false;
-        if (session_mod.context_usage.getLatestCompactionEntry(branch) == null) return false;
+        const branch = store.buildCurrentBranchAlloc(arena.allocator()) catch return false;
+        if (session_core.context.getLatestCompactionEntry(branch) == null) return false;
         return !hasPostCompactionUsage(branch);
     }
 
-    fn hasPostCompactionUsage(branch: []const session_mod.protocol.SessionEntry) bool {
+    fn hasPostCompactionUsage(branch: []const session_core.protocol.SessionEntry) bool {
         var i: usize = branch.len;
         scan: while (i > 0) {
             i -= 1;
@@ -782,7 +779,7 @@ pub const AgentSession = struct {
                 .message => |m| switch (m.message) {
                     .assistant => |assistant| switch (assistant.stop_reason) {
                         .aborted, .@"error" => {},
-                        else => return session_mod.context_usage.calculateContextTokens(assistant.usage) > 0,
+                        else => return session_core.context_usage.calculateContextTokens(assistant.usage) > 0,
                     },
                     else => {},
                 },
@@ -793,7 +790,7 @@ pub const AgentSession = struct {
     }
 
     fn contextUsageFromMessages(context_window: u64, messages: []const protocol.AgentMessage) ContextUsage {
-        const estimate = session_mod.context_usage.estimateContextTokens(messages);
+        const estimate = session_core.context_usage.estimateContextTokens(messages);
         return .{
             .tokens = estimate.tokens,
             .context_window = context_window,
@@ -1265,7 +1262,7 @@ pub const OpenSessionResult = struct {
     store: ?SessionStore,
     context_arena: std.heap.ArenaAllocator,
     messages: []protocol.AgentMessage,
-    model: ?session_mod.context.SessionContext.ModelInfo,
+    model: ?session_core.context.SessionContext.ModelInfo,
     thinking_level: []const u8,
 
     pub fn deinit(self: *OpenSessionResult) void {
@@ -1299,7 +1296,7 @@ pub fn openSession(
     var context_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer context_arena.deinit();
 
-    const ctx = try session_mod.context.buildSessionContext(context_arena.allocator(), store.cached_entries.?, null);
+    const ctx = try store.buildCurrentContextAlloc(context_arena.allocator());
     return .{
         .allocator = allocator,
         .store = store,
@@ -1831,7 +1828,7 @@ fn testAssistantMessageWithUsage(
 }
 
 fn syncMessagesFromStore(session: *AgentSession) !void {
-    const context = try session.session_store.buildContext(session.session_store.leafId());
+    const context = try session.session_store.buildCurrentContext();
     try session.agent.setMessages(context.messages);
     session.refreshContextUsageStateFromStore();
 }
@@ -1977,7 +1974,7 @@ test "AgentSession: getContextUsage is unknown immediately after compaction" {
     session.session_store.appendMessage(testUserMessage("first", 1));
     session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
     session.session_store.appendMessage(testUserMessage("second", 3));
-    const kept_user_id = session.session_store.leafId().?;
+    const kept_user_id = session.session_store.currentEntryId().?;
     session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
     session.session_store.appendCompaction("summary", kept_user_id, 195_000);
     session.session_store.appendMessage(testUserMessage("third", 5));
@@ -2056,7 +2053,7 @@ test "AgentSession: getContextUsage prefers post-compaction assistant usage" {
     session.session_store.appendMessage(testUserMessage("first", 1));
     session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
     session.session_store.appendMessage(testUserMessage("second", 3));
-    const kept_user_id = session.session_store.leafId().?;
+    const kept_user_id = session.session_store.currentEntryId().?;
     session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
     session.session_store.appendCompaction("summary", kept_user_id, 195_000);
     session.session_store.appendMessage(testUserMessage("third", 5));
@@ -2471,10 +2468,11 @@ test "AgentSession: replaceSessionStore rebinds resumed session ids for agent an
         fn make(alloc: std.mem.Allocator, session_id: []const u8) SessionStore {
             return .{
                 .allocator = alloc,
-                .writer = session_mod.writer.SessionWriter.initContinue(
+                .writer = session_runtime.writer.SessionWriter.initContinue(
                     alloc,
                     "",
                     alloc.dupe(u8, session_id) catch @panic("OOM"),
+                    "",
                     null,
                 ),
                 .cache_arena = null,

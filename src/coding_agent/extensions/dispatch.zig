@@ -51,7 +51,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const context_mod = @import("context.zig");
 const agent_protocol = @import("../../agent3/types.zig");
-const session_mod = @import("../session/root.zig");
+const session_core = @import("../../session/root.zig");
 const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
@@ -338,7 +338,7 @@ fn testHasPendingMessages(_: *anyopaque) bool {
     return false;
 }
 
-fn testGetContextUsage(_: *anyopaque) ?session_mod.context_usage.ContextUsage {
+fn testGetContextUsage(_: *anyopaque) ?session_core.context_usage.ContextUsage {
     return .{ .tokens = 321, .context_window = 1024, .percent = 31.34765625 };
 }
 

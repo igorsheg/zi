@@ -93,12 +93,12 @@ pub const SessionWriter = struct {
     /// Seeds leaf_id so new entries chain from where the session left off.
     /// Skips header creation — the file already has one.
     /// Marks as already flushed (file exists on disk).
-    pub fn initContinue(allocator: std.mem.Allocator, session_file: []const u8, session_id: []const u8, leaf_id: ?[]const u8) SessionWriter {
+    pub fn initContinue(allocator: std.mem.Allocator, session_file: []const u8, session_id: []const u8, cwd: []const u8, leaf_id: ?[]const u8) SessionWriter {
         return .{
             .allocator = allocator,
             .session_id = session_id,
             .session_file = session_file,
-            .cwd = "",
+            .cwd = cwd,
             .leaf_id = leaf_id,
             .ids = .{},
             .flushed = true,

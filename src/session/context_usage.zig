@@ -103,53 +103,6 @@ pub fn estimateTokens(message: agent.protocol.AgentMessage) u64 {
     return @intCast(@divTrunc(chars + 3, 4));
 }
 
-pub fn getLatestCompactionEntry(entries: []const proto.SessionEntry) ?proto.CompactionEntry {
-    var i: usize = entries.len;
-    while (i > 0) {
-        i -= 1;
-        switch (entries[i].entry) {
-            .compaction => |c| return c,
-            else => {},
-        }
-    }
-    return null;
-}
-
-pub fn buildBranchEntries(
-    allocator: std.mem.Allocator,
-    entries: []const proto.SessionEntry,
-    leaf_id: ?[]const u8,
-) ![]const proto.SessionEntry {
-    var by_id = std.StringHashMap(usize).init(allocator);
-    defer by_id.deinit();
-    for (entries, 0..) |*entry, idx| {
-        try by_id.put(entry.id, idx);
-    }
-
-    var leaf_idx: ?usize = null;
-    if (leaf_id) |lid| leaf_idx = by_id.get(lid);
-    if (leaf_idx == null and entries.len > 0) leaf_idx = entries.len - 1;
-    const idx = leaf_idx orelse return &.{};
-
-    var rev: std.ArrayList(proto.SessionEntry) = .empty;
-    defer rev.deinit(allocator);
-    var current: ?usize = idx;
-    while (current) |cur| {
-        try rev.append(allocator, entries[cur]);
-        current = if (entries[cur].parent_id) |pid| by_id.get(pid) else null;
-    }
-
-    const out = try allocator.alloc(proto.SessionEntry, rev.items.len);
-    var src_i = rev.items.len;
-    var dst_i: usize = 0;
-    while (src_i > 0) {
-        src_i -= 1;
-        out[dst_i] = rev.items[src_i];
-        dst_i += 1;
-    }
-    return out;
-}
-
 fn getLastAssistantUsageInfo(messages: []const agent.protocol.AgentMessage) ?struct { usage: ai.protocol.Usage, index: usize } {
     var i: usize = messages.len;
     while (i > 0) {

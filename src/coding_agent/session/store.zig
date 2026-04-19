@@ -54,10 +54,10 @@ pub const SessionStore = struct {
     /// (from `sdk.resolveSessionDir`) so v2's `session_directory` extension
     /// hook has a chance to override it before the store exists. Callers
     /// that don't care can pass `storage.getSessionDirForCwd(...)` directly.
-    pub fn create(allocator: std.mem.Allocator, session_dir: []const u8, cwd: []const u8) SessionStore {
+    pub fn create(allocator: std.mem.Allocator, session_dir: []const u8, project_cwd: []const u8) SessionStore {
         return .{
             .allocator = allocator,
-            .writer = writer_mod.SessionWriter.init(allocator, session_dir, cwd),
+            .writer = writer_mod.SessionWriter.init(allocator, session_dir, project_cwd),
         };
     }
 
@@ -91,6 +91,7 @@ pub const SessionStore = struct {
                 allocator,
                 try allocator.dupe(u8, path),
                 try allocator.dupe(u8, session_header.id),
+                try allocator.dupe(u8, session_header.cwd),
                 if (leaf_id) |id| try allocator.dupe(u8, id) else null,
             ),
             .cache_arena = cache_arena,
@@ -114,8 +115,12 @@ pub const SessionStore = struct {
         return self.writer.session_file;
     }
 
-    pub fn leafId(self: *const SessionStore) ?[]const u8 {
+    pub fn currentEntryId(self: *const SessionStore) ?[]const u8 {
         return self.writer.leaf_id;
+    }
+
+    pub fn leafId(self: *const SessionStore) ?[]const u8 {
+        return self.currentEntryId();
     }
 
     pub fn header(self: *const SessionStore) ?proto.SessionHeader {
@@ -125,6 +130,11 @@ pub const SessionStore = struct {
             .header => |session_header| session_header,
             .entry => null,
         };
+    }
+
+    pub fn cwd(self: *const SessionStore) []const u8 {
+        if (self.cached_header) |session_header| return session_header.cwd;
+        return self.writer.cwd;
     }
 
     // ── Append methods (delegate to writer) ──────────────────────
@@ -159,17 +169,56 @@ pub const SessionStore = struct {
         self.writer.appendSessionInfo(name);
     }
 
+    pub fn appendCustomEntry(self: *SessionStore, custom_type: []const u8, data: ?std.json.Value) void {
+        self.invalidateCache();
+        self.writer.appendCustomEntry(custom_type, data);
+    }
+
+    pub fn appendCustomMessage(self: *SessionStore, custom_type: []const u8, content: agent_mod.protocol.AgentMessage.CustomContent, display: bool, details: ?std.json.Value) void {
+        self.invalidateCache();
+        self.writer.appendCustomMessage(custom_type, content, display, details);
+    }
+
+    pub fn appendLabel(self: *SessionStore, target_id: []const u8, label: ?[]const u8) void {
+        self.invalidateCache();
+        self.writer.appendLabel(target_id, label);
+    }
+
     // ── Context building ─────────────────────────────────────────
 
     /// Build the LLM context from this session's entries.
     /// If the session was opened, uses cached entries.
     /// Otherwise reads the file from disk.
-    pub fn buildContext(self: *SessionStore, leaf_id: ?[]const u8) !context_mod.SessionContext {
+    pub fn buildContext(self: *SessionStore, selection: context_mod.LeafSelection) !context_mod.SessionContext {
+        return self.buildContextAlloc(self.allocator, selection);
+    }
+
+    pub fn buildCurrentContext(self: *SessionStore) !context_mod.SessionContext {
+        return self.buildContext(.current);
+    }
+
+    pub fn buildContextAlloc(self: *SessionStore, allocator: std.mem.Allocator, selection: context_mod.LeafSelection) !context_mod.SessionContext {
         if (self.cached_entries) |entries| {
-            return context_mod.buildSessionContext(self.allocator, entries, leaf_id);
+            return context_mod.buildSessionContext(allocator, entries, selection);
         }
         const data = try self.readIntoCache();
-        return context_mod.buildSessionContext(self.allocator, data.entries, leaf_id);
+        return context_mod.buildSessionContext(allocator, data.entries, selection);
+    }
+
+    pub fn buildCurrentContextAlloc(self: *SessionStore, allocator: std.mem.Allocator) !context_mod.SessionContext {
+        return self.buildContextAlloc(allocator, .current);
+    }
+
+    pub fn buildBranchEntriesAlloc(self: *SessionStore, allocator: std.mem.Allocator, selection: context_mod.LeafSelection) ![]const proto.SessionEntry {
+        if (self.cached_entries) |entries| {
+            return context_mod.buildBranchEntries(allocator, entries, selection);
+        }
+        const data = try self.readIntoCache();
+        return context_mod.buildBranchEntries(allocator, data.entries, selection);
+    }
+
+    pub fn buildCurrentBranchAlloc(self: *SessionStore, allocator: std.mem.Allocator) ![]const proto.SessionEntry {
+        return self.buildBranchEntriesAlloc(allocator, .current);
     }
 
     pub fn readEntries(self: *SessionStore) ![]proto.SessionEntry {

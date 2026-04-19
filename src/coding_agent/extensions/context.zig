@@ -2,7 +2,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const json_util = @import("../../ai/json_util.zig");
 const agent_protocol = @import("../../agent3/types.zig");
-const session_mod = @import("../session/root.zig");
+const session_core = @import("../../session/root.zig");
 
 const c = lua_runtime.c;
 
@@ -94,7 +94,7 @@ fn pushModel(L: *c.lua_State, model: agent_protocol.Model) void {
     c.lua_setfield(L, -2, "reasoning");
 }
 
-fn pushContextUsage(L: *c.lua_State, usage: session_mod.context_usage.ContextUsage) void {
+fn pushContextUsage(L: *c.lua_State, usage: session_core.context_usage.ContextUsage) void {
     c.lua_createtable(L, 0, 3);
     if (usage.tokens) |tokens| {
         c.lua_pushinteger(L, @intCast(tokens));
