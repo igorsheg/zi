@@ -157,6 +157,7 @@ pub fn streamEvents(
         var chunk_writer: std.Io.Writer = .fixed(chunk_buf);
         const n = streamReaderChunk(reader, &chunk_writer, .limited(effective_chunk_size)) catch |err| switch (err) {
             error.EndOfStream => {
+                _ = try drainReaderBufferInto(reader, &pending, allocator);
                 try flushPendingLines(parser, &pending, handler, false);
                 return;
             },
@@ -164,9 +165,23 @@ pub fn streamEvents(
             else => return err,
         };
 
-        if (n == 0) continue;
+        var progressed = false;
+        if (n != 0) {
+            try pending.appendSlice(allocator, chunk_writer.buffered());
+            progressed = true;
+        }
 
-        try pending.appendSlice(allocator, chunk_writer.buffered());
+        // The std.Io.Reader VTable contract permits `stream` to store bytes in
+        // the reader's own buffer (modifying seek/end) instead of — or in
+        // addition to — writing to `w`. When we pass a `.fixed` writer we
+        // never see those bytes, so we must consume them directly. Without
+        // this drain, readers that ever take that branch (e.g., std.crypto.tls
+        // under certain record boundaries, see ziglang/zig#25428) turn this
+        // loop into a 99% CPU spin because `stream` keeps returning 0 while
+        // bytes pile up in the reader's buffer.
+        if (try drainReaderBufferInto(reader, &pending, allocator)) progressed = true;
+
+        if (!progressed) continue;
         try flushPendingLines(parser, &pending, handler, false);
     }
 }
@@ -176,6 +191,32 @@ fn streamReaderChunk(reader: anytype, w: *std.Io.Writer, limit: std.Io.Limit) !u
         .pointer => reader.*.stream(w, limit),
         else => reader.stream(w, limit),
     };
+}
+
+fn drainReaderBufferInto(
+    reader: anytype,
+    pending: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+) !bool {
+    // Call sites may pass a `*std.Io.Reader` directly or a pointer to a
+    // pointer (e.g. `&reader` where reader is itself `*std.Io.Reader`).
+    // Peel pointer levels until we land on the container type that owns
+    // `buffered` / `tossBuffered`.
+    switch (comptime @typeInfo(@TypeOf(reader))) {
+        .pointer => |info| switch (comptime @typeInfo(info.child)) {
+            .pointer => return drainReaderBufferInto(reader.*, pending, allocator),
+            else => {
+                const R = info.child;
+                if (comptime !@hasDecl(R, "buffered") or !@hasDecl(R, "tossBuffered")) return false;
+                const buffered = reader.buffered();
+                if (buffered.len == 0) return false;
+                try pending.appendSlice(allocator, buffered);
+                reader.tossBuffered();
+                return true;
+            },
+        },
+        else => return false,
+    }
 }
 
 fn flushPendingLines(
@@ -505,4 +546,39 @@ test "streamEvents discards unterminated tail at EOF" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), ctx.count);
+}
+
+test "streamEvents makes forward progress when stream parks bytes in reader buffer" {
+    // Models the std.crypto.tls.Client pathology (ziglang/zig#25428) where
+    // `stream` returns 0 after moving bytes into the reader's own buffer.
+    // Before the drain fix this test would spin forever; after it the
+    // buffered bytes are consumed via `reader.buffered()` / `tossBuffered`.
+    const input = "data: hello\n\n";
+    var source_reader: std.Io.Reader = .fixed(input);
+
+    var indirect_buf: [32]u8 = undefined;
+    var indirect: std.testing.ReaderIndirect = .init(&source_reader, &indirect_buf);
+
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    const Ctx = struct {
+        seen: bool = false,
+        data: ?[]const u8 = null,
+
+        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = true;
+            self.data = evt.data;
+        }
+    };
+
+    var ctx = Ctx{};
+    try streamEvents(std.testing.allocator, &indirect.interface, &parser, 16, .{
+        .func = &Ctx.cb,
+        .ctx = @ptrCast(&ctx),
+    });
+
+    try std.testing.expect(ctx.seen);
+    try std.testing.expectEqualStrings("hello", ctx.data.?);
 }
