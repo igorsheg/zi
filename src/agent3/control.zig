@@ -1,6 +1,6 @@
 const std = @import("std");
 const mailbox_mod = @import("../runtime/mailbox.zig");
-const protocol = @import("protocol.zig");
+const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 
 pub const QueueMode = enum {
@@ -96,6 +96,15 @@ pub const RunControl = struct {
         self.clearFollowUp();
     }
 
+    pub fn visitPending(
+        self: *RunControl,
+        kind: QueueKind,
+        visitor: *const fn (item: *const protocol.AgentMessage, ctx: ?*anyopaque) anyerror!void,
+        ctx: ?*anyopaque,
+    ) !void {
+        try self.queueFor(kind).visitPending(visitor, ctx);
+    }
+
     pub fn snapshot(self: *RunControl, allocator: std.mem.Allocator) QueuedMessageSnapshot {
         return .{
             .steering = self.steering.snapshotTexts(allocator),
@@ -168,6 +177,14 @@ const MessageQueue = struct {
 
     fn clear(self: *MessageQueue) void {
         self.mailbox.clear();
+    }
+
+    fn visitPending(
+        self: *MessageQueue,
+        visitor: *const fn (item: *const protocol.AgentMessage, ctx: ?*anyopaque) anyerror!void,
+        ctx: ?*anyopaque,
+    ) !void {
+        try self.mailbox.visitPending(visitor, ctx);
     }
 
     fn drain(self: *MessageQueue, arena: std.mem.Allocator) []const protocol.AgentMessage {
@@ -245,7 +262,7 @@ fn cleanupAgentMessage(item_ptr: *anyopaque, allocator: std.mem.Allocator) void 
     message_memory.freeMessage(allocator, message);
 }
 
-fn extractQueuedMessageText(msg: protocol.AgentMessage) ?[]const u8 {
+pub fn extractQueuedMessageText(msg: protocol.AgentMessage) ?[]const u8 {
     return switch (msg) {
         .user => |user| switch (user.content) {
             .text => |text| text,

@@ -1,17 +1,17 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_root = @import("../agent2/root.zig");
-const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
-const session_controller_mod = @import("../coding_agent/session_controller.zig");
-const RunOutcome = session_controller_mod.RunOutcome;
+const agent_root = @import("../agent3/root.zig");
+const conversation_state_mod = @import("../agent3/conversation_state.zig");
+const runtime_host_mod = @import("../coding_agent/runtime_host.zig");
+const RunOutcome = runtime_host_mod.RunOutcome;
 
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
-/// mailbox-owned. Conversation changes cross as full semantic snapshots.
+/// mailbox-owned. Conversation changes cross as full semantic conversation state.
 pub const UiEvent = union(enum) {
     consumed: void,
 
     // --- conversation transport ---
-    conversation_snapshot: conversation_snapshot_mod.ConversationSnapshot,
+    conversation_state: conversation_state_mod.PublishedConversationState,
 
     // --- errors / status side effects ---
     error_message: struct { message: []u8 },
@@ -65,15 +65,9 @@ pub const UiEvent = union(enum) {
     // status_text or focus that the individual request handlers already set.
     request_worker_finished: void,
 
-    // --- queued-message snapshot ---
-    // Authoritative snapshot of the run-control steering/follow-up boundary.
-    // Used by the TUI to render queued user-message rows and restore them
-    // for amendment without maintaining a parallel semantic mirror.
-    queue_snapshot: agent_root.QueuedMessageSnapshot,
-
     // --- /resume outcomes ---
     // Banner-only outcome. Transcript state now crosses separately via
-    // `conversation_snapshot` so resume no longer ships raw AgentMessage[]
+    // `conversation_state` so resume no longer ships raw AgentMessage[]
     // through this event.
     session_resumed: struct {
         restore_warning: ?[]u8 = null,
@@ -87,6 +81,9 @@ pub const UiEvent = union(enum) {
     session_new_failed: struct {
         message: []u8,
     },
+
+    // --- queued-input restore outcomes ---
+    queued_inputs_restored: runtime_host_mod.QueuedMessageSnapshot,
 
     // --- shared status snapshot ---
     // Agent-thread owned model/thinking/context snapshot for the editor
@@ -119,11 +116,11 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    pub fn takeConversationSnapshot(self: *UiEvent) ?conversation_snapshot_mod.ConversationSnapshot {
+    pub fn takeConversationState(self: *UiEvent) ?conversation_state_mod.PublishedConversationState {
         return switch (self.*) {
-            .conversation_snapshot => |snapshot| blk: {
+            .conversation_state => |state| blk: {
                 self.* = .{ .consumed = {} };
-                break :blk snapshot;
+                break :blk state;
             },
             else => null,
         };
@@ -133,7 +130,7 @@ pub const UiEvent = union(enum) {
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .consumed => {},
-            .conversation_snapshot => |*snapshot| snapshot.deinit(allocator),
+            .conversation_state => |*state| state.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
             .assistant_run_finished => |m| {
                 if (m.error_message) |msg| allocator.free(msg);
@@ -148,13 +145,13 @@ pub const UiEvent = union(enum) {
             .retry_end => |r| {
                 if (r.final_error) |msg| allocator.free(msg);
             },
-            .queue_snapshot => |*q| q.deinit(allocator),
             .session_resumed => |s| {
                 if (s.restore_warning) |warning| allocator.free(warning);
             },
             .session_resume_failed => |f| allocator.free(f.message),
             .session_new_started => {},
             .session_new_failed => |f| allocator.free(f.message),
+            .queued_inputs_restored => |*snapshot| snapshot.deinit(allocator),
             .status_snapshot => |s| {
                 allocator.free(s.model_provider);
                 allocator.free(s.model_id);
@@ -172,22 +169,33 @@ pub const UiEvent = union(enum) {
 
 const testing = std.testing;
 
-test "UiEvent deinit frees conversation snapshot payload" {
-    const snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
-        .version = 1,
-        .messages = &.{},
-    });
-    var ev = UiEvent{ .conversation_snapshot = snapshot };
+test "UiEvent deinit frees conversation state payload" {
+    var ev = UiEvent{ .conversation_state = .{
+        .view = .{
+            .committed = try testing.allocator.alloc(agent_root.protocol.AgentMessage, 0),
+            .in_flight = null,
+        },
+        .queued = .{
+            .steering = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
+            .follow_up = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
+        },
+    } };
     ev.deinit(testing.allocator);
 }
 
-test "UiEvent takeConversationSnapshot disarms later cleanup" {
-    var ev = UiEvent{ .conversation_snapshot = try conversation_snapshot_mod.build(testing.allocator, .{
-        .version = 1,
-        .messages = &.{},
-    }) };
-    var snapshot = ev.takeConversationSnapshot().?;
-    defer snapshot.deinit(testing.allocator);
+test "UiEvent takeConversationState disarms later cleanup" {
+    var ev = UiEvent{ .conversation_state = .{
+        .view = .{
+            .committed = try testing.allocator.alloc(agent_root.protocol.AgentMessage, 0),
+            .in_flight = null,
+        },
+        .queued = .{
+            .steering = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
+            .follow_up = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
+        },
+    } };
+    var state = ev.takeConversationState().?;
+    defer state.deinit(testing.allocator);
 
     ev.deinit(testing.allocator);
 }
@@ -203,6 +211,14 @@ test "UiEvent deinit handles assistant failure without message" {
     var ev = UiEvent{ .assistant_run_finished = .{
         .is_aborted = false,
         .error_message = null,
+    } };
+    ev.deinit(testing.allocator);
+}
+
+test "UiEvent deinit frees queued-input restore snapshot" {
+    var ev = UiEvent{ .queued_inputs_restored = .{
+        .steering = try testing.allocator.dupe(runtime_host_mod.QueuedMessageText, &.{.{ .text = try testing.allocator.dupe(u8, "a") }}),
+        .follow_up = try testing.allocator.dupe(runtime_host_mod.QueuedMessageText, &.{.{ .text = try testing.allocator.dupe(u8, "b") }}),
     } };
     ev.deinit(testing.allocator);
 }

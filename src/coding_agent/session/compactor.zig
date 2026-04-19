@@ -1,18 +1,18 @@
 const std = @import("std");
-const agent = @import("../../agent2/root.zig");
+const agent = @import("../../agent3/root.zig");
 const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../root.zig");
 const context_mod = @import("../../session/context.zig");
 const context_usage = @import("../../session/context_usage.zig");
 const proto = @import("../../session/protocol.zig");
-const session_controller = @import("../session_controller.zig");
+const runtime_host = @import("../runtime_host.zig");
 
 const AgentSession = coding_agent.AgentSession;
 const AgentMessage = agent.protocol.AgentMessage;
-const CompactionPolicy = session_controller.CompactionPolicy;
-const CompactionReason = session_controller.CompactionReason;
-const CompactionExecutor = session_controller.CompactionExecutor;
-const CompactionResult = session_controller.CompactionResult;
+const CompactionPolicy = runtime_host.CompactionPolicy;
+const CompactionReason = runtime_host.CompactionReason;
+const CompactionExecutor = runtime_host.CompactionExecutor;
+const CompactionResult = runtime_host.CompactionResult;
 
 const summarization_system_prompt =
     "You are summarizing conversation history for another coding agent. Be precise, terse, and preserve exact file paths, function names, constraints, errors, and next steps.";

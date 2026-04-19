@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_mod = @import("../agent2/root.zig");
+const agent_mod = @import("../agent3/root.zig");
 const coding_agent = @import("root.zig");
 const model_registry_mod = @import("model_registry.zig");
 const storage = @import("../storage.zig");
@@ -28,13 +28,19 @@ const settings_manager_mod = @import("settings/manager.zig");
 
 pub const AgentSession = coding_agent.AgentSession;
 pub const SessionStore = coding_agent.SessionStore;
-pub const SessionController = @import("session_controller.zig").SessionController;
-pub const SessionEvent = @import("session_controller.zig").SessionEvent;
-pub const SessionPhase = @import("session_controller.zig").Phase;
-pub const RetryPolicy = @import("session_controller.zig").RetryPolicy;
-pub const CompactionPolicy = @import("session_controller.zig").CompactionPolicy;
-pub const CompactionExecutor = @import("session_controller.zig").CompactionExecutor;
-pub const SessionCompactionResult = @import("session_controller.zig").CompactionResult;
+pub const RuntimeHost = @import("runtime_host.zig").RuntimeHost;
+pub const RuntimeHostOptions = @import("runtime_host.zig").Options;
+pub const ConversationStatePublisher = @import("runtime_host.zig").ConversationStatePublisher;
+pub const RunOutcome = @import("runtime_host.zig").RunOutcome;
+pub const RetryStart = @import("runtime_host.zig").RetryStart;
+pub const RetryEnd = @import("runtime_host.zig").RetryEnd;
+pub const CompactionReason = @import("runtime_host.zig").CompactionReason;
+pub const CompactionEnd = @import("runtime_host.zig").CompactionEnd;
+pub const LifecycleHooks = @import("runtime_host.zig").LifecycleHooks;
+pub const RetryPolicy = @import("runtime_host.zig").RetryPolicy;
+pub const CompactionPolicy = @import("runtime_host.zig").CompactionPolicy;
+pub const CompactionExecutor = @import("runtime_host.zig").CompactionExecutor;
+pub const SessionCompactionResult = @import("runtime_host.zig").CompactionResult;
 
 pub const CreateOptions = struct {
     model: ai.protocol.Model,

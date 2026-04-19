@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const agent = @import("../../agent2/root.zig");
+const agent = @import("../../agent3/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
 

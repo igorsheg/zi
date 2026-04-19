@@ -2,7 +2,8 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const partial_json = @import("../json/partial.zig");
-const protocol = @import("protocol.zig");
+const control_mod = @import("control.zig");
+const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 
 pub const ConversationView = struct {
@@ -12,6 +13,17 @@ pub const ConversationView = struct {
     pub fn deinit(self: *ConversationView, allocator: std.mem.Allocator) void {
         message_memory.freeMessages(allocator, self.committed);
         if (self.in_flight) |*turn| turn.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const PublishedConversationState = struct {
+    view: ConversationView,
+    queued: control_mod.QueuedMessageSnapshot,
+
+    pub fn deinit(self: *PublishedConversationState, allocator: std.mem.Allocator) void {
+        self.view.deinit(allocator);
+        self.queued.deinit(allocator);
         self.* = undefined;
     }
 };

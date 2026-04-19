@@ -1,5 +1,5 @@
 const std = @import("std");
-const protocol = @import("../../agent2/protocol.zig");
+const protocol = @import("../../agent3/types.zig");
 const json_value = @import("../../json/value.zig");
 
 pub const RegistrationSource = struct {

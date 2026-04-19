@@ -14,7 +14,7 @@
 //!   passes in; ownership flows out of `execute` to the caller.
 
 const std = @import("std");
-const protocol = @import("../../agent2/protocol.zig");
+const protocol = @import("../../agent3/types.zig");
 
 pub const BuiltinCtx = struct {
     cwd: []const u8,

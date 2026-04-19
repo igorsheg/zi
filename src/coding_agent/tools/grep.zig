@@ -9,7 +9,7 @@
 //! - `literal: true` for fixed-string mode; otherwise rust-flavored regex
 
 const std = @import("std");
-const protocol = @import("../../agent2/protocol.zig");
+const protocol = @import("../../agent3/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 

@@ -1,6 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const protocol = @import("../../agent2/protocol.zig");
+const protocol = @import("../../agent3/types.zig");
 const json_util = @import("../../ai/json_util.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");

@@ -26,7 +26,7 @@
 //! follow-up; out of scope here.
 
 const std = @import("std");
-const agent_protocol = @import("../../agent2/protocol.zig");
+const agent_protocol = @import("../../agent3/types.zig");
 const ai_protocol = @import("../../ai/protocol.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
 const lua_runtime = @import("lua_runtime.zig");

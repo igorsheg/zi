@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const protocol = @import("protocol.zig");
+const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 
 pub const StreamBridge = struct {

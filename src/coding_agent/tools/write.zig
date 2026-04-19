@@ -6,7 +6,7 @@
 //! - file-tracker change record for undo_edit (undo tool not yet ported)
 
 const std = @import("std");
-const protocol = @import("../../agent2/protocol.zig");
+const protocol = @import("../../agent3/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const lock_registry = @import("lock_registry.zig");

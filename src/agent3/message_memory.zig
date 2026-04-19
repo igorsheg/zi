@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
-const protocol = @import("protocol.zig");
+const protocol = @import("types.zig");
 
 pub fn cloneMessages(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage) ![]protocol.AgentMessage {
     const cloned = try allocator.alloc(protocol.AgentMessage, messages.len);

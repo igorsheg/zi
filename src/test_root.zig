@@ -8,7 +8,6 @@ pub const std_options: std.Options = .{
 test {
     logging.setThreadLabel(.@"test");
     _ = @import("abort_signal.zig");
-    _ = @import("conversation_snapshot.zig");
     _ = @import("storage.zig");
     _ = @import("debug/tracked_allocator.zig");
     _ = @import("logging.zig");
@@ -20,7 +19,6 @@ test {
     _ = @import("coding_agent/cli/help.zig");
     _ = @import("coding_agent/cli/initial_message.zig");
     _ = @import("coding_agent/cli/run_interactive.zig");
-    _ = @import("agent2/root.zig");
     _ = @import("agent3/root.zig");
     _ = @import("coding_agent/session/root.zig");
     _ = @import("coding_agent/root.zig");

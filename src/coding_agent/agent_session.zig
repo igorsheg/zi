@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_mod = @import("../agent2/root.zig");
+const agent_mod = @import("../agent3/root.zig");
+const agent_impl = @import("../agent3/agent.zig");
 const session_mod = @import("session/root.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
 const tool_def = @import("tools/definition.zig");
@@ -21,7 +22,7 @@ const lua_tool_mod = @import("extensions/lua_tool.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
-const SubscriptionToken = agent_mod.SubscriptionToken;
+const SubscriptionToken = agent_impl.SubscriptionToken;
 pub const SessionStore = session_mod.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;

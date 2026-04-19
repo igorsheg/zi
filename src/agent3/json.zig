@@ -4,7 +4,7 @@
 ///
 /// Delegates message body serialization to session/json.zig (shared writers).
 const std = @import("std");
-const protocol = @import("protocol.zig");
+const protocol = @import("types.zig");
 const session_json = @import("../session/json.zig");
 const ai = @import("../ai/root.zig");
 

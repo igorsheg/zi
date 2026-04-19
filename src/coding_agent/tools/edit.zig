@@ -23,7 +23,7 @@
 //! edit), file-tracker hookup for undo_edit.
 
 const std = @import("std");
-const protocol = @import("../../agent2/protocol.zig");
+const protocol = @import("../../agent3/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const diff_mod = @import("../../lib/diff.zig");

@@ -7,14 +7,13 @@ const markdown_mod = @import("components/markdown.zig");
 const assistant_message_mod = @import("components/assistant_message.zig");
 const user_message_mod = @import("components/user_message.zig");
 const tool_display_mod = @import("tool_display.zig");
-const agent_mod = @import("../agent2/root.zig");
+const agent_mod = @import("../agent3/root.zig");
 const agent_protocol = agent_mod.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const display_wrap_mod = @import("display_wrap.zig");
-const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
@@ -107,6 +106,9 @@ pub const TranscriptRenderable = struct {
 
 /// Behavior tag for transcript-owned items.
 /// Renderables remain tagged for routing updates and typed retained-row access.
+pub const ItemId = enum(u64) { _ };
+pub const SemanticVersion = u64;
+
 pub const ItemKind = enum {
     generic,
     assistant_message,
@@ -127,8 +129,8 @@ pub const DeinitFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) v
 pub const TranscriptItem = struct {
     renderable: TranscriptRenderable,
     kind: ItemKind = .generic,
-    snapshot_item_id: ?conversation_snapshot_mod.ItemId = null,
-    snapshot_semantic_version: ?conversation_snapshot_mod.SemanticVersion = null,
+    retained_item_id: ?ItemId = null,
+    retained_semantic_version: ?SemanticVersion = null,
     /// For tool_execution: route updates by ID via pending_tools HashMap.
     tool_call_id: ?[]const u8 = null,
     /// Owned cleanup context. Called on item removal/transcript clear.
@@ -883,7 +885,7 @@ fn deinitUserMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 /// Scrollable retained transcript container with slice-native item storage.
 ///
 /// Items are owned transcript renderables plus optional metadata used for
-/// retained reconciliation (`snapshot_item_id`) and keyed tool-row lookup
+/// retained reconciliation (`retained_item_id`) and keyed tool-row lookup
 /// (`tool_call_id`). The transcript owns retained item order, layout, scroll,
 /// selection, and viewport rendering. Conversation semantics are projected into
 /// retained rows before they reach this container.
@@ -891,8 +893,8 @@ pub const Transcript = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
     /// Fast lookup: tool_call_id → item index for retained tool-row updates.
     pending_tools: std.StringHashMapUnmanaged(usize) = .{},
-    /// Fast lookup: snapshot item_id → item index for retained reconciliation.
-    snapshot_items: std.AutoHashMapUnmanaged(conversation_snapshot_mod.ItemId, usize) = .empty,
+    /// Fast lookup: retained item_id → item index for retained reconciliation.
+    retained_items: std.AutoHashMapUnmanaged(ItemId, usize) = .empty,
     layout: TranscriptLayout,
 
     allocator: std.mem.Allocator,
@@ -918,7 +920,7 @@ pub const Transcript = struct {
         for (self.items.items) |*item| item.deinit(self.allocator);
         self.items.deinit(self.allocator);
         self.pending_tools.deinit(self.allocator);
-        self.snapshot_items.deinit(self.allocator);
+        self.retained_items.deinit(self.allocator);
         self.layout.deinit();
     }
 
@@ -952,8 +954,8 @@ pub const Transcript = struct {
         errdefer self.items.items.len -= 1;
         self.layout.appendItem() catch return false;
         const idx = self.items.items.len - 1;
-        if (item.snapshot_item_id) |item_id| {
-            self.snapshot_items.put(self.allocator, item_id, idx) catch {
+        if (item.retained_item_id) |item_id| {
+            self.retained_items.put(self.allocator, item_id, idx) catch {
                 _ = self.items.pop();
                 self.layout.removeItem(idx);
                 return false;
@@ -961,7 +963,7 @@ pub const Transcript = struct {
         }
         if (item.tool_call_id) |tool_call_id| {
             self.pending_tools.put(self.allocator, tool_call_id, idx) catch {
-                if (item.snapshot_item_id) |item_id| _ = self.snapshot_items.remove(item_id);
+                if (item.retained_item_id) |item_id| _ = self.retained_items.remove(item_id);
                 _ = self.items.pop();
                 self.layout.removeItem(idx);
                 return false;
@@ -1012,8 +1014,8 @@ pub const Transcript = struct {
         if (item.tool_call_id) |id| {
             _ = self.pending_tools.remove(id);
         }
-        if (item.snapshot_item_id) |item_id| {
-            _ = self.snapshot_items.remove(item_id);
+        if (item.retained_item_id) |item_id| {
+            _ = self.retained_items.remove(item_id);
         }
         item.deinit(self.allocator);
         _ = self.items.orderedRemove(index);
@@ -1035,7 +1037,7 @@ pub const Transcript = struct {
         for (self.items.items) |*item| item.deinit(self.allocator);
         self.items.items.len = 0;
         self.pending_tools.clearRetainingCapacity();
-        self.snapshot_items.clearRetainingCapacity();
+        self.retained_items.clearRetainingCapacity();
         self.last_visible_height = 0;
         self.layout.clear();
     }
@@ -1073,11 +1075,11 @@ pub const Transcript = struct {
                 entry.value_ptr.* = tool_index;
             }
         }
-        var snapshot_iter = self.snapshot_items.iterator();
-        while (snapshot_iter.next()) |entry| {
+        var retained_iter = self.retained_items.iterator();
+        while (retained_iter.next()) |entry| {
             if (entry.value_ptr.* >= start_index) {
-                const snapshot_index = self.findSnapshotItemIndex(entry.key_ptr.*) orelse continue;
-                entry.value_ptr.* = snapshot_index;
+                const retained_index = self.findRetainedItemIndex(entry.key_ptr.*) orelse continue;
+                entry.value_ptr.* = retained_index;
             }
         }
     }
@@ -1091,13 +1093,13 @@ pub const Transcript = struct {
         return null;
     }
 
-    pub fn findSnapshotItemIndex(self: *Transcript, item_id: conversation_snapshot_mod.ItemId) ?usize {
-        const idx = self.snapshot_items.get(item_id) orelse return null;
+    pub fn findRetainedItemIndex(self: *Transcript, item_id: ItemId) ?usize {
+        const idx = self.retained_items.get(item_id) orelse return null;
         if (idx >= self.items.items.len) return null;
         const item = self.items.items[idx];
-        if (item.snapshot_item_id != null and item.snapshot_item_id.? == item_id) return idx;
+        if (item.retained_item_id != null and item.retained_item_id.? == item_id) return idx;
         for (self.items.items, 0..) |candidate, search_idx| {
-            if (candidate.snapshot_item_id != null and candidate.snapshot_item_id.? == item_id) return search_idx;
+            if (candidate.retained_item_id != null and candidate.retained_item_id.? == item_id) return search_idx;
         }
         return null;
     }
@@ -1116,8 +1118,8 @@ pub const Transcript = struct {
             return false;
         };
         self.layout.dirty_count += 1;
-        if (item.snapshot_item_id) |item_id| {
-            self.snapshot_items.put(self.allocator, item_id, insert_index) catch {
+        if (item.retained_item_id) |item_id| {
+            self.retained_items.put(self.allocator, item_id, insert_index) catch {
                 _ = self.layout.items.orderedRemove(insert_index);
                 self.layout.heights.rebuild(self.layout.items.items) catch {};
                 if (self.layout.dirty_count > 0) self.layout.dirty_count -= 1;
@@ -1138,13 +1140,13 @@ pub const Transcript = struct {
         if (index >= self.items.items.len) return false;
         var old_item = self.items.items[index];
         if (old_item.tool_call_id) |id| _ = self.pending_tools.remove(id);
-        if (old_item.snapshot_item_id) |item_id| _ = self.snapshot_items.remove(item_id);
+        if (old_item.retained_item_id) |item_id| _ = self.retained_items.remove(item_id);
         self.items.items[index] = item;
-        if (item.snapshot_item_id) |item_id| {
-            self.snapshot_items.put(self.allocator, item_id, index) catch {
+        if (item.retained_item_id) |item_id| {
+            self.retained_items.put(self.allocator, item_id, index) catch {
                 self.items.items[index] = old_item;
                 if (old_item.tool_call_id) |id| self.pending_tools.put(self.allocator, id, index) catch {};
-                if (old_item.snapshot_item_id) |old_item_id| self.snapshot_items.put(self.allocator, old_item_id, index) catch {};
+                if (old_item.retained_item_id) |old_item_id| self.retained_items.put(self.allocator, old_item_id, index) catch {};
                 return false;
             };
         }
@@ -1172,9 +1174,9 @@ pub const Transcript = struct {
         self.clampScroll();
     }
 
-    pub fn snapshotItemSemanticVersionAt(self: *Transcript, index: usize) ?conversation_snapshot_mod.SemanticVersion {
+    pub fn retainedItemSemanticVersionAt(self: *Transcript, index: usize) ?SemanticVersion {
         if (index >= self.items.items.len) return null;
-        return self.items.items[index].snapshot_semantic_version;
+        return self.items.items[index].retained_semantic_version;
     }
 
     pub fn isFollowingBottom(self: *Transcript) bool {

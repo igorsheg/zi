@@ -1,11 +1,7 @@
-pub const types = @import("types.zig");
-pub const agent_loop = @import("agent_loop.zig");
-pub const agent = @import("agent.zig");
-
-pub const Agent = agent.Agent;
-pub const SubscriptionToken = agent.SubscriptionToken;
-pub const defaultConvertToLlm = agent.defaultConvertToLlm;
-pub const defaultConvertToLlmHook = agent.defaultConvertToLlmHook;
+pub const protocol = @import("types.zig");
+pub const types = protocol;
+pub const conversation_state = @import("conversation_state.zig");
+pub const Agent = @import("agent.zig").Agent;
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -46,7 +46,7 @@ const runner_mod = @import("runner.zig");
 const tool_registry_mod = @import("registries/tool_registry.zig");
 const theme_mod = @import("../../tui/theme.zig");
 const theme_tokens = @import("../../themes/tokens.zig");
-const agent_protocol = @import("../../agent2/protocol.zig");
+const agent_protocol = @import("../../agent3/types.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_renderer);

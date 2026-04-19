@@ -50,7 +50,7 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const context_mod = @import("context.zig");
-const agent_protocol = @import("../../agent2/protocol.zig");
+const agent_protocol = @import("../../agent3/types.zig");
 const session_mod = @import("../session/root.zig");
 const event_registry = @import("registries/event_registry.zig");
 

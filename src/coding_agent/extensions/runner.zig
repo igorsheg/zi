@@ -2,7 +2,7 @@ const std = @import("std");
 const registries = @import("registries/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../abort_signal.zig");
-const agent_protocol = @import("../../agent2/protocol.zig");
+const agent_protocol = @import("../../agent3/types.zig");
 const session_mod = @import("../session/root.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.

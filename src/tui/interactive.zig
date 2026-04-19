@@ -30,7 +30,6 @@ const clipboard_mod = @import("clipboard.zig");
 const image_mod = @import("../image/root.zig");
 const string_util = @import("../lib/string_util.zig");
 const time_util = @import("../lib/time_util.zig");
-const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
@@ -47,20 +46,16 @@ const SessionStore = session_store_mod.SessionStore;
 const storage = @import("../storage.zig");
 const logging = @import("../logging.zig");
 
-const agent_mod = @import("../agent2/root.zig");
+const agent_mod = @import("../agent3/root.zig");
+const message_memory = @import("../agent3/message_memory.zig");
 const coding_agent_mod = @import("../coding_agent/root.zig");
-const session_controller_mod = @import("../coding_agent/session_controller.zig");
-const run_control_mod = @import("../agent2/control.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
-const AgentRequest = agent_mod.AgentRequest;
-const RequestQueue = agent_mod.RequestQueue;
+const AgentRequest = coding_agent_mod.AgentRequest;
+const RequestQueue = coding_agent_mod.RequestQueue;
 const agent_protocol = agent_mod.protocol;
-const message_memory = agent_mod.message_memory;
-const SessionController = session_controller_mod.SessionController;
-const RetryPolicy = session_controller_mod.RetryPolicy;
-const CompactionPolicy = session_controller_mod.CompactionPolicy;
-const CompactionExecutor = session_controller_mod.CompactionExecutor;
-const SessionEvent = session_controller_mod.SessionEvent;
+const RetryPolicy = coding_agent_mod.runtime_host.RetryPolicy;
+const CompactionPolicy = coding_agent_mod.runtime_host.CompactionPolicy;
+const CompactionExecutor = coding_agent_mod.runtime_host.CompactionExecutor;
 const ChildRect = container_mod.ChildRect;
 
 const MouseCapture = union(enum) {
@@ -69,6 +64,8 @@ const MouseCapture = union(enum) {
 };
 
 const AgentSession = coding_agent_mod.AgentSession;
+const RuntimeHost = coding_agent_mod.RuntimeHost;
+const ConversationStatePublisher = coding_agent_mod.ConversationStatePublisher;
 const json_util = @import("../ai/json_util.zig");
 const SettingsAction = enum {
     open_thinking,
@@ -403,8 +400,7 @@ pub const Interactive = struct {
     /// Owned storage lives in `msg_allocator` so teardown can free it on
     /// the TUI thread after all workers are joined.
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
-    /// Agent-thread publication counter for semantic conversation snapshots.
-    next_conversation_snapshot_version: u64 = 1,
+    runtime_host: RuntimeHost,
     loader: Loader = .{},
     loader_active: bool = false,
     retry_active: bool = false,
@@ -467,11 +463,8 @@ pub const Interactive = struct {
     /// values; the long-lived agent thread wakes, drains, and dispatches
     /// them on the owner thread.
     request_queue: RequestQueue,
-    run_control: run_control_mod.RunControl,
     ca: *AgentSession,
     memory_diagnostics: *const memory_debug.Diagnostics,
-    session_controller: SessionController,
-    session_event_token: ?SessionController.SubscriptionToken = null,
     agent_event_token: ?AgentSession.EventSubscriptionToken = null,
     agent_thread: ?std.Thread = null,
     running: bool = true,
@@ -522,6 +515,11 @@ pub const Interactive = struct {
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
             .status_data = StatusData.init(state_allocator),
+            .runtime_host = try RuntimeHost.init(ca, msg_allocator, .{
+                .retry_policy = retry_policy,
+                .compaction_policy = compaction_policy,
+                .compaction_executor = compaction_executor,
+            }),
             .header_container = container_mod.Container.init(state_allocator),
             .pending_container = container_mod.Container.init(state_allocator),
             .status_container = container_mod.Container.init(state_allocator),
@@ -532,14 +530,8 @@ pub const Interactive = struct {
             .input = input_buffer_mod.InputBuffer.init(state_allocator),
             .event_queue = try UiEventQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
-            .run_control = try run_control_mod.RunControl.init(msg_allocator, .{}),
             .ca = ca,
             .memory_diagnostics = memory_diagnostics,
-            .session_controller = SessionController.init(state_allocator, ca, .{
-                .retry_policy = retry_policy,
-                .compaction_policy = compaction_policy,
-                .compaction_executor = compaction_executor,
-            }),
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
             .model_catalog = if (ca.model_registry) |mr| mr.getAll() else &.{},
@@ -587,17 +579,11 @@ pub const Interactive = struct {
         } else {
             self.request_queue.close();
         }
-        self.ca.agent.unbindRunControl(&self.run_control);
 
         if (self.agent_event_token) |token| {
             self.ca.unsubscribeEvents(token);
             self.agent_event_token = null;
         }
-        if (self.session_event_token) |token| {
-            self.session_controller.unsubscribe(token);
-            self.session_event_token = null;
-        }
-        self.session_controller.deinit();
         self.event_queue.close();
 
         // drain and free any remaining events
@@ -613,6 +599,7 @@ pub const Interactive = struct {
         self.pending_images.deinit(self.allocator);
         if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
         self.command_registry.deinit();
+        self.runtime_host.deinit();
         if (self.last_published_status_snapshot) |*snapshot| {
             snapshot.deinit(self.msg_allocator);
             self.last_published_status_snapshot = null;
@@ -620,7 +607,6 @@ pub const Interactive = struct {
         self.status_data.deinit();
         self.input.deinit();
         self.event_queue.deinit();
-        self.run_control.deinit();
         // Any unexpectedly undrained requests are mailbox-owned here;
         // deinit cleans them with AgentRequest.deinit.
         self.request_queue.deinit();
@@ -661,11 +647,14 @@ pub const Interactive = struct {
         self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.active_editor.setStatusData(&self.status_data);
-        self.ca.agent.bindRunControl(&self.run_control);
-        self.rebuildConversationFromMessages(self.ca.agent.messages());
-        self.syncQueueSnapshotFromRunControl();
         self.agent_event_token = self.ca.subscribeEvents(&agentEventCallback, @ptrCast(self));
-        self.session_event_token = self.session_controller.subscribe(&sessionEventCallback, @ptrCast(self));
+        self.runtime_host.setLifecycleHooks(.{
+            .on_retry_start = &runtimeRetryStartCallback,
+            .on_retry_wait_finished = &runtimeRetryWaitFinishedCallback,
+            .on_retry_end = &runtimeRetryEndCallback,
+            .on_compaction_end = &runtimeCompactionEndCallback,
+            .ctx = @ptrCast(self),
+        });
 
         self.detectGitBranch();
         try self.startAgentThread();
@@ -858,7 +847,7 @@ pub const Interactive = struct {
         // App-level keybindings — no overlay active
         if (keybindings.matches(.app_interrupt, key)) {
             if (self.retry_waiting) {
-                self.session_controller.abortRetry();
+                self.runtime_host.abortRetry();
                 return;
             }
             if (self.is_streaming) {
@@ -878,7 +867,7 @@ pub const Interactive = struct {
                 return;
             }
             if (self.retry_waiting) {
-                self.session_controller.abortRetry();
+                self.runtime_host.abortRetry();
                 return;
             }
             if (self.is_streaming) {
@@ -1032,14 +1021,14 @@ pub const Interactive = struct {
     }
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
-        if (ev.takeConversationSnapshot()) |snapshot| {
-            var owned_snapshot = snapshot;
+        if (ev.takeConversationState()) |state| {
+            var owned_state = state;
             const was_following_bottom = self.transcript.isFollowingBottom();
-            self.conversation_projection.replaceAllOwnedSnapshot(
+            self.conversation_projection.replaceAllOwnedState(
                 &self.transcript,
                 self.active_editor,
                 self.resolver,
-                &owned_snapshot,
+                &owned_state,
                 .{
                     .theme = self.theme,
                     .retry_attempt = self.retry_attempt,
@@ -1054,7 +1043,7 @@ pub const Interactive = struct {
 
         switch (ev.*) {
             .consumed => {},
-            .conversation_snapshot => unreachable,
+            .conversation_state => unreachable,
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
@@ -1143,20 +1132,6 @@ pub const Interactive = struct {
                 }
                 self.tui.dirty = true;
             },
-            .queue_snapshot => |q| {
-                if (self.conversation_projection.syncOwnedQueueSnapshot(
-                    &self.transcript,
-                    self.active_editor,
-                    self.resolver,
-                    q,
-                    .{
-                        .theme = self.theme,
-                        .retry_attempt = self.retry_attempt,
-                    },
-                )) {
-                    self.tui.dirty = true;
-                }
-            },
             .request_worker_finished => {
                 // Long-lived agent owner loop finished an idle request drain.
                 // Hide the loader only when the TUI actually has a pending
@@ -1199,6 +1174,9 @@ pub const Interactive = struct {
                 self.status_text.setContent(f.message);
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
+            },
+            .queued_inputs_restored => |*snapshot| {
+                self.applyRestoredQueuedInputs(snapshot);
             },
             .status_snapshot => |s| {
                 self.applyStatusSnapshot(s);
@@ -1248,34 +1226,6 @@ pub const Interactive = struct {
             assistant.setHideThinkingBlock(self.hide_thinking_block) catch continue;
             self.transcript.itemMutatedAt(idx);
         }
-    }
-
-    fn syncQueueSnapshotFromRunControl(self: *Interactive) void {
-        var snapshot = self.run_control.snapshot(self.allocator);
-        defer snapshot.deinit(self.allocator);
-        _ = self.conversation_projection.syncOwnedQueueSnapshot(
-            &self.transcript,
-            self.active_editor,
-            self.resolver,
-            snapshot,
-            .{
-                .theme = self.theme,
-                .retry_attempt = self.retry_attempt,
-            },
-        );
-    }
-
-    fn rebuildConversationFromMessages(self: *Interactive, messages: []const agent_protocol.AgentMessage) void {
-        self.conversation_projection.replaceAllFromMessages(
-            &self.transcript,
-            self.active_editor,
-            self.resolver,
-            messages,
-            .{
-                .theme = self.theme,
-                .retry_attempt = self.retry_attempt,
-            },
-        );
     }
 
     const TranscriptMouseZone = struct {
@@ -1590,33 +1540,50 @@ pub const Interactive = struct {
     }
 
     fn queueMessageWhileStreaming(self: *Interactive, kind: QueuedInputKind, text: []const u8) void {
-        const msg: agent_protocol.AgentMessage = .{ .user = .{
-            .content = .{ .text = text },
-            .timestamp = std.time.milliTimestamp(),
-        } };
-        const result = self.run_control.enqueue(switch (kind) {
-            .steering => .steering,
-            .follow_up => .follow_up,
-        }, msg);
-        switch (result) {
+        const text_copy = self.msg_allocator.dupe(u8, text) catch {
+            self.status_text.setContent("out of memory");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        };
+
+        switch (self.request_queue.trySend(.{ .enqueue_queued_input = .{
+            .kind = switch (kind) {
+                .steering => .steering,
+                .follow_up => .follow_up,
+            },
+            .text = text_copy,
+        } })) {
             .ok => {},
-            .closed, .oom => {
+            .dropped => unreachable,
+            .closed, .full, .oom => |rejected| {
+                var failed_req = rejected;
+                failed_req.deinit(self.msg_allocator);
                 self.status_text.setContent("agent unavailable");
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
                 return;
             },
         }
-        self.syncQueueSnapshotFromRunControl();
+
         self.active_editor.clear();
         self.refreshGreeterVisibility();
         self.tui.dirty = true;
     }
 
     fn restoreQueuedInputsToEditor(self: *Interactive) void {
-        var snapshot = self.run_control.clearAndSnapshot(self.allocator);
-        defer snapshot.deinit(self.allocator);
+        switch (self.request_queue.trySend(.{ .restore_queued_inputs = {} })) {
+            .ok => {},
+            .dropped => unreachable,
+            .closed, .full, .oom => {
+                self.status_text.setContent("agent unavailable");
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+            },
+        }
+    }
 
+    fn applyRestoredQueuedInputs(self: *Interactive, snapshot: *const coding_agent_mod.runtime_host.QueuedMessageSnapshot) void {
         const count = snapshot.steering.len + snapshot.follow_up.len;
         if (count == 0) {
             self.status_text.setContent("no queued messages");
@@ -1644,7 +1611,6 @@ pub const Interactive = struct {
         }
 
         self.active_editor.setText(buf.items);
-        self.syncQueueSnapshotFromRunControl();
         self.refreshGreeterVisibility();
         self.status_text.setContent(if (count == 1) "restored 1 queued message" else "restored queued messages");
         self.status_text.fg = self.theme.fg(.success);
@@ -2433,11 +2399,6 @@ pub const Interactive = struct {
         self.event_queue.push(.{ .login_progress = .{ .message = owned, .kind = .info } });
     }
 
-    fn publishQueueSnapshot(self: *Interactive) void {
-        const snapshot = self.run_control.snapshot(self.msg_allocator);
-        self.event_queue.push(.{ .queue_snapshot = snapshot });
-    }
-
     /// Long-lived agent owner thread entry point. This is the only
     /// path that runs agent-owned mutations: it binds lua ownership,
     /// blocks on the request inbox wake fd, drains queued work, and
@@ -2447,12 +2408,16 @@ pub const Interactive = struct {
     /// Completion events stay semantic rather than thread-shaped:
     ///   - prompt requests publish `.prompt_worker_finished`
     ///   - non-prompt request drains publish `.request_worker_finished`
+    ///   - queued-input restore publishes `.queued_inputs_restored`
     fn agentThreadFn(self: *Interactive) void {
         logging.setThreadLabel(.agent);
+        self.runtime_host.attachQueueMirror();
+        defer self.runtime_host.detachQueueMirror();
 
         if (self.ca.extensionRunner()) |runner| {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
+        _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
 
         while (true) {
             _ = self.request_queue.waitReadable(-1) catch break;
@@ -2495,14 +2460,13 @@ pub const Interactive = struct {
 
             var idle_processed = false;
             var prompt_processed = false;
-            var request_drain_active = false;
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 var req = &buf[i];
                 switch (req.*) {
                     .prompt => |p| {
                         prompt_processed = true;
-                        const outcome = self.session_controller.runUserContent(p.content) catch |err| {
+                        const outcome = self.runtime_host.runUserContent(p.content) catch |err| {
                             const err_msg = self.msg_allocator.dupe(u8, @errorName(err)) catch null;
                             self.event_queue.push(.{ .prompt_worker_finished = .{
                                 .outcome = .assistant_error,
@@ -2514,42 +2478,30 @@ pub const Interactive = struct {
                         self.event_queue.push(.{ .prompt_worker_finished = .{ .outcome = outcome } });
                     },
                     .resume_session => |r| {
-                        if (!request_drain_active) {
-                            self.session_controller.beginRequestDrain();
-                            request_drain_active = true;
-                        }
                         idle_processed = true;
                         self.handleResumeSession(r.path, r.restore_session_model);
                     },
                     .new_session => {
-                        if (!request_drain_active) {
-                            self.session_controller.beginRequestDrain();
-                            request_drain_active = true;
-                        }
                         idle_processed = true;
                         self.handleNewSession();
                     },
                     .set_model => |s| {
-                        if (!request_drain_active) {
-                            self.session_controller.beginRequestDrain();
-                            request_drain_active = true;
-                        }
                         idle_processed = true;
                         self.handleSetModel(s.model);
                     },
                     .set_thinking_level => |s| {
-                        if (!request_drain_active) {
-                            self.session_controller.beginRequestDrain();
-                            request_drain_active = true;
-                        }
                         idle_processed = true;
                         self.handleSetThinkingLevel(s.level);
                     },
+                    .enqueue_queued_input => |q| {
+                        idle_processed = true;
+                        self.handleEnqueueQueuedInput(q.kind, q.text);
+                    },
+                    .restore_queued_inputs => {
+                        idle_processed = true;
+                        self.handleRestoreQueuedInputs();
+                    },
                     .refresh_status_snapshot => {
-                        if (!request_drain_active) {
-                            self.session_controller.beginRequestDrain();
-                            request_drain_active = true;
-                        }
                         idle_processed = true;
                         self.publishStatusSnapshot();
                     },
@@ -2557,18 +2509,52 @@ pub const Interactive = struct {
                         req.deinit(self.msg_allocator);
                         self.discardAgentRequests(buf[i + 1 .. n]);
                         self.discardQueuedAgentRequests();
-                        if (request_drain_active) self.session_controller.finishRequestDrain();
                         return false;
                     },
                 }
                 req.deinit(self.msg_allocator);
             }
 
-            if (request_drain_active) self.session_controller.finishRequestDrain();
             if (idle_processed and !prompt_processed) {
                 self.event_queue.push(.{ .request_worker_finished = {} });
             }
         }
+    }
+
+    fn handleEnqueueQueuedInput(
+        self: *Interactive,
+        kind: coding_agent_mod.runtime_host.QueueKind,
+        text: []const u8,
+    ) void {
+        const message: agent_protocol.AgentMessage = .{ .user = .{
+            .content = .{ .text = text },
+            .timestamp = std.time.milliTimestamp(),
+        } };
+        const result = switch (kind) {
+            .steering => self.ca.agent.steer(message),
+            .follow_up => self.ca.agent.followUp(message),
+        };
+        switch (result) {
+            .ok => {
+                _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
+            },
+            .closed, .oom => {
+                const msg = self.msg_allocator.dupe(u8, "agent unavailable") catch return;
+                self.event_queue.push(.{ .error_message = .{ .message = msg } });
+            },
+        }
+    }
+
+    fn handleRestoreQueuedInputs(self: *Interactive) void {
+        var snapshot = self.runtime_host.restoreQueuedMessagesOnAgentThread(self.msg_allocator) catch {
+            const msg = self.msg_allocator.dupe(u8, "failed to restore queued messages") catch return;
+            self.event_queue.push(.{ .error_message = .{ .message = msg } });
+            return;
+        };
+        errdefer snapshot.deinit(self.msg_allocator);
+
+        _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
+        self.event_queue.push(.{ .queued_inputs_restored = snapshot });
     }
 
     fn handleNewSession(self: *Interactive) void {
@@ -2577,10 +2563,9 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
-        self.publishQueueSnapshot();
         self.publishStatusSnapshot();
-        if (!self.publishConversationSnapshot()) {
-            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation snapshot") catch return;
+        if (!self.runtime_host.publishConversationState(self.conversationStatePublisher())) {
+            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation state") catch return;
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
         }
@@ -2612,6 +2597,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
+        self.ca.agent.clearAllQueues();
         self.ca.agent.setMessages(loaded.messages) catch {
             const msg = self.msg_allocator.dupe(u8, "failed to restore session messages") catch return;
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
@@ -2651,11 +2637,10 @@ pub const Interactive = struct {
             }
         }
 
-        self.publishQueueSnapshot();
         self.publishStatusSnapshot();
-        if (!self.publishConversationSnapshot()) {
+        if (!self.runtime_host.publishConversationState(self.conversationStatePublisher())) {
             if (restore_warning) |warning| self.msg_allocator.free(warning);
-            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation snapshot") catch return;
+            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation state") catch return;
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         }
@@ -2664,24 +2649,16 @@ pub const Interactive = struct {
         } });
     }
 
-    fn publishConversationSnapshot(self: *Interactive) bool {
-        var queue_snapshot = self.run_control.snapshot(self.msg_allocator);
-        defer queue_snapshot.deinit(self.msg_allocator);
+    fn conversationStatePublisher(self: *Interactive) ConversationStatePublisher {
+        return .{
+            .func = &publishConversationStateToUi,
+            .ctx = @ptrCast(self),
+        };
+    }
 
-        var agent_view = self.ca.agent.cloneConversationView(self.msg_allocator) catch return false;
-        defer agent_view.deinit(self.msg_allocator);
-
-        const snapshot = conversation_snapshot_mod.buildFromAgentConversationView(self.msg_allocator, .{
-            .version = self.next_conversation_snapshot_version,
-            .view = agent_view,
-            .steering = queue_snapshot.steering,
-            .follow_up = queue_snapshot.follow_up,
-        }) catch return false;
-        self.next_conversation_snapshot_version +%= 1;
-        if (self.next_conversation_snapshot_version == 0) self.next_conversation_snapshot_version = 1;
-
-        self.event_queue.push(.{ .conversation_snapshot = snapshot });
-        return true;
+    fn publishConversationStateToUi(state: agent_mod.conversation_state.PublishedConversationState, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.event_queue.push(.{ .conversation_state = state });
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
@@ -2759,34 +2736,24 @@ pub const Interactive = struct {
         }
     }
 
-    fn publishQueueSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
-        switch (event) {
-            .message_start => |ms| switch (ms.message) {
-                .user => self.publishQueueSnapshot(),
-                else => {},
-            },
-            else => {},
-        }
-    }
-
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         _ = self.ca.trySetThinkingLevel(level);
         self.publishStatusSnapshot();
         self.event_queue.push(.{ .thinking_level_changed = {} });
     }
 
-    fn publishConversationSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
+    fn publishConversationStateForAgentEvent(self: *Interactive, event: AgentEvent) void {
         switch (event) {
             .message_start => |payload| switch (payload.message) {
-                .assistant => _ = self.publishConversationSnapshot(),
+                .assistant => _ = self.runtime_host.publishConversationState(self.conversationStatePublisher()),
                 else => {},
             },
             .message_update, .message_end, .tool_execution_start, .tool_execution_update, .tool_execution_end, .agent_end => {
-                _ = self.publishConversationSnapshot();
+                _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
             },
             .turn_end => |payload| {
                 if (payload.message != .assistant) return;
-                _ = self.publishConversationSnapshot();
+                _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
             },
             .agent_start, .turn_start => {},
         }
@@ -2795,49 +2762,46 @@ pub const Interactive = struct {
     /// Raw agent event callback — runs on the AGENT THREAD.
     fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.publishQueueSnapshotForAgentEvent(event);
-        self.publishConversationSnapshotForAgentEvent(event);
+        self.publishConversationStateForAgentEvent(event);
         if (convertAgentUiEvent(event, self.msg_allocator)) |ui_event| {
             self.event_queue.push(ui_event);
         }
         self.publishStatusSnapshotForAgentEvent(event);
     }
 
-    /// Session controller callback — runs on the AGENT THREAD.
-    fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
+    fn runtimeRetryStartCallback(event: coding_agent_mod.runtime_host.RetryStart, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        switch (event) {
-            .phase_changed => |pc| {
-                if (pc.from == .waiting_to_retry and pc.to == .running_continue) {
-                    self.event_queue.push(.retry_wait_finished);
-                }
-            },
-            .retry_start => |r| {
-                const err_msg = self.msg_allocator.dupe(u8, r.error_message) catch return;
-                self.event_queue.push(.{ .retry_start = .{
-                    .attempt = r.attempt,
-                    .max_attempts = r.max_attempts,
-                    .delay_ms = r.delay_ms,
-                    .error_message = err_msg,
-                } });
-            },
-            .retry_end => |r| {
-                const final_error = if (r.final_error) |msg|
-                    (self.msg_allocator.dupe(u8, msg) catch null)
-                else
-                    null;
-                self.event_queue.push(.{ .retry_end = .{
-                    .success = r.success,
-                    .attempt = r.attempt,
-                    .final_error = final_error,
-                } });
-            },
-            .compaction_start => {},
-            .compaction_end => {
-                self.publishStatusSnapshot();
-                _ = self.publishConversationSnapshot();
-            },
-        }
+        const err_msg = self.msg_allocator.dupe(u8, event.error_message) catch return;
+        self.event_queue.push(.{ .retry_start = .{
+            .attempt = event.attempt,
+            .max_attempts = event.max_attempts,
+            .delay_ms = event.delay_ms,
+            .error_message = err_msg,
+        } });
+    }
+
+    fn runtimeRetryWaitFinishedCallback(ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.event_queue.push(.retry_wait_finished);
+    }
+
+    fn runtimeRetryEndCallback(event: coding_agent_mod.runtime_host.RetryEnd, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        const final_error = if (event.final_error) |msg|
+            (self.msg_allocator.dupe(u8, msg) catch null)
+        else
+            null;
+        self.event_queue.push(.{ .retry_end = .{
+            .success = event.success,
+            .attempt = event.attempt,
+            .final_error = final_error,
+        } });
+    }
+
+    fn runtimeCompactionEndCallback(_: coding_agent_mod.runtime_host.CompactionEnd, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.publishStatusSnapshot();
+        _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
     }
 };
 
@@ -2953,7 +2917,7 @@ fn userFacingFailureMessage(
 }
 
 /// Convert an AgentEvent to a small TUI side-effect event.
-/// Conversation semantics cross separately as `conversation_snapshot`.
+/// Conversation semantics cross separately as `conversation_state`.
 fn convertAgentUiEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
     switch (event) {
         .message_update => |mu| switch (mu.assistant_message_event) {

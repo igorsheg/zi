@@ -1,7 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
 const ai_protocol = @import("../ai/protocol.zig");
-const message_memory = @import("message_memory.zig");
+const control_mod = @import("../agent3/control.zig");
+const message_memory = @import("../agent3/message_memory.zig");
 const mailbox_mod = @import("../runtime/mailbox.zig");
 
 /// AgentRequest — mailbox payload for the TUI → agent mutation channel.
@@ -24,6 +25,8 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 ///   - new_session
 ///   - set_model
 ///   - set_thinking_level
+///   - enqueue_queued_input
+///   - restore_queued_inputs
 ///   - refresh_status_snapshot
 ///   - shutdown
 ///
@@ -45,7 +48,12 @@ pub const AgentRequest = union(enum) {
     },
     new_session: void,
     set_model: struct { model: ai_protocol.Model },
-    set_thinking_level: struct { level: @import("protocol.zig").ThinkingLevel },
+    set_thinking_level: struct { level: @import("../agent3/types.zig").ThinkingLevel },
+    enqueue_queued_input: struct {
+        kind: control_mod.QueueKind,
+        text: []const u8,
+    },
+    restore_queued_inputs: void,
     refresh_status_snapshot: void,
     shutdown: void,
 
@@ -56,6 +64,8 @@ pub const AgentRequest = union(enum) {
             .new_session => {},
             .set_model => {},
             .set_thinking_level => {},
+            .enqueue_queued_input => |q| allocator.free(q.text),
+            .restore_queued_inputs => {},
             .refresh_status_snapshot => {},
             .shutdown => {},
         }
@@ -87,6 +97,30 @@ test "RequestQueue round-trips a resume_session payload and restore policy" {
     buf[0].deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), q.drainInto(&buf));
+}
+
+test "RequestQueue queued-input payload round-trips kind and text" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    const text = try allocator.dupe(u8, "queued follow-up");
+    q.push(.{ .enqueue_queued_input = .{
+        .kind = .follow_up,
+        .text = text,
+    } });
+
+    var buf: [1]AgentRequest = undefined;
+    const n = q.drainInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    switch (buf[0]) {
+        .enqueue_queued_input => |payload| {
+            try std.testing.expectEqual(control_mod.QueueKind.follow_up, payload.kind);
+            try std.testing.expectEqualStrings("queued follow-up", payload.text);
+        },
+        else => return error.UnexpectedResult,
+    }
+    buf[0].deinit(allocator);
 }
 
 test "RequestQueue shutdown sentinel round-trips as an ordered terminal request" {
