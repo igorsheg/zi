@@ -1,12 +1,17 @@
 const std = @import("std");
 const agent_mod = @import("../agent3/root.zig");
-const agent_impl = @import("../agent3/agent.zig");
 const control_mod = @import("../agent3/control.zig");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
-const AgentSession = @import("agent_session.zig").AgentSession;
+const agent_session_mod = @import("agent_session.zig");
+const AgentSession = agent_session_mod.AgentSession;
+const sdk = @import("sdk.zig");
+const resolve_mod = @import("resolve.zig");
 const classifier = @import("session_error_classifier.zig");
 const conversation_state = @import("../agent3/conversation_state.zig");
+const theme_mod = @import("../tui/theme.zig");
+const themes_builtin = @import("../themes/builtin.zig");
+const session_event_mod = @import("session_event.zig");
 
 pub const QueueKind = control_mod.QueueKind;
 pub const EnqueueResult = control_mod.EnqueueResult;
@@ -19,31 +24,11 @@ pub const RunOutcome = enum {
     aborted,
 };
 
-pub const RetryStart = struct {
-    attempt: u32,
-    max_attempts: u32,
-    delay_ms: u64,
-    error_message: []const u8,
-};
-
-pub const RetryEnd = struct {
-    success: bool,
-    attempt: u32,
-    final_error: ?[]const u8 = null,
-};
-
-pub const CompactionReason = enum {
-    overflow,
-    threshold,
-    manual,
-};
-
-pub const CompactionEnd = struct {
-    reason: CompactionReason,
-    success: bool,
-    will_retry: bool,
-    error_message: ?[]const u8 = null,
-};
+pub const RetryStart = session_event_mod.RetryStart;
+pub const RetryEnd = session_event_mod.RetryEnd;
+pub const CompactionReason = session_event_mod.CompactionReason;
+pub const CompactionEnd = session_event_mod.CompactionEnd;
+pub const SessionEvent = session_event_mod.SessionEvent;
 
 pub const RetryPolicy = struct {
     enabled: bool = true,
@@ -94,70 +79,182 @@ pub const ConversationStatePublisher = struct {
 
 pub const RuntimeHost = struct {
     session: *AgentSession,
-    allocator: std.mem.Allocator,
+    session_allocator: std.mem.Allocator,
+    msg_allocator: std.mem.Allocator,
+    create_options: sdk.CreateOptions,
     retry_policy: RetryPolicy,
     compaction_policy: CompactionPolicy,
     compaction_executor: ?CompactionExecutor,
     lifecycle_hooks: LifecycleHooks = .{},
+    event_listeners: std.ArrayList(EventHandler),
+    session_event_token: ?AgentSession.EventSubscriptionToken = null,
     retry_attempt: u32 = 0,
     overflow_recovery_attempted: bool = false,
     retry_abort_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    queue_mutex: std.Thread.Mutex = .{},
-    steering_mirror: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty,
-    follow_up_mirror: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty,
+
+    pub const EventHandler = struct {
+        func: *const fn (event: SessionEvent, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque = null,
+    };
+
+    pub const EventSubscriptionToken = struct {
+        index: usize,
+    };
 
     const RunMode = enum {
         prompt,
         continue_turn,
     };
 
-    pub fn init(session: *AgentSession, allocator: std.mem.Allocator, options: Options) !RuntimeHost {
-        return .{
+    pub fn init(
+        session: *AgentSession,
+        session_allocator: std.mem.Allocator,
+        msg_allocator: std.mem.Allocator,
+        create_options: sdk.CreateOptions,
+        options: Options,
+    ) !RuntimeHost {
+        var self: RuntimeHost = .{
             .session = session,
-            .allocator = allocator,
+            .session_allocator = session_allocator,
+            .msg_allocator = msg_allocator,
+            .create_options = create_options,
             .retry_policy = options.retry_policy,
             .compaction_policy = options.compaction_policy,
             .compaction_executor = options.compaction_executor,
+            .event_listeners = .empty,
         };
+        self.session.activateRuntimeHooks();
+        return self;
     }
 
     pub fn deinit(self: *RuntimeHost) void {
-        self.detachQueueMirror();
-        self.clearQueueMirror();
-        self.steering_mirror.deinit(self.allocator);
-        self.follow_up_mirror.deinit(self.allocator);
+        self.unbindSessionEvents();
+        self.session.deinit();
+        self.session_allocator.destroy(self.session);
+        self.event_listeners.deinit(self.session_allocator);
         self.* = undefined;
+    }
+
+    pub fn currentSession(self: *RuntimeHost) *AgentSession {
+        return self.session;
+    }
+
+    pub fn selectedTheme(self: *const RuntimeHost) theme_mod.Theme {
+        if (self.create_options.settings_manager) |settings| {
+            if (settings.getTheme()) |selected_name| {
+                if (self.session.resource_loader.findThemeByName(selected_name)) |loaded| {
+                    return loaded.theme;
+                }
+            }
+        }
+
+        const fallback_name: []const u8 = switch (theme_mod.Theme.detectTerminalBackground()) {
+            .dark => "dark",
+            .light => "light",
+        };
+        if (self.session.resource_loader.findThemeByName(fallback_name)) |loaded| {
+            return loaded.theme;
+        }
+
+        return themes_builtin.defaultForTerminal().*;
+    }
+
+    pub fn subscribeEvents(
+        self: *RuntimeHost,
+        func: *const fn (event: SessionEvent, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque,
+    ) EventSubscriptionToken {
+        self.bindSessionEvents();
+        const index = self.event_listeners.items.len;
+        self.event_listeners.append(self.session_allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
+        return .{ .index = index };
+    }
+
+    pub fn unsubscribeEvents(self: *RuntimeHost, token: EventSubscriptionToken) void {
+        if (token.index < self.event_listeners.items.len) {
+            _ = self.event_listeners.orderedRemove(token.index);
+        }
     }
 
     pub fn setLifecycleHooks(self: *RuntimeHost, hooks: LifecycleHooks) void {
         self.lifecycle_hooks = hooks;
     }
 
-    pub fn attachQueueMirror(self: *RuntimeHost) void {
-        self.session.agent.setQueueObserver(.{
-            .func = &queueMutationCallback,
-            .ctx = @ptrCast(self),
-        });
-    }
-
-    pub fn detachQueueMirror(self: *RuntimeHost) void {
-        self.session.agent.setQueueObserver(null);
+    pub fn setCompactionExecutor(self: *RuntimeHost, executor: ?CompactionExecutor) void {
+        self.compaction_executor = executor;
     }
 
     /// Agent-thread-only helper for the queued-input restore flow.
-    /// Clones the runtime-owned queue mirror first, then clears the
-    /// authoritative agent queues so the observer drains the mirror in
-    /// the same order. Callers own the returned snapshot.
     pub fn restoreQueuedMessagesOnAgentThread(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
-        var snapshot = try self.cloneQueueMirrorSnapshot(allocator);
-        errdefer snapshot.deinit(allocator);
-        self.session.agent.clearAllQueues();
-        return snapshot;
+        return self.session.restoreQueuedMessagesOnAgentThread(allocator);
     }
 
     pub fn abortRetry(self: *RuntimeHost) void {
         self.retry_abort_requested.store(true, .release);
         self.session.agent.wakeAbortWaiters();
+    }
+
+    pub fn abortCurrentRun(self: *RuntimeHost) void {
+        self.session.agent.abort();
+    }
+
+    pub const ResumeResult = struct {
+        restore_warning: ?[]u8 = null,
+    };
+
+    pub fn newSession(self: *RuntimeHost) !void {
+        var create_options = self.create_options;
+        create_options.cwd = self.session.resource_loader.cwd;
+        create_options.model = self.session.agent.modelValue();
+        create_options.initial_messages = &.{};
+        create_options.thinking_level = self.session.agent.thinkingLevel();
+
+        const session_dir = try sdk.resolveSessionDir(self.session_allocator, create_options.cwd);
+        defer self.session_allocator.free(session_dir);
+        var new_store = agent_session_mod.SessionStore.create(self.session_allocator, session_dir, create_options.cwd);
+        errdefer new_store.deinit();
+        create_options.session_store = new_store;
+
+        const next = try self.createOwnedSession(create_options);
+        next.session_store.appendModelChange(json_util.providerToString(next.agent.modelValue().provider), next.agent.modelValue().id);
+        next.session_store.appendThinkingLevelChange(thinkingLevelToString(next.agent.thinkingLevel()));
+        self.replaceSession(next);
+    }
+
+    pub fn resumeSession(self: *RuntimeHost, path: []const u8, restore_session_model: bool) !ResumeResult {
+        var loaded = try agent_session_mod.openSession(self.session_allocator, path);
+        defer loaded.deinit();
+
+        var create_options = self.create_options;
+        create_options.cwd = loaded.store.?.writer.cwd;
+        create_options.initial_messages = loaded.messages;
+        create_options.thinking_level = parseThinkingLevel(loaded.thinking_level);
+
+        var restore_warning: ?[]u8 = null;
+        create_options.model = self.session.agent.modelValue();
+        if (restore_session_model) {
+            if (loaded.model) |saved| {
+                if (self.session.model_registry) |registry| {
+                    const restore = resolve_mod.restoreModelFromSession(.{
+                        .saved_provider = saved.provider,
+                        .saved_model_id = saved.model_id,
+                        .current_model = create_options.model,
+                        .registry = registry,
+                        .allocator = self.msg_allocator,
+                    }) catch resolve_mod.RestoreResult{ .model = null, .fallback_message = null };
+                    if (restore.model) |model| create_options.model = model;
+                    restore_warning = restore.fallback_message;
+                }
+            }
+        }
+
+        var new_store = loaded.takeStore();
+        errdefer new_store.deinit();
+        create_options.session_store = new_store;
+
+        const next = try self.createOwnedSession(create_options);
+        self.replaceSession(next);
+        return .{ .restore_warning = restore_warning };
     }
 
     pub fn runUserContent(self: *RuntimeHost, content: ai.protocol.UserMessage.UserMessageContent) !RunOutcome {
@@ -211,17 +308,58 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         publisher: ConversationStatePublisher,
     ) bool {
-        var view = self.session.agent.cloneConversationView(self.allocator) catch return false;
-        errdefer view.deinit(self.allocator);
+        var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
+        errdefer view.deinit(self.msg_allocator);
 
-        var queued = self.cloneQueueMirrorSnapshot(self.allocator) catch return false;
-        errdefer queued.deinit(self.allocator);
+        var queued = self.session.cloneQueuedMessageSnapshot(self.msg_allocator) catch return false;
+        errdefer queued.deinit(self.msg_allocator);
 
         publisher.publish(.{
             .view = view,
             .queued = queued,
         });
         return true;
+    }
+
+    fn bindSessionEvents(self: *RuntimeHost) void {
+        if (self.session_event_token != null) return;
+        self.session_event_token = self.session.subscribeEvents(&sessionEventBridge, @ptrCast(self));
+    }
+
+    fn unbindSessionEvents(self: *RuntimeHost) void {
+        if (self.session_event_token) |token| {
+            self.session.unsubscribeEvents(token);
+            self.session_event_token = null;
+        }
+    }
+
+    fn emitSessionEvent(self: *RuntimeHost, event: SessionEvent) void {
+        for (self.event_listeners.items) |handler| {
+            handler.func(event, handler.ctx);
+        }
+    }
+
+    fn sessionEventBridge(event: SessionEvent, ctx: ?*anyopaque) void {
+        const self: *RuntimeHost = @ptrCast(@alignCast(ctx.?));
+        self.emitSessionEvent(event);
+    }
+
+    fn createOwnedSession(self: *RuntimeHost, create_options: sdk.CreateOptions) !*AgentSession {
+        const session = try self.session_allocator.create(AgentSession);
+        errdefer self.session_allocator.destroy(session);
+        session.* = try sdk.createAgentSession(self.session_allocator, create_options);
+        return session;
+    }
+
+    fn replaceSession(self: *RuntimeHost, next: *AgentSession) void {
+        const had_runtime_listeners = self.event_listeners.items.len > 0;
+        self.unbindSessionEvents();
+        self.session.shutdownExtensionsOnAgentThread();
+        self.session.deinit();
+        self.session_allocator.destroy(self.session);
+        self.session = next;
+        self.session.activateRuntimeHooks();
+        if (had_runtime_listeners) self.bindSessionEvents();
     }
 
     fn runWithRecovery(
@@ -383,69 +521,23 @@ pub const RuntimeHost = struct {
     }
 
     fn notifyRetryStart(self: *RuntimeHost, event: RetryStart) void {
+        self.emitSessionEvent(.{ .auto_retry_start = event });
         if (self.lifecycle_hooks.on_retry_start) |cb| cb(event, self.lifecycle_hooks.ctx);
     }
 
     fn notifyRetryWaitFinished(self: *RuntimeHost) void {
+        self.emitSessionEvent(.{ .auto_retry_wait_finished = {} });
         if (self.lifecycle_hooks.on_retry_wait_finished) |cb| cb(self.lifecycle_hooks.ctx);
     }
 
     fn notifyRetryEnd(self: *RuntimeHost, event: RetryEnd) void {
+        self.emitSessionEvent(.{ .auto_retry_end = event });
         if (self.lifecycle_hooks.on_retry_end) |cb| cb(event, self.lifecycle_hooks.ctx);
     }
 
     fn notifyCompactionEnd(self: *RuntimeHost, event: CompactionEnd) void {
+        self.emitSessionEvent(.{ .compaction_end = event });
         if (self.lifecycle_hooks.on_compaction_end) |cb| cb(event, self.lifecycle_hooks.ctx);
-    }
-
-    fn cloneQueueMirrorSnapshot(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
-
-        const steering = try cloneQueuedEntries(allocator, self.steering_mirror.items);
-        errdefer {
-            freeQueuedEntries(allocator, steering);
-            allocator.free(steering);
-        }
-        const follow_up = try cloneQueuedEntries(allocator, self.follow_up_mirror.items);
-        return .{
-            .steering = steering,
-            .follow_up = follow_up,
-        };
-    }
-
-    fn clearQueueMirror(self: *RuntimeHost) void {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
-
-        freeQueuedEntries(self.allocator, self.steering_mirror.items);
-        freeQueuedEntries(self.allocator, self.follow_up_mirror.items);
-        self.steering_mirror.clearRetainingCapacity();
-        self.follow_up_mirror.clearRetainingCapacity();
-    }
-
-    fn applyQueueMutation(self: *RuntimeHost, action: agent_impl.QueueMutationAction, kind: QueueKind, message: agent_mod.protocol.AgentMessage) void {
-        const text = control_mod.extractQueuedMessageText(message) orelse return;
-
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
-
-        const target = switch (kind) {
-            .steering => &self.steering_mirror,
-            .follow_up => &self.follow_up_mirror,
-        };
-
-        switch (action) {
-            .enqueued => {
-                const owned = self.allocator.dupe(u8, text) catch return;
-                target.append(self.allocator, .{ .text = owned }) catch self.allocator.free(owned);
-            },
-            .drained, .cleared => {
-                if (target.items.len == 0) return;
-                const entry = target.orderedRemove(0);
-                self.allocator.free(entry.text);
-            },
-        }
     }
 };
 
@@ -454,36 +546,24 @@ fn retryAbortRequested(ctx: ?*anyopaque) bool {
     return self.retry_abort_requested.load(.acquire);
 }
 
-fn queueMutationCallback(
-    action: agent_impl.QueueMutationAction,
-    kind: QueueKind,
-    message: agent_mod.protocol.AgentMessage,
-    ctx: ?*anyopaque,
-) void {
-    const self: *RuntimeHost = @ptrCast(@alignCast(ctx.?));
-    self.applyQueueMutation(action, kind, message);
+fn parseThinkingLevel(value: []const u8) agent_mod.protocol.ThinkingLevel {
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    return .off;
 }
 
-fn cloneQueuedEntries(
-    allocator: std.mem.Allocator,
-    entries: []const control_mod.QueuedMessageText,
-) ![]control_mod.QueuedMessageText {
-    var out: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty;
-    errdefer {
-        freeQueuedEntries(allocator, out.items);
-        out.deinit(allocator);
-    }
-
-    for (entries) |entry| {
-        const text = try allocator.dupe(u8, entry.text);
-        errdefer allocator.free(text);
-        try out.append(allocator, .{ .text = text });
-    }
-    return try out.toOwnedSlice(allocator);
-}
-
-fn freeQueuedEntries(allocator: std.mem.Allocator, entries: []control_mod.QueuedMessageText) void {
-    for (entries) |entry| allocator.free(entry.text);
+fn thinkingLevelToString(level: agent_mod.protocol.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "off",
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
 }
 
 const testing = std.testing;
@@ -552,32 +632,29 @@ fn fauxErrorAssistantMessage(
     return message;
 }
 
-fn createTestAgentSession(
-    allocator: std.mem.Allocator,
-    registry: *ai.provider.Registry,
-) AgentSession {
-    const resource_loader = resources.ResourceLoader.init(allocator, .{ .cwd = "/tmp/zi-test" }) catch @panic("OOM");
-    return AgentSession.init(allocator, .{
+fn createTestCreateOptions(registry: ?*ai.provider.Registry) sdk.CreateOptions {
+    return .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
-        .resource_loader = resource_loader,
         .registry = registry,
         .tools = &.{},
         .no_session = true,
-    });
+    };
+}
+
+fn createOwnedTestAgentSession(
+    allocator: std.mem.Allocator,
+    registry: ?*ai.provider.Registry,
+) !*AgentSession {
+    const session = try allocator.create(AgentSession);
+    errdefer allocator.destroy(session);
+    session.* = try sdk.createAgentSession(allocator, createTestCreateOptions(registry));
+    return session;
 }
 
 test "runtime host publishes committed and queued conversation state" {
-    var session = AgentSession.init(testing.allocator, .{
-        .model = faux.fauxModel(),
-        .api_key = "test-key",
-        .cwd = "/tmp/zi-test",
-        .resource_loader = resources.ResourceLoader.init(testing.allocator, .{ .cwd = "/tmp/zi-test" }) catch @panic("OOM"),
-        .tools = &.{},
-        .no_session = true,
-    });
-    defer session.deinit();
+    const session = try createOwnedTestAgentSession(testing.allocator, null);
 
     try session.agent.setMessages(&.{.{ .user = .{
         .content = .{ .text = "hello" },
@@ -594,12 +671,10 @@ test "runtime host publishes committed and queued conversation state" {
         }
     };
 
-    var host = try RuntimeHost.init(&session, testing.allocator, .{});
+    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
     defer host.deinit();
-    host.attachQueueMirror();
-    defer host.detachQueueMirror();
 
-    try testing.expectEqual(.ok, session.agent.followUp(.{ .user = .{
+    try testing.expectEqual(.ok, host.currentSession().agent.followUp(.{ .user = .{
         .content = .{ .text = "queued" },
         .timestamp = 2,
     } }));
@@ -616,6 +691,38 @@ test "runtime host publishes committed and queued conversation state" {
     try testing.expectEqualStrings("queued", published.?.queued.follow_up[0].text);
 }
 
+test "runtime host keeps session-event subscriptions across session replacement" {
+    const session = try createOwnedTestAgentSession(testing.allocator, null);
+    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
+    defer host.deinit();
+
+    const Collector = struct {
+        queue_updates: usize = 0,
+
+        fn onEvent(event: SessionEvent, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .queue_update => self.queue_updates += 1,
+                else => {},
+            }
+        }
+    };
+
+    var collector = Collector{};
+    const token = host.subscribeEvents(&Collector.onEvent, @ptrCast(&collector));
+    defer host.unsubscribeEvents(token);
+
+    const before_session_id = host.currentSession().session_store.sessionId();
+    try host.newSession();
+    try testing.expect(!std.mem.eql(u8, before_session_id, host.currentSession().session_store.sessionId()));
+
+    try testing.expectEqual(.ok, host.currentSession().agent.followUp(.{ .user = .{
+        .content = .{ .text = "queued after replace" },
+        .timestamp = 1,
+    } }));
+    try testing.expectEqual(@as(usize, 1), collector.queue_updates);
+}
+
 test "runtime host retries transient assistant failures and prunes the failed assistant turn before continue" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -630,13 +737,12 @@ test "runtime host retries transient assistant failures and prunes the failed as
     var registry = ai.provider.Registry.init(allocator);
     try registry.register("faux", fp.provider(), null);
 
-    var session = createTestAgentSession(allocator, &registry);
-    defer session.deinit();
+    const session = try createOwnedTestAgentSession(allocator, &registry);
 
     var collector = LifecycleCollector{ .allocator = allocator };
     defer collector.deinit();
 
-    var host = try RuntimeHost.init(&session, allocator, .{
+    var host = try RuntimeHost.init(session, allocator, allocator, createTestCreateOptions(&registry), .{
         .retry_policy = .{
             .enabled = true,
             .max_retries = 2,
@@ -645,8 +751,6 @@ test "runtime host retries transient assistant failures and prunes the failed as
         },
     });
     defer host.deinit();
-    host.attachQueueMirror();
-    defer host.detachQueueMirror();
     host.setLifecycleHooks(.{
         .on_retry_start = &LifecycleCollector.onRetryStart,
         .on_retry_wait_finished = &LifecycleCollector.onRetryWaitFinished,
@@ -664,8 +768,8 @@ test "runtime host retries transient assistant failures and prunes the failed as
     try testing.expectEqual(@as(u32, 1), collector.retry_starts.items[0].attempt);
     try testing.expectEqual(@as(u32, 1), collector.retry_ends.items[0].attempt);
     try testing.expect(collector.retry_ends.items[0].success);
-    try testing.expectEqual(@as(usize, 2), session.agent.messages().len);
-    try testing.expectEqualStrings("recovered", session.agent.messages()[1].assistant.content[0].text.text);
+    try testing.expectEqual(@as(usize, 2), host.currentSession().agent.messages().len);
+    try testing.expectEqualStrings("recovered", host.currentSession().agent.messages()[1].assistant.content[0].text.text);
 }
 
 test "runtime host recovers overflow with one compaction pass before retrying continue" {
@@ -682,8 +786,7 @@ test "runtime host recovers overflow with one compaction pass before retrying co
     var registry = ai.provider.Registry.init(allocator);
     try registry.register("faux", fp.provider(), null);
 
-    var session = createTestAgentSession(allocator, &registry);
-    defer session.deinit();
+    const session = try createOwnedTestAgentSession(allocator, &registry);
 
     var collector = LifecycleCollector{ .allocator = allocator };
     defer collector.deinit();
@@ -691,15 +794,13 @@ test "runtime host recovers overflow with one compaction pass before retrying co
     var compaction_spy = CompactionSpy{ .allocator = allocator };
     defer compaction_spy.deinit();
 
-    var host = try RuntimeHost.init(&session, allocator, .{
+    var host = try RuntimeHost.init(session, allocator, allocator, createTestCreateOptions(&registry), .{
         .compaction_executor = .{
             .func = &CompactionSpy.execute,
             .ctx = @ptrCast(&compaction_spy),
         },
     });
     defer host.deinit();
-    host.attachQueueMirror();
-    defer host.detachQueueMirror();
     host.setLifecycleHooks(.{
         .on_retry_start = &LifecycleCollector.onRetryStart,
         .on_retry_end = &LifecycleCollector.onRetryEnd,
@@ -717,6 +818,6 @@ test "runtime host recovers overflow with one compaction pass before retrying co
     try testing.expect(collector.compaction_ends.items[0].success);
     try testing.expect(collector.compaction_ends.items[0].will_retry);
     try testing.expectEqual(@as(usize, 0), collector.retry_starts.items.len);
-    try testing.expectEqual(@as(usize, 2), session.agent.messages().len);
-    try testing.expectEqualStrings("after compaction", session.agent.messages()[1].assistant.content[0].text.text);
+    try testing.expectEqual(@as(usize, 2), host.currentSession().agent.messages().len);
+    try testing.expectEqualStrings("after compaction", host.currentSession().agent.messages()[1].assistant.content[0].text.text);
 }

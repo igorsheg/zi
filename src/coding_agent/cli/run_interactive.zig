@@ -2,10 +2,9 @@ const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const model_resolve = @import("../resolve.zig");
 const logging = @import("../../logging.zig");
+const coding_agent_mod = @import("../root.zig");
 const sdk = @import("../sdk.zig");
 const interactive_mod = @import("../../tui/interactive.zig");
-const theme_mod = @import("../../tui/theme.zig");
-const themes_builtin = @import("../../themes/builtin.zig");
 const tool_display = @import("../../tui/tool_display.zig");
 const builtin_renderers = @import("../../tui/renderers/builtins.zig");
 const compactor = @import("../session/compactor.zig");
@@ -81,7 +80,7 @@ pub fn run(
     const needs_auth = api_key.len == 0;
     const allowlist_opt = try common.parseToolAllowlist(ctx.allocator, options.tool_allowlist_csv);
 
-    var ca = try sdk.createAgentSession(ctx.allocator, .{
+    const session_create_options: sdk.CreateOptions = .{
         .model = effective_model,
         .api_key = api_key,
         .cwd = runtime.cwd,
@@ -93,8 +92,11 @@ pub fn run(
         .no_session = options.no_session,
         .append_system_prompt = options.append_system_prompt,
         .tool_allowlist = allowlist_opt,
-    });
-    defer ca.deinit();
+    };
+    const session_ptr = try ctx.allocator.create(sdk.AgentSession);
+    errdefer ctx.allocator.destroy(session_ptr);
+    session_ptr.* = try sdk.createAgentSession(ctx.allocator, session_create_options);
+    errdefer session_ptr.deinit();
 
     const static_entries: []const tool_display.Registration = &.{
         .{ .tool_name = "bash", .renderer = builtin_renderers.bash_renderer },
@@ -108,7 +110,19 @@ pub fn run(
     const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
     const retry_settings = runtime.settings_manager.getRetrySettings();
     const compaction_settings = runtime.settings_manager.getCompactionSettings();
-    const compaction_executor = compactor.createExecutor(&ca);
+    const runtime_host = try coding_agent_mod.RuntimeHost.init(session_ptr, ctx.allocator, ctx.msg_allocator, session_create_options, .{
+        .retry_policy = .{
+            .enabled = retry_settings.enabled,
+            .max_retries = @intCast(@max(retry_settings.max_retries, 0)),
+            .base_delay_ms = @intCast(@max(retry_settings.base_delay_ms, 0)),
+            .max_delay_ms = @intCast(@max(retry_settings.max_delay_ms, 0)),
+        },
+        .compaction_policy = .{
+            .enabled = compaction_settings.enabled,
+            .reserve_tokens = @intCast(@max(compaction_settings.reserve_tokens, 0)),
+            .keep_recent_tokens = @intCast(@max(compaction_settings.keep_recent_tokens, 0)),
+        },
+    });
     const memory_diagnostics = @import("../../debug/tracked_allocator.zig").Diagnostics{
         .root = ctx.root_tracker,
         .agent = ctx.agent_backing_tracker,
@@ -118,28 +132,18 @@ pub fn run(
     var interactive = try interactive_mod.Interactive.init(
         ctx.tui_backing_tracker.allocator(),
         ctx.msg_allocator,
-        &ca,
+        runtime_host,
         &memory_diagnostics,
         resolver,
         runtime.cwd,
         runtime.auth_storage,
         runtime.settings_manager,
-        .{
-            .enabled = retry_settings.enabled,
-            .max_retries = @intCast(@max(retry_settings.max_retries, 0)),
-            .base_delay_ms = @intCast(@max(retry_settings.base_delay_ms, 0)),
-            .max_delay_ms = @intCast(@max(retry_settings.max_delay_ms, 0)),
-        },
-        .{
-            .enabled = compaction_settings.enabled,
-            .reserve_tokens = @intCast(@max(compaction_settings.reserve_tokens, 0)),
-            .keep_recent_tokens = @intCast(@max(compaction_settings.keep_recent_tokens, 0)),
-        },
-        compaction_executor,
+        runtime.model_registry,
     );
     defer interactive.deinit();
 
-    applyInteractiveTheme(&interactive, resolveSelectedTheme(&ca, runtime.settings_manager));
+    interactive.runtime_host.setCompactionExecutor(compactor.createExecutor(&interactive.runtime_host));
+    interactive.applyTheme(interactive.runtime_host.selectedTheme());
     interactive.setStartupAction(switch (startup_action) {
         .none => .none,
         .prompt => |prompt| .{ .prompt = prompt },
@@ -252,34 +256,4 @@ test "interactive startup prepares shared @file prompt content" {
         },
         .err => return error.UnexpectedDiagnostic,
     }
-}
-
-fn resolveSelectedTheme(ca: *sdk.AgentSession, settings: *const @import("../settings/manager.zig").SettingsManager) *const theme_mod.Theme {
-    if (settings.getTheme()) |selected_name| {
-        if (ca.resource_loader.findThemeByName(selected_name)) |loaded| {
-            return &loaded.theme;
-        }
-    }
-
-    const fallback_name: []const u8 = switch (theme_mod.Theme.detectTerminalBackground()) {
-        .dark => "dark",
-        .light => "light",
-    };
-    if (ca.resource_loader.findThemeByName(fallback_name)) |loaded| {
-        return &loaded.theme;
-    }
-
-    return themes_builtin.defaultForTerminal();
-}
-
-fn applyInteractiveTheme(interactive: *interactive_mod.Interactive, theme: *const theme_mod.Theme) void {
-    interactive.theme = theme;
-    interactive.greeter.theme = theme;
-    interactive.footer.theme = theme;
-    interactive.hotkeys_overlay.theme = theme;
-    interactive.editor.setTheme(theme);
-    interactive.transcript.theme = theme;
-    interactive.loader.shimmer_edge_fg = theme.fg(.muted);
-    interactive.loader.message_fg = theme.fg(.dim);
-    interactive.loader.shimmer_peak_fg = @import("../../tui/cell.zig").Color.rgb(0xF2, 0xF1, 0xEF);
 }

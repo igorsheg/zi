@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent3/root.zig");
 const agent_impl = @import("../agent3/agent.zig");
+const control_mod = @import("../agent3/control.zig");
 const session_mod = @import("session/root.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
 const tool_def = @import("tools/definition.zig");
@@ -19,6 +20,7 @@ const lua_runtime = @import("extensions/lua_runtime.zig");
 const extension_api = @import("extensions/api.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const lua_tool_mod = @import("extensions/lua_tool.zig");
+const session_event_mod = @import("session_event.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -45,8 +47,8 @@ pub const AgentSession = struct {
     session_store: SessionStore,
     allocator: std.mem.Allocator,
     tools: []const protocol.AgentTool,
-    event_handler: ?EventHandler,
-    event_listeners: std.ArrayList(EventHandler),
+    event_handler: ?RawEventHandler,
+    event_listeners: std.ArrayList(SessionEventHandler),
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
@@ -92,12 +94,22 @@ pub const AgentSession = struct {
     /// on the active branch has not yet been followed by a successful
     /// assistant response with non-zero usage.
     context_usage_unknown_after_compaction: bool = false,
+    queue_mutex: std.Thread.Mutex = .{},
+    steering_mirror: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty,
+    follow_up_mirror: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty,
 
-    pub const EventHandler = struct {
+    pub const RawEventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque = null,
     };
 
+    pub const SessionEventHandler = struct {
+        func: *const fn (event: session_event_mod.SessionEvent, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque = null,
+    };
+
+    pub const EventHandler = RawEventHandler;
+    pub const SessionEvent = session_event_mod.SessionEvent;
     pub const EventSubscriptionToken = struct {
         index: usize,
     };
@@ -144,7 +156,7 @@ pub const AgentSession = struct {
         /// the session takes ownership. Tests typically pass their own
         /// faux-only registry and skip the bundle.
         registry: ?*ai.provider.Registry = null,
-        event_handler: ?EventHandler = null,
+        event_handler: ?RawEventHandler = null,
         auth_storage: ?*auth_storage_mod.AuthStorage = null,
         settings_manager: ?*settings_manager_mod.SettingsManager = null,
         /// Borrowed, caller-owned. Session holds it for the TUI to
@@ -806,6 +818,7 @@ pub const AgentSession = struct {
         if (self._subscription_token) |token| {
             self.agent.unsubscribe(token);
         }
+        self.agent.setQueueObserver(null);
         if (self._extension_runner) |runner| {
             runner.deinit();
             self.allocator.destroy(runner);
@@ -818,6 +831,9 @@ pub const AgentSession = struct {
         }
         self.allocator.destroy(self._stream_closure);
         self.event_listeners.deinit(self.allocator);
+        clearQueueMirror(self);
+        self.steering_mirror.deinit(self.allocator);
+        self.follow_up_mirror.deinit(self.allocator);
         self.agent.deinit();
         self.session_store.deinit();
         self.resource_loader.deinit();
@@ -832,7 +848,7 @@ pub const AgentSession = struct {
 
     pub fn subscribeEvents(
         self: *AgentSession,
-        func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
+        func: *const fn (event: SessionEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque,
     ) EventSubscriptionToken {
         const index = self.event_listeners.items.len;
@@ -846,9 +862,46 @@ pub const AgentSession = struct {
         }
     }
 
+    pub fn cloneQueuedMessageSnapshot(self: *AgentSession, allocator: std.mem.Allocator) !control_mod.QueuedMessageSnapshot {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        const steering = try cloneQueuedEntries(allocator, self.steering_mirror.items);
+        errdefer {
+            freeQueuedEntries(allocator, steering);
+            allocator.free(steering);
+        }
+        const follow_up = try cloneQueuedEntries(allocator, self.follow_up_mirror.items);
+        return .{
+            .steering = steering,
+            .follow_up = follow_up,
+        };
+    }
+
+    pub fn restoreQueuedMessagesOnAgentThread(self: *AgentSession, allocator: std.mem.Allocator) !control_mod.QueuedMessageSnapshot {
+        var snapshot = try self.cloneQueuedMessageSnapshot(allocator);
+        errdefer snapshot.deinit(allocator);
+        self.agent.clearAllQueues();
+        return snapshot;
+    }
+
+    fn emitSessionEvent(self: *AgentSession, event: SessionEvent) void {
+        for (self.event_listeners.items) |handler| {
+            handler.func(event, handler.ctx);
+        }
+    }
+
     /// Subscribe the session persistence listener.
     /// Must be called after self is pinned (not moved).
+    pub fn activateRuntimeHooks(self: *AgentSession) void {
+        self.wireSubscription();
+    }
+
     fn wireSubscription(self: *AgentSession) void {
+        self.agent.setQueueObserver(.{
+            .func = &queueMutationCallback,
+            .ctx = @ptrCast(self),
+        });
         if (self._subscription_token == null) {
             self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
         }
@@ -1031,13 +1084,11 @@ pub const AgentSession = struct {
             else => {},
         }
 
-        // Forward to external handler first
+        // Forward to external raw-event handler first.
         if (self.event_handler) |handler| {
             handler.func(event, handler.ctx);
         }
-        for (self.event_listeners.items) |handler| {
-            handler.func(event, handler.ctx);
-        }
+        self.emitSessionEvent(.{ .agent = event });
 
         // Session persistence on message_end
         switch (event) {
@@ -1257,6 +1308,89 @@ pub fn openSession(
         .model = ctx.model,
         .thinking_level = ctx.thinking_level,
     };
+}
+
+fn queueMutationCallback(
+    action: agent_impl.QueueMutationAction,
+    kind: control_mod.QueueKind,
+    message: protocol.AgentMessage,
+    ctx: ?*anyopaque,
+) void {
+    const self: *AgentSession = @ptrCast(@alignCast(ctx.?));
+    applyQueueMutation(self, action, kind, message);
+}
+
+fn applyQueueMutation(
+    self: *AgentSession,
+    action: agent_impl.QueueMutationAction,
+    kind: control_mod.QueueKind,
+    message: protocol.AgentMessage,
+) void {
+    const text = control_mod.extractQueuedMessageText(message) orelse return;
+    var changed = false;
+
+    self.queue_mutex.lock();
+    const target = switch (kind) {
+        .steering => &self.steering_mirror,
+        .follow_up => &self.follow_up_mirror,
+    };
+
+    switch (action) {
+        .enqueued => {
+            const owned = self.allocator.dupe(u8, text) catch {
+                self.queue_mutex.unlock();
+                return;
+            };
+            target.append(self.allocator, .{ .text = owned }) catch {
+                self.allocator.free(owned);
+                self.queue_mutex.unlock();
+                return;
+            };
+            changed = true;
+        },
+        .drained, .cleared => {
+            if (target.items.len > 0) {
+                const entry = target.orderedRemove(0);
+                self.allocator.free(entry.text);
+                changed = true;
+            }
+        },
+    }
+    self.queue_mutex.unlock();
+
+    if (changed) self.emitSessionEvent(.{ .queue_update = {} });
+}
+
+fn clearQueueMirror(self: *AgentSession) void {
+    self.queue_mutex.lock();
+    defer self.queue_mutex.unlock();
+
+    freeQueuedEntries(self.allocator, self.steering_mirror.items);
+    freeQueuedEntries(self.allocator, self.follow_up_mirror.items);
+    self.steering_mirror.clearRetainingCapacity();
+    self.follow_up_mirror.clearRetainingCapacity();
+}
+
+fn cloneQueuedEntries(
+    allocator: std.mem.Allocator,
+    entries: []const control_mod.QueuedMessageText,
+) ![]control_mod.QueuedMessageText {
+    var out: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty;
+    errdefer {
+        freeQueuedEntries(allocator, out.items);
+        out.deinit(allocator);
+    }
+
+    for (entries) |entry| {
+        const text = try allocator.dupe(u8, entry.text);
+        errdefer allocator.free(text);
+        try out.append(allocator, .{ .text = text });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn freeQueuedEntries(allocator: std.mem.Allocator, entries: []control_mod.QueuedMessageText) void {
+    for (entries) |entry| allocator.free(entry.text);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

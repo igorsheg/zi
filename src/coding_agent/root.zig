@@ -1,6 +1,7 @@
 pub const agent_session = @import("agent_session.zig");
 pub const sdk = @import("sdk.zig");
 pub const session_error_classifier = @import("session_error_classifier.zig");
+pub const session_event = @import("session_event.zig");
 pub const runtime_host = @import("runtime_host.zig");
 pub const request = @import("request.zig");
 pub const system_prompt = @import("system_prompt.zig");
@@ -29,6 +30,7 @@ pub const RetryStart = runtime_host.RetryStart;
 pub const RetryEnd = runtime_host.RetryEnd;
 pub const CompactionReason = runtime_host.CompactionReason;
 pub const CompactionEnd = runtime_host.CompactionEnd;
+pub const SessionEvent = session_event.SessionEvent;
 pub const LifecycleHooks = runtime_host.LifecycleHooks;
 pub const AgentRequest = request.AgentRequest;
 pub const RequestQueue = request.RequestQueue;

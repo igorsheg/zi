@@ -3,6 +3,7 @@ const ai = @import("../ai/root.zig");
 const agent_root = @import("../agent3/root.zig");
 const conversation_state_mod = @import("../agent3/conversation_state.zig");
 const runtime_host_mod = @import("../coding_agent/runtime_host.zig");
+const theme_mod = @import("theme.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
@@ -15,6 +16,7 @@ pub const UiEvent = union(enum) {
 
     // --- errors / status side effects ---
     error_message: struct { message: []u8 },
+    theme_changed: theme_mod.Theme,
     assistant_run_finished: struct {
         is_aborted: bool,
         error_message: ?[]u8,
@@ -132,6 +134,7 @@ pub const UiEvent = union(enum) {
             .consumed => {},
             .conversation_state => |*state| state.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
+            .theme_changed => {},
             .assistant_run_finished => |m| {
                 if (m.error_message) |msg| allocator.free(msg);
             },

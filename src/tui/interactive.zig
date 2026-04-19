@@ -64,6 +64,7 @@ const MouseCapture = union(enum) {
 };
 
 const AgentSession = coding_agent_mod.AgentSession;
+const SessionEvent = coding_agent_mod.session_event.SessionEvent;
 const RuntimeHost = coding_agent_mod.RuntimeHost;
 const ConversationStatePublisher = coding_agent_mod.ConversationStatePublisher;
 const json_util = @import("../ai/json_util.zig");
@@ -379,6 +380,7 @@ pub const Interactive = struct {
     /// See `docs/runtime.md` doctrine R3.
     msg_allocator: std.mem.Allocator,
     tui: TUI,
+    theme_storage: theme_mod.Theme,
     theme: *const theme_mod.Theme = undefined,
     cwd: []const u8 = "",
 
@@ -386,8 +388,9 @@ pub const Interactive = struct {
     editor: editor_mod.Editor,
     /// Active editor interface — routes paste/newline/ctrl+d/clear.
     /// Defaults to the built-in editor. Extensions can swap via setEditor().
-    /// Initialized in init() after self.editor is set up.
+    /// Initialized in run() after self.editor is set up.
     active_editor: EditorInterface = undefined,
+    active_editor_bound: bool = false,
     status_text: text_mod.Text,
     pending_image_banner: text_mod.Text,
     greeter: greeter_mod.Greeter,
@@ -463,9 +466,9 @@ pub const Interactive = struct {
     /// values; the long-lived agent thread wakes, drains, and dispatches
     /// them on the owner thread.
     request_queue: RequestQueue,
-    ca: *AgentSession,
+    model_registry: ?*coding_agent_mod.ModelRegistry,
     memory_diagnostics: *const memory_debug.Diagnostics,
-    agent_event_token: ?AgentSession.EventSubscriptionToken = null,
+    session_event_token: ?RuntimeHost.EventSubscriptionToken = null,
     agent_thread: ?std.Thread = null,
     running: bool = true,
     is_streaming: bool = false,
@@ -485,15 +488,13 @@ pub const Interactive = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         msg_allocator: std.mem.Allocator,
-        ca: *AgentSession,
+        runtime_host: RuntimeHost,
         memory_diagnostics: *const memory_debug.Diagnostics,
         resolver: ToolRendererResolver,
         cwd: []const u8,
         auth_storage: *auth_storage_mod.AuthStorage,
         settings_manager: *settings_manager_mod.SettingsManager,
-        retry_policy: RetryPolicy,
-        compaction_policy: CompactionPolicy,
-        compaction_executor: ?CompactionExecutor,
+        model_registry: ?*coding_agent_mod.ModelRegistry,
     ) !Interactive {
         _ = allocator;
         const theme = themes_builtin.defaultForTerminal();
@@ -503,6 +504,7 @@ pub const Interactive = struct {
             .allocator = state_allocator,
             .msg_allocator = msg_allocator,
             .tui = try TUI.init(state_allocator),
+            .theme_storage = theme.*,
             .theme = theme,
             .cwd = cwd,
             .editor = editor_mod.Editor.init(state_allocator),
@@ -515,11 +517,7 @@ pub const Interactive = struct {
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
             .status_data = StatusData.init(state_allocator),
-            .runtime_host = try RuntimeHost.init(ca, msg_allocator, .{
-                .retry_policy = retry_policy,
-                .compaction_policy = compaction_policy,
-                .compaction_executor = compaction_executor,
-            }),
+            .runtime_host = runtime_host,
             .header_container = container_mod.Container.init(state_allocator),
             .pending_container = container_mod.Container.init(state_allocator),
             .status_container = container_mod.Container.init(state_allocator),
@@ -530,18 +528,12 @@ pub const Interactive = struct {
             .input = input_buffer_mod.InputBuffer.init(state_allocator),
             .event_queue = try UiEventQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
-            .ca = ca,
+            .model_registry = model_registry,
             .memory_diagnostics = memory_diagnostics,
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
-            .model_catalog = if (ca.model_registry) |mr| mr.getAll() else &.{},
+            .model_catalog = if (model_registry) |mr| mr.getAll() else &.{},
         };
-        self.editor.setTheme(theme);
-        self.loader.shimmer_edge_fg = theme.fg(.muted);
-        self.loader.message_fg = theme.fg(.dim);
-        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
-        self.pending_image_banner.fg = theme.fg(.accent);
-        self.pending_image_banner.bg = theme.bg(.tool_pending_bg);
         self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
@@ -549,7 +541,7 @@ pub const Interactive = struct {
         // NOTE: active_editor is bound in run() where self is at its final
         // address. Binding it here would capture a pointer to the local `self`
         // that becomes dangling after the by-value return.
-        self.transcript.theme = theme;
+        self.applyTheme(theme.*);
         return self;
     }
 
@@ -569,7 +561,7 @@ pub const Interactive = struct {
         // request boundary, then enqueue an ordered shutdown, close the
         // transport, and join.
         if (self.agent_thread) |t| {
-            if (self.is_streaming) self.ca.agent.abort();
+            if (self.is_streaming) self.runtime_host.abortCurrentRun();
             self.enqueueAgentShutdown();
             self.request_queue.close();
             t.join();
@@ -580,9 +572,9 @@ pub const Interactive = struct {
             self.request_queue.close();
         }
 
-        if (self.agent_event_token) |token| {
-            self.ca.unsubscribeEvents(token);
-            self.agent_event_token = null;
+        if (self.session_event_token) |token| {
+            self.runtime_host.unsubscribeEvents(token);
+            self.session_event_token = null;
         }
         self.event_queue.close();
 
@@ -640,6 +632,7 @@ pub const Interactive = struct {
         self.kitty_deadline_ns = std.time.nanoTimestamp() + 150_000_000; // 150ms
 
         self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
+        self.active_editor_bound = true;
         self.active_editor.setOnSubmit(&onEditorSubmit, @ptrCast(self));
         self.active_editor.setOnChange(&onEditorChange, @ptrCast(self));
         self.active_editor.setTheme(self.theme);
@@ -647,14 +640,7 @@ pub const Interactive = struct {
         self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.active_editor.setStatusData(&self.status_data);
-        self.agent_event_token = self.ca.subscribeEvents(&agentEventCallback, @ptrCast(self));
-        self.runtime_host.setLifecycleHooks(.{
-            .on_retry_start = &runtimeRetryStartCallback,
-            .on_retry_wait_finished = &runtimeRetryWaitFinishedCallback,
-            .on_retry_end = &runtimeRetryEndCallback,
-            .on_compaction_end = &runtimeCompactionEndCallback,
-            .ctx = @ptrCast(self),
-        });
+        self.session_event_token = self.runtime_host.subscribeEvents(&sessionEventCallback, @ptrCast(self));
 
         self.detectGitBranch();
         try self.startAgentThread();
@@ -851,7 +837,7 @@ pub const Interactive = struct {
                 return;
             }
             if (self.is_streaming) {
-                self.ca.agent.abort();
+                self.runtime_host.abortCurrentRun();
                 self.status_text.setContent("aborted");
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
@@ -871,7 +857,7 @@ pub const Interactive = struct {
                 return;
             }
             if (self.is_streaming) {
-                self.ca.agent.abort();
+                self.runtime_host.abortCurrentRun();
                 self.status_text.setContent("aborted");
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
@@ -1047,6 +1033,10 @@ pub const Interactive = struct {
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+            },
+            .theme_changed => |theme| {
+                self.applyTheme(theme);
                 self.tui.dirty = true;
             },
             .assistant_run_finished => |m| {
@@ -2008,7 +1998,7 @@ pub const Interactive = struct {
         // CLI flag so users get identical semantics: canonical
         // provider/id, inferred-provider-from-slash, alias-vs-dated
         // preference, and fuzzy id/name matching. pi-mono parity.
-        const registry = self.ca.model_registry orelse {
+        const registry = self.model_registry orelse {
             self.status_text.setContent("model registry unavailable");
             self.status_text.fg = self.theme.fg(.@"error");
             return;
@@ -2411,13 +2401,11 @@ pub const Interactive = struct {
     ///   - queued-input restore publishes `.queued_inputs_restored`
     fn agentThreadFn(self: *Interactive) void {
         logging.setThreadLabel(.agent);
-        self.runtime_host.attachQueueMirror();
-        defer self.runtime_host.detachQueueMirror();
 
-        if (self.ca.extensionRunner()) |runner| {
+        if (self.runtime_host.currentSession().extensionRunner()) |runner| {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
-        _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
+        _ = self.publishConversationState();
 
         while (true) {
             _ = self.request_queue.waitReadable(-1) catch break;
@@ -2426,7 +2414,7 @@ pub const Interactive = struct {
             if (self.request_queue.isDrained()) break;
         }
 
-        self.ca.shutdownExtensionsOnAgentThread();
+        self.runtime_host.currentSession().shutdownExtensionsOnAgentThread();
     }
 
     fn enqueueAgentShutdown(self: *Interactive) void {
@@ -2531,12 +2519,12 @@ pub const Interactive = struct {
             .timestamp = std.time.milliTimestamp(),
         } };
         const result = switch (kind) {
-            .steering => self.ca.agent.steer(message),
-            .follow_up => self.ca.agent.followUp(message),
+            .steering => self.runtime_host.currentSession().agent.steer(message),
+            .follow_up => self.runtime_host.currentSession().agent.followUp(message),
         };
         switch (result) {
             .ok => {
-                _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
+                _ = self.publishConversationState();
             },
             .closed, .oom => {
                 const msg = self.msg_allocator.dupe(u8, "agent unavailable") catch return;
@@ -2553,18 +2541,19 @@ pub const Interactive = struct {
         };
         errdefer snapshot.deinit(self.msg_allocator);
 
-        _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
+        _ = self.publishConversationState();
         self.event_queue.push(.{ .queued_inputs_restored = snapshot });
     }
 
     fn handleNewSession(self: *Interactive) void {
-        self.ca.startNewSession() catch |err| {
+        self.runtime_host.newSession() catch |err| {
             const msg = std.fmt.allocPrint(self.msg_allocator, "failed to start new session: {s}", .{@errorName(err)}) catch return;
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
+        self.publishThemeSnapshot();
         self.publishStatusSnapshot();
-        if (!self.runtime_host.publishConversationState(self.conversationStatePublisher())) {
+        if (!self.publishConversationState()) {
             const msg = self.msg_allocator.dupe(u8, "out of memory building conversation state") catch return;
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
@@ -2580,65 +2569,17 @@ pub const Interactive = struct {
     /// Transcript rebuild stays on the TUI thread — this handler
     /// does NOT touch `self.transcript`. That's .15's whole point.
     fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
-        var loaded = coding_agent_mod.openSession(self.ca.allocator, path) catch {
+        const result = self.runtime_host.resumeSession(path, restore_session_model) catch {
             const msg = self.msg_allocator.dupe(u8, "failed to load session") catch return;
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
-        defer loaded.deinit();
 
-        // Agent-thread state mutations (doctrine: session_store +
-        // ca.agent.state are agent-owned). Safe here — we're on the
-        // agent thread and no stream is in flight.
-        var new_store = loaded.takeStore();
-        errdefer new_store.deinit();
-        self.ca.replaceSessionStore(new_store) catch {
-            const msg = self.msg_allocator.dupe(u8, "failed to bind resumed session") catch return;
-            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
-            return;
-        };
-        self.ca.agent.clearAllQueues();
-        self.ca.agent.setMessages(loaded.messages) catch {
-            const msg = self.msg_allocator.dupe(u8, "failed to restore session messages") catch return;
-            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
-            return;
-        };
-        self.ca.agent.setThinkingLevel(parseAgentThinkingLevel(loaded.thinking_level));
+        const restore_warning = result.restore_warning;
 
-        // pi-mono parity: when startup did not pin an explicit CLI model,
-        // restore the session's last model via `restoreModelFromSession`.
-        // Falls back to the current model / first authed model when the
-        // saved one disappeared or lost auth. `restore_warning`, when set,
-        // rides along with `.session_resumed` so it survives the
-        // transcript-rebuild status update on the TUI side.
-        //
-        // pi-mono source: sdk.ts:202-229 and model-resolver.ts:559-628
-        var restore_warning: ?[]u8 = null;
-        if (restore_session_model) {
-            if (loaded.model) |saved| {
-                if (self.ca.model_registry) |registry| {
-                    const restore = ai_resolve.restoreModelFromSession(.{
-                        .saved_provider = saved.provider,
-                        .saved_model_id = saved.model_id,
-                        .current_model = self.ca.agent.modelValue(),
-                        .registry = registry,
-                        .allocator = self.msg_allocator,
-                    }) catch ai_resolve.RestoreResult{ .model = null, .fallback_message = null };
-                    if (restore.model) |m| {
-                        self.ca.agent.setModel(m);
-                    }
-                    if (restore.fallback_message) |msg| {
-                        // `restoreModelFromSession` allocates via
-                        // msg_allocator above; take ownership directly.
-                        // `UiEvent.deinit` frees with the same allocator.
-                        restore_warning = msg;
-                    }
-                }
-            }
-        }
-
+        self.publishThemeSnapshot();
         self.publishStatusSnapshot();
-        if (!self.runtime_host.publishConversationState(self.conversationStatePublisher())) {
+        if (!self.publishConversationState()) {
             if (restore_warning) |warning| self.msg_allocator.free(warning);
             const msg = self.msg_allocator.dupe(u8, "out of memory building conversation state") catch return;
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
@@ -2647,6 +2588,10 @@ pub const Interactive = struct {
         self.event_queue.push(.{ .session_resumed = .{
             .restore_warning = restore_warning,
         } });
+    }
+
+    fn publishConversationState(self: *Interactive) bool {
+        return self.runtime_host.publishConversationState(self.conversationStatePublisher());
     }
 
     fn conversationStatePublisher(self: *Interactive) ConversationStatePublisher {
@@ -2666,7 +2611,7 @@ pub const Interactive = struct {
     /// `AgentSession.trySetModel`, then translates the typed outcome
     /// into a TUI-owned event payload.
     fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
-        switch (self.ca.trySetModel(m)) {
+        switch (self.runtime_host.currentSession().trySetModel(m)) {
             .success => |_| {
                 self.publishStatusSnapshot();
                 self.event_queue.push(.{ .model_switched = {} });
@@ -2687,8 +2632,31 @@ pub const Interactive = struct {
         }
     }
 
+    fn publishThemeSnapshot(self: *Interactive) void {
+        self.event_queue.push(.{ .theme_changed = self.runtime_host.selectedTheme() });
+    }
+
+    pub fn applyTheme(self: *Interactive, theme: theme_mod.Theme) void {
+        self.theme_storage = theme;
+        self.theme = &self.theme_storage;
+        self.greeter.theme = self.theme;
+        self.footer.theme = self.theme;
+        self.hotkeys_overlay.theme = self.theme;
+        if (self.active_editor_bound) {
+            self.active_editor.setTheme(self.theme);
+        } else {
+            self.editor.setTheme(self.theme);
+        }
+        self.transcript.theme = self.theme;
+        self.loader.shimmer_edge_fg = self.theme.fg(.muted);
+        self.loader.message_fg = self.theme.fg(.dim);
+        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
+        self.pending_image_banner.fg = self.theme.fg(.accent);
+        self.pending_image_banner.bg = self.theme.bg(.tool_pending_bg);
+    }
+
     fn publishStatusSnapshot(self: *Interactive) void {
-        const snapshot = self.ca.statusSnapshot();
+        const snapshot = self.runtime_host.currentSession().statusSnapshot();
         if (self.shouldSkipStatusSnapshotPublish(snapshot)) return;
 
         const provider_copy = self.msg_allocator.dupe(u8, snapshot.model_provider) catch return;
@@ -2737,7 +2705,7 @@ pub const Interactive = struct {
     }
 
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
-        _ = self.ca.trySetThinkingLevel(level);
+        _ = self.runtime_host.currentSession().trySetThinkingLevel(level);
         self.publishStatusSnapshot();
         self.event_queue.push(.{ .thinking_level_changed = {} });
     }
@@ -2745,63 +2713,62 @@ pub const Interactive = struct {
     fn publishConversationStateForAgentEvent(self: *Interactive, event: AgentEvent) void {
         switch (event) {
             .message_start => |payload| switch (payload.message) {
-                .assistant => _ = self.runtime_host.publishConversationState(self.conversationStatePublisher()),
+                .assistant => _ = self.publishConversationState(),
                 else => {},
             },
             .message_update, .message_end, .tool_execution_start, .tool_execution_update, .tool_execution_end, .agent_end => {
-                _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
+                _ = self.publishConversationState();
             },
             .turn_end => |payload| {
                 if (payload.message != .assistant) return;
-                _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
+                _ = self.publishConversationState();
             },
             .agent_start, .turn_start => {},
         }
     }
 
-    /// Raw agent event callback — runs on the AGENT THREAD.
-    fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
+    /// Session event callback — runs on the AGENT THREAD.
+    fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.publishConversationStateForAgentEvent(event);
-        if (convertAgentUiEvent(event, self.msg_allocator)) |ui_event| {
-            self.event_queue.push(ui_event);
+        switch (event) {
+            .agent => |agent_event| {
+                self.publishConversationStateForAgentEvent(agent_event);
+                if (convertAgentUiEvent(agent_event, self.msg_allocator)) |ui_event| {
+                    self.event_queue.push(ui_event);
+                }
+                self.publishStatusSnapshotForAgentEvent(agent_event);
+            },
+            .queue_update => {
+                _ = self.publishConversationState();
+            },
+            .auto_retry_start => |retry| {
+                const err_msg = self.msg_allocator.dupe(u8, retry.error_message) catch return;
+                self.event_queue.push(.{ .retry_start = .{
+                    .attempt = retry.attempt,
+                    .max_attempts = retry.max_attempts,
+                    .delay_ms = retry.delay_ms,
+                    .error_message = err_msg,
+                } });
+            },
+            .auto_retry_wait_finished => {
+                self.event_queue.push(.retry_wait_finished);
+            },
+            .auto_retry_end => |retry| {
+                const final_error = if (retry.final_error) |msg|
+                    (self.msg_allocator.dupe(u8, msg) catch null)
+                else
+                    null;
+                self.event_queue.push(.{ .retry_end = .{
+                    .success = retry.success,
+                    .attempt = retry.attempt,
+                    .final_error = final_error,
+                } });
+            },
+            .compaction_end => {
+                self.publishStatusSnapshot();
+                _ = self.publishConversationState();
+            },
         }
-        self.publishStatusSnapshotForAgentEvent(event);
-    }
-
-    fn runtimeRetryStartCallback(event: coding_agent_mod.runtime_host.RetryStart, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        const err_msg = self.msg_allocator.dupe(u8, event.error_message) catch return;
-        self.event_queue.push(.{ .retry_start = .{
-            .attempt = event.attempt,
-            .max_attempts = event.max_attempts,
-            .delay_ms = event.delay_ms,
-            .error_message = err_msg,
-        } });
-    }
-
-    fn runtimeRetryWaitFinishedCallback(ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.event_queue.push(.retry_wait_finished);
-    }
-
-    fn runtimeRetryEndCallback(event: coding_agent_mod.runtime_host.RetryEnd, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        const final_error = if (event.final_error) |msg|
-            (self.msg_allocator.dupe(u8, msg) catch null)
-        else
-            null;
-        self.event_queue.push(.{ .retry_end = .{
-            .success = event.success,
-            .attempt = event.attempt,
-            .final_error = final_error,
-        } });
-    }
-
-    fn runtimeCompactionEndCallback(_: coding_agent_mod.runtime_host.CompactionEnd, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.publishStatusSnapshot();
-        _ = self.runtime_host.publishConversationState(self.conversationStatePublisher());
     }
 };
 

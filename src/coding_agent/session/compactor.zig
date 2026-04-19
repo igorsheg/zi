@@ -39,16 +39,17 @@ const summarization_prompt =
     "- [important concrete details]\n\n" ++
     "Keep it concise. Preserve exact file paths, function names, and error messages.";
 
-pub fn createExecutor(session: *AgentSession) CompactionExecutor {
+pub fn createExecutor(host: *runtime_host.RuntimeHost) CompactionExecutor {
     return .{
         .func = &execute,
-        .ctx = @ptrCast(session),
+        .ctx = @ptrCast(host),
     };
 }
 
 fn execute(reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult {
     _ = reason;
-    const session: *AgentSession = @ptrCast(@alignCast(ctx.?));
+    const host: *runtime_host.RuntimeHost = @ptrCast(@alignCast(ctx.?));
+    const session = host.currentSession();
 
     var arena = std.heap.ArenaAllocator.init(session.allocator);
     defer arena.deinit();
