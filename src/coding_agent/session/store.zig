@@ -3,6 +3,7 @@ const proto = @import("../../session/protocol.zig");
 const writer_mod = @import("writer.zig");
 const reader_mod = @import("reader.zig");
 const context_mod = @import("../../session/context.zig");
+const context_usage = @import("../../session/context_usage.zig");
 const storage = @import("../../storage.zig");
 const agent_mod = @import("../../agent3/root.zig");
 
@@ -36,6 +37,28 @@ pub fn freeSessionInfos(allocator: std.mem.Allocator, sessions: []SessionInfo) v
     allocator.free(sessions);
 }
 
+pub const OpenSessionResult = struct {
+    store: ?SessionStore,
+    context_arena: std.heap.ArenaAllocator,
+    messages: []agent_mod.protocol.AgentMessage,
+    model: ?context_mod.SessionContext.ModelInfo,
+    thinking_level: []const u8,
+
+    pub fn deinit(self: *OpenSessionResult) void {
+        self.context_arena.deinit();
+        if (self.store) |*store| {
+            store.deinit();
+            self.store = null;
+        }
+    }
+
+    pub fn takeStore(self: *OpenSessionResult) SessionStore {
+        const store = self.store orelse @panic("OpenSessionResult.takeStore called twice");
+        self.store = null;
+        return store;
+    }
+};
+
 /// Facade over session writer/reader/context.
 /// Manages a single session's lifecycle: create, open, append, read, build context.
 pub const SessionStore = struct {
@@ -51,14 +74,20 @@ pub const SessionStore = struct {
     cached_header: ?proto.SessionHeader = null,
 
     /// Create a new session. `session_dir` is the already-resolved directory
-    /// (from `sdk.resolveSessionDir`) so v2's `session_directory` extension
-    /// hook has a chance to override it before the store exists. Callers
-    /// that don't care can pass `storage.getSessionDirForCwd(...)` directly.
+    /// so callers that need custom placement can decide it before persistence
+    /// begins.
     pub fn create(allocator: std.mem.Allocator, session_dir: []const u8, project_cwd: []const u8) SessionStore {
         return .{
             .allocator = allocator,
             .writer = writer_mod.SessionWriter.init(allocator, session_dir, project_cwd),
         };
+    }
+
+    /// Create a new persisted session for a cwd using zi's canonical session directory layout.
+    pub fn createForCwd(allocator: std.mem.Allocator, project_cwd: []const u8) !SessionStore {
+        const session_dir = try storage.getSessionDirForCwd(allocator, project_cwd, null);
+        defer allocator.free(session_dir);
+        return SessionStore.create(allocator, session_dir, project_cwd);
     }
 
     /// Create an ephemeral session (no disk persistence).
@@ -184,6 +213,12 @@ pub const SessionStore = struct {
         self.writer.appendLabel(target_id, label);
     }
 
+    /// Seed the fresh session with the runtime defaults that should survive resume.
+    pub fn appendRuntimeDefaults(self: *SessionStore, provider: []const u8, model_id: []const u8, thinking_level: []const u8) void {
+        self.appendModelChange(provider, model_id);
+        self.appendThinkingLevelChange(thinking_level);
+    }
+
     // ── Context building ─────────────────────────────────────────
 
     /// Build the LLM context from this session's entries.
@@ -195,6 +230,24 @@ pub const SessionStore = struct {
 
     pub fn buildCurrentContext(self: *SessionStore) !context_mod.SessionContext {
         return self.buildContext(.current);
+    }
+
+    /// Open a session file for resume and build the current branch context in one step.
+    pub fn openForResume(allocator: std.mem.Allocator, session_path: []const u8) !OpenSessionResult {
+        var store = try SessionStore.open(allocator, session_path);
+        errdefer store.deinit();
+
+        var context_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer context_arena.deinit();
+
+        const ctx = try store.buildCurrentContextAlloc(context_arena.allocator());
+        return .{
+            .store = store,
+            .context_arena = context_arena,
+            .messages = ctx.messages,
+            .model = ctx.model,
+            .thinking_level = ctx.thinking_level,
+        };
     }
 
     pub fn buildContextAlloc(self: *SessionStore, allocator: std.mem.Allocator, selection: context_mod.LeafSelection) !context_mod.SessionContext {
@@ -219,6 +272,23 @@ pub const SessionStore = struct {
 
     pub fn buildCurrentBranchAlloc(self: *SessionStore, allocator: std.mem.Allocator) ![]const proto.SessionEntry {
         return self.buildBranchEntriesAlloc(allocator, .current);
+    }
+
+    /// Append a compaction entry and rebuild the current branch context.
+    pub fn applyCompaction(self: *SessionStore, summary: []const u8, first_kept_entry_id: []const u8, tokens_before: u64) !context_mod.SessionContext {
+        self.appendCompaction(summary, first_kept_entry_id, tokens_before);
+        return self.buildCurrentContext();
+    }
+
+    /// Whether the latest compaction on the current branch has not yet been
+    /// followed by a successful assistant response with non-zero usage.
+    pub fn contextUsageUnknownAfterCompaction(self: *SessionStore, allocator: std.mem.Allocator) bool {
+        if (self.cached_entries == null) return false;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const branch = self.buildCurrentBranchAlloc(arena.allocator()) catch return false;
+        if (context_mod.getLatestCompactionEntry(branch) == null) return false;
+        return !hasPostCompactionUsage(branch);
     }
 
     pub fn readEntries(self: *SessionStore) ![]proto.SessionEntry {
@@ -251,6 +321,25 @@ pub const SessionStore = struct {
         self.cached_header = null;
     }
 };
+
+fn hasPostCompactionUsage(branch: []const proto.SessionEntry) bool {
+    var i: usize = branch.len;
+    scan: while (i > 0) {
+        i -= 1;
+        switch (branch[i].entry) {
+            .compaction => break :scan,
+            .message => |m| switch (m.message) {
+                .assistant => |assistant| switch (assistant.stop_reason) {
+                    .aborted, .@"error" => {},
+                    else => return context_usage.calculateContextTokens(assistant.usage) > 0,
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return false;
+}
 
 // ── Session discovery ────────────────────────────────────────────────
 
@@ -528,6 +617,120 @@ fn truncatePreview(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
     }
 
     return allocator.dupe(u8, scratch[0..pos]) catch null;
+}
+
+fn testUserMessage(text: []const u8, timestamp: i64) agent_mod.protocol.AgentMessage {
+    return .{ .user = .{
+        .content = .{ .text = text },
+        .timestamp = timestamp,
+    } };
+}
+
+fn testAssistantMessageWithUsage(allocator: std.mem.Allocator, text: []const u8, total_tokens: u64, timestamp: i64) !agent_mod.protocol.AgentMessage {
+    const content = try allocator.alloc(@import("../../ai/root.zig").protocol.AssistantMessage.AssistantContentBlock, 1);
+    content[0] = .{ .text = .{ .text = text } };
+    return .{ .assistant = .{
+        .content = content,
+        .api = .anthropic_messages,
+        .provider = .anthropic,
+        .model = "claude-test",
+        .usage = .{
+            .input = total_tokens,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = total_tokens,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .stop,
+        .timestamp = timestamp,
+    } };
+}
+
+test "openForResume returns resume context and transfers store ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "session.jsonl",
+        .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
+            "{\"type\":\"model_change\",\"id\":\"m0\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:00Z\",\"provider\":\"anthropic\",\"modelId\":\"claude\"}\n" ++
+            "{\"type\":\"thinking_level_change\",\"id\":\"t0\",\"parentId\":\"m0\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"thinkingLevel\":\"high\"}\n" ++
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":\"t0\",\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
+    });
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session.jsonl");
+    defer std.testing.allocator.free(path);
+
+    var opened = try SessionStore.openForResume(std.testing.allocator, path);
+    defer opened.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), opened.messages.len);
+    try std.testing.expectEqualStrings("high", opened.thinking_level);
+    try std.testing.expect(opened.model != null);
+    try std.testing.expectEqualStrings("anthropic", opened.model.?.provider);
+    try std.testing.expectEqualStrings("claude", opened.model.?.model_id);
+    try std.testing.expectEqualStrings("hi", opened.messages[0].user.content.text);
+
+    var resumed_store = opened.takeStore();
+    defer resumed_store.deinit();
+    try std.testing.expectEqualStrings("abc", resumed_store.sessionId());
+    try std.testing.expectEqualStrings("u1", resumed_store.currentEntryId().?);
+}
+
+test "appendRuntimeDefaults seeds model change before thinking level change" {
+    var store = SessionStore.createEphemeral(std.testing.allocator);
+    defer store.deinit();
+
+    store.appendRuntimeDefaults("anthropic", "claude", "high");
+
+    const buffered = store.writer.buffered_entries.items;
+    try std.testing.expectEqual(@as(usize, 2), buffered.len);
+    try std.testing.expect(buffered[0] == .entry);
+    try std.testing.expect(buffered[0].entry.entry == .model_change);
+    try std.testing.expectEqualStrings("anthropic", buffered[0].entry.entry.model_change.provider);
+    try std.testing.expectEqualStrings("claude", buffered[0].entry.entry.model_change.model_id);
+    try std.testing.expect(buffered[1] == .entry);
+    try std.testing.expect(buffered[1].entry.entry == .thinking_level_change);
+    try std.testing.expectEqualStrings("high", buffered[1].entry.entry.thinking_level_change.thinking_level);
+}
+
+test "applyCompaction appends summary and rebuilds current context" {
+    var store = SessionStore.createEphemeral(std.testing.allocator);
+    defer store.deinit();
+
+    store.appendMessage(testUserMessage("first", 1));
+    store.appendMessage(testUserMessage("second", 2));
+
+    const rebuilt = try store.applyCompaction("summary", store.currentEntryId().?, 42);
+
+    try std.testing.expectEqual(@as(usize, 2), rebuilt.messages.len);
+    try std.testing.expect(rebuilt.messages[0] == .compaction_summary);
+    try std.testing.expectEqualStrings("summary", rebuilt.messages[0].compaction_summary.summary);
+    try std.testing.expect(rebuilt.messages[1] == .user);
+    try std.testing.expectEqualStrings("second", rebuilt.messages[1].user.content.text);
+}
+
+test "contextUsageUnknownAfterCompaction tracks post-compaction assistant usage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var store = SessionStore.createEphemeral(allocator);
+    defer store.deinit();
+
+    store.appendMessage(testUserMessage("first", 1));
+    store.appendMessage(try testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
+    store.appendMessage(testUserMessage("second", 3));
+    const kept_user_id = store.currentEntryId().?;
+    store.appendMessage(try testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
+    store.appendCompaction("summary", kept_user_id, 195_000);
+    store.appendMessage(testUserMessage("third", 5));
+
+    try std.testing.expect(store.contextUsageUnknownAfterCompaction(allocator));
+
+    store.appendMessage(try testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
+    try std.testing.expect(!store.contextUsageUnknownAfterCompaction(allocator));
 }
 
 test "open duplicates writer session and leaf ids from cached session data" {

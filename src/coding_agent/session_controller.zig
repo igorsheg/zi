@@ -1,17 +1,18 @@
 const runtime_host = @import("runtime_host.zig");
+const session_runner = @import("session_runner.zig");
 
 pub const SessionController = runtime_host.RuntimeHost;
-pub const Options = runtime_host.Options;
-pub const LifecycleHooks = runtime_host.LifecycleHooks;
-pub const RunOutcome = runtime_host.RunOutcome;
-pub const RetryStart = runtime_host.RetryStart;
-pub const RetryEnd = runtime_host.RetryEnd;
-pub const CompactionReason = runtime_host.CompactionReason;
-pub const CompactionEnd = runtime_host.CompactionEnd;
-pub const RetryPolicy = runtime_host.RetryPolicy;
-pub const CompactionPolicy = runtime_host.CompactionPolicy;
-pub const CompactionResult = runtime_host.CompactionResult;
-pub const CompactionExecutor = runtime_host.CompactionExecutor;
+pub const Options = session_runner.Options;
+pub const LifecycleHooks = session_runner.LifecycleHooks;
+pub const RunOutcome = session_runner.RunOutcome;
+pub const RetryStart = session_runner.RetryStart;
+pub const RetryEnd = session_runner.RetryEnd;
+pub const CompactionReason = session_runner.CompactionReason;
+pub const CompactionEnd = session_runner.CompactionEnd;
+pub const RetryPolicy = session_runner.RetryPolicy;
+pub const CompactionPolicy = session_runner.CompactionPolicy;
+pub const CompactionResult = session_runner.CompactionResult;
+pub const CompactionExecutor = session_runner.CompactionExecutor;
 pub const ConversationStatePublisher = runtime_host.ConversationStatePublisher;
 
 test {

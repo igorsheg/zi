@@ -7,7 +7,7 @@ const agent_session_mod = @import("agent_session.zig");
 const AgentSession = agent_session_mod.AgentSession;
 const sdk = @import("sdk.zig");
 const resolve_mod = @import("resolve.zig");
-const classifier = @import("session_error_classifier.zig");
+const session_runner = @import("session_runner.zig");
 const conversation_state = @import("../agent3/conversation_state.zig");
 const theme_mod = @import("../tui/theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
@@ -18,55 +18,18 @@ pub const EnqueueResult = control_mod.EnqueueResult;
 pub const QueuedMessageText = control_mod.QueuedMessageText;
 pub const QueuedMessageSnapshot = control_mod.QueuedMessageSnapshot;
 
-pub const RunOutcome = enum {
-    success,
-    assistant_error,
-    aborted,
-};
-
-pub const RetryStart = session_event_mod.RetryStart;
-pub const RetryEnd = session_event_mod.RetryEnd;
-pub const CompactionReason = session_event_mod.CompactionReason;
-pub const CompactionEnd = session_event_mod.CompactionEnd;
+pub const RunOutcome = session_runner.RunOutcome;
+pub const RetryStart = session_runner.RetryStart;
+pub const RetryEnd = session_runner.RetryEnd;
+pub const CompactionReason = session_runner.CompactionReason;
+pub const CompactionEnd = session_runner.CompactionEnd;
 pub const SessionEvent = session_event_mod.SessionEvent;
-
-pub const RetryPolicy = struct {
-    enabled: bool = true,
-    max_retries: u32 = 3,
-    base_delay_ms: u64 = 2000,
-    max_delay_ms: u64 = 30000,
-};
-
-pub const CompactionPolicy = struct {
-    enabled: bool = true,
-    reserve_tokens: u64 = 16384,
-    keep_recent_tokens: u64 = 20000,
-};
-
-pub const CompactionResult = struct {
-    summary: []const u8,
-    first_kept_entry_id: []const u8,
-    tokens_before: u64,
-};
-
-pub const CompactionExecutor = struct {
-    func: *const fn (reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult,
-    ctx: ?*anyopaque = null,
-};
-
-pub const LifecycleHooks = struct {
-    on_retry_start: ?*const fn (event: RetryStart, ctx: ?*anyopaque) void = null,
-    on_retry_wait_finished: ?*const fn (ctx: ?*anyopaque) void = null,
-    on_retry_end: ?*const fn (event: RetryEnd, ctx: ?*anyopaque) void = null,
-    on_compaction_end: ?*const fn (event: CompactionEnd, ctx: ?*anyopaque) void = null,
-    ctx: ?*anyopaque = null,
-};
-
-pub const Options = struct {
-    retry_policy: RetryPolicy = .{},
-    compaction_policy: CompactionPolicy = .{},
-    compaction_executor: ?CompactionExecutor = null,
-};
+pub const RetryPolicy = session_runner.RetryPolicy;
+pub const CompactionPolicy = session_runner.CompactionPolicy;
+pub const CompactionResult = session_runner.CompactionResult;
+pub const CompactionExecutor = session_runner.CompactionExecutor;
+pub const LifecycleHooks = session_runner.LifecycleHooks;
+pub const Options = session_runner.Options;
 
 pub const ConversationStatePublisher = struct {
     func: *const fn (state: conversation_state.PublishedConversationState, ctx: ?*anyopaque) void,
@@ -82,15 +45,9 @@ pub const RuntimeHost = struct {
     session_allocator: std.mem.Allocator,
     msg_allocator: std.mem.Allocator,
     create_options: sdk.CreateOptions,
-    retry_policy: RetryPolicy,
-    compaction_policy: CompactionPolicy,
-    compaction_executor: ?CompactionExecutor,
-    lifecycle_hooks: LifecycleHooks = .{},
+    runner: session_runner.SessionRunner,
     event_listeners: std.ArrayList(EventHandler),
     session_event_token: ?AgentSession.EventSubscriptionToken = null,
-    retry_attempt: u32 = 0,
-    overflow_recovery_attempted: bool = false,
-    retry_abort_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const EventHandler = struct {
         func: *const fn (event: SessionEvent, ctx: ?*anyopaque) void,
@@ -99,11 +56,6 @@ pub const RuntimeHost = struct {
 
     pub const EventSubscriptionToken = struct {
         index: usize,
-    };
-
-    const RunMode = enum {
-        prompt,
-        continue_turn,
     };
 
     pub fn init(
@@ -118,9 +70,7 @@ pub const RuntimeHost = struct {
             .session_allocator = session_allocator,
             .msg_allocator = msg_allocator,
             .create_options = create_options,
-            .retry_policy = options.retry_policy,
-            .compaction_policy = options.compaction_policy,
-            .compaction_executor = options.compaction_executor,
+            .runner = session_runner.SessionRunner.init(options),
             .event_listeners = .empty,
         };
         self.session.activateRuntimeHooks();
@@ -177,11 +127,11 @@ pub const RuntimeHost = struct {
     }
 
     pub fn setLifecycleHooks(self: *RuntimeHost, hooks: LifecycleHooks) void {
-        self.lifecycle_hooks = hooks;
+        self.runner.setLifecycleHooks(hooks);
     }
 
     pub fn setCompactionExecutor(self: *RuntimeHost, executor: ?CompactionExecutor) void {
-        self.compaction_executor = executor;
+        self.runner.setCompactionExecutor(executor);
     }
 
     /// Agent-thread-only helper for the queued-input restore flow.
@@ -190,8 +140,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn abortRetry(self: *RuntimeHost) void {
-        self.retry_abort_requested.store(true, .release);
-        self.session.agent.wakeAbortWaiters();
+        self.runner.abortRetry(self.session);
     }
 
     pub fn abortCurrentRun(self: *RuntimeHost) void {
@@ -209,20 +158,21 @@ pub const RuntimeHost = struct {
         create_options.initial_messages = &.{};
         create_options.thinking_level = self.session.agent.thinkingLevel();
 
-        const session_dir = try sdk.resolveSessionDir(self.session_allocator, create_options.cwd);
-        defer self.session_allocator.free(session_dir);
-        var new_store = agent_session_mod.SessionStore.create(self.session_allocator, session_dir, create_options.cwd);
+        var new_store = try agent_session_mod.SessionStore.createForCwd(self.session_allocator, create_options.cwd);
         errdefer new_store.deinit();
         create_options.session_store = new_store;
 
         const next = try self.createOwnedSession(create_options);
-        next.session_store.appendModelChange(json_util.providerToString(next.agent.modelValue().provider), next.agent.modelValue().id);
-        next.session_store.appendThinkingLevelChange(thinkingLevelToString(next.agent.thinkingLevel()));
+        next.session_store.appendRuntimeDefaults(
+            json_util.providerToString(next.agent.modelValue().provider),
+            next.agent.modelValue().id,
+            thinkingLevelToString(next.agent.thinkingLevel()),
+        );
         self.replaceSession(next);
     }
 
     pub fn resumeSession(self: *RuntimeHost, path: []const u8, restore_session_model: bool) !ResumeResult {
-        var loaded = try agent_session_mod.openSession(self.session_allocator, path);
+        var loaded = try agent_session_mod.SessionStore.openForResume(self.session_allocator, path);
         defer loaded.deinit();
 
         var create_options = self.create_options;
@@ -258,50 +208,15 @@ pub const RuntimeHost = struct {
     }
 
     pub fn runUserContent(self: *RuntimeHost, content: ai.protocol.UserMessage.UserMessageContent) !RunOutcome {
-        return self.runWithRecovery(.prompt, content);
+        return self.runner.runUserContent(self.session, self.runnerEventEmitter(), content);
     }
 
     pub fn continueTurn(self: *RuntimeHost) !RunOutcome {
-        return self.runWithRecovery(.continue_turn, null);
+        return self.runner.continueTurn(self.session, self.runnerEventEmitter());
     }
 
     pub fn runCompaction(self: *RuntimeHost, reason: CompactionReason, will_retry: bool) !CompactionResult {
-        if (!self.compaction_policy.enabled) {
-            self.notifyCompactionEnd(.{
-                .reason = reason,
-                .success = false,
-                .will_retry = false,
-                .error_message = "CompactionDisabled",
-            });
-            return error.CompactionDisabled;
-        }
-
-        const executor = self.compaction_executor orelse {
-            self.notifyCompactionEnd(.{
-                .reason = reason,
-                .success = false,
-                .will_retry = false,
-                .error_message = "CompactionUnavailable",
-            });
-            return error.CompactionUnavailable;
-        };
-
-        const result = executor.func(reason, self.compaction_policy, executor.ctx) catch |err| {
-            self.notifyCompactionEnd(.{
-                .reason = reason,
-                .success = false,
-                .will_retry = false,
-                .error_message = @errorName(err),
-            });
-            return err;
-        };
-
-        self.notifyCompactionEnd(.{
-            .reason = reason,
-            .success = true,
-            .will_retry = will_retry,
-        });
-        return result;
+        return self.runner.runCompaction(self.session, self.runnerEventEmitter(), reason, will_retry);
     }
 
     pub fn publishConversationState(
@@ -362,189 +277,13 @@ pub const RuntimeHost = struct {
         if (had_runtime_listeners) self.bindSessionEvents();
     }
 
-    fn runWithRecovery(
-        self: *RuntimeHost,
-        initial_mode: RunMode,
-        prompt_content: ?ai.protocol.UserMessage.UserMessageContent,
-    ) !RunOutcome {
-        self.retry_attempt = 0;
-        self.overflow_recovery_attempted = false;
-        self.retry_abort_requested.store(false, .release);
-        defer {
-            self.retry_attempt = 0;
-            self.overflow_recovery_attempted = false;
-            self.retry_abort_requested.store(false, .release);
-        }
-
-        var mode = initial_mode;
-        while (true) {
-            switch (mode) {
-                .prompt => try self.session.runUserContent(prompt_content.?),
-                .continue_turn => try self.session.continueSession(),
-            }
-
-            const outcome = self.resolveRunOutcome();
-            if (outcome != .assistant_error) {
-                self.overflow_recovery_attempted = false;
-                if (self.retry_attempt > 0) {
-                    self.notifyRetryEnd(.{
-                        .success = true,
-                        .attempt = self.retry_attempt,
-                    });
-                }
-                return outcome;
-            }
-
-            const assistant = self.latestAssistantMessage() orelse return outcome;
-            const classification = classifier.classifyAssistantMessage(
-                &assistant,
-                self.session.agent.modelValue().context_window,
-            );
-            switch (classification.class) {
-                .retryable_transient => {
-                    if (!self.beginRetry(classification.error_message orelse assistant.error_message orelse "unknown error")) {
-                        return outcome;
-                    }
-
-                    self.pruneTransientAssistantError();
-                    if (self.waitForRetryDelay(self.computeRetryDelayMs())) {
-                        self.notifyRetryEnd(.{
-                            .success = false,
-                            .attempt = self.retry_attempt,
-                            .final_error = "Retry cancelled",
-                        });
-                        return .aborted;
-                    }
-
-                    self.notifyRetryWaitFinished();
-                    mode = .continue_turn;
-                },
-                .overflow => {
-                    if (!self.isLatestAssistantFromCurrentModel(assistant)) return outcome;
-                    if (self.overflow_recovery_attempted) {
-                        self.notifyCompactionEnd(.{
-                            .reason = .overflow,
-                            .success = false,
-                            .will_retry = false,
-                            .error_message = "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
-                        });
-                        return outcome;
-                    }
-
-                    self.overflow_recovery_attempted = true;
-                    self.pruneTransientAssistantError();
-                    _ = self.runCompaction(.overflow, true) catch return outcome;
-                    mode = .continue_turn;
-                },
-                else => return outcome,
-            }
-        }
-    }
-
-    fn latestAssistantMessage(self: *RuntimeHost) ?ai.protocol.AssistantMessage {
-        return self.session.agent.latestAssistant();
-    }
-
-    fn resolveRunOutcome(self: *RuntimeHost) RunOutcome {
-        if (self.session.agent.isAbortRequested()) return .aborted;
-        const assistant = self.latestAssistantMessage() orelse return .success;
-        return switch (assistant.stop_reason) {
-            .aborted => .aborted,
-            .@"error" => .assistant_error,
-            else => .success,
+    fn runnerEventEmitter(self: *RuntimeHost) session_runner.EventEmitter {
+        return .{
+            .func = &sessionEventBridge,
+            .ctx = @ptrCast(self),
         };
-    }
-
-    fn isLatestAssistantFromCurrentModel(self: *const RuntimeHost, assistant: ai.protocol.AssistantMessage) bool {
-        const model = self.session.agent.modelValue();
-        return std.mem.eql(u8, json_util.providerToString(assistant.provider), json_util.providerToString(model.provider)) and
-            std.mem.eql(u8, assistant.model, model.id);
-    }
-
-    fn beginRetry(self: *RuntimeHost, error_message: []const u8) bool {
-        if (!self.retry_policy.enabled) return false;
-
-        const next_attempt = self.retry_attempt + 1;
-        if (next_attempt > self.retry_policy.max_retries) {
-            self.notifyRetryEnd(.{
-                .success = false,
-                .attempt = self.retry_attempt,
-                .final_error = error_message,
-            });
-            return false;
-        }
-
-        self.retry_attempt = next_attempt;
-        self.notifyRetryStart(.{
-            .attempt = self.retry_attempt,
-            .max_attempts = self.retry_policy.max_retries,
-            .delay_ms = self.computeRetryDelayMs(),
-            .error_message = error_message,
-        });
-        return true;
-    }
-
-    fn computeRetryDelayMs(self: *const RuntimeHost) u64 {
-        var delay = self.retry_policy.base_delay_ms;
-        var n: u32 = 1;
-        while (n < self.retry_attempt) : (n += 1) {
-            if (self.retry_policy.max_delay_ms > 0 and delay >= self.retry_policy.max_delay_ms / 2) {
-                return self.retry_policy.max_delay_ms;
-            }
-            delay *= 2;
-        }
-        if (self.retry_policy.max_delay_ms > 0 and delay > self.retry_policy.max_delay_ms) {
-            return self.retry_policy.max_delay_ms;
-        }
-        return delay;
-    }
-
-    fn waitForRetryDelay(self: *RuntimeHost, delay_ms: u64) bool {
-        return switch (self.session.agent.abortSignal().waitUntil(
-            delay_ms * @as(u64, std.time.ns_per_ms),
-            &retryAbortRequested,
-            @ptrCast(self),
-        )) {
-            .aborted, .predicate => true,
-            .timeout, .none => self.retry_abort_requested.load(.acquire) or self.session.agent.isAbortRequested(),
-        };
-    }
-
-    fn pruneTransientAssistantError(self: *RuntimeHost) void {
-        const messages = self.session.agent.messages();
-        if (messages.len == 0) return;
-        const last = messages[messages.len - 1];
-        if (last != .assistant) return;
-        if (last.assistant.stop_reason != .@"error") return;
-        self.session.agent.truncateCommitted(messages.len - 1);
-        self.session.agent.clearError();
-    }
-
-    fn notifyRetryStart(self: *RuntimeHost, event: RetryStart) void {
-        self.emitSessionEvent(.{ .auto_retry_start = event });
-        if (self.lifecycle_hooks.on_retry_start) |cb| cb(event, self.lifecycle_hooks.ctx);
-    }
-
-    fn notifyRetryWaitFinished(self: *RuntimeHost) void {
-        self.emitSessionEvent(.{ .auto_retry_wait_finished = {} });
-        if (self.lifecycle_hooks.on_retry_wait_finished) |cb| cb(self.lifecycle_hooks.ctx);
-    }
-
-    fn notifyRetryEnd(self: *RuntimeHost, event: RetryEnd) void {
-        self.emitSessionEvent(.{ .auto_retry_end = event });
-        if (self.lifecycle_hooks.on_retry_end) |cb| cb(event, self.lifecycle_hooks.ctx);
-    }
-
-    fn notifyCompactionEnd(self: *RuntimeHost, event: CompactionEnd) void {
-        self.emitSessionEvent(.{ .compaction_end = event });
-        if (self.lifecycle_hooks.on_compaction_end) |cb| cb(event, self.lifecycle_hooks.ctx);
     }
 };
-
-fn retryAbortRequested(ctx: ?*anyopaque) bool {
-    const self: *RuntimeHost = @ptrCast(@alignCast(ctx.?));
-    return self.retry_abort_requested.load(.acquire);
-}
 
 fn parseThinkingLevel(value: []const u8) agent_mod.protocol.ThinkingLevel {
     if (std.mem.eql(u8, value, "minimal")) return .minimal;
@@ -608,7 +347,7 @@ const CompactionSpy = struct {
     allocator: std.mem.Allocator,
     calls: std.ArrayListUnmanaged(CompactionReason) = .empty,
 
-    fn execute(reason: CompactionReason, _: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult {
+    fn execute(_: *AgentSession, reason: CompactionReason, _: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult {
         const self: *CompactionSpy = @ptrCast(@alignCast(ctx.?));
         try self.calls.append(self.allocator, reason);
         return .{

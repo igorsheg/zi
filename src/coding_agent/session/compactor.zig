@@ -5,14 +5,14 @@ const coding_agent = @import("../root.zig");
 const context_mod = @import("../../session/context.zig");
 const context_usage = @import("../../session/context_usage.zig");
 const proto = @import("../../session/protocol.zig");
-const runtime_host = @import("../runtime_host.zig");
+const session_runner = @import("../session_runner.zig");
 
 const AgentSession = coding_agent.AgentSession;
 const AgentMessage = agent.protocol.AgentMessage;
-const CompactionPolicy = runtime_host.CompactionPolicy;
-const CompactionReason = runtime_host.CompactionReason;
-const CompactionExecutor = runtime_host.CompactionExecutor;
-const CompactionResult = runtime_host.CompactionResult;
+const CompactionPolicy = session_runner.CompactionPolicy;
+const CompactionReason = session_runner.CompactionReason;
+const CompactionExecutor = session_runner.CompactionExecutor;
+const CompactionResult = session_runner.CompactionResult;
 
 const summarization_system_prompt =
     "You are summarizing conversation history for another coding agent. Be precise, terse, and preserve exact file paths, function names, constraints, errors, and next steps.";
@@ -39,17 +39,15 @@ const summarization_prompt =
     "- [important concrete details]\n\n" ++
     "Keep it concise. Preserve exact file paths, function names, and error messages.";
 
-pub fn createExecutor(host: *runtime_host.RuntimeHost) CompactionExecutor {
+pub fn createExecutor() CompactionExecutor {
     return .{
         .func = &execute,
-        .ctx = @ptrCast(host),
     };
 }
 
-fn execute(reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult {
+fn execute(session: *AgentSession, reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult {
     _ = reason;
-    const host: *runtime_host.RuntimeHost = @ptrCast(@alignCast(ctx.?));
-    const session = host.currentSession();
+    _ = ctx;
 
     var arena = std.heap.ArenaAllocator.init(session.allocator);
     defer arena.deinit();
@@ -62,8 +60,7 @@ fn execute(reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque)
     const max_tokens = @max(@divTrunc(policy.reserve_tokens * 4, 5), 1024);
     const summary = try session.completeUserText(session.allocator, summarization_system_prompt, prompt_text, max_tokens);
 
-    session.session_store.appendCompaction(summary, prep.first_kept_entry_id, prep.tokens_before);
-    const new_context = try session.session_store.buildCurrentContext();
+    const new_context = try session.session_store.applyCompaction(summary, prep.first_kept_entry_id, prep.tokens_before);
     try session.agent.setMessages(new_context.messages);
     session.noteCompactionApplied();
     session.agent.clearError();

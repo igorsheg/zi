@@ -142,7 +142,7 @@ pub fn run(
     );
     defer interactive.deinit();
 
-    interactive.runtime_host.setCompactionExecutor(compactor.createExecutor(&interactive.runtime_host));
+    interactive.runtime_host.setCompactionExecutor(compactor.createExecutor());
     interactive.applyTheme(interactive.runtime_host.selectedTheme());
     interactive.setStartupAction(switch (startup_action) {
         .none => .none,

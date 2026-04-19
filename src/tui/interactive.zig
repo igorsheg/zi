@@ -1473,12 +1473,10 @@ pub const Interactive = struct {
 
     fn sleepUntilNextLoopDeadline(self: *Interactive) void {
         const now_ns = std.time.nanoTimestamp();
-        const max_idle_sleep_ns: i128 = 8_333_334; // ≈120 FPS cap while still honoring timer deadlines even with mailbox wakeups
-        const timeout_ns: i128 = if (self.nextLoopDeadlineNs(now_ns)) |deadline|
-            if (deadline <= now_ns) 0 else @min(deadline - now_ns, max_idle_sleep_ns)
+        const timeout_ms: i32 = if (self.nextLoopDeadlineNs(now_ns)) |deadline|
+            if (deadline <= now_ns) 0 else @intCast(@divFloor(deadline - now_ns + 999_999, 1_000_000))
         else
-            max_idle_sleep_ns;
-        const timeout_ms: i32 = @intCast(@divFloor(timeout_ns + 999_999, 1_000_000));
+            -1;
 
         var pfds = [2]posix.pollfd{
             .{

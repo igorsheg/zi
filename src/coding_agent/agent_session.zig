@@ -16,9 +16,9 @@ const settings_manager_mod = @import("settings/manager.zig");
 const settings_types_mod = @import("settings/types.zig");
 const model_registry_mod = @import("model_registry.zig");
 const storage = @import("../storage.zig");
+const extension_api = @import("extensions/api.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
-const extension_api = @import("extensions/api.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const lua_tool_mod = @import("extensions/lua_tool.zig");
 const session_event_mod = @import("session_event.zig");
@@ -138,73 +138,130 @@ pub const AgentSession = struct {
         context_window: u64,
     };
 
+    pub const PreparedDeps = struct {
+        session_store: SessionStore,
+        resource_loader: resources.ResourceLoader,
+        stream_closure: *StreamClosure,
+        system_prompt: []const u8,
+        tools: []const protocol.AgentTool,
+        owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
+        builtin_ctx: ?*builtin_util.BuiltinCtx = null,
+        extension_runner: ?*ExtensionRunner = null,
+        extension_lua_state: ?*lua_runtime.LuaState = null,
+    };
+
     pub const Options = struct {
         model: ai.protocol.Model,
-        /// Static API key fallback. Used only when no `auth_storage` is
-        /// attached or its lookup returns empty. Tests pass this; real
-        /// callers should set `auth_storage` so token refresh / login
-        /// flows are picked up live by the stream closure.
+        prepared: PreparedDeps,
+        event_handler: ?RawEventHandler = null,
+        auth_storage: ?*auth_storage_mod.AuthStorage = null,
+        settings_manager: ?*settings_manager_mod.SettingsManager = null,
+        model_registry: ?*model_registry_mod.ModelRegistry = null,
+        initial_messages: []const protocol.AgentMessage = &.{},
+        thinking_level: ?protocol.ThinkingLevel = null,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, options: Options) AgentSession {
+        var prepared = options.prepared;
+        const stream_hook = protocol.StreamHook{
+            .func = &StreamClosure.streamFn,
+            .ctx = @ptrCast(prepared.stream_closure),
+        };
+        const get_api_key_hook: ?protocol.GetApiKeyHook = if (options.auth_storage) |as| .{
+            .func = &getApiKeyFromStorage,
+            .ctx = @ptrCast(@constCast(as)),
+        } else null;
+
+        const before_tool_hook: ?protocol.BeforeToolCallHook = if (prepared.extension_runner) |runner| .{
+            .func = &event_bridge.beforeToolCall,
+            .ctx = @ptrCast(runner),
+        } else null;
+        const after_tool_hook: ?protocol.AfterToolCallHook = if (prepared.extension_runner) |runner| .{
+            .func = &event_bridge.afterToolCall,
+            .ctx = @ptrCast(runner),
+        } else null;
+
+        const agent = Agent.init(allocator, .{
+            .system_prompt = prepared.system_prompt,
+            .model = options.model,
+            .tools = prepared.tools,
+            .messages = options.initial_messages,
+            .thinking_level = options.thinking_level orelse .off,
+            .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
+            .stream_fn = stream_hook,
+            .session_id = prepared.session_store.sessionId(),
+            .get_api_key = get_api_key_hook,
+            .before_tool_call = before_tool_hook,
+            .after_tool_call = after_tool_hook,
+        }) catch @panic("OOM");
+        const context_usage_unknown_after_compaction = prepared.session_store.contextUsageUnknownAfterCompaction(allocator);
+
+        return .{
+            .agent = agent,
+            .session_store = prepared.session_store,
+            .allocator = allocator,
+            .tools = prepared.tools,
+            .event_handler = options.event_handler,
+            .event_listeners = .empty,
+            ._subscription_token = null,
+            ._stream_closure = prepared.stream_closure,
+            .auth_storage = options.auth_storage,
+            .settings_manager = options.settings_manager,
+            .resource_loader = prepared.resource_loader,
+            .model_registry = options.model_registry,
+            ._owned_provider_bundle = prepared.owned_provider_bundle,
+            ._builtin_ctx = prepared.builtin_ctx,
+            .context_usage_unknown_after_compaction = context_usage_unknown_after_compaction,
+            ._extension_runner = prepared.extension_runner,
+            ._extension_lua_state = prepared.extension_lua_state,
+        };
+    }
+
+    /// Test-only raw bootstrap path.
+    ///
+    /// Keep this in sync with `sdk.prepareSessionDeps`. Production
+    /// construction must flow through sdk; this helper exists so the
+    /// in-file tests can build sessions without importing sdk and
+    /// creating an import cycle back into AgentSession.
+    const TestInitOptions = struct {
+        model: ai.protocol.Model,
         api_key: []const u8 = "",
         cwd: []const u8,
-        /// Canonical loaded resource state, constructed by the
-        /// composition root (`sdk.createAgentSession`) and transferred
-        /// into the session as an owned dependency.
         resource_loader: resources.ResourceLoader,
         max_tokens: ?u64 = 4096,
         tools: ?[]const tool_def.ToolDefinition = null,
-        /// Optional pre-built provider registry. When null, the sdk
-        /// factory creates one via `ai.provider_defaults.Bundle` and
-        /// the session takes ownership. Tests typically pass their own
-        /// faux-only registry and skip the bundle.
         registry: ?*ai.provider.Registry = null,
         event_handler: ?RawEventHandler = null,
         auth_storage: ?*auth_storage_mod.AuthStorage = null,
         settings_manager: ?*settings_manager_mod.SettingsManager = null,
-        /// Borrowed, caller-owned. Session holds it for the TUI to
-        /// read via `getAll()` and for future resolve calls. Phase 2:
-        /// main.zig constructs the registry before this init.
         model_registry: ?*model_registry_mod.ModelRegistry = null,
-        /// Seed with existing messages for --continue.
         initial_messages: []const protocol.AgentMessage = &.{},
-        /// Initial thinking level (from findInitialModel).
         thinking_level: ?protocol.ThinkingLevel = null,
-        /// Pre-built session store (from SessionStore.open for --continue).
-        /// If null, a new session is created for `cwd`.
         session_store: ?SessionStore = null,
         no_session: bool = false,
-        /// Strict tool allowlist. When non-null, the final
-        /// precedence-resolved tool set is filtered to only tools
-        /// whose `name` or `label` matches an entry in this
-        /// list (case-insensitive). Empty slice → zero tools.
-        /// Null → no filtering (default).
-        ///
-        /// Mirrors pi-mono's `--tools` CLI contract: the flag is a
-        /// hard whitelist the parent binary enforces, so subagents
-        /// (Task) that spawn children with `--tools bash,read` get
-        /// EXACTLY those tools — not those plus whatever extensions
-        /// the child process happens to discover. Without this,
-        /// Task-in-Task spawns recurse because the child re-registers
-        /// Task from `~/.zi/agent/extensions/task.lua`.
         tool_allowlist: ?[]const []const u8 = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator, options: Options) AgentSession {
-        // Fallback path when no store was pre-built by the sdk factory.
-        // The preferred entry point is `sdk.createAgentSession`, which
-        // runs `resolveSessionDir` up front (v2 hook point). Direct
-        // `AgentSession.init` callers — tests, the odd standalone — get
-        // the default directory here without the extension hook.
+    pub fn initTestSession(allocator: std.mem.Allocator, options: TestInitOptions) AgentSession {
+        const prepared = prepareTestDeps(allocator, options);
+        return AgentSession.init(allocator, .{
+            .model = options.model,
+            .prepared = prepared,
+            .event_handler = options.event_handler,
+            .auth_storage = options.auth_storage,
+            .settings_manager = options.settings_manager,
+            .model_registry = options.model_registry,
+            .initial_messages = options.initial_messages,
+            .thinking_level = options.thinking_level,
+        });
+    }
+
+    fn prepareTestDeps(allocator: std.mem.Allocator, options: TestInitOptions) PreparedDeps {
         var store = options.session_store orelse if (options.no_session)
             SessionStore.createEphemeral(allocator)
-        else blk: {
-            const default_dir = storage.getSessionDirForCwd(allocator, options.cwd, null) catch @panic("OOM");
-            break :blk SessionStore.create(allocator, default_dir, options.cwd);
-        };
+        else
+            SessionStore.createForCwd(allocator, options.cwd) catch @panic("OOM");
 
-        // Default built-ins: bash + read/write/edit/grep/find/ls.
-        // The bundle owns a per-session BuiltinCtx (cwd + session id)
-        // that every tool ctx pointer references for the session
-        // lifetime.
         const image_auto_resize = if (options.settings_manager) |settings|
             settings.getImageAutoResize()
         else
@@ -219,10 +276,6 @@ pub const AgentSession = struct {
             break :blk @as([]const tool_def.ToolDefinition, bundle.definitions);
         };
 
-        // Resolve the provider registry. The preferred path: sdk passes
-        // null and we own a Bundle for the session lifetime. Tests pass
-        // their own faux registry and we skip the bundle. Either way the
-        // closure sees a real `*Registry` and never branches on null.
         var owned_bundle: ?*ai.provider_defaults.Bundle = null;
         const registry: *ai.provider.Registry = options.registry orelse blk: {
             const bundle = ai.provider_defaults.Bundle.init(allocator) catch @panic("OOM");
@@ -237,20 +290,11 @@ pub const AgentSession = struct {
             .api_key = options.api_key,
             .max_tokens = options.max_tokens,
         };
-        const stream_hook = protocol.StreamHook{
-            .func = &StreamClosure.streamFn,
-            .ctx = @ptrCast(closure),
-        };
 
         var resource_loader = options.resource_loader;
         const prompt_inputs = resource_loader.getPromptInputs();
         const loaded_extensions = resource_loader.getExtensions();
 
-        // Construct the extension runtime BEFORE building the tools
-        // list so Lua-registered tools can join the agent's tool set.
-        // Failures here are non-fatal: ext_state/ext_runner stay null,
-        // builtin tools still flow through, agent runs without
-        // extensions. See `docs/extensions.md`.
         var ext_state: ?*lua_runtime.LuaState = null;
         var ext_runner: ?*ExtensionRunner = null;
         ext_setup: {
@@ -271,26 +315,22 @@ pub const AgentSession = struct {
             ext_state = state_ptr;
             ext_runner = runner_ptr;
 
-            // Configure `package.path` so extensions can
-            // `require("lib/foo")` relative to their extension dir.
-            // Dirs are best-effort — missing ones are silently
-            // skipped.
             const agent_dir = storage.getAgentDir(allocator, null) catch null;
-            defer if (agent_dir) |d| allocator.free(d);
+            defer if (agent_dir) |dir| allocator.free(dir);
             const project_dir = storage.getProjectDir(allocator, options.cwd) catch null;
-            defer if (project_dir) |d| allocator.free(d);
-            const agent_ext = if (agent_dir) |d| std.fs.path.join(allocator, &.{ d, "extensions" }) catch null else null;
-            defer if (agent_ext) |d| allocator.free(d);
-            const project_ext = if (project_dir) |d| std.fs.path.join(allocator, &.{ d, "extensions" }) catch null else null;
-            defer if (project_ext) |d| allocator.free(d);
+            defer if (project_dir) |dir| allocator.free(dir);
+            const agent_ext = if (agent_dir) |dir| std.fs.path.join(allocator, &.{ dir, "extensions" }) catch null else null;
+            defer if (agent_ext) |dir| allocator.free(dir);
+            const project_ext = if (project_dir) |dir| std.fs.path.join(allocator, &.{ dir, "extensions" }) catch null else null;
+            defer if (project_ext) |dir| allocator.free(dir);
             var dirs_buf: [2][]const u8 = .{ "", "" };
             var dirs_n: usize = 0;
-            if (project_ext) |d| {
-                dirs_buf[dirs_n] = d;
+            if (project_ext) |dir| {
+                dirs_buf[dirs_n] = dir;
                 dirs_n += 1;
             }
-            if (agent_ext) |d| {
-                dirs_buf[dirs_n] = d;
+            if (agent_ext) |dir| {
+                dirs_buf[dirs_n] = dir;
                 dirs_n += 1;
             }
             state_ptr.setPackagePath(dirs_buf[0..dirs_n]) catch {};
@@ -307,20 +347,20 @@ pub const AgentSession = struct {
             registerBaseToolDefinitions(runner_ptr, builtin_definitions);
         }
 
-        const definitions: []const tool_def.ToolDefinition = if (ext_runner) |r|
-            r.tool_registry.items()
+        const definitions: []const tool_def.ToolDefinition = if (ext_runner) |runner|
+            runner.tool_registry.items()
         else
             builtin_definitions;
 
         const filtered_definitions: []const tool_def.ToolDefinition = if (options.tool_allowlist) |allow| blk_f: {
             const filtered = allocator.alloc(tool_def.ToolDefinition, definitions.len) catch break :blk_f definitions;
             var fi: usize = 0;
-            for (definitions) |t| {
+            for (definitions) |definition| {
                 for (allow) |want| {
-                    const w = std.mem.trim(u8, want, &std.ascii.whitespace);
-                    if (w.len == 0) continue;
-                    if (std.ascii.eqlIgnoreCase(w, t.name) or std.ascii.eqlIgnoreCase(w, t.label)) {
-                        filtered[fi] = t;
+                    const trimmed = std.mem.trim(u8, want, &std.ascii.whitespace);
+                    if (trimmed.len == 0) continue;
+                    if (std.ascii.eqlIgnoreCase(trimmed, definition.name) or std.ascii.eqlIgnoreCase(trimmed, definition.label)) {
+                        filtered[fi] = definition;
                         fi += 1;
                         break;
                     }
@@ -332,14 +372,14 @@ pub const AgentSession = struct {
         const filtered_tools: []const protocol.AgentTool = blk: {
             const out = allocator.alloc(protocol.AgentTool, filtered_definitions.len) catch break :blk &.{};
             var n: usize = 0;
-            for (filtered_definitions) |def| {
-                const tool = switch (def.impl) {
-                    .builtin => tool_def.toAgentTool(def),
-                    .lua => if (ext_runner) |r|
-                        lua_tool_mod.buildAgentTool(allocator, r, def) catch |err| {
+            for (filtered_definitions) |definition| {
+                const tool = switch (definition.impl) {
+                    .builtin => tool_def.toAgentTool(definition),
+                    .lua => if (ext_runner) |runner|
+                        lua_tool_mod.buildAgentTool(allocator, runner, definition) catch |err| {
                             std.log.scoped(.extensions).warn(
                                 "failed to build agent tool for {s}: {s}",
-                                .{ def.name, @errorName(err) },
+                                .{ definition.name, @errorName(err) },
                             );
                             continue;
                         }
@@ -361,7 +401,7 @@ pub const AgentSession = struct {
             null;
         defer if (skills_section) |section| allocator.free(section);
 
-        const sys_prompt = blk: {
+        const system_prompt = blk: {
             if (prompt_inputs.system_prompt) |custom| {
                 break :blk system_prompt_mod.buildSystemPrompt(allocator, .{
                     .custom_prompt = custom,
@@ -385,64 +425,17 @@ pub const AgentSession = struct {
             }) catch "You are a helpful coding assistant.";
         };
 
-        const get_api_key_hook: ?protocol.GetApiKeyHook = if (options.auth_storage) |as| .{
-            .func = &getApiKeyFromStorage,
-            .ctx = @ptrCast(@constCast(as)),
-        } else null;
-
-        // Build hooks AFTER ext setup so we can use the runner ptr
-        // as the hook ctx. Hooks are nil when no runner exists; the
-        // agent loop already short-circuits null hooks.
-        const before_tool_hook: ?protocol.BeforeToolCallHook = if (ext_runner) |r| .{
-            .func = &event_bridge.beforeToolCall,
-            .ctx = @ptrCast(r),
-        } else null;
-        const after_tool_hook: ?protocol.AfterToolCallHook = if (ext_runner) |r| .{
-            .func = &event_bridge.afterToolCall,
-            .ctx = @ptrCast(r),
-        } else null;
-
-        const a = Agent.init(allocator, .{
-            .system_prompt = sys_prompt,
-            .model = options.model,
-            .tools = filtered_tools,
-            .messages = options.initial_messages,
-            .thinking_level = options.thinking_level orelse .off,
-            .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
-            .stream_fn = stream_hook,
-            .session_id = store.sessionId(),
-            .get_api_key = get_api_key_hook,
-            .before_tool_call = before_tool_hook,
-            .after_tool_call = after_tool_hook,
-        }) catch @panic("OOM");
-        const context_usage_unknown_after_compaction = contextUsageUnknownFromStore(allocator, &store);
-
-        const self = AgentSession{
-            .agent = a,
+        return .{
             .session_store = store,
-            .allocator = allocator,
-            .tools = filtered_tools,
-            .event_handler = options.event_handler,
-            .event_listeners = .empty,
-            ._subscription_token = null,
-            ._stream_closure = closure,
-            .auth_storage = options.auth_storage,
-            .settings_manager = options.settings_manager,
             .resource_loader = resource_loader,
-            .model_registry = options.model_registry,
-            ._owned_provider_bundle = owned_bundle,
-            ._builtin_ctx = builtin_ctx,
-            .context_usage_unknown_after_compaction = context_usage_unknown_after_compaction,
-            ._extension_runner = ext_runner,
-            ._extension_lua_state = ext_state,
+            .stream_closure = closure,
+            .system_prompt = system_prompt,
+            .tools = filtered_tools,
+            .owned_provider_bundle = owned_bundle,
+            .builtin_ctx = builtin_ctx,
+            .extension_runner = ext_runner,
+            .extension_lua_state = ext_state,
         };
-
-        // Subscribe for session persistence: write message_end entries.
-        // We use a pointer to self, so self must be pinned after init.
-        // The caller must not move self after calling init.
-        // We'll wire this up in run/continueSession instead.
-
-        return self;
     }
 
     fn registerBaseToolDefinitions(
@@ -682,19 +675,17 @@ pub const AgentSession = struct {
     /// Ownership: agent-thread only. Mutates `session_store` and
     /// `agent.state`, both owned by the agent thread per doctrine.
     pub fn startNewSession(self: *AgentSession) !void {
-        var new_store = blk: {
-            const cwd = self.resource_loader.cwd;
-            const session_dir = try storage.getSessionDirForCwd(self.allocator, cwd, null);
-            defer self.allocator.free(session_dir);
-            break :blk SessionStore.create(self.allocator, session_dir, cwd);
-        };
+        var new_store = try SessionStore.createForCwd(self.allocator, self.resource_loader.cwd);
         errdefer new_store.deinit();
 
         try self.replaceSessionStore(new_store);
         self.agent.reset();
         const current_model = self.agent.modelValue();
-        self.session_store.appendModelChange(ai.json_util.providerToString(current_model.provider), current_model.id);
-        self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(self.agent.thinkingLevel()));
+        self.session_store.appendRuntimeDefaults(
+            ai.json_util.providerToString(current_model.provider),
+            current_model.id,
+            agentThinkingLevelToString(self.agent.thinkingLevel()),
+        );
     }
 
     /// Current context usage for the active model.
@@ -740,7 +731,7 @@ pub const AgentSession = struct {
     }
 
     fn refreshContextUsageStateFromStore(self: *AgentSession) void {
-        self.context_usage_unknown_after_compaction = contextUsageUnknownFromStore(self.allocator, &self.session_store);
+        self.context_usage_unknown_after_compaction = self.session_store.contextUsageUnknownAfterCompaction(self.allocator);
     }
 
     fn noteMessageForContextUsage(self: *AgentSession, message: protocol.AgentMessage) void {
@@ -756,37 +747,6 @@ pub const AgentSession = struct {
             },
             else => {},
         }
-    }
-
-    fn contextUsageUnknownFromStore(
-        allocator: std.mem.Allocator,
-        store: *SessionStore,
-    ) bool {
-        if (store.cached_entries == null) return false;
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const branch = store.buildCurrentBranchAlloc(arena.allocator()) catch return false;
-        if (session_core.context.getLatestCompactionEntry(branch) == null) return false;
-        return !hasPostCompactionUsage(branch);
-    }
-
-    fn hasPostCompactionUsage(branch: []const session_core.protocol.SessionEntry) bool {
-        var i: usize = branch.len;
-        scan: while (i > 0) {
-            i -= 1;
-            switch (branch[i].entry) {
-                .compaction => break :scan,
-                .message => |m| switch (m.message) {
-                    .assistant => |assistant| switch (assistant.stop_reason) {
-                        .aborted, .@"error" => {},
-                        else => return session_core.context_usage.calculateContextTokens(assistant.usage) > 0,
-                    },
-                    else => {},
-                },
-                else => {},
-            }
-        }
-        return false;
     }
 
     fn contextUsageFromMessages(context_window: u64, messages: []const protocol.AgentMessage) ContextUsage {
@@ -1112,7 +1072,7 @@ pub const AgentSession = struct {
     /// rebuilding the session) and falls back to the static
     /// `api_key` snapshot only when no auth storage is attached
     /// (the test path). See beads zi-yjc for the bug this fixes.
-    const StreamClosure = struct {
+    pub const StreamClosure = struct {
         registry: *ai.provider.Registry,
         auth_storage: ?*auth_storage_mod.AuthStorage,
         api_key: []const u8,
@@ -1257,56 +1217,6 @@ pub fn convertToLlm(
     return result.items;
 }
 
-pub const OpenSessionResult = struct {
-    allocator: std.mem.Allocator,
-    store: ?SessionStore,
-    context_arena: std.heap.ArenaAllocator,
-    messages: []protocol.AgentMessage,
-    model: ?session_core.context.SessionContext.ModelInfo,
-    thinking_level: []const u8,
-
-    pub fn deinit(self: *OpenSessionResult) void {
-        self.context_arena.deinit();
-        if (self.store) |*store| {
-            store.deinit();
-            self.store = null;
-        }
-    }
-
-    pub fn takeStore(self: *OpenSessionResult) SessionStore {
-        const store = self.store orelse @panic("OpenSessionResult.takeStore called twice");
-        self.store = null;
-        return store;
-    }
-};
-
-/// Open a session file and build context for --continue.
-/// Returns an owned result that carries both the SessionStore (ready for
-/// appending) and the resolved context. Callers must either `deinit()` the
-/// result or `takeStore()` before deinit when transferring store ownership.
-///
-/// pi-mono: SessionManager.buildSessionContext → Agent.state.messages = existingSession.messages
-pub fn openSession(
-    allocator: std.mem.Allocator,
-    session_path: []const u8,
-) !OpenSessionResult {
-    var store = try SessionStore.open(allocator, session_path);
-    errdefer store.deinit();
-
-    var context_arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer context_arena.deinit();
-
-    const ctx = try store.buildCurrentContextAlloc(context_arena.allocator());
-    return .{
-        .allocator = allocator,
-        .store = store,
-        .context_arena = context_arena,
-        .messages = ctx.messages,
-        .model = ctx.model,
-        .thinking_level = ctx.thinking_level,
-    };
-}
-
 fn queueMutationCallback(
     action: agent_impl.QueueMutationAction,
     kind: control_mod.QueueKind,
@@ -1410,7 +1320,7 @@ test "trySetModel updates session state and appends model change when auth exist
     try registry.register("faux", fp.provider(), null);
 
     const target = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    var ca = AgentSession.init(alloc, .{
+    var ca = AgentSession.initTestSession(alloc, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1451,7 +1361,7 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
     try registry.register("faux", fp.provider(), null);
 
     const target = model_registry.find(.anthropic, "claude-sonnet-4-20250514") orelse return error.MissingCatalogEntry;
-    var ca = AgentSession.init(alloc, .{
+    var ca = AgentSession.initTestSession(alloc, .{
         .model = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry,
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1494,7 +1404,7 @@ test "trySetModel persists defaults through settings manager" {
     try registry.register("faux", fp.provider(), null);
 
     const target = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    var ca = AgentSession.init(alloc, .{
+    var ca = AgentSession.initTestSession(alloc, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1533,7 +1443,7 @@ test "trySetThinkingLevel persists default through settings manager" {
     try registry.register("faux", fp.provider(), null);
 
     const initial = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    var ca = AgentSession.init(alloc, .{
+    var ca = AgentSession.initTestSession(alloc, .{
         .model = initial,
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1568,7 +1478,7 @@ test "trySetModel rejects unauthed model without mutating state or session" {
 
     const initial = faux.fauxModel();
     const blocked = model_registry.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    var ca = AgentSession.init(alloc, .{
+    var ca = AgentSession.initTestSession(alloc, .{
         .model = initial,
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1789,7 +1699,7 @@ fn createTestAgentSession(
     registry: *ai.provider.Registry,
     collector: *EventCollector,
 ) AgentSession {
-    return AgentSession.init(allocator, .{
+    return AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1929,7 +1839,7 @@ test "AgentSession: getContextUsage falls back to in-memory messages for no-sess
     var registry = ai.provider.Registry.init(allocator);
     try registry.register("faux", fp.provider(), null);
     var collector = EventCollector.init(allocator);
-    var session = AgentSession.init(allocator, .{
+    var session = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -1995,7 +1905,7 @@ test "AgentSession: in-memory compaction state clears on the first successful po
     var registry = ai.provider.Registry.init(allocator);
     try registry.register("faux", fp.provider(), null);
     var collector = EventCollector.init(allocator);
-    var session = AgentSession.init(allocator, .{
+    var session = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -2093,7 +2003,7 @@ test "AgentSession: tool_allowlist filters the post-precedence tool set" {
     try registry.register("faux", fp.provider(), null);
 
     const allow = [_][]const u8{"read"};
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "k",
         .cwd = "/tmp/zi-test",
@@ -2146,7 +2056,7 @@ test "AgentSession: user extension overrides builtin tool at execution time" {
 
     var collector = EventCollector.init(allocator);
     defer collector.deinit();
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -2193,7 +2103,7 @@ test "AgentSession: final prompt metadata comes from the winning tool definition
     defer registry.deinit();
     try registry.register("faux", fp.provider(), null);
 
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -2361,7 +2271,7 @@ test "AgentSession: session persistence round-trip" {
     const session_file = ca.getSessionFile();
 
     // Read back the session file
-    var loaded = try openSession(allocator, session_file);
+    var loaded = try SessionStore.openForResume(allocator, session_file);
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
@@ -2428,7 +2338,7 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     const tools = [_]tool_def.ToolDefinition{echo_tool};
 
     var collector = EventCollector.init(allocator);
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -2485,7 +2395,7 @@ test "AgentSession: replaceSessionStore rebinds resumed session ids for agent an
     var registry = ai.provider.Registry.init(allocator);
     defer registry.deinit();
 
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .cwd = "/tmp/zi-test",
         .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
@@ -2516,7 +2426,7 @@ test "AgentSession: startNewSession resets transcript and seeds model plus think
     var registry = ai.provider.Registry.init(allocator);
     defer registry.deinit();
 
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .cwd = "/tmp/zi-test",
         .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
@@ -2559,7 +2469,7 @@ test "AgentSession: startNewSession switches ephemeral sessions onto normal pers
     var registry = ai.provider.Registry.init(allocator);
     defer registry.deinit();
 
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .cwd = "/tmp/zi-test",
         .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
@@ -2595,7 +2505,7 @@ test "AgentSession: continue sends restored context to provider" {
     try reg1.register("faux", fp1.provider(), null);
 
     var col1 = EventCollector.init(allocator);
-    var ca1 = AgentSession.init(allocator, .{
+    var ca1 = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -2611,7 +2521,7 @@ test "AgentSession: continue sends restored context to provider" {
     const session_file = ca1.getSessionFile();
 
     // Phase 2: load the session and continue with a new user message
-    var loaded = try openSession(allocator, session_file);
+    var loaded = try SessionStore.openForResume(allocator, session_file);
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
@@ -2632,7 +2542,7 @@ test "AgentSession: continue sends restored context to provider" {
     try all_messages.appendSlice(allocator, loaded.messages);
     try all_messages.append(allocator, new_user);
 
-    var ca2 = AgentSession.init(allocator, .{
+    var ca2 = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
@@ -2681,7 +2591,7 @@ test "AgentSession: compaction_summary converted to user message for provider" {
         .{ .user = .{ .content = .{ .text = "next question" }, .timestamp = 2 } },
     };
 
-    var ca = AgentSession.init(allocator, .{
+    var ca = AgentSession.initTestSession(allocator, .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
