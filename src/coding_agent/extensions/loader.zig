@@ -1,0 +1,563 @@
+const std = @import("std");
+const storage = @import("../../storage.zig");
+const lua_runtime = @import("lua_runtime.zig");
+const runner_mod = @import("runner.zig");
+
+const log = std.log.scoped(.extensions);
+
+/// Max extension file size. 1 MiB is absurdly generous for a Lua
+/// script; anything larger is almost certainly a mistake (binary
+/// in the wrong dir, runaway generator). Capping here keeps the
+/// read path bounded without needing streaming.
+const MAX_EXTENSION_SIZE: usize = 1024 * 1024;
+
+/// Source of an extension file.
+pub const ExtensionSource = enum { explicit, user, project, builtin };
+
+/// Discovered extension descriptor. Strings owned by the allocator passed to discover().
+pub const LoadedExtension = struct {
+    id: []const u8, // basename without .lua, or dir name for init.lua
+    path: []const u8, // absolute path to the .lua file to load
+    source: ExtensionSource,
+};
+
+/// Options for extension discovery.
+pub const DiscoverOptions = struct {
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    explicit_paths: []const []const u8 = &.{},
+    agent_dir_override: ?[]const u8 = null,
+};
+
+/// Track seen IDs within a source to avoid duplicates.
+const SeenIds = struct {
+    ids: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn contains(self: *const SeenIds, id: []const u8) bool {
+        for (self.ids.items) |existing| {
+            if (std.mem.eql(u8, existing, id)) return true;
+        }
+        return false;
+    }
+
+    fn add(self: *SeenIds, allocator: std.mem.Allocator, id: []const u8) !void {
+        const duped = try allocator.dupe(u8, id);
+        errdefer allocator.free(duped);
+        try self.ids.append(allocator, duped);
+    }
+
+    fn deinit(self: *SeenIds, allocator: std.mem.Allocator) void {
+        for (self.ids.items) |id| allocator.free(id);
+        self.ids.deinit(allocator);
+    }
+};
+
+/// Discover all extensions in load order (explicit → user → project).
+/// Caller owns returned slice and all strings. Use freeExtensions() to clean up.
+/// Built-in extensions are NOT handled here (skip for C1).
+pub fn discover(opts: DiscoverOptions) ![]LoadedExtension {
+    var results: std.ArrayListUnmanaged(LoadedExtension) = .empty;
+    var seen: SeenIds = .{};
+    defer seen.deinit(opts.allocator);
+
+    // 1. Explicit paths (highest priority)
+    for (opts.explicit_paths) |path| {
+        try loadExplicitPath(opts.allocator, path, &results, &seen);
+    }
+
+    // 2. User-global: <agent_dir>/extensions/*.lua
+    const agent_dir = try storage.getAgentDir(opts.allocator, opts.agent_dir_override);
+    defer opts.allocator.free(agent_dir);
+    const user_ext_dir = try std.fs.path.join(opts.allocator, &.{ agent_dir, "extensions" });
+    defer opts.allocator.free(user_ext_dir);
+    try scanDirectory(opts.allocator, user_ext_dir, .user, &results, &seen);
+
+    // 3. Project-local: <project_dir>/extensions/*.lua
+    const project_dir = try storage.getProjectDir(opts.allocator, opts.cwd);
+    defer opts.allocator.free(project_dir);
+    const project_ext_dir = try std.fs.path.join(opts.allocator, &.{ project_dir, "extensions" });
+    defer opts.allocator.free(project_ext_dir);
+    try scanDirectory(opts.allocator, project_ext_dir, .project, &results, &seen);
+
+    // Note: builtin extensions handled via @embedFile elsewhere
+
+    return results.toOwnedSlice(opts.allocator);
+}
+
+/// Free all strings and the slice itself.
+pub fn freeExtensions(allocator: std.mem.Allocator, list: []LoadedExtension) void {
+    for (list) |ext| {
+        allocator.free(ext.id);
+        allocator.free(ext.path);
+    }
+    allocator.free(list);
+}
+
+/// Load an explicit path. Error if path doesn't exist.
+fn loadExplicitPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    results: *std.ArrayListUnmanaged(LoadedExtension),
+    seen: *SeenIds,
+) !void {
+    // Verify file exists
+    std.fs.accessAbsolute(path, .{}) catch |err| {
+        log.warn("explicit extension path not found: {s} ({s})", .{ path, @errorName(err) });
+        return err;
+    };
+
+    const basename = std.fs.path.basename(path);
+    const id = if (std.mem.endsWith(u8, basename, ".lua"))
+        basename[0 .. basename.len - 4]
+    else
+        basename;
+
+    if (seen.contains(id)) {
+        log.debug("skipping duplicate explicit extension id: {s}", .{id});
+        return;
+    }
+
+    const abs_path = try std.fs.realpathAlloc(allocator, path);
+    errdefer allocator.free(abs_path);
+
+    const duped_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(duped_id);
+
+    try seen.add(allocator, id);
+    try results.append(allocator, .{
+        .id = duped_id,
+        .path = abs_path,
+        .source = .explicit,
+    });
+}
+
+/// Scan a directory for .lua files and foo/init.lua patterns.
+fn scanDirectory(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    source: ExtensionSource,
+    results: *std.ArrayListUnmanaged(LoadedExtension),
+    seen: *SeenIds,
+) !void {
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return, // graceful: missing dir = no extensions
+        else => {
+            log.warn("failed to open extension dir {s}: {s}", .{ dir_path, @errorName(err) });
+            return;
+        },
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.name[0] == '.') continue; // skip dotfiles
+
+        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(full_path);
+
+        switch (entry.kind) {
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
+                const id = entry.name[0 .. entry.name.len - 4];
+                if (seen.contains(id)) {
+                    log.debug("skipping duplicate extension id in {s}: {s}", .{ @tagName(source), id });
+                    continue;
+                }
+                try addExtension(allocator, id, full_path, source, results, seen);
+            },
+            .directory => {
+                // Check for <dir>/init.lua
+                const init_path = try std.fs.path.join(allocator, &.{ full_path, "init.lua" });
+                defer allocator.free(init_path);
+
+                std.fs.accessAbsolute(init_path, .{}) catch continue; // no init.lua, skip
+
+                if (seen.contains(entry.name)) {
+                    log.debug("skipping duplicate extension id in {s}: {s}", .{ @tagName(source), entry.name });
+                    continue;
+                }
+                try addExtension(allocator, entry.name, init_path, source, results, seen);
+            },
+            else => continue,
+        }
+    }
+}
+
+/// Add an extension to results, duplicating strings.
+fn addExtension(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    path: []const u8,
+    source: ExtensionSource,
+    results: *std.ArrayListUnmanaged(LoadedExtension),
+    seen: *SeenIds,
+) !void {
+    const duped_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(duped_id);
+
+    const duped_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(duped_path);
+
+    try seen.add(allocator, id);
+    try results.append(allocator, .{
+        .id = duped_id,
+        .path = duped_path,
+        .source = source,
+    });
+}
+
+// ── Factory execution ───────────────────────────────────────────────
+//
+// v1 model matches the spec: an extension chunk returns a factory
+// function and the host calls `factory(zi)` against the shared Lua
+// state. Extensions are NOT sandboxed — they share one state — but
+// registrations are attributed to the extension currently being loaded
+// via the runner's temporary load context.
+//
+// Ordering matches `discover` output: explicit → user → project. The
+// tool/command registries are first-registered-wins, so a user override
+// of a project tool arrives at registration BEFORE the project version
+// and silently drops it. Event handlers are additive and run in
+// registration order.
+
+pub const LoadStats = struct {
+    attempted: u32 = 0,
+    loaded: u32 = 0,
+    failed: u32 = 0,
+};
+
+/// Read each discovered extension file and execute it against `state`.
+/// Per-file read or Lua errors are logged and skipped — one broken
+/// extension does not prevent the others from loading. Returns a small
+/// stat bundle for the caller to log.
+///
+/// Caller must have already installed `zi.*` on the state (via
+/// `extensions/api.zig:installZiTable`) before calling this.
+pub fn loadAll(
+    allocator: std.mem.Allocator,
+    state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
+    list: []const LoadedExtension,
+) LoadStats {
+    var stats: LoadStats = .{};
+    for (list) |ext| {
+        stats.attempted += 1;
+        loadOne(allocator, state, runner, ext) catch |err| {
+            log.warn("extension load failed: {s} ({s}): {s}", .{
+                ext.id,
+                ext.path,
+                @errorName(err),
+            });
+            stats.failed += 1;
+            continue;
+        };
+        stats.loaded += 1;
+        log.debug("extension loaded: {s} [{s}]", .{ ext.id, @tagName(ext.source) });
+    }
+    return stats;
+}
+
+fn loadOne(
+    allocator: std.mem.Allocator,
+    state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
+    ext: LoadedExtension,
+) !void {
+    const file = try std.fs.openFileAbsolute(ext.path, .{});
+    defer file.close();
+    const src = try file.readToEndAlloc(allocator, MAX_EXTENSION_SIZE);
+    defer allocator.free(src);
+
+    const chunk_name_buf = try std.fmt.allocPrint(allocator, "@{s}", .{ext.path});
+    defer allocator.free(chunk_name_buf);
+    const chunk_name = try allocator.dupeZ(u8, chunk_name_buf);
+    defer allocator.free(chunk_name);
+
+    runner.assertOnLuaThread();
+
+    // Step 1: execute the chunk itself. Spec-shaped extensions return
+    // a factory function from top level.
+    try state.loadChunk(src, chunk_name);
+    const chunk_call_rc = lua_runtime.c.lua_pcallk(state.L, 0, 1, 0, 0, null);
+    if (chunk_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, chunk_call_rc);
+    errdefer lua_runtime.c.lua_pop(state.L, 1);
+
+    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+        return error.ExtensionFactoryExpectedFunction;
+    }
+
+    // Step 2: call the returned factory with the shared `zi` table.
+    const load_source: runner_mod.ExtensionLoadSource = .{
+        .kind = sourceKindString(ext.source),
+        .id = ext.id,
+        .path = ext.path,
+    };
+
+    _ = lua_runtime.c.lua_getglobal(state.L, "zi");
+    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TTABLE) {
+        lua_runtime.c.lua_pop(state.L, 2);
+        return error.LuaRuntime;
+    }
+
+    runner.beginLoadContext(load_source);
+    defer runner.endLoadContext();
+
+    const factory_call_rc = lua_runtime.c.lua_pcallk(state.L, 1, 0, 0, 0, null);
+    if (factory_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, factory_call_rc);
+}
+
+fn sourceKindString(source: ExtensionSource) []const u8 {
+    return switch (source) {
+        .explicit => "explicit",
+        .user => "user",
+        .project => "project",
+        .builtin => "builtin",
+    };
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+const api = @import("api.zig");
+
+test "discover finds foo.lua and bar/init.lua in a temp dir" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create extensions directory structure
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+
+    // foo.lua (single-file extension)
+    try ext_dir.writeFile(.{ .sub_path = "foo.lua", .data = "-- foo extension" });
+
+    // bar/init.lua (directory extension)
+    try ext_dir.makeDir("bar");
+    var bar_dir = try ext_dir.openDir("bar", .{});
+    try bar_dir.writeFile(.{ .sub_path = "init.lua", .data = "-- bar extension" });
+
+    // Get absolute path to the extensions dir
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    // Discover using agent_dir_override
+    const opts = DiscoverOptions{
+        .allocator = allocator,
+        .cwd = "/nonexistent/project", // won't be used since we override agent dir
+        .explicit_paths = &.{},
+        .agent_dir_override = tmp_path,
+    };
+
+    const exts = try discover(opts);
+    defer freeExtensions(allocator, exts);
+
+    // Should find exactly 2 extensions
+    try std.testing.expectEqual(@as(usize, 2), exts.len);
+
+    // Verify we found both foo and bar (order depends on filesystem iteration)
+    var found_foo = false;
+    var found_bar = false;
+    for (exts) |ext| {
+        if (std.mem.eql(u8, ext.id, "foo")) {
+            found_foo = true;
+            try std.testing.expectEqual(ExtensionSource.user, ext.source);
+            try std.testing.expect(std.mem.endsWith(u8, ext.path, "foo.lua"));
+        } else if (std.mem.eql(u8, ext.id, "bar")) {
+            found_bar = true;
+            try std.testing.expectEqual(ExtensionSource.user, ext.source);
+            try std.testing.expect(std.mem.endsWith(u8, ext.path, "bar/init.lua"));
+        }
+    }
+    try std.testing.expect(found_foo);
+    try std.testing.expect(found_bar);
+}
+
+test "discover returns empty when directories missing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    // Use a path with no extensions subdirectory
+    const opts = DiscoverOptions{
+        .allocator = allocator,
+        .cwd = tmp_path, // will try <tmp_path>/.zi/extensions (doesn't exist)
+        .explicit_paths = &.{},
+        .agent_dir_override = tmp_path, // will try <tmp_path>/extensions (doesn't exist)
+    };
+
+    const exts = try discover(opts);
+    defer freeExtensions(allocator, exts);
+
+    try std.testing.expectEqual(@as(usize, 0), exts.len);
+}
+
+test "explicit paths come first in result order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create user extensions dir with one extension
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.writeFile(.{ .sub_path = "user_ext.lua", .data = "-- user" });
+
+    // Create explicit extension file
+    try tmp.dir.writeFile(.{ .sub_path = "explicit_ext.lua", .data = "-- explicit" });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const explicit_path = try std.fs.path.join(allocator, &.{ tmp_path, "explicit_ext.lua" });
+    defer allocator.free(explicit_path);
+
+    const opts = DiscoverOptions{
+        .allocator = allocator,
+        .cwd = "/nonexistent/project",
+        .explicit_paths = &.{explicit_path},
+        .agent_dir_override = tmp_path,
+    };
+
+    const exts = try discover(opts);
+    defer freeExtensions(allocator, exts);
+
+    // Should have exactly 2 extensions, explicit first
+    try std.testing.expectEqual(@as(usize, 2), exts.len);
+    try std.testing.expectEqualStrings("explicit_ext", exts[0].id);
+    try std.testing.expectEqual(ExtensionSource.explicit, exts[0].source);
+    try std.testing.expectEqualStrings("user_ext", exts[1].id);
+    try std.testing.expectEqual(ExtensionSource.user, exts[1].source);
+}
+
+test "loadAll executes discovered .lua files and registrations land" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    const hello_src =
+        "return function(zi)\n" ++
+        "  _loaded = true\n" ++
+        "  zi.on(\"message_end\", function(e, ctx) end)\n" ++
+        "end\n";
+    try ext_dir.writeFile(.{ .sub_path = "hello.lua", .data = hello_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const exts = try discover(.{
+        .allocator = allocator,
+        .cwd = "/nonexistent",
+        .agent_dir_override = tmp_path,
+    });
+    defer freeExtensions(allocator, exts);
+    try std.testing.expectEqual(@as(usize, 1), exts.len);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.attempted);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expectEqual(@as(u32, 0), stats.failed);
+
+    try state.doString("assert(_loaded == true)", "verify");
+    try std.testing.expectEqual(@as(usize, 1), runner.event_registry.handlers(.message_end).len);
+    try std.testing.expectEqualStrings(exts[0].path, runner.event_registry.handlers(.message_end)[0].source_id);
+}
+
+test "loadAll continues after a broken extension" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.writeFile(.{ .sub_path = "broken.lua", .data = "this is not valid lua !!!" });
+    try ext_dir.writeFile(.{ .sub_path = "good.lua", .data = "return function(zi) _good = 42 end" });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const exts = try discover(.{
+        .allocator = allocator,
+        .cwd = "/nonexistent",
+        .agent_dir_override = tmp_path,
+    });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 2), stats.attempted);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expectEqual(@as(u32, 1), stats.failed);
+
+    // Good extension still ran despite broken sibling.
+    try state.doString("assert(_good == 42)", "verify");
+}
+
+test "loadAll calls factory with zi and stamps source provenance" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    const prov_src =
+        "return function(zi)\n" ++
+        "  zi.register_tool({\n" ++
+        "    name = \"demo\",\n" ++
+        "    description = \"demo tool\",\n" ++
+        "    parameters = { type = \"object\", properties = {} },\n" ++
+        "    execute = function(params, ctx)\n" ++
+        "      return { ok = true }\n" ++
+        "    end,\n" ++
+        "  })\n" ++
+        "  zi.on(\"message_end\", function() end)\n" ++
+        "end\n";
+    try ext_dir.writeFile(.{ .sub_path = "provenance.lua", .data = prov_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const exts = try discover(.{
+        .allocator = allocator,
+        .cwd = "/nonexistent",
+        .agent_dir_override = tmp_path,
+    });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    const tool = runner.tool_registry.get("demo").?;
+    try std.testing.expectEqualStrings("user", tool.source.kind);
+    try std.testing.expectEqualStrings(exts[0].path, tool.source.id);
+    try std.testing.expectEqualStrings(exts[0].path, runner.event_registry.handlers(.message_end)[0].source_id);
+}

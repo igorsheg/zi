@@ -1,7 +1,7 @@
 const std = @import("std");
 const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
-const slash_commands_mod = @import("../slash_commands.zig");
+const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 
 const SelectItem = select_list_mod.SelectItem;
 const CommandRegistry = slash_commands_mod.CommandRegistry;

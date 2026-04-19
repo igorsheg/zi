@@ -34,7 +34,7 @@ const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
-const slash_commands_mod = @import("../slash_commands.zig");
+const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
@@ -42,14 +42,14 @@ const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
-const session_store_mod = @import("../session/store.zig");
+const session_store_mod = @import("../coding_agent/session/store.zig");
 const SessionStore = session_store_mod.SessionStore;
 const storage = @import("../storage.zig");
 const logging = @import("../logging.zig");
 
 const agent_mod = @import("../agent2/root.zig");
-const coding_agent_mod = @import("../coding_agent.zig");
-const session_controller_mod = @import("../session_controller.zig");
+const coding_agent_mod = @import("../coding_agent/root.zig");
+const session_controller_mod = @import("../coding_agent/session_controller.zig");
 const run_control_mod = @import("../agent2/control.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentRequest = agent_mod.AgentRequest;
@@ -80,11 +80,11 @@ const IdleRequestDispatch = struct {
     loader_message: []const u8,
     spawn_failed_message: []const u8,
 };
-const auth_storage_mod = @import("../auth/storage.zig");
-const oauth_mod = @import("../auth/oauth.zig");
-const settings_manager_mod = @import("../settings/manager.zig");
+const auth_storage_mod = @import("../coding_agent/auth/storage.zig");
+const oauth_mod = @import("../coding_agent/auth/oauth.zig");
+const settings_manager_mod = @import("../coding_agent/settings/manager.zig");
 const ai_protocol = @import("../ai/protocol.zig");
-const ai_resolve = @import("../ai/resolve.zig");
+const ai_resolve = @import("../coding_agent/resolve.zig");
 const memory_debug = @import("../debug/tracked_allocator.zig");
 
 const Color = cell_mod.Color;

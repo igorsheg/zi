@@ -1125,7 +1125,7 @@ test "Editor undo restores destructive backspace and delete edits" {
 }
 
 test "Editor undo restores autocomplete application as one edit" {
-    const slash_commands_mod = @import("../../slash_commands.zig");
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
     defer registry.deinit();
@@ -1170,7 +1170,7 @@ test "Editor submit actions preserve disable-submit and escaped newline semantic
 }
 
 test "Editor autocomplete confirm respects disable-submit and stays undoable" {
-    const slash_commands_mod = @import("../../slash_commands.zig");
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
     defer registry.deinit();

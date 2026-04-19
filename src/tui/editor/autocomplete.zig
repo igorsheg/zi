@@ -280,7 +280,7 @@ fn driveAsyncTick(session: *AutocompleteSession, buffer: *PromptBuffer) TickOutc
 }
 
 test "AutocompleteSession applies replacement range without borrowing mutable buffer slices" {
-    const slash_commands_mod = @import("../../slash_commands.zig");
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
     defer registry.deinit();
@@ -306,7 +306,7 @@ test "AutocompleteSession applies replacement range without borrowing mutable bu
 }
 
 test "AutocompleteSession enter accepts slash command selection and requests submit" {
-    const slash_commands_mod = @import("../../slash_commands.zig");
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
     defer registry.deinit();
@@ -328,12 +328,12 @@ test "AutocompleteSession enter accepts slash command selection and requests sub
     try testing.expect(!session.isActive());
 }
 
-fn makeCombinedProvider(registry: *const @import("../../slash_commands.zig").CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
+fn makeCombinedProvider(registry: *const @import("../../coding_agent/slash_commands.zig").CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
     return CombinedAutocompleteProvider.init(testing.allocator, registry, cwd);
 }
 
 test "AutocompleteSession enter accepts file completion without submit" {
-    const slash_commands_mod = @import("../../slash_commands.zig");
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -365,7 +365,7 @@ test "AutocompleteSession enter accepts file completion without submit" {
 }
 
 test "AutocompleteSession tab on directory completion refreshes into the expanded directory" {
-    const slash_commands_mod = @import("../../slash_commands.zig");
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -401,7 +401,7 @@ test "AutocompleteSession tab on directory completion refreshes into the expande
 test "AutocompleteSession tab force-completes a single at-file suggestion after async tick" {
     if (!hasAsyncSearchBackend()) return error.SkipZigTest;
 
-    const slash_commands_mod = @import("../../slash_commands.zig");
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

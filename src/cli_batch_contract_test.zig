@@ -1,3 +1,3 @@
 test {
-    _ = @import("cli/batch_contract.zig");
+    _ = @import("coding_agent/cli/batch_contract.zig");
 }

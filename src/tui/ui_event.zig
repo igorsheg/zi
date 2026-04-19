@@ -2,7 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_root = @import("../agent2/root.zig");
 const conversation_snapshot_mod = @import("../conversation_snapshot.zig");
-const session_controller_mod = @import("../session_controller.zig");
+const session_controller_mod = @import("../coding_agent/session_controller.zig");
 const RunOutcome = session_controller_mod.RunOutcome;
 
 /// TUI-owned event type. All cross-thread payloads are deep-copied and

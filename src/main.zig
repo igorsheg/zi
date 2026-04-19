@@ -2,7 +2,7 @@ const std = @import("std");
 const terminal_mod = @import("tui/terminal.zig");
 const memory_debug = @import("debug/tracked_allocator.zig");
 const logging = @import("logging.zig");
-const cli = @import("cli/root.zig");
+const cli = @import("coding_agent/cli/root.zig");
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
 pub const panic = terminal_mod.panic;
