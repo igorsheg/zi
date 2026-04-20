@@ -12,6 +12,7 @@ const conversation_state = @import("../agent3/conversation_state.zig");
 const theme_mod = @import("../tui/theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const session_event_mod = @import("session_event.zig");
+const profile = @import("../debug/profile.zig");
 
 pub const QueueKind = control_mod.QueueKind;
 pub const EnqueueResult = control_mod.EnqueueResult;
@@ -223,6 +224,9 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         publisher: ConversationStatePublisher,
     ) bool {
+        var publish_timer = profile.ScopedTimer.begin(.publish_conversation_state);
+        defer publish_timer.end();
+
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
 
@@ -423,8 +427,8 @@ test "runtime host publishes committed and queued conversation state" {
         .ctx = @ptrCast(&published),
     }));
     try testing.expect(published != null);
-    try testing.expectEqual(@as(usize, 1), published.?.view.committed.len);
-    try testing.expectEqualStrings("hello", published.?.view.committed[0].user.content.text);
+    try testing.expectEqual(@as(usize, 1), published.?.view.committed.flat.len);
+    try testing.expectEqualStrings("hello", published.?.view.committed.flat[0].user.content.text);
     try testing.expectEqual(@as(usize, 0), published.?.queued.steering.len);
     try testing.expectEqual(@as(usize, 1), published.?.queued.follow_up.len);
     try testing.expectEqualStrings("queued", published.?.queued.follow_up[0].text);

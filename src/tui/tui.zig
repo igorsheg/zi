@@ -6,6 +6,7 @@ const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal.zig");
 const keys_mod = @import("keys.zig");
 const buffer_mod = @import("buffer.zig");
+const profile = @import("../debug/profile.zig");
 
 const Component = component_mod.Component;
 const CursorState = component_mod.CursorState;
@@ -160,13 +161,21 @@ pub const TUI = struct {
     /// Returns the cursor state (if any focused component reports one).
     pub fn render(self: *TUI) ?CursorState {
         const region = self.renderer.begin();
-        self.root.render(region);
 
-        if (self.overlays.hasVisibleOverlays()) {
-            self.overlays.renderOverlays(region);
+        {
+            var tree_timer = profile.ScopedTimer.begin(.tui_render_tree);
+            defer tree_timer.end();
+            self.root.render(region);
+            if (self.overlays.hasVisibleOverlays()) {
+                self.overlays.renderOverlays(region);
+            }
         }
 
-        self.renderer.end() catch {};
+        {
+            var end_timer = profile.ScopedTimer.begin(.tui_renderer_end);
+            defer end_timer.end();
+            self.renderer.end() catch {};
+        }
 
         // Cursor: check overlay first, then container tree
         if (self.overlays.hasVisibleOverlays()) {

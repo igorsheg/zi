@@ -5,13 +5,20 @@ const partial_json = @import("../json/partial.zig");
 const control_mod = @import("control.zig");
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
+const shared_committed_mod = @import("shared_committed.zig");
 
+pub const SharedCommitted = shared_committed_mod.SharedCommitted;
+
+/// Cross-thread snapshot of conversation state. `committed` is a
+/// refcounted shared handle — retained on construction, released on
+/// deinit. The in-flight turn is still deep-cloned (single message,
+/// bounded cost).
 pub const ConversationView = struct {
-    committed: []protocol.AgentMessage,
+    committed: *SharedCommitted,
     in_flight: ?InFlightTurn = null,
 
     pub fn deinit(self: *ConversationView, allocator: std.mem.Allocator) void {
-        message_memory.freeMessages(allocator, self.committed);
+        self.committed.release();
         if (self.in_flight) |*turn| turn.deinit(allocator);
         self.* = undefined;
     }

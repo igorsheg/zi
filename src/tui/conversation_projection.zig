@@ -18,6 +18,7 @@ const editor_mod = @import("components/editor.zig");
 const conversation_state_mod = @import("../agent3/conversation_state.zig");
 const message_memory = @import("../agent3/message_memory.zig");
 const json_util = @import("../ai/json_util.zig");
+const profile = @import("../debug/profile.zig");
 
 const Transcript = transcript_mod.Transcript;
 const TranscriptItem = transcript_mod.TranscriptItem;
@@ -38,13 +39,17 @@ pub const RebuildOptions = struct {
 const DesiredItem = struct {
     item_id: transcript_mod.ItemId,
     semantic_version: transcript_mod.SemanticVersion,
-    row: TranscriptItem,
+    /// P2: null means "the transcript already has a retained row with
+    /// this id+version; reconcile must only retain/move, not replace or
+    /// insert." Non-null rows are owned until reconcile transfers
+    /// ownership via insertItemAt/replaceItemAt and disarmDesiredRow.
+    row: ?TranscriptItem = null,
     seed_editor_history: bool = false,
     history_text: ?ExtractedText = null,
 
     fn deinit(self: *DesiredItem, allocator: std.mem.Allocator) void {
         if (self.history_text) |text| text.deinit(allocator);
-        self.row.deinit(allocator);
+        if (self.row) |*row| row.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -72,8 +77,8 @@ fn ownedConversationStateFromMessages(
     allocator: std.mem.Allocator,
     messages: []const agent_protocol.AgentMessage,
 ) !conversation_state_mod.PublishedConversationState {
-    const committed = try message_memory.cloneMessages(allocator, messages);
-    errdefer message_memory.freeMessages(allocator, committed);
+    const shared = try conversation_state_mod.SharedCommitted.fromMessages(allocator, messages);
+    errdefer shared.release();
 
     const steering = try allocator.alloc(control_mod.QueuedMessageText, 0);
     errdefer allocator.free(steering);
@@ -81,7 +86,7 @@ fn ownedConversationStateFromMessages(
 
     return .{
         .view = .{
-            .committed = committed,
+            .committed = shared,
             .in_flight = null,
         },
         .queued = .{
@@ -121,7 +126,7 @@ pub const ProjectionState = struct {
         const owned_state = state.*;
         state.* = undefined;
         const must_reset_history = if (self.state) |previous|
-            !committedUserHistoryIsPrefix(previous.view.committed, owned_state.view.committed)
+            !committedUserHistoryIsPrefix(previous.view.committed.flat, owned_state.view.committed.flat)
         else
             false;
         self.clear();
@@ -129,7 +134,7 @@ pub const ProjectionState = struct {
         reconcileFromState(transcript, editor, resolver, self.state.?, options);
         if (must_reset_history) {
             editor.clearHistory();
-            seedHistoryFromCommittedMessages(editor, self.state.?.view.committed);
+            seedHistoryFromCommittedMessages(editor, self.state.?.view.committed.flat);
         }
     }
 };
@@ -144,14 +149,18 @@ pub fn rebuildFromState(
     transcript.clearAll();
     editor.clearHistory();
 
-    var desired_items = buildDesiredItems(transcript.allocator, resolver, state, options, transcript.hide_thinking_block) catch return;
+    var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, state, options, transcript.hide_thinking_block) catch return;
     defer {
         for (desired_items.items) |*item| item.deinit(transcript.allocator);
         desired_items.deinit(transcript.allocator);
     }
 
     for (desired_items.items, 0..) |desired, idx| {
-        if (!transcript.addItem(desired.row)) return;
+        // rebuildFromState cleared the transcript above, so every desired
+        // item MUST carry a freshly-built row (P2 retain path can't trigger
+        // against an empty transcript).
+        std.debug.assert(desired.row != null);
+        if (!transcript.addItem(desired.row.?)) return;
         disarmDesiredRow(&desired_items.items[idx]);
         if (desired.seed_editor_history) {
             if (desired.history_text) |history_text| editor.addToHistory(history_text.slice());
@@ -168,7 +177,10 @@ pub fn reconcileFromState(
     state: conversation_state_mod.PublishedConversationState,
     options: RebuildOptions,
 ) void {
-    var desired_items = buildDesiredItems(transcript.allocator, resolver, state, options, transcript.hide_thinking_block) catch return;
+    var reconcile_timer = profile.ScopedTimer.begin(.reconcile_from_state);
+    defer reconcile_timer.end();
+
+    var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, state, options, transcript.hide_thinking_block) catch return;
     defer {
         for (desired_items.items) |*item| item.deinit(transcript.allocator);
         desired_items.deinit(transcript.allocator);
@@ -180,14 +192,20 @@ pub fn reconcileFromState(
         const existing_index = transcript.findRetainedItemIndex(desired.item_id);
         if (existing_index) |current_index| {
             if (transcript.retainedItemSemanticVersionAt(current_index) == desired.semantic_version) {
+                // P2 contract: same version ⇒ row must be null (not built).
+                std.debug.assert(desired.row == null);
                 if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
             } else {
-                _ = transcript.replaceItemAt(current_index, desired.row);
+                // Version changed ⇒ builder must have produced a fresh row.
+                std.debug.assert(desired.row != null);
+                _ = transcript.replaceItemAt(current_index, desired.row.?);
                 disarmDesiredRow(&desired_items.items[desired_index]);
                 if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
             }
         } else {
-            _ = transcript.insertItemAt(desired_index, desired.row);
+            // New item ⇒ builder must have produced a fresh row.
+            std.debug.assert(desired.row != null);
+            _ = transcript.insertItemAt(desired_index, desired.row.?);
             disarmDesiredRow(&desired_items.items[desired_index]);
         }
 
@@ -238,10 +256,14 @@ fn committedUserHistoryIsPrefix(
 fn buildDesiredItems(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
+    transcript: *Transcript,
     state: conversation_state_mod.PublishedConversationState,
     options: RebuildOptions,
     hide_thinking_block: bool,
 ) !std.ArrayList(DesiredItem) {
+    var build_timer = profile.ScopedTimer.begin(.build_desired_items);
+    defer build_timer.end();
+
     var desired_items: std.ArrayList(DesiredItem) = .empty;
     errdefer {
         for (desired_items.items) |*item| item.deinit(allocator);
@@ -256,11 +278,12 @@ fn buildDesiredItems(
         }
     }
 
-    for (state.view.committed, 0..) |message, idx| {
+    const committed_slice = state.view.committed.flat;
+    for (committed_slice, 0..) |message, idx| {
         try appendDesiredItem(
             allocator,
             &desired_items,
-            buildCommittedMessageItem(allocator, resolver, idx, message, options, live_tool_ids.items, hide_thinking_block),
+            buildCommittedMessageItem(allocator, resolver, transcript, idx, message, options, live_tool_ids.items, hide_thinking_block),
         );
         switch (message) {
             .assistant => |assistant| {
@@ -274,9 +297,10 @@ fn buildDesiredItems(
                         buildCommittedToolCallDesiredItem(
                             allocator,
                             resolver,
+                            transcript,
                             tool_call,
                             assistant,
-                            findCommittedToolResultMessage(state.view.committed[idx + 1 ..], tool_call.id),
+                            findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
                             options,
                         ),
                     );
@@ -290,14 +314,14 @@ fn buildDesiredItems(
             try appendDesiredItem(
                 allocator,
                 &desired_items,
-                buildActiveAssistantDesiredItem(allocator, assistant, live_tool_ids.items, options.theme, hide_thinking_block),
+                buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids.items, options.theme, hide_thinking_block),
             );
         }
         for (turn.tool_executions) |tool| {
             try appendDesiredItem(
                 allocator,
                 &desired_items,
-                buildToolExecutionDesiredItem(allocator, resolver, tool, options.theme),
+                buildToolExecutionDesiredItem(allocator, resolver, transcript, tool, options.theme),
             );
         }
     }
@@ -305,14 +329,14 @@ fn buildDesiredItems(
         try appendDesiredItem(
             allocator,
             &desired_items,
-            buildQueuedUserDesiredItem(allocator, .steering, idx, entry.text, options.theme),
+            buildQueuedUserDesiredItem(allocator, transcript, .steering, idx, entry.text, options.theme),
         );
     }
     for (state.queued.follow_up, 0..) |entry, idx| {
         try appendDesiredItem(
             allocator,
             &desired_items,
-            buildQueuedUserDesiredItem(allocator, .follow_up, idx, entry.text, options.theme),
+            buildQueuedUserDesiredItem(allocator, transcript, .follow_up, idx, entry.text, options.theme),
         );
     }
     return desired_items;
@@ -338,6 +362,7 @@ fn appendDesiredItem(
 fn buildCommittedMessageItem(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
+    transcript: *Transcript,
     index: usize,
     message: agent_protocol.AgentMessage,
     options: RebuildOptions,
@@ -346,6 +371,9 @@ fn buildCommittedMessageItem(
 ) !DesiredItem {
     const item_id = committedMessageId(index, message);
     const semantic_version = committedMessageSemanticVersion(message);
+    if (transcript.hasRetainedMatch(item_id, semantic_version)) {
+        return .{ .item_id = item_id, .semantic_version = semantic_version };
+    }
     var row = try buildMessageRow(allocator, resolver, message, options, live_tool_ids, hide_thinking_block);
     row.retained_item_id = item_id;
     row.retained_semantic_version = semantic_version;
@@ -362,6 +390,7 @@ fn buildCommittedMessageItem(
 
 fn buildActiveAssistantDesiredItem(
     allocator: std.mem.Allocator,
+    transcript: *Transcript,
     assistant: agent_protocol.AssistantMessage,
     live_tool_ids: []const []const u8,
     theme: *const Theme,
@@ -369,6 +398,9 @@ fn buildActiveAssistantDesiredItem(
 ) !DesiredItem {
     const item_id = activeAssistantId(assistant);
     const semantic_version = activeAssistantSemanticVersion(assistant);
+    if (transcript.hasRetainedMatch(item_id, semantic_version)) {
+        return .{ .item_id = item_id, .semantic_version = semantic_version };
+    }
     var row = try createAssistantMessageRow(allocator, assistant, live_tool_ids, theme, hide_thinking_block);
     row.retained_item_id = item_id;
     row.retained_semantic_version = semantic_version;
@@ -378,11 +410,15 @@ fn buildActiveAssistantDesiredItem(
 fn buildToolExecutionDesiredItem(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
+    transcript: *Transcript,
     tool_execution: conversation_state_mod.ToolExecution,
     theme: *const Theme,
 ) !DesiredItem {
     const item_id = toolExecutionId(tool_execution.tool_call_id);
     const semantic_version = toolExecutionSemanticVersion(tool_execution);
+    if (transcript.hasRetainedMatch(item_id, semantic_version)) {
+        return .{ .item_id = item_id, .semantic_version = semantic_version };
+    }
     var row = try createToolExecutionRow(allocator, resolver, tool_execution, theme);
     row.retained_item_id = item_id;
     row.retained_semantic_version = semantic_version;
@@ -392,6 +428,7 @@ fn buildToolExecutionDesiredItem(
 fn buildCommittedToolCallDesiredItem(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
+    transcript: *Transcript,
     tool_call: agent_protocol.ToolCall,
     assistant: agent_protocol.AssistantMessage,
     result_message: ?agent_protocol.ToolResultMessage,
@@ -399,6 +436,9 @@ fn buildCommittedToolCallDesiredItem(
 ) !DesiredItem {
     const item_id = toolExecutionId(tool_call.id);
     const semantic_version = committedToolCallSemanticVersion(tool_call, assistant, result_message, options.retry_attempt);
+    if (transcript.hasRetainedMatch(item_id, semantic_version)) {
+        return .{ .item_id = item_id, .semantic_version = semantic_version };
+    }
     var row = try createCommittedToolCallRow(
         allocator,
         resolver,
@@ -415,6 +455,7 @@ fn buildCommittedToolCallDesiredItem(
 
 fn buildQueuedUserDesiredItem(
     allocator: std.mem.Allocator,
+    transcript: *Transcript,
     kind: QueuedUserMessageKind,
     ordinal: usize,
     text: []const u8,
@@ -422,6 +463,9 @@ fn buildQueuedUserDesiredItem(
 ) !DesiredItem {
     const item_id = queuedUserMessageId(kind, ordinal);
     const semantic_version = queuedUserMessageSemanticVersion(text);
+    if (transcript.hasRetainedMatch(item_id, semantic_version)) {
+        return .{ .item_id = item_id, .semantic_version = semantic_version };
+    }
     var model = try buildUserRowModel(
         allocator,
         text,
@@ -439,8 +483,10 @@ fn buildQueuedUserDesiredItem(
     return .{ .item_id = item_id, .semantic_version = semantic_version, .row = row };
 }
 fn disarmDesiredRow(item: *DesiredItem) void {
-    item.row.deinit_ctx = null;
-    item.row.deinit_fn = null;
+    if (item.row) |*row| {
+        row.deinit_ctx = null;
+        row.deinit_fn = null;
+    }
 }
 
 fn seedHistoryFromCommittedMessages(editor: EditorInterface, messages: []const agent_protocol.AgentMessage) void {

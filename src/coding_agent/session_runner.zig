@@ -321,7 +321,10 @@ pub const SessionRunner = struct {
         const last = messages[messages.len - 1];
         if (last != .assistant) return;
         if (last.assistant.stop_reason != .@"error") return;
-        session.agent.truncateCommitted(messages.len - 1);
+        // Only clear the error flag if we actually removed the message
+        // — otherwise the error-bearing message stays committed while
+        // the flag says "no error," which is a control-flow lie.
+        session.agent.truncateCommitted(messages.len - 1) catch return;
         session.agent.clearError();
     }
 

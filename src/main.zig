@@ -2,6 +2,7 @@ const std = @import("std");
 const terminal_mod = @import("tui/terminal.zig");
 const memory_debug = @import("debug/tracked_allocator.zig");
 const logging = @import("logging.zig");
+const profile = @import("debug/profile.zig");
 const cli = @import("coding_agent/cli/root.zig");
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
@@ -88,6 +89,9 @@ pub fn main() !void {
         .sink_mode = sinkModeForPlan(execution_plan),
     });
     defer log_session.deinit();
+
+    profile.initFromEnv();
+    defer profile.logDumpInfo();
 
     var cli_runtime: ?cli.runtime.Runtime = null;
     defer if (cli_runtime) |*runtime| runtime.deinit();

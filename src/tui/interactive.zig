@@ -28,6 +28,7 @@ const input_buffer_mod = @import("input_buffer.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
 const image_mod = @import("../image/root.zig");
+const profile_mod = @import("../debug/profile.zig");
 const string_util = @import("../lib/string_util.zig");
 const time_util = @import("../lib/time_util.zig");
 
@@ -403,6 +404,14 @@ pub const Interactive = struct {
     /// Owned storage lives in `msg_allocator` so teardown can free it on
     /// the TUI thread after all workers are joined.
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
+
+    // ── Conversation-publish coalescer (agent thread only) ────────
+    // P1: soft events (token deltas, tool_execution_update) mark-dirty
+    // and only publish if the cadence has elapsed. Hard events flush
+    // immediately. See flushPendingConversationPublish /
+    // maybePublishSoftConversation below.
+    last_conversation_publish_ns: u64 = 0,
+    conversation_publish_dirty: bool = false,
     runtime_host: RuntimeHost,
     loader: Loader = .{},
     loader_active: bool = false,
@@ -1496,6 +1505,10 @@ pub const Interactive = struct {
     }
 
     fn renderFrame(self: *Interactive) void {
+        var frame_timer = profile_mod.ScopedTimer.begin(.tui_render_frame);
+        defer frame_timer.end();
+        defer profile_mod.maybeEmitPeriodic(120);
+
         const w = self.tui.width();
         const h = self.tui.height();
 
@@ -2592,6 +2605,39 @@ pub const Interactive = struct {
         return self.runtime_host.publishConversationState(self.conversationStatePublisher());
     }
 
+    /// Soft conversation-publish cadence (ns between forced publishes
+    /// while streaming). 30 Hz feels "live" in a terminal and lets us
+    /// collapse token-rate event floods (1000+/turn) down to ~30/sec.
+    const soft_conversation_publish_cadence_ns: u64 = 33 * std.time.ns_per_ms;
+
+    fn monotonicNowNs() u64 {
+        return @intCast(std.time.nanoTimestamp());
+    }
+
+    /// Flush the latest conversation snapshot unconditionally. Called on
+    /// hard event boundaries (message_start/end, tool_execution_*,
+    /// turn_end, queue_update, compaction_end).
+    fn flushPendingConversationPublish(self: *Interactive) void {
+        _ = self.publishConversationState();
+        self.last_conversation_publish_ns = monotonicNowNs();
+        self.conversation_publish_dirty = false;
+    }
+
+    /// Soft path: mark dirty and publish only if cadence has elapsed
+    /// since the last publish. Otherwise drop — the next event will
+    /// re-check, or a hard boundary will flush. Accepted edge: a mid-
+    /// stream pause longer than the cadence leaves one pending snapshot
+    /// deferred until the next event; acceptable for P1.
+    fn maybePublishSoftConversation(self: *Interactive) void {
+        self.conversation_publish_dirty = true;
+        const now = monotonicNowNs();
+        const elapsed = now -% self.last_conversation_publish_ns;
+        if (elapsed < soft_conversation_publish_cadence_ns) return;
+        _ = self.publishConversationState();
+        self.last_conversation_publish_ns = now;
+        self.conversation_publish_dirty = false;
+    }
+
     fn conversationStatePublisher(self: *Interactive) ConversationStatePublisher {
         return .{
             .func = &publishConversationStateToUi,
@@ -2711,15 +2757,21 @@ pub const Interactive = struct {
     fn publishConversationStateForAgentEvent(self: *Interactive, event: AgentEvent) void {
         switch (event) {
             .message_start => |payload| switch (payload.message) {
-                .assistant => _ = self.publishConversationState(),
+                .assistant => self.flushPendingConversationPublish(),
                 else => {},
             },
-            .message_update, .message_end, .tool_execution_start, .tool_execution_update, .tool_execution_end, .agent_end => {
-                _ = self.publishConversationState();
+            // Soft deltas: coalesce at the configured cadence.
+            .message_update, .tool_execution_update => {
+                self.maybePublishSoftConversation();
+            },
+            // Hard semantic boundaries: flush now so the UI never stalls
+            // behind a dropped soft event.
+            .message_end, .tool_execution_start, .tool_execution_end, .agent_end => {
+                self.flushPendingConversationPublish();
             },
             .turn_end => |payload| {
                 if (payload.message != .assistant) return;
-                _ = self.publishConversationState();
+                self.flushPendingConversationPublish();
             },
             .agent_start, .turn_start => {},
         }
@@ -2737,7 +2789,7 @@ pub const Interactive = struct {
                 self.publishStatusSnapshotForAgentEvent(agent_event);
             },
             .queue_update => {
-                _ = self.publishConversationState();
+                self.flushPendingConversationPublish();
             },
             .auto_retry_start => |retry| {
                 const err_msg = self.msg_allocator.dupe(u8, retry.error_message) catch return;
@@ -2764,7 +2816,7 @@ pub const Interactive = struct {
             },
             .compaction_end => {
                 self.publishStatusSnapshot();
-                _ = self.publishConversationState();
+                self.flushPendingConversationPublish();
             },
         }
     }

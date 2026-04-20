@@ -7,6 +7,7 @@ const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const parser_mod = @import("../markdown/parser.zig");
 const render_mod = @import("../markdown/render.zig");
+const profile = @import("../../debug/profile.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -149,12 +150,24 @@ pub const Markdown = struct {
 
         _ = self.arena.reset(.retain_capacity);
         const arena = self.arena.allocator();
-        const doc = parser_mod.parseDocument(self.content, arena) catch return null;
+
+        var parse_timer = profile.ScopedTimer.begin(.markdown_parse);
+        const doc = parser_mod.parseDocument(self.content, arena) catch {
+            parse_timer.end();
+            return null;
+        };
+        parse_timer.end();
+
+        var render_timer = profile.ScopedTimer.begin(.markdown_render_document);
         const built = render_mod.renderDocument(doc, content_width, self.theme, .{
             .fg = self.fg,
             .bg = Color.default,
             .attrs = self.attrs,
-        }, self.code_block_indent, arena) catch return null;
+        }, self.code_block_indent, arena) catch {
+            render_timer.end();
+            return null;
+        };
+        render_timer.end();
 
         self.cached_lines = built;
         self.cached_width = content_width;

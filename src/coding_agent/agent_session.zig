@@ -399,8 +399,11 @@ pub const AgentSession = struct {
         var new_store = try SessionStore.createForCwd(self.allocator, self.resource_loader.cwd);
         errdefer new_store.deinit();
 
+        // Reset the agent FIRST. If reset fails (OOM allocating the
+        // empty SharedCommitted), we avoid the half-applied state of
+        // "new session store installed but old conversation retained."
+        try self.agent.reset();
         try self.replaceSessionStore(new_store);
-        self.agent.reset();
         const current_model = self.agent.modelValue();
         self.session_store.appendRuntimeDefaults(
             ai.json_util.providerToString(current_model.provider),

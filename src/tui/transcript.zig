@@ -1179,6 +1179,18 @@ pub const Transcript = struct {
         return self.items.items[index].retained_semantic_version;
     }
 
+    /// O(1) check for the P2 retain short-circuit: is there already a
+    /// retained row for this item_id with exactly this semantic_version?
+    /// If true, callers may emit a metadata-only DesiredItem (row=null)
+    /// and skip the full row-build cost.
+    pub fn hasRetainedMatch(self: *Transcript, item_id: ItemId, version: SemanticVersion) bool {
+        const idx = self.retained_items.get(item_id) orelse return false;
+        if (idx >= self.items.items.len) return false;
+        const item = self.items.items[idx];
+        if (item.retained_item_id == null or item.retained_item_id.? != item_id) return false;
+        return item.retained_semantic_version == version;
+    }
+
     pub fn isFollowingBottom(self: *Transcript) bool {
         return self.layout.follow_bottom;
     }

@@ -6,6 +6,9 @@ const control_mod = @import("control.zig");
 const conversation_state = @import("conversation_state.zig");
 const loop_mod = @import("loop.zig");
 const message_memory = @import("message_memory.zig");
+const profile = @import("../debug/profile.zig");
+const shared_committed_mod = @import("shared_committed.zig");
+const SharedCommitted = shared_committed_mod.SharedCommitted;
 const testing = std.testing;
 
 pub const QueueMode = control_mod.QueueMode;
@@ -38,7 +41,12 @@ pub const Agent = struct {
 
     listeners: std.ArrayList(Listener),
     next_listener_id: u64,
-    committed: std.ArrayList(protocol.AgentMessage),
+    /// P3: authoritative committed history. Refcounted shared handle;
+    /// each publish retains this rather than deep-copying. Replaced
+    /// atomically on append/truncate/reset/setMessages (release old,
+    /// install new). Segments keep older snapshots alive for outstanding
+    /// published views.
+    shared_committed: *SharedCommitted,
     in_flight: conversation_state.InFlightState,
 
     run_control: control_mod.RunControl,
@@ -99,12 +107,8 @@ pub const Agent = struct {
         var runtime_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer runtime_arena.deinit();
 
-        const aa = history_arena.allocator();
-        var committed: std.ArrayList(protocol.AgentMessage) = .empty;
-        errdefer committed.deinit(aa);
-        for (options.messages) |message| {
-            try committed.append(aa, try message_memory.cloneMessage(aa, message));
-        }
+        const initial_shared = try SharedCommitted.fromMessages(allocator, options.messages);
+        errdefer initial_shared.release();
 
         const run_control = try control_mod.RunControl.init(allocator, .{
             .steering_mode = options.steering_mode,
@@ -148,7 +152,7 @@ pub const Agent = struct {
             .runtime_arena = runtime_arena,
             .listeners = .empty,
             .next_listener_id = 1,
-            .committed = committed,
+            .shared_committed = initial_shared,
             .in_flight = conversation_state.InFlightState.init(allocator),
             .run_control = run_control,
             .system_prompt = options.system_prompt,
@@ -180,6 +184,7 @@ pub const Agent = struct {
         self.state_pending_tool_calls.deinit(self.allocator);
         self.in_flight.deinit();
         self.run_control.deinit();
+        self.shared_committed.release();
         self.runtime_arena.deinit();
         self.history_arena.deinit();
         if (self.session_id) |session_id| self.allocator.free(session_id);
@@ -287,14 +292,15 @@ pub const Agent = struct {
     }
 
     pub fn messages(self: *const Agent) []const protocol.AgentMessage {
-        return self.committed.items;
+        return self.shared_committed.flat;
     }
 
     pub fn latestAssistant(self: *const Agent) ?protocol.AssistantMessage {
-        var i = self.committed.items.len;
+        const flat = self.shared_committed.flat;
+        var i = flat.len;
         while (i > 0) {
             i -= 1;
-            switch (self.committed.items[i]) {
+            switch (flat[i]) {
                 .assistant => |assistant| return assistant,
                 else => {},
             }
@@ -320,7 +326,7 @@ pub const Agent = struct {
             .model = self.model,
             .thinking_level = self.thinking_level,
             .tools = self.tools,
-            .messages = self.committed.items,
+            .messages = self.shared_committed.flat,
             .is_streaming = self.is_streaming,
             .streaming_message = if (self.in_flight.assistant_streaming and self.in_flight.assistant != null)
                 .{ .assistant = self.in_flight.assistant.? }
@@ -338,30 +344,43 @@ pub const Agent = struct {
     }
 
     pub fn setMessages(self: *Agent, new_messages: []const protocol.AgentMessage) !void {
-        var staging_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer staging_arena.deinit();
-        const staging = staging_arena.allocator();
+        // Build the new shared prefix BEFORE touching existing state, so
+        // any allocation failure leaves the agent untouched.
+        const new_shared = try SharedCommitted.fromMessages(self.allocator, new_messages);
+        errdefer new_shared.release();
 
-        var staged: std.ArrayList(protocol.AgentMessage) = .empty;
-        defer staged.deinit(staging);
-        for (new_messages) |message| {
-            try staged.append(staging, try message_memory.cloneMessage(staging, message));
-        }
+        const old_shared = self.shared_committed;
+        self.shared_committed = new_shared;
+        old_shared.release();
 
         self.resetHistoryArena();
         self.clearInFlight();
-        const aa = self.history_arena.allocator();
-        for (staged.items) |message| {
-            try self.committed.append(aa, try message_memory.cloneMessage(aa, message));
-        }
     }
 
-    pub fn truncateCommitted(self: *Agent, new_len: usize) void {
-        std.debug.assert(new_len <= self.committed.items.len);
-        self.committed.items.len = new_len;
+    pub fn truncateCommitted(self: *Agent, new_len: usize) !void {
+        const current = self.shared_committed;
+        std.debug.assert(new_len <= current.flat.len);
+        if (new_len == current.flat.len) return;
+
+        // Cold path: rebuild a fresh shared prefix from the first
+        // new_len messages. Old shared stays alive in any outstanding
+        // published views until they drain. Propagates OOM so callers
+        // can avoid acting on a half-applied truncate.
+        const new_shared = try SharedCommitted.fromMessages(self.allocator, current.flat[0..new_len]);
+        self.shared_committed = new_shared;
+        current.release();
     }
 
-    pub fn reset(self: *Agent) void {
+    pub fn reset(self: *Agent) !void {
+        // Allocate the new empty prefix first so that a failure here
+        // leaves the agent untouched. Propagates OOM — callers must
+        // avoid mutating adjacent state (e.g. session store swap)
+        // before this succeeds.
+        const empty_shared = try SharedCommitted.empty(self.allocator);
+        const old = self.shared_committed;
+        self.shared_committed = empty_shared;
+        old.release();
+
         self.resetHistoryArena();
         self.resetRuntimeArena();
         self.is_streaming = false;
@@ -370,11 +389,20 @@ pub const Agent = struct {
     }
 
     pub fn cloneConversationView(self: *const Agent, allocator: std.mem.Allocator) !conversation_state.ConversationView {
-        const committed = try message_memory.cloneMessages(allocator, self.committed.items);
-        errdefer message_memory.freeMessages(allocator, committed);
+        var clone_timer = profile.ScopedTimer.begin(.clone_conversation_view);
+        defer clone_timer.end();
+
         const in_flight = try self.in_flight.freeze(allocator);
+        errdefer if (in_flight) |*frozen| {
+            var mut = frozen.*;
+            mut.deinit(allocator);
+        };
+
+        // retain() needs a mutable handle; the SharedCommitted itself is
+        // immutable post-construction, so this @constCast is safe.
+        const mutable: *SharedCommitted = @constCast(self.shared_committed);
         return .{
-            .committed = committed,
+            .committed = mutable.retain(),
             .in_flight = in_flight,
         };
     }
@@ -386,9 +414,10 @@ pub const Agent = struct {
 
     pub fn continueTurn(self: *Agent) !void {
         if (self.is_running.load(.acquire)) return error.AlreadyProcessing;
-        if (self.committed.items.len == 0) return error.NoMessages;
+        const flat = self.shared_committed.flat;
+        if (flat.len == 0) return error.NoMessages;
 
-        const last = self.committed.items[self.committed.items.len - 1];
+        const last = flat[flat.len - 1];
         if (last == .assistant) {
             if (self.run_control.hasSteeringMessages()) {
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -427,9 +456,13 @@ pub const Agent = struct {
     }
 
     fn resetHistoryArena(self: *Agent) void {
+        // Resets the scratch arena used for fields that still live in it
+        // (currently just `self.error_message`). Committed history is
+        // owned by `self.shared_committed` and must be replaced
+        // separately — see setMessages / truncateCommitted / reset.
         self.history_arena.deinit();
         self.history_arena = std.heap.ArenaAllocator.init(self.allocator);
-        self.committed = .empty;
+        self.error_message = null;
     }
 
     fn clearInFlight(self: *Agent) void {
@@ -443,12 +476,18 @@ pub const Agent = struct {
     }
 
     fn appendCommittedMessage(self: *Agent, message: protocol.AgentMessage) void {
-        const aa = self.history_arena.allocator();
-        const owned = message_memory.cloneMessage(aa, message) catch return;
-        self.committed.append(aa, owned) catch {
-            var mutable = owned;
-            message_memory.freeMessage(aa, &mutable);
-        };
+        // P3 hot path: build a new SharedCommitted that appends a fresh
+        // segment holding the deep-copied message. The old handle is
+        // released — its segments stay alive via the new handle, plus
+        // any outstanding published views.
+        const new_shared = SharedCommitted.appendMessage(
+            self.allocator,
+            self.shared_committed,
+            message,
+        ) catch return;
+        const old = self.shared_committed;
+        self.shared_committed = new_shared;
+        old.release();
     }
 
     fn runWithLifecycle(self: *Agent, prompt_messages: ?[]const protocol.AgentMessage, is_continue: bool, skip_initial_steering_poll: bool) void {
@@ -495,7 +534,7 @@ pub const Agent = struct {
     fn createContextSnapshot(self: *const Agent) protocol.AgentContext {
         return .{
             .system_prompt = self.system_prompt,
-            .messages = self.committed.items,
+            .messages = self.shared_committed.flat,
             .tools = if (self.tools.len > 0) self.tools else null,
         };
     }
@@ -778,7 +817,7 @@ test "conversation view keeps current turn separate until turn_end" {
     var view = try agent.cloneConversationView(testing.allocator);
     defer view.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), view.committed.len);
+    try testing.expectEqual(@as(usize, 1), view.committed.flat.len);
     try testing.expect(view.in_flight != null);
     try testing.expect(view.in_flight.?.assistant != null);
     try testing.expectEqual(@as(usize, 1), view.in_flight.?.tool_executions.len);
@@ -836,7 +875,7 @@ test "truncateCommitted drops tail without rebuilding history" {
     });
     defer agent.deinit();
 
-    agent.truncateCommitted(1);
+    try agent.truncateCommitted(1);
 
     try testing.expectEqual(@as(usize, 1), agent.messages().len);
     try testing.expect(agent.messages()[0] == .user);
