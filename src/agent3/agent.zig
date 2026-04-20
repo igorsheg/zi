@@ -257,6 +257,10 @@ pub const Agent = struct {
         return self.run_control.clearAndSnapshot(allocator);
     }
 
+    pub fn currentQueuedVersion(self: *const Agent) u64 {
+        return self.run_control.currentVersion();
+    }
+
     pub fn abort(self: *Agent) void {
         if (self.is_running.load(.acquire)) {
             self.abort_controller.requestAbort();

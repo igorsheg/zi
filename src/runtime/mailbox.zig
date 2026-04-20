@@ -271,6 +271,30 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             }
         }
 
+        /// Atomic snapshot-and-clear: visits each pending item with the
+        /// mutex held, then cleans up and resets the queue — all under a
+        /// single lock acquisition so callers never observe a partial
+        /// drain. A visitor error aborts the traversal without clearing
+        /// any items, matching `visitPending` semantics.
+        pub fn visitAndClear(
+            self: *Self,
+            visitor: *const fn (item: *const T, ctx: ?*anyopaque) anyerror!void,
+            ctx: ?*anyopaque,
+        ) anyerror!void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            for (0..self.queue.len) |i| {
+                try visitor(self.queue.itemPtr(i), ctx);
+            }
+            for (0..self.queue.len) |i| {
+                Self.cleanupItem(self.queue.itemPtr(i), self.allocator);
+            }
+            self.queue.len = 0;
+            self.queue.head = 0;
+            self.reconcileStateAndWakeLocked();
+        }
+
         pub fn clear(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();

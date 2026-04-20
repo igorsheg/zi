@@ -26,6 +26,10 @@ pub const QueuedMessageText = struct {
 pub const QueuedMessageSnapshot = struct {
     steering: []QueuedMessageText,
     follow_up: []QueuedMessageText,
+    /// Monotonically increasing per-RunControl. Consumers compare
+    /// versions to drop snapshots that are older than what they have
+    /// already applied. Version 0 is the initial pre-mutation state.
+    version: u64 = 0,
 
     pub fn deinit(self: *QueuedMessageSnapshot, allocator: std.mem.Allocator) void {
         for (self.steering) |entry| allocator.free(entry.text);
@@ -45,6 +49,11 @@ const MessageMailbox = mailbox_mod.Mailbox(protocol.AgentMessage, .{
 pub const RunControl = struct {
     steering: MessageQueue,
     follow_up: MessageQueue,
+    /// Monotonically increasing counter that ticks on every user-visible
+    /// mutation (enqueue, drain, clear, atomic take+clear). Snapshot
+    /// consumers use it to drop stale snapshots that might be delivered
+    /// out of order when producers on different threads publish concurrently.
+    version: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub const Options = struct {
         steering_mode: QueueMode = .one_at_a_time,
@@ -68,7 +77,9 @@ pub const RunControl = struct {
     }
 
     pub fn enqueue(self: *RunControl, kind: QueueKind, message: protocol.AgentMessage) EnqueueResult {
-        return self.queueFor(kind).enqueue(message);
+        const result = self.queueFor(kind).enqueue(message);
+        if (result == .ok) self.bumpVersion();
+        return result;
     }
 
     pub fn hasSteeringMessages(self: *RunControl) bool {
@@ -84,11 +95,15 @@ pub const RunControl = struct {
     }
 
     pub fn clearSteering(self: *RunControl) void {
+        const had_items = self.steering.hasItems();
         self.steering.clear();
+        if (had_items) self.bumpVersion();
     }
 
     pub fn clearFollowUp(self: *RunControl) void {
+        const had_items = self.follow_up.hasItems();
         self.follow_up.clear();
+        if (had_items) self.bumpVersion();
     }
 
     pub fn clearAll(self: *RunControl) void {
@@ -109,22 +124,39 @@ pub const RunControl = struct {
         return .{
             .steering = self.steering.snapshotTexts(allocator),
             .follow_up = self.follow_up.snapshotTexts(allocator),
+            .version = self.currentVersion(),
         };
     }
 
     pub fn clearAndSnapshot(self: *RunControl, allocator: std.mem.Allocator) QueuedMessageSnapshot {
+        const steering_texts = self.steering.takeSnapshotAndClear(allocator);
+        const follow_up_texts = self.follow_up.takeSnapshotAndClear(allocator);
+        if (steering_texts.len > 0 or follow_up_texts.len > 0) self.bumpVersion();
         return .{
-            .steering = self.steering.takeSnapshotAndClear(allocator),
-            .follow_up = self.follow_up.takeSnapshotAndClear(allocator),
+            .steering = steering_texts,
+            .follow_up = follow_up_texts,
+            .version = self.currentVersion(),
         };
     }
 
     pub fn drainSteering(self: *RunControl, arena: std.mem.Allocator) []const protocol.AgentMessage {
-        return self.steering.drain(arena);
+        const drained = self.steering.drain(arena);
+        if (drained.len > 0) self.bumpVersion();
+        return drained;
     }
 
     pub fn drainFollowUp(self: *RunControl, arena: std.mem.Allocator) []const protocol.AgentMessage {
-        return self.follow_up.drain(arena);
+        const drained = self.follow_up.drain(arena);
+        if (drained.len > 0) self.bumpVersion();
+        return drained;
+    }
+
+    pub fn currentVersion(self: *const RunControl) u64 {
+        return self.version.load(.acquire);
+    }
+
+    fn bumpVersion(self: *RunControl) void {
+        _ = self.version.fetchAdd(1, .acq_rel);
     }
 
     fn queueFor(self: *RunControl, kind: QueueKind) *MessageQueue {
@@ -220,6 +252,19 @@ const MessageQueue = struct {
         return cloned[0..out_len];
     }
 
+    const SnapshotCtx = struct {
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(QueuedMessageText),
+    };
+
+    fn snapshotVisit(item: *const protocol.AgentMessage, raw_ctx: ?*anyopaque) !void {
+        const ctx_ptr: *SnapshotCtx = @ptrCast(@alignCast(raw_ctx.?));
+        const text = extractQueuedMessageText(item.*) orelse return;
+        const owned = try ctx_ptr.allocator.dupe(u8, text);
+        errdefer ctx_ptr.allocator.free(owned);
+        try ctx_ptr.out.append(ctx_ptr.allocator, .{ .text = owned });
+    }
+
     fn snapshotTexts(self: *MessageQueue, allocator: std.mem.Allocator) []QueuedMessageText {
         var out: std.ArrayList(QueuedMessageText) = .empty;
         var success = false;
@@ -228,31 +273,28 @@ const MessageQueue = struct {
             out.deinit(allocator);
         };
 
-        const SnapshotCtx = struct {
-            allocator: std.mem.Allocator,
-            out: *std.ArrayList(QueuedMessageText),
-        };
         var ctx = SnapshotCtx{ .allocator = allocator, .out = &out };
-
-        const Visitor = struct {
-            fn visit(item: *const protocol.AgentMessage, raw_ctx: ?*anyopaque) !void {
-                const ctx_ptr: *SnapshotCtx = @ptrCast(@alignCast(raw_ctx.?));
-                const text = extractQueuedMessageText(item.*) orelse return;
-                const owned = try ctx_ptr.allocator.dupe(u8, text);
-                errdefer ctx_ptr.allocator.free(owned);
-                try ctx_ptr.out.append(ctx_ptr.allocator, .{ .text = owned });
-            }
-        };
-
-        self.mailbox.visitPending(Visitor.visit, @ptrCast(&ctx)) catch return &.{};
+        self.mailbox.visitPending(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
         const snapshot = out.toOwnedSlice(allocator) catch return &.{};
         success = true;
         return snapshot;
     }
 
+    /// Atomic clone-and-clear: holds the mailbox mutex once across both
+    /// operations so producers enqueuing concurrently either show up in
+    /// the snapshot or land after the clear — never lost between them.
     fn takeSnapshotAndClear(self: *MessageQueue, allocator: std.mem.Allocator) []QueuedMessageText {
-        const snapshot = self.snapshotTexts(allocator);
-        self.clear();
+        var out: std.ArrayList(QueuedMessageText) = .empty;
+        var success = false;
+        defer if (!success) {
+            for (out.items) |entry| allocator.free(entry.text);
+            out.deinit(allocator);
+        };
+
+        var ctx = SnapshotCtx{ .allocator = allocator, .out = &out };
+        self.mailbox.visitAndClear(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
+        const snapshot = out.toOwnedSlice(allocator) catch return &.{};
+        success = true;
         return snapshot;
     }
 };
