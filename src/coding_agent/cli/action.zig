@@ -1,3 +1,4 @@
+const spec = @import("spec.zig");
 const std = @import("std");
 
 pub const Action = enum {
@@ -11,9 +12,12 @@ pub const Action = enum {
         var saw_list_models = false;
 
         for (argv) |arg| {
-            if (eql(arg, "--version") or eql(arg, "-v")) return .version;
-            if (eql(arg, "--list-models")) saw_list_models = true;
-            if (eql(arg, "--help") or eql(arg, "-h")) saw_help = true;
+            const utility_action = spec.utilityActionForArg(arg) orelse continue;
+            switch (utility_action) {
+                .version => return .version,
+                .list_models => saw_list_models = true,
+                .help => saw_help = true,
+            }
         }
 
         if (saw_list_models) return .list_models;
@@ -21,10 +25,6 @@ pub const Action = enum {
         return .run;
     }
 };
-
-fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
 
 test "action detection prefers specific utility actions over help fallback" {
     try std.testing.expectEqual(Action.run, Action.detect(&.{"hello"}));

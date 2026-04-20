@@ -9,6 +9,7 @@ pub fn writeParseDiagnostic(writer: anytype, diagnostic: parse.ParseDiagnostic) 
         .missing_value => |flag| try writer.print("error: missing value for {s}\n", .{flag}),
         .invalid_mode => |value| try writer.print("error: unknown mode '{s}'. use 'json' or 'text'\n", .{value}),
         .unknown_flag => |flag| try writer.print("error: unknown flag '{s}'\n", .{flag}),
+        .unexpected_argument => |arg| try writer.print("error: unexpected argument '{s}'\n", .{arg}),
     }
 }
 

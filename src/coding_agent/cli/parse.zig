@@ -1,5 +1,6 @@
 const std = @import("std");
 const action_mod = @import("action.zig");
+const spec = @import("spec.zig");
 
 pub const Action = action_mod.Action;
 
@@ -59,6 +60,7 @@ pub const ParseDiagnostic = union(enum) {
     missing_value: []const u8,
     invalid_mode: []const u8,
     unknown_flag: []const u8,
+    unexpected_argument: []const u8,
 };
 
 pub const ParseResult = union(enum) {
@@ -73,8 +75,8 @@ pub fn parse(
 ) std.mem.Allocator.Error!ParseResult {
     return switch (action) {
         .run => try parseRun(allocator, argv),
-        .help => .{ .ok = .{ .help = .{} } },
-        .version => .{ .ok = .{ .version = .{} } },
+        .help => try parseUtilityAction(.help, argv),
+        .version => try parseUtilityAction(.version, argv),
         .list_models => try parseListModels(allocator, argv),
     };
 }
@@ -90,54 +92,27 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
 
-        if (eql(arg, "-p") or eql(arg, "--print")) {
-            raw.print_mode = true;
-            continue;
-        }
-        if (eql(arg, "--api-key")) {
-            const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
-            raw.api_key = value;
-            continue;
-        }
-        if (eql(arg, "--model")) {
-            const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
-            raw.model_id = value;
-            continue;
-        }
-        if (eql(arg, "--continue") or eql(arg, "-c")) {
-            raw.continue_session = true;
-            continue;
-        }
-        if (eql(arg, "--resume") or eql(arg, "-r")) {
-            raw.resume_picker = true;
-            continue;
-        }
-        if (eql(arg, "--session")) {
-            const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
-            raw.session_ref = value;
-            continue;
-        }
-        if (eql(arg, "--mode")) {
-            const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
-            raw.mode = parseMode(value) orelse return .{ .err = .{ .invalid_mode = value } };
-            continue;
-        }
-        if (eql(arg, "--no-session")) {
-            raw.no_session = true;
-            continue;
-        }
-        if (eql(arg, "--tools")) {
-            const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
-            raw.tools_filter = value;
-            continue;
-        }
-        if (eql(arg, "--append-system-prompt")) {
-            const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
-            raw.append_system_prompt = value;
-            continue;
-        }
         if (arg.len > 0 and arg[0] == '@') {
             try file_args.append(allocator, arg[1..]);
+            continue;
+        }
+        if (spec.findForAction(.run, arg)) |flag| {
+            switch (flag.id) {
+                .print_mode => raw.print_mode = true,
+                .api_key => raw.api_key = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } },
+                .model_id => raw.model_id = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } },
+                .continue_session => raw.continue_session = true,
+                .resume_picker => raw.resume_picker = true,
+                .session_ref => raw.session_ref = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } },
+                .mode => {
+                    const value = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
+                    raw.mode = parseMode(value) orelse return .{ .err = .{ .invalid_mode = value } };
+                },
+                .no_session => raw.no_session = true,
+                .tools_filter => raw.tools_filter = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } },
+                .append_system_prompt => raw.append_system_prompt = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } },
+                .list_models, .help, .version => unreachable,
+            }
             continue;
         }
         if (arg.len > 0 and arg[0] == '-') {
@@ -153,13 +128,27 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
     return .{ .ok = .{ .run = raw } };
 }
 
+fn parseUtilityAction(comptime action: spec.ActionScope, argv: []const []const u8) std.mem.Allocator.Error!ParseResult {
+    for (argv) |arg| {
+        if (spec.findForAction(action, arg) != null) continue;
+        if (arg.len > 0 and arg[0] == '-') return .{ .err = .{ .unknown_flag = arg } };
+        return .{ .err = .{ .unexpected_argument = arg } };
+    }
+
+    return switch (action) {
+        .help => .{ .ok = .{ .help = .{} } },
+        .version => .{ .ok = .{ .version = .{} } },
+        .run, .list_models => unreachable,
+    };
+}
+
 fn parseListModels(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allocator.Error!ParseResult {
     var raw: RawListModelsArgs = .{};
     var positionals: std.ArrayList([]const u8) = .empty;
     defer positionals.deinit(allocator);
 
     for (argv) |arg| {
-        if (eql(arg, "--list-models") or eql(arg, "--help") or eql(arg, "-h")) {
+        if (spec.findForAction(.list_models, arg) != null) {
             continue;
         }
         if (arg.len > 0 and arg[0] == '-') {
@@ -181,13 +170,9 @@ fn consumeValue(argv: []const []const u8, index: *usize, _: []const u8) ?[]const
 }
 
 fn parseMode(value: []const u8) ?OutputMode {
-    if (eql(value, "text")) return .text;
-    if (eql(value, "json")) return .json;
+    if (std.mem.eql(u8, value, "text")) return .text;
+    if (std.mem.eql(u8, value, "json")) return .json;
     return null;
-}
-
-fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
 }
 
 test "list-models parsing keeps its optional search positional and rejects unrelated flags" {
@@ -210,6 +195,38 @@ test "list-models parsing keeps its optional search positional and rejects unrel
     switch (bad_flag) {
         .err => |diag| switch (diag) {
             .unknown_flag => |flag| try std.testing.expectEqualStrings("--model", flag),
+            else => return error.UnexpectedDiagnostic,
+        },
+        .ok => return error.ExpectedDiagnostic,
+    }
+}
+
+test "utility action parsing rejects unsupported flags and swallowed positionals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const help_ok = try parse(arena.allocator(), .help, &.{"--help"});
+    switch (help_ok) {
+        .ok => |cmd| switch (cmd) {
+            .help => {},
+            else => return error.UnexpectedCommand,
+        },
+        .err => return error.UnexpectedDiagnostic,
+    }
+
+    const help_bad_flag = try parse(arena.allocator(), .help, &.{ "--help", "--model", "gpt-4o" });
+    switch (help_bad_flag) {
+        .err => |diag| switch (diag) {
+            .unknown_flag => |flag| try std.testing.expectEqualStrings("--model", flag),
+            else => return error.UnexpectedDiagnostic,
+        },
+        .ok => return error.ExpectedDiagnostic,
+    }
+
+    const version_bad_positional = try parse(arena.allocator(), .version, &.{ "--version", "hello" });
+    switch (version_bad_positional) {
+        .err => |diag| switch (diag) {
+            .unexpected_argument => |arg| try std.testing.expectEqualStrings("hello", arg),
             else => return error.UnexpectedDiagnostic,
         },
         .ok => return error.ExpectedDiagnostic,

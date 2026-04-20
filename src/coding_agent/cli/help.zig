@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_meta = @import("../../app_meta.zig");
+const spec = @import("spec.zig");
 
 pub fn writeGeneralHelp(writer: anytype) !void {
     try writer.print("{s} — {s}\n\n", .{ app_meta.name, app_meta.tagline });
@@ -56,24 +57,10 @@ pub fn writeGeneralHelp(writer: anytype) !void {
             app_meta.name,
         },
     );
+    try spec.writeHelpSection(writer, .run_options);
+    try spec.writeHelpSection(writer, .actions);
     try writer.writeAll(
-        "Run options:\n" ++
-            "  -p, --print                  Select batch text mode; prints the final assistant text only\n" ++
-            "  --mode <text|json>           Select batch output mode; JSON emits a session header then event lines\n" ++
-            "  --continue, -c               Resume the most recent session for this project\n" ++
-            "  --resume, -r                 Open the interactive session picker\n" ++
-            "  --session <path|id>          Resume a specific session by path or ID prefix\n" ++
-            "  --model <id>                 Model ID or pattern\n" ++
-            "  --api-key <key>              API key override\n" ++
-            "  --no-session                 Disable session persistence for the startup session\n" ++
-            "  --tools <filter>             Comma-separated list of allowed tools\n" ++
-            "  --append-system-prompt <text|path>\n" ++
-            "                              Append literal text or file contents to the system prompt\n\n" ++
-            "Actions:\n" ++
-            "  --list-models [search]       List available models (optional fuzzy search)\n" ++
-            "  -h, --help                   Show help\n" ++
-            "  -v, --version                Show version\n\n" ++
-            "Notes:\n" ++
+        "Notes:\n" ++
             "  - batch mode is explicit: use -p or --mode\n" ++
             "  - piped stdin is read only for explicit batch mode, never to force batch selection\n" ++
             "  - @file arguments are supported for interactive startup and explicit batch mode\n" ++
