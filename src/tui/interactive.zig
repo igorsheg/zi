@@ -1313,6 +1313,16 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
+            .session_compacted => {
+                self.status_text.setContent("session compacted; ctx updates after next response");
+                self.status_text.fg = self.theme.fg(.success);
+                self.tui.dirty = true;
+            },
+            .session_compaction_failed => |f| {
+                self.status_text.setContent(f.message);
+                self.status_text.fg = self.theme.fg(.@"error");
+                self.tui.dirty = true;
+            },
             .status_snapshot => |s| {
                 self.applyStatusSnapshot(s);
                 self.tui.dirty = true;
@@ -2930,12 +2940,21 @@ pub const Interactive = struct {
     }
 
     fn publishStatusSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
-        switch (event) {
-            // Status chips reflect current semantic state, so publish at
-            // message commit boundaries instead of waiting for turn_end.
-            .message_end => self.publishStatusSnapshot(),
-            else => {},
-        }
+        if (!shouldPublishStatusSnapshotForAgentEvent(event)) return;
+        self.publishStatusSnapshot();
+    }
+
+    fn shouldPublishStatusSnapshotForAgentEvent(event: AgentEvent) bool {
+        return switch (event) {
+            // Context usage becomes authoritative on assistant commits.
+            // Publishing on user commits can resurrect stale pre-compaction
+            // counts in the footer before a fresh assistant usage lands.
+            .message_end => |payload| switch (payload.message) {
+                .assistant => true,
+                else => false,
+            },
+            else => false,
+        };
     }
 
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
@@ -3005,11 +3024,32 @@ pub const Interactive = struct {
             .compaction_start => {
                 self.publishStatusSnapshot();
             },
-            .compaction_end => {
+            .compaction_end => |compaction| {
+                self.publishManualCompactionLifecycle(compaction);
                 self.publishStatusSnapshot();
                 self.flushPendingConversationPublish();
             },
         }
+    }
+
+    fn publishManualCompactionLifecycle(
+        self: *Interactive,
+        compaction: coding_agent_mod.session_event.CompactionEnd,
+    ) void {
+        if (compaction.reason != .manual) return;
+
+        if (compaction.success) {
+            _ = self.publishLifecycleUiEvent(.{ .session_compacted = {} });
+            return;
+        }
+
+        const msg = if (compaction.aborted)
+            self.msg_allocator.dupe(u8, "compaction cancelled") catch return
+        else if (compaction.error_message) |err|
+            self.msg_allocator.dupe(u8, err) catch return
+        else
+            self.msg_allocator.dupe(u8, "compaction failed") catch return;
+        _ = self.publishLifecycleUiEvent(.{ .session_compaction_failed = .{ .message = msg } });
     }
 };
 
@@ -3306,4 +3346,38 @@ test "pendingImageBannerText includes latest image details and clear shortcut" {
     try testing.expect(std.mem.indexOf(u8, banner, "image/jpeg") != null);
     try testing.expect(std.mem.indexOf(u8, banner, "30x40") != null);
     try testing.expect(std.mem.indexOf(u8, banner, "ctrl+c") != null);
+}
+
+test "status snapshot publication tracks assistant commits only" {
+    const user = agent_protocol.AgentMessage{ .user = .{
+        .content = .{ .text = "hello" },
+        .timestamp = 1,
+    } };
+    const assistant = agent_protocol.AgentMessage{ .assistant = .{
+        .content = &.{},
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "gpt-test",
+        .usage = .{
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .stop,
+        .timestamp = 2,
+    } };
+    const tool_result = agent_protocol.AgentMessage{ .tool_result = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .content = &.{},
+        .is_error = false,
+        .timestamp = 3,
+    } };
+
+    try testing.expect(!Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = user } }));
+    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = assistant } }));
+    try testing.expect(!Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = tool_result } }));
 }
