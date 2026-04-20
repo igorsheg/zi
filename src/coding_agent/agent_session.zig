@@ -544,26 +544,11 @@ pub const AgentSession = struct {
     }
 
     pub fn cloneQueuedMessageSnapshot(self: *AgentSession, allocator: std.mem.Allocator) !control_mod.QueuedMessageSnapshot {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
-
-        const steering = try cloneQueuedEntries(allocator, self.steering_mirror.items);
-        errdefer {
-            freeQueuedEntries(allocator, steering);
-            allocator.free(steering);
-        }
-        const follow_up = try cloneQueuedEntries(allocator, self.follow_up_mirror.items);
-        return .{
-            .steering = steering,
-            .follow_up = follow_up,
-        };
+        return self.agent.snapshotQueuedMessages(allocator);
     }
 
     pub fn restoreQueuedMessagesOnAgentThread(self: *AgentSession, allocator: std.mem.Allocator) !control_mod.QueuedMessageSnapshot {
-        var snapshot = try self.cloneQueuedMessageSnapshot(allocator);
-        errdefer snapshot.deinit(allocator);
-        self.agent.clearAllQueues();
-        return snapshot;
+        return self.agent.takeQueuedMessagesAndClear(allocator);
     }
 
     fn emitSessionEvent(self: *AgentSession, event: SessionEvent) void {
