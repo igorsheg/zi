@@ -1202,9 +1202,6 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
-            .queued_inputs_restored => |*snapshot| {
-                self.applyRestoredQueuedInputs(snapshot);
-            },
             .status_snapshot => |s| {
                 self.applyStatusSnapshot(s);
                 self.tui.dirty = true;
@@ -1569,25 +1566,17 @@ pub const Interactive = struct {
     }
 
     fn queueMessageWhileStreaming(self: *Interactive, kind: QueuedInputKind, text: []const u8) void {
-        const text_copy = self.msg_allocator.dupe(u8, text) catch {
-            self.status_text.setContent("out of memory");
-            self.status_text.fg = self.theme.fg(.@"error");
-            self.tui.dirty = true;
-            return;
+        // Run-control is the dedicated cross-thread queued-message boundary
+        // (see docs/runtime.md). Enqueue directly from the TUI thread so
+        // steering submits appear immediately in the transcript instead of
+        // waiting for `runUserContent` to return on the agent owner loop.
+        const queue_kind: coding_agent_mod.runtime_host.QueueKind = switch (kind) {
+            .steering => .steering,
+            .follow_up => .follow_up,
         };
-
-        switch (self.request_queue.trySend(.{ .enqueue_queued_input = .{
-            .kind = switch (kind) {
-                .steering => .steering,
-                .follow_up => .follow_up,
-            },
-            .text = text_copy,
-        } })) {
+        switch (self.runtime_host.enqueueQueuedText(queue_kind, text)) {
             .ok => {},
-            .dropped => unreachable,
-            .closed, .full, .oom => |rejected| {
-                var failed_req = rejected;
-                failed_req.deinit(self.msg_allocator);
+            .closed, .oom => {
                 self.status_text.setContent("agent unavailable");
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
@@ -1595,21 +1584,28 @@ pub const Interactive = struct {
             },
         }
 
+        // Publish the queued snapshot so the transcript projection picks up
+        // the new row without waiting for the agent thread to surface.
+        _ = self.publishQueuedSnapshot();
+
         self.active_editor.clear();
         self.refreshGreeterVisibility();
         self.tui.dirty = true;
     }
 
     fn restoreQueuedInputsToEditor(self: *Interactive) void {
-        switch (self.request_queue.trySend(.{ .restore_queued_inputs = {} })) {
-            .ok => {},
-            .dropped => unreachable,
-            .closed, .full, .oom => {
-                self.status_text.setContent("agent unavailable");
-                self.status_text.fg = self.theme.fg(.@"error");
-                self.tui.dirty = true;
-            },
-        }
+        // Atomic take-and-clear on the TUI thread (safe — run-control's
+        // mailbox serializes it against the agent thread's drain).
+        var snapshot = self.runtime_host.takeQueuedMessagesAndClear(self.msg_allocator) catch {
+            self.status_text.setContent("failed to restore queued messages");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        };
+        defer snapshot.deinit(self.msg_allocator);
+
+        self.applyRestoredQueuedInputs(&snapshot);
+        _ = self.publishQueuedSnapshot();
     }
 
     fn applyRestoredQueuedInputs(self: *Interactive, snapshot: *const coding_agent_mod.runtime_host.QueuedMessageSnapshot) void {
@@ -2437,7 +2433,6 @@ pub const Interactive = struct {
     /// Completion events stay semantic rather than thread-shaped:
     ///   - prompt requests publish `.prompt_worker_finished`
     ///   - non-prompt request drains publish `.request_worker_finished`
-    ///   - queued-input restore publishes `.queued_inputs_restored`
     fn agentThreadFn(self: *Interactive) void {
         logging.setThreadLabel(.agent);
 
@@ -2521,14 +2516,6 @@ pub const Interactive = struct {
                         idle_processed = true;
                         self.handleSetThinkingLevel(s.level);
                     },
-                    .enqueue_queued_input => |q| {
-                        idle_processed = true;
-                        self.handleEnqueueQueuedInput(q.kind, q.text);
-                    },
-                    .restore_queued_inputs => {
-                        idle_processed = true;
-                        self.handleRestoreQueuedInputs();
-                    },
                     .refresh_status_snapshot => {
                         idle_processed = true;
                         self.publishStatusSnapshot();
@@ -2547,42 +2534,6 @@ pub const Interactive = struct {
                 self.event_queue.push(.{ .request_worker_finished = {} });
             }
         }
-    }
-
-    fn handleEnqueueQueuedInput(
-        self: *Interactive,
-        kind: coding_agent_mod.runtime_host.QueueKind,
-        text: []const u8,
-    ) void {
-        const message: agent_protocol.AgentMessage = .{ .user = .{
-            .content = .{ .text = text },
-            .timestamp = std.time.milliTimestamp(),
-        } };
-        const result = switch (kind) {
-            .steering => self.runtime_host.currentSession().agent.steer(message),
-            .follow_up => self.runtime_host.currentSession().agent.followUp(message),
-        };
-        switch (result) {
-            .ok => {
-                self.publishQueuedSnapshotIfChanged();
-            },
-            .closed, .oom => {
-                const msg = self.msg_allocator.dupe(u8, "agent unavailable") catch return;
-                self.event_queue.push(.{ .error_message = .{ .message = msg } });
-            },
-        }
-    }
-
-    fn handleRestoreQueuedInputs(self: *Interactive) void {
-        var snapshot = self.runtime_host.restoreQueuedMessagesOnAgentThread(self.msg_allocator) catch {
-            const msg = self.msg_allocator.dupe(u8, "failed to restore queued messages") catch return;
-            self.event_queue.push(.{ .error_message = .{ .message = msg } });
-            return;
-        };
-        errdefer snapshot.deinit(self.msg_allocator);
-
-        self.publishQueuedSnapshotIfChanged();
-        self.event_queue.push(.{ .queued_inputs_restored = snapshot });
     }
 
     fn handleNewSession(self: *Interactive) void {

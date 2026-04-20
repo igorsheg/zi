@@ -84,9 +84,6 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    // --- queued-input restore outcomes ---
-    queued_inputs_restored: runtime_host_mod.QueuedMessageSnapshot,
-
     // --- shared status snapshot ---
     // Agent-thread owned model/thinking/context snapshot for the editor
     // border chips. Published whenever session state changes in a way the
@@ -165,7 +162,6 @@ pub const UiEvent = union(enum) {
             .session_resume_failed => |f| allocator.free(f.message),
             .session_new_started => {},
             .session_new_failed => |f| allocator.free(f.message),
-            .queued_inputs_restored => |*snapshot| snapshot.deinit(allocator),
             .status_snapshot => |s| {
                 allocator.free(s.model_provider);
                 allocator.free(s.model_id);
@@ -223,10 +219,3 @@ test "UiEvent deinit handles assistant failure without message" {
     ev.deinit(testing.allocator);
 }
 
-test "UiEvent deinit frees queued-input restore snapshot" {
-    var ev = UiEvent{ .queued_inputs_restored = .{
-        .steering = try testing.allocator.dupe(runtime_host_mod.QueuedMessageText, &.{.{ .text = try testing.allocator.dupe(u8, "a") }}),
-        .follow_up = try testing.allocator.dupe(runtime_host_mod.QueuedMessageText, &.{.{ .text = try testing.allocator.dupe(u8, "b") }}),
-    } };
-    ev.deinit(testing.allocator);
-}
