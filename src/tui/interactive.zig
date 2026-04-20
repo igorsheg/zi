@@ -1879,6 +1879,11 @@ pub const Interactive = struct {
             }
             if (std.mem.eql(u8, name, "clear")) {
                 self.transcript.clearAll();
+                // Drop the projection snapshot/cache too — otherwise the
+                // next replaceViewSnapshot with the same committed ptr
+                // would take the cache-hit path and hand reconcile
+                // metadata-only items against a wiped transcript.
+                self.conversation_projection.clear();
                 self.status_text.setContent("");
                 self.tui.dirty = true;
                 return true;

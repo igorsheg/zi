@@ -96,10 +96,41 @@ fn emptyQueuedSnapshot(allocator: std.mem.Allocator) !control_mod.QueuedMessageS
     };
 }
 
+const CachedCommittedItem = struct {
+    item_id: transcript_mod.ItemId,
+    semantic_version: transcript_mod.SemanticVersion,
+};
+
+/// Cached metadata for the committed portion of the last projected
+/// view snapshot. Reused by replaceViewSnapshot when the incoming
+/// snapshot points at the same *SharedCommitted and the cache key
+/// inputs (retry_attempt) still match — lets us skip rebuilding the
+/// committed-message portion of desired items, which is the hot part
+/// of the projection loop on soft updates.
+///
+/// The cache retains its own reference on `committed` because the
+/// pointer is used as a cache key across frames; without the retain,
+/// a failed full-rebuild after the previous view_snapshot is released
+/// could leave the cache holding a freed pointer that a later frame
+/// would compare against (ABA risk).
+const CommittedProjectionCache = struct {
+    committed: *conversation_state_mod.SharedCommitted,
+    retry_attempt: u32,
+    items: []CachedCommittedItem,
+
+    fn deinit(self: *CommittedProjectionCache, allocator: std.mem.Allocator) void {
+        self.committed.release();
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
 pub const ProjectionState = struct {
     allocator: std.mem.Allocator,
     view_snapshot: ?conversation_state_mod.ConversationViewSnapshot = null,
     queued_snapshot: ?control_mod.QueuedMessageSnapshot = null,
+    committed_cache: ?CommittedProjectionCache = null,
+    committed_cache_hits: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) ProjectionState {
         return .{ .allocator = allocator };
@@ -112,8 +143,10 @@ pub const ProjectionState = struct {
     pub fn clear(self: *ProjectionState) void {
         if (self.view_snapshot) |*snapshot| snapshot.deinit(self.allocator);
         if (self.queued_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+        if (self.committed_cache) |*cache| cache.deinit(self.allocator);
         self.view_snapshot = null;
         self.queued_snapshot = null;
+        self.committed_cache = null;
     }
 
     pub fn replaceViewSnapshot(
@@ -130,13 +163,96 @@ pub const ProjectionState = struct {
             !committedUserHistoryIsPrefix(previous.view.committed.flat, owned.view.committed.flat)
         else
             false;
+
+        const can_reuse_committed_cache = blk: {
+            const cache = self.committed_cache orelse break :blk false;
+            if (cache.committed != owned.view.committed) break :blk false;
+            if (cache.retry_attempt != options.retry_attempt) break :blk false;
+            break :blk true;
+        };
+
         if (self.view_snapshot) |*s| s.deinit(self.allocator);
         self.view_snapshot = owned;
-        reconcileFromSnapshots(transcript, editor, resolver, self.view_snapshot, self.queued_snapshot, options);
+
+        self.reconcileView(transcript, editor, resolver, options, can_reuse_committed_cache);
+
         if (must_reset_history) {
             editor.clearHistory();
             seedHistoryFromCommittedMessages(editor, self.view_snapshot.?.view.committed.flat);
         }
+    }
+
+    fn reconcileView(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        options: RebuildOptions,
+        use_committed_cache: bool,
+    ) void {
+        var reconcile_timer = profile.ScopedTimer.begin(.reconcile_from_state);
+        defer reconcile_timer.end();
+
+        const allocator = transcript.allocator;
+
+        if (use_committed_cache) {
+            const cache = &self.committed_cache.?;
+            var desired_items = buildDesiredItemsFromCommittedCache(
+                allocator,
+                resolver,
+                transcript,
+                self.view_snapshot,
+                self.queued_snapshot,
+                options,
+                transcript.hide_thinking_block,
+                cache.items,
+            ) catch return;
+            defer {
+                for (desired_items.items) |*item| item.deinit(allocator);
+                desired_items.deinit(allocator);
+            }
+            self.committed_cache_hits +%= 1;
+            reconcileDesiredItems(transcript, editor, &desired_items);
+            return;
+        }
+
+        var cache_builder: std.ArrayList(CachedCommittedItem) = .empty;
+        var cache_ptr: ?*std.ArrayList(CachedCommittedItem) = null;
+        const can_cache = if (self.view_snapshot) |v| blk: {
+            cache_ptr = &cache_builder;
+            break :blk v.view.committed;
+        } else null;
+
+        var desired_items = buildDesiredItemsFull(
+            allocator,
+            resolver,
+            transcript,
+            self.view_snapshot,
+            self.queued_snapshot,
+            options,
+            transcript.hide_thinking_block,
+            cache_ptr,
+        ) catch {
+            cache_builder.deinit(allocator);
+            return;
+        };
+        defer {
+            for (desired_items.items) |*item| item.deinit(allocator);
+            desired_items.deinit(allocator);
+        }
+
+        if (can_cache) |committed| {
+            if (self.committed_cache) |*old| old.deinit(allocator);
+            self.committed_cache = .{
+                .committed = committed.retain(),
+                .retry_attempt = options.retry_attempt,
+                .items = cache_builder.toOwnedSlice(allocator) catch &.{},
+            };
+        } else {
+            cache_builder.deinit(allocator);
+        }
+
+        reconcileDesiredItems(transcript, editor, &desired_items);
     }
 
     pub fn replaceQueuedSnapshot(
@@ -227,6 +343,14 @@ pub fn reconcileFromSnapshots(
         desired_items.deinit(transcript.allocator);
     }
 
+    reconcileDesiredItems(transcript, editor, &desired_items);
+}
+
+fn reconcileDesiredItems(
+    transcript: *Transcript,
+    editor: EditorInterface,
+    desired_items: *std.ArrayList(DesiredItem),
+) void {
     var desired_index: usize = 0;
     while (desired_index < desired_items.items.len) : (desired_index += 1) {
         const desired = desired_items.items[desired_index];
@@ -303,6 +427,24 @@ fn buildDesiredItems(
     options: RebuildOptions,
     hide_thinking_block: bool,
 ) !std.ArrayList(DesiredItem) {
+    return buildDesiredItemsFull(allocator, resolver, transcript, view, queued, options, hide_thinking_block, null);
+}
+
+/// Full builder: rebuilds committed-message desired items from scratch
+/// and appends transient items (active assistant, live tool executions,
+/// queued messages). If `cache_out` is non-null, records the committed
+/// prefix metadata so a later soft update with an unchanged committed
+/// pointer can skip the committed portion.
+fn buildDesiredItemsFull(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    transcript: *Transcript,
+    view: ?conversation_state_mod.ConversationViewSnapshot,
+    queued: ?control_mod.QueuedMessageSnapshot,
+    options: RebuildOptions,
+    hide_thinking_block: bool,
+    cache_out: ?*std.ArrayList(CachedCommittedItem),
+) !std.ArrayList(DesiredItem) {
     var build_timer = profile.ScopedTimer.begin(.build_desired_items);
     defer build_timer.end();
 
@@ -320,72 +462,185 @@ fn buildDesiredItems(
         }
     };
 
-    if (view) |v| {
-        const committed_slice = v.view.committed.flat;
-        for (committed_slice, 0..) |message, idx| {
-            try appendDesiredItem(
-                allocator,
-                &desired_items,
-                buildCommittedMessageItem(allocator, resolver, transcript, idx, message, options, live_tool_ids.items, hide_thinking_block),
-            );
-            switch (message) {
-                .assistant => |assistant| {
-                    for (assistant.content) |block| {
-                        if (block != .tool_call) continue;
-                        const tool_call = block.tool_call;
-                        if (containsToolCallId(live_tool_ids.items, tool_call.id)) continue;
-                        try appendDesiredItem(
-                            allocator,
-                            &desired_items,
-                            buildCommittedToolCallDesiredItem(
-                                allocator,
-                                resolver,
-                                transcript,
-                                tool_call,
-                                assistant,
-                                findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
-                                options,
-                            ),
-                        );
-                    }
-                },
-                else => {},
-            }
+    const committed_start = desired_items.items.len;
+    if (view) |v| try appendCommittedDesiredItems(
+        allocator,
+        resolver,
+        transcript,
+        &desired_items,
+        v,
+        options,
+        live_tool_ids.items,
+        hide_thinking_block,
+    );
+    if (cache_out) |out| try recordCommittedCacheItems(allocator, out, desired_items.items[committed_start..]);
+
+    try appendTransientDesiredItems(
+        allocator,
+        resolver,
+        transcript,
+        &desired_items,
+        view,
+        queued,
+        options,
+        live_tool_ids.items,
+        hide_thinking_block,
+    );
+    return desired_items;
+}
+
+/// Fast path: seeds desired items from cached committed-prefix metadata
+/// (row = null, reconcile keeps the already-retained transcript row)
+/// and then appends transient items just like the full path.
+fn buildDesiredItemsFromCommittedCache(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    transcript: *Transcript,
+    view: ?conversation_state_mod.ConversationViewSnapshot,
+    queued: ?control_mod.QueuedMessageSnapshot,
+    options: RebuildOptions,
+    hide_thinking_block: bool,
+    cache_items: []const CachedCommittedItem,
+) !std.ArrayList(DesiredItem) {
+    var build_timer = profile.ScopedTimer.begin(.build_desired_items);
+    defer build_timer.end();
+
+    var desired_items: std.ArrayList(DesiredItem) = .empty;
+    errdefer {
+        for (desired_items.items) |*item| item.deinit(allocator);
+        desired_items.deinit(allocator);
+    }
+
+    var live_tool_ids: std.ArrayList([]const u8) = .empty;
+    defer live_tool_ids.deinit(allocator);
+    if (view) |v| if (v.view.in_flight) |turn| {
+        for (turn.tool_executions) |tool| {
+            try live_tool_ids.append(allocator, tool.tool_call_id);
         }
-        if (v.view.in_flight) |turn| {
-            if (turn.assistant) |assistant| {
-                try appendDesiredItem(
-                    allocator,
-                    &desired_items,
-                    buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids.items, options.theme, hide_thinking_block),
-                );
-            }
-            for (turn.tool_executions) |tool| {
-                try appendDesiredItem(
-                    allocator,
-                    &desired_items,
-                    buildToolExecutionDesiredItem(allocator, resolver, transcript, tool, options.theme),
-                );
-            }
+    };
+
+    try desired_items.ensureTotalCapacity(allocator, cache_items.len);
+    for (cache_items) |cached| {
+        desired_items.appendAssumeCapacity(.{
+            .item_id = cached.item_id,
+            .semantic_version = cached.semantic_version,
+        });
+    }
+
+    try appendTransientDesiredItems(
+        allocator,
+        resolver,
+        transcript,
+        &desired_items,
+        view,
+        queued,
+        options,
+        live_tool_ids.items,
+        hide_thinking_block,
+    );
+    return desired_items;
+}
+
+fn appendCommittedDesiredItems(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    transcript: *Transcript,
+    desired_items: *std.ArrayList(DesiredItem),
+    view: conversation_state_mod.ConversationViewSnapshot,
+    options: RebuildOptions,
+    live_tool_ids: []const []const u8,
+    hide_thinking_block: bool,
+) !void {
+    const committed_slice = view.view.committed.flat;
+    for (committed_slice, 0..) |message, idx| {
+        try appendDesiredItem(
+            allocator,
+            desired_items,
+            buildCommittedMessageItem(allocator, resolver, transcript, idx, message, options, live_tool_ids, hide_thinking_block),
+        );
+        switch (message) {
+            .assistant => |assistant| {
+                for (assistant.content) |block| {
+                    if (block != .tool_call) continue;
+                    const tool_call = block.tool_call;
+                    if (containsToolCallId(live_tool_ids, tool_call.id)) continue;
+                    try appendDesiredItem(
+                        allocator,
+                        desired_items,
+                        buildCommittedToolCallDesiredItem(
+                            allocator,
+                            resolver,
+                            transcript,
+                            tool_call,
+                            assistant,
+                            findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
+                            options,
+                        ),
+                    );
+                }
+            },
+            else => {},
         }
     }
+}
+
+fn appendTransientDesiredItems(
+    allocator: std.mem.Allocator,
+    resolver: ToolRendererResolver,
+    transcript: *Transcript,
+    desired_items: *std.ArrayList(DesiredItem),
+    view: ?conversation_state_mod.ConversationViewSnapshot,
+    queued: ?control_mod.QueuedMessageSnapshot,
+    options: RebuildOptions,
+    live_tool_ids: []const []const u8,
+    hide_thinking_block: bool,
+) !void {
+    if (view) |v| if (v.view.in_flight) |turn| {
+        if (turn.assistant) |assistant| {
+            try appendDesiredItem(
+                allocator,
+                desired_items,
+                buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids, options.theme, hide_thinking_block),
+            );
+        }
+        for (turn.tool_executions) |tool| {
+            try appendDesiredItem(
+                allocator,
+                desired_items,
+                buildToolExecutionDesiredItem(allocator, resolver, transcript, tool, options.theme),
+            );
+        }
+    };
     if (queued) |q| {
         for (q.steering, 0..) |entry, idx| {
             try appendDesiredItem(
                 allocator,
-                &desired_items,
+                desired_items,
                 buildQueuedUserDesiredItem(allocator, transcript, .steering, idx, entry.text, options.theme),
             );
         }
         for (q.follow_up, 0..) |entry, idx| {
             try appendDesiredItem(
                 allocator,
-                &desired_items,
+                desired_items,
                 buildQueuedUserDesiredItem(allocator, transcript, .follow_up, idx, entry.text, options.theme),
             );
         }
     }
-    return desired_items;
+}
+
+fn recordCommittedCacheItems(
+    allocator: std.mem.Allocator,
+    cache_out: *std.ArrayList(CachedCommittedItem),
+    committed_items: []const DesiredItem,
+) !void {
+    try cache_out.ensureTotalCapacity(allocator, committed_items.len);
+    for (committed_items) |desired| {
+        cache_out.appendAssumeCapacity(.{
+            .item_id = desired.item_id,
+            .semantic_version = desired.semantic_version,
+        });
+    }
 }
 
 fn appendDesiredItem(
@@ -1847,4 +2102,156 @@ test "replaceAllOwnedState preserves editor history on append-only user history"
 
     try testing.expectEqual(@as(u32, 2), mock_editor.history_count);
     try testing.expectEqual(@as(u32, 0), mock_editor.clear_history_count);
+}
+
+fn viewSnapshotRetainingCommitted(
+    committed: *conversation_state_mod.SharedCommitted,
+) conversation_state_mod.ConversationViewSnapshot {
+    return .{ .view = .{
+        .committed = committed.retain(),
+        .in_flight = null,
+    } };
+}
+
+test "replaceViewSnapshot reuses committed prefix on same committed pointer" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    const committed_ptr = view_a.view.committed;
+    const assistant_a_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "working" } },
+    };
+    const assistant_a = makeAssistantMessage(&assistant_a_content, .toolUse, null);
+    view_a.view.in_flight = .{
+        .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant_a.assistant),
+        .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_a, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+    const committed_row_ptr = transcript.items.items[0].deinit_ctx;
+    const assistant_row_v1 = transcript.items.items[1].deinit_ctx;
+    try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
+
+    var view_b = viewSnapshotRetainingCommitted(committed_ptr);
+    const assistant_b_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "working more" } },
+    };
+    const assistant_b = makeAssistantMessage(&assistant_b_content, .toolUse, null);
+    view_b.view.in_flight = .{
+        .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant_b.assistant),
+        .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_b, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(@as(u32, 1), projection.committed_cache_hits);
+    try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+    try testing.expectEqual(committed_row_ptr, transcript.items.items[0].deinit_ctx);
+    try testing.expect(assistant_row_v1 != transcript.items.items[1].deinit_ctx);
+}
+
+test "replaceViewSnapshot invalidates committed cache when committed pointer changes" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("one")});
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_a, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
+    try testing.expect(projection.committed_cache != null);
+    const cache_ptr_a = projection.committed_cache.?.committed;
+    try testing.expectEqual(@as(usize, 1), projection.committed_cache.?.items.len);
+
+    var view_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two") });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_b, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
+    try testing.expect(projection.committed_cache != null);
+    try testing.expect(projection.committed_cache.?.committed != cache_ptr_a);
+    try testing.expectEqual(@as(usize, 2), projection.committed_cache.?.items.len);
+    try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+}
+
+test "replaceViewSnapshot bypasses committed cache when retry_attempt changes" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    const committed_ptr = view_a.view.committed;
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_a, .{ .theme = themes_builtin.dark(), .retry_attempt = 0 });
+    try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
+
+    var view_b = viewSnapshotRetainingCommitted(committed_ptr);
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_b, .{ .theme = themes_builtin.dark(), .retry_attempt = 1 });
+
+    try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
+    try testing.expect(projection.committed_cache != null);
+    try testing.expectEqual(@as(u32, 1), projection.committed_cache.?.retry_attempt);
+}
+
+test "ProjectionState.clear drops committed cache" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_a, .{ .theme = themes_builtin.dark() });
+    try testing.expect(projection.committed_cache != null);
+
+    projection.clear();
+    try testing.expect(projection.committed_cache == null);
+}
+
+test "replaceViewSnapshot after transcript+projection clear does full rebuild against same committed ptr" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    const committed_ptr = view_a.view.committed.retain();
+    defer committed_ptr.release();
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_a, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
+    try testing.expect(projection.committed_cache != null);
+
+    // Simulate /clear: transcript retained rows wiped AND projection cache dropped.
+    transcript.clearAll();
+    projection.clear();
+
+    // Same committed pointer returns — if cache had survived, reconcile
+    // would receive metadata-only items against an empty transcript and
+    // hit the null-row insert assert.
+    var view_b = viewSnapshotRetainingCommitted(committed_ptr);
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view_b, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
+    try testing.expectEqual(@as(usize, 1), transcript.items.items.len);
 }
