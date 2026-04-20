@@ -102,7 +102,9 @@ pub const UiEvent = union(enum) {
     // Published by the agent thread after processing a set_model
     // AgentRequest. Success is banner-only; semantic model state is
     // carried by the adjacent status_snapshot publication.
-    model_switched: void,
+    model_switched: struct {
+        model_id: []u8,
+    },
     model_switch_failed: struct {
         message: []u8,
     },
@@ -110,10 +112,25 @@ pub const UiEvent = union(enum) {
     // --- /settings thinking-level outcomes ---
     // Success is banner-only; semantic thinking state is carried by
     // the adjacent status_snapshot publication.
-    thinking_level_changed: void,
+    thinking_level_changed: struct {
+        level: []u8,
+    },
     thinking_level_change_failed: struct {
         message: []u8,
     },
+
+    pub fn isSnapshotEvent(self: UiEvent) bool {
+        return switch (self) {
+            .conversation_state,
+            .queued_snapshot,
+            .theme_changed,
+            .tool_running,
+            .login_progress,
+            .status_snapshot,
+            => true,
+            else => false,
+        };
+    }
 
     pub fn takeConversationState(self: *UiEvent) ?conversation_state_mod.ConversationViewSnapshot {
         return switch (self.*) {
@@ -167,12 +184,14 @@ pub const UiEvent = union(enum) {
                 allocator.free(s.model_id);
                 allocator.free(s.thinking_level);
             },
+            .model_switched => |m| allocator.free(m.model_id),
             .model_switch_failed => |m| allocator.free(m.message),
+            .thinking_level_changed => |t| allocator.free(t.level),
             .thinking_level_change_failed => |t| allocator.free(t.message),
             .prompt_worker_finished => |p| {
                 if (p.internal_error) |msg| allocator.free(msg);
             },
-            .retry_wait_finished, .request_worker_finished, .model_switched, .thinking_level_changed => {},
+            .retry_wait_finished, .request_worker_finished => {},
         }
     }
 };
@@ -219,3 +238,16 @@ test "UiEvent deinit handles assistant failure without message" {
     ev.deinit(testing.allocator);
 }
 
+test "UiEvent snapshot classification matches lossy transport variants" {
+    var snapshot = UiEvent{ .status_snapshot = .{
+        .model_provider = try testing.allocator.dupe(u8, "openai"),
+        .model_id = try testing.allocator.dupe(u8, "gpt-5"),
+        .thinking_level = try testing.allocator.dupe(u8, "high"),
+        .context_tokens = 1,
+        .context_window = 2,
+    } };
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expect(snapshot.isSnapshotEvent());
+    try testing.expect(!(UiEvent{ .request_worker_finished = {} }).isSnapshotEvent());
+}

@@ -58,6 +58,7 @@ const RetryPolicy = coding_agent_mod.runtime_host.RetryPolicy;
 const CompactionPolicy = coding_agent_mod.runtime_host.CompactionPolicy;
 const CompactionExecutor = coding_agent_mod.runtime_host.CompactionExecutor;
 const ChildRect = container_mod.ChildRect;
+const log = std.log.scoped(.tui_interactive);
 
 const MouseCapture = union(enum) {
     none,
@@ -139,14 +140,26 @@ const PublishedStatusSnapshot = struct {
     }
 };
 
-/// Mailbox-backed agent/helper → TUI event channel.
+const ui_snapshot_queue_capacity: usize = 64;
+const ui_lifecycle_queue_capacity: usize = 64;
+
+/// Mailbox-backed agent/helper → TUI snapshot channel.
 ///
-/// The queue shape remains part of zi's runtime doctrine, but wakeup
-/// signaling now comes from the shared mailbox primitive rather than a
-/// bespoke event pipe implementation.
-const UiEventQueue = mailbox_mod.Mailbox(UiEvent, .{
+/// Snapshot/progress traffic is bounded and lossy: the latest semantic
+/// state will be republished, so intermediate snapshots may be dropped.
+const UiSnapshotQueue = mailbox_mod.Mailbox(UiEvent, .{
     .cleanup = .deinit,
-    .policy = .unbounded,
+    .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_newest } },
+    .wakeup = .pipe,
+});
+
+/// Mailbox-backed agent/helper → TUI lifecycle channel.
+///
+/// Terminal lifecycle outcomes must not disappear silently, so this
+/// channel rejects on overload instead of dropping.
+const UiLifecycleQueue = mailbox_mod.Mailbox(UiEvent, .{
+    .cleanup = .deinit,
+    .policy = .{ .bounded = .{ .capacity = ui_lifecycle_queue_capacity, .on_full = .reject } },
     .wakeup = .pipe,
 });
 
@@ -191,11 +204,34 @@ const BuiltSubmitContent = struct {
     }
 };
 
-test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
-    var q = try UiEventQueue.init(std.testing.allocator);
+test "UiSnapshotQueue drops newest snapshot traffic when bounded" {
+    var q = try UiSnapshotQueue.init(std.testing.allocator);
     defer q.deinit();
 
-    q.push(.{ .request_worker_finished = {} });
+    try std.testing.expectEqual(.ok, q.trySend(.{ .theme_changed = themes_builtin.dark() }));
+    try std.testing.expectEqual(.dropped, q.trySend(.{ .theme_changed = themes_builtin.light() }));
+
+    const stats = q.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.pending_depth);
+    try std.testing.expectEqual(@as(usize, 1), stats.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.send_count);
+}
+
+test "UiLifecycleQueue rejects overload and keeps wake semantics" {
+    var q = try UiLifecycleQueue.init(std.testing.allocator);
+    defer q.deinit();
+
+    var sent: usize = 0;
+    while (sent < ui_lifecycle_queue_capacity) : (sent += 1) {
+        try std.testing.expectEqual(.ok, q.trySend(.{ .request_worker_finished = {} }));
+    }
+    switch (q.trySend(.{ .request_worker_finished = {} })) {
+        .full => |rejected| {
+            var failed = rejected;
+            failed.deinit(std.testing.allocator);
+        },
+        else => return error.UnexpectedResult,
+    }
 
     var pfd = [1]posix.pollfd{.{
         .fd = q.wakeReadFd().?,
@@ -205,18 +241,14 @@ test "UiEventQueue wake pipe signals poll and drains with mailbox semantics" {
     const ready = try posix.poll(&pfd, 0);
     try std.testing.expectEqual(@as(usize, 1), ready);
 
-    var out: [2]UiEvent = undefined;
+    var out: [ui_lifecycle_queue_capacity]UiEvent = undefined;
     const count = q.drainInto(&out);
-    try std.testing.expectEqual(@as(usize, 1), count);
-    switch (out[0]) {
-        .request_worker_finished => {},
-        else => return error.UnexpectedResult,
-    }
-    out[0].deinit(std.testing.allocator);
+    try std.testing.expectEqual(ui_lifecycle_queue_capacity, count);
+    for (out[0..count]) |*ev| ev.deinit(std.testing.allocator);
 
-    pfd[0].revents = 0;
-    const after = try posix.poll(&pfd, 0);
-    try std.testing.expectEqual(@as(usize, 0), after);
+    const stats = q.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.rejected_count);
+    try std.testing.expectEqual(ui_lifecycle_queue_capacity, stats.high_water_depth);
 }
 
 /// Owns all transient heap-backed data for one `/resume` overlay.
@@ -361,7 +393,7 @@ const StartupAction = union(enum) {
 };
 
 /// Interactive mode — wires AgentSession (blocking on its thread)
-/// to the TUI (main thread) via a thread-safe event queue.
+/// to the TUI (main thread) via thread-safe snapshot and lifecycle queues.
 ///
 /// Uses UiEvent (deep-copied) instead of raw AgentEvent to ensure
 /// no borrowed pointers cross the thread boundary.
@@ -477,7 +509,8 @@ pub const Interactive = struct {
     login_thread: ?std.Thread = null,
     login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    event_queue: UiEventQueue,
+    snapshot_event_queue: UiSnapshotQueue,
+    lifecycle_event_queue: UiLifecycleQueue,
     /// TUI → agent owner inbox. The TUI enqueues `AgentRequest`
     /// values; the long-lived agent thread wakes, drains, and dispatches
     /// them on the owner thread.
@@ -542,7 +575,8 @@ pub const Interactive = struct {
             .widget_below_container = container_mod.Container.init(state_allocator),
             .command_registry = CommandRegistry.init(state_allocator),
             .input = input_buffer_mod.InputBuffer.init(state_allocator),
-            .event_queue = try UiEventQueue.init(msg_allocator),
+            .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
+            .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
             .model_registry = model_registry,
             .memory_diagnostics = memory_diagnostics,
@@ -592,15 +626,10 @@ pub const Interactive = struct {
             self.runtime_host.unsubscribeEvents(token);
             self.session_event_token = null;
         }
-        self.event_queue.close();
+        self.snapshot_event_queue.close();
+        self.lifecycle_event_queue.close();
 
-        // drain and free any remaining events
-        var drain_buf: [64]UiEvent = undefined;
-        while (true) {
-            const count = self.event_queue.drainInto(&drain_buf);
-            if (count == 0) break;
-            for (drain_buf[0..count]) |*ev| ev.deinit(self.msg_allocator);
-        }
+        self.drainUiEvents();
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
         self.clearPendingImages();
@@ -614,7 +643,11 @@ pub const Interactive = struct {
         }
         self.status_data.deinit();
         self.input.deinit();
-        self.event_queue.deinit();
+        logMailboxStats("snapshot", self.snapshot_event_queue.stats());
+        logMailboxStats("lifecycle", self.lifecycle_event_queue.stats());
+        logMailboxStats("request", self.request_queue.stats());
+        self.snapshot_event_queue.deinit();
+        self.lifecycle_event_queue.deinit();
         // Any unexpectedly undrained requests are mailbox-owned here;
         // deinit cleans them with AgentRequest.deinit.
         self.request_queue.deinit();
@@ -696,73 +729,40 @@ pub const Interactive = struct {
         self.tui.dirty = true;
         self.performStartupAction();
 
+        var should_wait = false;
+        var input_ready = true;
         while (self.running) {
-            // 1. Drain UI events (owned, thread-safe)
-            var event_buf: [64]UiEvent = undefined;
-            while (true) {
-                const count = self.event_queue.drainInto(&event_buf);
-                if (count == 0) break;
-                for (event_buf[0..count]) |*ev| {
-                    self.handleUiEvent(ev);
-                    ev.deinit(self.msg_allocator);
-                }
+            if (should_wait) {
+                const readiness = self.waitForLoopReadiness();
+                input_ready = readiness.input_ready;
+                if (readiness.snapshot_ready) self.snapshot_event_queue.wait();
+                if (readiness.lifecycle_ready) self.lifecycle_event_queue.wait();
+            } else {
+                should_wait = true;
+                input_ready = true;
             }
 
-            // 2. Poll terminal input (non-blocking: MIN=0, TIME=0)
-            var input_raw: [4096]u8 = undefined;
-            const n = self.tui.terminal.readInput(&input_raw) catch 0;
-            if (n > 0) {
-                // During kitty negotiation, buffer input and check for response
-                if (self.kitty_deadline_ns != null) {
-                    self.input.buf.appendSlice(self.allocator, input_raw[0..n]) catch {};
-                    if (self.input.consumeKittyResponse()) {
-                        self.tui.terminal.enableKittyProtocol();
-                        self.kitty_deadline_ns = null;
-                        // Drain buffered input now that kitty is active
-                        self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
-                    }
-                    // Still negotiating — hold bytes for timeout
-                    continue;
-                }
-                // Feed through InputBuffer — emits complete sequences via callbacks
-                self.input.feed(input_raw[0..n], &onInputSequence, &onInputPaste, @ptrCast(self));
-            }
+            self.drainUiEvents();
+            if (!self.running) break;
 
-            // 2b. Check InputBuffer timeout (lone ESC, incomplete sequences)
+            if (input_ready and self.processTerminalInput()) continue;
+
             self.input.checkTimeout(&onInputSequence, @ptrCast(self));
+            self.finishKittyNegotiationIfDue();
 
-            // 2c. Kitty negotiation timeout → fall back to modifyOtherKeys
-            if (self.kitty_deadline_ns) |deadline| {
-                if (std.time.nanoTimestamp() >= deadline) {
-                    self.tui.terminal.enableModifyOtherKeys();
-                    self.kitty_deadline_ns = null;
-                    // Drain any buffered input from negotiation period
-                    if (self.input.buf.items.len > 0) {
-                        self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
-                    }
-                }
-            }
-
-            // 3. Check for terminal resize
             if (self.tui.checkResize()) {
                 self.cancelTranscriptSelection();
             }
 
-            // 3b. Tick any animated components that reached their deadline.
             const now_ns = std.time.nanoTimestamp();
             if (self.tui.tickAnimations(now_ns)) {
                 self.tui.dirty = true;
             }
 
-            // 4. Render if dirty
             if (self.tui.dirty) {
                 self.renderFrame();
                 self.tui.dirty = false;
             }
-
-            // 5. Sleep until the next input/animation deadline, capped so
-            // timer-driven UI work still wakes promptly alongside mailbox events.
-            self.sleepUntilNextLoopDeadline();
         }
     }
 
@@ -798,8 +798,119 @@ pub const Interactive = struct {
         switch (self.request_queue.trySend(.{ .refresh_status_snapshot = {} })) {
             .ok => {},
             .dropped => unreachable,
-            .closed, .full, .oom => return,
+            .full => |rejected| {
+                var failed_req = rejected;
+                failed_req.deinit(self.msg_allocator);
+                self.showAgentRequestQueueFull();
+            },
+            .closed, .oom => |rejected| {
+                var failed_req = rejected;
+                failed_req.deinit(self.msg_allocator);
+            },
         }
+    }
+
+    fn drainUiEvents(self: *Interactive) void {
+        self.drainUiEventQueue(&self.snapshot_event_queue);
+        self.drainUiEventQueue(&self.lifecycle_event_queue);
+    }
+
+    fn drainUiEventQueue(self: *Interactive, queue: anytype) void {
+        var event_buf: [64]UiEvent = undefined;
+        while (true) {
+            const count = queue.drainInto(&event_buf);
+            if (count == 0) break;
+            for (event_buf[0..count]) |*ev| {
+                self.handleUiEvent(ev);
+                ev.deinit(self.msg_allocator);
+            }
+        }
+    }
+
+    fn processTerminalInput(self: *Interactive) bool {
+        var input_raw: [4096]u8 = undefined;
+        const n = self.tui.terminal.readInput(&input_raw) catch 0;
+        if (n == 0) return false;
+
+        if (self.kitty_deadline_ns != null) {
+            self.input.buf.appendSlice(self.allocator, input_raw[0..n]) catch {};
+            if (self.input.consumeKittyResponse()) {
+                self.tui.terminal.enableKittyProtocol();
+                self.kitty_deadline_ns = null;
+                self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
+                return false;
+            }
+            return true;
+        }
+
+        self.input.feed(input_raw[0..n], &onInputSequence, &onInputPaste, @ptrCast(self));
+        return false;
+    }
+
+    fn finishKittyNegotiationIfDue(self: *Interactive) void {
+        if (self.kitty_deadline_ns) |deadline| {
+            if (std.time.nanoTimestamp() >= deadline) {
+                self.tui.terminal.enableModifyOtherKeys();
+                self.kitty_deadline_ns = null;
+                if (self.input.buf.items.len > 0) {
+                    self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
+                }
+            }
+        }
+    }
+
+    fn showAgentRequestQueueFull(self: *Interactive) void {
+        self.status_text.setContent("agent request queue full; try again");
+        self.status_text.fg = self.theme.fg(.@"error");
+        self.tui.dirty = true;
+    }
+
+    fn publishUiEvent(self: *Interactive, event: UiEvent) bool {
+        return if (event.isSnapshotEvent())
+            self.publishSnapshotUiEvent(event)
+        else
+            self.publishLifecycleUiEvent(event);
+    }
+
+    fn publishSnapshotUiEvent(self: *Interactive, event: UiEvent) bool {
+        switch (self.snapshot_event_queue.trySend(event)) {
+            .ok => return true,
+            .dropped => return false,
+            .closed, .full, .oom => |rejected| {
+                var failed = rejected;
+                failed.deinit(self.msg_allocator);
+                return false;
+            },
+        }
+    }
+
+    fn publishLifecycleUiEvent(self: *Interactive, event: UiEvent) bool {
+        switch (self.lifecycle_event_queue.trySend(event)) {
+            .ok => return true,
+            .dropped => unreachable,
+            .closed, .full, .oom => |rejected| {
+                var failed = rejected;
+                defer failed.deinit(self.msg_allocator);
+                log.warn("lifecycle queue rejected ui event", .{});
+                return false;
+            },
+        }
+    }
+
+    fn logMailboxStats(comptime label: []const u8, stats: anytype) void {
+        log.info(
+            "{s} queue stats pending={d} high_water={d} sends={d} wakes={d} rejected={d} dropped={d} state={s}",
+            .{
+                label,
+                stats.pending_depth,
+                stats.high_water_depth,
+                stats.send_count,
+                stats.wake_count,
+                stats.rejected_count,
+                stats.dropped_count,
+                @tagName(stats.state),
+            },
+        );
     }
 
     // ── InputBuffer callbacks ───────────────────────────────────────
@@ -1211,17 +1322,17 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
-            .model_switched => {
+            .model_switched => |m| {
                 var buf: [80]u8 = undefined;
-                const label = if (self.status_data.model_id.len > 0) self.status_data.model_id else "model switched";
+                const label = if (m.model_id.len > 0) m.model_id else "model switched";
                 const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{label}) catch "model switched";
                 self.status_text.setContent(msg);
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
             },
-            .thinking_level_changed => {
+            .thinking_level_changed => |t| {
                 var buf: [96]u8 = undefined;
-                const level = if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off";
+                const level = if (t.level.len > 0) t.level else "off";
                 const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{level}) catch "thinking level updated";
                 self.status_text.setContent(msg);
                 self.status_text.fg = self.theme.fg(.success);
@@ -1505,28 +1616,45 @@ pub const Interactive = struct {
         return next_deadline;
     }
 
-    fn sleepUntilNextLoopDeadline(self: *Interactive) void {
+    const LoopReadiness = struct {
+        input_ready: bool = false,
+        snapshot_ready: bool = false,
+        lifecycle_ready: bool = false,
+    };
+
+    fn waitForLoopReadiness(self: *Interactive) LoopReadiness {
+        const idle_wait_timeout_ms: i32 = 50;
         const now_ns = std.time.nanoTimestamp();
         const timeout_ms: i32 = if (self.nextLoopDeadlineNs(now_ns)) |deadline|
             if (deadline <= now_ns) 0 else @intCast(@divFloor(deadline - now_ns + 999_999, 1_000_000))
         else
-            -1;
+            idle_wait_timeout_ms;
 
-        var pfds = [2]posix.pollfd{
+        var pfds = [3]posix.pollfd{
             .{
                 .fd = self.tui.terminal.fd_in,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
             .{
-                .fd = self.event_queue.wakeReadFd().?,
+                .fd = self.snapshot_event_queue.wakeReadFd().?,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = self.lifecycle_event_queue.wakeReadFd().?,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
         };
 
-        const ready = posix.poll(&pfds, timeout_ms) catch return;
-        if (ready <= 0) return;
+        const ready = posix.poll(&pfds, timeout_ms) catch return .{};
+        if (ready <= 0) return .{};
+        return .{
+            .input_ready = pfds[0].revents & posix.POLL.IN != 0,
+            .snapshot_ready = pfds[1].revents & posix.POLL.IN != 0,
+            .lifecycle_ready = pfds[2].revents & posix.POLL.IN != 0,
+        };
     }
 
     fn renderFrame(self: *Interactive) void {
@@ -1655,7 +1783,14 @@ pub const Interactive = struct {
         switch (self.request_queue.trySend(.{ .prompt = .{ .content = content_copy } })) {
             .ok => {},
             .dropped => unreachable,
-            .closed, .full, .oom => |rejected| {
+            .full => |rejected| {
+                var failed_req = rejected;
+                failed_req.deinit(self.msg_allocator);
+                self.tui.setFocus(self.active_editor.component());
+                self.showAgentRequestQueueFull();
+                return false;
+            },
+            .closed, .oom => |rejected| {
                 var failed_req = rejected;
                 failed_req.deinit(self.msg_allocator);
                 self.tui.setFocus(self.active_editor.component());
@@ -1924,7 +2059,13 @@ pub const Interactive = struct {
         switch (self.request_queue.trySend(req)) {
             .ok => {},
             .dropped => unreachable,
-            .closed, .full, .oom => |rejected| {
+            .full => |rejected| {
+                var failed_req = rejected;
+                failed_req.deinit(self.msg_allocator);
+                self.showAgentRequestQueueFull();
+                return false;
+            },
+            .closed, .oom => |rejected| {
                 var failed_req = rejected;
                 failed_req.deinit(self.msg_allocator);
                 self.status_text.setContent(options.spawn_failed_message);
@@ -2373,21 +2514,21 @@ pub const Interactive = struct {
                     json_util.freeJsonValue(self.msg_allocator, e.value_ptr.*);
                 }
                 extras.deinit();
-                self.event_queue.push(.{ .login_complete = .{
+                _ = self.publishLifecycleUiEvent(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = true,
                     .message = self.msg_allocator.dupe(u8, "logged in") catch return,
                 } });
             },
             .cancelled => {
-                self.event_queue.push(.{ .login_complete = .{
+                _ = self.publishLifecycleUiEvent(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = false,
                     .message = self.msg_allocator.dupe(u8, "login cancelled") catch return,
                 } });
             },
             .err => |msg| {
-                self.event_queue.push(.{ .login_complete = .{
+                _ = self.publishLifecycleUiEvent(.{ .login_complete = .{
                     .provider_id = provider_id,
                     .success = false,
                     .message = self.msg_allocator.dupe(u8, msg) catch return,
@@ -2399,7 +2540,7 @@ pub const Interactive = struct {
     // zi-wub.17: login-thread callbacks. These run on the login
     // thread, so they MUST NOT touch TUI-owned state (status_text,
     // tui.dirty, etc). Instead they publish a `login_progress` event
-    // on `event_queue` with an msg_allocator-owned payload; the TUI
+    // on the snapshot queue with an msg_allocator-owned payload; the TUI
     // thread consumes it from the normal drain loop. Single-owner
     // invariant for status_text is restored — only the TUI thread
     // writes it.
@@ -2415,13 +2556,13 @@ pub const Interactive = struct {
         }) catch {};
 
         const msg = self.msg_allocator.dupe(u8, "login: check your browser") catch return;
-        self.event_queue.push(.{ .login_progress = .{ .message = msg, .kind = .auth_url } });
+        _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = msg, .kind = .auth_url } });
     }
 
     fn onLoginProgress(msg: []const u8, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         const owned = self.msg_allocator.dupe(u8, msg) catch return;
-        self.event_queue.push(.{ .login_progress = .{ .message = owned, .kind = .info } });
+        _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = owned, .kind = .info } });
     }
 
     /// Long-lived agent owner thread entry point. This is the only
@@ -2491,14 +2632,14 @@ pub const Interactive = struct {
                         prompt_processed = true;
                         const outcome = self.runtime_host.runUserContent(p.content) catch |err| {
                             const err_msg = self.msg_allocator.dupe(u8, @errorName(err)) catch null;
-                            self.event_queue.push(.{ .prompt_worker_finished = .{
+                            _ = self.publishLifecycleUiEvent(.{ .prompt_worker_finished = .{
                                 .outcome = .assistant_error,
                                 .internal_error = err_msg,
                             } });
                             req.deinit(self.msg_allocator);
                             continue;
                         };
-                        self.event_queue.push(.{ .prompt_worker_finished = .{ .outcome = outcome } });
+                        _ = self.publishLifecycleUiEvent(.{ .prompt_worker_finished = .{ .outcome = outcome } });
                     },
                     .resume_session => |r| {
                         idle_processed = true;
@@ -2531,7 +2672,7 @@ pub const Interactive = struct {
             }
 
             if (idle_processed and !prompt_processed) {
-                self.event_queue.push(.{ .request_worker_finished = {} });
+                _ = self.publishLifecycleUiEvent(.{ .request_worker_finished = {} });
             }
         }
     }
@@ -2539,18 +2680,16 @@ pub const Interactive = struct {
     fn handleNewSession(self: *Interactive) void {
         self.runtime_host.newSession() catch |err| {
             const msg = std.fmt.allocPrint(self.msg_allocator, "failed to start new session: {s}", .{@errorName(err)}) catch return;
-            self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
+            _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
         self.publishThemeSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {
-            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation state") catch return;
-            self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
-            return;
+            log.warn("snapshot queue dropped new-session conversation state", .{});
         }
         self.publishQueuedSnapshotIfChanged();
-        self.event_queue.push(.{ .session_new_started = {} });
+        _ = self.publishLifecycleUiEvent(.{ .session_new_started = {} });
     }
 
     /// Agent-thread handler for `AgentRequest.resume_session`.
@@ -2563,7 +2702,7 @@ pub const Interactive = struct {
     fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
         const result = self.runtime_host.resumeSession(path, restore_session_model) catch {
             const msg = self.msg_allocator.dupe(u8, "failed to load session") catch return;
-            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
+            _ = self.publishLifecycleUiEvent(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
 
@@ -2572,13 +2711,10 @@ pub const Interactive = struct {
         self.publishThemeSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {
-            if (restore_warning) |warning| self.msg_allocator.free(warning);
-            const msg = self.msg_allocator.dupe(u8, "out of memory building conversation state") catch return;
-            self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
-            return;
+            log.warn("snapshot queue dropped resumed conversation state", .{});
         }
         self.publishQueuedSnapshotIfChanged();
-        self.event_queue.push(.{ .session_resumed = .{
+        _ = self.publishLifecycleUiEvent(.{ .session_resumed = .{
             .restore_warning = restore_warning,
         } });
     }
@@ -2617,10 +2753,12 @@ pub const Interactive = struct {
     /// hard event boundaries (message_start/end, tool_execution_*,
     /// turn_end, queue_update, compaction_end).
     fn flushPendingConversationPublish(self: *Interactive) void {
-        _ = self.publishConversationState();
+        const published = self.publishConversationState();
         self.publishQueuedSnapshotIfChanged();
-        self.last_conversation_publish_ns = monotonicNowNs();
-        self.conversation_publish_dirty = false;
+        if (published) {
+            self.last_conversation_publish_ns = monotonicNowNs();
+            self.conversation_publish_dirty = false;
+        }
     }
 
     /// Soft path: mark dirty and publish only if cadence has elapsed
@@ -2633,7 +2771,7 @@ pub const Interactive = struct {
         const now = monotonicNowNs();
         const elapsed = now -% self.last_conversation_publish_ns;
         if (elapsed < soft_conversation_publish_cadence_ns) return;
-        _ = self.publishConversationState();
+        if (!self.publishConversationState()) return;
         self.last_conversation_publish_ns = now;
         self.conversation_publish_dirty = false;
     }
@@ -2652,14 +2790,14 @@ pub const Interactive = struct {
         };
     }
 
-    fn publishConversationStateToUi(state: agent_mod.conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) void {
+    fn publishConversationStateToUi(state: agent_mod.conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) bool {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.event_queue.push(.{ .conversation_state = state });
+        return self.publishSnapshotUiEvent(.{ .conversation_state = state });
     }
 
-    fn publishQueuedSnapshotToUi(snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot, ctx: ?*anyopaque) void {
+    fn publishQueuedSnapshotToUi(snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot, ctx: ?*anyopaque) bool {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.event_queue.push(.{ .queued_snapshot = snapshot });
+        return self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot });
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
@@ -2670,7 +2808,8 @@ pub const Interactive = struct {
         switch (self.runtime_host.currentSession().trySetModel(m)) {
             .success => |_| {
                 self.publishStatusSnapshot();
-                self.event_queue.push(.{ .model_switched = {} });
+                const model_id = self.msg_allocator.dupe(u8, m.id) catch return;
+                _ = self.publishLifecycleUiEvent(.{ .model_switched = .{ .model_id = model_id } });
             },
             .no_auth => |blocked| {
                 const provider_str = json_util.providerToString(blocked.provider);
@@ -2679,17 +2818,17 @@ pub const Interactive = struct {
                     "No API key for {s}/{s}",
                     .{ provider_str, blocked.id },
                 ) catch return;
-                self.event_queue.push(.{ .model_switch_failed = .{ .message = msg } });
+                _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
             },
             .registry_unavailable => {
                 const msg = self.msg_allocator.dupe(u8, "model registry unavailable") catch return;
-                self.event_queue.push(.{ .model_switch_failed = .{ .message = msg } });
+                _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
             },
         }
     }
 
     fn publishThemeSnapshot(self: *Interactive) void {
-        self.event_queue.push(.{ .theme_changed = self.runtime_host.selectedTheme() });
+        _ = self.publishSnapshotUiEvent(.{ .theme_changed = self.runtime_host.selectedTheme() });
     }
 
     pub fn applyTheme(self: *Interactive, theme: theme_mod.Theme) void {
@@ -2722,14 +2861,15 @@ pub const Interactive = struct {
         const thinking_copy = self.msg_allocator.dupe(u8, agentThinkingLabel(snapshot.thinking_level)) catch return;
         errdefer self.msg_allocator.free(thinking_copy);
 
-        self.rememberPublishedStatusSnapshot(snapshot);
-        self.event_queue.push(.{ .status_snapshot = .{
+        if (self.publishSnapshotUiEvent(.{ .status_snapshot = .{
             .model_provider = provider_copy,
             .model_id = model_id_copy,
             .thinking_level = thinking_copy,
             .context_tokens = snapshot.context_tokens,
             .context_window = snapshot.context_window,
-        } });
+        } })) {
+            self.rememberPublishedStatusSnapshot(snapshot);
+        }
     }
 
     fn shouldSkipStatusSnapshotPublish(
@@ -2763,7 +2903,8 @@ pub const Interactive = struct {
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         _ = self.runtime_host.currentSession().trySetThinkingLevel(level);
         self.publishStatusSnapshot();
-        self.event_queue.push(.{ .thinking_level_changed = {} });
+        const level_label = self.msg_allocator.dupe(u8, agentThinkingLabel(level)) catch return;
+        _ = self.publishLifecycleUiEvent(.{ .thinking_level_changed = .{ .level = level_label } });
     }
 
     fn publishConversationStateForAgentEvent(self: *Interactive, event: AgentEvent) void {
@@ -2796,13 +2937,13 @@ pub const Interactive = struct {
             .agent => |agent_event| {
                 self.publishConversationStateForAgentEvent(agent_event);
                 if (convertAgentUiEvent(agent_event, self.msg_allocator)) |ui_event| {
-                    self.event_queue.push(ui_event);
+                    _ = self.publishUiEvent(ui_event);
                 }
                 self.publishStatusSnapshotForAgentEvent(agent_event);
             },
             .auto_retry_start => |retry| {
                 const err_msg = self.msg_allocator.dupe(u8, retry.error_message) catch return;
-                self.event_queue.push(.{ .retry_start = .{
+                _ = self.publishLifecycleUiEvent(.{ .retry_start = .{
                     .attempt = retry.attempt,
                     .max_attempts = retry.max_attempts,
                     .delay_ms = retry.delay_ms,
@@ -2810,14 +2951,14 @@ pub const Interactive = struct {
                 } });
             },
             .auto_retry_wait_finished => {
-                self.event_queue.push(.retry_wait_finished);
+                _ = self.publishLifecycleUiEvent(.retry_wait_finished);
             },
             .auto_retry_end => |retry| {
                 const final_error = if (retry.final_error) |msg|
                     (self.msg_allocator.dupe(u8, msg) catch null)
                 else
                     null;
-                self.event_queue.push(.{ .retry_end = .{
+                _ = self.publishLifecycleUiEvent(.{ .retry_end = .{
                     .success = retry.success,
                     .attempt = retry.attempt,
                     .final_error = final_error,

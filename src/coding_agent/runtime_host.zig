@@ -33,20 +33,20 @@ pub const LifecycleHooks = session_runner.LifecycleHooks;
 pub const Options = session_runner.Options;
 
 pub const ConversationStatePublisher = struct {
-    func: *const fn (state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) void,
+    func: *const fn (state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) bool,
     ctx: ?*anyopaque = null,
 
-    pub fn publish(self: ConversationStatePublisher, state: conversation_state.ConversationViewSnapshot) void {
-        self.func(state, self.ctx);
+    pub fn publish(self: ConversationStatePublisher, state: conversation_state.ConversationViewSnapshot) bool {
+        return self.func(state, self.ctx);
     }
 };
 
 pub const QueuedSnapshotPublisher = struct {
-    func: *const fn (snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) void,
+    func: *const fn (snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) bool,
     ctx: ?*anyopaque = null,
 
-    pub fn publish(self: QueuedSnapshotPublisher, snapshot: control_mod.QueuedMessageSnapshot) void {
-        self.func(snapshot, self.ctx);
+    pub fn publish(self: QueuedSnapshotPublisher, snapshot: control_mod.QueuedMessageSnapshot) bool {
+        return self.func(snapshot, self.ctx);
     }
 };
 
@@ -272,7 +272,7 @@ pub const RuntimeHost = struct {
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
 
-        publisher.publish(.{ .view = view });
+        if (!publisher.publish(.{ .view = view })) return false;
         return true;
     }
 
@@ -283,7 +283,7 @@ pub const RuntimeHost = struct {
         var snapshot = self.session.cloneQueuedMessageSnapshot(self.msg_allocator) catch return false;
         errdefer snapshot.deinit(self.msg_allocator);
 
-        publisher.publish(snapshot);
+        if (!publisher.publish(snapshot)) return false;
         return true;
     }
 
@@ -458,14 +458,16 @@ test "runtime host publishes committed view and queued snapshots independently" 
     defer if (published_queued) |*snapshot| snapshot.deinit(testing.allocator);
 
     const Capture = struct {
-        fn publishView(state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) void {
+        fn publishView(state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) bool {
             const out: *?conversation_state.ConversationViewSnapshot = @ptrCast(@alignCast(ctx.?));
             out.* = state;
+            return true;
         }
 
-        fn publishQueued(snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) void {
+        fn publishQueued(snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) bool {
             const out: *?control_mod.QueuedMessageSnapshot = @ptrCast(@alignCast(ctx.?));
             out.* = snapshot;
+            return true;
         }
     };
 

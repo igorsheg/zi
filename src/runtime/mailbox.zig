@@ -67,6 +67,9 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         state: State = .active,
         rejected_count: usize = 0,
         dropped_count: usize = 0,
+        high_water_depth: usize = 0,
+        send_count: usize = 0,
+        wake_count: usize = 0,
         wake_read_fd: ?posix.fd_t = null,
         wake_write_fd: ?posix.fd_t = null,
         wake_signaled: bool = false,
@@ -136,6 +139,9 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
 
         pub const Stats = struct {
             pending_depth: usize,
+            high_water_depth: usize,
+            send_count: usize,
+            wake_count: usize,
             state: State,
             closed: bool,
             rejected_count: usize,
@@ -236,6 +242,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
                 self.rejected_count += 1;
                 return .{ .oom = item };
             };
+            self.send_count += 1;
+            self.high_water_depth = @max(self.high_water_depth, self.queue.len);
             if (was_empty) self.signalWakeLocked();
             return .ok;
         }
@@ -367,8 +375,11 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             defer self.mutex.unlock();
             return .{
                 .pending_depth = self.queue.len,
+                .high_water_depth = self.high_water_depth,
+                .send_count = self.send_count,
+                .wake_count = self.wake_count,
                 .state = self.state,
-                .closed = self.state != .active,
+                .closed = self.state == .closed,
                 .rejected_count = self.rejected_count,
                 .dropped_count = self.dropped_count,
             };
@@ -417,6 +428,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
                         else => return,
                     };
                     self.wake_signaled = true;
+                    self.wake_count += 1;
                 },
             }
         }
@@ -510,7 +522,11 @@ test "Mailbox ring storage preserves FIFO across partial drains and wraparound g
         rest[9].value,
         rest[10].value,
     });
-    try std.testing.expectEqual(@as(usize, 0), mailbox.pendingDepth());
+    const stats = mailbox.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.pending_depth);
+    try std.testing.expectEqual(@as(usize, 11), stats.high_water_depth);
+    try std.testing.expectEqual(@as(usize, 14), stats.send_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.wake_count);
     try std.testing.expectEqual(State.active, mailbox.lifecycleState());
 }
 
@@ -535,7 +551,10 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
         .full => |msg| try std.testing.expectEqual(@as(u32, 2), msg.value),
         else => return error.UnexpectedResult,
     }
-    try std.testing.expectEqual(@as(usize, 1), reject_box.stats().rejected_count);
+    const reject_stats = reject_box.stats();
+    try std.testing.expectEqual(@as(usize, 1), reject_stats.rejected_count);
+    try std.testing.expectEqual(@as(usize, 1), reject_stats.high_water_depth);
+    try std.testing.expectEqual(@as(usize, 1), reject_stats.send_count);
 
     CleanupState.cleaned = 0;
     var drop_box = try Mailbox(Msg, .{
@@ -546,7 +565,10 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
 
     try std.testing.expectEqual(.ok, drop_box.trySend(.{ .value = 11 }));
     try std.testing.expectEqual(.dropped, drop_box.trySend(.{ .value = 12 }));
-    try std.testing.expectEqual(@as(usize, 1), drop_box.stats().dropped_count);
+    const drop_stats = drop_box.stats();
+    try std.testing.expectEqual(@as(usize, 1), drop_stats.dropped_count);
+    try std.testing.expectEqual(@as(usize, 1), drop_stats.high_water_depth);
+    try std.testing.expectEqual(@as(usize, 1), drop_stats.send_count);
     try std.testing.expectEqual(@as(usize, 1), CleanupState.cleaned);
 
     var out: [2]Msg = undefined;
@@ -571,6 +593,7 @@ test "Mailbox coalesces pipe wake readiness until the queue drains" {
     }};
     try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pfd, 0));
     try std.testing.expect(try mailbox.waitReadable(0));
+    try std.testing.expectEqual(@as(usize, 1), mailbox.stats().wake_count);
 
     pfd[0].revents = 0;
     try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pfd, 0));
@@ -607,6 +630,10 @@ test "Mailbox close transitions active to closing to closed and preserves queued
     var out: [2]Msg = undefined;
     try std.testing.expectEqual(@as(usize, 1), mailbox.drainInto(&out));
     try std.testing.expectEqual(@as(u32, 21), out[0].value);
+    const stats = mailbox.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.rejected_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.send_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.high_water_depth);
     try std.testing.expectEqual(State.closed, mailbox.lifecycleState());
     try std.testing.expect(mailbox.isDrained());
 }

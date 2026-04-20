@@ -68,9 +68,11 @@ pub const AgentRequest = union(enum) {
     }
 };
 
+pub const request_queue_capacity: usize = 64;
+
 pub const RequestQueue = mailbox_mod.Mailbox(AgentRequest, .{
     .cleanup = .deinit,
-    .policy = .unbounded,
+    .policy = .{ .bounded = .{ .capacity = request_queue_capacity, .on_full = .reject } },
     .wakeup = .pipe,
 });
 
@@ -100,15 +102,62 @@ test "RequestQueue shutdown sentinel round-trips as an ordered terminal request"
     var q = try RequestQueue.init(allocator);
     defer q.deinit();
 
-    q.push(.{ .shutdown = {} });
+    const text = try allocator.dupe(u8, "hello");
+    try std.testing.expectEqual(.ok, q.trySend(.{ .prompt = .{ .content = .{ .text = text } } }));
+    try std.testing.expectEqual(.ok, q.trySend(.{ .new_session = {} }));
+    try std.testing.expectEqual(.ok, q.trySend(.{ .shutdown = {} }));
 
-    var buf: [1]AgentRequest = undefined;
+    var buf: [3]AgentRequest = undefined;
     const n = q.drainInto(&buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    switch (buf[0]) {
+    try std.testing.expectEqual(@as(usize, 3), n);
+    switch (buf[0].prompt.content) {
+        .text => |payload| try std.testing.expectEqualStrings("hello", payload),
+        else => return error.UnexpectedResult,
+    }
+    switch (buf[1]) {
+        .new_session => {},
+        else => return error.UnexpectedResult,
+    }
+    switch (buf[2]) {
         .shutdown => {},
         else => return error.UnexpectedResult,
     }
+    for (buf[0..n]) |*req| req.deinit(allocator);
+}
+
+test "RequestQueue bounded policy rejects after capacity without disturbing pending work" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    var sent: usize = 0;
+    errdefer {
+        var cleanup: [request_queue_capacity]AgentRequest = undefined;
+        const count = q.drainInto(&cleanup);
+        for (cleanup[0..count]) |*req| req.deinit(allocator);
+    }
+    while (sent < request_queue_capacity) : (sent += 1) {
+        const text = try std.fmt.allocPrint(allocator, "msg-{d}", .{sent});
+        switch (q.trySend(.{ .prompt = .{ .content = .{ .text = text } } })) {
+            .ok => {},
+            .dropped, .closed, .full, .oom => unreachable,
+        }
+    }
+
+    const overflow_text = try allocator.dupe(u8, "overflow");
+    switch (q.trySend(.{ .prompt = .{ .content = .{ .text = overflow_text } } })) {
+        .full => |rejected| {
+            var failed = rejected;
+            failed.deinit(allocator);
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const stats = q.stats();
+    try std.testing.expectEqual(request_queue_capacity, stats.pending_depth);
+    try std.testing.expectEqual(request_queue_capacity, stats.high_water_depth);
+    try std.testing.expectEqual(request_queue_capacity, stats.send_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.rejected_count);
 }
 
 test "RequestQueue wake pipe stays readable until the long-lived owner drains requests" {
