@@ -249,6 +249,14 @@ pub const Agent = struct {
         self.clearFollowUpQueue();
     }
 
+    pub fn snapshotQueuedMessages(self: *Agent, allocator: std.mem.Allocator) control_mod.QueuedMessageSnapshot {
+        return self.run_control.snapshot(allocator);
+    }
+
+    pub fn takeQueuedMessagesAndClear(self: *Agent, allocator: std.mem.Allocator) control_mod.QueuedMessageSnapshot {
+        return self.run_control.clearAndSnapshot(allocator);
+    }
+
     pub fn abort(self: *Agent) void {
         if (self.is_running.load(.acquire)) {
             self.abort_controller.requestAbort();
