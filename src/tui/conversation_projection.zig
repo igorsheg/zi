@@ -704,8 +704,14 @@ fn buildAssistantRowModel(
 
     for (assistant.content) |block| {
         switch (block) {
-            .text => |text| try model.blocks.append(allocator, .{ .text = try allocator.dupe(u8, text.text) }),
-            .thinking => |thinking| try model.blocks.append(allocator, .{ .thinking = try allocator.dupe(u8, thinking.thinking) }),
+            .text => |text| {
+                if (std.mem.trim(u8, text.text, &std.ascii.whitespace).len == 0) continue;
+                try model.blocks.append(allocator, .{ .text = try allocator.dupe(u8, text.text) });
+            },
+            .thinking => |thinking| {
+                if (std.mem.trim(u8, thinking.thinking, &std.ascii.whitespace).len == 0) continue;
+                try model.blocks.append(allocator, .{ .thinking = try allocator.dupe(u8, thinking.thinking) });
+            },
             .tool_call => |tool_call| if (containsToolCallId(live_tool_ids, tool_call.id)) continue,
         }
     }

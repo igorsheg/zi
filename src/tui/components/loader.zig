@@ -81,7 +81,7 @@ pub const Loader = struct {
 
     fn shimmerConfig(self: *const Loader) Shimmer {
         return .{
-            .step_ns = 80_000_000,
+            .step_ns = 50_000_000,
             .lead_pad_cols = 4,
             .tail_pad_cols = 8,
             .band_half_width = 5,
