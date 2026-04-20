@@ -2946,10 +2946,22 @@ pub const Interactive = struct {
 
     fn shouldPublishStatusSnapshotForAgentEvent(event: AgentEvent) bool {
         return switch (event) {
-            // Context usage becomes authoritative on assistant commits.
-            // Publishing on user commits can resurrect stale pre-compaction
-            // counts in the footer before a fresh assistant usage lands.
+            // Immediate-commit messages are visible in `agent.messages()` at
+            // message_end, so the footer can update there.
             .message_end => |payload| switch (payload.message) {
+                // Successful assistant messages do NOT become committed until
+                // turn_end in agent3's conversation state. Publishing here
+                // would read the previous assistant usage and can resurrect a
+                // stale pre-compaction count.
+                .assistant => |assistant| switch (assistant.stop_reason) {
+                    .aborted, .@"error" => true,
+                    else => false,
+                },
+                else => true,
+            },
+            // Successful assistant usage becomes authoritative only once the
+            // completed turn is committed.
+            .turn_end => |payload| switch (payload.message) {
                 .assistant => true,
                 else => false,
             },
@@ -3348,7 +3360,7 @@ test "pendingImageBannerText includes latest image details and clear shortcut" {
     try testing.expect(std.mem.indexOf(u8, banner, "ctrl+c") != null);
 }
 
-test "status snapshot publication tracks assistant commits only" {
+test "status snapshot publication waits for successful assistant turn commit" {
     const user = agent_protocol.AgentMessage{ .user = .{
         .content = .{ .text = "hello" },
         .timestamp = 1,
@@ -3377,7 +3389,8 @@ test "status snapshot publication tracks assistant commits only" {
         .timestamp = 3,
     } };
 
-    try testing.expect(!Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = user } }));
-    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = assistant } }));
-    try testing.expect(!Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = tool_result } }));
+    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = user } }));
+    try testing.expect(!Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = assistant } }));
+    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = tool_result } }));
+    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .turn_end = .{ .message = assistant, .tool_results = &.{} } }));
 }
