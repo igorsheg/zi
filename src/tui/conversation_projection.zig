@@ -147,8 +147,18 @@ pub const ProjectionState = struct {
         snapshot: *control_mod.QueuedMessageSnapshot,
         options: RebuildOptions,
     ) void {
-        const owned = snapshot.*;
+        var owned = snapshot.*;
         snapshot.* = undefined;
+        // Drop queued snapshots that are older than what we've already
+        // projected. With two producers (TUI-thread immediate publishes
+        // and agent-thread drain publishes), a stale snapshot delivered
+        // after a newer one would otherwise undo visible state.
+        if (self.queued_snapshot) |current| {
+            if (owned.version <= current.version) {
+                owned.deinit(self.allocator);
+                return;
+            }
+        }
         if (self.queued_snapshot) |*s| s.deinit(self.allocator);
         self.queued_snapshot = owned;
         reconcileFromSnapshots(transcript, editor, resolver, self.view_snapshot, self.queued_snapshot, options);

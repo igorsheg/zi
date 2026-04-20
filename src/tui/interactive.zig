@@ -412,6 +412,13 @@ pub const Interactive = struct {
     // maybePublishSoftConversation below.
     last_conversation_publish_ns: u64 = 0,
     conversation_publish_dirty: bool = false,
+    /// Last queued-snapshot version we've published from the agent thread.
+    /// Used by `publishQueuedSnapshotIfChanged` to skip redundant publishes
+    /// when the run-control queue hasn't mutated since our last send. The
+    /// TUI-thread direct publish path does **not** update this field; stale
+    /// deliveries from race conditions are handled downstream by
+    /// `ProjectionState.replaceQueuedSnapshot` version filtering.
+    last_published_queued_version: u64 = 0,
     runtime_host: RuntimeHost,
     loader: Loader = .{},
     loader_active: bool = false,
@@ -2438,7 +2445,7 @@ pub const Interactive = struct {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
         _ = self.publishConversationState();
-        _ = self.publishQueuedSnapshot();
+        self.publishQueuedSnapshotIfChanged();
 
         while (true) {
             _ = self.request_queue.waitReadable(-1) catch break;
@@ -2557,7 +2564,7 @@ pub const Interactive = struct {
         };
         switch (result) {
             .ok => {
-                _ = self.publishQueuedSnapshot();
+                self.publishQueuedSnapshotIfChanged();
             },
             .closed, .oom => {
                 const msg = self.msg_allocator.dupe(u8, "agent unavailable") catch return;
@@ -2574,7 +2581,7 @@ pub const Interactive = struct {
         };
         errdefer snapshot.deinit(self.msg_allocator);
 
-        _ = self.publishQueuedSnapshot();
+        self.publishQueuedSnapshotIfChanged();
         self.event_queue.push(.{ .queued_inputs_restored = snapshot });
     }
 
@@ -2591,7 +2598,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
         }
-        _ = self.publishQueuedSnapshot();
+        self.publishQueuedSnapshotIfChanged();
         self.event_queue.push(.{ .session_new_started = {} });
     }
 
@@ -2619,7 +2626,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         }
-        _ = self.publishQueuedSnapshot();
+        self.publishQueuedSnapshotIfChanged();
         self.event_queue.push(.{ .session_resumed = .{
             .restore_warning = restore_warning,
         } });
@@ -2631,6 +2638,19 @@ pub const Interactive = struct {
 
     fn publishQueuedSnapshot(self: *Interactive) bool {
         return self.runtime_host.publishQueuedSnapshot(self.queuedSnapshotPublisher());
+    }
+
+    /// Agent-thread entry point for queued-snapshot publication. Skips
+    /// the publish when the run-control version hasn't moved since we
+    /// last pushed. This is how pending rows disappear after the agent
+    /// loop drains steering/follow-up during a run — the drain bumps
+    /// the version, and this call picks that up on the next event flush.
+    fn publishQueuedSnapshotIfChanged(self: *Interactive) void {
+        const current_version = self.runtime_host.currentQueuedVersion();
+        if (current_version == self.last_published_queued_version) return;
+        if (self.publishQueuedSnapshot()) {
+            self.last_published_queued_version = current_version;
+        }
     }
 
     /// Soft conversation-publish cadence (ns between forced publishes
@@ -2647,7 +2667,7 @@ pub const Interactive = struct {
     /// turn_end, queue_update, compaction_end).
     fn flushPendingConversationPublish(self: *Interactive) void {
         _ = self.publishConversationState();
-        _ = self.publishQueuedSnapshot();
+        self.publishQueuedSnapshotIfChanged();
         self.last_conversation_publish_ns = monotonicNowNs();
         self.conversation_publish_dirty = false;
     }
