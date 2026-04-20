@@ -33,11 +33,20 @@ pub const LifecycleHooks = session_runner.LifecycleHooks;
 pub const Options = session_runner.Options;
 
 pub const ConversationStatePublisher = struct {
-    func: *const fn (state: conversation_state.PublishedConversationState, ctx: ?*anyopaque) void,
+    func: *const fn (state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) void,
     ctx: ?*anyopaque = null,
 
-    pub fn publish(self: ConversationStatePublisher, state: conversation_state.PublishedConversationState) void {
+    pub fn publish(self: ConversationStatePublisher, state: conversation_state.ConversationViewSnapshot) void {
         self.func(state, self.ctx);
+    }
+};
+
+pub const QueuedSnapshotPublisher = struct {
+    func: *const fn (snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) void,
+    ctx: ?*anyopaque = null,
+
+    pub fn publish(self: QueuedSnapshotPublisher, snapshot: control_mod.QueuedMessageSnapshot) void {
+        self.func(snapshot, self.ctx);
     }
 };
 
@@ -230,13 +239,18 @@ pub const RuntimeHost = struct {
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
 
-        var queued = self.session.cloneQueuedMessageSnapshot(self.msg_allocator) catch return false;
-        errdefer queued.deinit(self.msg_allocator);
+        publisher.publish(.{ .view = view });
+        return true;
+    }
 
-        publisher.publish(.{
-            .view = view,
-            .queued = queued,
-        });
+    pub fn publishQueuedSnapshot(
+        self: *RuntimeHost,
+        publisher: QueuedSnapshotPublisher,
+    ) bool {
+        var snapshot = self.session.cloneQueuedMessageSnapshot(self.msg_allocator) catch return false;
+        errdefer snapshot.deinit(self.msg_allocator);
+
+        publisher.publish(snapshot);
         return true;
     }
 
@@ -396,7 +410,7 @@ fn createOwnedTestAgentSession(
     return session;
 }
 
-test "runtime host publishes committed and queued conversation state" {
+test "runtime host publishes committed view and queued snapshots independently" {
     const session = try createOwnedTestAgentSession(testing.allocator, null);
 
     try session.agent.setMessages(&.{.{ .user = .{
@@ -404,13 +418,21 @@ test "runtime host publishes committed and queued conversation state" {
         .timestamp = 1,
     } }});
 
-    var published: ?conversation_state.PublishedConversationState = null;
-    defer if (published) |*state| state.deinit(testing.allocator);
+    var published_view: ?conversation_state.ConversationViewSnapshot = null;
+    defer if (published_view) |*state| state.deinit(testing.allocator);
+
+    var published_queued: ?control_mod.QueuedMessageSnapshot = null;
+    defer if (published_queued) |*snapshot| snapshot.deinit(testing.allocator);
 
     const Capture = struct {
-        fn publish(state: conversation_state.PublishedConversationState, ctx: ?*anyopaque) void {
-            const out: *?conversation_state.PublishedConversationState = @ptrCast(@alignCast(ctx.?));
+        fn publishView(state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) void {
+            const out: *?conversation_state.ConversationViewSnapshot = @ptrCast(@alignCast(ctx.?));
             out.* = state;
+        }
+
+        fn publishQueued(snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) void {
+            const out: *?control_mod.QueuedMessageSnapshot = @ptrCast(@alignCast(ctx.?));
+            out.* = snapshot;
         }
     };
 
@@ -423,15 +445,22 @@ test "runtime host publishes committed and queued conversation state" {
     } }));
 
     try testing.expect(host.publishConversationState(.{
-        .func = &Capture.publish,
-        .ctx = @ptrCast(&published),
+        .func = &Capture.publishView,
+        .ctx = @ptrCast(&published_view),
     }));
-    try testing.expect(published != null);
-    try testing.expectEqual(@as(usize, 1), published.?.view.committed.flat.len);
-    try testing.expectEqualStrings("hello", published.?.view.committed.flat[0].user.content.text);
-    try testing.expectEqual(@as(usize, 0), published.?.queued.steering.len);
-    try testing.expectEqual(@as(usize, 1), published.?.queued.follow_up.len);
-    try testing.expectEqualStrings("queued", published.?.queued.follow_up[0].text);
+    try testing.expect(host.publishQueuedSnapshot(.{
+        .func = &Capture.publishQueued,
+        .ctx = @ptrCast(&published_queued),
+    }));
+
+    try testing.expect(published_view != null);
+    try testing.expectEqual(@as(usize, 1), published_view.?.view.committed.flat.len);
+    try testing.expectEqualStrings("hello", published_view.?.view.committed.flat[0].user.content.text);
+
+    try testing.expect(published_queued != null);
+    try testing.expectEqual(@as(usize, 0), published_queued.?.steering.len);
+    try testing.expectEqual(@as(usize, 1), published_queued.?.follow_up.len);
+    try testing.expectEqualStrings("queued", published_queued.?.follow_up[0].text);
 }
 
 test "runtime host keeps session-event subscriptions across session replacement" {

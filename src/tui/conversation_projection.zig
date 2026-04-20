@@ -73,32 +73,33 @@ const ExtractedText = union(enum) {
     }
 };
 
-fn ownedConversationStateFromMessages(
+fn ownedViewSnapshotFromMessages(
     allocator: std.mem.Allocator,
     messages: []const agent_protocol.AgentMessage,
-) !conversation_state_mod.PublishedConversationState {
+) !conversation_state_mod.ConversationViewSnapshot {
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(allocator, messages);
     errdefer shared.release();
 
+    return .{ .view = .{
+        .committed = shared,
+        .in_flight = null,
+    } };
+}
+
+fn emptyQueuedSnapshot(allocator: std.mem.Allocator) !control_mod.QueuedMessageSnapshot {
     const steering = try allocator.alloc(control_mod.QueuedMessageText, 0);
     errdefer allocator.free(steering);
     const follow_up = try allocator.alloc(control_mod.QueuedMessageText, 0);
-
     return .{
-        .view = .{
-            .committed = shared,
-            .in_flight = null,
-        },
-        .queued = .{
-            .steering = steering,
-            .follow_up = follow_up,
-        },
+        .steering = steering,
+        .follow_up = follow_up,
     };
 }
 
 pub const ProjectionState = struct {
     allocator: std.mem.Allocator,
-    state: ?conversation_state_mod.PublishedConversationState = null,
+    view_snapshot: ?conversation_state_mod.ConversationViewSnapshot = null,
+    queued_snapshot: ?control_mod.QueuedMessageSnapshot = null,
 
     pub fn init(allocator: std.mem.Allocator) ProjectionState {
         return .{ .allocator = allocator };
@@ -109,10 +110,48 @@ pub const ProjectionState = struct {
     }
 
     pub fn clear(self: *ProjectionState) void {
-        if (self.state) |*state| {
-            state.deinit(self.allocator);
-            self.state = null;
+        if (self.view_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+        if (self.queued_snapshot) |*snapshot| snapshot.deinit(self.allocator);
+        self.view_snapshot = null;
+        self.queued_snapshot = null;
+    }
+
+    pub fn replaceViewSnapshot(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        snapshot: *conversation_state_mod.ConversationViewSnapshot,
+        options: RebuildOptions,
+    ) void {
+        const owned = snapshot.*;
+        snapshot.* = undefined;
+        const must_reset_history = if (self.view_snapshot) |previous|
+            !committedUserHistoryIsPrefix(previous.view.committed.flat, owned.view.committed.flat)
+        else
+            false;
+        if (self.view_snapshot) |*s| s.deinit(self.allocator);
+        self.view_snapshot = owned;
+        reconcileFromSnapshots(transcript, editor, resolver, self.view_snapshot, self.queued_snapshot, options);
+        if (must_reset_history) {
+            editor.clearHistory();
+            seedHistoryFromCommittedMessages(editor, self.view_snapshot.?.view.committed.flat);
         }
+    }
+
+    pub fn replaceQueuedSnapshot(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        snapshot: *control_mod.QueuedMessageSnapshot,
+        options: RebuildOptions,
+    ) void {
+        const owned = snapshot.*;
+        snapshot.* = undefined;
+        if (self.queued_snapshot) |*s| s.deinit(self.allocator);
+        self.queued_snapshot = owned;
+        reconcileFromSnapshots(transcript, editor, resolver, self.view_snapshot, self.queued_snapshot, options);
     }
 
     pub fn replaceAllOwnedState(
@@ -120,43 +159,34 @@ pub const ProjectionState = struct {
         transcript: *Transcript,
         editor: EditorInterface,
         resolver: ToolRendererResolver,
-        state: *conversation_state_mod.PublishedConversationState,
+        view: *conversation_state_mod.ConversationViewSnapshot,
+        queued: *control_mod.QueuedMessageSnapshot,
         options: RebuildOptions,
     ) void {
-        const owned_state = state.*;
-        state.* = undefined;
-        const must_reset_history = if (self.state) |previous|
-            !committedUserHistoryIsPrefix(previous.view.committed.flat, owned_state.view.committed.flat)
-        else
-            false;
-        self.clear();
-        self.state = owned_state;
-        reconcileFromState(transcript, editor, resolver, self.state.?, options);
-        if (must_reset_history) {
-            editor.clearHistory();
-            seedHistoryFromCommittedMessages(editor, self.state.?.view.committed.flat);
-        }
+        self.replaceViewSnapshot(transcript, editor, resolver, view, options);
+        self.replaceQueuedSnapshot(transcript, editor, resolver, queued, options);
     }
 };
 
-pub fn rebuildFromState(
+pub fn rebuildFromSnapshots(
     transcript: *Transcript,
     editor: EditorInterface,
     resolver: ToolRendererResolver,
-    state: conversation_state_mod.PublishedConversationState,
+    view: ?conversation_state_mod.ConversationViewSnapshot,
+    queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
 ) void {
     transcript.clearAll();
     editor.clearHistory();
 
-    var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, state, options, transcript.hide_thinking_block) catch return;
+    var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, view, queued, options, transcript.hide_thinking_block) catch return;
     defer {
         for (desired_items.items) |*item| item.deinit(transcript.allocator);
         desired_items.deinit(transcript.allocator);
     }
 
     for (desired_items.items, 0..) |desired, idx| {
-        // rebuildFromState cleared the transcript above, so every desired
+        // rebuildFromSnapshots cleared the transcript above, so every desired
         // item MUST carry a freshly-built row (P2 retain path can't trigger
         // against an empty transcript).
         std.debug.assert(desired.row != null);
@@ -170,17 +200,18 @@ pub fn rebuildFromState(
     transcript.clearPendingToolRouting();
 }
 
-pub fn reconcileFromState(
+pub fn reconcileFromSnapshots(
     transcript: *Transcript,
     editor: EditorInterface,
     resolver: ToolRendererResolver,
-    state: conversation_state_mod.PublishedConversationState,
+    view: ?conversation_state_mod.ConversationViewSnapshot,
+    queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
 ) void {
     var reconcile_timer = profile.ScopedTimer.begin(.reconcile_from_state);
     defer reconcile_timer.end();
 
-    var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, state, options, transcript.hide_thinking_block) catch return;
+    var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, view, queued, options, transcript.hide_thinking_block) catch return;
     defer {
         for (desired_items.items) |*item| item.deinit(transcript.allocator);
         desired_items.deinit(transcript.allocator);
@@ -257,7 +288,8 @@ fn buildDesiredItems(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
     transcript: *Transcript,
-    state: conversation_state_mod.PublishedConversationState,
+    view: ?conversation_state_mod.ConversationViewSnapshot,
+    queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
     hide_thinking_block: bool,
 ) !std.ArrayList(DesiredItem) {
@@ -272,72 +304,76 @@ fn buildDesiredItems(
 
     var live_tool_ids: std.ArrayList([]const u8) = .empty;
     defer live_tool_ids.deinit(allocator);
-    if (state.view.in_flight) |turn| {
+    if (view) |v| if (v.view.in_flight) |turn| {
         for (turn.tool_executions) |tool| {
             try live_tool_ids.append(allocator, tool.tool_call_id);
         }
-    }
+    };
 
-    const committed_slice = state.view.committed.flat;
-    for (committed_slice, 0..) |message, idx| {
-        try appendDesiredItem(
-            allocator,
-            &desired_items,
-            buildCommittedMessageItem(allocator, resolver, transcript, idx, message, options, live_tool_ids.items, hide_thinking_block),
-        );
-        switch (message) {
-            .assistant => |assistant| {
-                for (assistant.content) |block| {
-                    if (block != .tool_call) continue;
-                    const tool_call = block.tool_call;
-                    if (containsToolCallId(live_tool_ids.items, tool_call.id)) continue;
-                    try appendDesiredItem(
-                        allocator,
-                        &desired_items,
-                        buildCommittedToolCallDesiredItem(
+    if (view) |v| {
+        const committed_slice = v.view.committed.flat;
+        for (committed_slice, 0..) |message, idx| {
+            try appendDesiredItem(
+                allocator,
+                &desired_items,
+                buildCommittedMessageItem(allocator, resolver, transcript, idx, message, options, live_tool_ids.items, hide_thinking_block),
+            );
+            switch (message) {
+                .assistant => |assistant| {
+                    for (assistant.content) |block| {
+                        if (block != .tool_call) continue;
+                        const tool_call = block.tool_call;
+                        if (containsToolCallId(live_tool_ids.items, tool_call.id)) continue;
+                        try appendDesiredItem(
                             allocator,
-                            resolver,
-                            transcript,
-                            tool_call,
-                            assistant,
-                            findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
-                            options,
-                        ),
-                    );
-                }
-            },
-            else => {},
+                            &desired_items,
+                            buildCommittedToolCallDesiredItem(
+                                allocator,
+                                resolver,
+                                transcript,
+                                tool_call,
+                                assistant,
+                                findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
+                                options,
+                            ),
+                        );
+                    }
+                },
+                else => {},
+            }
+        }
+        if (v.view.in_flight) |turn| {
+            if (turn.assistant) |assistant| {
+                try appendDesiredItem(
+                    allocator,
+                    &desired_items,
+                    buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids.items, options.theme, hide_thinking_block),
+                );
+            }
+            for (turn.tool_executions) |tool| {
+                try appendDesiredItem(
+                    allocator,
+                    &desired_items,
+                    buildToolExecutionDesiredItem(allocator, resolver, transcript, tool, options.theme),
+                );
+            }
         }
     }
-    if (state.view.in_flight) |turn| {
-        if (turn.assistant) |assistant| {
+    if (queued) |q| {
+        for (q.steering, 0..) |entry, idx| {
             try appendDesiredItem(
                 allocator,
                 &desired_items,
-                buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids.items, options.theme, hide_thinking_block),
+                buildQueuedUserDesiredItem(allocator, transcript, .steering, idx, entry.text, options.theme),
             );
         }
-        for (turn.tool_executions) |tool| {
+        for (q.follow_up, 0..) |entry, idx| {
             try appendDesiredItem(
                 allocator,
                 &desired_items,
-                buildToolExecutionDesiredItem(allocator, resolver, transcript, tool, options.theme),
+                buildQueuedUserDesiredItem(allocator, transcript, .follow_up, idx, entry.text, options.theme),
             );
         }
-    }
-    for (state.queued.steering, 0..) |entry, idx| {
-        try appendDesiredItem(
-            allocator,
-            &desired_items,
-            buildQueuedUserDesiredItem(allocator, transcript, .steering, idx, entry.text, options.theme),
-        );
-    }
-    for (state.queued.follow_up, 0..) |entry, idx| {
-        try appendDesiredItem(
-            allocator,
-            &desired_items,
-            buildQueuedUserDesiredItem(allocator, transcript, .follow_up, idx, entry.text, options.theme),
-        );
     }
     return desired_items;
 }
@@ -1340,7 +1376,7 @@ fn dupQueuedEntries(allocator: std.mem.Allocator, texts: []const []const u8) ![]
     return entries;
 }
 
-test "rebuildFromState reconstructs tool call rows and tool results from committed messages" {
+test "rebuildFromSnapshots reconstructs tool call rows and tool results from committed messages" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1361,14 +1397,15 @@ test "rebuildFromState reconstructs tool call rows and tool results from committ
         makeToolResultMessage("tc-1", "bash", &tool_result_content, false),
     };
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &messages);
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &messages);
     defer state.deinit(testing.allocator);
 
-    rebuildFromState(
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        null,
         .{ .theme = themes_builtin.dark() },
     );
 
@@ -1386,7 +1423,7 @@ test "rebuildFromState reconstructs tool call rows and tool results from committ
     try testing.expectEqualStrings("done", tool.model.result.?.content[0].text.text);
 }
 
-test "rebuildFromState preserves assistant text thinking and tool call ordering" {
+test "rebuildFromSnapshots preserves assistant text thinking and tool call ordering" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1402,14 +1439,15 @@ test "rebuildFromState preserves assistant text thinking and tool call ordering"
         makeAssistantMessage(&assistant_content, .toolUse, null),
     };
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &messages);
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &messages);
     defer state.deinit(testing.allocator);
 
-    rebuildFromState(
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        null,
         .{ .theme = themes_builtin.dark() },
     );
 
@@ -1423,7 +1461,7 @@ test "rebuildFromState preserves assistant text thinking and tool call ordering"
     try testing.expect(ponder_idx < tool_idx);
 }
 
-test "rebuildFromState respects hidden thinking labels for committed assistant rows" {
+test "rebuildFromSnapshots respects hidden thinking labels for committed assistant rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
     transcript.hide_thinking_block = true;
@@ -1439,14 +1477,15 @@ test "rebuildFromState respects hidden thinking labels for committed assistant r
         makeAssistantMessage(&assistant_content, .stop, null),
     };
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &messages);
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &messages);
     defer state.deinit(testing.allocator);
 
-    rebuildFromState(
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        null,
         .{ .theme = themes_builtin.dark() },
     );
 
@@ -1458,7 +1497,7 @@ test "rebuildFromState respects hidden thinking labels for committed assistant r
     try testing.expect(std.mem.indexOf(u8, rendered, "ponder") == null);
 }
 
-test "rebuildFromState renders failed tool rows for aborted assistant" {
+test "rebuildFromSnapshots renders failed tool rows for aborted assistant" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1472,14 +1511,15 @@ test "rebuildFromState renders failed tool rows for aborted assistant" {
         makeAssistantMessage(&assistant_content, .aborted, null),
     };
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &messages);
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &messages);
     defer state.deinit(testing.allocator);
 
-    rebuildFromState(
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        null,
         .{
             .theme = themes_builtin.dark(),
             .retry_attempt = 0,
@@ -1495,7 +1535,7 @@ test "rebuildFromState renders failed tool rows for aborted assistant" {
     try testing.expectEqualStrings("Operation aborted", tool.model.result.?.content[0].text.text);
 }
 
-test "rebuildFromState includes summaries displayable custom messages and editor history" {
+test "rebuildFromSnapshots includes summaries displayable custom messages and editor history" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1525,14 +1565,15 @@ test "rebuildFromState includes summaries displayable custom messages and editor
         } },
     };
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &messages);
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &messages);
     defer state.deinit(testing.allocator);
 
-    rebuildFromState(
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        null,
         .{ .theme = themes_builtin.dark() },
     );
 
@@ -1548,7 +1589,7 @@ test "rebuildFromState includes summaries displayable custom messages and editor
     try testing.expect(std.mem.indexOf(u8, rendered, "do not show") == null);
 }
 
-test "rebuildFromState reconstructs committed messages and queued rows" {
+test "rebuildFromSnapshots reconstructs committed messages and queued rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1560,18 +1601,21 @@ test "rebuildFromState reconstructs committed messages and queued rows" {
         .{ .compaction_summary = .{ .summary = "kept the recent turns", .tokens_before = 42, .timestamp = 2 } },
     };
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &messages);
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &messages);
     defer state.deinit(testing.allocator);
-    testing.allocator.free(state.queued.steering);
-    testing.allocator.free(state.queued.follow_up);
-    state.queued.steering = try dupQueuedEntries(testing.allocator, &.{"steer me"});
-    state.queued.follow_up = try dupQueuedEntries(testing.allocator, &.{"follow me"});
 
-    rebuildFromState(
+    var queued: control_mod.QueuedMessageSnapshot = .{
+        .steering = try dupQueuedEntries(testing.allocator, &.{"steer me"}),
+        .follow_up = try dupQueuedEntries(testing.allocator, &.{"follow me"}),
+    };
+    defer queued.deinit(testing.allocator);
+
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        queued,
         .{ .theme = themes_builtin.dark() },
     );
 
@@ -1589,7 +1633,7 @@ test "rebuildFromState reconstructs committed messages and queued rows" {
     try testing.expect(std.mem.indexOf(u8, rendered, "follow me") != null);
 }
 
-test "rebuildFromState reconstructs active assistant and live tool execution rows" {
+test "rebuildFromSnapshots reconstructs active assistant and live tool execution rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1606,7 +1650,7 @@ test "rebuildFromState reconstructs active assistant and live tool execution row
     };
     const partial_result = AgentToolResult{ .content = &partial_blocks, .is_error = false };
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
     defer state.deinit(testing.allocator);
     const live_tools = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 1);
     live_tools[0] = .{
@@ -1624,11 +1668,12 @@ test "rebuildFromState reconstructs active assistant and live tool execution row
         .tool_executions = live_tools,
     };
 
-    rebuildFromState(
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        null,
         .{ .theme = themes_builtin.dark() },
     );
 
@@ -1641,7 +1686,7 @@ test "rebuildFromState reconstructs active assistant and live tool execution row
     try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, rendered, "tc-1 tc-1"));
 }
 
-test "rebuildFromState respects hidden thinking labels for active assistant rows" {
+test "rebuildFromSnapshots respects hidden thinking labels for active assistant rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
     transcript.hide_thinking_block = true;
@@ -1655,18 +1700,19 @@ test "rebuildFromState respects hidden thinking labels for active assistant rows
     };
     const assistant = makeAssistantMessage(&assistant_content, .stop, null);
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &.{});
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &.{});
     defer state.deinit(testing.allocator);
     state.view.in_flight = .{
         .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant.assistant),
         .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
     };
 
-    rebuildFromState(
+    rebuildFromSnapshots(
         &transcript,
         EditorInterface.init(editor_mod.Editor, &editor),
         tool_display_mod.empty_resolver,
         state,
+        null,
         .{ .theme = themes_builtin.dark() },
     );
 
@@ -1678,65 +1724,65 @@ test "rebuildFromState respects hidden thinking labels for active assistant rows
     try testing.expect(std.mem.indexOf(u8, rendered, "ponder") == null);
 }
 
-test "reconcileFromState retains unchanged rows and appends editor history once" {
+test "reconcileFromSnapshots retains unchanged rows and appends editor history once" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
     var mock_editor = editor_iface_mod.MockEditor{};
     const editor = mock_editor.editorInterface();
 
-    var state = try ownedConversationStateFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
     defer state.deinit(testing.allocator);
 
-    reconcileFromState(&transcript, editor, tool_display_mod.empty_resolver, state, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state, null, .{ .theme = themes_builtin.dark() });
     try testing.expectEqual(@as(usize, 1), transcript.items.items.len);
     const first_ptr = transcript.items.items[0].deinit_ctx;
     try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
 
-    reconcileFromState(&transcript, editor, tool_display_mod.empty_resolver, state, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state, null, .{ .theme = themes_builtin.dark() });
     try testing.expectEqual(first_ptr, transcript.items.items[0].deinit_ctx);
     try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
 }
 
-test "reconcileFromState replaces only changed semantic rows" {
+test "reconcileFromSnapshots replaces only changed semantic rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
     var mock_editor = editor_iface_mod.MockEditor{};
     const editor = mock_editor.editorInterface();
 
-    var state_a = try ownedConversationStateFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two") });
+    var state_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two") });
     defer state_a.deinit(testing.allocator);
-    reconcileFromState(&transcript, editor, tool_display_mod.empty_resolver, state_a, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_a, null, .{ .theme = themes_builtin.dark() });
 
     const first_ptr = transcript.items.items[0].deinit_ctx;
     const second_ptr = transcript.items.items[1].deinit_ctx;
 
-    var state_b = try ownedConversationStateFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two updated") });
+    var state_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two updated") });
     defer state_b.deinit(testing.allocator);
-    reconcileFromState(&transcript, editor, tool_display_mod.empty_resolver, state_b, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark() });
 
     try testing.expectEqual(first_ptr, transcript.items.items[0].deinit_ctx);
     try testing.expect(second_ptr != transcript.items.items[1].deinit_ctx);
 }
 
-test "reconcileFromState reorders rows and preserves scroll offset when not following bottom" {
+test "reconcileFromSnapshots reorders rows and preserves scroll offset when not following bottom" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
     var mock_editor = editor_iface_mod.MockEditor{};
     const editor = mock_editor.editorInterface();
 
-    var state_a = try ownedConversationStateFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two"), makeUserMessage("three") });
+    var state_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two"), makeUserMessage("three") });
     defer state_a.deinit(testing.allocator);
-    reconcileFromState(&transcript, editor, tool_display_mod.empty_resolver, state_a, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_a, null, .{ .theme = themes_builtin.dark() });
     _ = transcript.totalHeight(40);
     transcript.scrollBy(40, 2, -1);
     const scroll_before = transcript.scrollOffset();
 
-    var state_b = try ownedConversationStateFromMessages(testing.allocator, &.{ makeUserMessage("three"), makeUserMessage("one"), makeUserMessage("two") });
+    var state_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("three"), makeUserMessage("one"), makeUserMessage("two") });
     defer state_b.deinit(testing.allocator);
-    reconcileFromState(&transcript, editor, tool_display_mod.empty_resolver, state_b, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark() });
 
     try testing.expectEqual(scroll_before, transcript.scrollOffset());
 }
@@ -1751,13 +1797,15 @@ test "replaceAllOwnedState clears and reseeds editor history when committed user
     var mock_editor = editor_iface_mod.MockEditor{};
     const editor = mock_editor.editorInterface();
 
-    var state_a = try ownedConversationStateFromMessages(testing.allocator, &.{makeUserMessage("old")});
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &state_a, .{ .theme = themes_builtin.dark() });
+    var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("old")});
+    var queued_a = try emptyQueuedSnapshot(testing.allocator);
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_a, &queued_a, .{ .theme = themes_builtin.dark() });
     try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
     try testing.expectEqual(@as(u32, 0), mock_editor.clear_history_count);
 
-    var state_b = try ownedConversationStateFromMessages(testing.allocator, &.{makeUserMessage("new")});
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &state_b, .{ .theme = themes_builtin.dark() });
+    var view_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("new")});
+    var queued_b = try emptyQueuedSnapshot(testing.allocator);
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_b, &queued_b, .{ .theme = themes_builtin.dark() });
 
     try testing.expectEqual(@as(u32, 2), mock_editor.history_count);
     try testing.expectEqual(@as(u32, 1), mock_editor.clear_history_count);
@@ -1773,11 +1821,13 @@ test "replaceAllOwnedState preserves editor history on append-only user history"
     var mock_editor = editor_iface_mod.MockEditor{};
     const editor = mock_editor.editorInterface();
 
-    var state_a = try ownedConversationStateFromMessages(testing.allocator, &.{makeUserMessage("one")});
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &state_a, .{ .theme = themes_builtin.dark() });
+    var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("one")});
+    var queued_a = try emptyQueuedSnapshot(testing.allocator);
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_a, &queued_a, .{ .theme = themes_builtin.dark() });
 
-    var state_b = try ownedConversationStateFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two") });
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &state_b, .{ .theme = themes_builtin.dark() });
+    var view_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two") });
+    var queued_b = try emptyQueuedSnapshot(testing.allocator);
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_b, &queued_b, .{ .theme = themes_builtin.dark() });
 
     try testing.expectEqual(@as(u32, 2), mock_editor.history_count);
     try testing.expectEqual(@as(u32, 0), mock_editor.clear_history_count);

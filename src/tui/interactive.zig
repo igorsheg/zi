@@ -1019,7 +1019,7 @@ pub const Interactive = struct {
         if (ev.takeConversationState()) |state| {
             var owned_state = state;
             const was_following_bottom = self.transcript.isFollowingBottom();
-            self.conversation_projection.replaceAllOwnedState(
+            self.conversation_projection.replaceViewSnapshot(
                 &self.transcript,
                 self.active_editor,
                 self.resolver,
@@ -1036,9 +1036,30 @@ pub const Interactive = struct {
             return;
         }
 
+        if (ev.takeQueuedSnapshot()) |snapshot| {
+            var owned = snapshot;
+            const was_following_bottom = self.transcript.isFollowingBottom();
+            self.conversation_projection.replaceQueuedSnapshot(
+                &self.transcript,
+                self.active_editor,
+                self.resolver,
+                &owned,
+                .{
+                    .theme = self.theme,
+                    .retry_attempt = self.retry_attempt,
+                },
+            );
+            if (was_following_bottom) {
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+            }
+            self.tui.dirty = true;
+            return;
+        }
+
         switch (ev.*) {
             .consumed => {},
             .conversation_state => unreachable,
+            .queued_snapshot => unreachable,
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
@@ -2417,6 +2438,7 @@ pub const Interactive = struct {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
         }
         _ = self.publishConversationState();
+        _ = self.publishQueuedSnapshot();
 
         while (true) {
             _ = self.request_queue.waitReadable(-1) catch break;
@@ -2535,7 +2557,7 @@ pub const Interactive = struct {
         };
         switch (result) {
             .ok => {
-                _ = self.publishConversationState();
+                _ = self.publishQueuedSnapshot();
             },
             .closed, .oom => {
                 const msg = self.msg_allocator.dupe(u8, "agent unavailable") catch return;
@@ -2552,7 +2574,7 @@ pub const Interactive = struct {
         };
         errdefer snapshot.deinit(self.msg_allocator);
 
-        _ = self.publishConversationState();
+        _ = self.publishQueuedSnapshot();
         self.event_queue.push(.{ .queued_inputs_restored = snapshot });
     }
 
@@ -2569,6 +2591,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_new_failed = .{ .message = msg } });
             return;
         }
+        _ = self.publishQueuedSnapshot();
         self.event_queue.push(.{ .session_new_started = {} });
     }
 
@@ -2596,6 +2619,7 @@ pub const Interactive = struct {
             self.event_queue.push(.{ .session_resume_failed = .{ .message = msg } });
             return;
         }
+        _ = self.publishQueuedSnapshot();
         self.event_queue.push(.{ .session_resumed = .{
             .restore_warning = restore_warning,
         } });
@@ -2603,6 +2627,10 @@ pub const Interactive = struct {
 
     fn publishConversationState(self: *Interactive) bool {
         return self.runtime_host.publishConversationState(self.conversationStatePublisher());
+    }
+
+    fn publishQueuedSnapshot(self: *Interactive) bool {
+        return self.runtime_host.publishQueuedSnapshot(self.queuedSnapshotPublisher());
     }
 
     /// Soft conversation-publish cadence (ns between forced publishes
@@ -2619,6 +2647,7 @@ pub const Interactive = struct {
     /// turn_end, queue_update, compaction_end).
     fn flushPendingConversationPublish(self: *Interactive) void {
         _ = self.publishConversationState();
+        _ = self.publishQueuedSnapshot();
         self.last_conversation_publish_ns = monotonicNowNs();
         self.conversation_publish_dirty = false;
     }
@@ -2645,9 +2674,21 @@ pub const Interactive = struct {
         };
     }
 
-    fn publishConversationStateToUi(state: agent_mod.conversation_state.PublishedConversationState, ctx: ?*anyopaque) void {
+    fn queuedSnapshotPublisher(self: *Interactive) coding_agent_mod.runtime_host.QueuedSnapshotPublisher {
+        return .{
+            .func = &publishQueuedSnapshotToUi,
+            .ctx = @ptrCast(self),
+        };
+    }
+
+    fn publishConversationStateToUi(state: agent_mod.conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         self.event_queue.push(.{ .conversation_state = state });
+    }
+
+    fn publishQueuedSnapshotToUi(snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.event_queue.push(.{ .queued_snapshot = snapshot });
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).

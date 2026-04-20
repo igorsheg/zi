@@ -1,6 +1,5 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_root = @import("../agent3/root.zig");
 const conversation_state_mod = @import("../agent3/conversation_state.zig");
 const runtime_host_mod = @import("../coding_agent/runtime_host.zig");
 const theme_mod = @import("theme.zig");
@@ -12,7 +11,8 @@ pub const UiEvent = union(enum) {
     consumed: void,
 
     // --- conversation transport ---
-    conversation_state: conversation_state_mod.PublishedConversationState,
+    conversation_state: conversation_state_mod.ConversationViewSnapshot,
+    queued_snapshot: runtime_host_mod.QueuedMessageSnapshot,
 
     // --- errors / status side effects ---
     error_message: struct { message: []u8 },
@@ -118,11 +118,21 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    pub fn takeConversationState(self: *UiEvent) ?conversation_state_mod.PublishedConversationState {
+    pub fn takeConversationState(self: *UiEvent) ?conversation_state_mod.ConversationViewSnapshot {
         return switch (self.*) {
             .conversation_state => |state| blk: {
                 self.* = .{ .consumed = {} };
                 break :blk state;
+            },
+            else => null,
+        };
+    }
+
+    pub fn takeQueuedSnapshot(self: *UiEvent) ?runtime_host_mod.QueuedMessageSnapshot {
+        return switch (self.*) {
+            .queued_snapshot => |snapshot| blk: {
+                self.* = .{ .consumed = {} };
+                break :blk snapshot;
             },
             else => null,
         };
@@ -133,6 +143,7 @@ pub const UiEvent = union(enum) {
         switch (self.*) {
             .consumed => {},
             .conversation_state => |*state| state.deinit(allocator),
+            .queued_snapshot => |*snapshot| snapshot.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
             .theme_changed => {},
             .assistant_run_finished => |m| {
@@ -173,28 +184,22 @@ pub const UiEvent = union(enum) {
 const testing = std.testing;
 
 test "UiEvent deinit frees conversation state payload" {
+    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
     var ev = UiEvent{ .conversation_state = .{
         .view = .{
-            .committed = try testing.allocator.alloc(agent_root.protocol.AgentMessage, 0),
+            .committed = shared,
             .in_flight = null,
-        },
-        .queued = .{
-            .steering = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
-            .follow_up = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
         },
     } };
     ev.deinit(testing.allocator);
 }
 
 test "UiEvent takeConversationState disarms later cleanup" {
+    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
     var ev = UiEvent{ .conversation_state = .{
         .view = .{
-            .committed = try testing.allocator.alloc(agent_root.protocol.AgentMessage, 0),
+            .committed = shared,
             .in_flight = null,
-        },
-        .queued = .{
-            .steering = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
-            .follow_up = try testing.allocator.alloc(runtime_host_mod.QueuedMessageText, 0),
         },
     } };
     var state = ev.takeConversationState().?;
