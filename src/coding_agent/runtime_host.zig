@@ -149,6 +149,39 @@ pub const RuntimeHost = struct {
         return self.session.restoreQueuedMessagesOnAgentThread(allocator);
     }
 
+    /// Thread-safe run-control enqueue. Callable from any thread while a
+    /// run is active — this is the point of the run-control boundary.
+    /// `text` is not retained; the agent clones it into an owned message.
+    pub fn enqueueQueuedText(
+        self: *RuntimeHost,
+        kind: control_mod.QueueKind,
+        text: []const u8,
+    ) control_mod.EnqueueResult {
+        const message: agent_mod.protocol.AgentMessage = .{ .user = .{
+            .content = .{ .text = text },
+            .timestamp = std.time.milliTimestamp(),
+        } };
+        return switch (kind) {
+            .steering => self.session.agent.steer(message),
+            .follow_up => self.session.agent.followUp(message),
+        };
+    }
+
+    /// Thread-safe read of the current run-control queue state.
+    pub fn snapshotQueuedMessages(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
+        return self.session.cloneQueuedMessageSnapshot(allocator);
+    }
+
+    /// Thread-safe atomic drain: returns what was queued and clears the
+    /// queues in a single run-control mutation.
+    pub fn takeQueuedMessagesAndClear(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
+        return self.session.restoreQueuedMessagesOnAgentThread(allocator);
+    }
+
+    pub fn currentQueuedVersion(self: *const RuntimeHost) u64 {
+        return self.session.agent.currentQueuedVersion();
+    }
+
     pub fn abortRetry(self: *RuntimeHost) void {
         self.runner.abortRetry(self.session);
     }
