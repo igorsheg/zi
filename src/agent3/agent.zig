@@ -23,17 +23,6 @@ pub const SubscriptionToken = struct {
     id: u64,
 };
 
-pub const QueueMutationAction = enum {
-    enqueued,
-    drained,
-    cleared,
-};
-
-pub const QueueObserver = struct {
-    func: *const fn (action: QueueMutationAction, kind: control_mod.QueueKind, message: protocol.AgentMessage, ctx: ?*anyopaque) void,
-    ctx: ?*anyopaque = null,
-};
-
 pub const Agent = struct {
     allocator: std.mem.Allocator,
     history_arena: std.heap.ArenaAllocator,
@@ -50,7 +39,6 @@ pub const Agent = struct {
     in_flight: conversation_state.InFlightState,
 
     run_control: control_mod.RunControl,
-    queue_observer: ?QueueObserver = null,
 
     system_prompt: []const u8,
     model: protocol.Model,
@@ -214,20 +202,12 @@ pub const Agent = struct {
         }
     }
 
-    pub fn setQueueObserver(self: *Agent, observer: ?QueueObserver) void {
-        self.queue_observer = observer;
-    }
-
     pub fn steer(self: *Agent, message: protocol.AgentMessage) control_mod.EnqueueResult {
-        const result = self.run_control.enqueue(.steering, message);
-        if (result == .ok) self.notifyQueueMutation(.enqueued, .steering, message);
-        return result;
+        return self.run_control.enqueue(.steering, message);
     }
 
     pub fn followUp(self: *Agent, message: protocol.AgentMessage) control_mod.EnqueueResult {
-        const result = self.run_control.enqueue(.follow_up, message);
-        if (result == .ok) self.notifyQueueMutation(.enqueued, .follow_up, message);
-        return result;
+        return self.run_control.enqueue(.follow_up, message);
     }
 
     pub fn hasQueuedMessages(self: *Agent) bool {
@@ -235,12 +215,10 @@ pub const Agent = struct {
     }
 
     pub fn clearSteeringQueue(self: *Agent) void {
-        self.notifyPendingQueueCleared(.steering);
         self.run_control.clearSteering();
     }
 
     pub fn clearFollowUpQueue(self: *Agent) void {
-        self.notifyPendingQueueCleared(.follow_up);
         self.run_control.clearFollowUp();
     }
 
@@ -600,40 +578,11 @@ pub const Agent = struct {
         return self.drainQueuedMessages(.follow_up, allocator);
     }
 
-    fn notifyPendingQueueCleared(self: *Agent, kind: control_mod.QueueKind) void {
-        const observer = self.queue_observer orelse return;
-        const Visitor = struct {
-            fn visit(item: *const protocol.AgentMessage, raw_ctx: ?*anyopaque) !void {
-                const ctx_ptr: *const struct {
-                    agent: *Agent,
-                    observer: QueueObserver,
-                    kind: control_mod.QueueKind,
-                } = @ptrCast(@alignCast(raw_ctx.?));
-                ctx_ptr.observer.func(.cleared, ctx_ptr.kind, item.*, ctx_ptr.observer.ctx);
-                _ = ctx_ptr.agent;
-            }
-        };
-        const Ctx = struct {
-            agent: *Agent,
-            observer: QueueObserver,
-            kind: control_mod.QueueKind,
-        };
-        var ctx = Ctx{ .agent = self, .observer = observer, .kind = kind };
-        self.run_control.visitPending(kind, Visitor.visit, @ptrCast(&ctx)) catch {};
-    }
-
     fn drainQueuedMessages(self: *Agent, kind: control_mod.QueueKind, allocator: std.mem.Allocator) []const protocol.AgentMessage {
-        const drained = switch (kind) {
+        return switch (kind) {
             .steering => self.run_control.drainSteering(allocator),
             .follow_up => self.run_control.drainFollowUp(allocator),
         };
-        for (drained) |message| self.notifyQueueMutation(.drained, kind, message);
-        return drained;
-    }
-
-    fn notifyQueueMutation(self: *Agent, action: QueueMutationAction, kind: control_mod.QueueKind, message: protocol.AgentMessage) void {
-        const observer = self.queue_observer orelse return;
-        observer.func(action, kind, message, observer.ctx);
     }
 
     fn processEventsSink(event: protocol.AgentEvent, ctx: ?*anyopaque) void {

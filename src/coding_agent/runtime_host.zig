@@ -463,26 +463,10 @@ test "runtime host publishes committed view and queued snapshots independently" 
     try testing.expectEqualStrings("queued", published_queued.?.follow_up[0].text);
 }
 
-test "runtime host keeps session-event subscriptions across session replacement" {
+test "runtime host keeps queued-snapshot reads wired after session replacement" {
     const session = try createOwnedTestAgentSession(testing.allocator, null);
     var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
     defer host.deinit();
-
-    const Collector = struct {
-        queue_updates: usize = 0,
-
-        fn onEvent(event: SessionEvent, ctx: ?*anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            switch (event) {
-                .queue_update => self.queue_updates += 1,
-                else => {},
-            }
-        }
-    };
-
-    var collector = Collector{};
-    const token = host.subscribeEvents(&Collector.onEvent, @ptrCast(&collector));
-    defer host.unsubscribeEvents(token);
 
     const before_session_id = host.currentSession().session_store.sessionId();
     try host.newSession();
@@ -492,7 +476,11 @@ test "runtime host keeps session-event subscriptions across session replacement"
         .content = .{ .text = "queued after replace" },
         .timestamp = 1,
     } }));
-    try testing.expectEqual(@as(usize, 1), collector.queue_updates);
+
+    var snap = try host.currentSession().cloneQueuedMessageSnapshot(testing.allocator);
+    defer snap.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), snap.follow_up.len);
+    try testing.expectEqualStrings("queued after replace", snap.follow_up[0].text);
 }
 
 test "runtime host retries transient assistant failures and prunes the failed assistant turn before continue" {

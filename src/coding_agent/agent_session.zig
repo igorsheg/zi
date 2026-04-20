@@ -90,9 +90,6 @@ pub const AgentSession = struct {
     /// on the active branch has not yet been followed by a successful
     /// assistant response with non-zero usage.
     context_usage_unknown_after_compaction: bool = false,
-    queue_mutex: std.Thread.Mutex = .{},
-    steering_mirror: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty,
-    follow_up_mirror: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty,
 
     pub const RawEventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -499,7 +496,6 @@ pub const AgentSession = struct {
         if (self._subscription_token) |token| {
             self.agent.unsubscribe(token);
         }
-        self.agent.setQueueObserver(null);
         if (self._extension_runner) |runner| {
             runner.deinit();
             self.allocator.destroy(runner);
@@ -512,9 +508,6 @@ pub const AgentSession = struct {
         }
         self.allocator.destroy(self._stream_closure);
         self.event_listeners.deinit(self.allocator);
-        clearQueueMirror(self);
-        self.steering_mirror.deinit(self.allocator);
-        self.follow_up_mirror.deinit(self.allocator);
         self.agent.deinit();
         self.session_store.deinit();
         self.resource_loader.deinit();
@@ -564,10 +557,6 @@ pub const AgentSession = struct {
     }
 
     fn wireSubscription(self: *AgentSession) void {
-        self.agent.setQueueObserver(.{
-            .func = &queueMutationCallback,
-            .ctx = @ptrCast(self),
-        });
         if (self._subscription_token == null) {
             self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
         }
@@ -878,89 +867,6 @@ pub fn convertToLlm(
         }
     }
     return result.items;
-}
-
-fn queueMutationCallback(
-    action: agent_impl.QueueMutationAction,
-    kind: control_mod.QueueKind,
-    message: protocol.AgentMessage,
-    ctx: ?*anyopaque,
-) void {
-    const self: *AgentSession = @ptrCast(@alignCast(ctx.?));
-    applyQueueMutation(self, action, kind, message);
-}
-
-fn applyQueueMutation(
-    self: *AgentSession,
-    action: agent_impl.QueueMutationAction,
-    kind: control_mod.QueueKind,
-    message: protocol.AgentMessage,
-) void {
-    const text = control_mod.extractQueuedMessageText(message) orelse return;
-    var changed = false;
-
-    self.queue_mutex.lock();
-    const target = switch (kind) {
-        .steering => &self.steering_mirror,
-        .follow_up => &self.follow_up_mirror,
-    };
-
-    switch (action) {
-        .enqueued => {
-            const owned = self.allocator.dupe(u8, text) catch {
-                self.queue_mutex.unlock();
-                return;
-            };
-            target.append(self.allocator, .{ .text = owned }) catch {
-                self.allocator.free(owned);
-                self.queue_mutex.unlock();
-                return;
-            };
-            changed = true;
-        },
-        .drained, .cleared => {
-            if (target.items.len > 0) {
-                const entry = target.orderedRemove(0);
-                self.allocator.free(entry.text);
-                changed = true;
-            }
-        },
-    }
-    self.queue_mutex.unlock();
-
-    if (changed) self.emitSessionEvent(.{ .queue_update = {} });
-}
-
-fn clearQueueMirror(self: *AgentSession) void {
-    self.queue_mutex.lock();
-    defer self.queue_mutex.unlock();
-
-    freeQueuedEntries(self.allocator, self.steering_mirror.items);
-    freeQueuedEntries(self.allocator, self.follow_up_mirror.items);
-    self.steering_mirror.clearRetainingCapacity();
-    self.follow_up_mirror.clearRetainingCapacity();
-}
-
-fn cloneQueuedEntries(
-    allocator: std.mem.Allocator,
-    entries: []const control_mod.QueuedMessageText,
-) ![]control_mod.QueuedMessageText {
-    var out: std.ArrayListUnmanaged(control_mod.QueuedMessageText) = .empty;
-    errdefer {
-        freeQueuedEntries(allocator, out.items);
-        out.deinit(allocator);
-    }
-
-    for (entries) |entry| {
-        const text = try allocator.dupe(u8, entry.text);
-        errdefer allocator.free(text);
-        try out.append(allocator, .{ .text = text });
-    }
-    return try out.toOwnedSlice(allocator);
-}
-
-fn freeQueuedEntries(allocator: std.mem.Allocator, entries: []control_mod.QueuedMessageText) void {
-    for (entries) |entry| allocator.free(entry.text);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

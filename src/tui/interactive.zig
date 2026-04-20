@@ -2829,9 +2829,6 @@ pub const Interactive = struct {
                 }
                 self.publishStatusSnapshotForAgentEvent(agent_event);
             },
-            .queue_update => {
-                self.flushPendingConversationPublish();
-            },
             .auto_retry_start => |retry| {
                 const err_msg = self.msg_allocator.dupe(u8, retry.error_message) catch return;
                 self.event_queue.push(.{ .retry_start = .{

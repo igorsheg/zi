@@ -28,7 +28,6 @@ pub const CompactionEnd = struct {
 
 pub const SessionEvent = union(enum) {
     agent: agent_mod.protocol.AgentEvent,
-    queue_update: void,
     auto_retry_start: RetryStart,
     auto_retry_wait_finished: void,
     auto_retry_end: RetryEnd,
