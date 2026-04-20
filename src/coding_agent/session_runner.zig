@@ -5,6 +5,7 @@ const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const session_event_mod = @import("session_event.zig");
 const classifier = @import("session_error_classifier.zig");
+const context_usage = @import("../session/context_usage.zig");
 
 pub const RunOutcome = enum {
     success,
@@ -15,7 +16,9 @@ pub const RunOutcome = enum {
 pub const RetryStart = session_event_mod.RetryStart;
 pub const RetryEnd = session_event_mod.RetryEnd;
 pub const CompactionReason = session_event_mod.CompactionReason;
+pub const CompactionStart = session_event_mod.CompactionStart;
 pub const CompactionEnd = session_event_mod.CompactionEnd;
+pub const CompactionResult = session_event_mod.CompactionResult;
 pub const SessionEvent = session_event_mod.SessionEvent;
 
 pub const RetryPolicy = struct {
@@ -31,14 +34,14 @@ pub const CompactionPolicy = struct {
     keep_recent_tokens: u64 = 20000,
 };
 
-pub const CompactionResult = struct {
-    summary: []const u8,
-    first_kept_entry_id: []const u8,
-    tokens_before: u64,
+/// Per-call context for a compaction run. Lives only for the duration of
+/// one `runCompaction` invocation — strings are borrows from the caller.
+pub const CompactionRunContext = struct {
+    custom_instructions: ?[]const u8 = null,
 };
 
 pub const CompactionExecutor = struct {
-    func: *const fn (session: *AgentSession, reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult,
+    func: *const fn (session: *AgentSession, reason: CompactionReason, policy: CompactionPolicy, run_ctx: CompactionRunContext, ctx: ?*anyopaque) anyerror!CompactionResult,
     ctx: ?*anyopaque = null,
 };
 
@@ -46,6 +49,7 @@ pub const LifecycleHooks = struct {
     on_retry_start: ?*const fn (event: RetryStart, ctx: ?*anyopaque) void = null,
     on_retry_wait_finished: ?*const fn (ctx: ?*anyopaque) void = null,
     on_retry_end: ?*const fn (event: RetryEnd, ctx: ?*anyopaque) void = null,
+    on_compaction_start: ?*const fn (event: CompactionStart, ctx: ?*anyopaque) void = null,
     on_compaction_end: ?*const fn (event: CompactionEnd, ctx: ?*anyopaque) void = null,
     ctx: ?*anyopaque = null,
 };
@@ -109,6 +113,13 @@ pub const SessionRunner = struct {
         emitter: EventEmitter,
         content: ai.protocol.UserMessage.UserMessageContent,
     ) !RunOutcome {
+        // pi-mono sendPrompt() → _checkCompaction(lastAssistant, false):
+        // a pre-prompt policy check catches oversized contexts that were
+        // left in place by aborted or failed turns. Labeled .threshold to
+        // match pi-mono's observable contract.
+        if (self.shouldRunThresholdCompaction(session)) {
+            _ = self.runCompaction(session, emitter, .threshold, false, .{}) catch {};
+        }
         return self.runWithRecovery(session, emitter, .prompt, content);
     }
 
@@ -126,7 +137,10 @@ pub const SessionRunner = struct {
         emitter: EventEmitter,
         reason: CompactionReason,
         will_retry: bool,
+        run_ctx: CompactionRunContext,
     ) !CompactionResult {
+        self.notifyCompactionStart(emitter, .{ .reason = reason });
+
         if (!self.compaction_policy.enabled) {
             self.notifyCompactionEnd(emitter, .{
                 .reason = reason,
@@ -147,12 +161,14 @@ pub const SessionRunner = struct {
             return error.CompactionUnavailable;
         };
 
-        const result = executor.func(session, reason, self.compaction_policy, executor.ctx) catch |err| {
+        const result = executor.func(session, reason, self.compaction_policy, run_ctx, executor.ctx) catch |err| {
+            const aborted = err == error.CompactionCancelled;
             self.notifyCompactionEnd(emitter, .{
                 .reason = reason,
                 .success = false,
+                .aborted = aborted,
                 .will_retry = false,
-                .error_message = @errorName(err),
+                .error_message = if (aborted) null else @errorName(err),
             });
             return err;
         };
@@ -160,6 +176,8 @@ pub const SessionRunner = struct {
         self.notifyCompactionEnd(emitter, .{
             .reason = reason,
             .success = true,
+            .result = result,
+            .aborted = false,
             .will_retry = will_retry,
         });
         return result;
@@ -196,6 +214,13 @@ pub const SessionRunner = struct {
                         .success = true,
                         .attempt = self.retry_attempt,
                     });
+                }
+                // pi-mono agent_end → _checkCompaction: post-turn
+                // threshold policy. No retry — distinct from bounded
+                // overflow recovery. Gated so a fresh post-compaction
+                // turn does not retrigger.
+                if (outcome == .success and self.shouldRunThresholdCompaction(session)) {
+                    _ = self.runCompaction(session, emitter, .threshold, false, .{}) catch {};
                 }
                 return outcome;
             }
@@ -238,7 +263,7 @@ pub const SessionRunner = struct {
 
                     self.overflow_recovery_attempted = true;
                     pruneTransientAssistantError(session);
-                    _ = self.runCompaction(session, emitter, .overflow, true) catch return outcome;
+                    _ = self.runCompaction(session, emitter, .overflow, true, .{}) catch return outcome;
                     mode = .continue_turn;
                 },
                 else => return outcome,
@@ -341,6 +366,26 @@ pub const SessionRunner = struct {
     fn notifyRetryEnd(self: *SessionRunner, emitter: EventEmitter, event: RetryEnd) void {
         emitter.emit(.{ .auto_retry_end = event });
         if (self.lifecycle_hooks.on_retry_end) |cb| cb(event, self.lifecycle_hooks.ctx);
+    }
+
+    /// pi-mono compaction.ts: shouldCompact. Gate for threshold/pre-prompt
+    /// policy. Stale pre-compaction usage is filtered via
+    /// `contextUsageUnknownAfterCompaction` so a fresh post-compaction turn
+    /// never retriggers based on old usage.
+    fn shouldRunThresholdCompaction(self: *SessionRunner, session: *AgentSession) bool {
+        if (!self.compaction_policy.enabled) return false;
+        if (session.session_store.contextUsageUnknownAfterCompaction(session.allocator)) return false;
+        const messages = session.agent.messages();
+        if (messages.len == 0) return false;
+        const estimate = context_usage.estimateContextTokens(messages);
+        const context_window = session.agent.modelValue().context_window;
+        if (context_window <= self.compaction_policy.reserve_tokens) return false;
+        return estimate.tokens > context_window - self.compaction_policy.reserve_tokens;
+    }
+
+    fn notifyCompactionStart(self: *SessionRunner, emitter: EventEmitter, event: CompactionStart) void {
+        emitter.emit(.{ .compaction_start = event });
+        if (self.lifecycle_hooks.on_compaction_start) |cb| cb(event, self.lifecycle_hooks.ctx);
     }
 
     fn notifyCompactionEnd(self: *SessionRunner, emitter: EventEmitter, event: CompactionEnd) void {

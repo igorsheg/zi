@@ -23,6 +23,7 @@ pub const RunOutcome = session_runner.RunOutcome;
 pub const RetryStart = session_runner.RetryStart;
 pub const RetryEnd = session_runner.RetryEnd;
 pub const CompactionReason = session_runner.CompactionReason;
+pub const CompactionStart = session_runner.CompactionStart;
 pub const CompactionEnd = session_runner.CompactionEnd;
 pub const SessionEvent = session_event_mod.SessionEvent;
 pub const RetryPolicy = session_runner.RetryPolicy;
@@ -258,8 +259,13 @@ pub const RuntimeHost = struct {
         return self.runner.continueTurn(self.session, self.runnerEventEmitter());
     }
 
-    pub fn runCompaction(self: *RuntimeHost, reason: CompactionReason, will_retry: bool) !CompactionResult {
-        return self.runner.runCompaction(self.session, self.runnerEventEmitter(), reason, will_retry);
+    pub fn runCompaction(
+        self: *RuntimeHost,
+        reason: CompactionReason,
+        will_retry: bool,
+        run_ctx: session_runner.CompactionRunContext,
+    ) !CompactionResult {
+        return self.runner.runCompaction(self.session, self.runnerEventEmitter(), reason, will_retry, run_ctx);
     }
 
     pub fn publishConversationState(
@@ -398,7 +404,13 @@ const CompactionSpy = struct {
     allocator: std.mem.Allocator,
     calls: std.ArrayListUnmanaged(CompactionReason) = .empty,
 
-    fn execute(_: *AgentSession, reason: CompactionReason, _: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult {
+    fn execute(
+        _: *AgentSession,
+        reason: CompactionReason,
+        _: CompactionPolicy,
+        _: session_runner.CompactionRunContext,
+        ctx: ?*anyopaque,
+    ) anyerror!CompactionResult {
         const self: *CompactionSpy = @ptrCast(@alignCast(ctx.?));
         try self.calls.append(self.allocator, reason);
         return .{
@@ -410,6 +422,18 @@ const CompactionSpy = struct {
 
     fn deinit(self: *CompactionSpy) void {
         self.calls.deinit(self.allocator);
+    }
+};
+
+const CancelCompactionSpy = struct {
+    fn execute(
+        _: *AgentSession,
+        _: CompactionReason,
+        _: CompactionPolicy,
+        _: session_runner.CompactionRunContext,
+        _: ?*anyopaque,
+    ) anyerror!CompactionResult {
+        return error.CompactionCancelled;
     }
 };
 
@@ -611,8 +635,97 @@ test "runtime host recovers overflow with one compaction pass before retrying co
     try testing.expectEqual(CompactionReason.overflow, compaction_spy.calls.items[0]);
     try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
     try testing.expect(collector.compaction_ends.items[0].success);
+    try testing.expect(!collector.compaction_ends.items[0].aborted);
+    try testing.expect(collector.compaction_ends.items[0].result != null);
     try testing.expect(collector.compaction_ends.items[0].will_retry);
     try testing.expectEqual(@as(usize, 0), collector.retry_starts.items.len);
     try testing.expectEqual(@as(usize, 2), host.currentSession().agent.messages().len);
     try testing.expectEqualStrings("after compaction", host.currentSession().agent.messages()[1].assistant.content[0].text.text);
+}
+
+test "runtime host runs threshold compaction after successful turn when context exceeds threshold" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
+    content[0] = .{ .text = .{ .text = "ok" } };
+    // Heavy assistant usage (~112k tokens) clears the default threshold
+    // of context_window (128000) minus reserve_tokens (16384) = 111616.
+    const heavy_msg: ai.protocol.AssistantMessage = .{
+        .content = content,
+        .api = .{ .custom = "faux" },
+        .provider = .{ .custom = "faux" },
+        .model = "faux-1",
+        .usage = .{
+            .input = 112_000,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 112_000,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .stop,
+        .timestamp = std.time.milliTimestamp(),
+    };
+    fp.setResponses(&.{heavy_msg});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    const session = try createOwnedTestAgentSession(allocator, &registry);
+
+    var collector = LifecycleCollector{ .allocator = allocator };
+    defer collector.deinit();
+    var compaction_spy = CompactionSpy{ .allocator = allocator };
+    defer compaction_spy.deinit();
+
+    var host = try RuntimeHost.init(session, allocator, allocator, createTestCreateOptions(&registry), .{
+        .compaction_executor = .{
+            .func = &CompactionSpy.execute,
+            .ctx = @ptrCast(&compaction_spy),
+        },
+    });
+    defer host.deinit();
+    host.setLifecycleHooks(.{
+        .on_compaction_end = &LifecycleCollector.onCompactionEnd,
+        .ctx = @ptrCast(&collector),
+    });
+
+    const outcome = try host.runUserContent(.{ .text = "hi" });
+
+    try testing.expectEqual(RunOutcome.success, outcome);
+    try testing.expectEqual(@as(usize, 1), compaction_spy.calls.items.len);
+    try testing.expectEqual(CompactionReason.threshold, compaction_spy.calls.items[0]);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
+    try testing.expectEqual(CompactionReason.threshold, collector.compaction_ends.items[0].reason);
+    try testing.expect(collector.compaction_ends.items[0].success);
+    try testing.expect(!collector.compaction_ends.items[0].aborted);
+    try testing.expect(collector.compaction_ends.items[0].result != null);
+    try testing.expect(!collector.compaction_ends.items[0].will_retry);
+}
+
+test "runtime host reports cancelled compaction as aborted without an error string" {
+    const session = try createOwnedTestAgentSession(testing.allocator, null);
+    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{
+        .compaction_executor = .{
+            .func = &CancelCompactionSpy.execute,
+        },
+    });
+    defer host.deinit();
+
+    var collector = LifecycleCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+    host.setLifecycleHooks(.{
+        .on_compaction_end = &LifecycleCollector.onCompactionEnd,
+        .ctx = @ptrCast(&collector),
+    });
+
+    try testing.expectError(error.CompactionCancelled, host.runCompaction(.manual, false, .{}));
+    try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
+    try testing.expect(!collector.compaction_ends.items[0].success);
+    try testing.expect(collector.compaction_ends.items[0].aborted);
+    try testing.expect(collector.compaction_ends.items[0].result == null);
+    try testing.expect(collector.compaction_ends.items[0].error_message == null);
 }

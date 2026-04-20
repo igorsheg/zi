@@ -1,52 +1,110 @@
+//! Compaction executor.
+//!
+//! Orchestration / glue layer. Pure domain logic (cut-point selection,
+//! split-turn detection, file-op extraction, summarization-input
+//! serialization) lives in `compaction_prep.zig`. This file only:
+//!  - fans out to the pure prep module
+//!  - performs the LLM completion(s) needed to produce summaries
+//!  - composes the final summary (history + split-turn prefix + file-ops)
+//!  - mutates the session store via applyCompaction and refreshes agent context
+//!
+//! Keep it thin — pi-mono's `compact()` in compaction.ts is the reference.
+
 const std = @import("std");
 const agent = @import("../../agent3/root.zig");
 const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../root.zig");
 const context_mod = @import("../../session/context.zig");
-const context_usage = @import("../../session/context_usage.zig");
-const proto = @import("../../session/protocol.zig");
+const prep = @import("compaction_prep.zig");
+const hooks_mod = @import("compaction_hooks.zig");
 const session_runner = @import("../session_runner.zig");
 
 const AgentSession = coding_agent.AgentSession;
-const AgentMessage = agent.protocol.AgentMessage;
 const CompactionPolicy = session_runner.CompactionPolicy;
 const CompactionReason = session_runner.CompactionReason;
 const CompactionExecutor = session_runner.CompactionExecutor;
 const CompactionResult = session_runner.CompactionResult;
+const CompactionRunContext = session_runner.CompactionRunContext;
 
 const summarization_system_prompt =
-    "You are summarizing conversation history for another coding agent. Be precise, terse, and preserve exact file paths, function names, constraints, errors, and next steps.";
+    "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\n" ++
+    "Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
-const summarization_prompt =
-    "Summarize the conversation below for a coding agent that will continue the work.\n\n" ++
-    "Use this exact structure:\n\n" ++
+const initial_summarization_prompt =
+    "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\n" ++
+    "Use this EXACT format:\n\n" ++
     "## Goal\n" ++
-    "[what the user is trying to accomplish]\n\n" ++
+    "[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n" ++
     "## Constraints & Preferences\n" ++
-    "- [constraints, preferences, or requirements]\n\n" ++
+    "- [Any constraints, preferences, or requirements mentioned by user]\n" ++
+    "- [Or \"(none)\" if none were mentioned]\n\n" ++
     "## Progress\n" ++
     "### Done\n" ++
-    "- [completed work]\n\n" ++
+    "- [x] [Completed tasks/changes]\n\n" ++
     "### In Progress\n" ++
-    "- [current work]\n\n" ++
+    "- [ ] [Current work]\n\n" ++
     "### Blocked\n" ++
-    "- [blockers or none]\n\n" ++
+    "- [Issues preventing progress, if any]\n\n" ++
     "## Key Decisions\n" ++
-    "- [decision and rationale]\n\n" ++
+    "- **[Decision]**: [Brief rationale]\n\n" ++
     "## Next Steps\n" ++
-    "1. [next actions]\n\n" ++
+    "1. [Ordered list of what should happen next]\n\n" ++
     "## Critical Context\n" ++
-    "- [important concrete details]\n\n" ++
-    "Keep it concise. Preserve exact file paths, function names, and error messages.";
+    "- [Any data, examples, or references needed to continue]\n" ++
+    "- [Or \"(none)\" if not applicable]\n\n" ++
+    "Keep each section concise. Preserve exact file paths, function names, and error messages.";
+
+const update_summarization_prompt =
+    "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\n" ++
+    "Update the existing structured summary with new information. RULES:\n" ++
+    "- PRESERVE all existing information from the previous summary\n" ++
+    "- ADD new progress, decisions, and context from the new messages\n" ++
+    "- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n" ++
+    "- UPDATE \"Next Steps\" based on what was accomplished\n" ++
+    "- PRESERVE exact file paths, function names, and error messages\n" ++
+    "- If something is no longer relevant, you may remove it\n\n" ++
+    "Use this EXACT format:\n\n" ++
+    "## Goal\n" ++
+    "[Preserve existing goals, add new ones if the task expanded]\n\n" ++
+    "## Constraints & Preferences\n" ++
+    "- [Preserve existing, add new ones discovered]\n\n" ++
+    "## Progress\n" ++
+    "### Done\n" ++
+    "- [x] [Include previously done items AND newly completed items]\n\n" ++
+    "### In Progress\n" ++
+    "- [ ] [Current work - update based on progress]\n\n" ++
+    "### Blocked\n" ++
+    "- [Current blockers - remove if resolved]\n\n" ++
+    "## Key Decisions\n" ++
+    "- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n" ++
+    "## Next Steps\n" ++
+    "1. [Update based on current state]\n\n" ++
+    "## Critical Context\n" ++
+    "- [Preserve important context, add new if needed]\n\n" ++
+    "Keep each section concise. Preserve exact file paths, function names, and error messages.";
+
+const turn_prefix_summarization_prompt =
+    "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\n" ++
+    "Summarize the prefix to provide context for the retained suffix:\n\n" ++
+    "## Original Request\n" ++
+    "[What did the user ask for in this turn?]\n\n" ++
+    "## Early Progress\n" ++
+    "- [Key decisions and work done in the prefix]\n\n" ++
+    "## Context for Suffix\n" ++
+    "- [Information needed to understand the retained recent work]\n\n" ++
+    "Be concise. Focus on what's needed to understand the kept suffix.";
 
 pub fn createExecutor() CompactionExecutor {
-    return .{
-        .func = &execute,
-    };
+    return .{ .func = &execute };
 }
 
-fn execute(session: *AgentSession, reason: CompactionReason, policy: CompactionPolicy, ctx: ?*anyopaque) anyerror!CompactionResult {
-    _ = reason;
+fn execute(
+    session: *AgentSession,
+    reason: CompactionReason,
+    policy: CompactionPolicy,
+    run_ctx: CompactionRunContext,
+    ctx: ?*anyopaque,
+) anyerror!CompactionResult {
     _ = ctx;
 
     var arena = std.heap.ArenaAllocator.init(session.allocator);
@@ -54,278 +112,200 @@ fn execute(session: *AgentSession, reason: CompactionReason, policy: CompactionP
     const allocator = arena.allocator();
 
     const entries = try session.session_store.readEntries();
-    const prep = try prepareCompaction(allocator, entries, .current, policy);
+    const path = try context_mod.buildBranchEntries(allocator, entries, .current);
+    if (path.len == 0) return error.NothingToCompact;
 
-    const prompt_text = try buildPrompt(allocator, prep.messages_to_summarize, prep.previous_summary);
-    const max_tokens = @max(@divTrunc(policy.reserve_tokens * 4, 5), 1024);
-    const summary = try session.completeUserText(session.allocator, summarization_system_prompt, prompt_text, max_tokens);
+    const settings: prep.CompactionSettings = .{
+        .enabled = policy.enabled,
+        .reserve_tokens = policy.reserve_tokens,
+        .keep_recent_tokens = policy.keep_recent_tokens,
+    };
 
-    const new_context = try session.session_store.applyCompaction(summary, prep.first_kept_entry_id, prep.tokens_before);
+    const preparation = (try prep.prepareCompaction(allocator, path, settings)) orelse return error.NothingToCompact;
+
+    // Extension seam: session_before_compact may proceed, cancel, or
+    // provide an alternate compaction result. Canceling propagates as
+    // error.CompactionCancelled. Providing still flows through the
+    // canonical persistence path below so resumed sessions treat the
+    // artifact uniformly (from_hook = true).
+    const hook_reason: hooks_mod.BeforeCompactPayload.Reason = switch (reason) {
+        .manual => .manual,
+        .threshold => .threshold,
+        .overflow => .overflow,
+    };
+
+    var from_hook = false;
+    var composed_summary: []const u8 = "";
+    var first_kept_id_source: []const u8 = preparation.first_kept_entry_id;
+    var tokens_before_value: u64 = preparation.tokens_before;
+    var details_from_hook: ?std.json.Value = null;
+
+    const before_outcome: hooks_mod.BeforeCompactOutcome = if (session.compaction_hooks.before_compact) |cb|
+        cb(.{ .reason = hook_reason, .preparation = &preparation }, session.compaction_hooks.ctx)
+    else
+        .proceed;
+
+    switch (before_outcome) {
+        .cancel => return error.CompactionCancelled,
+        .provide => |provided| {
+            from_hook = true;
+            composed_summary = provided.summary;
+            first_kept_id_source = provided.first_kept_entry_id;
+            tokens_before_value = provided.tokens_before;
+            details_from_hook = provided.details;
+        },
+        .proceed => {
+            const history_summary = if (preparation.is_split_turn and
+                preparation.turn_prefix_messages.len > 0 and
+                preparation.messages_to_summarize.len == 0)
+                try allocator.dupe(u8, "No prior history.")
+            else
+                try generateHistorySummary(
+                    session,
+                    allocator,
+                    preparation.messages_to_summarize,
+                    preparation.previous_summary,
+                    policy,
+                    run_ctx.custom_instructions,
+                );
+
+            if (preparation.is_split_turn and preparation.turn_prefix_messages.len > 0) {
+                const turn_prefix_summary = try generateTurnPrefixSummary(
+                    session,
+                    allocator,
+                    preparation.turn_prefix_messages,
+                    policy,
+                );
+                composed_summary = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}\n\n---\n\n**Turn Context (split turn):**\n\n{s}",
+                    .{ history_summary, turn_prefix_summary },
+                );
+            } else {
+                composed_summary = history_summary;
+            }
+        },
+    }
+
+    const file_lists = try prep.computeFileLists(allocator, &preparation.file_ops);
+    const file_ops_suffix = if (from_hook)
+        try allocator.dupe(u8, "")
+    else
+        try prep.formatFileOperations(allocator, file_lists.read_files, file_lists.modified_files);
+
+    // Session-store-owned strings must survive the executor arena.
+    const summary_owned = try std.fmt.allocPrint(session.allocator, "{s}{s}", .{ composed_summary, file_ops_suffix });
+    const first_kept_id_owned = try session.allocator.dupe(u8, first_kept_id_source);
+    const details_value: std.json.Value = if (from_hook)
+        if (details_from_hook) |d| try ai.json_util.cloneJsonValue(session.allocator, d) else .null
+    else
+        try buildDetailsJson(session.allocator, file_lists);
+    const details_arg: ?std.json.Value = if (details_value == .null) null else details_value;
+
+    const new_context = try session.session_store.applyCompaction(
+        summary_owned,
+        first_kept_id_owned,
+        tokens_before_value,
+        details_arg,
+        from_hook,
+    );
     try session.agent.setMessages(new_context.messages);
     session.noteCompactionApplied();
     session.agent.clearError();
 
+    if (session.compaction_hooks.after_compact) |cb| {
+        cb(.{ .reason = hook_reason, .entry = .{
+            .summary = summary_owned,
+            .first_kept_entry_id = first_kept_id_owned,
+            .tokens_before = tokens_before_value,
+            .details = details_arg,
+            .from_hook = from_hook,
+        } }, session.compaction_hooks.ctx);
+    }
+
     return .{
-        .summary = summary,
-        .first_kept_entry_id = prep.first_kept_entry_id,
-        .tokens_before = prep.tokens_before,
+        .summary = summary_owned,
+        .first_kept_entry_id = first_kept_id_owned,
+        .tokens_before = tokens_before_value,
+        .details = details_arg,
+        .from_hook = from_hook,
     };
 }
 
-const Preparation = struct {
-    first_kept_entry_id: []const u8,
-    tokens_before: u64,
-    previous_summary: ?[]const u8,
-    messages_to_summarize: []const AgentMessage,
-};
-
-fn prepareCompaction(
+/// Build the persisted `details` JSON object — pi-mono shape
+/// `{ "readFiles": string[], "modifiedFiles": string[] }`. Allocates from the
+/// session's long-lived allocator so the value outlives any executor-local arena.
+fn buildDetailsJson(
     allocator: std.mem.Allocator,
-    entries: []const proto.SessionEntry,
-    selection: context_mod.LeafSelection,
+    file_lists: prep.ComputedFileLists,
+) !std.json.Value {
+    var obj: std.json.ObjectMap = .init(allocator);
+    errdefer obj.deinit();
+
+    var read_arr: std.json.Array = .init(allocator);
+    errdefer read_arr.deinit();
+    for (file_lists.read_files) |f| {
+        try read_arr.append(.{ .string = try allocator.dupe(u8, f) });
+    }
+
+    var mod_arr: std.json.Array = .init(allocator);
+    errdefer mod_arr.deinit();
+    for (file_lists.modified_files) |f| {
+        try mod_arr.append(.{ .string = try allocator.dupe(u8, f) });
+    }
+
+    try obj.put("readFiles", .{ .array = read_arr });
+    try obj.put("modifiedFiles", .{ .array = mod_arr });
+    return .{ .object = obj };
+}
+
+fn generateHistorySummary(
+    session: *AgentSession,
+    allocator: std.mem.Allocator,
+    messages: []const agent.protocol.AgentMessage,
+    previous_summary: ?[]const u8,
     policy: CompactionPolicy,
-) !Preparation {
-    const path = try context_mod.buildBranchEntries(allocator, entries, selection);
-    if (path.len == 0) return error.NothingToCompact;
-    if (path[path.len - 1].entry == .compaction) return error.AlreadyCompacted;
-
-    const current_context = try context_mod.buildSessionContext(allocator, entries, selection);
-    const tokens_before = context_usage.estimateContextTokens(current_context.messages).tokens;
-
-    var boundary_start: usize = 0;
-    var previous_summary: ?[]const u8 = null;
-    var i: usize = path.len;
-    while (i > 0) {
-        i -= 1;
-        if (path[i].entry == .compaction) {
-            previous_summary = path[i].entry.compaction.summary;
-            boundary_start = findEntryIndexById(path, path[i].entry.compaction.first_kept_entry_id) orelse (i + 1);
-            break;
-        }
+    custom_instructions: ?[]const u8,
+) ![]const u8 {
+    if (messages.len == 0 and previous_summary != null) {
+        return try allocator.dupe(u8, previous_summary.?);
     }
+    if (messages.len == 0) return try allocator.dupe(u8, "No prior history.");
 
-    const cut_index = findCutPoint(path, boundary_start, policy.keep_recent_tokens);
-    if (cut_index <= boundary_start) return error.NothingToCompact;
+    const conversation = try prep.serializeConversation(allocator, messages);
+    const template = if (previous_summary != null) update_summarization_prompt else initial_summarization_prompt;
+    const base = if (custom_instructions) |ci| try std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nAdditional focus: {s}",
+        .{ template, ci },
+    ) else template;
 
-    var messages = std.ArrayList(AgentMessage).empty;
-    for (path[boundary_start..cut_index]) |entry| {
-        if (extractMessage(entry)) |msg| try messages.append(allocator, msg);
-    }
-    if (messages.items.len == 0) return error.NothingToCompact;
-
-    return .{
-        .first_kept_entry_id = path[cut_index].id,
-        .tokens_before = tokens_before,
-        .previous_summary = previous_summary,
-        .messages_to_summarize = messages.items,
-    };
-}
-
-fn findEntryIndexById(entries: []const proto.SessionEntry, id: []const u8) ?usize {
-    for (entries, 0..) |entry, idx| {
-        if (std.mem.eql(u8, entry.id, id)) return idx;
-    }
-    return null;
-}
-
-fn findCutPoint(entries: []const proto.SessionEntry, start_index: usize, keep_recent_tokens: u64) usize {
-    var accumulated: u64 = 0;
-    var cut_index = start_index;
-    var i: usize = entries.len;
-    while (i > start_index) {
-        i -= 1;
-        if (extractMessage(entries[i])) |msg| {
-            accumulated += context_usage.estimateTokens(msg);
-            if (accumulated >= keep_recent_tokens) {
-                cut_index = findNextValidCut(entries, i, start_index) orelse start_index;
-                break;
-            }
-        }
-    }
-    return cut_index;
-}
-
-fn findNextValidCut(entries: []const proto.SessionEntry, candidate_index: usize, start_index: usize) ?usize {
-    var i = candidate_index;
-    while (i < entries.len) : (i += 1) {
-        if (i < start_index) continue;
-        if (isValidCutEntry(entries[i])) return i;
-    }
-    return null;
-}
-
-fn isValidCutEntry(entry: proto.SessionEntry) bool {
-    switch (entry.entry) {
-        .message => |m| return switch (m.message) {
-            .user, .custom => true,
-            else => false,
-        },
-        .branch_summary, .custom_message => return true,
-        else => return false,
-    }
-}
-
-fn buildPrompt(allocator: std.mem.Allocator, messages: []const AgentMessage, previous_summary: ?[]const u8) ![]u8 {
-    const conversation = try serializeConversation(allocator, messages);
-    if (previous_summary) |prev| {
-        return std.fmt.allocPrint(
-            allocator,
-            "<conversation>\n{s}\n</conversation>\n\n<previous-summary>\n{s}\n</previous-summary>\n\n{s}",
-            .{ conversation, prev, summarization_prompt },
-        );
-    }
-    return std.fmt.allocPrint(
+    const prompt_text = if (previous_summary) |prev| try std.fmt.allocPrint(
+        allocator,
+        "<conversation>\n{s}\n</conversation>\n\n<previous-summary>\n{s}\n</previous-summary>\n\n{s}",
+        .{ conversation, prev, base },
+    ) else try std.fmt.allocPrint(
         allocator,
         "<conversation>\n{s}\n</conversation>\n\n{s}",
-        .{ conversation, summarization_prompt },
+        .{ conversation, base },
     );
+
+    const max_tokens: u32 = @intCast(@max(@divTrunc(policy.reserve_tokens * 4, 5), 1024));
+    return try session.completeUserText(session.allocator, summarization_system_prompt, prompt_text, max_tokens);
 }
 
-fn serializeConversation(allocator: std.mem.Allocator, messages: []const AgentMessage) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (messages) |msg| {
-        switch (msg) {
-            .user => |u| {
-                try out.appendSlice(allocator, "[user]\n");
-                switch (u.content) {
-                    .text => |t| try out.appendSlice(allocator, t),
-                    .blocks => |blocks| for (blocks) |block| switch (block) {
-                        .text => |t| try out.appendSlice(allocator, t.text),
-                        else => {},
-                    },
-                }
-                try out.appendSlice(allocator, "\n\n");
-            },
-            .assistant => |a| {
-                try out.appendSlice(allocator, "[assistant]\n");
-                for (a.content) |block| switch (block) {
-                    .text => |t| try out.appendSlice(allocator, t.text),
-                    .thinking => |t| try out.appendSlice(allocator, t.thinking),
-                    .tool_call => |tc| {
-                        try out.writer(allocator).print("tool {s} ", .{tc.name});
-                    },
-                };
-                if (a.error_message) |err| {
-                    try out.appendSlice(allocator, "\nerror: ");
-                    try out.appendSlice(allocator, err);
-                }
-                try out.appendSlice(allocator, "\n\n");
-            },
-            .tool_result => |tr| {
-                try out.writer(allocator).print("[tool_result:{s}]\n", .{tr.tool_name});
-                for (tr.content) |block| switch (block) {
-                    .text => |t| try out.appendSlice(allocator, t.text),
-                    else => {},
-                };
-                try out.appendSlice(allocator, "\n\n");
-            },
-            .compaction_summary => |cs| {
-                try out.appendSlice(allocator, "[compaction_summary]\n");
-                try out.appendSlice(allocator, cs.summary);
-                try out.appendSlice(allocator, "\n\n");
-            },
-            .branch_summary => |bs| {
-                try out.appendSlice(allocator, "[branch_summary]\n");
-                try out.appendSlice(allocator, bs.summary);
-                try out.appendSlice(allocator, "\n\n");
-            },
-            .custom => |cm| {
-                try out.writer(allocator).print("[custom:{s}]\n", .{cm.custom_type});
-                switch (cm.content) {
-                    .text => |t| try out.appendSlice(allocator, t),
-                    .blocks => |blocks| for (blocks) |block| switch (block) {
-                        .text => |t| try out.appendSlice(allocator, t.text),
-                        else => {},
-                    },
-                }
-                try out.appendSlice(allocator, "\n\n");
-            },
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn extractMessage(entry: proto.SessionEntry) ?AgentMessage {
-    switch (entry.entry) {
-        .message => |m| return m.message,
-        .branch_summary => |bs| {
-            if (bs.summary.len == 0) return null;
-            return .{ .branch_summary = .{
-                .summary = bs.summary,
-                .from_id = bs.from_id,
-                .timestamp = 0,
-            } };
-        },
-        .custom_message => |cm| return .{ .custom = .{
-            .custom_type = cm.custom_type,
-            .content = cm.content,
-            .display = cm.display,
-            .details = cm.details,
-            .timestamp = 0,
-        } },
-        else => return null,
-    }
-}
-
-const testing = std.testing;
-
-fn testUserEntry(id: []const u8, parent_id: ?[]const u8, text: []const u8) proto.SessionEntry {
-    return .{
-        .id = id,
-        .parent_id = parent_id,
-        .timestamp = "2025-01-01T00:00:00Z",
-        .entry = .{ .message = .{ .message = .{
-            .user = .{ .content = .{ .text = text }, .timestamp = 1 },
-        } } },
-    };
-}
-
-fn testAssistantEntry(
+fn generateTurnPrefixSummary(
+    session: *AgentSession,
     allocator: std.mem.Allocator,
-    id: []const u8,
-    parent_id: ?[]const u8,
-    text: []const u8,
-) !proto.SessionEntry {
-    const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
-    content[0] = .{ .text = .{ .text = text } };
-    return .{
-        .id = id,
-        .parent_id = parent_id,
-        .timestamp = "2025-01-01T00:00:00Z",
-        .entry = .{ .message = .{ .message = .{
-            .assistant = .{
-                .content = content,
-                .api = .openai_responses,
-                .provider = .openai,
-                .model = "gpt-test",
-                .usage = .{
-                    .input = 0,
-                    .output = 0,
-                    .cache_read = 0,
-                    .cache_write = 0,
-                    .total_tokens = 0,
-                    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-                },
-                .stop_reason = .stop,
-                .timestamp = 1,
-            },
-        } } },
-    };
-}
-
-test "prepareCompaction stops at user boundaries even when an assistant-heavy tail blocks a smaller cut" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const entries = [_]proto.SessionEntry{
-        testUserEntry("u1", null, "first prompt"),
-        try testAssistantEntry(allocator, "a1", "u1", "first answer"),
-        testUserEntry("u2", "a1", "second prompt"),
-        try testAssistantEntry(allocator, "a2", "u2", "this assistant tail is intentionally long enough to exceed the keep recent token budget by itself"),
-    };
-
-    try testing.expectError(error.NothingToCompact, prepareCompaction(allocator, &entries, .{ .entry_id = "a2" }, .{
-        .keep_recent_tokens = 8,
-    }));
+    messages: []const agent.protocol.AgentMessage,
+    policy: CompactionPolicy,
+) ![]const u8 {
+    const conversation = try prep.serializeConversation(allocator, messages);
+    const prompt_text = try std.fmt.allocPrint(
+        allocator,
+        "<conversation>\n{s}\n</conversation>\n\n{s}",
+        .{ conversation, turn_prefix_summarization_prompt },
+    );
+    const max_tokens: u32 = @intCast(@max(@divTrunc(policy.reserve_tokens, 2), 512));
+    return try session.completeUserText(session.allocator, summarization_system_prompt, prompt_text, max_tokens);
 }

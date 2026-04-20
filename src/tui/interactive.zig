@@ -1891,6 +1891,18 @@ pub const Interactive = struct {
                 });
                 return true;
             }
+            if (std.mem.eql(u8, name, "compact")) {
+                const instructions: ?[]const u8 = if (args.len > 0)
+                    self.msg_allocator.dupe(u8, args) catch null
+                else
+                    null;
+                _ = self.dispatchIdleRequest(.{ .compact = .{ .custom_instructions = instructions } }, .{
+                    .busy_message = "cannot compact while agent is running",
+                    .loader_message = "Compacting session...",
+                    .spawn_failed_message = "failed to queue compaction",
+                });
+                return true;
+            }
             if (std.mem.eql(u8, name, "resume")) {
                 self.showSessionPicker(true);
                 return true;
@@ -2661,6 +2673,10 @@ pub const Interactive = struct {
                         idle_processed = true;
                         self.publishStatusSnapshot();
                     },
+                    .compact => |c| {
+                        idle_processed = true;
+                        self.handleManualCompactRequest(c.custom_instructions);
+                    },
                     .shutdown => {
                         req.deinit(self.msg_allocator);
                         self.discardAgentRequests(buf[i + 1 .. n]);
@@ -2674,6 +2690,23 @@ pub const Interactive = struct {
             if (idle_processed and !prompt_processed) {
                 _ = self.publishLifecycleUiEvent(.{ .request_worker_finished = {} });
             }
+        }
+    }
+
+    /// Agent-thread handler for `AgentRequest.compact`. The runner emits
+    /// `compaction_start`/`compaction_end` events which the TUI consumes
+    /// via `sessionEventCallback`; no direct mutation of agent-owned state
+    /// happens here. Failures still flow through `compaction_end`.
+    fn handleManualCompactRequest(self: *Interactive, custom_instructions: ?[]const u8) void {
+        _ = self.runtime_host.runCompaction(.manual, false, .{
+            .custom_instructions = custom_instructions,
+        }) catch {
+            self.publishStatusSnapshot();
+            return;
+        };
+        self.publishStatusSnapshot();
+        if (!self.publishConversationState()) {
+            log.warn("snapshot queue dropped post-compaction conversation state", .{});
         }
     }
 
@@ -2963,6 +2996,9 @@ pub const Interactive = struct {
                     .attempt = retry.attempt,
                     .final_error = final_error,
                 } });
+            },
+            .compaction_start => {
+                self.publishStatusSnapshot();
             },
             .compaction_end => {
                 self.publishStatusSnapshot();

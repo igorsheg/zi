@@ -183,9 +183,16 @@ pub const SessionStore = struct {
         self.writer.appendModelChange(provider, model_id);
     }
 
-    pub fn appendCompaction(self: *SessionStore, summary: []const u8, first_kept_entry_id: []const u8, tokens_before: u64) void {
+    pub fn appendCompaction(
+        self: *SessionStore,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        details: ?std.json.Value,
+        from_hook: ?bool,
+    ) void {
         self.invalidateCache();
-        self.writer.appendCompaction(summary, first_kept_entry_id, tokens_before);
+        self.writer.appendCompaction(summary, first_kept_entry_id, tokens_before, details, from_hook);
     }
 
     pub fn appendBranchSummary(self: *SessionStore, from_id: []const u8, summary: []const u8) void {
@@ -275,8 +282,15 @@ pub const SessionStore = struct {
     }
 
     /// Append a compaction entry and rebuild the current branch context.
-    pub fn applyCompaction(self: *SessionStore, summary: []const u8, first_kept_entry_id: []const u8, tokens_before: u64) !context_mod.SessionContext {
-        self.appendCompaction(summary, first_kept_entry_id, tokens_before);
+    pub fn applyCompaction(
+        self: *SessionStore,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        details: ?std.json.Value,
+        from_hook: ?bool,
+    ) !context_mod.SessionContext {
+        self.appendCompaction(summary, first_kept_entry_id, tokens_before, details, from_hook);
         return self.buildCurrentContext();
     }
 
@@ -702,7 +716,7 @@ test "applyCompaction appends summary and rebuilds current context" {
     store.appendMessage(testUserMessage("first", 1));
     store.appendMessage(testUserMessage("second", 2));
 
-    const rebuilt = try store.applyCompaction("summary", store.currentEntryId().?, 42);
+    const rebuilt = try store.applyCompaction("summary", store.currentEntryId().?, 42, null, null);
 
     try std.testing.expectEqual(@as(usize, 2), rebuilt.messages.len);
     try std.testing.expect(rebuilt.messages[0] == .compaction_summary);
@@ -724,7 +738,7 @@ test "contextUsageUnknownAfterCompaction tracks post-compaction assistant usage"
     store.appendMessage(testUserMessage("second", 3));
     const kept_user_id = store.currentEntryId().?;
     store.appendMessage(try testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
-    store.appendCompaction("summary", kept_user_id, 195_000);
+    store.appendCompaction("summary", kept_user_id, 195_000, null, null);
     store.appendMessage(testUserMessage("third", 5));
 
     try std.testing.expect(store.contextUsageUnknownAfterCompaction(allocator));

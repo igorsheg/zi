@@ -91,6 +91,13 @@ pub const AgentSession = struct {
     /// assistant response with non-zero usage.
     context_usage_unknown_after_compaction: bool = false,
 
+    /// Compaction extension seam (zi-v3j.10.7). Extensions register a
+    /// pair of function pointers here to observe preparation, cancel,
+    /// provide alternate compaction content, and observe the persisted
+    /// result. Nil when no extension participates, in which case the
+    /// executor runs zi's default summarization pass.
+    compaction_hooks: @import("session/compaction_hooks.zig").CompactionHooks = .{},
+
     pub const RawEventHandler = struct {
         func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque = null,
@@ -449,6 +456,16 @@ pub const AgentSession = struct {
 
     pub fn noteCompactionApplied(self: *AgentSession) void {
         self.context_usage_unknown_after_compaction = true;
+    }
+
+    /// Extension entry point for registering compaction hook callbacks.
+    /// Hook functions run on the agent thread, inside the executor's
+    /// compaction flow. Callbacks must not block on cross-thread I/O.
+    pub fn setCompactionHooks(
+        self: *AgentSession,
+        hooks: @import("session/compaction_hooks.zig").CompactionHooks,
+    ) void {
+        self.compaction_hooks = hooks;
     }
 
     fn refreshContextUsageStateFromStore(self: *AgentSession) void {
@@ -1455,7 +1472,7 @@ test "AgentSession: getContextUsage is unknown immediately after compaction" {
     session.session_store.appendMessage(testUserMessage("second", 3));
     const kept_user_id = session.session_store.currentEntryId().?;
     session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
-    session.session_store.appendCompaction("summary", kept_user_id, 195_000);
+    session.session_store.appendCompaction("summary", kept_user_id, 195_000, null, null);
     session.session_store.appendMessage(testUserMessage("third", 5));
     try syncMessagesFromStore(&session);
 
@@ -1534,7 +1551,7 @@ test "AgentSession: getContextUsage prefers post-compaction assistant usage" {
     session.session_store.appendMessage(testUserMessage("second", 3));
     const kept_user_id = session.session_store.currentEntryId().?;
     session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
-    session.session_store.appendCompaction("summary", kept_user_id, 195_000);
+    session.session_store.appendCompaction("summary", kept_user_id, 195_000, null, null);
     session.session_store.appendMessage(testUserMessage("third", 5));
     session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
     try syncMessagesFromStore(&session);

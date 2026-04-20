@@ -165,11 +165,24 @@ pub const SessionWriter = struct {
     }
 
     /// Append a compaction entry.
-    pub fn appendCompaction(self: *SessionWriter, summary: []const u8, first_kept_entry_id: []const u8, tokens_before: u64) void {
+    ///
+    /// `details` and `from_hook` are product contract fields persisted in the
+    /// CompactionEntry wire format. Callers must pass slices / values owned by
+    /// an allocator that outlives the writer's buffer/flush window.
+    pub fn appendCompaction(
+        self: *SessionWriter,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        details: ?std.json.Value,
+        from_hook: ?bool,
+    ) void {
         self.appendEntry(.{ .compaction = .{
             .summary = summary,
             .first_kept_entry_id = first_kept_entry_id,
             .tokens_before = tokens_before,
+            .details = details,
+            .from_hook = from_hook,
         } });
     }
 

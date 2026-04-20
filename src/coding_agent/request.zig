@@ -25,6 +25,7 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 ///   - set_model
 ///   - set_thinking_level
 ///   - refresh_status_snapshot
+///   - compact
 ///   - shutdown
 ///
 /// Queued-message submits (steering / follow-up) do NOT go through this
@@ -53,6 +54,13 @@ pub const AgentRequest = union(enum) {
     set_model: struct { model: ai_protocol.Model },
     set_thinking_level: struct { level: @import("../agent3/types.zig").ThinkingLevel },
     refresh_status_snapshot: void,
+    /// Manual compaction request — /compact. Mirrors pi-mono's
+    /// `agentSession.compact(customInstructions)`. Lifecycle runs through
+    /// the session-layer compaction owner path; results publish via
+    /// `UiEvent`/snapshots like any other request.
+    compact: struct {
+        custom_instructions: ?[]const u8 = null,
+    },
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
@@ -63,6 +71,7 @@ pub const AgentRequest = union(enum) {
             .set_model => {},
             .set_thinking_level => {},
             .refresh_status_snapshot => {},
+            .compact => |c| if (c.custom_instructions) |ci| allocator.free(ci),
             .shutdown => {},
         }
     }
