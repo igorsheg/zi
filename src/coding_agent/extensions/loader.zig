@@ -299,6 +299,16 @@ fn loadOne(
 
     runner.assertOnLuaThread();
 
+    const load_source: runner_mod.ExtensionLoadSource = .{
+        .kind = sourceKindString(ext.source),
+        .id = ext.id,
+        .path = ext.path,
+        .provenance = ext.provenance,
+    };
+
+    runner.beginLoadContext(load_source);
+    defer runner.endLoadContext();
+
     // Step 1: execute the chunk itself. Spec-shaped extensions return
     // a factory function from top level.
     try state.loadChunk(src, chunk_name);
@@ -311,21 +321,11 @@ fn loadOne(
     }
 
     // Step 2: call the returned factory with the shared `zi` table.
-    const load_source: runner_mod.ExtensionLoadSource = .{
-        .kind = sourceKindString(ext.source),
-        .id = ext.id,
-        .path = ext.path,
-        .provenance = ext.provenance,
-    };
-
     _ = lua_runtime.c.lua_getglobal(state.L, "zi");
     if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TTABLE) {
         lua_runtime.c.lua_pop(state.L, 2);
         return error.LuaRuntime;
     }
-
-    runner.beginLoadContext(load_source);
-    defer runner.endLoadContext();
 
     const factory_call_rc = lua_runtime.c.lua_pcallk(state.L, 1, 0, 0, 0, null);
     if (factory_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, factory_call_rc);
@@ -683,4 +683,52 @@ test "loadAll calls factory with zi and stamps source provenance" {
     try std.testing.expectEqualStrings(tmp_path, loaded.runtime_root_id);
     try std.testing.expectEqualStrings("provenance", loaded.extension_id);
     try std.testing.expectEqualStrings(expected_state_owner, loaded.state_owner_id);
+}
+
+test "loadAll stamps provenance on top-level registrations outside factory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    const top_level_src =
+        "zi.on(\"message_end\", function() end)\n" ++
+        "return function(zi)\n" ++
+        "end\n";
+    try ext_dir.writeFile(.{ .sub_path = "toplevel.lua", .data = top_level_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+        .runtime_root_id = tmp_path,
+        .state_owner_id = tmp_path,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    const handler = runner.event_registry.handlers(.message_end)[0];
+    try std.testing.expectEqualStrings(exts[0].path, handler.source_id);
+    try std.testing.expect(handler.provenance != null);
+    try std.testing.expectEqualStrings(tmp_path, handler.provenance.?.runtime_root_id);
+    try std.testing.expectEqualStrings("toplevel", handler.provenance.?.extension_id);
+    const expected_state_owner = try std.fmt.allocPrint(allocator, "{s}::{s}", .{ tmp_path, exts[0].id });
+    defer allocator.free(expected_state_owner);
+    try std.testing.expectEqualStrings(expected_state_owner, handler.provenance.?.state_owner_id);
 }
