@@ -309,6 +309,13 @@ fn loadOne(
     runner.beginLoadContext(load_source);
     defer runner.endLoadContext();
 
+    // Record the module root before execution so that `require` in
+    // top-level code and the factory resolve truthfully.
+    runner.recordModuleRoot(ext.provenance.state_owner_id, ext.path) catch |err| {
+        log.warn("failed to record module root for {s}: {s}", .{ ext.id, @errorName(err) });
+    };
+    runner.setModuleContext(state, ext.provenance);
+
     // Step 1: execute the chunk itself. Spec-shaped extensions return
     // a factory function from top level.
     try state.loadChunk(src, chunk_name);
@@ -346,6 +353,7 @@ fn sourceKindString(source: ExtensionSource) []const u8 {
 // ── Tests ───────────────────────────────────────────────────────────
 
 const api = @import("api.zig");
+const dispatch_mod = @import("dispatch.zig");
 
 test "discover finds foo.lua and bar/init.lua in a temp dir" {
     const allocator = std.testing.allocator;
@@ -731,4 +739,197 @@ test "loadAll stamps provenance on top-level registrations outside factory" {
     const expected_state_owner = try std.fmt.allocPrint(allocator, "{s}::{s}", .{ tmp_path, exts[0].id });
     defer allocator.free(expected_state_owner);
     try std.testing.expectEqualStrings(expected_state_owner, handler.provenance.?.state_owner_id);
+}
+
+test "flat extension requires private helper resolved from synthetic module root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.makeDir("foo");
+    var foo_dir = try ext_dir.openDir("foo", .{});
+    try foo_dir.writeFile(.{ .sub_path = "helper.lua", .data = "_helper_loaded = true\n" });
+    const ext_src =
+        "require(\"helper\")\n" ++
+        "return function(zi) end\n";
+    try ext_dir.writeFile(.{ .sub_path = "foo.lua", .data = ext_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+        .runtime_root_id = tmp_path,
+        .state_owner_id = tmp_path,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    try state.doString("assert(_helper_loaded == true)", "verify");
+}
+
+test "bundled extension requires private helper resolved from directory module root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.makeDir("bar");
+    var bar_dir = try ext_dir.openDir("bar", .{});
+    try bar_dir.writeFile(.{ .sub_path = "helper.lua", .data = "_bar_helper_loaded = true\n" });
+    const ext_src =
+        "require(\"helper\")\n" ++
+        "return function(zi) end\n";
+    try bar_dir.writeFile(.{ .sub_path = "init.lua", .data = ext_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+        .runtime_root_id = tmp_path,
+        .state_owner_id = tmp_path,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    try state.doString("assert(_bar_helper_loaded == true)", "verify");
+}
+
+test "shared lua root resolves before later root in canonical order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    const ext_src =
+        "local s = require(\"shared_helper\")\n" ++
+        "_shared_value = s\n" ++
+        "return function(zi) end\n";
+    try ext_dir.writeFile(.{ .sub_path = "ext.lua", .data = ext_src });
+
+    try tmp.dir.makeDir("lua");
+    var lua_dir = try tmp.dir.openDir("lua", .{});
+    try lua_dir.writeFile(.{ .sub_path = "shared_helper.lua", .data = "return 'first'\n" });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+        .runtime_root_id = tmp_path,
+        .state_owner_id = tmp_path,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+
+    // Prime shared lua paths so the extension can resolve shared modules.
+    const shared_path = try std.fs.path.join(allocator, &.{ tmp_path, "lua" });
+    defer allocator.free(shared_path);
+    var shared_buf: std.ArrayList(u8) = .empty;
+    defer shared_buf.deinit(allocator);
+    try shared_buf.writer(allocator).print("{s}/?.lua;{s}/?/init.lua", .{ shared_path, shared_path });
+    runner.shared_lua_paths = try allocator.dupe(u8, shared_buf.items);
+
+    api.installZiTable(&state, &runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    try state.doString("assert(_shared_value == 'first')", "verify");
+}
+
+test "event handler dispatch inherits extension module context for require" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.makeDir("evt");
+    var evt_dir = try ext_dir.openDir("evt", .{});
+    try evt_dir.writeFile(.{ .sub_path = "helper.lua", .data = "_evt_helper_loaded = true\n" });
+    const ext_src =
+        "zi.on(\"message_end\", function(event, ctx)\n" ++
+        "  require(\"helper\")\n" ++
+        "end)\n" ++
+        "return function(zi) end\n";
+    try evt_dir.writeFile(.{ .sub_path = "init.lua", .data = ext_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+        .runtime_root_id = tmp_path,
+        .state_owner_id = tmp_path,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    const stats = loadAll(allocator, &state, &runner, exts);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    // Build a payload table on the main stack: { name = "ping" }
+    lua_runtime.c.lua_createtable(state.L, 0, 1);
+    _ = lua_runtime.c.lua_pushlstring(state.L, "ping", 4);
+    lua_runtime.c.lua_setfield(state.L, -2, "name");
+
+    try dispatch_mod.dispatchObserver(&state, &runner, .message_end, -1);
+    lua_runtime.c.lua_pop(state.L, 1);
+
+    try state.doString("assert(_evt_helper_loaded == true)", "verify");
 }

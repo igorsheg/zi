@@ -160,6 +160,10 @@ fn runHandler(
     c.lua_pushcclosure(co.L, &luaToolUpdate, 1);
     c.lua_setfield(co.L, -2, "update");
 
+    // Inherit the current tool's module context for nested host
+    // callbacks (e.g. `zi.spawn` on_event trampolines).
+    runner.setModuleContext(state, provenance);
+
     while (true) {
         const r = try co.resumeWith(2);
         switch (r.status) {

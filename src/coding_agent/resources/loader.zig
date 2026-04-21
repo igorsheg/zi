@@ -32,6 +32,10 @@ pub const ResourceLoader = struct {
     extended_prompt_paths: []types.ResourcePath,
     extended_theme_paths: []types.ResourcePath,
 
+    /// Canonical ordered extension roots used for discovery.
+    /// Persisted so consumers can build shared `lua/` search paths.
+    extension_roots: []types.StaticExtensionRoot = &.{},
+
     pub const Options = struct {
         cwd: []const u8,
         agent_dir_override: ?[]const u8 = null,
@@ -80,6 +84,7 @@ pub const ResourceLoader = struct {
             .extended_skill_paths = &.{},
             .extended_prompt_paths = &.{},
             .extended_theme_paths = &.{},
+            .extension_roots = &.{},
         };
         errdefer self.deinit();
 
@@ -102,6 +107,10 @@ pub const ResourceLoader = struct {
 
     pub fn getExtensions(self: *const ResourceLoader) types.LoadedExtensions {
         return self.extensions;
+    }
+
+    pub fn getExtensionRoots(self: *const ResourceLoader) []const types.StaticExtensionRoot {
+        return self.extension_roots;
     }
 
     pub fn loadExtensionsInto(self: *const ResourceLoader, state: *lua_runtime.LuaState, runner: *extension_runner.ExtensionRunner) extension_loader.LoadStats {
@@ -167,13 +176,17 @@ pub const ResourceLoader = struct {
 
     fn reloadExtensions(self: *ResourceLoader) !void {
         const roots = try self.normalizeStaticExtensionRoots();
-        defer freeStaticExtensionRoots(self.allocator, roots);
+        errdefer freeStaticExtensionRoots(self.allocator, roots);
 
         const discovered = try extension_loader.discover(.{
             .allocator = self.allocator,
             .roots = roots,
         });
         defer extension_loader.freeExtensions(self.allocator, discovered);
+
+        // Replace old roots with new ones.
+        freeStaticExtensionRoots(self.allocator, self.extension_roots);
+        self.extension_roots = roots;
 
         self.extensions = .{
             .extensions = try copyLoadedExtensions(self.allocator, discovered),
@@ -269,6 +282,8 @@ pub const ResourceLoader = struct {
     }
 
     fn clearLoadedState(self: *ResourceLoader) void {
+        freeStaticExtensionRoots(self.allocator, self.extension_roots);
+        self.extension_roots = &.{};
         freeLoadedExtensions(self.allocator, self.extensions.extensions);
         self.extensions = .{};
 

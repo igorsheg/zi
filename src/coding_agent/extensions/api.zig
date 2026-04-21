@@ -1142,6 +1142,11 @@ test "zi.register_tool surfaces validation errors as Lua errors" {
     try testing.expectEqual(@as(usize, 0), runner.tool_registry.count());
 }
 
+// Wrapper because lua_pushcclosure expects lua_CFunction, not lua_KFunction.
+fn ziSpawnContinueWrapper(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    return ziSpawnContinue(L_opt, c.LUA_YIELD, 0);
+}
+
 test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
@@ -1184,7 +1189,7 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     }
 
     c.lua_pushlightuserdata(co.L, &runner);
-    c.lua_pushcclosure(co.L, ziSpawnContinue, 1);
+    c.lua_pushcclosure(co.L, ziSpawnContinueWrapper, 1);
     const second = try co.resumeWith(0);
     try testing.expectEqual(lua_runtime.Coroutine.Status.finished, second.status);
     _ = c.lua_getfield(co.L, -1, "output");

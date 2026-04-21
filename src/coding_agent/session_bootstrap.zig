@@ -15,6 +15,7 @@ const extension_api = @import("extensions/api.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const lua_tool_mod = @import("extensions/lua_tool.zig");
+const c = lua_runtime.c;
 
 pub const SessionStore = session_runtime.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
@@ -338,26 +339,47 @@ fn buildExtensionRuntime(
     runner_ptr.attachLuaState(state_ptr);
     extension_api.installZiTable(state_ptr, runner_ptr);
 
-    const agent_dir = storage.getAgentDir(allocator, null) catch null;
-    defer if (agent_dir) |dir| allocator.free(dir);
-    const project_dir = storage.getProjectDir(allocator, cwd) catch null;
-    defer if (project_dir) |dir| allocator.free(dir);
-    const agent_ext = if (agent_dir) |dir| std.fs.path.join(allocator, &.{ dir, "extensions" }) catch null else null;
-    defer if (agent_ext) |dir| allocator.free(dir);
-    const project_ext = if (project_dir) |dir| std.fs.path.join(allocator, &.{ dir, "extensions" }) catch null else null;
-    defer if (project_ext) |dir| allocator.free(dir);
+    // Capture the default Lua package.path before any extension
+    // overrides, so we can append it after private + shared roots.
+    _ = c.lua_getglobal(state_ptr.L, "package");
+    defer c.lua_pop(state_ptr.L, 1);
+    if (c.lua_type(state_ptr.L, -1) == c.LUA_TTABLE) {
+        _ = c.lua_getfield(state_ptr.L, -1, "path");
+        defer c.lua_pop(state_ptr.L, 1);
+        if (c.lua_type(state_ptr.L, -1) == c.LUA_TSTRING) {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(state_ptr.L, -1, &len);
+            runner_ptr.base_package_path = allocator.dupe(u8, ptr[0..len]) catch null;
+        }
+    }
 
-    var dirs_buf: [2][]const u8 = .{ "", "" };
-    var dirs_count: usize = 0;
-    if (project_ext) |dir| {
-        dirs_buf[dirs_count] = dir;
-        dirs_count += 1;
+    // Build shared `lua/` search paths from the canonical ordered root list.
+    const roots = resource_loader.getExtensionRoots();
+    var lua_dirs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lua_dirs.items) |d| allocator.free(d);
+        lua_dirs.deinit(allocator);
     }
-    if (agent_ext) |dir| {
-        dirs_buf[dirs_count] = dir;
-        dirs_count += 1;
+    for (roots) |root| {
+        if (root.kind != .runtime_root) continue;
+        const lua_dir = std.fs.path.join(allocator, &.{ root.path, "lua" }) catch continue;
+        lua_dirs.append(allocator, lua_dir) catch {
+            allocator.free(lua_dir);
+            continue;
+        };
     }
-    state_ptr.setPackagePath(dirs_buf[0..dirs_count]) catch {};
+    if (lua_dirs.items.len > 0) {
+        var shared_buf: std.ArrayList(u8) = .empty;
+        defer shared_buf.deinit(allocator);
+        for (lua_dirs.items) |d| {
+            if (shared_buf.items.len > 0) shared_buf.append(allocator, ';') catch {};
+            shared_buf.writer(allocator).print("{s}/?.lua;{s}/?/init.lua", .{ d, d }) catch {};
+        }
+        runner_ptr.shared_lua_paths = allocator.dupe(u8, shared_buf.items) catch null;
+    }
+
+    // Set the initial package.path = shared + default (no private root yet).
+    runner_ptr.setModuleContext(state_ptr, null);
 
     runner_ptr.bindLuaOwnerThread(std.Thread.getCurrentId());
     const loaded_extensions = resource_loader.getExtensions();

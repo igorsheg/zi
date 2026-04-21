@@ -296,6 +296,23 @@ pub const ExtensionRunner = struct {
     /// the smallest seam.
     hook_arena: std.heap.ArenaAllocator,
 
+    /// Per-extension private module root directories, keyed by
+    /// `state_owner_id`. Set during extension load so that later
+    /// execution (tool, event, render) can prepend the right
+    /// private root to `package.path`.
+    module_roots: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    /// Shared `lua/` search paths built from the canonical ordered
+    /// root list. Persisted so every execution entry point can
+    /// prepend the private root and restore the shared + default
+    /// package.path.
+    shared_lua_paths: ?[]const u8 = null,
+
+    /// The default `package.path` captured at Lua state creation,
+    /// before any extension overrides. Preserves builtin/default
+    /// module resolution after shared and private roots.
+    base_package_path: ?[]const u8 = null,
+
     // Future fields documented as comments so the runner shape is
     // visible without compiling unused state:
     //
@@ -439,6 +456,16 @@ pub const ExtensionRunner = struct {
         self.tool_registry.deinit();
         self.loaded_extensions.deinit(self.allocator);
         self.hook_arena.deinit();
+
+        // Free module-context state.
+        var it = self.module_roots.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.module_roots.deinit(self.allocator);
+        if (self.shared_lua_paths) |p| self.allocator.free(p);
+        if (self.base_package_path) |p| self.allocator.free(p);
     }
 
     /// Swap the runtime from stub to bound. Idempotent guard: errors if
@@ -462,7 +489,65 @@ pub const ExtensionRunner = struct {
     pub fn isBound(self: *const ExtensionRunner) bool {
         return self.runtime == .bound;
     }
+
+    /// Record the private module root for an extension so that later
+    /// execution entry points can resolve `require("helper")` relative
+    /// to the extension's directory.
+    pub fn recordModuleRoot(self: *ExtensionRunner, state_owner_id: []const u8, path: []const u8) !void {
+        const root = try moduleRootFromExtensionPath(self.allocator, path);
+        errdefer self.allocator.free(root);
+        const key = try self.allocator.dupe(u8, state_owner_id);
+        errdefer self.allocator.free(key);
+        try self.module_roots.put(self.allocator, key, root);
+    }
+
+    /// Set Lua `package.path` for the execution context belonging to
+    /// `provenance`. Prepends the extension's private root (if any),
+    /// then the shared `lua/` roots, then the default builtin paths.
+    /// Single-threaded: every entry point overwrites the path for
+    /// its own context, so nested callbacks naturally inherit the
+    /// current tool's module context.
+    pub fn setModuleContext(self: *ExtensionRunner, state: *lua_runtime.LuaState, provenance: ?resource_types.ExtensionProvenance) void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        // Private root first.
+        if (provenance) |prov| {
+            if (self.module_roots.get(prov.state_owner_id)) |private_root| {
+                buf.writer(self.allocator).print("{s}/?.lua;{s}/?/init.lua", .{ private_root, private_root }) catch {};
+            }
+        }
+
+        // Shared lua/ anchors from canonical roots.
+        if (self.shared_lua_paths) |shared| {
+            if (buf.items.len > 0) buf.append(self.allocator, ';') catch {};
+            buf.appendSlice(self.allocator, shared) catch {};
+        }
+
+        // Default Lua search paths (builtin libraries).
+        if (self.base_package_path) |base| {
+            if (buf.items.len > 0) buf.append(self.allocator, ';') catch {};
+            buf.appendSlice(self.allocator, base) catch {};
+        }
+
+        if (buf.items.len > 0) {
+            state.setPackagePathRaw(buf.items);
+        }
+    }
 };
+
+fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const basename = std.fs.path.basename(path);
+    if (std.mem.eql(u8, basename, "init.lua")) {
+        const dir = std.fs.path.dirname(path) orelse path;
+        return try allocator.dupe(u8, dir);
+    }
+    if (std.mem.endsWith(u8, path, ".lua")) {
+        return try allocator.dupe(u8, path[0 .. path.len - 4]);
+    }
+    const dir = std.fs.path.dirname(path) orelse path;
+    return try allocator.dupe(u8, dir);
+}
 
 // =============================================================================
 // Tests

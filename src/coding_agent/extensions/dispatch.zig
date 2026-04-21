@@ -282,6 +282,10 @@ fn pushHandlerAndContext(
 
     // Second arg: shared extension context.
     try context_mod.pushExtensionContext(co.L, runner, provenance);
+
+    // Ensure the handler sees the same private-root package.path
+    // that the extension had during load.
+    runner.setModuleContext(state, provenance);
 }
 
 /// One-shot handler runner used by dispatchObserver. Same shape as

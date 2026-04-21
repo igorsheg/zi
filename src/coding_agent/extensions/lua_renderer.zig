@@ -155,6 +155,10 @@ pub fn dispatchRenderResultFromResultOn(
 
     runner.assertOnLuaThread();
 
+    // Inherit the tool's module context so render hooks can `require`
+    // private helpers from the extension's module root.
+    runner.setModuleContext(state_ptr, tool.source.provenance);
+
     const out_state = allocator.create(LuaRenderState) catch return null;
     out_state.* = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
@@ -272,6 +276,10 @@ pub fn dispatchRenderResult(
     const state_ptr = runner.lua_state orelse return null;
 
     runner.assertOnLuaThread();
+
+    // Inherit the tool's module context so render hooks can `require`
+    // private helpers from the extension's module root.
+    runner.setModuleContext(state_ptr, tool.source.provenance);
 
     // Arena owns every string we produce for the returned state.
     const out_state = allocator.create(LuaRenderState) catch return null;

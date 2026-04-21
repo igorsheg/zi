@@ -222,6 +222,17 @@ pub const LuaState = struct {
         _ = c.lua_pushlstring(self.L, buf.items.ptr, buf.items.len);
         c.lua_setfield(self.L, -2, "path");
     }
+
+    /// Set `package.path` to an already-built string. Used by
+    /// `ExtensionRunner.setModuleContext` when it has composed the
+    /// full private + shared + default path externally.
+    pub fn setPackagePathRaw(self: *LuaState, path: []const u8) void {
+        _ = c.lua_getglobal(self.L, "package");
+        defer c.lua_pop(self.L, 1);
+        if (c.lua_type(self.L, -1) != c.LUA_TTABLE) return;
+        _ = c.lua_pushlstring(self.L, path.ptr, path.len);
+        c.lua_setfield(self.L, -2, "path");
+    }
 };
 
 // =============================================================================
