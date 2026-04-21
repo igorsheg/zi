@@ -100,12 +100,12 @@ pub const RuntimeHost = struct {
             .session_event_listeners = .empty,
             .next_extension_generation = nextExtensionGenerationFor(session),
         };
-        self.activateSessionLifecycle(.startup, null);
+        self.activateSessionLifecycle(.startup, null, null);
         return self;
     }
 
     pub fn deinit(self: *RuntimeHost) void {
-        self.shutdownSessionLifecycle(.exit, null);
+        self.shutdownSessionLifecycle(.exit, null, null);
         self.session.deinit();
         self.session_allocator.destroy(self.session);
         self.agent_event_listeners.deinit(self.session_allocator);
@@ -114,7 +114,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn shutdownCurrentSessionOnAgentThread(self: *RuntimeHost) void {
-        self.shutdownSessionLifecycle(.exit, null);
+        self.shutdownSessionLifecycle(.exit, null, null);
     }
 
     pub fn currentSession(self: *RuntimeHost) *AgentSession {
@@ -252,7 +252,7 @@ pub const RuntimeHost = struct {
             next.agent.modelValue().id,
             thinkingLevelToString(next.agent.thinkingLevel()),
         );
-        try self.replaceSession(next, .new);
+        try self.replaceSession(next, .new, null);
     }
 
     pub fn forkSession(self: *RuntimeHost, entry_id: []const u8) !void {
@@ -291,7 +291,7 @@ pub const RuntimeHost = struct {
             cancel_result.deinit(self.msg_allocator);
         }
 
-        try self.replaceSession(next, .fork);
+        try self.replaceSession(next, .fork, entry_id);
     }
 
     pub fn resumeSession(self: *RuntimeHost, path: []const u8, restore_session_model: bool) !ResumeResult {
@@ -333,7 +333,7 @@ pub const RuntimeHost = struct {
 
         const next = try self.createOwnedSession(create_options);
         owns_new_store = false;
-        try self.replaceSession(next, .@"resume");
+        try self.replaceSession(next, .@"resume", null);
         return .{ .restore_warning = restore_warning };
     }
 
@@ -527,9 +527,10 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         reason: event_bridge.SessionLifecycleReason,
         previous: ?event_bridge.LifecyclePeer,
+        fork_parent_entry_id: ?[]const u8,
     ) void {
         self.session.activateLifecycle();
-        self.emitExtensionSessionStart(reason, previous);
+        self.emitExtensionSessionStart(reason, previous, fork_parent_entry_id);
         if (self.agent_event_listeners.items.len > 0) self.bindAgentEvents();
         if (self.session_event_listeners.items.len > 0) self.bindSessionEvents();
     }
@@ -538,8 +539,9 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         reason: event_bridge.SessionLifecycleReason,
         next: ?event_bridge.SessionLifecycleContext,
+        fork_parent_entry_id: ?[]const u8,
     ) void {
-        self.emitExtensionSessionShutdown(reason, next);
+        self.emitExtensionSessionShutdown(reason, next, fork_parent_entry_id);
         self.unbindAgentEvents();
         self.unbindSessionEvents();
         self.session.shutdownLifecycleOnAgentThread();
@@ -561,6 +563,7 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         next: *AgentSession,
         reason: event_bridge.SessionLifecycleReason,
+        fork_parent_entry_id: ?[]const u8,
     ) !void {
         const old = self.session;
         const previous_ctx = lifecycleContext(old);
@@ -592,12 +595,12 @@ pub const RuntimeHost = struct {
         }
         errdefer if (previous_snapshot) |*snap| snap.deinit();
 
-        self.emitExtensionSessionShutdown(reason, successor);
+        self.emitExtensionSessionShutdown(reason, successor, fork_parent_entry_id);
         self.unbindAgentEvents();
         self.unbindSessionEvents();
         old.shutdownLifecycleOnAgentThread();
         self.session = next;
-        self.activateSessionLifecycle(reason, if (previous_snapshot) |*snap| .{ .snapshot = snap } else null);
+        self.activateSessionLifecycle(reason, if (previous_snapshot) |*snap| .{ .snapshot = snap } else null, fork_parent_entry_id);
         if (previous_snapshot) |*snap| snap.deinit();
         old.deinit();
         self.session_allocator.destroy(old);
@@ -607,9 +610,10 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         reason: event_bridge.SessionLifecycleReason,
         previous: ?event_bridge.LifecyclePeer,
+        fork_parent_entry_id: ?[]const u8,
     ) void {
         const current = lifecycleContext(self.session) orelse return;
-        event_bridge.dispatchSessionStart(current, previous, reason) catch |err| {
+        event_bridge.dispatchSessionStart(current, previous, reason, fork_parent_entry_id) catch |err| {
             std.log.scoped(.zi_bridge).warn("session_start dispatch failed: {s}", .{@errorName(err)});
         };
     }
@@ -618,9 +622,10 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         reason: event_bridge.SessionLifecycleReason,
         next: ?event_bridge.SessionLifecycleContext,
+        fork_parent_entry_id: ?[]const u8,
     ) void {
         const current = lifecycleContext(self.session) orelse return;
-        event_bridge.dispatchSessionShutdown(current, next, reason) catch |err| {
+        event_bridge.dispatchSessionShutdown(current, next, reason, fork_parent_entry_id) catch |err| {
             std.log.scoped(.zi_bridge).warn("session_shutdown dispatch failed: {s}", .{@errorName(err)});
         };
     }
@@ -1400,4 +1405,62 @@ test "runtime host forkSession replaces session and skips session_before_switch"
 
     try testing.expect(!std.mem.eql(u8, before_session_id, host.currentSession().session_store.sessionId()));
     try testing.expectEqual(before_generation + 1, host.currentSession().extensionRunner().?.generation);
+}
+
+test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const log_path = try tmp.dir.realpathAlloc(allocator, "forklog.txt");
+    defer allocator.free(log_path);
+
+    const lua_src = try std.fmt.allocPrint(allocator,
+        \\return function(zi)
+        \\  zi.on("session_shutdown", function(event, ctx)
+        \\    if event.reason == "fork" then
+        \\      local f = assert(io.open("{s}", "a"))
+        \\      f:write((event.fork_parent_entry_id or "MISSING") .. "|shutdown\n")
+        \\      f:close()
+        \\    end
+        \\  end)
+        \\  zi.on("session_start", function(event, ctx)
+        \\    if event.reason == "fork" then
+        \\      local f = assert(io.open("{s}", "a"))
+        \\      f:write((event.fork_parent_entry_id or "MISSING") .. "|start\n")
+        \\      f:close()
+        \\    end
+        \\  end)
+        \\end
+    , .{ log_path, log_path });
+    defer allocator.free(lua_src);
+
+    try tmp.dir.makePath(".zi/extensions");
+    try tmp.dir.writeFile(.{ .sub_path = ".zi/extensions/fork-log.lua", .data = lua_src });
+
+    const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
+    const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
+    var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{});
+    defer host.deinit();
+
+    try host.forkSession("entry-42");
+
+    const file = try std.fs.openFileAbsolute(log_path, .{});
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(raw);
+
+    var lines_out: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines_out.deinit(allocator);
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try lines_out.append(allocator, line);
+    }
+
+    try testing.expectEqual(@as(usize, 2), lines_out.items.len);
+    try testing.expectEqualStrings("entry-42|shutdown", lines_out.items[0]);
+    try testing.expectEqualStrings("entry-42|start", lines_out.items[1]);
 }

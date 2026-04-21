@@ -253,16 +253,18 @@ pub fn dispatchSessionStart(
     current: SessionLifecycleContext,
     previous: ?LifecyclePeer,
     reason: SessionLifecycleReason,
+    fork_parent_entry_id: ?[]const u8,
 ) !void {
-    try dispatchSessionLifecycle(.session_start, current, previous, reason);
+    try dispatchSessionLifecycle(.session_start, current, previous, reason, fork_parent_entry_id);
 }
 
 pub fn dispatchSessionShutdown(
     current: SessionLifecycleContext,
     next: ?SessionLifecycleContext,
     reason: SessionLifecycleReason,
+    fork_parent_entry_id: ?[]const u8,
 ) !void {
-    try dispatchSessionLifecycle(.session_shutdown, current, if (next) |n| .{ .live = n } else null, reason);
+    try dispatchSessionLifecycle(.session_shutdown, current, if (next) |n| .{ .live = n } else null, reason, fork_parent_entry_id);
 }
 
 pub fn dispatchSessionBeforeSwitch(
@@ -305,6 +307,7 @@ fn dispatchSessionLifecycle(
     current: SessionLifecycleContext,
     related: ?LifecyclePeer,
     reason: SessionLifecycleReason,
+    fork_parent_entry_id: ?[]const u8,
 ) !void {
     const state = current.runner.lua_state orelse return error.NoState;
     current.runner.assertOnLuaThread();
@@ -313,8 +316,7 @@ fn dispatchSessionLifecycle(
     if (handlers.len == 0) return;
 
     for (handlers) |handler| {
-        const provenance = handler.provenance orelse continue;
-        try pushSessionLifecyclePayload(state.L, kind, reason, provenance, current, related);
+        try pushSessionLifecyclePayload(state.L, kind, reason, handler.provenance, current, related, fork_parent_entry_id);
         dispatch.dispatchObserverHandler(state, current.runner, handler, -1) catch |err| {
             c.lua_pop(state.L, 1);
             log.warn("observer handler for {s} failed: {s}", .{ @tagName(kind), @errorName(err) });
@@ -328,11 +330,12 @@ fn pushSessionLifecyclePayload(
     L: *c.lua_State,
     kind: event_registry.EventKind,
     reason: SessionLifecycleReason,
-    provenance: resource_types.ExtensionProvenance,
+    provenance: ?resource_types.ExtensionProvenance,
     current: SessionLifecycleContext,
     related: ?LifecyclePeer,
+    fork_parent_entry_id: ?[]const u8,
 ) !void {
-    c.lua_createtable(L, 0, 4);
+    c.lua_createtable(L, 0, if (fork_parent_entry_id != null and reason == .fork) 5 else 4);
 
     const event_type = switch (kind) {
         .session_start => "session_start",
@@ -346,17 +349,30 @@ fn pushSessionLifecyclePayload(
     _ = c.lua_pushlstring(L, reason_str.ptr, reason_str.len);
     c.lua_setfield(L, -2, "reason");
 
-    context_mod.pushBinding(L, provenance, current.runner.generation, current.workspace_id, current.session_id, current.session_file);
+    if (provenance) |prov| {
+        context_mod.pushBinding(L, prov, current.runner.generation, current.workspace_id, current.session_id, current.session_file);
+    } else {
+        c.lua_pushnil(L);
+    }
     c.lua_setfield(L, -2, "binding");
 
-    if (related) |peer| {
-        if (peer.findLoadedExtensionById(provenance.extension_id)) |peer_provenance| {
-            context_mod.pushBinding(L, peer_provenance, peer.generation(), peer.workspaceId(), peer.sessionId(), peer.sessionFile());
-            c.lua_setfield(L, -2, switch (kind) {
-                .session_start => "previous",
-                .session_shutdown => "next",
-                else => unreachable,
-            });
+    if (provenance) |prov| {
+        if (related) |peer| {
+            if (peer.findLoadedExtensionById(prov.extension_id)) |peer_provenance| {
+                context_mod.pushBinding(L, peer_provenance, peer.generation(), peer.workspaceId(), peer.sessionId(), peer.sessionFile());
+                c.lua_setfield(L, -2, switch (kind) {
+                    .session_start => "previous",
+                    .session_shutdown => "next",
+                    else => unreachable,
+                });
+            }
+        }
+    }
+
+    if (fork_parent_entry_id) |id| {
+        if (reason == .fork) {
+            _ = c.lua_pushlstring(L, id.ptr, id.len);
+            c.lua_setfield(L, -2, "fork_parent_entry_id");
         }
     }
 }
@@ -1032,4 +1048,47 @@ test "afterToolCall transforms result content via transformable chain" {
     const new_content = result.?.content.?;
     try testing.expectEqual(@as(usize, 1), new_content.len);
     try testing.expectEqualStrings("REDACTED", new_content[0].text.text);
+}
+
+test "lifecycle observer delivers null-provenance handler with nil binding" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+
+    // Push a handler that records whether event.binding is nil.
+    try state.doString(
+        \\_received_binding = "UNSET"
+        \\function handler(event, ctx)
+        \\  if event.binding == nil then
+        \\    _received_binding = "NIL"
+        \\  else
+        \\    _received_binding = "SET"
+        \\  end
+        \\end
+    , "setup");
+
+    // Capture ref and subscribe with null provenance.
+    _ = c.lua_getglobal(state.L, "handler");
+    const ref = c.luaL_ref(state.L, c.LUA_REGISTRYINDEX);
+
+    try runner.event_registry.subscribe(.session_start, .{
+        .lua_ref = ref,
+        .source_id = "null-test",
+        .provenance = null,
+    });
+
+    // Dispatch a session_start with no related peer.
+    try dispatchSessionStart(.{
+        .runner = &runner,
+        .workspace_id = "ws",
+        .session_id = "sess",
+    }, null, .startup, null);
+
+    // Verify the handler ran and saw nil binding.
+    try state.doString(
+        \\assert(_received_binding == "NIL", "expected binding nil, got " .. tostring(_received_binding))
+    , "verify");
 }
