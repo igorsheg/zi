@@ -50,6 +50,9 @@ pub const AgentRequest = union(enum) {
         path: []const u8,
         restore_session_model: bool = true,
     },
+    fork_session: struct {
+        entry_id: []const u8,
+    },
     new_session: void,
     set_model: struct { model: ai_protocol.Model },
     set_thinking_level: struct { level: @import("../agent3/types.zig").ThinkingLevel },
@@ -67,6 +70,7 @@ pub const AgentRequest = union(enum) {
         switch (self.*) {
             .prompt => |*p| message_memory.freeUserContent(allocator, &p.content),
             .resume_session => |r| allocator.free(r.path),
+            .fork_session => |f| allocator.free(f.entry_id),
             .new_session => {},
             .set_model => {},
             .set_thinking_level => {},

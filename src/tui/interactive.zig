@@ -1314,6 +1314,12 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.success);
                 self.tui.dirty = true;
             },
+            .session_fork_started => {
+                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
+                self.status_text.setContent("session forked");
+                self.status_text.fg = self.theme.fg(.success);
+                self.tui.dirty = true;
+            },
             .session_new_failed => |f| {
                 self.status_text.setContent(f.message);
                 self.status_text.fg = self.theme.fg(.@"error");
@@ -1926,6 +1932,21 @@ pub const Interactive = struct {
             }
             if (std.mem.eql(u8, name, "resume")) {
                 self.showSessionPicker(true);
+                return true;
+            }
+            if (std.mem.eql(u8, name, "fork")) {
+                if (args.len == 0) {
+                    self.status_text.setContent("usage: /fork <entry-id>");
+                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.tui.dirty = true;
+                    return true;
+                }
+                const entry_id = self.msg_allocator.dupe(u8, args) catch return true;
+                _ = self.dispatchIdleRequest(.{ .fork_session = .{ .entry_id = entry_id } }, .{
+                    .busy_message = "cannot fork while agent is running",
+                    .loader_message = "Forking session...",
+                    .spawn_failed_message = "failed to queue fork",
+                });
                 return true;
             }
             if (std.mem.eql(u8, name, "model")) {
@@ -2678,6 +2699,10 @@ pub const Interactive = struct {
                         idle_processed = true;
                         self.handleResumeSession(r.path, r.restore_session_model);
                     },
+                    .fork_session => |f| {
+                        idle_processed = true;
+                        self.handleForkSession(f.entry_id);
+                    },
                     .new_session => {
                         idle_processed = true;
                         self.handleNewSession();
@@ -2747,6 +2772,24 @@ pub const Interactive = struct {
         }
         self.publishQueuedSnapshotIfChanged();
         _ = self.publishLifecycleUiEvent(.{ .session_new_started = {} });
+    }
+
+    fn handleForkSession(self: *Interactive, entry_id: []const u8) void {
+        self.runtime_host.forkSession(entry_id) catch |err| {
+            const msg = switch (err) {
+                error.SessionBeforeForkBlocked => self.msg_allocator.dupe(u8, "session fork blocked by extension") catch return,
+                else => std.fmt.allocPrint(self.msg_allocator, "failed to fork session: {s}", .{@errorName(err)}) catch return,
+            };
+            _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
+            return;
+        };
+        self.publishThemeSnapshot();
+        self.publishStatusSnapshot();
+        if (!self.publishConversationState()) {
+            log.warn("snapshot queue dropped forked conversation state", .{});
+        }
+        self.publishQueuedSnapshotIfChanged();
+        _ = self.publishLifecycleUiEvent(.{ .session_fork_started = {} });
     }
 
     /// Agent-thread handler for `AgentRequest.resume_session`.

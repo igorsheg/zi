@@ -80,6 +80,7 @@ pub const UiEvent = union(enum) {
 
     // --- /new outcomes ---
     session_new_started: void,
+    session_fork_started: void,
     session_new_failed: struct {
         message: []u8,
     },
@@ -184,6 +185,7 @@ pub const UiEvent = union(enum) {
             },
             .session_resume_failed => |f| allocator.free(f.message),
             .session_new_started => {},
+            .session_fork_started => {},
             .session_new_failed => |f| allocator.free(f.message),
             .session_compacted => {},
             .session_compaction_failed => |f| allocator.free(f.message),

@@ -48,6 +48,7 @@ pub const EventKind = enum {
     session_start,
     session_shutdown,
     session_before_switch,
+    session_before_fork,
 
     // Meta
     model_select,
@@ -58,7 +59,7 @@ pub const EventKind = enum {
     /// the semantics of an existing event.
     pub fn semantics(self: EventKind) Semantics {
         return switch (self) {
-            .tool_call, .session_before_switch => .cancellable,
+            .tool_call, .session_before_switch, .session_before_fork => .cancellable,
             .tool_result => .transformable,
             else => .observer,
         };
@@ -163,5 +164,6 @@ test "EventKind.semantics matches spec" {
     try testing.expectEqual(Semantics.transformable, EventKind.tool_result.semantics());
     try testing.expectEqual(Semantics.observer, EventKind.message_end.semantics());
     try testing.expectEqual(Semantics.cancellable, EventKind.session_before_switch.semantics());
+    try testing.expectEqual(Semantics.cancellable, EventKind.session_before_fork.semantics());
     try testing.expectEqual(Semantics.observer, EventKind.session_start.semantics());
 }

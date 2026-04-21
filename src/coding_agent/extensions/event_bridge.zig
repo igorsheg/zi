@@ -130,7 +130,7 @@ fn observeWith(
     try dispatch.dispatchObserver(state, runner, kind, -1);
 }
 
-pub const SessionLifecycleReason = enum { startup, new, @"resume", exit };
+pub const SessionLifecycleReason = enum { startup, new, @"resume", exit, fork };
 
 pub const SessionLifecycleContext = struct {
     runner: *runner_mod.ExtensionRunner,
@@ -283,6 +283,23 @@ pub fn dispatchSessionBeforeSwitch(
     return dispatch.dispatchCancellable(state, current.runner, .session_before_switch, -1, allocator);
 }
 
+pub fn dispatchSessionBeforeFork(
+    current: SessionLifecycleContext,
+    entry_id: []const u8,
+    allocator: std.mem.Allocator,
+) !dispatch.CancelResult {
+    const state = current.runner.lua_state orelse return error.NoState;
+    current.runner.assertOnLuaThread();
+
+    const handlers = current.runner.event_registry.handlers(.session_before_fork);
+    if (handlers.len == 0) return .{ .blocked = false };
+
+    try pushSessionBeforeForkPayload(state.L, current, entry_id);
+    defer c.lua_pop(state.L, 1);
+
+    return dispatch.dispatchCancellable(state, current.runner, .session_before_fork, -1, allocator);
+}
+
 fn dispatchSessionLifecycle(
     kind: event_registry.EventKind,
     current: SessionLifecycleContext,
@@ -372,12 +389,35 @@ fn pushSessionBeforeSwitchPayload(
     }
 }
 
+fn pushSessionBeforeForkPayload(
+    L: *c.lua_State,
+    current: SessionLifecycleContext,
+    entry_id: []const u8,
+) !void {
+    c.lua_createtable(L, 0, 3);
+
+    _ = c.lua_pushlstring(L, "session_before_fork".ptr, "session_before_fork".len);
+    c.lua_setfield(L, -2, "type");
+
+    _ = c.lua_pushlstring(L, "fork".ptr, "fork".len);
+    c.lua_setfield(L, -2, "reason");
+
+    _ = c.lua_pushlstring(L, entry_id.ptr, entry_id.len);
+    c.lua_setfield(L, -2, "entry_id");
+
+    if (current.session_file) |path| {
+        _ = c.lua_pushlstring(L, path.ptr, path.len);
+        c.lua_setfield(L, -2, "current_session_file");
+    }
+}
+
 fn sessionLifecycleReasonString(reason: SessionLifecycleReason) []const u8 {
     return switch (reason) {
         .startup => "startup",
         .new => "new",
         .@"resume" => "resume",
         .exit => "exit",
+        .fork => "fork",
     };
 }
 

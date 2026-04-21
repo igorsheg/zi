@@ -345,6 +345,7 @@ fn parseEventKind(name: []const u8) ?event_registry.EventKind {
         .{ .name = "session_start", .kind = .session_start },
         .{ .name = "session_shutdown", .kind = .session_shutdown },
         .{ .name = "session_before_switch", .kind = .session_before_switch },
+        .{ .name = "session_before_fork", .kind = .session_before_fork },
         // meta
         .{ .name = "model_select", .kind = .model_select },
     };
