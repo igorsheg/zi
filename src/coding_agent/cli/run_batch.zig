@@ -82,6 +82,7 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
         .tool_allowlist = allowlist_opt,
     });
     defer ca.deinit();
+    ca.activateLifecycle();
 
     if (options.output == .json) {
         var out_buf: [4096]u8 = undefined;

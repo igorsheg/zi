@@ -302,6 +302,7 @@ pub const ResourceLoader = struct {
                     .project => .project,
                     .builtin => .builtin,
                 },
+                .provenance = entry.provenance,
             };
         }
         return entries;
@@ -318,10 +319,14 @@ pub const ResourceLoader = struct {
         if (self.settings_manager) |settings_manager| {
             try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, settings_manager.getGlobalExtensionPaths() orelse &.{}, .user);
         }
+        const agent_root = try self.allocator.dupe(u8, self.agent_dir);
+        errdefer self.allocator.free(agent_root);
         try roots.append(self.allocator, .{
             .source = .user,
-            .path = try self.allocator.dupe(u8, self.agent_dir),
+            .path = agent_root,
             .kind = .runtime_root,
+            .runtime_root_id = agent_root,
+            .state_owner_id = agent_root,
         });
         if (self.settings_manager) |settings_manager| {
             try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, settings_manager.getProjectExtensionPaths() orelse &.{}, .project);
@@ -333,6 +338,8 @@ pub const ResourceLoader = struct {
             .source = .project,
             .path = project_dir,
             .kind = .runtime_root,
+            .runtime_root_id = project_dir,
+            .state_owner_id = project_dir,
         });
 
         return try roots.toOwnedSlice(self.allocator);
@@ -355,11 +362,13 @@ fn appendStaticExtensionRootPaths(
             .source = source,
             .path = resolved,
             .kind = kind,
+            .runtime_root_id = resolved,
+            .state_owner_id = resolved,
         });
     }
 }
 
-fn classifyStaticExtensionRoot(allocator: std.mem.Allocator, path: []const u8) !types.StaticExtensionRoot.Kind {
+fn classifyStaticExtensionRoot(allocator: std.mem.Allocator, path: []const u8) !types.StaticExtensionRootKind {
     if (std.mem.endsWith(u8, path, ".lua")) return .synthetic_extension;
 
     const init_path = try std.fs.path.join(allocator, &.{ path, "init.lua" });
@@ -509,6 +518,12 @@ fn copyLoadedExtensions(
             .id = try allocator.dupe(u8, discovered[i].id),
             .path = try allocator.dupe(u8, discovered[i].path),
             .source = source,
+            .provenance = .{
+                .runtime_root_id = try allocator.dupe(u8, discovered[i].provenance.runtime_root_id),
+                .extension_id = undefined,
+                .state_owner_id = try allocator.dupe(u8, discovered[i].provenance.state_owner_id),
+                .root_kind = discovered[i].provenance.root_kind,
+            },
             .source_info = .{
                 .path = try allocator.dupe(u8, discovered[i].path),
                 .source = switch (source) {
@@ -525,6 +540,7 @@ fn copyLoadedExtensions(
                 .origin = .top_level,
             },
         };
+        out[i].provenance.extension_id = out[i].id;
     }
     return out;
 }
@@ -841,6 +857,8 @@ fn pathContains(root: []const u8, candidate: []const u8) bool {
 fn freeLoadedExtension(allocator: std.mem.Allocator, entry: types.LoadedExtension) void {
     allocator.free(entry.id);
     allocator.free(entry.path);
+    allocator.free(entry.provenance.runtime_root_id);
+    allocator.free(entry.provenance.state_owner_id);
     if (entry.source_info) |source_info| {
         allocator.free(source_info.path);
         allocator.free(source_info.source);

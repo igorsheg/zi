@@ -1,10 +1,12 @@
 const std = @import("std");
 const protocol = @import("../../agent3/types.zig");
 const json_value = @import("../../json/value.zig");
+const resource_types = @import("../resources/types.zig");
 
 pub const RegistrationSource = struct {
     kind: []const u8,
     id: []const u8,
+    provenance: ?resource_types.ExtensionProvenance = null,
 };
 
 pub const BuiltinImpl = struct {

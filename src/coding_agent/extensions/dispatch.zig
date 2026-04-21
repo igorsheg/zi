@@ -52,6 +52,7 @@ const runner_mod = @import("runner.zig");
 const context_mod = @import("context.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
+const resource_types = @import("../resources/types.zig");
 const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
@@ -134,7 +135,7 @@ pub fn dispatchCancellable(
         var co = try lua_runtime.Coroutine.init(state);
         defer co.deinit();
 
-        try pushHandlerAndContext(state, runner, &co, h.lua_ref, payload_idx);
+        try pushHandlerAndContext(state, runner, &co, h.lua_ref, h.provenance, payload_idx);
 
         const r = try co.resumeWith(2);
         switch (r.status) {
@@ -212,7 +213,7 @@ pub fn dispatchTransformable(
         var co = try lua_runtime.Coroutine.init(state);
         defer co.deinit();
 
-        try pushHandlerAndContext(state, runner, &co, h.lua_ref, abs_payload);
+        try pushHandlerAndContext(state, runner, &co, h.lua_ref, h.provenance, abs_payload);
 
         const r = try co.resumeWith(2);
         switch (r.status) {
@@ -244,6 +245,15 @@ pub fn dispatchTransformable(
 // Internals
 // =============================================================================
 
+pub fn dispatchObserverHandler(
+    state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
+    h: event_registry.EventHandler,
+    payload_idx: c_int,
+) DispatchError!void {
+    return runOneHandler(state, runner, h, payload_idx);
+}
+
 /// Push the handler (resolved from the registry ref) onto the
 /// coroutine's stack, then xmove a copy of the main state's payload
 /// onto it. Stack on entry: main has payload at payload_idx.
@@ -254,6 +264,7 @@ fn pushHandlerAndContext(
     runner: *runner_mod.ExtensionRunner,
     co: *lua_runtime.Coroutine,
     handler_ref: c_int,
+    provenance: ?resource_types.ExtensionProvenance,
     payload_idx: c_int,
 ) DispatchError!void {
     // Resolve the handler. lua_rawgeti against LUA_REGISTRYINDEX
@@ -270,7 +281,7 @@ fn pushHandlerAndContext(
     c.lua_xmove(state.L, co.L, 1);
 
     // Second arg: shared extension context.
-    try context_mod.pushExtensionContext(co.L, runner);
+    try context_mod.pushExtensionContext(co.L, runner, provenance);
 }
 
 /// One-shot handler runner used by dispatchObserver. Same shape as
@@ -284,7 +295,7 @@ fn runOneHandler(
     var co = try lua_runtime.Coroutine.init(state);
     defer co.deinit();
 
-    try pushHandlerAndContext(state, runner, &co, h.lua_ref, payload_idx);
+    try pushHandlerAndContext(state, runner, &co, h.lua_ref, h.provenance, payload_idx);
 
     const r = try co.resumeWith(2);
     switch (r.status) {
@@ -346,6 +357,32 @@ fn testGetSystemPrompt(_: *anyopaque) []const u8 {
     return "system";
 }
 
+fn testGetBindingInfo(_: *anyopaque) runner_mod.ExtensionBindingInfo {
+    return .{
+        .workspace_id = "/workspace",
+        .session_id = "session-123",
+        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+    };
+}
+
+fn testProvenance() resource_types.ExtensionProvenance {
+    return .{
+        .runtime_root_id = "root-123",
+        .extension_id = "ext-123",
+        .state_owner_id = "state-123",
+        .root_kind = .runtime_root,
+    };
+}
+
+fn testLoadSource() runner_mod.ExtensionLoadSource {
+    return .{
+        .kind = "project",
+        .id = "ext-123",
+        .path = "/workspace/extensions/ext.lua",
+        .provenance = testProvenance(),
+    };
+}
+
 test "dispatchObserver runs every handler in order" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
@@ -364,6 +401,7 @@ test "dispatchObserver runs every handler in order" {
         .shutdown = null,
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
     });
 
     try setupCounterChain(&state, &runner, "message_end");
@@ -410,6 +448,7 @@ test "dispatchObserver passes extension context helpers" {
         .shutdown = null,
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
     });
 
     api.installZiTable(&state, &runner);
@@ -421,6 +460,7 @@ test "dispatchObserver passes extension context helpers" {
         \\  assert(ctx.model.id == "test-model")
         \\  assert(ctx.is_idle() == true)
         \\  assert(ctx.get_system_prompt() == "system")
+        \\  assert(ctx.binding == nil)
         \\end)
     , "ctx_observer");
 
@@ -429,6 +469,74 @@ test "dispatchObserver passes extension context helpers" {
     c.lua_setfield(state.L, -2, "name");
     try dispatchObserver(&state, &runner, .message_end, -1);
     c.lua_pop(state.L, 1);
+}
+
+test "dispatch paths expose binding from handler provenance" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
+    defer runner.deinit();
+
+    var dummy: u8 = 0;
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&dummy),
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
+    });
+
+    api.installZiTable(&state, &runner);
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+
+    try state.doString(
+        \\zi.on("message_end", function(event, ctx)
+        \\  assert(ctx.binding ~= nil)
+        \\  assert(ctx.binding.runtime_root_id == "root-123")
+        \\  assert(ctx.binding.state_owner_id == "state-123")
+        \\  assert(ctx.binding.generation_id == 7)
+        \\  assert(ctx.binding.namespace_id == "state-123::7::/workspace")
+        \\  assert(ctx.binding.workspace_id == "/workspace")
+        \\  assert(ctx.binding.session_id == "session-123")
+        \\  assert(ctx.binding.session_file == "/workspace/.zi/sessions/session-123.jsonl")
+        \\end)
+        \\zi.on("tool_call", function(event, ctx)
+        \\  assert(ctx.binding ~= nil)
+        \\  assert(ctx.binding.namespace_id == "state-123::7::/workspace")
+        \\  return { block = true, reason = ctx.binding.session_id }
+        \\end)
+        \\zi.on("tool_result", function(event, ctx)
+        \\  assert(ctx.binding ~= nil)
+        \\  return { namespace_id = ctx.binding.namespace_id, session_file = ctx.binding.session_file }
+        \\end)
+    , "binding_dispatch");
+
+    c.lua_createtable(state.L, 0, 0);
+    try dispatchObserver(&state, &runner, .message_end, -1);
+    c.lua_pop(state.L, 1);
+
+    c.lua_createtable(state.L, 0, 0);
+    var cancel = try dispatchCancellable(&state, &runner, .tool_call, -1, testing.allocator);
+    defer cancel.deinit(testing.allocator);
+    c.lua_pop(state.L, 1);
+    try testing.expect(cancel.blocked);
+    try testing.expectEqualStrings("session-123", cancel.reason.?);
+
+    c.lua_createtable(state.L, 0, 0);
+    var transformed = try dispatchTransformable(&state, &runner, .tool_result, -1, testing.allocator);
+    defer lua_runtime.freeJsonValue(testing.allocator, transformed);
+    c.lua_pop(state.L, 1);
+
+    try testing.expect(transformed == .object);
+    try testing.expectEqualStrings("state-123::7::/workspace", transformed.object.get("namespace_id").?.string);
+    try testing.expectEqualStrings("/workspace/.zi/sessions/session-123.jsonl", transformed.object.get("session_file").?.string);
 }
 
 test "dispatchCancellable stops at first block=true" {

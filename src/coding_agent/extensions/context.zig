@@ -1,5 +1,7 @@
+const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const resource_types = @import("../resources/types.zig");
 const json_util = @import("../../ai/json_util.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
@@ -9,8 +11,12 @@ const c = lua_runtime.c;
 /// Push the shared extension context table used by tool execution and
 /// event handlers. Tool-specific callers can add extra fields (e.g.
 /// `update`) after this returns.
-pub fn pushExtensionContext(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) !void {
-    c.lua_createtable(L, 0, 10);
+pub fn pushExtensionContext(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+    provenance: ?resource_types.ExtensionProvenance,
+) !void {
+    c.lua_createtable(L, 0, 11);
 
     _ = c.lua_pushlstring(L, runner.cwd.ptr, runner.cwd.len);
     c.lua_setfield(L, -2, "cwd");
@@ -27,6 +33,9 @@ pub fn pushExtensionContext(L: *c.lua_State, runner: *runner_mod.ExtensionRunner
 
     c.lua_pushnil(L);
     c.lua_setfield(L, -2, "signal");
+
+    pushContextBinding(L, runner, provenance);
+    c.lua_setfield(L, -2, "binding");
 
     switch (runner.runtime) {
         .bound => |bound| {
@@ -72,6 +81,75 @@ pub fn pushExtensionContext(L: *c.lua_State, runner: *runner_mod.ExtensionRunner
             c.lua_setfield(L, -2, "get_system_prompt");
         },
     }
+}
+
+fn pushContextBinding(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+    provenance: ?resource_types.ExtensionProvenance,
+) void {
+    const prov = provenance orelse {
+        c.lua_pushnil(L);
+        return;
+    };
+
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const binding = bound.get_binding_info(bound.session);
+            pushBinding(L, prov, runner, binding.workspace_id, binding.session_id, binding.session_file);
+        },
+        .stub => c.lua_pushnil(L),
+    }
+}
+
+pub fn pushBinding(
+    L: *c.lua_State,
+    provenance: resource_types.ExtensionProvenance,
+    runner: *const runner_mod.ExtensionRunner,
+    workspace_id: []const u8,
+    session_id: []const u8,
+    session_file: ?[]const u8,
+) void {
+    c.lua_createtable(L, 0, 7);
+
+    _ = c.lua_pushlstring(L, provenance.runtime_root_id.ptr, provenance.runtime_root_id.len);
+    c.lua_setfield(L, -2, "runtime_root_id");
+
+    _ = c.lua_pushlstring(L, provenance.state_owner_id.ptr, provenance.state_owner_id.len);
+    c.lua_setfield(L, -2, "state_owner_id");
+
+    c.lua_pushinteger(L, @intCast(runner.generation));
+    c.lua_setfield(L, -2, "generation_id");
+
+    pushNamespaceId(L, provenance.state_owner_id, runner.generation);
+    c.lua_setfield(L, -2, "namespace_id");
+
+    _ = c.lua_pushlstring(L, workspace_id.ptr, workspace_id.len);
+    c.lua_setfield(L, -2, "workspace_id");
+
+    _ = c.lua_pushlstring(L, session_id.ptr, session_id.len);
+    c.lua_setfield(L, -2, "session_id");
+
+    if (session_file) |path| {
+        if (path.len > 0) {
+            _ = c.lua_pushlstring(L, path.ptr, path.len);
+            c.lua_setfield(L, -2, "session_file");
+        }
+    }
+}
+
+fn pushNamespaceId(
+    L: *c.lua_State,
+    state_owner_id: []const u8,
+    generation: runner_mod.Generation,
+) void {
+    var generation_buf: [32]u8 = undefined;
+    const generation_str = std.fmt.bufPrint(&generation_buf, "{d}", .{generation}) catch unreachable;
+
+    _ = c.lua_pushlstring(L, state_owner_id.ptr, state_owner_id.len);
+    _ = c.lua_pushlstring(L, "::".ptr, 2);
+    _ = c.lua_pushlstring(L, generation_str.ptr, generation_str.len);
+    c.lua_concat(L, 3);
 }
 
 fn pushMethod(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, func: *const fn (?*c.lua_State) callconv(.c) c_int) void {

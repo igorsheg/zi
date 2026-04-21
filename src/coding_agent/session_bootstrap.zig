@@ -84,6 +84,7 @@ pub const PrepareOptions = struct {
     no_session: bool = false,
     append_system_prompt: ?[]const u8 = null,
     tool_allowlist: ?[]const []const u8 = null,
+    extension_generation: extension_runner_mod.Generation = 0,
 };
 
 pub fn prepareSessionDeps(
@@ -146,6 +147,7 @@ pub fn prepareSessionDeps(
         options.cwd,
         resource_loader,
         builtin_definitions,
+        options.extension_generation,
     );
     errdefer extension_runtime.deinit(allocator);
 
@@ -320,6 +322,7 @@ fn buildExtensionRuntime(
     cwd: []const u8,
     resource_loader: resources.ResourceLoader,
     builtin_definitions: []const tool_def.ToolDefinition,
+    generation: extension_runner_mod.Generation,
 ) !ExtensionRuntime {
     var runtime: ExtensionRuntime = .{};
 
@@ -330,7 +333,7 @@ fn buildExtensionRuntime(
 
     const runner_ptr = allocator.create(ExtensionRunner) catch return runtime;
     errdefer allocator.destroy(runner_ptr);
-    runner_ptr.* = ExtensionRunner.init(allocator, 0);
+    runner_ptr.* = ExtensionRunner.init(allocator, generation);
     runner_ptr.cwd = cwd;
     runner_ptr.attachLuaState(state_ptr);
     extension_api.installZiTable(state_ptr, runner_ptr);

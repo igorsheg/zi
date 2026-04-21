@@ -29,6 +29,7 @@ const agent_protocol = @import("../../agent3/types.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
 const api = @import("api.zig");
 const context_mod = @import("context.zig");
+const resource_types = @import("../resources/types.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
 
@@ -44,6 +45,7 @@ const AgentToolResult = agent_protocol.AgentToolResult;
 pub const LuaToolCtx = struct {
     runner: *runner_mod.ExtensionRunner,
     lua_ref: c_int,
+    provenance: ?resource_types.ExtensionProvenance,
     /// Borrowed from `ToolDefinition.name` in the runner's tool
     /// registry. Lifetime matches the runner generation.
     name: []const u8,
@@ -67,7 +69,12 @@ pub fn buildAgentTool(
         .builtin => return error.NotALuaTool,
     };
     const ctx = try allocator.create(LuaToolCtx);
-    ctx.* = .{ .runner = runner, .lua_ref = lua_ref, .name = ext_tool.name };
+    ctx.* = .{
+        .runner = runner,
+        .lua_ref = lua_ref,
+        .provenance = ext_tool.source.provenance,
+        .name = ext_tool.name,
+    };
 
     return .{
         .name = ext_tool.name,
@@ -114,7 +121,7 @@ fn execute(
         tctx.runner.current_update_ctx = null;
     }
 
-    const result = runHandler(allocator, state, tctx.runner, tctx.lua_ref, args) catch |err| {
+    const result = runHandler(allocator, state, tctx.runner, tctx.lua_ref, tctx.provenance, args) catch |err| {
         log.warn("lua tool execution failed: {s}", .{@errorName(err)});
         return errorResult(allocator, @errorName(err));
     };
@@ -129,6 +136,7 @@ fn runHandler(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
     handler_ref: c_int,
+    provenance: ?resource_types.ExtensionProvenance,
     args: std.json.Value,
 ) !AgentToolResult {
     var co = try lua_runtime.Coroutine.init(state);
@@ -147,7 +155,7 @@ fn runHandler(
     // arg 2: ctx table.
     // Base fields come from the bound extension runtime; tool
     // execution adds the `update(partial)` helper on top.
-    try context_mod.pushExtensionContext(co.L, runner);
+    try context_mod.pushExtensionContext(co.L, runner, provenance);
     c.lua_pushlightuserdata(co.L, runner);
     c.lua_pushcclosure(co.L, &luaToolUpdate, 1);
     c.lua_setfield(co.L, -2, "update");
@@ -442,6 +450,142 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
 // =============================================================================
 
 const testing = std.testing;
+
+fn testGetModel(_: *anyopaque) agent_protocol.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = .{ .custom = "test-api" },
+        .provider = .{ .custom = "test-provider" },
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 1024,
+    };
+}
+
+fn testIsIdle(_: *anyopaque) bool {
+    return true;
+}
+
+fn testAbort(_: *anyopaque) void {}
+
+fn testHasPendingMessages(_: *anyopaque) bool {
+    return false;
+}
+
+fn testGetContextUsage(_: *anyopaque) ?@import("../../session/root.zig").context_usage.ContextUsage {
+    return .{ .tokens = 321, .context_window = 1024, .percent = 31.34765625 };
+}
+
+fn testGetSystemPrompt(_: *anyopaque) []const u8 {
+    return "system";
+}
+
+fn testGetBindingInfo(_: *anyopaque) runner_mod.ExtensionBindingInfo {
+    return .{
+        .workspace_id = "/workspace",
+        .session_id = "session-123",
+        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+    };
+}
+
+fn testProvenance() resource_types.ExtensionProvenance {
+    return .{
+        .runtime_root_id = "root-123",
+        .extension_id = "ext-123",
+        .state_owner_id = "state-123",
+        .root_kind = .runtime_root,
+    };
+}
+
+fn testLoadSource() runner_mod.ExtensionLoadSource {
+    return .{
+        .kind = "project",
+        .id = "ext-123",
+        .path = "/workspace/extensions/ext.lua",
+        .provenance = testProvenance(),
+    };
+}
+
+test "lua tool ctx exposes binding from tool provenance" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+
+    var dummy: u8 = 0;
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&dummy),
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
+    });
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+
+    try state.doString(
+        \\zi.register_tool({
+        \\  name = "binding",
+        \\  description = "binding",
+        \\  parameters = { type = "object", properties = {} },
+        \\  execute = function(args, ctx)
+        \\    assert(ctx.binding ~= nil)
+        \\    return {
+        \\      details = {
+        \\        runtime_root_id = ctx.binding.runtime_root_id,
+        \\        state_owner_id = ctx.binding.state_owner_id,
+        \\        generation_id = ctx.binding.generation_id,
+        \\        namespace_id = ctx.binding.namespace_id,
+        \\        workspace_id = ctx.binding.workspace_id,
+        \\        session_id = ctx.binding.session_id,
+        \\        session_file = ctx.binding.session_file,
+        \\      },
+        \\    }
+        \\  end,
+        \\})
+    , "register_binding_tool");
+
+    const ext_tool = runner.tool_registry.get("binding").?.*;
+    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+    defer testing.allocator.destroy(@as(*LuaToolCtx, @ptrCast(@alignCast(tool.ctx.?))));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const result = tool.execute(
+        tool.ctx,
+        arena.allocator(),
+        "id-binding",
+        .{ .null = {} },
+        abort_signal_mod.AbortSignal.none,
+        null,
+        null,
+    );
+
+    try testing.expect(!result.is_error);
+    try testing.expect(result.details == .object);
+    try testing.expectEqualStrings("root-123", result.details.object.get("runtime_root_id").?.string);
+    try testing.expectEqualStrings("state-123", result.details.object.get("state_owner_id").?.string);
+    try testing.expectEqual(@as(i64, 7), result.details.object.get("generation_id").?.integer);
+    try testing.expectEqualStrings("state-123::7::/workspace", result.details.object.get("namespace_id").?.string);
+    try testing.expectEqualStrings("/workspace", result.details.object.get("workspace_id").?.string);
+    try testing.expectEqualStrings("session-123", result.details.object.get("session_id").?.string);
+    try testing.expectEqualStrings("/workspace/.zi/sessions/session-123.jsonl", result.details.object.get("session_file").?.string);
+}
 
 test "lua tool returning a string produces a single text content block" {
     var state = try lua_runtime.LuaState.init(testing.allocator);

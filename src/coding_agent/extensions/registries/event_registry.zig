@@ -19,6 +19,7 @@
 //! pick the right loop without a per-event switch.
 
 const std = @import("std");
+const resource_types = @import("../../resources/types.zig");
 
 /// Every extension event the runner knows about. v1 covers lifecycle,
 /// tool, session_start/shutdown, and model_select. v2 events get added
@@ -76,6 +77,7 @@ pub const EventHandler = struct {
     lua_ref: c_int,
     /// Provenance — extension file path or builtin name. Borrowed.
     source_id: []const u8,
+    provenance: ?resource_types.ExtensionProvenance = null,
 };
 
 /// Map from EventKind to its handler chain.

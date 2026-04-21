@@ -271,23 +271,20 @@ pub const AgentSession = struct {
     /// after this runs, `AgentSession.deinit` sees null fields and
     /// skips the blocks.
     ///
+    /// Idempotent. Unsubscribes the extension bridge and unbinds the
+    /// runtime, but keeps the runner/lua state alive so replacement
+    /// flows can still read old-generation provenance during the new
+    /// generation's `session_start` publication.
+    pub fn deactivateLifecycleOnAgentThread(self: *AgentSession) void {
+        self.deactivateLifecycle();
+    }
+
     /// Idempotent. Unsubscribes the extension bridge first so no
-    /// in-flight agent event can re-enter the runner mid-teardown.
-    pub fn shutdownExtensionsOnAgentThread(self: *AgentSession) void {
-        if (self._extension_subscription_token) |token| {
-            self.agent.unsubscribe(token);
-            self._extension_subscription_token = null;
-        }
-        if (self._extension_runner) |runner| {
-            runner.deinit();
-            self.allocator.destroy(runner);
-            self._extension_runner = null;
-        }
-        if (self._extension_lua_state) |state| {
-            state.deinit();
-            self.allocator.destroy(state);
-            self._extension_lua_state = null;
-        }
+    /// in-flight agent event can re-enter the runner mid-teardown,
+    /// then explicitly unbinds the runtime before destroy.
+    pub fn shutdownLifecycleOnAgentThread(self: *AgentSession) void {
+        self.deactivateLifecycleOnAgentThread();
+        self.destroyExtensionRuntime();
     }
 
     /// Canonical session-owned model switch. Owns validation,
@@ -502,32 +499,13 @@ pub const AgentSession = struct {
     }
 
     pub fn deinit(self: *AgentSession) void {
-        // Unsubscribe extension bridge FIRST so no agent event can
-        // re-enter the runner mid-teardown. Then unsubscribe the
-        // persistence listener.
-        // zi-wub.28: in interactive mode the extension teardown
-        // already ran on the agent thread via
-        // shutdownExtensionsOnAgentThread() — these blocks are no-ops
-        // because the fields are already null. Non-interactive callers
-        // (tests, print mode without ext) still get the same teardown
-        // here, on whatever thread owns lua (single-thread by default).
-        if (self._extension_subscription_token) |token| {
-            self.agent.unsubscribe(token);
-            self._extension_subscription_token = null;
-        }
-        if (self._subscription_token) |token| {
-            self.agent.unsubscribe(token);
-        }
-        if (self._extension_runner) |runner| {
-            runner.deinit();
-            self.allocator.destroy(runner);
-            self._extension_runner = null;
-        }
-        if (self._extension_lua_state) |state| {
-            state.deinit();
-            self.allocator.destroy(state);
-            self._extension_lua_state = null;
-        }
+        // zi-wub.28: in interactive mode the lifecycle teardown may
+        // already have run on the agent thread via
+        // shutdownLifecycleOnAgentThread() — the helpers are
+        // idempotent, so direct/non-interactive callers still use the
+        // same path here on whatever thread owns lua.
+        self.deactivateLifecycle();
+        self.destroyExtensionRuntime();
         self.allocator.destroy(self._stream_closure);
         self.agent_event_listeners.deinit(self.allocator);
         self.session_event_listeners.deinit(self.allocator);
@@ -598,19 +576,22 @@ pub const AgentSession = struct {
         }
     }
 
-    /// Subscribe the session persistence listener.
-    /// Must be called after self is pinned (not moved).
-    pub fn activateRuntimeHooks(self: *AgentSession) void {
+    /// Activate session-owned lifecycle seams once the session is pinned.
+    pub fn activateLifecycle(self: *AgentSession) void {
+        self.bindExtensionRuntime();
         self.wireSubscription();
+    }
+
+    fn deactivateLifecycle(self: *AgentSession) void {
+        self.unwireExtensionSubscription();
+        self.unwireSubscription();
+        self.unbindExtensionRuntime();
     }
 
     fn wireSubscription(self: *AgentSession) void {
         if (self._subscription_token == null) {
             self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
         }
-        // Wire the extension event bridge once the session is pinned.
-        // The runner pointer is heap-allocated and stable for the
-        // session lifetime; agent.subscribe stores the ctx ptr.
         if (self._extension_subscription_token == null) {
             if (self._extension_runner) |runner| {
                 self._extension_subscription_token = self.agent.subscribe(
@@ -621,7 +602,21 @@ pub const AgentSession = struct {
         }
     }
 
-    fn bindExtensionRuntimeIfNeeded(self: *AgentSession) void {
+    fn unwireSubscription(self: *AgentSession) void {
+        if (self._subscription_token) |token| {
+            self.agent.unsubscribe(token);
+            self._subscription_token = null;
+        }
+    }
+
+    fn unwireExtensionSubscription(self: *AgentSession) void {
+        if (self._extension_subscription_token) |token| {
+            self.agent.unsubscribe(token);
+            self._extension_subscription_token = null;
+        }
+    }
+
+    fn bindExtensionRuntime(self: *AgentSession) void {
         const runner = self._extension_runner orelse return;
         if (runner.isBound()) return;
 
@@ -636,7 +631,27 @@ pub const AgentSession = struct {
             .shutdown = null,
             .get_context_usage = &runtimeGetContextUsage,
             .get_system_prompt = &runtimeGetSystemPrompt,
+            .get_binding_info = &runtimeGetBindingInfo,
         }) catch {};
+    }
+
+    fn unbindExtensionRuntime(self: *AgentSession) void {
+        if (self._extension_runner) |runner| {
+            runner.unbindRuntime();
+        }
+    }
+
+    fn destroyExtensionRuntime(self: *AgentSession) void {
+        if (self._extension_runner) |runner| {
+            runner.deinit();
+            self.allocator.destroy(runner);
+            self._extension_runner = null;
+        }
+        if (self._extension_lua_state) |state| {
+            state.deinit();
+            self.allocator.destroy(state);
+            self._extension_lua_state = null;
+        }
     }
 
     fn runtimeGetModel(session_ptr: *anyopaque) protocol.Model {
@@ -669,6 +684,16 @@ pub const AgentSession = struct {
         return self.agent.systemPrompt();
     }
 
+    fn runtimeGetBindingInfo(session_ptr: *anyopaque) extension_runner_mod.ExtensionBindingInfo {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const session_file = self.getSessionFile();
+        return .{
+            .workspace_id = self.resource_loader.cwd,
+            .session_id = self.session_store.sessionId(),
+            .session_file = if (session_file.len == 0) null else session_file,
+        };
+    }
+
     /// Run a new text prompt. Wires session persistence, then delegates to Agent.prompt.
     pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
         try self.runUserContent(.{ .text = prompt_text });
@@ -676,15 +701,6 @@ pub const AgentSession = struct {
 
     /// Run a new user message with explicit text/image content blocks.
     pub fn runUserContent(self: *AgentSession, user_content: ai.protocol.UserMessage.UserMessageContent) !void {
-        // zi-wub.6: this thread is now the lua owner. Bind BEFORE
-        // wireSubscription because subscribe→agentEventSink calls
-        // assertOnLuaThread on the first event. Interactive mode now
-        // uses one long-lived agent owner thread, so this bind is
-        // idempotent after startup rather than a per-prompt rebind.
-        if (self._extension_runner) |runner| {
-            runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-        }
-        self.bindExtensionRuntimeIfNeeded();
         self.wireSubscription();
 
         const user_msg = protocol.AgentMessage{
@@ -702,12 +718,6 @@ pub const AgentSession = struct {
     /// If transcript ends with assistant (nothing to continue from),
     /// returns NeedsPrompt so the caller can provide one.
     pub fn continueSession(self: *AgentSession) !void {
-        // zi-wub.6: see `run()` for the bind rationale; on the
-        // long-lived interactive agent owner thread this is idempotent.
-        if (self._extension_runner) |runner| {
-            runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-        }
-        self.bindExtensionRuntimeIfNeeded();
         self.wireSubscription();
         self.agent.continueTurn() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,

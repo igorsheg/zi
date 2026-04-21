@@ -84,21 +84,31 @@ pub const ExtensionSource = enum {
     builtin,
 };
 
+pub const StaticExtensionRootKind = enum {
+    runtime_root,
+    synthetic_extension,
+};
+
+pub const ExtensionProvenance = struct {
+    runtime_root_id: []const u8,
+    extension_id: []const u8,
+    state_owner_id: []const u8,
+    root_kind: StaticExtensionRootKind,
+};
+
 pub const StaticExtensionRoot = struct {
     source: ExtensionSource,
     path: []const u8,
-    kind: Kind,
-
-    pub const Kind = enum {
-        runtime_root,
-        synthetic_extension,
-    };
+    kind: StaticExtensionRootKind,
+    runtime_root_id: []const u8,
+    state_owner_id: []const u8,
 };
 
 pub const LoadedExtension = struct {
     id: []const u8,
     path: []const u8,
     source: ExtensionSource,
+    provenance: ExtensionProvenance,
     source_info: ?SourceInfo = null,
 };
 

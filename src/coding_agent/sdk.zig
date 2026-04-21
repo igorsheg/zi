@@ -24,6 +24,7 @@ const resources = @import("resources/root.zig");
 const tool_def = @import("tools/definition.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const settings_manager_mod = @import("settings/manager.zig");
+const extension_runner_mod = @import("extensions/runner.zig");
 
 pub const AgentSession = agent_session_mod.AgentSession;
 pub const SessionStore = agent_session_mod.SessionStore;
@@ -55,6 +56,7 @@ pub const CreateOptions = struct {
     /// ResourceLoader bootstrap input: append-system-prompt source.
     append_system_prompt: ?[]const u8 = null,
     tool_allowlist: ?[]const []const u8 = null,
+    extension_generation: extension_runner_mod.Generation = 0,
 };
 
 /// Resolve the on-disk directory for a session's files before the
@@ -86,6 +88,7 @@ pub fn createAgentSession(
         .no_session = options.no_session,
         .append_system_prompt = options.append_system_prompt,
         .tool_allowlist = options.tool_allowlist,
+        .extension_generation = options.extension_generation,
     });
     return AgentSession.init(allocator, .{
         .model = options.model,

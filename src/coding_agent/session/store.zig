@@ -473,16 +473,18 @@ pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) 
 
     // Sort by file mtime descending (most recent activity first).
     const items = results.items;
-    for (1..items.len) |i| {
-        const key = items[i];
-        var j: usize = i;
-        while (j > 0) {
-            if (items[j - 1].modified_at < key.modified_at) {
-                items[j] = items[j - 1];
-                j -= 1;
-            } else break;
+    if (items.len > 1) {
+        for (1..items.len) |i| {
+            const key = items[i];
+            var j: usize = i;
+            while (j > 0) {
+                if (items[j - 1].modified_at < key.modified_at) {
+                    items[j] = items[j - 1];
+                    j -= 1;
+                } else break;
+            }
+            items[j] = key;
         }
-        items[j] = key;
     }
 
     return try results.toOwnedSlice(allocator);
@@ -659,6 +661,19 @@ fn testAssistantMessageWithUsage(allocator: std.mem.Allocator, text: []const u8,
         .stop_reason = .stop,
         .timestamp = timestamp,
     } };
+}
+
+test "listSessionsInDir returns empty slice for empty directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(session_dir);
+
+    const sessions = try listSessionsInDir(std.testing.allocator, session_dir);
+    defer freeSessionInfos(std.testing.allocator, sessions);
+
+    try std.testing.expectEqual(@as(usize, 0), sessions.len);
 }
 
 test "openForResume returns resume context and transfers store ownership" {

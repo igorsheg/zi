@@ -304,6 +304,7 @@ fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     runner.event_registry.subscribe(kind, .{
         .lua_ref = handler_ref,
         .source_id = currentEventSourceId(runner),
+        .provenance = currentEventProvenance(runner),
     }) catch {
         // OOM during subscribe: release the handler ref so the Lua
         // GC can reclaim it, then surface as a Lua error.
@@ -714,7 +715,12 @@ fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
 
 fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_registry.RegistrationSource {
     const source = runner.currentLoadSource() orelse return .{ .kind = "lua", .id = "lua" };
-    return .{ .kind = source.kind, .id = source.path };
+    return .{ .kind = source.kind, .id = source.path, .provenance = source.provenance };
+}
+
+fn currentEventProvenance(runner: *const runner_mod.ExtensionRunner) ?@import("../resources/types.zig").ExtensionProvenance {
+    const source = runner.currentLoadSource() orelse return null;
+    return source.provenance;
 }
 
 fn currentEventSourceId(runner: *const runner_mod.ExtensionRunner) []const u8 {

@@ -4,6 +4,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../abort_signal.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
+const resource_types = @import("../resources/types.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 ///
@@ -15,6 +16,12 @@ const session_core = @import("../../session/root.zig");
 /// event. The generation is u64 to ensure monotonicity even across very long
 /// sessions (practically infinite).
 pub const Generation = u64;
+
+pub const ExtensionBindingInfo = struct {
+    workspace_id: []const u8,
+    session_id: []const u8,
+    session_file: ?[]const u8 = null,
+};
 
 /// Two-phase runtime lifecycle: stub → bound.
 ///
@@ -51,6 +58,7 @@ pub const ExtensionRuntime = union(enum) {
         shutdown: ?*const fn (session: *anyopaque) void = null,
         get_context_usage: *const fn (session: *anyopaque) ?session_core.context_usage.ContextUsage,
         get_system_prompt: *const fn (session: *anyopaque) []const u8,
+        get_binding_info: *const fn (session: *anyopaque) ExtensionBindingInfo,
     };
 };
 
@@ -120,6 +128,7 @@ pub const ExtensionLoadSource = struct {
     kind: []const u8,
     id: []const u8,
     path: []const u8,
+    provenance: resource_types.ExtensionProvenance,
 };
 
 pub const LoadContext = struct {
@@ -222,6 +231,7 @@ pub const ExtensionRunner = struct {
     current_spawn_request: ?SpawnRequest = null,
     current_spawn_result: ?SpawnOutcome = null,
 
+    loaded_extensions: std.ArrayListUnmanaged(resource_types.ExtensionProvenance) = .empty,
     load_context: ?LoadContext = null,
 
     /// Identity of the thread that owns the `lua_state`.
@@ -300,6 +310,7 @@ pub const ExtensionRunner = struct {
             .event_registry = registries.EventRegistry.init(allocator),
             .command_registry = registries.CommandRegistry.init(allocator),
             .provider_queue = registries.ProviderQueue.init(allocator),
+            .loaded_extensions = .empty,
             .hook_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -346,6 +357,17 @@ pub const ExtensionRunner = struct {
 
     pub fn currentLoadSource(self: *const ExtensionRunner) ?ExtensionLoadSource {
         return if (self.load_context) |ctx| ctx.source else null;
+    }
+
+    pub fn recordLoadedExtension(self: *ExtensionRunner, provenance: resource_types.ExtensionProvenance) !void {
+        try self.loaded_extensions.append(self.allocator, provenance);
+    }
+
+    pub fn findLoadedExtensionByStateOwner(self: *const ExtensionRunner, state_owner_id: []const u8) ?resource_types.ExtensionProvenance {
+        for (self.loaded_extensions.items) |provenance| {
+            if (std.mem.eql(u8, provenance.state_owner_id, state_owner_id)) return provenance;
+        }
+        return null;
     }
 
     /// Assert that the current thread is allowed to call into
@@ -409,6 +431,7 @@ pub const ExtensionRunner = struct {
         self.command_registry.deinit();
         self.event_registry.deinit();
         self.tool_registry.deinit();
+        self.loaded_extensions.deinit(self.allocator);
         self.hook_arena.deinit();
     }
 
@@ -424,6 +447,12 @@ pub const ExtensionRunner = struct {
         self.runtime = .{ .bound = bound };
     }
 
+    pub fn unbindRuntime(self: *ExtensionRunner) void {
+        if (self.runtime == .bound) {
+            self.runtime = .{ .stub = {} };
+        }
+    }
+
     pub fn isBound(self: *const ExtensionRunner) bool {
         return self.runtime == .bound;
     }
@@ -432,6 +461,31 @@ pub const ExtensionRunner = struct {
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "ExtensionRunner unbinds back to stub state" {
+    const allocator = std.testing.allocator;
+    var runner = ExtensionRunner.init(allocator, 7);
+    defer runner.deinit();
+
+    try runner.bindRuntime(.{
+        .session = undefined,
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
+    });
+    try std.testing.expect(runner.isBound());
+
+    runner.unbindRuntime();
+    try std.testing.expect(!runner.isBound());
+    try std.testing.expect(runner.runtime == .stub);
+}
 
 test "ExtensionRunner starts in stub state" {
     const allocator = std.testing.allocator;
@@ -475,6 +529,14 @@ fn testGetSystemPrompt(_: *anyopaque) []const u8 {
     return "system";
 }
 
+fn testGetBindingInfo(_: *anyopaque) ExtensionBindingInfo {
+    return .{
+        .workspace_id = "/workspace",
+        .session_id = "session-123",
+        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+    };
+}
+
 test "bindRuntime rejects double-bind" {
     const allocator = std.testing.allocator;
     var runner = ExtensionRunner.init(allocator, 1);
@@ -494,6 +556,7 @@ test "bindRuntime rejects double-bind" {
         .shutdown = null,
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
     };
 
     try runner.bindRuntime(bound);
@@ -513,6 +576,7 @@ test "bindRuntime rejects double-bind" {
         .shutdown = null,
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
     };
 
     const result = runner.bindRuntime(bound2);

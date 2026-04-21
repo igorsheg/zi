@@ -29,8 +29,10 @@ const std = @import("std");
 const agent_protocol = @import("../../agent3/types.zig");
 const ai_protocol = @import("../../ai/protocol.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
+const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const context_mod = @import("context.zig");
 const dispatch = @import("dispatch.zig");
 const event_registry = @import("registries/event_registry.zig");
 
@@ -126,6 +128,101 @@ fn observeWith(
     try builder(state.L, payload);
     defer c.lua_pop(state.L, 1);
     try dispatch.dispatchObserver(state, runner, kind, -1);
+}
+
+pub const SessionLifecycleReason = enum { startup, new, @"resume", exit };
+
+pub const SessionLifecycleContext = struct {
+    runner: *runner_mod.ExtensionRunner,
+    workspace_id: []const u8,
+    session_id: []const u8,
+    session_file: ?[]const u8 = null,
+};
+
+pub fn dispatchSessionStart(
+    current: SessionLifecycleContext,
+    previous: ?SessionLifecycleContext,
+    reason: SessionLifecycleReason,
+) !void {
+    try dispatchSessionLifecycle(.session_start, current, previous, reason);
+}
+
+pub fn dispatchSessionShutdown(
+    current: SessionLifecycleContext,
+    next: ?SessionLifecycleContext,
+    reason: SessionLifecycleReason,
+) !void {
+    try dispatchSessionLifecycle(.session_shutdown, current, next, reason);
+}
+
+fn dispatchSessionLifecycle(
+    kind: event_registry.EventKind,
+    current: SessionLifecycleContext,
+    related: ?SessionLifecycleContext,
+    reason: SessionLifecycleReason,
+) !void {
+    const state = current.runner.lua_state orelse return error.NoState;
+    current.runner.assertOnLuaThread();
+
+    const handlers = current.runner.event_registry.handlers(kind);
+    if (handlers.len == 0) return;
+
+    for (handlers) |handler| {
+        const provenance = handler.provenance orelse continue;
+        try pushSessionLifecyclePayload(state.L, kind, reason, provenance, current, related);
+        dispatch.dispatchObserverHandler(state, current.runner, handler, -1) catch |err| {
+            c.lua_pop(state.L, 1);
+            log.warn("observer handler for {s} failed: {s}", .{ @tagName(kind), @errorName(err) });
+            continue;
+        };
+        c.lua_pop(state.L, 1);
+    }
+}
+
+fn pushSessionLifecyclePayload(
+    L: *c.lua_State,
+    kind: event_registry.EventKind,
+    reason: SessionLifecycleReason,
+    provenance: resource_types.ExtensionProvenance,
+    current: SessionLifecycleContext,
+    related: ?SessionLifecycleContext,
+) !void {
+    c.lua_createtable(L, 0, 4);
+
+    const event_type = switch (kind) {
+        .session_start => "session_start",
+        .session_shutdown => "session_shutdown",
+        else => unreachable,
+    };
+    _ = c.lua_pushlstring(L, event_type.ptr, event_type.len);
+    c.lua_setfield(L, -2, "type");
+
+    const reason_str = sessionLifecycleReasonString(reason);
+    _ = c.lua_pushlstring(L, reason_str.ptr, reason_str.len);
+    c.lua_setfield(L, -2, "reason");
+
+    context_mod.pushBinding(L, provenance, current.runner, current.workspace_id, current.session_id, current.session_file);
+    c.lua_setfield(L, -2, "binding");
+
+    if (related) |peer| {
+        if (peer.runner.findLoadedExtensionByStateOwner(provenance.state_owner_id)) |peer_provenance| {
+            context_mod.pushBinding(L, peer_provenance, peer.runner, peer.workspace_id, peer.session_id, peer.session_file);
+            c.lua_setfield(L, -2, switch (kind) {
+                .session_start => "previous",
+                .session_shutdown => "next",
+                else => unreachable,
+            });
+        }
+    }
+}
+
+fn sessionLifecycleReasonString(reason: SessionLifecycleReason) []const u8 {
+    return switch (reason) {
+        .startup => "startup",
+        .new => "new",
+        .@"resume" => "resume",
+        .exit => "exit",
+    };
 }
 
 // =============================================================================

@@ -12,6 +12,8 @@ const conversation_state = @import("../agent3/conversation_state.zig");
 const theme_mod = @import("../tui/theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const session_event_mod = @import("session_event.zig");
+const extension_runner_mod = @import("extensions/runner.zig");
+const event_bridge = @import("extensions/event_bridge.zig");
 const profile = @import("../debug/profile.zig");
 
 pub const QueueKind = control_mod.QueueKind;
@@ -61,6 +63,7 @@ pub const RuntimeHost = struct {
     session_event_listeners: std.ArrayList(EventHandler),
     agent_event_token: ?AgentSession.AgentEventSubscriptionToken = null,
     session_event_token: ?AgentSession.EventSubscriptionToken = null,
+    next_extension_generation: extension_runner_mod.Generation,
 
     pub const AgentEventHandler = struct {
         func: *const fn (event: agent_mod.protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -95,19 +98,23 @@ pub const RuntimeHost = struct {
             .runner = session_runner.SessionRunner.init(options),
             .agent_event_listeners = .empty,
             .session_event_listeners = .empty,
+            .next_extension_generation = nextExtensionGenerationFor(session),
         };
-        self.session.activateRuntimeHooks();
+        self.activateSessionLifecycle(.startup, null);
         return self;
     }
 
     pub fn deinit(self: *RuntimeHost) void {
-        self.unbindAgentEvents();
-        self.unbindSessionEvents();
+        self.shutdownSessionLifecycle(.exit, null);
         self.session.deinit();
         self.session_allocator.destroy(self.session);
         self.agent_event_listeners.deinit(self.session_allocator);
         self.session_event_listeners.deinit(self.session_allocator);
         self.* = undefined;
+    }
+
+    pub fn shutdownCurrentSessionOnAgentThread(self: *RuntimeHost) void {
+        self.shutdownSessionLifecycle(.exit, null);
     }
 
     pub fn currentSession(self: *RuntimeHost) *AgentSession {
@@ -243,15 +250,20 @@ pub const RuntimeHost = struct {
             next.agent.modelValue().id,
             thinkingLevelToString(next.agent.thinkingLevel()),
         );
-        self.replaceSession(next);
+        self.replaceSession(next, .new);
     }
 
     pub fn resumeSession(self: *RuntimeHost, path: []const u8, restore_session_model: bool) !ResumeResult {
         var loaded = try agent_session_mod.SessionStore.openForResume(self.session_allocator, path);
         defer loaded.deinit();
 
+        const loaded_store = loaded.store.?;
+        if (std.mem.eql(u8, loaded_store.sessionId(), self.session.session_store.sessionId())) {
+            return error.SessionAlreadyActive;
+        }
+
         var create_options = self.create_options;
-        create_options.cwd = loaded.store.?.cwd();
+        create_options.cwd = loaded_store.cwd();
         create_options.initial_messages = loaded.messages;
         create_options.thinking_level = parseThinkingLevel(loaded.thinking_level);
 
@@ -278,7 +290,7 @@ pub const RuntimeHost = struct {
         create_options.session_store = new_store;
 
         const next = try self.createOwnedSession(create_options);
-        self.replaceSession(next);
+        self.replaceSession(next, .@"resume");
         return .{ .restore_warning = restore_warning };
     }
 
@@ -459,24 +471,98 @@ pub const RuntimeHost = struct {
     }
 
     fn createOwnedSession(self: *RuntimeHost, create_options: sdk.CreateOptions) !*AgentSession {
+        var next_options = create_options;
+        next_options.extension_generation = self.reserveExtensionGeneration();
+
         const session = try self.session_allocator.create(AgentSession);
         errdefer self.session_allocator.destroy(session);
-        session.* = try sdk.createAgentSession(self.session_allocator, create_options);
+        session.* = try sdk.createAgentSession(self.session_allocator, next_options);
         return session;
     }
 
-    fn replaceSession(self: *RuntimeHost, next: *AgentSession) void {
-        const had_agent_event_listeners = self.agent_event_listeners.items.len > 0;
-        const had_session_event_listeners = self.session_event_listeners.items.len > 0;
+    fn activateSessionLifecycle(
+        self: *RuntimeHost,
+        reason: event_bridge.SessionLifecycleReason,
+        previous: ?event_bridge.SessionLifecycleContext,
+    ) void {
+        self.session.activateLifecycle();
+        self.emitExtensionSessionStart(reason, previous);
+        if (self.agent_event_listeners.items.len > 0) self.bindAgentEvents();
+        if (self.session_event_listeners.items.len > 0) self.bindSessionEvents();
+    }
+
+    fn shutdownSessionLifecycle(
+        self: *RuntimeHost,
+        reason: event_bridge.SessionLifecycleReason,
+        next: ?event_bridge.SessionLifecycleContext,
+    ) void {
+        self.emitExtensionSessionShutdown(reason, next);
         self.unbindAgentEvents();
         self.unbindSessionEvents();
-        self.session.shutdownExtensionsOnAgentThread();
-        self.session.deinit();
-        self.session_allocator.destroy(self.session);
+        self.session.shutdownLifecycleOnAgentThread();
+    }
+
+    fn reserveExtensionGeneration(self: *RuntimeHost) extension_runner_mod.Generation {
+        const generation = self.next_extension_generation;
+        std.debug.assert(generation < std.math.maxInt(extension_runner_mod.Generation));
+        self.next_extension_generation += 1;
+        return generation;
+    }
+
+    fn nextExtensionGenerationFor(session: *AgentSession) extension_runner_mod.Generation {
+        const runner = session.extensionRunner() orelse return 0;
+        return runner.generation + 1;
+    }
+
+    fn replaceSession(
+        self: *RuntimeHost,
+        next: *AgentSession,
+        reason: event_bridge.SessionLifecycleReason,
+    ) void {
+        const old = self.session;
+        const previous = lifecycleContext(old);
+        const successor = lifecycleContext(next);
+        self.emitExtensionSessionShutdown(reason, successor);
+        self.unbindAgentEvents();
+        self.unbindSessionEvents();
+        old.deactivateLifecycleOnAgentThread();
         self.session = next;
-        self.session.activateRuntimeHooks();
-        if (had_agent_event_listeners) self.bindAgentEvents();
-        if (had_session_event_listeners) self.bindSessionEvents();
+        self.activateSessionLifecycle(reason, previous);
+        old.deinit();
+        self.session_allocator.destroy(old);
+    }
+
+    fn emitExtensionSessionStart(
+        self: *RuntimeHost,
+        reason: event_bridge.SessionLifecycleReason,
+        previous: ?event_bridge.SessionLifecycleContext,
+    ) void {
+        const current = lifecycleContext(self.session) orelse return;
+        event_bridge.dispatchSessionStart(current, previous, reason) catch |err| {
+            std.log.scoped(.zi_bridge).warn("session_start dispatch failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn emitExtensionSessionShutdown(
+        self: *RuntimeHost,
+        reason: event_bridge.SessionLifecycleReason,
+        next: ?event_bridge.SessionLifecycleContext,
+    ) void {
+        const current = lifecycleContext(self.session) orelse return;
+        event_bridge.dispatchSessionShutdown(current, next, reason) catch |err| {
+            std.log.scoped(.zi_bridge).warn("session_shutdown dispatch failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn lifecycleContext(session: *AgentSession) ?event_bridge.SessionLifecycleContext {
+        const runner = session.extensionRunner() orelse return null;
+        const session_file = session.getSessionFile();
+        return .{
+            .runner = runner,
+            .workspace_id = session.resource_loader.cwd,
+            .session_id = session.session_store.sessionId(),
+            .session_file = if (session_file.len == 0) null else session_file,
+        };
     }
 
     fn runnerEventEmitter(self: *RuntimeHost) session_runner.EventEmitter {
@@ -610,6 +696,266 @@ fn createOwnedTestAgentSession(
     errdefer allocator.destroy(session);
     session.* = try sdk.createAgentSession(allocator, createTestCreateOptions(registry));
     return session;
+}
+
+fn createTestCreateOptionsForCwd(
+    cwd: []const u8,
+    extension_paths: []const []const u8,
+    no_session: bool,
+) sdk.CreateOptions {
+    return .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = cwd,
+        .tools = &.{},
+        .no_session = no_session,
+        .extension_paths = extension_paths,
+    };
+}
+
+fn createOwnedTestAgentSessionWithOptions(
+    allocator: std.mem.Allocator,
+    options: sdk.CreateOptions,
+) !*AgentSession {
+    const session = try allocator.create(AgentSession);
+    errdefer allocator.destroy(session);
+    session.* = try sdk.createAgentSession(allocator, options);
+    return session;
+}
+
+fn makeLifecycleLoggerSource(
+    allocator: std.mem.Allocator,
+    log_path: []const u8,
+    extension_name: []const u8,
+) ![]u8 {
+    const template =
+        "local log_path = \"{s}\"\n" ++
+        "local extension_name = \"{s}\"\n" ++
+        "local function value(v)\n" ++
+        "  if v == nil then return \"\" end\n" ++
+        "  return tostring(v)\n" ++
+        "end\n" ++
+        "local function write_event(event, ctx, related_key)\n" ++
+        "  local binding = event.binding or {{}}\n" ++
+        "  local related = event[related_key]\n" ++
+        "  local f = assert(io.open(log_path, \"a\"))\n" ++
+        "  f:write(table.concat({{\n" ++
+        "    extension_name,\n" ++
+        "    value(event.type),\n" ++
+        "    value(event.reason),\n" ++
+        "    ctx.model and \"1\" or \"0\",\n" ++
+        "    value(binding.runtime_root_id),\n" ++
+        "    value(binding.state_owner_id),\n" ++
+        "    value(binding.workspace_id),\n" ++
+        "    value(binding.namespace_id),\n" ++
+        "    value(binding.generation_id),\n" ++
+        "    value(binding.session_id),\n" ++
+        "    binding.session_file and \"1\" or \"0\",\n" ++
+        "    related_key,\n" ++
+        "    related and value(related.workspace_id) or \"\",\n" ++
+        "  }}, \"|\"), \"\\n\")\n" ++
+        "  f:close()\n" ++
+        "end\n" ++
+        "return function(zi)\n" ++
+        "  zi.on(\"session_start\", function(event, ctx) write_event(event, ctx, \"previous\") end)\n" ++
+        "  zi.on(\"session_shutdown\", function(event, ctx) write_event(event, ctx, \"next\") end)\n" ++
+        "end\n";
+
+    return std.fmt.allocPrint(allocator, template, .{ log_path, extension_name });
+}
+
+test "runtime host rejects self-resume and only replaces with a different persisted session" {
+    const session = try createOwnedTestAgentSession(testing.allocator, null);
+    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
+    defer host.deinit();
+
+    const initial_runner = host.currentSession().extensionRunner() orelse return error.MissingExtensionRunner;
+    try testing.expect(initial_runner.isBound());
+    const initial_generation = initial_runner.generation;
+    const initial_session_file = try testing.allocator.dupe(u8, host.currentSession().getSessionFile());
+    defer testing.allocator.free(initial_session_file);
+    const initial_session_id = try testing.allocator.dupe(u8, host.currentSession().session_store.sessionId());
+    defer testing.allocator.free(initial_session_id);
+
+    try host.newSession();
+    const after_new_runner = host.currentSession().extensionRunner() orelse return error.MissingExtensionRunner;
+    try testing.expect(after_new_runner.isBound());
+    try testing.expectEqual(initial_generation + 1, after_new_runner.generation);
+
+    const active_session_file = try testing.allocator.dupe(u8, host.currentSession().getSessionFile());
+    defer testing.allocator.free(active_session_file);
+    const active_session_id = try testing.allocator.dupe(u8, host.currentSession().session_store.sessionId());
+    defer testing.allocator.free(active_session_id);
+    try testing.expect(!std.mem.eql(u8, initial_session_id, active_session_id));
+
+    try testing.expectError(error.SessionAlreadyActive, host.resumeSession(active_session_file, false));
+    const after_failed_resume_runner = host.currentSession().extensionRunner() orelse return error.MissingExtensionRunner;
+    try testing.expect(after_failed_resume_runner.isBound());
+    try testing.expectEqual(initial_generation + 1, after_failed_resume_runner.generation);
+    try testing.expectEqualStrings(active_session_file, host.currentSession().getSessionFile());
+    try testing.expectEqualStrings(active_session_id, host.currentSession().session_store.sessionId());
+
+    _ = try host.resumeSession(initial_session_file, false);
+    const after_resume_runner = host.currentSession().extensionRunner() orelse return error.MissingExtensionRunner;
+    try testing.expect(after_resume_runner.isBound());
+    try testing.expectEqual(initial_generation + 2, after_resume_runner.generation);
+    try testing.expectEqualStrings(initial_session_file, host.currentSession().getSessionFile());
+    try testing.expectEqualStrings(initial_session_id, host.currentSession().session_store.sessionId());
+}
+
+test "runtime host emits truthful session lifecycle events across startup new resume and exit" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("shared/extensions");
+    try tmp.dir.makePath("workspace-a/.zi/extensions");
+    try tmp.dir.makePath("workspace-b/.zi/extensions");
+    try tmp.dir.writeFile(.{ .sub_path = "lifecycle.log", .data = "" });
+
+    const shared_root = try tmp.dir.realpathAlloc(allocator, "shared");
+    defer allocator.free(shared_root);
+    const workspace_a = try tmp.dir.realpathAlloc(allocator, "workspace-a");
+    defer allocator.free(workspace_a);
+    const workspace_b = try tmp.dir.realpathAlloc(allocator, "workspace-b");
+    defer allocator.free(workspace_b);
+    const project_root_a = try std.fs.path.join(allocator, &.{ workspace_a, ".zi" });
+    defer allocator.free(project_root_a);
+    const project_root_b = try std.fs.path.join(allocator, &.{ workspace_b, ".zi" });
+    defer allocator.free(project_root_b);
+    const log_path = try tmp.dir.realpathAlloc(allocator, "lifecycle.log");
+    defer allocator.free(log_path);
+
+    const explicit_src = try makeLifecycleLoggerSource(allocator, log_path, "explicit");
+    defer allocator.free(explicit_src);
+    const project_src = try makeLifecycleLoggerSource(allocator, log_path, "project");
+    defer allocator.free(project_src);
+
+    try tmp.dir.writeFile(.{ .sub_path = "shared/extensions/explicit.lua", .data = explicit_src });
+    try tmp.dir.writeFile(.{ .sub_path = "workspace-a/.zi/extensions/project.lua", .data = project_src });
+    try tmp.dir.writeFile(.{ .sub_path = "workspace-b/.zi/extensions/project.lua", .data = project_src });
+
+    const extension_paths = [_][]const u8{shared_root};
+    const create_options = createTestCreateOptionsForCwd(workspace_a, &extension_paths, false);
+    const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
+    var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{});
+
+    try host.newSession();
+
+    const readLines = struct {
+        fn run(alloc: std.mem.Allocator, path_: []const u8) !std.ArrayListUnmanaged([]u8) {
+            const file = try std.fs.openFileAbsolute(path_, .{});
+            defer file.close();
+            const raw = try file.readToEndAlloc(alloc, 1024 * 1024);
+            defer alloc.free(raw);
+
+            var lines: std.ArrayListUnmanaged([]u8) = .empty;
+            errdefer {
+                for (lines.items) |line| alloc.free(line);
+                lines.deinit(alloc);
+            }
+
+            var it = std.mem.splitScalar(u8, raw, '\n');
+            while (it.next()) |line| {
+                if (line.len == 0) continue;
+                try lines.append(alloc, try alloc.dupe(u8, line));
+            }
+            return lines;
+        }
+    };
+
+    var lines_before_failed_resume = try readLines.run(allocator, log_path);
+    defer {
+        for (lines_before_failed_resume.items) |line| allocator.free(line);
+        lines_before_failed_resume.deinit(allocator);
+    }
+    try testing.expectEqual(@as(usize, 6), lines_before_failed_resume.items.len);
+
+    const missing_resume = try std.fs.path.join(allocator, &.{ workspace_a, "missing-session.jsonl" });
+    defer allocator.free(missing_resume);
+    try testing.expectError(error.FileNotFound, host.resumeSession(missing_resume, false));
+
+    var lines_after_failed_resume = try readLines.run(allocator, log_path);
+    defer {
+        for (lines_after_failed_resume.items) |line| allocator.free(line);
+        lines_after_failed_resume.deinit(allocator);
+    }
+    try testing.expectEqual(lines_before_failed_resume.items.len, lines_after_failed_resume.items.len);
+
+    var resume_store = try agent_session_mod.SessionStore.createForCwd(allocator, workspace_b);
+    const resume_path = try allocator.dupe(u8, resume_store.sessionFile());
+    resume_store.deinit();
+    defer allocator.free(resume_path);
+
+    _ = try host.resumeSession(resume_path, false);
+    host.deinit();
+
+    var lines = try readLines.run(allocator, log_path);
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    try testing.expectEqual(@as(usize, 12), lines.items.len);
+
+    const Parsed = struct { fields: [13][]const u8 };
+    const parse = struct {
+        fn line(input: []const u8) !Parsed {
+            var out: [13][]const u8 = undefined;
+            var i: usize = 0;
+            var it = std.mem.splitScalar(u8, input, '|');
+            while (it.next()) |field| {
+                if (i >= out.len) return error.TooManyFields;
+                out[i] = field;
+                i += 1;
+            }
+            if (i != out.len) return error.NotEnoughFields;
+            return .{ .fields = out };
+        }
+    };
+
+    const expectLine = struct {
+        fn run(parsed: Parsed, expected: struct {
+            ext: []const u8,
+            event_type: []const u8,
+            reason: []const u8,
+            runtime_root: []const u8,
+            workspace: []const u8,
+            generation: []const u8,
+            related_kind: []const u8,
+            related_workspace: []const u8,
+        }) !void {
+            try testing.expectEqualStrings(expected.ext, parsed.fields[0]);
+            try testing.expectEqualStrings(expected.event_type, parsed.fields[1]);
+            try testing.expectEqualStrings(expected.reason, parsed.fields[2]);
+            try testing.expectEqualStrings("1", parsed.fields[3]);
+            try testing.expectEqualStrings(expected.runtime_root, parsed.fields[4]);
+            const expected_state_owner = try std.fmt.allocPrint(testing.allocator, "{s}::{s}", .{ expected.runtime_root, expected.ext });
+            defer testing.allocator.free(expected_state_owner);
+            try testing.expectEqualStrings(expected_state_owner, parsed.fields[5]);
+            try testing.expectEqualStrings(expected.workspace, parsed.fields[6]);
+            const expected_namespace = try std.fmt.allocPrint(testing.allocator, "{s}::{s}", .{ expected_state_owner, expected.generation });
+            defer testing.allocator.free(expected_namespace);
+            try testing.expectEqualStrings(expected_namespace, parsed.fields[7]);
+            try testing.expectEqualStrings(expected.generation, parsed.fields[8]);
+            try testing.expect(parsed.fields[9].len > 0);
+            try testing.expectEqualStrings("1", parsed.fields[10]);
+            try testing.expectEqualStrings(expected.related_kind, parsed.fields[11]);
+            try testing.expectEqualStrings(expected.related_workspace, parsed.fields[12]);
+        }
+    };
+
+    try expectLine.run(try parse.line(lines.items[0]), .{ .ext = "explicit", .event_type = "session_start", .reason = "startup", .runtime_root = shared_root, .workspace = workspace_a, .generation = "0", .related_kind = "previous", .related_workspace = "" });
+    try expectLine.run(try parse.line(lines.items[1]), .{ .ext = "project", .event_type = "session_start", .reason = "startup", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "0", .related_kind = "previous", .related_workspace = "" });
+    try expectLine.run(try parse.line(lines.items[2]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "new", .runtime_root = shared_root, .workspace = workspace_a, .generation = "0", .related_kind = "next", .related_workspace = workspace_a });
+    try expectLine.run(try parse.line(lines.items[3]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "new", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "0", .related_kind = "next", .related_workspace = workspace_a });
+    try expectLine.run(try parse.line(lines.items[4]), .{ .ext = "explicit", .event_type = "session_start", .reason = "new", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
+    try expectLine.run(try parse.line(lines.items[5]), .{ .ext = "project", .event_type = "session_start", .reason = "new", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
+    try expectLine.run(try parse.line(lines.items[6]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = workspace_b });
+    try expectLine.run(try parse.line(lines.items[7]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "resume", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = "" });
+    try expectLine.run(try parse.line(lines.items[8]), .{ .ext = "explicit", .event_type = "session_start", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = workspace_a });
+    try expectLine.run(try parse.line(lines.items[9]), .{ .ext = "project", .event_type = "session_start", .reason = "resume", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = "" });
+    try expectLine.run(try parse.line(lines.items[10]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "exit", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
+    try expectLine.run(try parse.line(lines.items[11]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "exit", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
 }
 
 test "runtime host publishes committed view and queued snapshots independently" {

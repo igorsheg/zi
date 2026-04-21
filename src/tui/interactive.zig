@@ -2623,7 +2623,7 @@ pub const Interactive = struct {
             if (self.request_queue.isDrained()) break;
         }
 
-        self.runtime_host.currentSession().shutdownExtensionsOnAgentThread();
+        self.runtime_host.shutdownCurrentSessionOnAgentThread();
     }
 
     fn enqueueAgentShutdown(self: *Interactive) void {
@@ -2754,8 +2754,12 @@ pub const Interactive = struct {
     /// Transcript rebuild stays on the TUI thread — this handler
     /// does NOT touch `self.transcript`. That's .15's whole point.
     fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
-        const result = self.runtime_host.resumeSession(path, restore_session_model) catch {
-            const msg = self.msg_allocator.dupe(u8, "failed to load session") catch return;
+        const result = self.runtime_host.resumeSession(path, restore_session_model) catch |err| {
+            const message = switch (err) {
+                error.SessionAlreadyActive => "session is already active",
+                else => "failed to load session",
+            };
+            const msg = self.msg_allocator.dupe(u8, message) catch return;
             _ = self.publishLifecycleUiEvent(.{ .session_resume_failed = .{ .message = msg } });
             return;
         };
