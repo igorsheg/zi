@@ -487,7 +487,7 @@ pub const RuntimeHost = struct {
     fn activateSessionLifecycle(
         self: *RuntimeHost,
         reason: event_bridge.SessionLifecycleReason,
-        previous: ?event_bridge.SessionLifecycleContext,
+        previous: ?event_bridge.LifecyclePeer,
     ) void {
         self.session.activateLifecycle();
         self.emitExtensionSessionStart(reason, previous);
@@ -524,10 +524,10 @@ pub const RuntimeHost = struct {
         reason: event_bridge.SessionLifecycleReason,
     ) !void {
         const old = self.session;
-        const previous = lifecycleContext(old);
+        const previous_ctx = lifecycleContext(old);
         const successor = lifecycleContext(next);
 
-        if (previous) |ctx| {
+        if (previous_ctx) |ctx| {
             var cancel_result = event_bridge.dispatchSessionBeforeSwitch(ctx, successor, reason, self.msg_allocator) catch |err| {
                 next.deinit();
                 self.session_allocator.destroy(next);
@@ -542,12 +542,23 @@ pub const RuntimeHost = struct {
             cancel_result.deinit(self.msg_allocator);
         }
 
+        var previous_snapshot: ?event_bridge.SessionLifecycleSnapshot = null;
+        if (previous_ctx) |ctx| {
+            previous_snapshot = event_bridge.snapshotLifecycleContext(ctx, self.msg_allocator) catch |err| {
+                next.deinit();
+                self.session_allocator.destroy(next);
+                return err;
+            };
+        }
+        errdefer if (previous_snapshot) |*snap| snap.deinit();
+
         self.emitExtensionSessionShutdown(reason, successor);
         self.unbindAgentEvents();
         self.unbindSessionEvents();
-        old.deactivateLifecycleOnAgentThread();
+        old.shutdownLifecycleOnAgentThread();
         self.session = next;
-        self.activateSessionLifecycle(reason, previous);
+        self.activateSessionLifecycle(reason, if (previous_snapshot) |*snap| .{ .snapshot = snap } else null);
+        if (previous_snapshot) |*snap| snap.deinit();
         old.deinit();
         self.session_allocator.destroy(old);
     }
@@ -555,7 +566,7 @@ pub const RuntimeHost = struct {
     fn emitExtensionSessionStart(
         self: *RuntimeHost,
         reason: event_bridge.SessionLifecycleReason,
-        previous: ?event_bridge.SessionLifecycleContext,
+        previous: ?event_bridge.LifecyclePeer,
     ) void {
         const current = lifecycleContext(self.session) orelse return;
         event_bridge.dispatchSessionStart(current, previous, reason) catch |err| {

@@ -139,9 +139,119 @@ pub const SessionLifecycleContext = struct {
     session_file: ?[]const u8 = null,
 };
 
+pub const SessionLifecycleSnapshot = struct {
+    generation: runner_mod.Generation,
+    workspace_id: []const u8,
+    session_id: []const u8,
+    session_file: ?[]const u8 = null,
+    loaded_extensions: []const resource_types.ExtensionProvenance,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *SessionLifecycleSnapshot) void {
+        for (self.loaded_extensions) |prov| {
+            self.allocator.free(prov.runtime_root_id);
+            self.allocator.free(prov.extension_id);
+            self.allocator.free(prov.state_owner_id);
+        }
+        self.allocator.free(self.loaded_extensions);
+        self.allocator.free(self.workspace_id);
+        self.allocator.free(self.session_id);
+        if (self.session_file) |path| self.allocator.free(path);
+    }
+
+    pub fn findLoadedExtensionById(self: *const SessionLifecycleSnapshot, extension_id: []const u8) ?resource_types.ExtensionProvenance {
+        for (self.loaded_extensions) |provenance| {
+            if (std.mem.eql(u8, provenance.extension_id, extension_id)) return provenance;
+        }
+        return null;
+    }
+};
+
+pub const LifecyclePeer = union(enum) {
+    live: SessionLifecycleContext,
+    snapshot: *SessionLifecycleSnapshot,
+
+    pub fn workspaceId(self: LifecyclePeer) []const u8 {
+        return switch (self) {
+            .live => |ctx| ctx.workspace_id,
+            .snapshot => |snap| snap.workspace_id,
+        };
+    }
+
+    pub fn sessionId(self: LifecyclePeer) []const u8 {
+        return switch (self) {
+            .live => |ctx| ctx.session_id,
+            .snapshot => |snap| snap.session_id,
+        };
+    }
+
+    pub fn sessionFile(self: LifecyclePeer) ?[]const u8 {
+        return switch (self) {
+            .live => |ctx| ctx.session_file,
+            .snapshot => |snap| snap.session_file,
+        };
+    }
+
+    pub fn generation(self: LifecyclePeer) runner_mod.Generation {
+        return switch (self) {
+            .live => |ctx| ctx.runner.generation,
+            .snapshot => |snap| snap.generation,
+        };
+    }
+
+    pub fn findLoadedExtensionById(self: LifecyclePeer, extension_id: []const u8) ?resource_types.ExtensionProvenance {
+        return switch (self) {
+            .live => |ctx| ctx.runner.findLoadedExtensionById(extension_id),
+            .snapshot => |snap| snap.findLoadedExtensionById(extension_id),
+        };
+    }
+};
+
+pub fn snapshotLifecycleContext(ctx: SessionLifecycleContext, allocator: std.mem.Allocator) !SessionLifecycleSnapshot {
+    const workspace_id = try allocator.dupe(u8, ctx.workspace_id);
+    errdefer allocator.free(workspace_id);
+
+    const session_id = try allocator.dupe(u8, ctx.session_id);
+    errdefer allocator.free(session_id);
+
+    const session_file = if (ctx.session_file) |path| try allocator.dupe(u8, path) else null;
+    errdefer if (session_file) |path| allocator.free(path);
+
+    const loaded_extensions = try allocator.alloc(resource_types.ExtensionProvenance, ctx.runner.loaded_extensions.items.len);
+    errdefer allocator.free(loaded_extensions);
+
+    var i: usize = 0;
+    errdefer {
+        for (loaded_extensions[0..i]) |prov| {
+            allocator.free(prov.runtime_root_id);
+            allocator.free(prov.extension_id);
+            allocator.free(prov.state_owner_id);
+        }
+    }
+
+    for (ctx.runner.loaded_extensions.items, 0..) |prov, idx| {
+        loaded_extensions[idx] = .{
+            .runtime_root_id = try allocator.dupe(u8, prov.runtime_root_id),
+            .extension_id = try allocator.dupe(u8, prov.extension_id),
+            .state_owner_id = try allocator.dupe(u8, prov.state_owner_id),
+            .root_kind = prov.root_kind,
+        };
+        i += 1;
+    }
+
+    return .{
+        .generation = ctx.runner.generation,
+        .workspace_id = workspace_id,
+        .session_id = session_id,
+        .session_file = session_file,
+        .loaded_extensions = loaded_extensions,
+        .allocator = allocator,
+    };
+}
+
 pub fn dispatchSessionStart(
     current: SessionLifecycleContext,
-    previous: ?SessionLifecycleContext,
+    previous: ?LifecyclePeer,
     reason: SessionLifecycleReason,
 ) !void {
     try dispatchSessionLifecycle(.session_start, current, previous, reason);
@@ -152,7 +262,7 @@ pub fn dispatchSessionShutdown(
     next: ?SessionLifecycleContext,
     reason: SessionLifecycleReason,
 ) !void {
-    try dispatchSessionLifecycle(.session_shutdown, current, next, reason);
+    try dispatchSessionLifecycle(.session_shutdown, current, if (next) |n| .{ .live = n } else null, reason);
 }
 
 pub fn dispatchSessionBeforeSwitch(
@@ -176,7 +286,7 @@ pub fn dispatchSessionBeforeSwitch(
 fn dispatchSessionLifecycle(
     kind: event_registry.EventKind,
     current: SessionLifecycleContext,
-    related: ?SessionLifecycleContext,
+    related: ?LifecyclePeer,
     reason: SessionLifecycleReason,
 ) !void {
     const state = current.runner.lua_state orelse return error.NoState;
@@ -203,7 +313,7 @@ fn pushSessionLifecyclePayload(
     reason: SessionLifecycleReason,
     provenance: resource_types.ExtensionProvenance,
     current: SessionLifecycleContext,
-    related: ?SessionLifecycleContext,
+    related: ?LifecyclePeer,
 ) !void {
     c.lua_createtable(L, 0, 4);
 
@@ -219,12 +329,12 @@ fn pushSessionLifecyclePayload(
     _ = c.lua_pushlstring(L, reason_str.ptr, reason_str.len);
     c.lua_setfield(L, -2, "reason");
 
-    context_mod.pushBinding(L, provenance, current.runner, current.workspace_id, current.session_id, current.session_file);
+    context_mod.pushBinding(L, provenance, current.runner.generation, current.workspace_id, current.session_id, current.session_file);
     c.lua_setfield(L, -2, "binding");
 
     if (related) |peer| {
-        if (peer.runner.findLoadedExtensionById(provenance.extension_id)) |peer_provenance| {
-            context_mod.pushBinding(L, peer_provenance, peer.runner, peer.workspace_id, peer.session_id, peer.session_file);
+        if (peer.findLoadedExtensionById(provenance.extension_id)) |peer_provenance| {
+            context_mod.pushBinding(L, peer_provenance, peer.generation(), peer.workspaceId(), peer.sessionId(), peer.sessionFile());
             c.lua_setfield(L, -2, switch (kind) {
                 .session_start => "previous",
                 .session_shutdown => "next",

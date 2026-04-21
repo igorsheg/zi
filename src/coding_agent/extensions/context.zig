@@ -96,7 +96,7 @@ fn pushContextBinding(
     switch (runner.runtime) {
         .bound => |bound| {
             const binding = bound.get_binding_info(bound.session);
-            pushBinding(L, prov, runner, binding.workspace_id, binding.session_id, binding.session_file);
+            pushBinding(L, prov, runner.generation, binding.workspace_id, binding.session_id, binding.session_file);
         },
         .stub => c.lua_pushnil(L),
     }
@@ -105,7 +105,7 @@ fn pushContextBinding(
 pub fn pushBinding(
     L: *c.lua_State,
     provenance: resource_types.ExtensionProvenance,
-    runner: *const runner_mod.ExtensionRunner,
+    generation: runner_mod.Generation,
     workspace_id: []const u8,
     session_id: []const u8,
     session_file: ?[]const u8,
@@ -118,10 +118,10 @@ pub fn pushBinding(
     _ = c.lua_pushlstring(L, provenance.state_owner_id.ptr, provenance.state_owner_id.len);
     c.lua_setfield(L, -2, "state_owner_id");
 
-    c.lua_pushinteger(L, @intCast(runner.generation));
+    c.lua_pushinteger(L, @intCast(generation));
     c.lua_setfield(L, -2, "generation_id");
 
-    pushNamespaceId(L, provenance.state_owner_id, runner.generation);
+    pushNamespaceId(L, provenance.state_owner_id, generation);
     c.lua_setfield(L, -2, "namespace_id");
 
     _ = c.lua_pushlstring(L, workspace_id.ptr, workspace_id.len);

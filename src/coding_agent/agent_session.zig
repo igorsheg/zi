@@ -272,9 +272,8 @@ pub const AgentSession = struct {
     /// skips the blocks.
     ///
     /// Idempotent. Unsubscribes the extension bridge and unbinds the
-    /// runtime, but keeps the runner/lua state alive so replacement
-    /// flows can still read old-generation provenance during the new
-    /// generation's `session_start` publication.
+    /// runtime. Replacement flows snapshot provenance before calling
+    /// this so `session_start` payloads remain truthful.
     pub fn deactivateLifecycleOnAgentThread(self: *AgentSession) void {
         self.deactivateLifecycle();
     }
