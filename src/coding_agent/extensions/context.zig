@@ -157,7 +157,7 @@ fn pushMethod(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, func: *const
     c.lua_pushcclosure(L, func, 1);
 }
 
-fn pushModel(L: *c.lua_State, model: agent_protocol.Model) void {
+pub fn pushModel(L: *c.lua_State, model: agent_protocol.Model) void {
     c.lua_createtable(L, 0, 6);
     _ = c.lua_pushlstring(L, model.id.ptr, model.id.len);
     c.lua_setfield(L, -2, "id");

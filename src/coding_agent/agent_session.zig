@@ -295,6 +295,7 @@ pub const AgentSession = struct {
             return .{ .no_auth = model };
         }
 
+        const previous_model = self.agent.modelValue();
         const previous_thinking = self.agent.thinkingLevel();
         const next_thinking = clampThinkingLevelForModel(previous_thinking, model);
         const thinking_changed = next_thinking != previous_thinking;
@@ -310,6 +311,13 @@ pub const AgentSession = struct {
         if (thinking_changed) {
             self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(next_thinking));
         }
+
+        if (self._extension_runner) |runner| {
+            if (!ai.models.modelsAreEqual(previous_model, model)) {
+                event_bridge.dispatchModelSelect(runner, model, previous_model, "set");
+            }
+        }
+
         return .{ .success = .{
             .model = model,
             .thinking_level = next_thinking,

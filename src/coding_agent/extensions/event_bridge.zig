@@ -267,6 +267,57 @@ pub fn dispatchSessionShutdown(
     try dispatchSessionLifecycle(.session_shutdown, current, if (next) |n| .{ .live = n } else null, reason, fork_parent_entry_id);
 }
 
+/// Dispatch `model_select` to the extension observer chain.
+/// Called from the successful model-change path in `AgentSession.trySetModel`.
+/// No-op if the runner has no lua_state or no handlers are registered.
+/// Observer failures are logged and swallowed per pi-mono doctrine.
+pub fn dispatchModelSelect(
+    runner: *runner_mod.ExtensionRunner,
+    model: agent_protocol.Model,
+    previous_model: ?agent_protocol.Model,
+    source: []const u8,
+) void {
+    const state = runner.lua_state orelse return;
+    runner.assertOnLuaThread();
+
+    const handlers = runner.event_registry.handlers(.model_select);
+    if (handlers.len == 0) return;
+
+    pushModelSelectPayload(state.L, model, previous_model, source) catch |err| {
+        log.warn("model_select payload build failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer c.lua_pop(state.L, 1);
+
+    dispatch.dispatchObserver(state, runner, .model_select, -1) catch |err| {
+        log.warn("model_select dispatch failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn pushModelSelectPayload(
+    L: *c.lua_State,
+    model: agent_protocol.Model,
+    previous_model: ?agent_protocol.Model,
+    source: []const u8,
+) !void {
+    c.lua_createtable(L, 0, 4);
+    _ = c.lua_pushlstring(L, "model_select".ptr, "model_select".len);
+    c.lua_setfield(L, -2, "type");
+
+    context_mod.pushModel(L, model);
+    c.lua_setfield(L, -2, "model");
+
+    if (previous_model) |pm| {
+        context_mod.pushModel(L, pm);
+    } else {
+        c.lua_pushnil(L);
+    }
+    c.lua_setfield(L, -2, "previous_model");
+
+    _ = c.lua_pushlstring(L, source.ptr, source.len);
+    c.lua_setfield(L, -2, "source");
+}
+
 pub fn dispatchSessionBeforeSwitch(
     current: SessionLifecycleContext,
     next: ?SessionLifecycleContext,
@@ -1090,5 +1141,61 @@ test "lifecycle observer delivers null-provenance handler with nil binding" {
     // Verify the handler ran and saw nil binding.
     try state.doString(
         \\assert(_received_binding == "NIL", "expected binding nil, got " .. tostring(_received_binding))
+    , "verify");
+}
+
+test "dispatchModelSelect exposes model, previous_model, and source" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\_seen_model = nil
+        \\_seen_prev = nil
+        \\_seen_source = nil
+        \\zi.on("model_select", function(event, ctx)
+        \\  _seen_model = event.model.id
+        \\  _seen_prev = event.previous_model and event.previous_model.id or nil
+        \\  _seen_source = event.source
+        \\end)
+    , "subscribe");
+
+    const prev_model = agent_protocol.Model{
+        .id = "prev-model",
+        .name = "Previous",
+        .api = .{ .openai_completions = {} },
+        .provider = .{ .openai = {} },
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1000,
+        .max_tokens = 100,
+    };
+
+    const next_model = agent_protocol.Model{
+        .id = "next-model",
+        .name = "Next",
+        .api = .{ .anthropic_messages = {} },
+        .provider = .{ .anthropic = {} },
+        .base_url = "",
+        .reasoning = true,
+        .input = &.{ .text, .image },
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 2000,
+        .max_tokens = 200,
+    };
+
+    dispatchModelSelect(&runner, next_model, prev_model, "set");
+
+    try state.doString(
+        \\assert(_seen_model == "next-model", "model: " .. tostring(_seen_model))
+        \\assert(_seen_prev == "prev-model", "previous: " .. tostring(_seen_prev))
+        \\assert(_seen_source == "set", "source: " .. tostring(_seen_source))
     , "verify");
 }
