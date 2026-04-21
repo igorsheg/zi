@@ -2733,7 +2733,10 @@ pub const Interactive = struct {
 
     fn handleNewSession(self: *Interactive) void {
         self.runtime_host.newSession() catch |err| {
-            const msg = std.fmt.allocPrint(self.msg_allocator, "failed to start new session: {s}", .{@errorName(err)}) catch return;
+            const msg = switch (err) {
+                error.SessionBeforeSwitchBlocked => self.msg_allocator.dupe(u8, "session switch blocked by extension") catch return,
+                else => std.fmt.allocPrint(self.msg_allocator, "failed to start new session: {s}", .{@errorName(err)}) catch return,
+            };
             _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
@@ -2757,6 +2760,7 @@ pub const Interactive = struct {
         const result = self.runtime_host.resumeSession(path, restore_session_model) catch |err| {
             const message = switch (err) {
                 error.SessionAlreadyActive => "session is already active",
+                error.SessionBeforeSwitchBlocked => "session switch blocked by extension",
                 else => "failed to load session",
             };
             const msg = self.msg_allocator.dupe(u8, message) catch return;

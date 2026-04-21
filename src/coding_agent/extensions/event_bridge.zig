@@ -155,6 +155,24 @@ pub fn dispatchSessionShutdown(
     try dispatchSessionLifecycle(.session_shutdown, current, next, reason);
 }
 
+pub fn dispatchSessionBeforeSwitch(
+    current: SessionLifecycleContext,
+    next: ?SessionLifecycleContext,
+    reason: SessionLifecycleReason,
+    allocator: std.mem.Allocator,
+) !dispatch.CancelResult {
+    const state = current.runner.lua_state orelse return error.NoState;
+    current.runner.assertOnLuaThread();
+
+    const handlers = current.runner.event_registry.handlers(.session_before_switch);
+    if (handlers.len == 0) return .{ .blocked = false };
+
+    try pushSessionBeforeSwitchPayload(state.L, reason, current, next);
+    defer c.lua_pop(state.L, 1);
+
+    return dispatch.dispatchCancellable(state, current.runner, .session_before_switch, -1, allocator);
+}
+
 fn dispatchSessionLifecycle(
     kind: event_registry.EventKind,
     current: SessionLifecycleContext,
@@ -205,13 +223,41 @@ fn pushSessionLifecyclePayload(
     c.lua_setfield(L, -2, "binding");
 
     if (related) |peer| {
-        if (peer.runner.findLoadedExtensionByStateOwner(provenance.state_owner_id)) |peer_provenance| {
+        if (peer.runner.findLoadedExtensionById(provenance.extension_id)) |peer_provenance| {
             context_mod.pushBinding(L, peer_provenance, peer.runner, peer.workspace_id, peer.session_id, peer.session_file);
             c.lua_setfield(L, -2, switch (kind) {
                 .session_start => "previous",
                 .session_shutdown => "next",
                 else => unreachable,
             });
+        }
+    }
+}
+
+fn pushSessionBeforeSwitchPayload(
+    L: *c.lua_State,
+    reason: SessionLifecycleReason,
+    current: SessionLifecycleContext,
+    next: ?SessionLifecycleContext,
+) !void {
+    c.lua_createtable(L, 0, 3);
+
+    _ = c.lua_pushlstring(L, "session_before_switch".ptr, "session_before_switch".len);
+    c.lua_setfield(L, -2, "type");
+
+    const reason_str = sessionLifecycleReasonString(reason);
+    _ = c.lua_pushlstring(L, reason_str.ptr, reason_str.len);
+    c.lua_setfield(L, -2, "reason");
+
+    if (current.session_file) |path| {
+        _ = c.lua_pushlstring(L, path.ptr, path.len);
+        c.lua_setfield(L, -2, "current_session_file");
+    }
+
+    if (next) |peer| {
+        if (peer.session_file) |path| {
+            _ = c.lua_pushlstring(L, path.ptr, path.len);
+            c.lua_setfield(L, -2, "target_session_file");
         }
     }
 }

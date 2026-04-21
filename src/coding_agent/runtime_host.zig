@@ -241,16 +241,18 @@ pub const RuntimeHost = struct {
         create_options.thinking_level = self.session.agent.thinkingLevel();
 
         var new_store = try agent_session_mod.SessionStore.createForCwd(self.session_allocator, create_options.cwd);
-        errdefer new_store.deinit();
+        var owns_new_store = true;
+        errdefer if (owns_new_store) new_store.deinit();
         create_options.session_store = new_store;
 
         const next = try self.createOwnedSession(create_options);
+        owns_new_store = false;
         next.session_store.appendRuntimeDefaults(
             json_util.providerToString(next.agent.modelValue().provider),
             next.agent.modelValue().id,
             thinkingLevelToString(next.agent.thinkingLevel()),
         );
-        self.replaceSession(next, .new);
+        try self.replaceSession(next, .new);
     }
 
     pub fn resumeSession(self: *RuntimeHost, path: []const u8, restore_session_model: bool) !ResumeResult {
@@ -286,11 +288,13 @@ pub const RuntimeHost = struct {
         }
 
         var new_store = loaded.takeStore();
-        errdefer new_store.deinit();
+        var owns_new_store = true;
+        errdefer if (owns_new_store) new_store.deinit();
         create_options.session_store = new_store;
 
         const next = try self.createOwnedSession(create_options);
-        self.replaceSession(next, .@"resume");
+        owns_new_store = false;
+        try self.replaceSession(next, .@"resume");
         return .{ .restore_warning = restore_warning };
     }
 
@@ -518,10 +522,26 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         next: *AgentSession,
         reason: event_bridge.SessionLifecycleReason,
-    ) void {
+    ) !void {
         const old = self.session;
         const previous = lifecycleContext(old);
         const successor = lifecycleContext(next);
+
+        if (previous) |ctx| {
+            var cancel_result = event_bridge.dispatchSessionBeforeSwitch(ctx, successor, reason, self.msg_allocator) catch |err| {
+                next.deinit();
+                self.session_allocator.destroy(next);
+                return err;
+            };
+            if (cancel_result.blocked) {
+                next.deinit();
+                self.session_allocator.destroy(next);
+                cancel_result.deinit(self.msg_allocator);
+                return error.SessionBeforeSwitchBlocked;
+            }
+            cancel_result.deinit(self.msg_allocator);
+        }
+
         self.emitExtensionSessionShutdown(reason, successor);
         self.unbindAgentEvents();
         self.unbindSessionEvents();
@@ -951,9 +971,9 @@ test "runtime host emits truthful session lifecycle events across startup new re
     try expectLine.run(try parse.line(lines.items[4]), .{ .ext = "explicit", .event_type = "session_start", .reason = "new", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
     try expectLine.run(try parse.line(lines.items[5]), .{ .ext = "project", .event_type = "session_start", .reason = "new", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
     try expectLine.run(try parse.line(lines.items[6]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = workspace_b });
-    try expectLine.run(try parse.line(lines.items[7]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "resume", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = "" });
+    try expectLine.run(try parse.line(lines.items[7]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "resume", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = workspace_b });
     try expectLine.run(try parse.line(lines.items[8]), .{ .ext = "explicit", .event_type = "session_start", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = workspace_a });
-    try expectLine.run(try parse.line(lines.items[9]), .{ .ext = "project", .event_type = "session_start", .reason = "resume", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = "" });
+    try expectLine.run(try parse.line(lines.items[9]), .{ .ext = "project", .event_type = "session_start", .reason = "resume", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = workspace_a });
     try expectLine.run(try parse.line(lines.items[10]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "exit", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
     try expectLine.run(try parse.line(lines.items[11]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "exit", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
 }
@@ -1224,4 +1244,39 @@ test "runtime host reports cancelled compaction as aborted without an error stri
     try testing.expect(collector.compaction_ends.items[0].aborted);
     try testing.expect(collector.compaction_ends.items[0].result == null);
     try testing.expect(collector.compaction_ends.items[0].error_message == null);
+}
+
+test "runtime host aborts replacement when session_before_switch is blocked" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".zi/extensions");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".zi/extensions/block.lua",
+        .data =
+        \\return function(zi)
+        \\  zi.on("session_before_switch", function(event, ctx)
+        \\    return { block = true, reason = "test-block" }
+        \\  end)
+        \\end
+        ,
+    });
+
+    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
+    const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
+    var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{});
+    defer host.deinit();
+
+    const before_session_id = try allocator.dupe(u8, host.currentSession().session_store.sessionId());
+    defer allocator.free(before_session_id);
+    const before_generation = host.currentSession().extensionRunner().?.generation;
+
+    try testing.expectError(error.SessionBeforeSwitchBlocked, host.newSession());
+
+    try testing.expectEqualStrings(before_session_id, host.currentSession().session_store.sessionId());
+    try testing.expectEqual(before_generation, host.currentSession().extensionRunner().?.generation);
 }

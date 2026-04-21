@@ -369,6 +369,12 @@ pub const ExtensionRunner = struct {
         }
         return null;
     }
+    pub fn findLoadedExtensionById(self: *const ExtensionRunner, extension_id: []const u8) ?resource_types.ExtensionProvenance {
+        for (self.loaded_extensions.items) |provenance| {
+            if (std.mem.eql(u8, provenance.extension_id, extension_id)) return provenance;
+        }
+        return null;
+    }
 
     /// Assert that the current thread is allowed to call into
     /// `lua_state`. Must be invoked at every Lua entry point
