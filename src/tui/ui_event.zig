@@ -6,12 +6,12 @@ const theme_mod = @import("theme.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
-/// mailbox-owned. Conversation changes cross as full semantic conversation state.
+/// mailbox-owned. Conversation changes cross as mailbox-owned semantic patches.
 pub const UiEvent = union(enum) {
     consumed: void,
 
     // --- conversation transport ---
-    conversation_state: conversation_state_mod.ConversationViewSnapshot,
+    conversation_patch: conversation_state_mod.ConversationPatch,
     queued_snapshot: runtime_host_mod.QueuedMessageSnapshot,
 
     // --- errors / status side effects ---
@@ -127,7 +127,7 @@ pub const UiEvent = union(enum) {
 
     pub fn isSnapshotEvent(self: UiEvent) bool {
         return switch (self) {
-            .conversation_state,
+            .conversation_patch,
             .queued_snapshot,
             .theme_changed,
             .tool_running,
@@ -138,11 +138,11 @@ pub const UiEvent = union(enum) {
         };
     }
 
-    pub fn takeConversationState(self: *UiEvent) ?conversation_state_mod.ConversationViewSnapshot {
+    pub fn takeConversationPatch(self: *UiEvent) ?conversation_state_mod.ConversationPatch {
         return switch (self.*) {
-            .conversation_state => |state| blk: {
+            .conversation_patch => |patch| blk: {
                 self.* = .{ .consumed = {} };
-                break :blk state;
+                break :blk patch;
             },
             else => null,
         };
@@ -162,7 +162,7 @@ pub const UiEvent = union(enum) {
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .consumed => {},
-            .conversation_state => |*state| state.deinit(allocator),
+            .conversation_patch => |*patch| patch.deinit(allocator),
             .queued_snapshot => |*snapshot| snapshot.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
             .theme_changed => {},
@@ -206,27 +206,27 @@ pub const UiEvent = union(enum) {
 
 const testing = std.testing;
 
-test "UiEvent deinit frees conversation state payload" {
+test "UiEvent deinit frees conversation patch payload" {
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
-    var ev = UiEvent{ .conversation_state = .{
+    var ev = UiEvent{ .conversation_patch = .{ .replace_all = .{
         .view = .{
             .committed = shared,
             .in_flight = null,
         },
-    } };
+    } } };
     ev.deinit(testing.allocator);
 }
 
-test "UiEvent takeConversationState disarms later cleanup" {
+test "UiEvent takeConversationPatch disarms later cleanup" {
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
-    var ev = UiEvent{ .conversation_state = .{
+    var ev = UiEvent{ .conversation_patch = .{ .replace_all = .{
         .view = .{
             .committed = shared,
             .in_flight = null,
         },
-    } };
-    var state = ev.takeConversationState().?;
-    defer state.deinit(testing.allocator);
+    } } };
+    var patch = ev.takeConversationPatch().?;
+    defer patch.deinit(testing.allocator);
 
     ev.deinit(testing.allocator);
 }

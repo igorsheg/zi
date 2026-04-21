@@ -44,7 +44,8 @@ pub const AgentSession = struct {
     allocator: std.mem.Allocator,
     tools: []const protocol.AgentTool,
     event_handler: ?RawEventHandler,
-    event_listeners: std.ArrayList(SessionEventHandler),
+    agent_event_listeners: std.ArrayList(RawEventHandler),
+    session_event_listeners: std.ArrayList(SessionEventHandler),
     _subscription_token: ?SubscriptionToken,
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
@@ -110,6 +111,9 @@ pub const AgentSession = struct {
 
     pub const EventHandler = RawEventHandler;
     pub const SessionEvent = session_event_mod.SessionEvent;
+    pub const AgentEventSubscriptionToken = struct {
+        index: usize,
+    };
     pub const EventSubscriptionToken = struct {
         index: usize,
     };
@@ -192,7 +196,8 @@ pub const AgentSession = struct {
             .allocator = allocator,
             .tools = prepared.tools,
             .event_handler = options.event_handler,
-            .event_listeners = .empty,
+            .agent_event_listeners = .empty,
+            .session_event_listeners = .empty,
             ._subscription_token = null,
             ._stream_closure = prepared.stream_closure,
             .auth_storage = options.auth_storage,
@@ -524,7 +529,8 @@ pub const AgentSession = struct {
             self._extension_lua_state = null;
         }
         self.allocator.destroy(self._stream_closure);
-        self.event_listeners.deinit(self.allocator);
+        self.agent_event_listeners.deinit(self.allocator);
+        self.session_event_listeners.deinit(self.allocator);
         self.agent.deinit();
         self.session_store.deinit();
         self.resource_loader.deinit();
@@ -537,19 +543,35 @@ pub const AgentSession = struct {
         }
     }
 
+    pub fn subscribeAgentEvents(
+        self: *AgentSession,
+        func: *const fn (event: protocol.AgentEvent, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque,
+    ) AgentEventSubscriptionToken {
+        const index = self.agent_event_listeners.items.len;
+        self.agent_event_listeners.append(self.allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
+        return .{ .index = index };
+    }
+
+    pub fn unsubscribeAgentEvents(self: *AgentSession, token: AgentEventSubscriptionToken) void {
+        if (token.index < self.agent_event_listeners.items.len) {
+            _ = self.agent_event_listeners.orderedRemove(token.index);
+        }
+    }
+
     pub fn subscribeEvents(
         self: *AgentSession,
         func: *const fn (event: SessionEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque,
     ) EventSubscriptionToken {
-        const index = self.event_listeners.items.len;
-        self.event_listeners.append(self.allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
+        const index = self.session_event_listeners.items.len;
+        self.session_event_listeners.append(self.allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
         return .{ .index = index };
     }
 
     pub fn unsubscribeEvents(self: *AgentSession, token: EventSubscriptionToken) void {
-        if (token.index < self.event_listeners.items.len) {
-            _ = self.event_listeners.orderedRemove(token.index);
+        if (token.index < self.session_event_listeners.items.len) {
+            _ = self.session_event_listeners.orderedRemove(token.index);
         }
     }
 
@@ -561,8 +583,17 @@ pub const AgentSession = struct {
         return self.agent.takeQueuedMessagesAndClear(allocator);
     }
 
-    fn emitSessionEvent(self: *AgentSession, event: SessionEvent) void {
-        for (self.event_listeners.items) |handler| {
+    fn emitAgentEvent(self: *AgentSession, event: protocol.AgentEvent) void {
+        if (self.event_handler) |handler| {
+            handler.func(event, handler.ctx);
+        }
+        for (self.agent_event_listeners.items) |handler| {
+            handler.func(event, handler.ctx);
+        }
+    }
+
+    pub fn emitSessionEvent(self: *AgentSession, event: SessionEvent) void {
+        for (self.session_event_listeners.items) |handler| {
             handler.func(event, handler.ctx);
         }
     }
@@ -756,11 +787,7 @@ pub const AgentSession = struct {
             else => {},
         }
 
-        // Forward to external raw-event handler first.
-        if (self.event_handler) |handler| {
-            handler.func(event, handler.ctx);
-        }
-        self.emitSessionEvent(.{ .agent = event });
+        self.emitAgentEvent(event);
 
         // Session persistence on message_end
         switch (event) {

@@ -649,6 +649,14 @@ pub const SettingsManager = struct {
         return self.settings.extensions;
     }
 
+    pub fn getGlobalExtensionPaths(self: *const SettingsManager) ?[]const []const u8 {
+        return self.global_settings.extensions;
+    }
+
+    pub fn getProjectExtensionPaths(self: *const SettingsManager) ?[]const []const u8 {
+        return self.project_settings.extensions;
+    }
+
     pub fn setExtensionPaths(self: *SettingsManager, paths: []const []const u8) void {
         self.global_settings.extensions = paths;
         self.markModified(.extensions, null);

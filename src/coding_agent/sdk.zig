@@ -39,6 +39,8 @@ pub const CreateOptions = struct {
     system_prompt: ?[]const u8 = null,
     /// ResourceLoader bootstrap input: injected AGENTS/CLAUDE-style files.
     context_files: []const resources.types.AgentsFile = &.{},
+    /// ResourceLoader bootstrap input: explicit extension roots/paths.
+    extension_paths: []const []const u8 = &.{},
     max_tokens: ?u64 = 4096,
     tools: ?[]const tool_def.ToolDefinition = null,
     registry: ?*ai.provider.Registry = null,
@@ -74,6 +76,7 @@ pub fn createAgentSession(
         .cwd = options.cwd,
         .system_prompt = options.system_prompt,
         .context_files = options.context_files,
+        .extension_paths = options.extension_paths,
         .max_tokens = options.max_tokens,
         .tools = options.tools,
         .registry = options.registry,

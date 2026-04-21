@@ -378,6 +378,11 @@ pub const Agent = struct {
         self.clearAllQueues();
     }
 
+    pub fn retainCommitted(self: *const Agent) *SharedCommitted {
+        const mutable: *SharedCommitted = @constCast(self.shared_committed);
+        return mutable.retain();
+    }
+
     pub fn cloneConversationView(self: *const Agent, allocator: std.mem.Allocator) !conversation_state.ConversationView {
         var clone_timer = profile.ScopedTimer.begin(.clone_conversation_view);
         defer clone_timer.end();
@@ -388,13 +393,18 @@ pub const Agent = struct {
             mut.deinit(allocator);
         };
 
-        // retain() needs a mutable handle; the SharedCommitted itself is
-        // immutable post-construction, so this @constCast is safe.
-        const mutable: *SharedCommitted = @constCast(self.shared_committed);
         return .{
-            .committed = mutable.retain(),
+            .committed = self.retainCommitted(),
             .in_flight = in_flight,
         };
+    }
+
+    pub fn cloneInFlightTurn(self: *const Agent, allocator: std.mem.Allocator) !?conversation_state.InFlightTurn {
+        return self.in_flight.freeze(allocator);
+    }
+
+    pub fn currentFrontierLocator(self: *const Agent) ?conversation_state.FrontierLocator {
+        return self.in_flight.currentLocator();
     }
 
     pub fn prompt(self: *Agent, prompts: []const protocol.AgentMessage) !void {
@@ -793,7 +803,7 @@ test "conversation view keeps current turn separate until turn_end" {
     var committed = try agent.cloneConversationView(testing.allocator);
     defer committed.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 3), committed.committed.len);
+    try testing.expectEqual(@as(usize, 3), committed.committed.flat.len);
     try testing.expect(committed.in_flight == null);
 }
 

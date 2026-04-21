@@ -84,6 +84,17 @@ pub const ExtensionSource = enum {
     builtin,
 };
 
+pub const StaticExtensionRoot = struct {
+    source: ExtensionSource,
+    path: []const u8,
+    kind: Kind,
+
+    pub const Kind = enum {
+        runtime_root,
+        synthetic_extension,
+    };
+};
+
 pub const LoadedExtension = struct {
     id: []const u8,
     path: []const u8,

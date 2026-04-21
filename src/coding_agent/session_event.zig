@@ -1,5 +1,4 @@
 const std = @import("std");
-const agent_mod = @import("../agent3/root.zig");
 
 pub const RetryStart = struct {
     attempt: u32,
@@ -42,7 +41,6 @@ pub const CompactionEnd = struct {
 };
 
 pub const SessionEvent = union(enum) {
-    agent: agent_mod.protocol.AgentEvent,
     auto_retry_start: RetryStart,
     auto_retry_wait_finished: void,
     auto_retry_end: RetryEnd,

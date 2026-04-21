@@ -13,7 +13,8 @@ pub const RetryPolicy = session_runner.RetryPolicy;
 pub const CompactionPolicy = session_runner.CompactionPolicy;
 pub const CompactionResult = session_runner.CompactionResult;
 pub const CompactionExecutor = session_runner.CompactionExecutor;
-pub const ConversationStatePublisher = runtime_host.ConversationStatePublisher;
+pub const ConversationPatchPublisher = runtime_host.ConversationPatchPublisher;
+pub const ConversationStatePublisher = ConversationPatchPublisher;
 
 test {
     @import("std").testing.refAllDecls(@This());

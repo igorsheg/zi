@@ -74,6 +74,7 @@ pub const PrepareOptions = struct {
     resource_loader: ?resources.ResourceLoader = null,
     system_prompt: ?[]const u8 = null,
     context_files: []const resources.types.AgentsFile = &.{},
+    extension_paths: []const []const u8 = &.{},
     max_tokens: ?u64 = 4096,
     tools: ?[]const tool_def.ToolDefinition = null,
     registry: ?*ai.provider.Registry = null,
@@ -101,6 +102,7 @@ pub fn prepareSessionDeps(
         .system_prompt = options.system_prompt,
         .append_system_prompt = options.append_system_prompt,
         .injected_agents_files = options.context_files,
+        .explicit_extension_paths = options.extension_paths,
     });
     errdefer {
         var loader = resource_loader;

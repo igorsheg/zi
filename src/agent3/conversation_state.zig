@@ -32,7 +32,20 @@ pub const ConversationViewSnapshot = struct {
     }
 };
 
+pub const FrontierLocator = struct {
+    assistant_timestamp: i64,
+
+    pub fn fromAssistant(assistant: protocol.AssistantMessage) FrontierLocator {
+        return .{ .assistant_timestamp = assistant.timestamp };
+    }
+
+    pub fn eql(self: FrontierLocator, other: FrontierLocator) bool {
+        return self.assistant_timestamp == other.assistant_timestamp;
+    }
+};
+
 pub const InFlightTurn = struct {
+    locator: FrontierLocator,
     assistant: ?protocol.AssistantMessage = null,
     tool_executions: []ToolExecution = &.{},
 
@@ -40,6 +53,41 @@ pub const InFlightTurn = struct {
         if (self.assistant) |*assistant| message_memory.freeAssistantMessage(allocator, assistant);
         for (self.tool_executions) |*tool| tool.deinit(allocator);
         allocator.free(self.tool_executions);
+        self.* = undefined;
+    }
+};
+
+pub const FrontierContentKind = enum {
+    text,
+    thinking,
+};
+
+pub const ConversationPatch = union(enum) {
+    replace_all: ConversationViewSnapshot,
+    append_committed: struct {
+        committed: *SharedCommitted,
+    },
+    replace_frontier: struct {
+        frontier: InFlightTurn,
+    },
+    append_frontier_content: struct {
+        locator: FrontierLocator,
+        kind: FrontierContentKind,
+        content_index: usize,
+        delta: []u8,
+    },
+    commit_frontier: struct {
+        locator: FrontierLocator,
+    },
+
+    pub fn deinit(self: *ConversationPatch, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .replace_all => |*snapshot| snapshot.deinit(allocator),
+            .append_committed => |payload| payload.committed.release(),
+            .replace_frontier => |*payload| payload.frontier.deinit(allocator),
+            .append_frontier_content => |payload| allocator.free(payload.delta),
+            .commit_frontier => {},
+        }
         self.* = undefined;
     }
 };
@@ -117,6 +165,7 @@ pub const ToolExecution = struct {
 
 pub const InFlightState = struct {
     allocator: std.mem.Allocator,
+    locator: ?FrontierLocator = null,
     assistant: ?protocol.AssistantMessage = null,
     assistant_streaming: bool = false,
     tool_executions: std.ArrayList(ToolExecution) = .empty,
@@ -219,10 +268,15 @@ pub const InFlightState = struct {
 
     pub fn clear(self: *InFlightState) void {
         if (self.assistant) |*assistant| message_memory.freeAssistantMessage(self.allocator, assistant);
+        self.locator = null;
         self.assistant = null;
         self.assistant_streaming = false;
         for (self.tool_executions.items) |*tool| tool.deinit(self.allocator);
         self.tool_executions.clearRetainingCapacity();
+    }
+
+    pub fn currentLocator(self: *const InFlightState) ?FrontierLocator {
+        return self.locator;
     }
 
     pub fn isActive(self: *const InFlightState) bool {
@@ -231,6 +285,7 @@ pub const InFlightState = struct {
 
     pub fn replaceAssistant(self: *InFlightState, assistant: protocol.AssistantMessage) void {
         if (self.assistant) |*old| message_memory.freeAssistantMessage(self.allocator, old);
+        if (self.locator == null) self.locator = FrontierLocator.fromAssistant(assistant);
         self.assistant = message_memory.cloneAssistantMessage(self.allocator, assistant) catch null;
     }
 
@@ -313,6 +368,7 @@ pub const InFlightState = struct {
         }
 
         return .{
+            .locator = self.locator orelse FrontierLocator.fromAssistant(assistant.?),
             .assistant = assistant,
             .tool_executions = tool_executions,
         };

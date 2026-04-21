@@ -163,13 +163,7 @@ pub const ProjectionState = struct {
             !committedUserHistoryIsPrefix(previous.view.committed.flat, owned.view.committed.flat)
         else
             false;
-
-        const can_reuse_committed_cache = blk: {
-            const cache = self.committed_cache orelse break :blk false;
-            if (cache.committed != owned.view.committed) break :blk false;
-            if (cache.retry_attempt != options.retry_attempt) break :blk false;
-            break :blk true;
-        };
+        const can_reuse_committed_cache = self.canReuseCommittedCacheFor(owned.view.committed, options.retry_attempt);
 
         if (self.view_snapshot) |*s| s.deinit(self.allocator);
         self.view_snapshot = owned;
@@ -180,6 +174,166 @@ pub const ProjectionState = struct {
             editor.clearHistory();
             seedHistoryFromCommittedMessages(editor, self.view_snapshot.?.view.committed.flat);
         }
+    }
+
+    pub fn applyPatch(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        patch: *conversation_state_mod.ConversationPatch,
+        options: RebuildOptions,
+    ) void {
+        switch (patch.*) {
+            .replace_all => |*snapshot| {
+                self.replaceViewSnapshot(transcript, editor, resolver, snapshot, options);
+                patch.* = undefined;
+            },
+            .append_committed => |payload| {
+                const committed = payload.committed;
+                patch.* = undefined;
+                self.replaceCommittedPointer(transcript, editor, resolver, committed, options);
+            },
+            .replace_frontier => |*payload| {
+                self.replaceFrontier(transcript, editor, resolver, &payload.frontier, options);
+                patch.* = undefined;
+            },
+            .append_frontier_content => |payload| {
+                const locator = payload.locator;
+                const kind = payload.kind;
+                const content_index = payload.content_index;
+                const delta = payload.delta;
+                patch.* = undefined;
+                defer self.allocator.free(delta);
+                self.appendFrontierContent(transcript, editor, resolver, locator, kind, content_index, delta, options);
+            },
+            .commit_frontier => |payload| {
+                patch.* = undefined;
+                self.commitFrontier(transcript, editor, resolver, payload.locator, options);
+            },
+        }
+    }
+
+    fn canReuseCommittedCache(self: *const ProjectionState, retry_attempt: u32) bool {
+        const snapshot = self.view_snapshot orelse return false;
+        return self.canReuseCommittedCacheFor(snapshot.view.committed, retry_attempt);
+    }
+
+    fn canReuseCommittedCacheFor(
+        self: *const ProjectionState,
+        committed: *conversation_state_mod.SharedCommitted,
+        retry_attempt: u32,
+    ) bool {
+        const cache = self.committed_cache orelse return false;
+        if (cache.committed != committed) return false;
+        if (cache.retry_attempt != retry_attempt) return false;
+        return true;
+    }
+
+    fn replaceCommittedPointer(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        committed: *conversation_state_mod.SharedCommitted,
+        options: RebuildOptions,
+    ) void {
+        if (self.view_snapshot == null) {
+            self.view_snapshot = .{ .view = .{
+                .committed = committed,
+                .in_flight = null,
+            } };
+            self.reconcileView(transcript, editor, resolver, options, false);
+            return;
+        }
+
+        const original = self.view_snapshot.?.view.committed;
+        self.view_snapshot.?.view.committed = committed;
+        original.release();
+        self.reconcileView(transcript, editor, resolver, options, false);
+    }
+
+    fn replaceFrontier(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        frontier: *conversation_state_mod.InFlightTurn,
+        options: RebuildOptions,
+    ) void {
+        var owned = frontier.*;
+        frontier.* = undefined;
+        errdefer owned.deinit(self.allocator);
+
+        if (self.view_snapshot == null) {
+            const shared = conversation_state_mod.SharedCommitted.empty(self.allocator) catch return;
+            self.view_snapshot = .{ .view = .{
+                .committed = shared,
+                .in_flight = null,
+            } };
+        }
+
+        if (self.view_snapshot.?.view.in_flight) |*current| current.deinit(self.allocator);
+        self.view_snapshot.?.view.in_flight = owned;
+        self.reconcileView(transcript, editor, resolver, options, self.canReuseCommittedCache(options.retry_attempt));
+    }
+
+    fn appendFrontierContent(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        locator: conversation_state_mod.FrontierLocator,
+        kind: conversation_state_mod.FrontierContentKind,
+        content_index: usize,
+        delta: []const u8,
+        options: RebuildOptions,
+    ) void {
+        if (self.view_snapshot == null) return;
+        const snapshot = &self.view_snapshot.?;
+        var turn = if (snapshot.view.in_flight) |*turn| turn else return;
+        if (!turn.locator.eql(locator)) return;
+        var assistant = if (turn.assistant) |*assistant| assistant else return;
+        if (content_index >= assistant.content.len) return;
+
+        const block: *agent_protocol.AssistantMessage.AssistantContentBlock = @constCast(&assistant.content[content_index]);
+        switch (block.*) {
+            .text => {
+                if (kind != .text) return;
+                const existing = block.text.text;
+                const next = appendOwnedBytes(self.allocator, existing, delta) catch return;
+                self.allocator.free(existing);
+                block.text.text = next;
+            },
+            .thinking => {
+                if (kind != .thinking) return;
+                const existing = block.thinking.thinking;
+                const next = appendOwnedBytes(self.allocator, existing, delta) catch return;
+                self.allocator.free(existing);
+                block.thinking.thinking = next;
+            },
+            else => return,
+        }
+
+        self.reconcileView(transcript, editor, resolver, options, self.canReuseCommittedCache(options.retry_attempt));
+    }
+
+    fn commitFrontier(
+        self: *ProjectionState,
+        transcript: *Transcript,
+        editor: EditorInterface,
+        resolver: ToolRendererResolver,
+        locator: conversation_state_mod.FrontierLocator,
+        options: RebuildOptions,
+    ) void {
+        if (self.view_snapshot == null) return;
+        const snapshot = &self.view_snapshot.?;
+        if (snapshot.view.in_flight) |current| {
+            if (!current.locator.eql(locator)) return;
+        } else return;
+        snapshot.view.in_flight.?.deinit(self.allocator);
+        snapshot.view.in_flight = null;
+        self.reconcileView(transcript, editor, resolver, options, self.canReuseCommittedCache(options.retry_attempt));
     }
 
     fn reconcileView(
@@ -265,10 +419,6 @@ pub const ProjectionState = struct {
     ) void {
         var owned = snapshot.*;
         snapshot.* = undefined;
-        // Drop queued snapshots that are older than what we've already
-        // projected. With two producers (TUI-thread immediate publishes
-        // and agent-thread drain publishes), a stale snapshot delivered
-        // after a newer one would otherwise undo visible state.
         if (self.queued_snapshot) |current| {
             if (owned.version <= current.version) {
                 owned.deinit(self.allocator);
@@ -293,6 +443,13 @@ pub const ProjectionState = struct {
         self.replaceQueuedSnapshot(transcript, editor, resolver, queued, options);
     }
 };
+
+fn appendOwnedBytes(allocator: std.mem.Allocator, existing: []const u8, delta: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, existing.len + delta.len);
+    @memcpy(out[0..existing.len], existing);
+    @memcpy(out[existing.len..], delta);
+    return out;
+}
 
 pub fn rebuildFromSnapshots(
     transcript: *Transcript,
@@ -1935,6 +2092,7 @@ test "rebuildFromSnapshots reconstructs active assistant and live tool execution
         .is_partial = true,
     };
     state.view.in_flight = .{
+        .locator = .{ .assistant_timestamp = assistant.assistant.timestamp },
         .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant.assistant),
         .tool_executions = live_tools,
     };
@@ -1974,6 +2132,7 @@ test "rebuildFromSnapshots respects hidden thinking labels for active assistant 
     var state = try ownedViewSnapshotFromMessages(testing.allocator, &.{});
     defer state.deinit(testing.allocator);
     state.view.in_flight = .{
+        .locator = .{ .assistant_timestamp = assistant.assistant.timestamp },
         .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant.assistant),
         .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
     };
@@ -2130,6 +2289,7 @@ test "replaceViewSnapshot reuses committed prefix on same committed pointer" {
     };
     const assistant_a = makeAssistantMessage(&assistant_a_content, .toolUse, null);
     view_a.view.in_flight = .{
+        .locator = .{ .assistant_timestamp = assistant_a.assistant.timestamp },
         .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant_a.assistant),
         .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
     };
@@ -2146,6 +2306,7 @@ test "replaceViewSnapshot reuses committed prefix on same committed pointer" {
     };
     const assistant_b = makeAssistantMessage(&assistant_b_content, .toolUse, null);
     view_b.view.in_flight = .{
+        .locator = .{ .assistant_timestamp = assistant_b.assistant.timestamp },
         .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant_b.assistant),
         .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
     };
@@ -2155,6 +2316,86 @@ test "replaceViewSnapshot reuses committed prefix on same committed pointer" {
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
     try testing.expectEqual(committed_row_ptr, transcript.items.items[0].deinit_ctx);
     try testing.expect(assistant_row_v1 != transcript.items.items[1].deinit_ctx);
+}
+
+test "applyPatch appends frontier text without replacing committed rows" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "work" } },
+    };
+    const assistant = makeAssistantMessage(&assistant_content, .toolUse, null);
+    const locator: conversation_state_mod.FrontierLocator = .{ .assistant_timestamp = assistant.assistant.timestamp };
+
+    var view = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    view.view.in_flight = .{
+        .locator = locator,
+        .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant.assistant),
+        .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view, .{ .theme = themes_builtin.dark() });
+
+    const committed_row_ptr = transcript.items.items[0].deinit_ctx;
+    const active_row_ptr = transcript.items.items[1].deinit_ctx;
+
+    var patch = conversation_state_mod.ConversationPatch{ .append_frontier_content = .{
+        .locator = locator,
+        .kind = .text,
+        .content_index = 0,
+        .delta = try testing.allocator.dupe(u8, "ing"),
+    } };
+    projection.applyPatch(&transcript, editor, tool_display_mod.empty_resolver, &patch, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(committed_row_ptr, transcript.items.items[0].deinit_ctx);
+    try testing.expect(active_row_ptr != transcript.items.items[1].deinit_ctx);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
+    defer testing.allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "working") != null);
+}
+
+test "applyPatch appends committed assistant then clears committed frontier" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "working" } },
+    };
+    const assistant_message = makeAssistantMessage(&assistant_content, .stop, null);
+    const locator: conversation_state_mod.FrontierLocator = .{ .assistant_timestamp = assistant_message.assistant.timestamp };
+
+    var view = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
+    view.view.in_flight = .{
+        .locator = locator,
+        .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant_message.assistant),
+        .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view, .{ .theme = themes_builtin.dark() });
+
+    const committed = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{assistant_message});
+    var append_patch = conversation_state_mod.ConversationPatch{ .append_committed = .{ .committed = committed } };
+    projection.applyPatch(&transcript, editor, tool_display_mod.empty_resolver, &append_patch, .{ .theme = themes_builtin.dark() });
+
+    var commit_patch = conversation_state_mod.ConversationPatch{ .commit_frontier = .{ .locator = locator } };
+    projection.applyPatch(&transcript, editor, tool_display_mod.empty_resolver, &commit_patch, .{ .theme = themes_builtin.dark() });
+
+    try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+    try testing.expect(projection.view_snapshot.?.view.in_flight == null);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
+    defer testing.allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "working") != null);
 }
 
 test "replaceViewSnapshot invalidates committed cache when committed pointer changes" {

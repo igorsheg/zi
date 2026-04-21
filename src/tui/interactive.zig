@@ -68,7 +68,7 @@ const MouseCapture = union(enum) {
 const AgentSession = coding_agent_mod.AgentSession;
 const SessionEvent = coding_agent_mod.session_event.SessionEvent;
 const RuntimeHost = coding_agent_mod.RuntimeHost;
-const ConversationStatePublisher = coding_agent_mod.ConversationStatePublisher;
+const ConversationPatchPublisher = coding_agent_mod.ConversationPatchPublisher;
 const json_util = @import("../ai/json_util.zig");
 const SettingsAction = enum {
     open_thinking,
@@ -517,6 +517,7 @@ pub const Interactive = struct {
     request_queue: RequestQueue,
     model_registry: ?*coding_agent_mod.ModelRegistry,
     memory_diagnostics: *const memory_debug.Diagnostics,
+    agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
     session_event_token: ?RuntimeHost.EventSubscriptionToken = null,
     agent_thread: ?std.Thread = null,
     running: bool = true,
@@ -622,6 +623,10 @@ pub const Interactive = struct {
             self.request_queue.close();
         }
 
+        if (self.agent_event_token) |token| {
+            self.runtime_host.unsubscribeAgentEvents(token);
+            self.agent_event_token = null;
+        }
         if (self.session_event_token) |token| {
             self.runtime_host.unsubscribeEvents(token);
             self.session_event_token = null;
@@ -689,6 +694,7 @@ pub const Interactive = struct {
         self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
         self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
         self.active_editor.setStatusData(&self.status_data);
+        self.agent_event_token = self.runtime_host.subscribeAgentEvents(&agentEventCallback, @ptrCast(self));
         self.session_event_token = self.runtime_host.subscribeEvents(&sessionEventCallback, @ptrCast(self));
 
         self.detectGitBranch();
@@ -1134,14 +1140,14 @@ pub const Interactive = struct {
     }
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
-        if (ev.takeConversationState()) |state| {
-            var owned_state = state;
+        if (ev.takeConversationPatch()) |patch| {
+            var owned_patch = patch;
             const was_following_bottom = self.transcript.isFollowingBottom();
-            self.conversation_projection.replaceViewSnapshot(
+            self.conversation_projection.applyPatch(
                 &self.transcript,
                 self.active_editor,
                 self.resolver,
-                &owned_state,
+                &owned_patch,
                 .{
                     .theme = self.theme,
                     .retry_attempt = self.retry_attempt,
@@ -1176,7 +1182,7 @@ pub const Interactive = struct {
 
         switch (ev.*) {
             .consumed => {},
-            .conversation_state => unreachable,
+            .conversation_patch => unreachable,
             .queued_snapshot => unreachable,
             .error_message => |e| {
                 self.status_text.setContent(e.message);
@@ -2768,7 +2774,15 @@ pub const Interactive = struct {
     }
 
     fn publishConversationState(self: *Interactive) bool {
-        return self.runtime_host.publishConversationState(self.conversationStatePublisher());
+        return self.runtime_host.publishConversationState(self.conversationPatchPublisher());
+    }
+
+    fn publishConversationFrontier(self: *Interactive) bool {
+        return self.runtime_host.publishConversationFrontier(self.conversationPatchPublisher());
+    }
+
+    fn publishConversationPatchForAgentEvent(self: *Interactive, event: AgentEvent) bool {
+        return self.runtime_host.publishConversationPatchForAgentEvent(event, self.conversationPatchPublisher());
     }
 
     fn publishQueuedSnapshot(self: *Interactive) bool {
@@ -2797,11 +2811,10 @@ pub const Interactive = struct {
         return @intCast(std.time.nanoTimestamp());
     }
 
-    /// Flush the latest conversation snapshot unconditionally. Called on
-    /// hard event boundaries (message_start/end, tool_execution_*,
-    /// turn_end, queue_update, compaction_end).
-    fn flushPendingConversationPublish(self: *Interactive) void {
-        const published = self.publishConversationState();
+    /// Flush the latest conversation patch unconditionally for the
+    /// current raw agent event.
+    fn flushPendingConversationPublish(self: *Interactive, event: AgentEvent) void {
+        const published = self.publishConversationPatchForAgentEvent(event);
         self.publishQueuedSnapshotIfChanged();
         if (published) {
             self.last_conversation_publish_ns = monotonicNowNs();
@@ -2814,19 +2827,24 @@ pub const Interactive = struct {
     /// re-check, or a hard boundary will flush. Accepted edge: a mid-
     /// stream pause longer than the cadence leaves one pending snapshot
     /// deferred until the next event; acceptable for P1.
-    fn maybePublishSoftConversation(self: *Interactive) void {
+    fn maybePublishSoftConversation(self: *Interactive, event: AgentEvent) void {
+        const had_pending = self.conversation_publish_dirty;
         self.conversation_publish_dirty = true;
         const now = monotonicNowNs();
         const elapsed = now -% self.last_conversation_publish_ns;
         if (elapsed < soft_conversation_publish_cadence_ns) return;
-        if (!self.publishConversationState()) return;
+        const published = if (had_pending)
+            self.publishConversationFrontier()
+        else
+            self.publishConversationPatchForAgentEvent(event);
+        if (!published) return;
         self.last_conversation_publish_ns = now;
         self.conversation_publish_dirty = false;
     }
 
-    fn conversationStatePublisher(self: *Interactive) ConversationStatePublisher {
+    fn conversationPatchPublisher(self: *Interactive) ConversationPatchPublisher {
         return .{
-            .func = &publishConversationStateToUi,
+            .func = &publishConversationPatchToUi,
             .ctx = @ptrCast(self),
         };
     }
@@ -2838,9 +2856,9 @@ pub const Interactive = struct {
         };
     }
 
-    fn publishConversationStateToUi(state: agent_mod.conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) bool {
+    fn publishConversationPatchToUi(patch: agent_mod.conversation_state.ConversationPatch, ctx: ?*anyopaque) bool {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        return self.publishSnapshotUiEvent(.{ .conversation_state = state });
+        return self.publishSnapshotUiEvent(.{ .conversation_patch = patch });
     }
 
     fn publishQueuedSnapshotToUi(snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot, ctx: ?*anyopaque) bool {
@@ -2979,37 +2997,40 @@ pub const Interactive = struct {
     fn publishConversationStateForAgentEvent(self: *Interactive, event: AgentEvent) void {
         switch (event) {
             .message_start => |payload| switch (payload.message) {
-                .assistant => self.flushPendingConversationPublish(),
+                .assistant => self.flushPendingConversationPublish(event),
                 else => {},
             },
             // Soft deltas: coalesce at the configured cadence.
             .message_update, .tool_execution_update => {
-                self.maybePublishSoftConversation();
+                self.maybePublishSoftConversation(event);
             },
             // Hard semantic boundaries: flush now so the UI never stalls
             // behind a dropped soft event.
             .message_end, .tool_execution_start, .tool_execution_end, .agent_end => {
-                self.flushPendingConversationPublish();
+                self.flushPendingConversationPublish(event);
             },
             .turn_end => |payload| {
                 if (payload.message != .assistant) return;
-                self.flushPendingConversationPublish();
+                self.flushPendingConversationPublish(event);
             },
             .agent_start, .turn_start => {},
         }
+    }
+
+    /// Raw agent event callback — runs on the AGENT THREAD.
+    fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.publishConversationStateForAgentEvent(event);
+        if (convertAgentUiEvent(event, self.msg_allocator)) |ui_event| {
+            _ = self.publishUiEvent(ui_event);
+        }
+        self.publishStatusSnapshotForAgentEvent(event);
     }
 
     /// Session event callback — runs on the AGENT THREAD.
     fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         switch (event) {
-            .agent => |agent_event| {
-                self.publishConversationStateForAgentEvent(agent_event);
-                if (convertAgentUiEvent(agent_event, self.msg_allocator)) |ui_event| {
-                    _ = self.publishUiEvent(ui_event);
-                }
-                self.publishStatusSnapshotForAgentEvent(agent_event);
-            },
             .auto_retry_start => |retry| {
                 const err_msg = self.msg_allocator.dupe(u8, retry.error_message) catch return;
                 _ = self.publishLifecycleUiEvent(.{ .retry_start = .{
@@ -3039,7 +3060,7 @@ pub const Interactive = struct {
             .compaction_end => |compaction| {
                 self.publishManualCompactionLifecycle(compaction);
                 self.publishStatusSnapshot();
-                self.flushPendingConversationPublish();
+                _ = self.publishConversationState();
             },
         }
     }

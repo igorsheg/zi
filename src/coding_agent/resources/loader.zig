@@ -18,6 +18,7 @@ pub const ResourceLoader = struct {
     system_prompt_source: ?[]const u8,
     append_system_prompt_source: ?[]const u8,
     injected_agents_files: []types.AgentsFile,
+    explicit_extension_paths: []const []const u8,
 
     extensions: types.LoadedExtensions,
     skills: types.LoadedSkills,
@@ -38,6 +39,7 @@ pub const ResourceLoader = struct {
         system_prompt: ?[]const u8 = null,
         append_system_prompt: ?[]const u8 = null,
         injected_agents_files: []const types.AgentsFile = &.{},
+        explicit_extension_paths: []const []const u8 = &.{},
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !ResourceLoader {
@@ -56,6 +58,9 @@ pub const ResourceLoader = struct {
         const injected_agents_files = try dupAgentsFiles(allocator, options.injected_agents_files);
         errdefer freeAgentsFiles(allocator, injected_agents_files);
 
+        const explicit_extension_paths = try dupStringSlice(allocator, options.explicit_extension_paths);
+        errdefer freeStringSlice(allocator, explicit_extension_paths);
+
         var self = ResourceLoader{
             .allocator = allocator,
             .cwd = cwd,
@@ -64,6 +69,7 @@ pub const ResourceLoader = struct {
             .system_prompt_source = system_prompt_source,
             .append_system_prompt_source = append_system_prompt_source,
             .injected_agents_files = injected_agents_files,
+            .explicit_extension_paths = explicit_extension_paths,
             .extensions = .{},
             .skills = .{},
             .prompts = .{},
@@ -87,6 +93,7 @@ pub const ResourceLoader = struct {
         if (self.system_prompt_source) |value| self.allocator.free(value);
         if (self.append_system_prompt_source) |value| self.allocator.free(value);
         freeAgentsFiles(self.allocator, self.injected_agents_files);
+        freeStringSlice(self.allocator, self.explicit_extension_paths);
         self.clearLoadedState();
         freeResourcePaths(self.allocator, self.extended_skill_paths);
         freeResourcePaths(self.allocator, self.extended_prompt_paths);
@@ -159,10 +166,12 @@ pub const ResourceLoader = struct {
     }
 
     fn reloadExtensions(self: *ResourceLoader) !void {
+        const roots = try self.normalizeStaticExtensionRoots();
+        defer freeStaticExtensionRoots(self.allocator, roots);
+
         const discovered = try extension_loader.discover(.{
             .allocator = self.allocator,
-            .cwd = self.cwd,
-            .agent_dir_override = self.agent_dir,
+            .roots = roots,
         });
         defer extension_loader.freeExtensions(self.allocator, discovered);
 
@@ -297,7 +306,72 @@ pub const ResourceLoader = struct {
         }
         return entries;
     }
+
+    fn normalizeStaticExtensionRoots(self: *const ResourceLoader) ![]types.StaticExtensionRoot {
+        var roots: std.ArrayListUnmanaged(types.StaticExtensionRoot) = .empty;
+        errdefer {
+            for (roots.items) |root| self.allocator.free(root.path);
+            roots.deinit(self.allocator);
+        }
+
+        try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, self.explicit_extension_paths, .explicit);
+        if (self.settings_manager) |settings_manager| {
+            try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, settings_manager.getGlobalExtensionPaths() orelse &.{}, .user);
+        }
+        try roots.append(self.allocator, .{
+            .source = .user,
+            .path = try self.allocator.dupe(u8, self.agent_dir),
+            .kind = .runtime_root,
+        });
+        if (self.settings_manager) |settings_manager| {
+            try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, settings_manager.getProjectExtensionPaths() orelse &.{}, .project);
+        }
+
+        const project_dir = try storage.getProjectDir(self.allocator, self.cwd);
+        errdefer self.allocator.free(project_dir);
+        try roots.append(self.allocator, .{
+            .source = .project,
+            .path = project_dir,
+            .kind = .runtime_root,
+        });
+
+        return try roots.toOwnedSlice(self.allocator);
+    }
 };
+
+fn appendStaticExtensionRootPaths(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged(types.StaticExtensionRoot),
+    cwd: []const u8,
+    paths: []const []const u8,
+    source: types.ExtensionSource,
+) !void {
+    for (paths) |path| {
+        const resolved = try resolveResourcePath(allocator, cwd, path);
+        errdefer allocator.free(resolved);
+
+        const kind = try classifyStaticExtensionRoot(allocator, resolved);
+        try roots.append(allocator, .{
+            .source = source,
+            .path = resolved,
+            .kind = kind,
+        });
+    }
+}
+
+fn classifyStaticExtensionRoot(allocator: std.mem.Allocator, path: []const u8) !types.StaticExtensionRoot.Kind {
+    if (std.mem.endsWith(u8, path, ".lua")) return .synthetic_extension;
+
+    const init_path = try std.fs.path.join(allocator, &.{ path, "init.lua" });
+    defer allocator.free(init_path);
+    std.fs.accessAbsolute(init_path, .{}) catch return .runtime_root;
+    return .synthetic_extension;
+}
+
+fn freeStaticExtensionRoots(allocator: std.mem.Allocator, roots: []types.StaticExtensionRoot) void {
+    for (roots) |root| allocator.free(root.path);
+    if (roots.len > 0) allocator.free(roots);
+}
 
 fn resolvePromptInput(allocator: std.mem.Allocator, cwd: []const u8, input: []const u8) ![]const u8 {
     const resolved_path = if (std.fs.path.isAbsolute(input))
@@ -803,6 +877,21 @@ fn freeAgentsFile(allocator: std.mem.Allocator, file: types.AgentsFile) void {
     allocator.free(file.content);
 }
 
+fn dupStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try allocator.alloc([]const u8, values.len);
+    var i: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < i) : (j += 1) allocator.free(out[j]);
+        if (values.len > 0) allocator.free(out);
+    }
+    while (i < values.len) : (i += 1) {
+        out[i] = try allocator.dupe(u8, values[i]);
+    }
+    return out;
+}
+
 fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| allocator.free(value);
     if (values.len > 0) allocator.free(values);
@@ -850,6 +939,74 @@ fn freeResourcePaths(allocator: std.mem.Allocator, paths: []types.ResourcePath) 
         if (entry.metadata.base_dir) |base_dir| allocator.free(base_dir);
     }
     if (paths.len > 0) allocator.free(paths);
+}
+
+test "resource loader normalizes static extension ingress into canonical order" {
+    const allocator = std.testing.allocator;
+
+    var agent_tmp = std.testing.tmpDir(.{});
+    defer agent_tmp.cleanup();
+    try agent_tmp.dir.makePath("extensions");
+    try agent_tmp.dir.writeFile(.{ .sub_path = "extensions/user_global.lua", .data = "-- user global" });
+    const agent_root = try agent_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent_root);
+
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    try project_tmp.dir.makePath("repo/.zi/extensions");
+    try project_tmp.dir.makePath("settings_project_root/extensions");
+    try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/extensions/project_local.lua", .data = "-- project local" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "explicit.lua", .data = "-- explicit" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "settings_user.lua", .data = "-- settings user" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "settings_project_root/extensions/settings_project.lua", .data = "-- settings project" });
+
+    const cwd = try project_tmp.dir.realpathAlloc(allocator, "repo");
+    defer allocator.free(cwd);
+    const explicit_path = try project_tmp.dir.realpathAlloc(allocator, "explicit.lua");
+    defer allocator.free(explicit_path);
+    const settings_user_path = try project_tmp.dir.realpathAlloc(allocator, "settings_user.lua");
+    defer allocator.free(settings_user_path);
+    const settings_project_root = try project_tmp.dir.realpathAlloc(allocator, "settings_project_root");
+    defer allocator.free(settings_project_root);
+
+    var settings_manager = try settings_manager_mod.SettingsManager.inMemory(allocator, null);
+    defer settings_manager.deinit();
+
+    const global_paths = try allocator.alloc([]const u8, 1);
+    defer allocator.free(global_paths);
+    global_paths[0] = settings_user_path;
+    settings_manager.setExtensionPaths(global_paths);
+
+    const project_paths = try allocator.alloc([]const u8, 1);
+    defer allocator.free(project_paths);
+    project_paths[0] = settings_project_root;
+    settings_manager.setProjectExtensionPaths(project_paths);
+
+    var loader = try ResourceLoader.init(allocator, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_root,
+        .settings_manager = &settings_manager,
+        .explicit_extension_paths = &.{explicit_path},
+    });
+    defer loader.deinit();
+
+    const extensions = loader.getExtensions().extensions;
+    try std.testing.expectEqual(@as(usize, 5), extensions.len);
+
+    try std.testing.expectEqualStrings("explicit", extensions[0].id);
+    try std.testing.expectEqual(types.ExtensionSource.explicit, extensions[0].source);
+
+    try std.testing.expectEqualStrings("settings_user", extensions[1].id);
+    try std.testing.expectEqual(types.ExtensionSource.user, extensions[1].source);
+
+    try std.testing.expectEqualStrings("user_global", extensions[2].id);
+    try std.testing.expectEqual(types.ExtensionSource.user, extensions[2].source);
+
+    try std.testing.expectEqualStrings("settings_project", extensions[3].id);
+    try std.testing.expectEqual(types.ExtensionSource.project, extensions[3].source);
+
+    try std.testing.expectEqualStrings("project_local", extensions[4].id);
+    try std.testing.expectEqual(types.ExtensionSource.project, extensions[4].source);
 }
 
 test "resource loader resolves prompt inputs and discovers agents files" {

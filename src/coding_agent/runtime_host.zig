@@ -33,12 +33,12 @@ pub const CompactionExecutor = session_runner.CompactionExecutor;
 pub const LifecycleHooks = session_runner.LifecycleHooks;
 pub const Options = session_runner.Options;
 
-pub const ConversationStatePublisher = struct {
-    func: *const fn (state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) bool,
+pub const ConversationPatchPublisher = struct {
+    func: *const fn (patch: conversation_state.ConversationPatch, ctx: ?*anyopaque) bool,
     ctx: ?*anyopaque = null,
 
-    pub fn publish(self: ConversationStatePublisher, state: conversation_state.ConversationViewSnapshot) bool {
-        return self.func(state, self.ctx);
+    pub fn publish(self: ConversationPatchPublisher, patch: conversation_state.ConversationPatch) bool {
+        return self.func(patch, self.ctx);
     }
 };
 
@@ -57,12 +57,23 @@ pub const RuntimeHost = struct {
     msg_allocator: std.mem.Allocator,
     create_options: sdk.CreateOptions,
     runner: session_runner.SessionRunner,
-    event_listeners: std.ArrayList(EventHandler),
+    agent_event_listeners: std.ArrayList(AgentEventHandler),
+    session_event_listeners: std.ArrayList(EventHandler),
+    agent_event_token: ?AgentSession.AgentEventSubscriptionToken = null,
     session_event_token: ?AgentSession.EventSubscriptionToken = null,
+
+    pub const AgentEventHandler = struct {
+        func: *const fn (event: agent_mod.protocol.AgentEvent, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque = null,
+    };
 
     pub const EventHandler = struct {
         func: *const fn (event: SessionEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque = null,
+    };
+
+    pub const AgentEventSubscriptionToken = struct {
+        index: usize,
     };
 
     pub const EventSubscriptionToken = struct {
@@ -82,17 +93,20 @@ pub const RuntimeHost = struct {
             .msg_allocator = msg_allocator,
             .create_options = create_options,
             .runner = session_runner.SessionRunner.init(options),
-            .event_listeners = .empty,
+            .agent_event_listeners = .empty,
+            .session_event_listeners = .empty,
         };
         self.session.activateRuntimeHooks();
         return self;
     }
 
     pub fn deinit(self: *RuntimeHost) void {
+        self.unbindAgentEvents();
         self.unbindSessionEvents();
         self.session.deinit();
         self.session_allocator.destroy(self.session);
-        self.event_listeners.deinit(self.session_allocator);
+        self.agent_event_listeners.deinit(self.session_allocator);
+        self.session_event_listeners.deinit(self.session_allocator);
         self.* = undefined;
     }
 
@@ -120,20 +134,37 @@ pub const RuntimeHost = struct {
         return themes_builtin.defaultForTerminal().*;
     }
 
+    pub fn subscribeAgentEvents(
+        self: *RuntimeHost,
+        func: *const fn (event: agent_mod.protocol.AgentEvent, ctx: ?*anyopaque) void,
+        ctx: ?*anyopaque,
+    ) AgentEventSubscriptionToken {
+        self.bindAgentEvents();
+        const index = self.agent_event_listeners.items.len;
+        self.agent_event_listeners.append(self.session_allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
+        return .{ .index = index };
+    }
+
+    pub fn unsubscribeAgentEvents(self: *RuntimeHost, token: AgentEventSubscriptionToken) void {
+        if (token.index < self.agent_event_listeners.items.len) {
+            _ = self.agent_event_listeners.orderedRemove(token.index);
+        }
+    }
+
     pub fn subscribeEvents(
         self: *RuntimeHost,
         func: *const fn (event: SessionEvent, ctx: ?*anyopaque) void,
         ctx: ?*anyopaque,
     ) EventSubscriptionToken {
         self.bindSessionEvents();
-        const index = self.event_listeners.items.len;
-        self.event_listeners.append(self.session_allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
+        const index = self.session_event_listeners.items.len;
+        self.session_event_listeners.append(self.session_allocator, .{ .func = func, .ctx = ctx }) catch return .{ .index = std.math.maxInt(usize) };
         return .{ .index = index };
     }
 
     pub fn unsubscribeEvents(self: *RuntimeHost, token: EventSubscriptionToken) void {
-        if (token.index < self.event_listeners.items.len) {
-            _ = self.event_listeners.orderedRemove(token.index);
+        if (token.index < self.session_event_listeners.items.len) {
+            _ = self.session_event_listeners.orderedRemove(token.index);
         }
     }
 
@@ -270,7 +301,7 @@ pub const RuntimeHost = struct {
 
     pub fn publishConversationState(
         self: *RuntimeHost,
-        publisher: ConversationStatePublisher,
+        publisher: ConversationPatchPublisher,
     ) bool {
         var publish_timer = profile.ScopedTimer.begin(.publish_conversation_state);
         defer publish_timer.end();
@@ -278,8 +309,91 @@ pub const RuntimeHost = struct {
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
 
-        if (!publisher.publish(.{ .view = view })) return false;
+        if (!publisher.publish(.{ .replace_all = .{ .view = view } })) return false;
         return true;
+    }
+
+    pub fn publishConversationFrontier(
+        self: *RuntimeHost,
+        publisher: ConversationPatchPublisher,
+    ) bool {
+        var frontier = self.session.agent.cloneInFlightTurn(self.msg_allocator) catch return false;
+        if (frontier == null) return false;
+        errdefer if (frontier) |*owned| owned.deinit(self.msg_allocator);
+
+        if (!publisher.publish(.{ .replace_frontier = .{ .frontier = frontier.? } })) return false;
+        return true;
+    }
+
+    pub fn publishConversationPatchForAgentEvent(
+        self: *RuntimeHost,
+        event: agent_mod.protocol.AgentEvent,
+        publisher: ConversationPatchPublisher,
+    ) bool {
+        switch (event) {
+            .agent_start, .turn_start, .agent_end => return true,
+            .message_start => |payload| switch (payload.message) {
+                .assistant => return self.publishConversationFrontier(publisher),
+                else => return true,
+            },
+            .message_update => |payload| switch (payload.message) {
+                .assistant => switch (payload.assistant_message_event) {
+                    .text_delta => |delta| {
+                        const locator = self.session.agent.currentFrontierLocator() orelse return false;
+                        const owned = self.msg_allocator.dupe(u8, delta.delta) catch return false;
+                        errdefer self.msg_allocator.free(owned);
+                        return publisher.publish(.{ .append_frontier_content = .{
+                            .locator = locator,
+                            .kind = .text,
+                            .content_index = delta.content_index,
+                            .delta = owned,
+                        } });
+                    },
+                    .thinking_delta => |delta| {
+                        const locator = self.session.agent.currentFrontierLocator() orelse return false;
+                        const owned = self.msg_allocator.dupe(u8, delta.delta) catch return false;
+                        errdefer self.msg_allocator.free(owned);
+                        return publisher.publish(.{ .append_frontier_content = .{
+                            .locator = locator,
+                            .kind = .thinking,
+                            .content_index = delta.content_index,
+                            .delta = owned,
+                        } });
+                    },
+                    else => return self.publishConversationFrontier(publisher),
+                },
+                else => return true,
+            },
+            .message_end => |payload| switch (payload.message) {
+                .assistant => return self.publishConversationFrontier(publisher),
+                .tool_result => {
+                    if (self.session.agent.currentFrontierLocator() != null) {
+                        return self.publishConversationFrontier(publisher);
+                    }
+                    const committed = self.session.agent.retainCommitted();
+                    errdefer committed.release();
+                    return publisher.publish(.{ .append_committed = .{ .committed = committed } });
+                },
+                else => {
+                    const committed = self.session.agent.retainCommitted();
+                    errdefer committed.release();
+                    return publisher.publish(.{ .append_committed = .{ .committed = committed } });
+                },
+            },
+            .tool_execution_start, .tool_execution_update, .tool_execution_end => {
+                return self.publishConversationFrontier(publisher);
+            },
+            .turn_end => |payload| switch (payload.message) {
+                .assistant => |assistant| {
+                    const locator = conversation_state.FrontierLocator.fromAssistant(assistant);
+                    const committed = self.session.agent.retainCommitted();
+                    errdefer committed.release();
+                    if (!publisher.publish(.{ .append_committed = .{ .committed = committed } })) return false;
+                    return publisher.publish(.{ .commit_frontier = .{ .locator = locator } });
+                },
+                else => return true,
+            },
+        }
     }
 
     pub fn publishQueuedSnapshot(
@@ -291,6 +405,18 @@ pub const RuntimeHost = struct {
 
         if (!publisher.publish(snapshot)) return false;
         return true;
+    }
+
+    fn bindAgentEvents(self: *RuntimeHost) void {
+        if (self.agent_event_token != null) return;
+        self.agent_event_token = self.session.subscribeAgentEvents(&agentEventBridge, @ptrCast(self));
+    }
+
+    fn unbindAgentEvents(self: *RuntimeHost) void {
+        if (self.agent_event_token) |token| {
+            self.session.unsubscribeAgentEvents(token);
+            self.agent_event_token = null;
+        }
     }
 
     fn bindSessionEvents(self: *RuntimeHost) void {
@@ -305,15 +431,31 @@ pub const RuntimeHost = struct {
         }
     }
 
-    fn emitSessionEvent(self: *RuntimeHost, event: SessionEvent) void {
-        for (self.event_listeners.items) |handler| {
+    fn emitAgentEvent(self: *RuntimeHost, event: agent_mod.protocol.AgentEvent) void {
+        for (self.agent_event_listeners.items) |handler| {
             handler.func(event, handler.ctx);
         }
+    }
+
+    fn emitSessionEvent(self: *RuntimeHost, event: SessionEvent) void {
+        for (self.session_event_listeners.items) |handler| {
+            handler.func(event, handler.ctx);
+        }
+    }
+
+    fn agentEventBridge(event: agent_mod.protocol.AgentEvent, ctx: ?*anyopaque) void {
+        const self: *RuntimeHost = @ptrCast(@alignCast(ctx.?));
+        self.emitAgentEvent(event);
     }
 
     fn sessionEventBridge(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *RuntimeHost = @ptrCast(@alignCast(ctx.?));
         self.emitSessionEvent(event);
+    }
+
+    fn runnerSessionEventBridge(event: SessionEvent, ctx: ?*anyopaque) void {
+        const self: *RuntimeHost = @ptrCast(@alignCast(ctx.?));
+        self.session.emitSessionEvent(event);
     }
 
     fn createOwnedSession(self: *RuntimeHost, create_options: sdk.CreateOptions) !*AgentSession {
@@ -324,19 +466,22 @@ pub const RuntimeHost = struct {
     }
 
     fn replaceSession(self: *RuntimeHost, next: *AgentSession) void {
-        const had_runtime_listeners = self.event_listeners.items.len > 0;
+        const had_agent_event_listeners = self.agent_event_listeners.items.len > 0;
+        const had_session_event_listeners = self.session_event_listeners.items.len > 0;
+        self.unbindAgentEvents();
         self.unbindSessionEvents();
         self.session.shutdownExtensionsOnAgentThread();
         self.session.deinit();
         self.session_allocator.destroy(self.session);
         self.session = next;
         self.session.activateRuntimeHooks();
-        if (had_runtime_listeners) self.bindSessionEvents();
+        if (had_agent_event_listeners) self.bindAgentEvents();
+        if (had_session_event_listeners) self.bindSessionEvents();
     }
 
     fn runnerEventEmitter(self: *RuntimeHost) session_runner.EventEmitter {
         return .{
-            .func = &sessionEventBridge,
+            .func = &runnerSessionEventBridge,
             .ctx = @ptrCast(self),
         };
     }
@@ -475,16 +620,16 @@ test "runtime host publishes committed view and queued snapshots independently" 
         .timestamp = 1,
     } }});
 
-    var published_view: ?conversation_state.ConversationViewSnapshot = null;
-    defer if (published_view) |*state| state.deinit(testing.allocator);
+    var published_patch: ?conversation_state.ConversationPatch = null;
+    defer if (published_patch) |*patch| patch.deinit(testing.allocator);
 
     var published_queued: ?control_mod.QueuedMessageSnapshot = null;
     defer if (published_queued) |*snapshot| snapshot.deinit(testing.allocator);
 
     const Capture = struct {
-        fn publishView(state: conversation_state.ConversationViewSnapshot, ctx: ?*anyopaque) bool {
-            const out: *?conversation_state.ConversationViewSnapshot = @ptrCast(@alignCast(ctx.?));
-            out.* = state;
+        fn publishPatch(patch: conversation_state.ConversationPatch, ctx: ?*anyopaque) bool {
+            const out: *?conversation_state.ConversationPatch = @ptrCast(@alignCast(ctx.?));
+            out.* = patch;
             return true;
         }
 
@@ -504,17 +649,22 @@ test "runtime host publishes committed view and queued snapshots independently" 
     } }));
 
     try testing.expect(host.publishConversationState(.{
-        .func = &Capture.publishView,
-        .ctx = @ptrCast(&published_view),
+        .func = &Capture.publishPatch,
+        .ctx = @ptrCast(&published_patch),
     }));
     try testing.expect(host.publishQueuedSnapshot(.{
         .func = &Capture.publishQueued,
         .ctx = @ptrCast(&published_queued),
     }));
 
-    try testing.expect(published_view != null);
-    try testing.expectEqual(@as(usize, 1), published_view.?.view.committed.flat.len);
-    try testing.expectEqualStrings("hello", published_view.?.view.committed.flat[0].user.content.text);
+    try testing.expect(published_patch != null);
+    switch (published_patch.?) {
+        .replace_all => |state| {
+            try testing.expectEqual(@as(usize, 1), state.view.committed.flat.len);
+            try testing.expectEqualStrings("hello", state.view.committed.flat[0].user.content.text);
+        },
+        else => return error.UnexpectedPatch,
+    }
 
     try testing.expect(published_queued != null);
     try testing.expectEqual(@as(usize, 0), published_queued.?.steering.len);

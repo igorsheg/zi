@@ -1,5 +1,5 @@
 const std = @import("std");
-const storage = @import("../../storage.zig");
+const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 
@@ -11,8 +11,8 @@ const log = std.log.scoped(.extensions);
 /// read path bounded without needing streaming.
 const MAX_EXTENSION_SIZE: usize = 1024 * 1024;
 
-/// Source of an extension file.
-pub const ExtensionSource = enum { explicit, user, project, builtin };
+pub const ExtensionSource = resource_types.ExtensionSource;
+pub const StaticExtensionRoot = resource_types.StaticExtensionRoot;
 
 /// Discovered extension descriptor. Strings owned by the allocator passed to discover().
 pub const LoadedExtension = struct {
@@ -24,9 +24,7 @@ pub const LoadedExtension = struct {
 /// Options for extension discovery.
 pub const DiscoverOptions = struct {
     allocator: std.mem.Allocator,
-    cwd: []const u8,
-    explicit_paths: []const []const u8 = &.{},
-    agent_dir_override: ?[]const u8 = null,
+    roots: []const StaticExtensionRoot,
 };
 
 /// Track seen IDs within a source to avoid duplicates.
@@ -52,7 +50,7 @@ const SeenIds = struct {
     }
 };
 
-/// Discover all extensions in load order (explicit → user → project).
+/// Discover all extensions from the caller-provided canonical root list.
 /// Caller owns returned slice and all strings. Use freeExtensions() to clean up.
 /// Built-in extensions are NOT handled here (skip for C1).
 pub fn discover(opts: DiscoverOptions) ![]LoadedExtension {
@@ -60,26 +58,16 @@ pub fn discover(opts: DiscoverOptions) ![]LoadedExtension {
     var seen: SeenIds = .{};
     defer seen.deinit(opts.allocator);
 
-    // 1. Explicit paths (highest priority)
-    for (opts.explicit_paths) |path| {
-        try loadExplicitPath(opts.allocator, path, &results, &seen);
+    for (opts.roots) |root| {
+        switch (root.kind) {
+            .runtime_root => {
+                const ext_dir = try std.fs.path.join(opts.allocator, &.{ root.path, "extensions" });
+                defer opts.allocator.free(ext_dir);
+                try scanDirectory(opts.allocator, ext_dir, root.source, &results, &seen);
+            },
+            .synthetic_extension => try loadSyntheticExtension(opts.allocator, root.path, root.source, &results, &seen),
+        }
     }
-
-    // 2. User-global: <agent_dir>/extensions/*.lua
-    const agent_dir = try storage.getAgentDir(opts.allocator, opts.agent_dir_override);
-    defer opts.allocator.free(agent_dir);
-    const user_ext_dir = try std.fs.path.join(opts.allocator, &.{ agent_dir, "extensions" });
-    defer opts.allocator.free(user_ext_dir);
-    try scanDirectory(opts.allocator, user_ext_dir, .user, &results, &seen);
-
-    // 3. Project-local: <project_dir>/extensions/*.lua
-    const project_dir = try storage.getProjectDir(opts.allocator, opts.cwd);
-    defer opts.allocator.free(project_dir);
-    const project_ext_dir = try std.fs.path.join(opts.allocator, &.{ project_dir, "extensions" });
-    defer opts.allocator.free(project_ext_dir);
-    try scanDirectory(opts.allocator, project_ext_dir, .project, &results, &seen);
-
-    // Note: builtin extensions handled via @embedFile elsewhere
 
     return results.toOwnedSlice(opts.allocator);
 }
@@ -93,31 +81,26 @@ pub fn freeExtensions(allocator: std.mem.Allocator, list: []LoadedExtension) voi
     allocator.free(list);
 }
 
-/// Load an explicit path. Error if path doesn't exist.
-fn loadExplicitPath(
+/// Load a synthetic single-extension root. Error if path doesn't exist.
+fn loadSyntheticExtension(
     allocator: std.mem.Allocator,
     path: []const u8,
+    source: ExtensionSource,
     results: *std.ArrayListUnmanaged(LoadedExtension),
     seen: *SeenIds,
 ) !void {
-    // Verify file exists
     std.fs.accessAbsolute(path, .{}) catch |err| {
-        log.warn("explicit extension path not found: {s} ({s})", .{ path, @errorName(err) });
+        log.warn("synthetic extension path not found: {s} ({s})", .{ path, @errorName(err) });
         return err;
     };
 
-    const basename = std.fs.path.basename(path);
-    const id = if (std.mem.endsWith(u8, basename, ".lua"))
-        basename[0 .. basename.len - 4]
-    else
-        basename;
-
+    const id = extensionIdFromSyntheticPath(path);
     if (seen.contains(id)) {
-        log.debug("skipping duplicate explicit extension id: {s}", .{id});
+        log.debug("skipping duplicate synthetic extension id in {s}: {s}", .{ @tagName(source), id });
         return;
     }
 
-    const abs_path = try std.fs.realpathAlloc(allocator, path);
+    const abs_path = try syntheticExtensionFilePath(allocator, path);
     errdefer allocator.free(abs_path);
 
     const duped_id = try allocator.dupe(u8, id);
@@ -127,8 +110,27 @@ fn loadExplicitPath(
     try results.append(allocator, .{
         .id = duped_id,
         .path = abs_path,
-        .source = .explicit,
+        .source = source,
     });
+}
+
+fn syntheticExtensionFilePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, path, ".lua")) return std.fs.realpathAlloc(allocator, path);
+
+    const init_path = try std.fs.path.join(allocator, &.{ path, "init.lua" });
+    defer allocator.free(init_path);
+    std.fs.accessAbsolute(init_path, .{}) catch return std.fs.realpathAlloc(allocator, path);
+    return std.fs.realpathAlloc(allocator, init_path);
+}
+
+fn extensionIdFromSyntheticPath(path: []const u8) []const u8 {
+    const basename = std.fs.path.basename(path);
+    if (std.mem.eql(u8, basename, "init.lua")) {
+        const parent = std.fs.path.dirname(path) orelse path;
+        return std.fs.path.basename(parent);
+    }
+    if (std.mem.endsWith(u8, basename, ".lua")) return basename[0 .. basename.len - 4];
+    return basename;
 }
 
 /// Scan a directory for .lua files and foo/init.lua patterns.
@@ -340,12 +342,14 @@ test "discover finds foo.lua and bar/init.lua in a temp dir" {
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
-    // Discover using agent_dir_override
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+    }};
     const opts = DiscoverOptions{
         .allocator = allocator,
-        .cwd = "/nonexistent/project", // won't be used since we override agent dir
-        .explicit_paths = &.{},
-        .agent_dir_override = tmp_path,
+        .roots = &roots,
     };
 
     const exts = try discover(opts);
@@ -380,12 +384,14 @@ test "discover returns empty when directories missing" {
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
-    // Use a path with no extensions subdirectory
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+    }};
     const opts = DiscoverOptions{
         .allocator = allocator,
-        .cwd = tmp_path, // will try <tmp_path>/.zi/extensions (doesn't exist)
-        .explicit_paths = &.{},
-        .agent_dir_override = tmp_path, // will try <tmp_path>/extensions (doesn't exist)
+        .roots = &roots,
     };
 
     const exts = try discover(opts);
@@ -413,11 +419,13 @@ test "explicit paths come first in result order" {
     const explicit_path = try std.fs.path.join(allocator, &.{ tmp_path, "explicit_ext.lua" });
     defer allocator.free(explicit_path);
 
+    const roots = [_]StaticExtensionRoot{
+        .{ .source = .explicit, .path = explicit_path, .kind = .synthetic_extension },
+        .{ .source = .user, .path = tmp_path, .kind = .runtime_root },
+    };
     const opts = DiscoverOptions{
         .allocator = allocator,
-        .cwd = "/nonexistent/project",
-        .explicit_paths = &.{explicit_path},
-        .agent_dir_override = tmp_path,
+        .roots = &roots,
     };
 
     const exts = try discover(opts);
@@ -429,6 +437,60 @@ test "explicit paths come first in result order" {
     try std.testing.expectEqual(ExtensionSource.explicit, exts[0].source);
     try std.testing.expectEqualStrings("user_ext", exts[1].id);
     try std.testing.expectEqual(ExtensionSource.user, exts[1].source);
+}
+
+test "discover derives synthetic bundled extension id from parent dir" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("bundle_ext");
+    var bundle_dir = try tmp.dir.openDir("bundle_ext", .{});
+    defer bundle_dir.close();
+    try bundle_dir.writeFile(.{ .sub_path = "init.lua", .data = "-- bundled" });
+
+    const init_path = try tmp.dir.realpathAlloc(allocator, "bundle_ext/init.lua");
+    defer allocator.free(init_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .explicit,
+        .path = init_path,
+        .kind = .synthetic_extension,
+    }};
+
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    try std.testing.expectEqual(@as(usize, 1), exts.len);
+    try std.testing.expectEqualStrings("bundle_ext", exts[0].id);
+    try std.testing.expectEqual(ExtensionSource.explicit, exts[0].source);
+}
+
+test "discover loads synthetic bundled extension from directory path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("bundle_ext");
+    var bundle_dir = try tmp.dir.openDir("bundle_ext", .{});
+    defer bundle_dir.close();
+    try bundle_dir.writeFile(.{ .sub_path = "init.lua", .data = "-- bundled" });
+
+    const bundle_path = try tmp.dir.realpathAlloc(allocator, "bundle_ext");
+    defer allocator.free(bundle_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .explicit,
+        .path = bundle_path,
+        .kind = .synthetic_extension,
+    }};
+
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    try std.testing.expectEqual(@as(usize, 1), exts.len);
+    try std.testing.expectEqualStrings("bundle_ext", exts[0].id);
+    try std.testing.expect(std.mem.endsWith(u8, exts[0].path, "bundle_ext/init.lua"));
 }
 
 test "loadAll executes discovered .lua files and registrations land" {
@@ -448,11 +510,12 @@ test "loadAll executes discovered .lua files and registrations land" {
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
-    const exts = try discover(.{
-        .allocator = allocator,
-        .cwd = "/nonexistent",
-        .agent_dir_override = tmp_path,
-    });
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
     try std.testing.expectEqual(@as(usize, 1), exts.len);
 
@@ -488,11 +551,12 @@ test "loadAll continues after a broken extension" {
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
-    const exts = try discover(.{
-        .allocator = allocator,
-        .cwd = "/nonexistent",
-        .agent_dir_override = tmp_path,
-    });
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
     var state = try lua_runtime.LuaState.init(allocator);
@@ -537,11 +601,12 @@ test "loadAll calls factory with zi and stamps source provenance" {
     const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
-    const exts = try discover(.{
-        .allocator = allocator,
-        .cwd = "/nonexistent",
-        .agent_dir_override = tmp_path,
-    });
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
     var state = try lua_runtime.LuaState.init(allocator);
