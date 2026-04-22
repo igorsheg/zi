@@ -121,6 +121,13 @@ pub const RuntimeHost = struct {
         return self.session;
     }
 
+    /// Dispatch an extension command on the agent thread by visible
+    /// invocation name. Errors if no runner or no such command.
+    pub fn dispatchExtensionCommand(self: *RuntimeHost, name: []const u8, args: []const u8) !void {
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        try runner.dispatchCommand(name, args);
+    }
+
     pub fn selectedTheme(self: *const RuntimeHost) theme_mod.Theme {
         if (self.create_options.settings_manager) |settings| {
             if (settings.getTheme()) |selected_name| {

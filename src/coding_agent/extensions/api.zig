@@ -46,6 +46,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
+const command_registry = @import("registries/command_registry.zig");
 const tool_def = @import("../tools/definition.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
@@ -63,11 +64,15 @@ const log = std.log.scoped(.zi_api);
 /// by tests that build a state inline.
 pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
-    c.lua_createtable(L, 0, 8);
+    c.lua_createtable(L, 0, 9);
 
     // zi.register_tool
     state.pushCClosureWithUserdata(ziRegisterTool, runner);
     c.lua_setfield(L, -2, "register_tool");
+
+    // zi.register_command
+    state.pushCClosureWithUserdata(ziRegisterCommand, runner);
+    c.lua_setfield(L, -2, "register_command");
 
     // host-private builtin bridge. builtin extension chunks may call
     // this while their load context is active; user extensions may not.
@@ -265,6 +270,114 @@ fn buildExtensionTool(
 /// `ToolRegistry.freeEntry` minus the registry-managed bookkeeping.
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
     tool_def.freeOwned(allocator, tool);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// zi.register_command
+// ─────────────────────────────────────────────────────────────────────────
+
+fn ziRegisterCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) {
+        return luaError(L, "register_command: expected a table argument");
+    }
+
+    const cmd = buildCommandDef(L, runner) catch |err| {
+        return luaError(L, switch (err) {
+            error.MissingName => "register_command: missing required field \"name\" (string)",
+            error.InvalidDescription => "register_command: \"description\" must be a string",
+            error.MissingHandler => "register_command: missing required field \"handler\" (function)",
+            error.InvalidHandler => "register_command: \"handler\" must be a function",
+            error.OutOfMemory => "register_command: out of memory",
+        });
+    };
+
+    runner.command_registry.register(cmd) catch {
+        c.luaL_unref(L, c.LUA_REGISTRYINDEX, cmd.lua_ref);
+        runner.allocator.free(cmd.name);
+        runner.allocator.free(cmd.description);
+        return luaError(L, "register_command: registry insert failed");
+    };
+
+    c.lua_pushboolean(L, 1);
+    return 1;
+}
+
+const RegisterCommandError = error{
+    OutOfMemory,
+    MissingName,
+    InvalidDescription,
+    MissingHandler,
+    InvalidHandler,
+};
+
+fn buildCommandDef(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+) RegisterCommandError!command_registry.CommandDef {
+    const a = runner.allocator;
+
+    var name: ?[]const u8 = null;
+    var description: ?[]const u8 = null;
+    defer {
+        if (name) |n| a.free(n);
+        if (description) |d| a.free(d);
+    }
+
+    _ = c.lua_getfield(L, 1, "name");
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) {
+        c.lua_pop(L, 1);
+        return error.MissingName;
+    }
+    var name_len: usize = 0;
+    const name_ptr = c.lua_tolstring(L, -1, &name_len).?;
+    name = a.dupe(u8, name_ptr[0..name_len]) catch return error.OutOfMemory;
+    c.lua_pop(L, 1);
+
+    _ = c.lua_getfield(L, 1, "description");
+    if (c.lua_type(L, -1) == c.LUA_TSTRING) {
+        var desc_len: usize = 0;
+        const desc_ptr = c.lua_tolstring(L, -1, &desc_len).?;
+        description = a.dupe(u8, desc_ptr[0..desc_len]) catch {
+            c.lua_pop(L, 1);
+            return error.OutOfMemory;
+        };
+        c.lua_pop(L, 1);
+    } else if (c.lua_type(L, -1) == c.LUA_TNIL) {
+        c.lua_pop(L, 1);
+        description = a.dupe(u8, "") catch return error.OutOfMemory;
+    } else {
+        c.lua_pop(L, 1);
+        return error.InvalidDescription;
+    }
+
+    _ = c.lua_getfield(L, 1, "handler");
+    if (c.lua_type(L, -1) == c.LUA_TNIL) {
+        c.lua_pop(L, 1);
+        return error.MissingHandler;
+    }
+    if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
+        c.lua_pop(L, 1);
+        return error.InvalidHandler;
+    }
+    const handler_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+
+    const owned_name = name.?;
+    const result = command_registry.CommandDef{
+        .name = owned_name,
+        .visible_name = a.dupe(u8, owned_name) catch {
+            c.luaL_unref(L, c.LUA_REGISTRYINDEX, handler_ref);
+            return error.OutOfMemory;
+        },
+        .description = description.?,
+        .lua_ref = handler_ref,
+        .source = currentRegistrationSource(runner),
+    };
+    name = null;
+    description = null;
+    return result;
 }
 
 fn ziRegisterBuiltinTools(L_opt: ?*c.lua_State) callconv(.c) c_int {
@@ -643,7 +756,7 @@ pub fn eventTrampoline(
 }
 
 pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.AgentToolResult) void {
-    c.lua_createtable(L, 0, 8);
+    c.lua_createtable(L, 0, 9);
 
     c.lua_pushinteger(L, if (result.is_error) 1 else 0);
     c.lua_setfield(L, -2, "exit_code");
@@ -690,7 +803,7 @@ pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.Agent
 }
 
 fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
-    c.lua_createtable(L, 0, 8);
+    c.lua_createtable(L, 0, 9);
 
     c.lua_pushinteger(L, @intCast(result.exit_code));
     c.lua_setfield(L, -2, "exit_code");
@@ -1228,4 +1341,49 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     _ = c.lua_getfield(co.L, -1, "output");
     try testing.expectEqualStrings("child output", lstring(co.L, -1));
     c.lua_pop(co.L, 1);
+}
+
+test "zi.register_command registers a command end-to-end" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\local ok = zi.register_command({
+        \\  name = "greet",
+        \\  description = "say hello",
+        \\  handler = function(args, ctx) end,
+        \\})
+        \\assert(ok == true, "registration should succeed")
+    , "test_register_command");
+
+    try testing.expectEqual(@as(usize, 1), runner.command_registry.count());
+    const cmd = runner.command_registry.getByVisibleName("greet").?;
+    try testing.expectEqualStrings("greet", cmd.name);
+    try testing.expectEqualStrings("greet", cmd.visible_name);
+    try testing.expectEqualStrings("say hello", cmd.description);
+}
+
+test "zi.register_command duplicate names aggregate" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.register_command({ name = "dup", description = "first", handler = function() end })
+        \\zi.register_command({ name = "dup", description = "second", handler = function() end })
+    , "test_dup");
+
+    try testing.expectEqual(@as(usize, 2), runner.command_registry.count());
+    try testing.expect(runner.command_registry.getByVisibleName("dup") == null);
+    try testing.expect(runner.command_registry.getByVisibleName("dup:1") != null);
+    try testing.expect(runner.command_registry.getByVisibleName("dup:2") != null);
 }

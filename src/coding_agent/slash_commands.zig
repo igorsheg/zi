@@ -4,11 +4,10 @@ const std = @import("std");
 pub const CommandAction = union(enum) {
     /// Built-in command: direct function call on main thread.
     builtin: *const fn (args: []const u8, ctx: *CommandContext) anyerror!void,
-    /// Extension-registered command: function + user context.
-    extension: struct {
-        handler: *const fn (args: []const u8, ctx: *CommandContext, user_ctx: ?*anyopaque) anyerror!void,
-        user_ctx: ?*anyopaque = null,
-    },
+    /// Extension-registered command: dispatched on the agent thread
+    /// via AgentRequest.extension_command. The TUI registry stores only
+    /// the visible name + description as a marker.
+    extension: void,
     /// Prompt template: text expanded and sent to LLM.
     prompt_template,
     /// Skill: expanded with skill: prefix.
@@ -82,19 +81,30 @@ pub const CommandRegistry = struct {
     }
 
     pub fn deinit(self: *CommandRegistry) void {
+        for (self.dynamic.items) |*cmd| {
+            self.allocator.free(cmd.name);
+            if (cmd.description) |d| self.allocator.free(d);
+        }
         self.dynamic.deinit(self.allocator);
     }
 
     /// Register a dynamic command (extension/prompt/skill).
+    /// Takes ownership of `cmd.name` / `cmd.description`.
     pub fn register(self: *CommandRegistry, cmd: SlashCommand) void {
-        self.dynamic.append(self.allocator, cmd) catch return;
+        self.dynamic.append(self.allocator, cmd) catch {
+            self.allocator.free(cmd.name);
+            if (cmd.description) |d| self.allocator.free(d);
+            return;
+        };
     }
 
     /// Unregister a dynamic command by name. Returns true if found and removed.
     pub fn unregister(self: *CommandRegistry, name: []const u8) bool {
         for (self.dynamic.items, 0..) |_, i| {
             if (std.mem.eql(u8, self.dynamic.items[i].name, name)) {
-                _ = self.dynamic.orderedRemove(i);
+                const cmd = self.dynamic.orderedRemove(i);
+                self.allocator.free(cmd.name);
+                if (cmd.description) |d| self.allocator.free(d);
                 return true;
             }
         }
@@ -135,8 +145,8 @@ test "CommandRegistry register and unregister dynamic" {
     defer reg.deinit();
 
     reg.register(.{
-        .name = "myplugin",
-        .description = "A test plugin",
+        .name = try std.testing.allocator.dupe(u8, "myplugin"),
+        .description = try std.testing.allocator.dupe(u8, "A test plugin"),
         .source = .extension,
         .action = .prompt_template,
     });
@@ -156,7 +166,7 @@ test "CommandRegistry count includes both" {
 
     try std.testing.expectEqual(@as(usize, BUILTIN_COMMANDS.len), reg.count());
 
-    reg.register(.{ .name = "extra", .source = .skill, .action = .skill });
+    reg.register(.{ .name = try std.testing.allocator.dupe(u8, "extra"), .source = .skill, .action = .skill });
     try std.testing.expectEqual(@as(usize, BUILTIN_COMMANDS.len + 1), reg.count());
 }
 
@@ -165,8 +175,8 @@ test "CommandRegistry builtin takes precedence" {
     defer reg.deinit();
 
     reg.register(.{
-        .name = "quit",
-        .description = "Shadow quit",
+        .name = try std.testing.allocator.dupe(u8, "quit"),
+        .description = try std.testing.allocator.dupe(u8, "Shadow quit"),
         .source = .extension,
         .action = .prompt_template,
     });

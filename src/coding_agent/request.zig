@@ -64,6 +64,12 @@ pub const AgentRequest = union(enum) {
     compact: struct {
         custom_instructions: ?[]const u8 = null,
     },
+    /// Extension slash-command dispatch. Visible invocation name + args.
+    /// Owned strings (msg_allocator); deinit frees them.
+    extension_command: struct {
+        name: []const u8,
+        args: []const u8,
+    },
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
@@ -76,6 +82,10 @@ pub const AgentRequest = union(enum) {
             .set_thinking_level => {},
             .refresh_status_snapshot => {},
             .compact => |c| if (c.custom_instructions) |ci| allocator.free(ci),
+            .extension_command => |ec| {
+                allocator.free(ec.name);
+                allocator.free(ec.args);
+            },
             .shutdown => {},
         }
     }
@@ -202,4 +212,21 @@ test "RequestQueue wake pipe stays readable until the long-lived owner drains re
 
     pfd[0].revents = 0;
     try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pfd, 0));
+}
+
+test "RequestQueue extension_command round-trips owned name and args" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    const name = try allocator.dupe(u8, "my-cmd:1");
+    const args = try allocator.dupe(u8, "hello world");
+    q.push(.{ .extension_command = .{ .name = name, .args = args } });
+
+    var buf: [2]AgentRequest = undefined;
+    const n = q.drainInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("my-cmd:1", buf[0].extension_command.name);
+    try std.testing.expectEqualStrings("hello world", buf[0].extension_command.args);
+    buf[0].deinit(allocator);
 }

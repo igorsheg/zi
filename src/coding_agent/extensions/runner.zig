@@ -6,6 +6,7 @@ const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
 const resource_types = @import("../resources/types.zig");
 const tool_def = @import("../tools/definition.zig");
+const context_mod = @import("context.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 ///
@@ -494,6 +495,52 @@ pub const ExtensionRunner = struct {
 
     pub fn isBound(self: *const ExtensionRunner) bool {
         return self.runtime == .bound;
+    }
+
+    /// Dispatch an extension command by its visible invocation name.
+    ///
+    /// Thread contract: must run on the Lua-owning (agent) thread.
+    /// The handler is invoked in a fresh coroutine with `args` as the
+    /// first argument and a command context as the second. If the
+    /// handler yields, returns `error.UnexpectedYield` — command
+    /// bodies are not yieldable in this slice.
+    pub fn dispatchCommand(self: *ExtensionRunner, name: []const u8, args: []const u8) !void {
+        self.assertOnLuaThread();
+
+        const state = self.lua_state orelse return error.MissingLuaState;
+        const cmd = self.command_registry.getByVisibleName(name) orelse return error.UnknownCommand;
+
+        var co = try lua_runtime.Coroutine.init(state);
+        defer co.deinit();
+
+        _ = lua_runtime.c.lua_rawgeti(co.L, lua_runtime.c.LUA_REGISTRYINDEX, cmd.lua_ref);
+        if (lua_runtime.c.lua_type(co.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+            lua_runtime.c.lua_pop(co.L, 1);
+            return error.InvalidHandlerRef;
+        }
+
+        // arg 1: args string
+        _ = lua_runtime.c.lua_pushlstring(co.L, args.ptr, args.len);
+
+        // arg 2: command context
+        context_mod.pushCommandContext(co.L, self, cmd.source.provenance) catch {
+            lua_runtime.c.lua_pop(co.L, 2); // args + handler
+            return error.ContextPushFailed;
+        };
+
+        self.setModuleContext(state, cmd.source.provenance);
+
+        const r = try co.resumeWith(2);
+        switch (r.status) {
+            .yielded => return error.UnexpectedYield,
+            .ok, .finished => {},
+        }
+
+        // Discard any return values.
+        const top = lua_runtime.c.lua_gettop(co.L);
+        if (r.nresults > 0) {
+            lua_runtime.c.lua_settop(co.L, top - r.nresults);
+        }
     }
 
     /// Record the private module root for an extension so that later

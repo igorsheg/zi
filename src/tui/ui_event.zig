@@ -5,6 +5,11 @@ const runtime_host_mod = @import("../coding_agent/runtime_host.zig");
 const theme_mod = @import("theme.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 
+pub const ExtensionCommandEntry = struct {
+    name: []u8,
+    description: []u8,
+};
+
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
 /// mailbox-owned. Conversation changes cross as mailbox-owned semantic patches.
 pub const UiEvent = union(enum) {
@@ -76,6 +81,10 @@ pub const UiEvent = union(enum) {
     },
     session_resume_failed: struct {
         message: []u8,
+    },
+
+    extension_commands_updated: struct {
+        commands: []ExtensionCommandEntry,
     },
 
     // --- /new outcomes ---
@@ -184,6 +193,13 @@ pub const UiEvent = union(enum) {
                 if (s.restore_warning) |warning| allocator.free(warning);
             },
             .session_resume_failed => |f| allocator.free(f.message),
+            .extension_commands_updated => |u| {
+                for (u.commands) |cmd| {
+                    allocator.free(cmd.name);
+                    allocator.free(cmd.description);
+                }
+                allocator.free(u.commands);
+            },
             .session_new_started => {},
             .session_fork_started => {},
             .session_new_failed => |f| allocator.free(f.message),

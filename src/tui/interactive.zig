@@ -1308,6 +1308,9 @@ pub const Interactive = struct {
                 self.status_text.fg = self.theme.fg(.@"error");
                 self.tui.dirty = true;
             },
+            .extension_commands_updated => |u| {
+                self.applyExtensionCommandsUpdate(u.commands);
+            },
             .session_new_started => {
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
                 self.status_text.setContent("new session started");
@@ -1987,12 +1990,25 @@ pub const Interactive = struct {
                     self.status_text.fg = self.theme.fg(.@"error");
                 };
             },
-            .extension => |ext| {
-                var cmd_ctx = slash_commands_mod.CommandContext{ ._reserved = @ptrCast(self) };
-                ext.handler(args, &cmd_ctx, ext.user_ctx) catch {
-                    self.status_text.setContent("extension command failed");
+            .extension => {
+                const name_copy = self.msg_allocator.dupe(u8, name) catch {
+                    self.status_text.setContent("out of memory");
                     self.status_text.fg = self.theme.fg(.@"error");
+                    self.tui.dirty = true;
+                    return true;
                 };
+                const args_copy = self.msg_allocator.dupe(u8, args) catch {
+                    self.msg_allocator.free(name_copy);
+                    self.status_text.setContent("out of memory");
+                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.tui.dirty = true;
+                    return true;
+                };
+                _ = self.dispatchIdleRequest(.{ .extension_command = .{ .name = name_copy, .args = args_copy } }, .{
+                    .busy_message = "cannot run command while agent is running",
+                    .loader_message = "Running command...",
+                    .spawn_failed_message = "failed to queue extension command",
+                });
             },
             .prompt_template, .skill => {
                 self.status_text.setContent("not yet implemented");
@@ -2633,6 +2649,7 @@ pub const Interactive = struct {
 
         if (self.runtime_host.currentSession().extensionRunner()) |runner| {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+            self.publishExtensionCommandsUpdate();
         }
         _ = self.publishConversationState();
         self.publishQueuedSnapshotIfChanged();
@@ -2723,6 +2740,16 @@ pub const Interactive = struct {
                         idle_processed = true;
                         self.handleManualCompactRequest(c.custom_instructions);
                     },
+                    .extension_command => |ec| {
+                        idle_processed = true;
+                        self.runtime_host.dispatchExtensionCommand(ec.name, ec.args) catch |err| {
+                            const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch {
+                                // OOM: skip publishing error message, keep draining.
+                                continue;
+                            };
+                            _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
+                        };
+                    },
                     .shutdown => {
                         req.deinit(self.msg_allocator);
                         self.discardAgentRequests(buf[i + 1 .. n]);
@@ -2737,6 +2764,61 @@ pub const Interactive = struct {
                 _ = self.publishLifecycleUiEvent(.{ .request_worker_finished = {} });
             }
         }
+    }
+
+    /// Publish the current extension command surface through the UI event
+    /// queue so the TUI thread can rebuild its own registry without reading
+    /// or mutating agent-owned runner state directly.
+    fn publishExtensionCommandsUpdate(self: *Interactive) void {
+        const commands = blk: {
+            const runner = self.runtime_host.currentSession().extensionRunner() orelse break :blk self.msg_allocator.alloc(ui_event_mod.ExtensionCommandEntry, 0) catch return;
+            const items = runner.command_registry.items();
+            var owned = self.msg_allocator.alloc(ui_event_mod.ExtensionCommandEntry, items.len) catch return;
+            var built: usize = 0;
+            errdefer {
+                for (owned[0..built]) |cmd| {
+                    self.msg_allocator.free(cmd.name);
+                    self.msg_allocator.free(cmd.description);
+                }
+                self.msg_allocator.free(owned);
+            }
+            for (items) |entry| {
+                owned[built] = .{
+                    .name = self.msg_allocator.dupe(u8, entry.visible_name) catch return,
+                    .description = self.msg_allocator.dupe(u8, entry.description) catch {
+                        self.msg_allocator.free(owned[built].name);
+                        return;
+                    },
+                };
+                built += 1;
+            }
+            break :blk owned;
+        };
+        _ = self.publishLifecycleUiEvent(.{ .extension_commands_updated = .{ .commands = commands } });
+    }
+
+    /// TUI-thread application of the latest extension command surface.
+    fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {
+        for (self.command_registry.dynamic.items) |*cmd| {
+            self.allocator.free(cmd.name);
+            if (cmd.description) |d| self.allocator.free(d);
+        }
+        self.command_registry.dynamic.clearRetainingCapacity();
+
+        for (commands) |entry| {
+            const name = self.allocator.dupe(u8, entry.name) catch continue;
+            const desc = self.allocator.dupe(u8, entry.description) catch {
+                self.allocator.free(name);
+                continue;
+            };
+            self.command_registry.register(.{
+                .name = name,
+                .description = desc,
+                .source = .extension,
+                .action = .extension,
+            });
+        }
+        self.tui.dirty = true;
     }
 
     /// Agent-thread handler for `AgentRequest.compact`. The runner emits
@@ -2765,6 +2847,7 @@ pub const Interactive = struct {
             _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
+        self.publishExtensionCommandsUpdate();
         self.publishThemeSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {
@@ -2783,6 +2866,7 @@ pub const Interactive = struct {
             _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
             return;
         };
+        self.publishExtensionCommandsUpdate();
         self.publishThemeSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {
@@ -2813,6 +2897,7 @@ pub const Interactive = struct {
 
         const restore_warning = result.restore_warning;
 
+        self.publishExtensionCommandsUpdate();
         self.publishThemeSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {

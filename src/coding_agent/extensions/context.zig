@@ -263,3 +263,36 @@ fn ctxGetSystemPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
     }
     return 1;
 }
+
+/// Push the extension context table for command handlers.
+///
+/// Command handlers receive the same base context as tool/event
+/// handlers plus command-only fields. In this slice those fields
+/// are absent/nil because session-control actions are not yet safe
+/// inside command bodies (they may destroy the live runner while
+/// the coroutine is still executing).
+pub fn pushCommandContext(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+    provenance: ?resource_types.ExtensionProvenance,
+) !void {
+    try pushExtensionContext(L, runner, provenance);
+
+    // Command-only session-control fields: all nil in this slice.
+    // They are explicitly present (rather than absent) so extension
+    // code that probes `ctx.new_session` sees nil and gets a clean
+    // "attempt to call a nil value" error instead of a missing-key
+    // diagnostic.
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, "wait_for_idle");
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, "new_session");
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, "fork");
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, "navigate_tree");
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, "switch_session");
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, "reload");
+}

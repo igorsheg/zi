@@ -76,9 +76,11 @@ why this order:
 
 current zi does not ship this full v2 surface yet. the code shows four relevant facts.
 
-### 1. public extension api is still tools + events + spawn only
+### 1. public extension api is tools + events + spawn + register_command
 
-`installZiTable` installs exactly `zi.register_tool`, `zi.on`, and `zi.spawn`, then publishes the table as global `zi` (`src/coding_agent/extensions/api.zig:64-81`).
+`installZiTable` installs `zi.register_tool`, `zi.register_command`, `zi.on`, and `zi.spawn`, then publishes the table as global `zi` (`src/coding_agent/extensions/api.zig:64-87`).
+
+`zi.register_command` takes a table with `name` (required string), `handler` (required function), and `description` (optional string). Duplicate canonical names aggregate deterministically into visible invocation names (`x:1`, `x:2`, …) in the runner's `command_registry` (`src/coding_agent/extensions/registries/command_registry.zig:33-85`).
 
 ### 2. command/session-control seams already exist as reserved seats
 
@@ -86,11 +88,11 @@ current zi does not ship this full v2 surface yet. the code shows four relevant 
 - `src/coding_agent/extensions/runner.zig:150-159` keeps a generation-local `command_registry` slot and describes it as a reserved target for the bind seam.
 - `src/coding_agent/agent_session.zig:2444-2475` defines `ExtensionCommandContext` with command-only session-control methods and says those methods are only safe inside user-initiated commands.
 
-### 3. slash-command dispatch is currently tui-owned
+### 3. slash-command dispatch: builtins stay tui-local, extension commands go to the agent thread
 
-- `src/coding_agent/slash_commands.zig:3-38` defines the slash command action families and treats builtins plus dynamic commands as one tui-facing registry type.
-- `src/tui/interactive.zig:1821-1827` intercepts `/...` input before prompt submission.
-- `src/tui/interactive.zig:1878-1976` resolves slash commands from the tui-owned registry and, today, even calls extension handlers inline on the tui path.
+- `src/coding_agent/slash_commands.zig:3-38` defines the slash command action families. the `extension` action is now a marker (no inline handler storage); the TUI registry only holds visible name + description.
+- `src/tui/interactive.zig` intercepts `/...` input before prompt submission. built-in commands execute locally; extension commands enqueue `AgentRequest.extension_command` through the idle-request path (`dispatchIdleRequest`).
+- `src/tui/interactive.zig` rebuilds its TUI-owned `command_registry.dynamic` from the runner's visible command list at startup and after every session replacement (`new`, `fork`, `resume`). this is a tui-owned copy/sync, not direct runner reads and not queued snapshot transport.
 
 ### 4. bind still leaves command actions unwired
 
@@ -142,6 +144,12 @@ why:
 - built-ins already intercept on the tui side before prompt submission (`src/tui/interactive.zig:1821-1827`, `src/tui/interactive.zig:1868-1953`).
 - `ExtensionCommandContext` exists specifically for command-only session control and explicitly forbids tool/event-style mid-turn use (`src/coding_agent/agent_session.zig:2444-2475`).
 - the lifecycle contract says command bodies are agent-thread work and may suspend only under the host scheduler (`docs/extensions-lifecycle.md:162-190`).
+
+### what is still pending after this slice
+
+- **command-only session-control actions** (`new_session`, `fork`, `switch_session`, `navigate_tree`, `reload`, `wait_for_idle`) are not yet wired on `ExtensionCommandContext`. the context fields are present as `nil` so extensions that try to use them get an honest Lua error rather than a missing-key diagnostic.
+- **yieldable command bodies** are not supported. if a command handler calls a yieldable host function (e.g. `zi.spawn`), dispatch returns `error.UnexpectedYield` and the command path fails.
+- **fallback to old inline tui execution** was removed entirely; extension commands that cannot reach the agent thread (e.g. queue full) surface the failure honestly in status text.
 
 ### naming and visibility
 
