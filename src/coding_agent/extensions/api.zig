@@ -69,6 +69,11 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     state.pushCClosureWithUserdata(ziRegisterTool, runner);
     c.lua_setfield(L, -2, "register_tool");
 
+    // host-private builtin bridge. builtin extension chunks may call
+    // this while their load context is active; user extensions may not.
+    state.pushCClosureWithUserdata(ziRegisterBuiltinTools, runner);
+    c.lua_setfield(L, -2, "__register_builtin_tools");
+
     // zi.on
     state.pushCClosureWithUserdata(ziOn, runner);
     c.lua_setfield(L, -2, "on");
@@ -260,6 +265,34 @@ fn buildExtensionTool(
 /// `ToolRegistry.freeEntry` minus the registry-managed bookkeeping.
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
     tool_def.freeOwned(allocator, tool);
+}
+
+fn ziRegisterBuiltinTools(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+    const source = runner.currentLoadSource() orelse return luaError(L, "builtin bridge: missing load context");
+    if (!std.mem.eql(u8, source.kind, "builtin")) {
+        return luaError(L, "builtin bridge: builtin load context required");
+    }
+
+    for (runner.builtin_tool_definitions) |definition| {
+        var cloned = tool_def.cloneOwned(runner.allocator, definition) catch {
+            return luaError(L, "builtin bridge: failed to clone builtin tool");
+        };
+        errdefer freeBuiltTool(runner.allocator, &cloned);
+        cloned.source = currentRegistrationSource(runner);
+
+        const accepted = runner.tool_registry.register(cloned) catch {
+            freeBuiltTool(runner.allocator, &cloned);
+            return luaError(L, "builtin bridge: registry insert failed");
+        };
+        if (!accepted) {
+            freeBuiltTool(runner.allocator, &cloned);
+        }
+    }
+
+    c.lua_pushboolean(L, 1);
+    return 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

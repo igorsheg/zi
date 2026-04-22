@@ -1,6 +1,7 @@
 const std = @import("std");
 const storage = @import("../../storage.zig");
 const extension_loader = @import("../extensions/loader.zig");
+const tool_def = @import("../tools/definition.zig");
 const extension_runner = @import("../extensions/runner.zig");
 const lua_runtime = @import("../extensions/lua_runtime.zig");
 const skills = @import("../skills/root.zig");
@@ -113,10 +114,10 @@ pub const ResourceLoader = struct {
         return self.extension_roots;
     }
 
-    pub fn loadExtensionsInto(self: *const ResourceLoader, state: *lua_runtime.LuaState, runner: *extension_runner.ExtensionRunner) extension_loader.LoadStats {
+    pub fn loadExtensionsInto(self: *const ResourceLoader, state: *lua_runtime.LuaState, runner: *extension_runner.ExtensionRunner, builtin_definitions: []const tool_def.ToolDefinition) extension_loader.LoadStats {
         const entries = self.allocExtensionLoaderEntries() catch return .{};
         defer self.allocator.free(entries);
-        return extension_loader.loadAll(self.allocator, state, runner, entries);
+        return extension_loader.loadAll(self.allocator, state, runner, entries, builtin_definitions);
     }
 
     pub fn getSkills(self: *const ResourceLoader) types.LoadedSkills {
@@ -355,6 +356,16 @@ pub const ResourceLoader = struct {
             .kind = .runtime_root,
             .runtime_root_id = project_dir,
             .state_owner_id = project_dir,
+        });
+
+        const builtin_root = try self.allocator.dupe(u8, "<builtin>");
+        errdefer self.allocator.free(builtin_root);
+        try roots.append(self.allocator, .{
+            .source = .builtin,
+            .path = builtin_root,
+            .kind = .builtin,
+            .runtime_root_id = builtin_root,
+            .state_owner_id = builtin_root,
         });
 
         return try roots.toOwnedSlice(self.allocator);
@@ -1024,7 +1035,7 @@ test "resource loader normalizes static extension ingress into canonical order" 
     defer loader.deinit();
 
     const extensions = loader.getExtensions().extensions;
-    try std.testing.expectEqual(@as(usize, 5), extensions.len);
+    try std.testing.expectEqual(@as(usize, 6), extensions.len);
 
     try std.testing.expectEqualStrings("explicit", extensions[0].id);
     try std.testing.expectEqual(types.ExtensionSource.explicit, extensions[0].source);
@@ -1040,6 +1051,9 @@ test "resource loader normalizes static extension ingress into canonical order" 
 
     try std.testing.expectEqualStrings("project_local", extensions[4].id);
     try std.testing.expectEqual(types.ExtensionSource.project, extensions[4].source);
+
+    try std.testing.expectEqualStrings("builtins", extensions[5].id);
+    try std.testing.expectEqual(types.ExtensionSource.builtin, extensions[5].source);
 }
 
 test "resource loader resolves prompt inputs and discovers agents files" {
@@ -1120,4 +1134,26 @@ test "resource loader resolves prompt inputs and discovers agents files" {
         }
     }
     try std.testing.expect(saw_extension_skill);
+}
+
+test "builtin root is last in canonical extension root order" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var loader = try ResourceLoader.init(allocator, .{
+        .cwd = tmp_path,
+    });
+    defer loader.deinit();
+
+    const roots = loader.getExtensionRoots();
+    try std.testing.expect(roots.len > 0);
+    const last = roots[roots.len - 1];
+    try std.testing.expectEqual(types.ExtensionSource.builtin, last.source);
+    try std.testing.expectEqual(types.StaticExtensionRootKind.builtin, last.kind);
+    try std.testing.expectEqualStrings("<builtin>", last.path);
 }

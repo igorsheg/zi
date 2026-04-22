@@ -148,6 +148,7 @@ pub fn prepareSessionDeps(
         options.cwd,
         resource_loader,
         builtin_definitions,
+        options.tools != null,
         options.extension_generation,
     );
     errdefer extension_runtime.deinit(allocator);
@@ -323,6 +324,7 @@ fn buildExtensionRuntime(
     cwd: []const u8,
     resource_loader: resources.ResourceLoader,
     builtin_definitions: []const tool_def.ToolDefinition,
+    has_custom_tools: bool,
     generation: extension_runner_mod.Generation,
 ) !ExtensionRuntime {
     var runtime: ExtensionRuntime = .{};
@@ -336,6 +338,7 @@ fn buildExtensionRuntime(
     errdefer allocator.destroy(runner_ptr);
     runner_ptr.* = ExtensionRunner.init(allocator, generation);
     runner_ptr.cwd = cwd;
+    runner_ptr.builtin_tool_definitions = if (has_custom_tools) &.{} else builtin_definitions;
     runner_ptr.attachLuaState(state_ptr);
     extension_api.installZiTable(state_ptr, runner_ptr);
 
@@ -382,55 +385,43 @@ fn buildExtensionRuntime(
     runner_ptr.setModuleContext(state_ptr, null);
 
     runner_ptr.bindLuaOwnerThread(std.Thread.getCurrentId());
-    const loaded_extensions = resource_loader.getExtensions();
-    if (loaded_extensions.extensions.len > 0) {
-        const stats = resource_loader.loadExtensionsInto(state_ptr, runner_ptr);
-        std.log.scoped(.extensions).info(
-            "extensions: {d} loaded, {d} failed of {d} discovered",
-            .{ stats.loaded, stats.failed, stats.attempted },
-        );
+    const stats = resource_loader.loadExtensionsInto(
+        state_ptr,
+        runner_ptr,
+        if (has_custom_tools) &.{} else builtin_definitions,
+    );
+    std.log.scoped(.extensions).info(
+        "extensions: {d} loaded, {d} failed of {d} discovered",
+        .{ stats.loaded, stats.failed, stats.attempted },
+    );
+
+    // If custom tools override builtins, register them directly.
+    if (has_custom_tools) {
+        for (builtin_definitions) |def| {
+            var cloned = tool_def.cloneOwned(runner_ptr.allocator, def) catch |err| {
+                std.log.scoped(.extensions).warn(
+                    "failed to clone custom tool '{s}' for registry: {s}",
+                    .{ def.name, @errorName(err) },
+                );
+                continue;
+            };
+            const accepted = runner_ptr.tool_registry.register(cloned) catch |err| {
+                std.log.scoped(.extensions).warn(
+                    "failed to register custom tool '{s}': {s}",
+                    .{ def.name, @errorName(err) },
+                );
+                tool_def.freeOwned(runner_ptr.allocator, &cloned);
+                continue;
+            };
+            if (!accepted) {
+                tool_def.freeOwned(runner_ptr.allocator, &cloned);
+            }
+        }
     }
 
-    registerBaseToolDefinitions(runner_ptr, builtin_definitions);
     runtime.lua_state = state_ptr;
     runtime.runner = runner_ptr;
     return runtime;
-}
-
-fn registerBaseToolDefinitions(
-    runner: *ExtensionRunner,
-    definitions: []const tool_def.ToolDefinition,
-) void {
-    for (definitions) |definition| {
-        registerBaseToolDefinition(runner, definition);
-    }
-}
-
-fn registerBaseToolDefinition(runner: *ExtensionRunner, definition: tool_def.ToolDefinition) void {
-    var cloned = tool_def.cloneOwned(runner.allocator, definition) catch |err| {
-        std.log.scoped(.extensions).warn(
-            "failed to clone base tool '{s}' for registry: {s}",
-            .{ definition.name, @errorName(err) },
-        );
-        return;
-    };
-
-    const accepted = runner.tool_registry.register(cloned) catch |err| {
-        std.log.scoped(.extensions).warn(
-            "failed to register base tool '{s}': {s}",
-            .{ definition.name, @errorName(err) },
-        );
-        tool_def.freeOwned(runner.allocator, &cloned);
-        return;
-    };
-    if (!accepted) {
-        const winner = runner.tool_registry.get(definition.name) orelse unreachable;
-        std.log.scoped(.extensions).info(
-            "base tool '{s}' from {s} ignored; already registered by {s}:{s}",
-            .{ definition.name, definition.source.kind, winner.source.kind, winner.source.id },
-        );
-        tool_def.freeOwned(runner.allocator, &cloned);
-    }
 }
 
 fn toolNameSlice(

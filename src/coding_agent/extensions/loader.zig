@@ -2,6 +2,7 @@ const std = @import("std");
 const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const tool_def = @import("../tools/definition.zig");
 
 const log = std.log.scoped(.extensions);
 
@@ -10,6 +11,10 @@ const log = std.log.scoped(.extensions);
 /// in the wrong dir, runaway generator). Capping here keeps the
 /// read path bounded without needing streaming.
 const MAX_EXTENSION_SIZE: usize = 1024 * 1024;
+const BUILTIN_EXTENSION_SOURCE =
+    "return function(zi)\n" ++
+    "  zi.__register_builtin_tools()\n" ++
+    "end\n";
 
 pub const ExtensionSource = resource_types.ExtensionSource;
 pub const StaticExtensionRoot = resource_types.StaticExtensionRoot;
@@ -53,7 +58,7 @@ const SeenIds = struct {
 
 /// Discover all extensions from the caller-provided canonical root list.
 /// Caller owns returned slice and all strings. Use freeExtensions() to clean up.
-/// Built-in extensions are NOT handled here (skip for C1).
+/// Built-in extensions are handled as virtual roots.
 pub fn discover(opts: DiscoverOptions) ![]LoadedExtension {
     var results: std.ArrayListUnmanaged(LoadedExtension) = .empty;
     var seen: SeenIds = .{};
@@ -67,6 +72,22 @@ pub fn discover(opts: DiscoverOptions) ![]LoadedExtension {
                 try scanDirectory(opts.allocator, ext_dir, root, &results, &seen);
             },
             .synthetic_extension => try loadSyntheticExtension(opts.allocator, root, &results, &seen),
+            .builtin => {
+                const builtin_id = try opts.allocator.dupe(u8, "builtins");
+                errdefer opts.allocator.free(builtin_id);
+                try results.append(opts.allocator, .{
+                    .id = builtin_id,
+                    .path = try opts.allocator.dupe(u8, "<builtin>"),
+                    .source = root.source,
+                    .provenance = .{
+                        .runtime_root_id = try opts.allocator.dupe(u8, root.runtime_root_id),
+                        .extension_id = builtin_id,
+                        .state_owner_id = try opts.allocator.dupe(u8, root.state_owner_id),
+                        .root_kind = root.kind,
+                    },
+                });
+                try seen.add(opts.allocator, "builtins");
+            },
         }
     }
 
@@ -262,23 +283,79 @@ pub fn loadAll(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
     list: []const LoadedExtension,
+    builtin_definitions: []const tool_def.ToolDefinition,
 ) LoadStats {
     var stats: LoadStats = .{};
     for (list) |ext| {
         stats.attempted += 1;
-        loadOne(allocator, state, runner, ext) catch |err| {
-            log.warn("extension load failed: {s} ({s}): {s}", .{
-                ext.id,
-                ext.path,
-                @errorName(err),
-            });
-            stats.failed += 1;
-            continue;
-        };
+        if (ext.source == .builtin) {
+            loadBuiltinExtension(state, runner, ext, builtin_definitions) catch |err| {
+                log.warn("builtin extension load failed: {s} ({s}): {s}", .{
+                    ext.id,
+                    ext.path,
+                    @errorName(err),
+                });
+                stats.failed += 1;
+                continue;
+            };
+        } else {
+            loadOne(allocator, state, runner, ext) catch |err| {
+                log.warn("extension load failed: {s} ({s}): {s}", .{
+                    ext.id,
+                    ext.path,
+                    @errorName(err),
+                });
+                stats.failed += 1;
+                continue;
+            };
+        }
         stats.loaded += 1;
         log.debug("extension loaded: {s} [{s}]", .{ ext.id, @tagName(ext.source) });
     }
     return stats;
+}
+
+fn loadBuiltinExtension(
+    state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
+    ext: LoadedExtension,
+    builtin_definitions: []const tool_def.ToolDefinition,
+) !void {
+    if (builtin_definitions.len == 0) return;
+
+    const chunk_name_buf = try std.fmt.allocPrint(runner.allocator, "@{s}", .{ext.path});
+    defer runner.allocator.free(chunk_name_buf);
+    const chunk_name = try runner.allocator.dupeZ(u8, chunk_name_buf);
+    defer runner.allocator.free(chunk_name);
+
+    const load_source: runner_mod.ExtensionLoadSource = .{
+        .kind = sourceKindString(ext.source),
+        .id = ext.id,
+        .path = ext.path,
+        .provenance = ext.provenance,
+    };
+    runner.beginLoadContext(load_source);
+    defer runner.endLoadContext();
+    runner.setModuleContext(state, ext.provenance);
+
+    try state.loadChunk(BUILTIN_EXTENSION_SOURCE, chunk_name);
+    const chunk_call_rc = lua_runtime.c.lua_pcallk(state.L, 0, 1, 0, 0, null);
+    if (chunk_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, chunk_call_rc);
+    errdefer lua_runtime.c.lua_pop(state.L, 1);
+
+    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+        return error.ExtensionFactoryExpectedFunction;
+    }
+
+    _ = lua_runtime.c.lua_getglobal(state.L, "zi");
+    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TTABLE) {
+        lua_runtime.c.lua_pop(state.L, 2);
+        return error.LuaRuntime;
+    }
+
+    const factory_call_rc = lua_runtime.c.lua_pcallk(state.L, 1, 0, 0, 0, null);
+    if (factory_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, factory_call_rc);
+    try runner.recordLoadedExtension(ext.provenance);
 }
 
 fn loadOne(
@@ -572,7 +649,7 @@ test "loadAll executes discovered .lua files and registrations land" {
     api.installZiTable(&state, &runner);
 
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.attempted);
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
     try std.testing.expectEqual(@as(u32, 0), stats.failed);
@@ -614,7 +691,7 @@ test "loadAll continues after a broken extension" {
     api.installZiTable(&state, &runner);
 
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 2), stats.attempted);
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
     try std.testing.expectEqual(@as(u32, 1), stats.failed);
@@ -666,7 +743,7 @@ test "loadAll calls factory with zi and stamps source provenance" {
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
     api.installZiTable(&state, &runner);
 
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
 
     const tool = runner.tool_registry.get("demo").?;
@@ -728,7 +805,7 @@ test "loadAll stamps provenance on top-level registrations outside factory" {
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
     api.installZiTable(&state, &runner);
 
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
 
     const handler = runner.event_registry.handlers(.message_end)[0];
@@ -778,7 +855,7 @@ test "flat extension requires private helper resolved from synthetic module root
     api.installZiTable(&state, &runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
 
     try state.doString("assert(_helper_loaded == true)", "verify");
@@ -821,7 +898,7 @@ test "bundled extension requires private helper resolved from directory module r
     api.installZiTable(&state, &runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
 
     try state.doString("assert(_bar_helper_loaded == true)", "verify");
@@ -875,7 +952,7 @@ test "shared lua root resolves before later root in canonical order" {
     api.installZiTable(&state, &runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
 
     try state.doString("assert(_shared_value == 'first')", "verify");
@@ -920,7 +997,7 @@ test "event handler dispatch inherits extension module context for require" {
     api.installZiTable(&state, &runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 
-    const stats = loadAll(allocator, &state, &runner, exts);
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
 
     // Build a payload table on the main stack: { name = "ping" }
@@ -932,4 +1009,180 @@ test "event handler dispatch inherits extension module context for require" {
     lua_runtime.c.lua_pop(state.L, 1);
 
     try state.doString("assert(_evt_helper_loaded == true)", "verify");
+}
+
+test "builtin tools register with builtin source through extension loader" {
+    const allocator = std.testing.allocator;
+
+    const params = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    const builtin_defs = try allocator.alloc(tool_def.ToolDefinition, 1);
+    defer {
+        allocator.free(builtin_defs[0].name);
+        allocator.free(builtin_defs[0].label);
+        allocator.free(builtin_defs[0].description);
+        var p = builtin_defs[0].parameters.object;
+        p.deinit();
+        allocator.free(builtin_defs);
+    }
+    builtin_defs[0] = .{
+        .name = try allocator.dupe(u8, "bash"),
+        .label = try allocator.dupe(u8, "bash"),
+        .description = try allocator.dupe(u8, "test bash"),
+        .parameters = params,
+        .impl = .{ .builtin = .{ .execute = undefined } },
+        .source = .{ .kind = "builtin", .id = "bash" },
+    };
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.builtin_tool_definitions = builtin_defs;
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    const ext = LoadedExtension{
+        .id = try allocator.dupe(u8, "builtins"),
+        .path = try allocator.dupe(u8, "<builtin>"),
+        .source = .builtin,
+        .provenance = .{
+            .runtime_root_id = try allocator.dupe(u8, "builtin"),
+            .extension_id = try allocator.dupe(u8, "builtins"),
+            .state_owner_id = try allocator.dupe(u8, "builtin"),
+            .root_kind = .builtin,
+        },
+    };
+    defer {
+        allocator.free(ext.id);
+        allocator.free(ext.path);
+        allocator.free(ext.provenance.runtime_root_id);
+        allocator.free(ext.provenance.extension_id);
+        allocator.free(ext.provenance.state_owner_id);
+    }
+
+    const stats = loadAll(allocator, &state, &runner, &.{ext}, builtin_defs);
+    try std.testing.expectEqual(@as(u32, 1), stats.attempted);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expectEqual(@as(u32, 0), stats.failed);
+
+    const tool = runner.tool_registry.get("bash").?;
+    try std.testing.expectEqualStrings("builtin", tool.source.kind);
+}
+
+test "user extension wins precedence over builtin with same name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    const user_src =
+        "return function(zi)\n" ++
+        "  zi.register_tool({\n" ++
+        "    name = \"bash\",\n" ++
+        "    description = \"user bash\",\n" ++
+        "    parameters = { type = \"object\", properties = {} },\n" ++
+        "    execute = function(params, ctx)\n" ++
+        "      return { ok = true }\n" ++
+        "    end,\n" ++
+        "  })\n" ++
+        "end\n";
+    try ext_dir.writeFile(.{ .sub_path = "bash.lua", .data = user_src });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+        .runtime_root_id = tmp_path,
+        .state_owner_id = tmp_path,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    const params = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    const builtin_defs = try allocator.alloc(tool_def.ToolDefinition, 1);
+    defer {
+        allocator.free(builtin_defs[0].name);
+        allocator.free(builtin_defs[0].label);
+        allocator.free(builtin_defs[0].description);
+        var p = builtin_defs[0].parameters.object;
+        p.deinit();
+        allocator.free(builtin_defs);
+    }
+    builtin_defs[0] = .{
+        .name = try allocator.dupe(u8, "bash"),
+        .label = try allocator.dupe(u8, "bash"),
+        .description = try allocator.dupe(u8, "builtin bash"),
+        .parameters = params,
+        .impl = .{ .builtin = .{ .execute = undefined } },
+        .source = .{ .kind = "builtin", .id = "bash" },
+    };
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.builtin_tool_definitions = builtin_defs;
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    // Load user extension first
+    const user_stats = loadAll(allocator, &state, &runner, exts, builtin_defs);
+    try std.testing.expectEqual(@as(u32, 1), user_stats.loaded);
+
+    // Load builtin extension after user
+    const builtin_ext = LoadedExtension{
+        .id = try allocator.dupe(u8, "builtins"),
+        .path = try allocator.dupe(u8, "<builtin>"),
+        .source = .builtin,
+        .provenance = .{
+            .runtime_root_id = try allocator.dupe(u8, "builtin"),
+            .extension_id = try allocator.dupe(u8, "builtins"),
+            .state_owner_id = try allocator.dupe(u8, "builtin"),
+            .root_kind = .builtin,
+        },
+    };
+    defer {
+        allocator.free(builtin_ext.id);
+        allocator.free(builtin_ext.path);
+        allocator.free(builtin_ext.provenance.runtime_root_id);
+        allocator.free(builtin_ext.provenance.extension_id);
+        allocator.free(builtin_ext.provenance.state_owner_id);
+    }
+
+    const builtin_stats = loadAll(allocator, &state, &runner, &.{builtin_ext}, builtin_defs);
+    try std.testing.expectEqual(@as(u32, 1), builtin_stats.attempted);
+    try std.testing.expectEqual(@as(u32, 1), builtin_stats.loaded);
+    try std.testing.expectEqual(@as(u32, 0), builtin_stats.failed);
+
+    // User version should win (first-registered-wins)
+    const tool = runner.tool_registry.get("bash").?;
+    try std.testing.expectEqualStrings("user", tool.source.kind);
+}
+
+test "builtin registration bridge rejects calls outside builtin load context" {
+    const allocator = std.testing.allocator;
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    try state.doString(
+        \\local ok = pcall(function()
+        \\  zi.__register_builtin_tools()
+        \\end)
+        \\assert(ok == false)
+    , "verify_builtin_bridge_private");
 }

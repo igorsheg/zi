@@ -5,6 +5,7 @@ const abort_signal = @import("../../abort_signal.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
 const resource_types = @import("../resources/types.zig");
+const tool_def = @import("../tools/definition.zig");
 
 /// Monotonic generation counter. Each reload creates a new generation.
 ///
@@ -312,6 +313,11 @@ pub const ExtensionRunner = struct {
     /// before any extension overrides. Preserves builtin/default
     /// module resolution after shared and private roots.
     base_package_path: ?[]const u8 = null,
+
+    /// Borrowed builtin tool catalog used by the host-private builtin
+    /// extension bridge during load. Empty for sessions that provide
+    /// custom top-level tools instead of the default builtin set.
+    builtin_tool_definitions: []const tool_def.ToolDefinition = &.{},
 
     // Future fields documented as comments so the runner shape is
     // visible without compiling unused state:
