@@ -51,6 +51,8 @@ const tool_def = @import("../tools/definition.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
+const session_core = @import("../../session/root.zig");
+const ai = @import("../../ai/root.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
@@ -64,7 +66,7 @@ const log = std.log.scoped(.zi_api);
 /// by tests that build a state inline.
 pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
-    c.lua_createtable(L, 0, 9);
+    c.lua_createtable(L, 0, 11);
 
     // zi.register_tool
     state.pushCClosureWithUserdata(ziRegisterTool, runner);
@@ -73,6 +75,14 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     // zi.register_command
     state.pushCClosureWithUserdata(ziRegisterCommand, runner);
     c.lua_setfield(L, -2, "register_command");
+
+    // zi.register_provider
+    state.pushCClosureWithUserdata(ziRegisterProvider, runner);
+    c.lua_setfield(L, -2, "register_provider");
+
+    // zi.unregister_provider
+    state.pushCClosureWithUserdata(ziUnregisterProvider, runner);
+    c.lua_setfield(L, -2, "unregister_provider");
 
     // host-private builtin bridge. builtin extension chunks may call
     // this while their load context is active; user extensions may not.
@@ -270,6 +280,107 @@ fn buildExtensionTool(
 /// `ToolRegistry.freeEntry` minus the registry-managed bookkeeping.
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
     tool_def.freeOwned(allocator, tool);
+}
+
+const RegisterProviderError = error{
+    MissingName,
+    InvalidName,
+    MissingConfig,
+    InvalidConfig,
+    MissingApi,
+    InvalidApi,
+    MissingBaseUrl,
+    InvalidBaseUrl,
+    OutOfMemory,
+};
+
+fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+
+    const claim = buildProviderRegistration(L, runner) catch |err| {
+        return luaError(L, switch (err) {
+            error.MissingName, error.InvalidName => "register_provider: expected provider name string as first argument",
+            error.MissingConfig, error.InvalidConfig => "register_provider: expected config table as second argument",
+            error.MissingApi => "register_provider: missing required field 'api'",
+            error.InvalidApi => "register_provider: field 'api' must be a string",
+            error.MissingBaseUrl => "register_provider: missing required field 'base_url'",
+            error.InvalidBaseUrl => "register_provider: field 'base_url' must be a string",
+            error.OutOfMemory => "register_provider: out of memory",
+        });
+    };
+
+    const accepted = runner.registerProviderClaim(claim) catch |err| {
+        return luaError(L, switch (err) {
+            error.UnknownApi => "register_provider: this slice only supports overriding an existing api",
+            error.OutOfMemory => "register_provider: out of memory",
+        });
+    };
+    if (!accepted) {
+        var rejected = claim;
+        rejected.deinit(runner.allocator);
+    }
+
+    c.lua_pushboolean(L, if (accepted) 1 else 0);
+    return 1;
+}
+
+fn ziUnregisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+        return luaError(L, "unregister_provider: expected provider name string as first argument");
+    }
+
+    var name_len: usize = 0;
+    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return luaError(L, "unregister_provider: invalid provider name");
+    const owned_name = runner.allocator.dupe(u8, name_ptr[0..name_len]) catch return luaError(L, "unregister_provider: out of memory");
+    const owned_owner = runner.allocator.dupe(u8, currentProviderOwnerId(runner)) catch {
+        runner.allocator.free(owned_name);
+        return luaError(L, "unregister_provider: out of memory");
+    };
+
+    const removed = runner.unregisterProviderClaim(owned_name, owned_owner) catch |err| {
+        return luaError(L, switch (err) {
+            error.OutOfMemory => "unregister_provider: out of memory",
+        });
+    };
+
+    c.lua_pushboolean(L, if (removed) 1 else 0);
+    return 1;
+}
+
+fn buildProviderRegistration(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+) RegisterProviderError!ai.provider.ClaimRegistration {
+    const a = runner.allocator;
+
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) return error.MissingName;
+    if (c.lua_type(L, 2) != c.LUA_TTABLE) return error.MissingConfig;
+
+    var name_len: usize = 0;
+    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return error.InvalidName;
+    const name = a.dupe(u8, name_ptr[0..name_len]) catch return error.OutOfMemory;
+    errdefer a.free(name);
+
+    const api_name = try requireProviderFieldString(L, 2, "api", a, error.MissingApi, error.InvalidApi);
+    errdefer a.free(api_name);
+
+    const base_url = try requireProviderFieldString(L, 2, "base_url", a, error.MissingBaseUrl, error.InvalidBaseUrl);
+    errdefer a.free(base_url);
+
+    const owner_id = a.dupe(u8, currentProviderOwnerId(runner)) catch return error.OutOfMemory;
+    errdefer a.free(owner_id);
+
+    return .{
+        .name = name,
+        .api = api_name,
+        .base_url = base_url,
+        .owner_id = owner_id,
+        .generation = runner.generation,
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -756,7 +867,7 @@ pub fn eventTrampoline(
 }
 
 pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.AgentToolResult) void {
-    c.lua_createtable(L, 0, 9);
+    c.lua_createtable(L, 0, 11);
 
     c.lua_pushinteger(L, if (result.is_error) 1 else 0);
     c.lua_setfield(L, -2, "exit_code");
@@ -803,7 +914,7 @@ pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.Agent
 }
 
 fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
-    c.lua_createtable(L, 0, 9);
+    c.lua_createtable(L, 0, 11);
 
     c.lua_pushinteger(L, @intCast(result.exit_code));
     c.lua_setfield(L, -2, "exit_code");
@@ -874,6 +985,33 @@ fn currentEventProvenance(runner: *const runner_mod.ExtensionRunner) ?@import(".
 fn currentEventSourceId(runner: *const runner_mod.ExtensionRunner) []const u8 {
     const source = runner.currentLoadSource() orelse return "lua";
     return source.path;
+}
+
+fn currentProviderOwnerId(runner: *const runner_mod.ExtensionRunner) []const u8 {
+    const source = runner.currentLoadSource() orelse return "lua";
+    return source.provenance.state_owner_id;
+}
+
+fn requireProviderFieldString(
+    L: *c.lua_State,
+    table_idx: c_int,
+    field: [:0]const u8,
+    allocator: std.mem.Allocator,
+    missing_err: RegisterProviderError,
+    invalid_err: RegisterProviderError,
+) RegisterProviderError![]const u8 {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+
+    return switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => missing_err,
+        c.LUA_TSTRING => blk: {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, -1, &len) orelse return invalid_err;
+            break :blk allocator.dupe(u8, ptr[0..len]) catch return error.OutOfMemory;
+        },
+        else => invalid_err,
+    };
 }
 
 /// Push an error message onto the Lua stack and longjmp out of the
@@ -986,6 +1124,122 @@ fn freeStringArray(allocator: std.mem.Allocator, arr: []const []const u8) void {
 // =============================================================================
 
 const testing = std.testing;
+
+fn testBindGetModel(_: *anyopaque) agent_protocol.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = .anthropic_messages,
+        .provider = .anthropic,
+        .base_url = "https://baseline.example",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 1024,
+    };
+}
+
+fn testBindIsIdle(_: *anyopaque) bool {
+    return true;
+}
+
+fn testBindAbort(_: *anyopaque) void {}
+
+fn testBindHasPendingMessages(_: *anyopaque) bool {
+    return false;
+}
+
+fn testBindGetContextUsage(_: *anyopaque) ?session_core.context_usage.ContextUsage {
+    return null;
+}
+
+fn testBindGetSystemPrompt(_: *anyopaque) []const u8 {
+    return "system";
+}
+
+fn testBindGetBindingInfo(_: *anyopaque) runner_mod.ExtensionBindingInfo {
+    return .{
+        .workspace_id = "/workspace",
+        .session_id = "session-123",
+        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+    };
+}
+
+fn testProviderProvenance() @import("../resources/types.zig").ExtensionProvenance {
+    return .{
+        .runtime_root_id = "root-123",
+        .extension_id = "ext-123",
+        .state_owner_id = "state-123",
+        .root_kind = .runtime_root,
+    };
+}
+
+fn testProviderLoadSource() runner_mod.ExtensionLoadSource {
+    return .{
+        .kind = "project",
+        .id = "ext-123",
+        .path = "/workspace/extensions/ext.lua",
+        .provenance = testProviderProvenance(),
+    };
+}
+
+test "zi.register_provider queues before bind and applies live changes after bind" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testProviderLoadSource());
+
+    try state.doString(
+        \\assert(zi.register_provider("queued", {
+        \\  api = "anthropic-messages",
+        \\  base_url = "https://queued.example"
+        \\}) == true)
+    , "provider_prebind");
+
+    try testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
+    runner.endLoadContext();
+
+    var baseline = ai.faux.FauxProvider.init(testing.allocator);
+    defer baseline.deinit();
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try provider_registry.register("anthropic-messages", baseline.provider(), null);
+
+    try runner.bindRuntime(.{
+        .session = undefined,
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testBindGetModel,
+        .is_idle = &testBindIsIdle,
+        .abort = &testBindAbort,
+        .has_pending_messages = &testBindHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testBindGetContextUsage,
+        .get_system_prompt = &testBindGetSystemPrompt,
+        .get_binding_info = &testBindGetBindingInfo,
+    }, &provider_registry);
+
+    try testing.expectEqualStrings("queued", provider_registry.get("anthropic-messages").?.getName());
+
+    runner.beginExecutionContext(runner.sourceForProvenance(testProviderProvenance()));
+    defer runner.endExecutionContext();
+
+    try state.doString(
+        \\assert(zi.register_provider("live", {
+        \\  api = "anthropic-messages",
+        \\  base_url = "https://live.example"
+        \\}) == true)
+        \\assert(zi.unregister_provider("live") == true)
+    , "provider_live");
+
+    try testing.expectEqualStrings("queued", provider_registry.get("anthropic-messages").?.getName());
+}
 
 test "zi.register_tool registers a Lua-defined tool end-to-end" {
     var state = try lua_runtime.LuaState.init(testing.allocator);

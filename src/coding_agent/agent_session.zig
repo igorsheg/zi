@@ -639,7 +639,7 @@ pub const AgentSession = struct {
             .get_context_usage = &runtimeGetContextUsage,
             .get_system_prompt = &runtimeGetSystemPrompt,
             .get_binding_info = &runtimeGetBindingInfo,
-        }) catch {};
+        }, self._stream_closure.registry) catch {};
     }
 
     fn unbindExtensionRuntime(self: *AgentSession) void {

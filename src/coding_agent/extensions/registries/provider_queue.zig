@@ -1,74 +1,66 @@
-//! Provider queue — pending custom-provider registrations awaiting bind.
+//! Provider queue — pre-bind provider registration operations awaiting bind.
 //!
-//! v1 leaves this empty: `zi.register_provider` is not yet exposed.
-//! The queue exists because the documented lifecycle separates load from
-//! bind — the runner accepts registrations during
-//! the load phase (when AgentSession isn't built yet) and flushes
-//! them into the AI provider registry once binding completes.
+//! The extension lifecycle splits load/register from bind. During load the runner
+//! can truthfully accept provider register/unregister calls, but the live AI
+//! provider registry does not exist yet. This queue records those operations in
+//! order, and `ExtensionRunner.bindRuntime` replays them once the session-owned
+//! provider registry is available.
 //!
-//! Why a queue, not a registry: providers are not addressable by
-//! name from inside the extension system. Once flushed they belong
-//! to `ai.provider.Registry` (the canonical zi-yjc bundle), and the
-//! runner forgets about them. The queue is FIFO write-only; bind is
-//! a single drain.
-//!
-//! v2 will add `unregister_provider`. That can be implemented either
-//! as a queue scrub (before bind) or a passthrough to the AI registry's
-//! `unregisterBySource` (after bind), keeping this file's job small.
+//! Why an operation queue instead of mutating the live registry directly:
+//! queued transport and the live registry have different owners and lifetimes.
+//! The queue is generation-local, Lua-facing transport. The live registry is the
+//! host-owned runtime projection keyed by API. Keeping them separate avoids
+//! leaking host mutation semantics into pre-bind registration.
 
 const std = @import("std");
-const tool_registry = @import("tool_registry.zig");
+const provider_mod = @import("../../../ai/provider.zig");
 
-/// One pending provider registration. The shape is intentionally
-/// minimal in v1 — fields will grow when v2 specifies what
-/// `zi.register_provider` accepts. Today it's just enough to
-/// document the seam.
-pub const PendingProvider = struct {
-    /// API identifier the provider answers to (e.g. "anthropic-messages").
-    /// Owned.
-    api: []const u8,
-    /// Lua registry ref to the provider config table. Resolved during
-    /// flush by the runner — it constructs the actual `ai.provider.Provider`
-    /// from the table and registers it. Stored as raw c_int because
-    /// extensions/runner.zig is the only thing that should reach into
-    /// Lua memory at flush time.
-    config_ref: c_int,
-    /// Provenance — extension file path. Borrowed.
-    source: tool_registry.RegistrationSource,
+pub const PendingProviderUnregister = struct {
+    name: []const u8,
+    owner_id: []const u8,
+
+    pub fn deinit(self: *PendingProviderUnregister, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.owner_id);
+        self.* = undefined;
+    }
+};
+
+pub const PendingProviderOperation = union(enum) {
+    register: provider_mod.ClaimRegistration,
+    unregister: PendingProviderUnregister,
+
+    pub fn deinit(self: *PendingProviderOperation, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .register => |*claim| claim.deinit(allocator),
+            .unregister => |*claim| claim.deinit(allocator),
+        }
+        self.* = undefined;
+    }
 };
 
 pub const ProviderQueue = struct {
     allocator: std.mem.Allocator,
-    pending: std.ArrayListUnmanaged(PendingProvider) = .empty,
+    pending: std.ArrayListUnmanaged(PendingProviderOperation) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ProviderQueue {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *ProviderQueue) void {
-        for (self.pending.items) |*p| self.allocator.free(p.api);
+        for (self.pending.items) |*op| op.deinit(self.allocator);
         self.pending.deinit(self.allocator);
     }
 
-    /// Append a provider to the queue. Always succeeds (modulo OOM)
-    /// — duplicate-api detection happens at flush time, when the
-    /// queue collides with the existing AI provider registry, not
-    /// here. The queue preserves registrations until bind, where normal
-    /// extension precedence rules are applied.
-    pub fn enqueue(self: *ProviderQueue, p: PendingProvider) !void {
-        try self.pending.append(self.allocator, p);
+    pub fn enqueueRegister(self: *ProviderQueue, claim: provider_mod.ClaimRegistration) !void {
+        try self.pending.append(self.allocator, .{ .register = claim });
     }
 
-    /// Drain the queue. Caller takes ownership of every entry's
-    /// `api` slice — the queue's own bookkeeping is reset and a
-    /// subsequent enqueue starts from empty. The borrowed `source`
-    /// strings remain owned by the loader.
-    ///
-    /// Used during `bindRuntime` (D7) once the AI provider registry
-    /// is available; the runner walks the drained slice, resolves
-    /// each Lua config, and hands it to the registry. v1 never
-    /// invokes this — there's nothing to drain.
-    pub fn drain(self: *ProviderQueue) []const PendingProvider {
+    pub fn enqueueUnregister(self: *ProviderQueue, op: PendingProviderUnregister) !void {
+        try self.pending.append(self.allocator, .{ .unregister = op });
+    }
+
+    pub fn drain(self: *ProviderQueue) []PendingProviderOperation {
         return self.pending.toOwnedSlice(self.allocator) catch &.{};
     }
 
@@ -77,37 +69,47 @@ pub const ProviderQueue = struct {
     }
 };
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 const testing = std.testing;
 
-test "ProviderQueue accumulates and drains" {
+test "ProviderQueue preserves ordered register/unregister operations" {
     var q = ProviderQueue.init(testing.allocator);
     defer q.deinit();
 
-    try q.enqueue(.{
+    try q.enqueueRegister(.{
+        .name = try testing.allocator.dupe(u8, "proxy-a"),
         .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .config_ref = 1,
-        .source = .{ .kind = "user", .id = "ext1" },
+        .base_url = try testing.allocator.dupe(u8, "https://a.example"),
+        .owner_id = try testing.allocator.dupe(u8, "ext-a"),
+        .generation = 7,
     });
-    try q.enqueue(.{
-        .api = try testing.allocator.dupe(u8, "openai-responses"),
-        .config_ref = 2,
-        .source = .{ .kind = "project", .id = "ext2" },
+    try q.enqueueUnregister(.{
+        .name = try testing.allocator.dupe(u8, "proxy-a"),
+        .owner_id = try testing.allocator.dupe(u8, "ext-a"),
     });
 
     try testing.expectEqual(@as(usize, 2), q.count());
 
     const drained = q.drain();
     defer {
-        for (drained) |p| testing.allocator.free(p.api);
+        for (drained) |*op| op.deinit(testing.allocator);
         testing.allocator.free(drained);
     }
 
     try testing.expectEqual(@as(usize, 2), drained.len);
     try testing.expectEqual(@as(usize, 0), q.count());
-    try testing.expectEqualStrings("anthropic-messages", drained[0].api);
-    try testing.expectEqualStrings("openai-responses", drained[1].api);
+
+    switch (drained[0]) {
+        .register => |claim| {
+            try testing.expectEqualStrings("proxy-a", claim.name);
+            try testing.expectEqualStrings("anthropic-messages", claim.api);
+        },
+        else => return error.ExpectedRegisterFirst,
+    }
+    switch (drained[1]) {
+        .unregister => |claim| {
+            try testing.expectEqualStrings("proxy-a", claim.name);
+            try testing.expectEqualStrings("ext-a", claim.owner_id);
+        },
+        else => return error.ExpectedUnregisterSecond,
+    }
 }

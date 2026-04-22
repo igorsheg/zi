@@ -27,6 +27,7 @@ const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
+const ai = @import("../../ai/root.zig");
 const api = @import("api.zig");
 const context_mod = @import("context.zig");
 const resource_types = @import("../resources/types.zig");
@@ -163,6 +164,10 @@ fn runHandler(
     // Inherit the current tool's module context for nested host
     // callbacks (e.g. `zi.spawn` on_event trampolines).
     runner.setModuleContext(state, provenance);
+    if (provenance) |prov| {
+        runner.beginExecutionContext(runner.sourceForProvenance(prov));
+        defer runner.endExecutionContext();
+    }
 
     while (true) {
         const r = try co.resumeWith(2);
@@ -521,6 +526,8 @@ test "lua tool ctx exposes binding from tool provenance" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
     defer runner.deinit();
     runner.attachLuaState(&state);
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
 
     var dummy: u8 = 0;
     try runner.bindRuntime(.{
@@ -535,7 +542,7 @@ test "lua tool ctx exposes binding from tool provenance" {
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-    });
+    }, &provider_registry);
     api.installZiTable(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());

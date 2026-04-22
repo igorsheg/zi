@@ -4,9 +4,12 @@ const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../abort_signal.zig");
 const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
+const ai = @import("../../ai/root.zig");
 const resource_types = @import("../resources/types.zig");
 const tool_def = @import("../tools/definition.zig");
 const context_mod = @import("context.zig");
+
+const log = std.log.scoped(.zi_runner);
 
 /// Monotonic generation counter. Each reload creates a new generation.
 ///
@@ -235,6 +238,8 @@ pub const ExtensionRunner = struct {
 
     loaded_extensions: std.ArrayListUnmanaged(resource_types.ExtensionProvenance) = .empty,
     load_context: ?LoadContext = null,
+    execution_context: ?LoadContext = null,
+    _provider_registry: ?*ai.provider.Registry = null,
 
     /// Identity of the thread that owns the `lua_state`.
     ///
@@ -379,8 +384,17 @@ pub const ExtensionRunner = struct {
         self.load_context = null;
     }
 
+    pub fn beginExecutionContext(self: *ExtensionRunner, source: ExtensionLoadSource) void {
+        self.execution_context = .{ .source = source };
+    }
+
+    pub fn endExecutionContext(self: *ExtensionRunner) void {
+        self.execution_context = null;
+    }
+
     pub fn currentLoadSource(self: *const ExtensionRunner) ?ExtensionLoadSource {
-        return if (self.load_context) |ctx| ctx.source else null;
+        if (self.load_context) |ctx| return ctx.source;
+        return if (self.execution_context) |ctx| ctx.source else null;
     }
 
     pub fn recordLoadedExtension(self: *ExtensionRunner, provenance: resource_types.ExtensionProvenance) !void {
@@ -398,6 +412,19 @@ pub const ExtensionRunner = struct {
             if (std.mem.eql(u8, provenance.extension_id, extension_id)) return provenance;
         }
         return null;
+    }
+
+    pub fn sourceForProvenance(self: *const ExtensionRunner, provenance: resource_types.ExtensionProvenance) ExtensionLoadSource {
+        _ = self;
+        return .{
+            .kind = switch (provenance.root_kind) {
+                .builtin => "builtin",
+                else => "extension",
+            },
+            .id = provenance.extension_id,
+            .path = provenance.state_owner_id,
+            .provenance = provenance,
+        };
     }
 
     /// Assert that the current thread is allowed to call into
@@ -482,14 +509,76 @@ pub const ExtensionRunner = struct {
     /// (session store, agent core, optional UI) are available. The bound
     /// pointers are opaque to avoid circular module dependencies; later
     /// phases cast them to concrete types at use sites.
-    pub fn bindRuntime(self: *ExtensionRunner, bound: ExtensionRuntime.Bound) !void {
+    pub fn bindRuntime(self: *ExtensionRunner, bound: ExtensionRuntime.Bound, provider_registry: *ai.provider.Registry) !void {
         if (self.runtime != .stub) return error.AlreadyBound;
         self.runtime = .{ .bound = bound };
+        self._provider_registry = provider_registry;
+        errdefer self._provider_registry = null;
+        try self.drainQueuedProviders();
     }
 
     pub fn unbindRuntime(self: *ExtensionRunner) void {
         if (self.runtime == .bound) {
+            if (self._provider_registry) |registry| {
+                registry.unregisterClaimsByGeneration(self.generation) catch |err| {
+                    log.warn("failed to revoke provider claims for generation {d}: {s}", .{ self.generation, @errorName(err) });
+                };
+            }
+            self._provider_registry = null;
             self.runtime = .{ .stub = {} };
+        }
+    }
+
+    pub fn registerProviderClaim(self: *ExtensionRunner, claim: ai.provider.ClaimRegistration) !bool {
+        if (self._provider_registry) |registry| {
+            errdefer {
+                var owned = claim;
+                owned.deinit(self.allocator);
+            }
+            return registry.registerClaim(claim);
+        }
+        errdefer {
+            var owned = claim;
+            owned.deinit(self.allocator);
+        }
+        try self.provider_queue.enqueueRegister(claim);
+        return true;
+    }
+
+    pub fn unregisterProviderClaim(self: *ExtensionRunner, name: []const u8, owner_id: []const u8) !bool {
+        if (self._provider_registry) |registry| {
+            defer self.allocator.free(name);
+            defer self.allocator.free(owner_id);
+            return registry.unregisterClaim(name, owner_id, self.generation);
+        }
+        errdefer {
+            self.allocator.free(name);
+            self.allocator.free(owner_id);
+        }
+        try self.provider_queue.enqueueUnregister(.{ .name = name, .owner_id = owner_id });
+        return true;
+    }
+
+    fn drainQueuedProviders(self: *ExtensionRunner) !void {
+        const registry = self._provider_registry orelse return;
+        const drained = self.provider_queue.drain();
+        defer self.allocator.free(drained);
+
+        for (drained) |*op| {
+            switch (op.*) {
+                .register => |claim| {
+                    if (!(try registry.registerClaim(claim))) {
+                        var rejected = claim;
+                        rejected.deinit(self.allocator);
+                    }
+                },
+                .unregister => |claim| {
+                    _ = try registry.unregisterClaim(claim.name, claim.owner_id, self.generation);
+                    var owned = claim;
+                    owned.deinit(self.allocator);
+                },
+            }
+            op.* = undefined;
         }
     }
 
@@ -529,6 +618,10 @@ pub const ExtensionRunner = struct {
         };
 
         self.setModuleContext(state, cmd.source.provenance);
+        if (cmd.source.provenance) |provenance| {
+            self.beginExecutionContext(self.sourceForProvenance(provenance));
+            defer self.endExecutionContext();
+        }
 
         const r = try co.resumeWith(2);
         switch (r.status) {
@@ -610,6 +703,8 @@ test "ExtensionRunner unbinds back to stub state" {
     const allocator = std.testing.allocator;
     var runner = ExtensionRunner.init(allocator, 7);
     defer runner.deinit();
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
 
     try runner.bindRuntime(.{
         .session = undefined,
@@ -623,7 +718,7 @@ test "ExtensionRunner unbinds back to stub state" {
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-    });
+    }, &provider_registry);
     try std.testing.expect(runner.isBound());
 
     runner.unbindRuntime();
@@ -685,6 +780,8 @@ test "bindRuntime rejects double-bind" {
     const allocator = std.testing.allocator;
     var runner = ExtensionRunner.init(allocator, 1);
     defer runner.deinit();
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
 
     // First bind should succeed
     var dummy: u8 = 0;
@@ -703,7 +800,7 @@ test "bindRuntime rejects double-bind" {
         .get_binding_info = &testGetBindingInfo,
     };
 
-    try runner.bindRuntime(bound);
+    try runner.bindRuntime(bound, &provider_registry);
     try std.testing.expect(runner.isBound());
 
     // Second bind should fail
@@ -723,8 +820,49 @@ test "bindRuntime rejects double-bind" {
         .get_binding_info = &testGetBindingInfo,
     };
 
-    const result = runner.bindRuntime(bound2);
+    const result = runner.bindRuntime(bound2, &provider_registry);
     try std.testing.expectError(error.AlreadyBound, result);
+}
+
+test "bindRuntime replays queued providers and unbindRuntime revokes the generation" {
+    const allocator = std.testing.allocator;
+    var runner = ExtensionRunner.init(allocator, 9);
+    defer runner.deinit();
+
+    var baseline = ai.faux.FauxProvider.init(allocator);
+    defer baseline.deinit();
+
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
+    try provider_registry.register("anthropic-messages", baseline.provider(), null);
+
+    try runner.provider_queue.enqueueRegister(.{
+        .name = try allocator.dupe(u8, "proxy"),
+        .api = try allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try allocator.dupe(u8, "https://proxy.example"),
+        .owner_id = try allocator.dupe(u8, "state-123"),
+        .generation = runner.generation,
+    });
+
+    try runner.bindRuntime(.{
+        .session = undefined,
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
+    }, &provider_registry);
+
+    try std.testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
+    try std.testing.expectEqualStrings("proxy", provider_registry.get("anthropic-messages").?.getName());
+
+    runner.unbindRuntime();
+    try std.testing.expectEqualStrings("faux", provider_registry.get("anthropic-messages").?.getName());
 }
 
 test "ExtensionRunner owns four empty registries on init" {
@@ -759,10 +897,12 @@ test "ExtensionRunner registries survive populated deinit" {
     try runner.event_registry.subscribe(.tool_call, .{ .lua_ref = 8, .source_id = "task.lua" });
 
     // Provider queue: pre-bind enqueue, never drained in this test.
-    try runner.provider_queue.enqueue(.{
+    try runner.provider_queue.enqueueRegister(.{
+        .name = try allocator.dupe(u8, "proxy"),
         .api = try allocator.dupe(u8, "anthropic-messages"),
-        .config_ref = 9,
-        .source = .{ .kind = "user", .id = "task.lua" },
+        .base_url = try allocator.dupe(u8, "https://proxy.example"),
+        .owner_id = try allocator.dupe(u8, "task.lua"),
+        .generation = runner.generation,
     });
 
     try std.testing.expectEqual(@as(usize, 1), runner.tool_registry.count());

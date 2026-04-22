@@ -54,6 +54,7 @@ const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
 const resource_types = @import("../resources/types.zig");
 const event_registry = @import("registries/event_registry.zig");
+const ai = @import("../../ai/root.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_dispatch);
@@ -300,6 +301,10 @@ fn runOneHandler(
     defer co.deinit();
 
     try pushHandlerAndContext(state, runner, &co, h.lua_ref, h.provenance, payload_idx);
+    if (h.provenance) |provenance| {
+        runner.beginExecutionContext(runner.sourceForProvenance(provenance));
+        defer runner.endExecutionContext();
+    }
 
     const r = try co.resumeWith(2);
     switch (r.status) {
@@ -392,6 +397,8 @@ test "dispatchObserver runs every handler in order" {
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
 
     var dummy: u8 = 0;
     try runner.bindRuntime(.{
@@ -406,7 +413,7 @@ test "dispatchObserver runs every handler in order" {
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-    });
+    }, &provider_registry);
 
     try setupCounterChain(&state, &runner, "message_end");
 
@@ -439,6 +446,8 @@ test "dispatchObserver passes extension context helpers" {
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
 
     var dummy: u8 = 0;
     try runner.bindRuntime(.{
@@ -453,7 +462,7 @@ test "dispatchObserver passes extension context helpers" {
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-    });
+    }, &provider_registry);
 
     api.installZiTable(&state, &runner);
     try state.doString(
@@ -480,6 +489,8 @@ test "dispatch paths expose binding from handler provenance" {
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
     defer runner.deinit();
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
 
     var dummy: u8 = 0;
     try runner.bindRuntime(.{
@@ -494,7 +505,7 @@ test "dispatch paths expose binding from handler provenance" {
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-    });
+    }, &provider_registry);
 
     api.installZiTable(&state, &runner);
     runner.beginLoadContext(testLoadSource());
