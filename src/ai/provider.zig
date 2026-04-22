@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const json_value = @import("../json/value.zig");
 
 /// Callback invoked for each streaming event.
 pub const EventCallback = *const fn (event: protocol.AssistantMessageEvent, ctx: ?*anyopaque) void;
@@ -59,21 +60,55 @@ pub const Provider = struct {
     }
 };
 
+pub const ClaimModelRegistration = struct {
+    id: []const u8,
+    name: []const u8,
+    api: ?[]const u8 = null,
+    reasoning: bool,
+    input: []const protocol.Model.InputType,
+    cost: protocol.Model.Cost,
+    context_window: u64,
+    max_tokens: u64,
+    headers: []const protocol.Header = &.{},
+    compat: ?std.json.Value = null,
+
+    pub fn deinit(self: *ClaimModelRegistration, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        if (self.api) |api| allocator.free(api);
+        if (self.input.len > 0) allocator.free(self.input);
+        freeHeaders(allocator, self.headers);
+        if (self.compat) |compat| json_value.freeJsonValue(allocator, compat);
+        self.* = undefined;
+    }
+};
+
 pub const ClaimRegistration = struct {
     name: []const u8,
     api: []const u8,
     base_url: []const u8,
     owner_id: []const u8,
     generation: u64,
+    models: []ClaimModelRegistration = &.{},
 
     pub fn deinit(self: *ClaimRegistration, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.api);
         allocator.free(self.base_url);
         allocator.free(self.owner_id);
+        for (self.models) |*model| model.deinit(allocator);
+        if (self.models.len > 0) allocator.free(self.models);
         self.* = undefined;
     }
 };
+
+fn freeHeaders(allocator: std.mem.Allocator, headers: []const protocol.Header) void {
+    for (headers) |header| {
+        allocator.free(header.key);
+        allocator.free(header.value);
+    }
+    if (headers.len > 0) allocator.free(headers);
+}
 
 const Claim = struct {
     registration: ClaimRegistration,
@@ -283,6 +318,14 @@ pub const Registry = struct {
         return self.providers.get(api);
     }
 
+    pub fn activeClaimCount(self: *const Registry) usize {
+        return self.claims.items.len;
+    }
+
+    pub fn activeClaimRegistrationAt(self: *const Registry, index: usize) *const ClaimRegistration {
+        return &self.claims.items[index].registration;
+    }
+
     /// Unregister all providers with a given source_id.
     pub fn unregisterBySource(self: *Registry, source_id: []const u8) void {
         var i: usize = 0;
@@ -460,12 +503,27 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
     const baseline = try RecordingProvider.create(testing.allocator, "baseline");
     try reg.register("anthropic-messages", baseline.provider(), null);
 
+    const first_models = blk: {
+        const models = try testing.allocator.alloc(ClaimModelRegistration, 1);
+        models[0] = .{
+            .id = try testing.allocator.dupe(u8, "claude-sonnet-4-20250514"),
+            .name = try testing.allocator.dupe(u8, "Claude 4 Sonnet"),
+            .reasoning = true,
+            .input = try testing.allocator.dupe(protocol.Model.InputType, &.{ .text, .image }),
+            .cost = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 },
+            .context_window = 200000,
+            .max_tokens = 16384,
+        };
+        break :blk models;
+    };
+
     const first = ClaimRegistration{
         .name = try testing.allocator.dupe(u8, "proxy-a"),
         .api = try testing.allocator.dupe(u8, "anthropic-messages"),
         .base_url = try testing.allocator.dupe(u8, "https://proxy-a.example"),
         .owner_id = try testing.allocator.dupe(u8, "ext-a"),
         .generation = 1,
+        .models = first_models,
     };
     try testing.expect(try reg.registerClaim(first));
 
@@ -477,6 +535,14 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
         .generation = 1,
     };
     try testing.expect(try reg.registerClaim(second));
+
+    try testing.expectEqual(@as(usize, 2), reg.activeClaimCount());
+    const active_first = reg.activeClaimRegistrationAt(0);
+    try testing.expectEqualStrings("proxy-a", active_first.name);
+    try testing.expectEqual(@as(usize, 1), active_first.models.len);
+    try testing.expectEqualStrings("claude-sonnet-4-20250514", active_first.models[0].id);
+    try testing.expectEqualStrings("Claude 4 Sonnet", active_first.models[0].name);
+    try testing.expectEqual(@as(usize, 2), active_first.models[0].input.len);
 
     reg.get("anthropic-messages").?.streamSimple(
         testing.allocator,
@@ -490,6 +556,7 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
 
     try testing.expect(!(try reg.unregisterClaim("proxy-b", "ext-a", 1)));
     try testing.expect(try reg.unregisterClaim("proxy-b", "ext-b", 1));
+    try testing.expectEqual(@as(usize, 1), reg.activeClaimCount());
 
     reg.get("anthropic-messages").?.streamSimple(
         testing.allocator,
@@ -502,6 +569,7 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
     try testing.expectEqualStrings("https://proxy-a.example", baseline.last_base_url.?);
 
     try testing.expect(try reg.unregisterClaim("proxy-a", "ext-a", 1));
+    try testing.expectEqual(@as(usize, 0), reg.activeClaimCount());
 
     reg.get("anthropic-messages").?.streamSimple(
         testing.allocator,

@@ -291,6 +291,24 @@ const RegisterProviderError = error{
     InvalidApi,
     MissingBaseUrl,
     InvalidBaseUrl,
+    InvalidModels,
+    MissingModelId,
+    InvalidModelId,
+    MissingModelDisplayName,
+    InvalidModelDisplayName,
+    InvalidModelApi,
+    MissingModelReasoning,
+    InvalidModelReasoning,
+    MissingModelInput,
+    InvalidModelInput,
+    MissingModelCost,
+    InvalidModelCost,
+    MissingModelContextWindow,
+    InvalidModelContextWindow,
+    MissingModelMaxTokens,
+    InvalidModelMaxTokens,
+    InvalidModelHeaders,
+    InvalidModelCompat,
     OutOfMemory,
 };
 
@@ -306,6 +324,17 @@ fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidApi => "register_provider: field 'api' must be a string",
             error.MissingBaseUrl => "register_provider: missing required field 'base_url'",
             error.InvalidBaseUrl => "register_provider: field 'base_url' must be a string",
+            error.InvalidModels => "register_provider: field 'models' must be an array of model tables",
+            error.MissingModelId, error.InvalidModelId => "register_provider: each model requires string field 'id'",
+            error.MissingModelDisplayName, error.InvalidModelDisplayName => "register_provider: each model requires string field 'name'",
+            error.InvalidModelApi => "register_provider: model field 'api' must be a string when present",
+            error.MissingModelReasoning, error.InvalidModelReasoning => "register_provider: each model requires boolean field 'reasoning'",
+            error.MissingModelInput, error.InvalidModelInput => "register_provider: each model requires array field 'input' containing 'text' and/or 'image'",
+            error.MissingModelCost, error.InvalidModelCost => "register_provider: each model requires cost table with numeric input/output/cache_read/cache_write fields",
+            error.MissingModelContextWindow, error.InvalidModelContextWindow => "register_provider: each model requires integer field 'context_window'",
+            error.MissingModelMaxTokens, error.InvalidModelMaxTokens => "register_provider: each model requires integer field 'max_tokens'",
+            error.InvalidModelHeaders => "register_provider: model field 'headers' must be a string map",
+            error.InvalidModelCompat => "register_provider: model field 'compat' must be a JSON-compatible table",
             error.OutOfMemory => "register_provider: out of memory",
         });
     };
@@ -374,12 +403,19 @@ fn buildProviderRegistration(
     const owner_id = a.dupe(u8, currentProviderOwnerId(runner)) catch return error.OutOfMemory;
     errdefer a.free(owner_id);
 
+    const models = try optionalProviderModels(L, 2, a);
+    errdefer {
+        for (models) |*model| model.deinit(a);
+        if (models.len > 0) a.free(models);
+    }
+
     return .{
         .name = name,
         .api = api_name,
         .base_url = base_url,
         .owner_id = owner_id,
         .generation = runner.generation,
+        .models = models,
     };
 }
 
@@ -1014,6 +1050,285 @@ fn requireProviderFieldString(
     };
 }
 
+fn optionalProviderFieldString(
+    L: *c.lua_State,
+    table_idx: c_int,
+    field: [:0]const u8,
+    allocator: std.mem.Allocator,
+    invalid_err: RegisterProviderError,
+) RegisterProviderError!?[]const u8 {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+
+    return switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => null,
+        c.LUA_TSTRING => blk: {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, -1, &len) orelse return invalid_err;
+            break :blk allocator.dupe(u8, ptr[0..len]) catch return error.OutOfMemory;
+        },
+        else => invalid_err,
+    };
+}
+
+fn requireProviderFieldBool(
+    L: *c.lua_State,
+    table_idx: c_int,
+    field: [:0]const u8,
+    missing_err: RegisterProviderError,
+    invalid_err: RegisterProviderError,
+) RegisterProviderError!bool {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+
+    return switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => missing_err,
+        c.LUA_TBOOLEAN => c.lua_toboolean(L, -1) != 0,
+        else => invalid_err,
+    };
+}
+
+fn requireProviderFieldF64(
+    L: *c.lua_State,
+    table_idx: c_int,
+    field: [:0]const u8,
+    missing_err: RegisterProviderError,
+    invalid_err: RegisterProviderError,
+) RegisterProviderError!f64 {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+
+    return switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => missing_err,
+        c.LUA_TNUMBER => c.lua_tonumberx(L, -1, null),
+        else => invalid_err,
+    };
+}
+
+fn requireProviderFieldU64(
+    L: *c.lua_State,
+    table_idx: c_int,
+    field: [:0]const u8,
+    missing_err: RegisterProviderError,
+    invalid_err: RegisterProviderError,
+) RegisterProviderError!u64 {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+
+    return switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => missing_err,
+        c.LUA_TNUMBER => blk: {
+            if (c.lua_isinteger(L, -1) == 0) return invalid_err;
+            const value = c.lua_tointegerx(L, -1, null);
+            if (value < 0) return invalid_err;
+            break :blk @intCast(value);
+        },
+        else => invalid_err,
+    };
+}
+
+fn optionalProviderModels(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+) RegisterProviderError![]ai.provider.ClaimModelRegistration {
+    _ = c.lua_getfield(L, table_idx, "models");
+    defer c.lua_pop(L, 1);
+
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return &.{},
+        c.LUA_TTABLE => {},
+        else => return error.InvalidModels,
+    }
+
+    const len = c.lua_rawlen(L, -1);
+    if (len == 0) return &.{};
+
+    const models = allocator.alloc(ai.provider.ClaimModelRegistration, len) catch return error.OutOfMemory;
+    var built: usize = 0;
+    errdefer {
+        for (models[0..built]) |*model| model.deinit(allocator);
+        allocator.free(models);
+    }
+
+    var i: c.lua_Integer = 1;
+    while (@as(usize, @intCast(i)) <= len) : (i += 1) {
+        _ = c.lua_rawgeti(L, -1, i);
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TTABLE) return error.InvalidModels;
+        const model_idx = c.lua_gettop(L);
+        models[built] = try buildProviderModelRegistration(L, model_idx, allocator);
+        built += 1;
+    }
+
+    return models;
+}
+
+fn buildProviderModelRegistration(
+    L: *c.lua_State,
+    model_idx: c_int,
+    allocator: std.mem.Allocator,
+) RegisterProviderError!ai.provider.ClaimModelRegistration {
+    const id = try requireProviderFieldString(L, model_idx, "id", allocator, error.MissingModelId, error.InvalidModelId);
+    errdefer allocator.free(id);
+
+    const name = try requireProviderFieldString(L, model_idx, "name", allocator, error.MissingModelDisplayName, error.InvalidModelDisplayName);
+    errdefer allocator.free(name);
+
+    const api = try optionalProviderFieldString(L, model_idx, "api", allocator, error.InvalidModelApi);
+    errdefer if (api) |owned| allocator.free(owned);
+
+    const reasoning = try requireProviderFieldBool(L, model_idx, "reasoning", error.MissingModelReasoning, error.InvalidModelReasoning);
+    const input = try requireProviderModelInputs(L, model_idx, allocator);
+    errdefer if (input.len > 0) allocator.free(input);
+
+    const cost = try requireProviderModelCost(L, model_idx);
+    const context_window = try requireProviderFieldU64(L, model_idx, "context_window", error.MissingModelContextWindow, error.InvalidModelContextWindow);
+    const max_tokens = try requireProviderFieldU64(L, model_idx, "max_tokens", error.MissingModelMaxTokens, error.InvalidModelMaxTokens);
+    const headers = try optionalProviderModelHeaders(L, model_idx, allocator);
+    errdefer {
+        for (headers) |header| {
+            allocator.free(header.key);
+            allocator.free(header.value);
+        }
+        if (headers.len > 0) allocator.free(headers);
+    }
+    const compat = try optionalProviderModelCompat(L, model_idx, allocator);
+    errdefer if (compat) |value| ai.json_util.freeJsonValue(allocator, value);
+
+    return .{
+        .id = id,
+        .name = name,
+        .api = api,
+        .reasoning = reasoning,
+        .input = input,
+        .cost = cost,
+        .context_window = context_window,
+        .max_tokens = max_tokens,
+        .headers = headers,
+        .compat = compat,
+    };
+}
+
+fn requireProviderModelInputs(
+    L: *c.lua_State,
+    model_idx: c_int,
+    allocator: std.mem.Allocator,
+) RegisterProviderError![]const ai.protocol.Model.InputType {
+    _ = c.lua_getfield(L, model_idx, "input");
+    defer c.lua_pop(L, 1);
+
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return error.MissingModelInput,
+        c.LUA_TTABLE => {},
+        else => return error.InvalidModelInput,
+    }
+
+    const len = c.lua_rawlen(L, -1);
+    if (len == 0) return error.InvalidModelInput;
+
+    const input = allocator.alloc(ai.protocol.Model.InputType, len) catch return error.OutOfMemory;
+    var built: usize = 0;
+    errdefer allocator.free(input);
+
+    var i: c.lua_Integer = 1;
+    while (@as(usize, @intCast(i)) <= len) : (i += 1) {
+        _ = c.lua_rawgeti(L, -1, i);
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidModelInput;
+        const value = lstring(L, -1);
+        input[built] = if (std.mem.eql(u8, value, "text"))
+            .text
+        else if (std.mem.eql(u8, value, "image"))
+            .image
+        else
+            return error.InvalidModelInput;
+        built += 1;
+    }
+
+    return input;
+}
+
+fn requireProviderModelCost(
+    L: *c.lua_State,
+    model_idx: c_int,
+) RegisterProviderError!ai.protocol.Model.Cost {
+    _ = c.lua_getfield(L, model_idx, "cost");
+    defer c.lua_pop(L, 1);
+
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return error.MissingModelCost,
+        c.LUA_TTABLE => {},
+        else => return error.InvalidModelCost,
+    }
+
+    const cost_idx = c.lua_gettop(L);
+    return .{
+        .input = try requireProviderFieldF64(L, cost_idx, "input", error.MissingModelCost, error.InvalidModelCost),
+        .output = try requireProviderFieldF64(L, cost_idx, "output", error.MissingModelCost, error.InvalidModelCost),
+        .cache_read = try requireProviderFieldF64(L, cost_idx, "cache_read", error.MissingModelCost, error.InvalidModelCost),
+        .cache_write = try requireProviderFieldF64(L, cost_idx, "cache_write", error.MissingModelCost, error.InvalidModelCost),
+    };
+}
+
+fn optionalProviderModelHeaders(
+    L: *c.lua_State,
+    model_idx: c_int,
+    allocator: std.mem.Allocator,
+) RegisterProviderError![]const ai.protocol.Header {
+    _ = c.lua_getfield(L, model_idx, "headers");
+    defer c.lua_pop(L, 1);
+
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return &.{},
+        c.LUA_TTABLE => {},
+        else => return error.InvalidModelHeaders,
+    }
+
+    const headers_idx = c.lua_gettop(L);
+    var headers: std.ArrayListUnmanaged(ai.protocol.Header) = .empty;
+    errdefer {
+        for (headers.items) |header| {
+            allocator.free(header.key);
+            allocator.free(header.value);
+        }
+        headers.deinit(allocator);
+    }
+
+    c.lua_pushnil(L);
+    while (c.lua_next(L, headers_idx) != 0) {
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -2) != c.LUA_TSTRING) return error.InvalidModelHeaders;
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidModelHeaders;
+        const key = allocator.dupe(u8, lstring(L, -2)) catch return error.OutOfMemory;
+        errdefer allocator.free(key);
+        const value = allocator.dupe(u8, lstring(L, -1)) catch return error.OutOfMemory;
+        errdefer allocator.free(value);
+        try headers.append(allocator, .{ .key = key, .value = value });
+    }
+
+    if (headers.items.len == 0) return &.{};
+    return headers.toOwnedSlice(allocator);
+}
+
+fn optionalProviderModelCompat(
+    L: *c.lua_State,
+    model_idx: c_int,
+    allocator: std.mem.Allocator,
+) RegisterProviderError!?std.json.Value {
+    _ = c.lua_getfield(L, model_idx, "compat");
+    defer c.lua_pop(L, 1);
+
+    return switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => null,
+        c.LUA_TTABLE => lua_runtime.luaValueToJson(L, -1, allocator) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidModelCompat,
+        },
+        else => error.InvalidModelCompat,
+    };
+}
+
 /// Push an error message onto the Lua stack and longjmp out of the
 /// C function. Returns `c_int` so callers can `return luaError(...)`.
 /// `lua_error` does not return — the cast is to satisfy the type
@@ -1184,7 +1499,7 @@ fn testProviderLoadSource() runner_mod.ExtensionLoadSource {
     };
 }
 
-test "zi.register_provider queues before bind and applies live changes after bind" {
+test "zi.register_provider queues models metadata before bind and keeps live routing behavior" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -1198,11 +1513,38 @@ test "zi.register_provider queues before bind and applies live changes after bin
     try state.doString(
         \\assert(zi.register_provider("queued", {
         \\  api = "anthropic-messages",
-        \\  base_url = "https://queued.example"
+        \\  base_url = "https://queued.example",
+        \\  models = {
+        \\    {
+        \\      id = "claude-sonnet-4-20250514",
+        \\      name = "Claude 4 Sonnet (queued)",
+        \\      reasoning = true,
+        \\      input = { "text", "image" },
+        \\      cost = { input = 3, output = 15, cache_read = 0.3, cache_write = 3.75 },
+        \\      context_window = 200000,
+        \\      max_tokens = 16384,
+        \\      headers = { ["x-model"] = "queued" },
+        \\      compat = { supports_store = true }
+        \\    }
+        \\  }
         \\}) == true)
     , "provider_prebind");
 
     try testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
+    switch (runner.provider_queue.pending.items[0]) {
+        .register => |claim| {
+            try testing.expectEqual(@as(usize, 1), claim.models.len);
+            try testing.expectEqualStrings("claude-sonnet-4-20250514", claim.models[0].id);
+            try testing.expectEqualStrings("Claude 4 Sonnet (queued)", claim.models[0].name);
+            try testing.expectEqual(@as(usize, 2), claim.models[0].input.len);
+            try testing.expectEqual(@as(usize, 1), claim.models[0].headers.len);
+            try testing.expectEqualStrings("x-model", claim.models[0].headers[0].key);
+            try testing.expectEqualStrings("queued", claim.models[0].headers[0].value);
+            try testing.expect(claim.models[0].compat != null);
+            try testing.expectEqual(true, claim.models[0].compat.?.object.get("supports_store").?.bool);
+        },
+        else => return error.ExpectedQueuedProviderRegistration,
+    }
     runner.endLoadContext();
 
     var baseline = ai.faux.FauxProvider.init(testing.allocator);
@@ -1226,6 +1568,11 @@ test "zi.register_provider queues before bind and applies live changes after bin
     }, &provider_registry);
 
     try testing.expectEqualStrings("queued", provider_registry.get("anthropic-messages").?.getName());
+    try testing.expectEqual(@as(usize, 1), provider_registry.activeClaimCount());
+    const queued_claim = provider_registry.activeClaimRegistrationAt(0);
+    try testing.expectEqualStrings("queued", queued_claim.name);
+    try testing.expectEqual(@as(usize, 1), queued_claim.models.len);
+    try testing.expectEqualStrings("claude-sonnet-4-20250514", queued_claim.models[0].id);
 
     runner.beginExecutionContext(runner.sourceForProvenance(testProviderProvenance()));
     defer runner.endExecutionContext();
@@ -1233,12 +1580,35 @@ test "zi.register_provider queues before bind and applies live changes after bin
     try state.doString(
         \\assert(zi.register_provider("live", {
         \\  api = "anthropic-messages",
-        \\  base_url = "https://live.example"
+        \\  base_url = "https://live.example",
+        \\  models = {
+        \\    {
+        \\      id = "claude-opus-4-6",
+        \\      name = "Claude 4.6 Opus (live)",
+        \\      api = "openai-responses",
+        \\      reasoning = false,
+        \\      input = { "text" },
+        \\      cost = { input = 15, output = 75, cache_read = 1.5, cache_write = 18.75 },
+        \\      context_window = 200000,
+        \\      max_tokens = 32000
+        \\    }
+        \\  }
         \\}) == true)
+    , "provider_live_register");
+
+    try testing.expectEqualStrings("live", provider_registry.get("anthropic-messages").?.getName());
+    try testing.expectEqual(@as(usize, 2), provider_registry.activeClaimCount());
+    const live_claim = provider_registry.activeClaimRegistrationAt(1);
+    try testing.expectEqualStrings("live", live_claim.name);
+    try testing.expectEqual(@as(usize, 1), live_claim.models.len);
+    try testing.expectEqualStrings("openai-responses", live_claim.models[0].api.?);
+
+    try state.doString(
         \\assert(zi.unregister_provider("live") == true)
-    , "provider_live");
+    , "provider_live_unregister");
 
     try testing.expectEqualStrings("queued", provider_registry.get("anthropic-messages").?.getName());
+    try testing.expectEqual(@as(usize, 1), provider_registry.activeClaimCount());
 }
 
 test "zi.register_tool registers a Lua-defined tool end-to-end" {

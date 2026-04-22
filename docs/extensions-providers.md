@@ -4,7 +4,7 @@
 
 contract for `zi-fex.10`.
 
-current implementation slice: `zi.register_provider(name, { api, base_url })` and `zi.unregister_provider(name)` now queue before bind, apply immediately after bind, and revoke on unbind/teardown. model catalog visibility rebuild, oauth/ui work, headers/auth config, and custom stream handlers are still follow-up work.
+current implementation slice: `zi.register_provider(name, { api, base_url, models? })` and `zi.unregister_provider(name)` now queue before bind, apply immediately after bind, and revoke on unbind/teardown. provider claims retain model metadata for a later host-owned visibility rebuild, but model catalog rebuild/publication, oauth/ui work, provider-level headers/auth config, and custom stream handlers are still follow-up work.
 it follows [extensions.md](./extensions.md), [runtime.md](./runtime.md), [runtime-roots.md](./runtime-roots.md), [extensions-lifecycle.md](./extensions-lifecycle.md), [extensions-events.md](./extensions-events.md), [extensions-retained-objects.md](./extensions-retained-objects.md), [extensions-state-rebinding.md](./extensions-state-rebinding.md), and the [v2 cutover adr](./adr/extensions-v2-cutover.md).
 
 adjacent seams stay split on purpose: [runtime roots](./runtime-roots.md) defines precedence, [lifecycle](./extensions-lifecycle.md) defines `load/register -> bind -> unbind -> teardown`, [events/interceptors](./extensions-events.md) defines `before_provider_request`, and [state rebinding](./extensions-state-rebinding.md) defines what survives reload/new/resume/fork.
