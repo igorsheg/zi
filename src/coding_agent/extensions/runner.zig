@@ -64,6 +64,7 @@ pub const ExtensionRuntime = union(enum) {
         get_context_usage: *const fn (session: *anyopaque) ?session_core.context_usage.ContextUsage,
         get_system_prompt: *const fn (session: *anyopaque) []const u8,
         get_binding_info: *const fn (session: *anyopaque) ExtensionBindingInfo,
+        provider_projection_changed: ?*const fn (session: *anyopaque) void = null,
     };
 };
 
@@ -514,16 +515,21 @@ pub const ExtensionRunner = struct {
         self.runtime = .{ .bound = bound };
         self._provider_registry = provider_registry;
         errdefer self._provider_registry = null;
-        try self.drainQueuedProviders();
+        const projection_changed = try self.drainQueuedProviders();
+        if (projection_changed) self.notifyProviderProjectionChanged();
     }
 
     pub fn unbindRuntime(self: *ExtensionRunner) void {
         if (self.runtime == .bound) {
+            var projection_changed = false;
             if (self._provider_registry) |registry| {
+                const before = registry.activeClaimCount();
                 registry.unregisterClaimsByGeneration(self.generation) catch |err| {
                     log.warn("failed to revoke provider claims for generation {d}: {s}", .{ self.generation, @errorName(err) });
                 };
+                projection_changed = registry.activeClaimCount() != before;
             }
+            if (projection_changed) self.notifyProviderProjectionChanged();
             self._provider_registry = null;
             self.runtime = .{ .stub = {} };
         }
@@ -535,7 +541,9 @@ pub const ExtensionRunner = struct {
                 var owned = claim;
                 owned.deinit(self.allocator);
             }
-            return registry.registerClaim(claim);
+            const accepted = try registry.registerClaim(claim);
+            if (accepted) self.notifyProviderProjectionChanged();
+            return accepted;
         }
         errdefer {
             var owned = claim;
@@ -549,7 +557,9 @@ pub const ExtensionRunner = struct {
         if (self._provider_registry) |registry| {
             defer self.allocator.free(name);
             defer self.allocator.free(owner_id);
-            return registry.unregisterClaim(name, owner_id, self.generation);
+            const removed = try registry.unregisterClaim(name, owner_id, self.generation);
+            if (removed) self.notifyProviderProjectionChanged();
+            return removed;
         }
         errdefer {
             self.allocator.free(name);
@@ -559,27 +569,42 @@ pub const ExtensionRunner = struct {
         return true;
     }
 
-    fn drainQueuedProviders(self: *ExtensionRunner) !void {
-        const registry = self._provider_registry orelse return;
+    fn drainQueuedProviders(self: *ExtensionRunner) !bool {
+        const registry = self._provider_registry orelse return false;
         const drained = self.provider_queue.drain();
         defer self.allocator.free(drained);
 
+        var projection_changed = false;
         for (drained) |*op| {
             switch (op.*) {
                 .register => |claim| {
-                    if (!(try registry.registerClaim(claim))) {
+                    if (try registry.registerClaim(claim)) {
+                        projection_changed = true;
+                    } else {
                         var rejected = claim;
                         rejected.deinit(self.allocator);
                     }
                 },
                 .unregister => |claim| {
-                    _ = try registry.unregisterClaim(claim.name, claim.owner_id, self.generation);
+                    if (try registry.unregisterClaim(claim.name, claim.owner_id, self.generation)) {
+                        projection_changed = true;
+                    }
                     var owned = claim;
                     owned.deinit(self.allocator);
                 },
             }
             op.* = undefined;
         }
+        return projection_changed;
+    }
+
+    fn notifyProviderProjectionChanged(self: *ExtensionRunner) void {
+        const bound = switch (self.runtime) {
+            .bound => |runtime| runtime,
+            .stub => return,
+        };
+        const callback = bound.provider_projection_changed orelse return;
+        callback(bound.session);
     }
 
     pub fn isBound(self: *const ExtensionRunner) bool {

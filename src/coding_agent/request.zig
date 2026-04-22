@@ -23,6 +23,7 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 ///   - resume_session
 ///   - new_session
 ///   - set_model
+///   - set_model_by_pattern
 ///   - set_thinking_level
 ///   - refresh_status_snapshot
 ///   - compact
@@ -55,6 +56,7 @@ pub const AgentRequest = union(enum) {
     },
     new_session: void,
     set_model: struct { model: ai_protocol.Model },
+    set_model_by_pattern: struct { pattern: []const u8 },
     set_thinking_level: struct { level: @import("../agent3/types.zig").ThinkingLevel },
     refresh_status_snapshot: void,
     /// Manual compaction request — /compact. Mirrors pi-mono's
@@ -79,6 +81,7 @@ pub const AgentRequest = union(enum) {
             .fork_session => |f| allocator.free(f.entry_id),
             .new_session => {},
             .set_model => {},
+            .set_model_by_pattern => |m| allocator.free(m.pattern),
             .set_thinking_level => {},
             .refresh_status_snapshot => {},
             .compact => |c| if (c.custom_instructions) |ci| allocator.free(ci),
@@ -98,6 +101,21 @@ pub const RequestQueue = mailbox_mod.Mailbox(AgentRequest, .{
     .policy = .{ .bounded = .{ .capacity = request_queue_capacity, .on_full = .reject } },
     .wakeup = .pipe,
 });
+
+test "RequestQueue round-trips a set_model_by_pattern payload" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    const pattern = try allocator.dupe(u8, "proxy-a/proxy-model");
+    q.push(.{ .set_model_by_pattern = .{ .pattern = pattern } });
+
+    var buf: [2]AgentRequest = undefined;
+    const n = q.drainInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("proxy-a/proxy-model", buf[0].set_model_by_pattern.pattern);
+    buf[0].deinit(allocator);
+}
 
 test "RequestQueue round-trips a resume_session payload and restore policy" {
     const allocator = std.testing.allocator;

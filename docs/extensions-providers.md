@@ -4,7 +4,7 @@
 
 contract for `zi-fex.10`.
 
-current implementation slice: `zi.register_provider(name, { api, base_url, models? })` and `zi.unregister_provider(name)` now queue before bind, apply immediately after bind, and revoke on unbind/teardown. provider claims retain model metadata for a later host-owned visibility rebuild, but model catalog rebuild/publication, oauth/ui work, provider-level headers/auth config, and custom stream handlers are still follow-up work.
+current implementation slice: `zi.register_provider(name, { api, base_url, models? })` and `zi.unregister_provider(name)` now queue before bind, apply immediately after bind, revoke on unbind/teardown, and drive a host-owned visible model catalog rebuild from active provider claims. the tui now consumes deep-copied visible-model snapshots from the agent thread. oauth/login work, provider-level headers/auth config, and custom stream handlers are still follow-up work.
 it follows [extensions.md](./extensions.md), [runtime.md](./runtime.md), [runtime-roots.md](./runtime-roots.md), [extensions-lifecycle.md](./extensions-lifecycle.md), [extensions-events.md](./extensions-events.md), [extensions-retained-objects.md](./extensions-retained-objects.md), [extensions-state-rebinding.md](./extensions-state-rebinding.md), and the [v2 cutover adr](./adr/extensions-v2-cutover.md).
 
 adjacent seams stay split on purpose: [runtime roots](./runtime-roots.md) defines precedence, [lifecycle](./extensions-lifecycle.md) defines `load/register -> bind -> unbind -> teardown`, [events/interceptors](./extensions-events.md) defines `before_provider_request`, and [state rebinding](./extensions-state-rebinding.md) defines what survives reload/new/resume/fork.
@@ -66,11 +66,11 @@ canonical root order
 
 ## current zi evidence
 
-- `src/coding_agent/extensions/api.zig:64-81` installs only `zi.register_tool`, `zi.on`, and `zi.spawn` into the public `zi` table. there is no public `zi.register_provider`. `rg "register_provider" src/coding_agent/extensions/api.zig` returns no matches.
-- `src/coding_agent/extensions/registries/provider_queue.zig:1-18` and `src/coding_agent/extensions/registries/provider_queue.zig:40-78` already define `ProviderQueue` as pending custom-provider registrations awaiting bind, with `enqueue`, `drain`, and `count`.
-- `src/coding_agent/extensions/runner.zig:155-159` says `provider_queue` is drained by `bindRuntime`, but `src/coding_agent/extensions/runner.zig:422-425` currently only flips `self.runtime` from `stub` to `bound`. no queue flush happens there today.
-- `src/ai/provider.zig:62-132` is the live provider registry today. it is host-side and mutable, but it is keyed by api identifier string, not by extension provider name.
-- `src/coding_agent/model_registry.zig:1-99` makes the model registry a session-owned, read-only snapshot built at session init and immutable for the session lifetime. there is no public register/remove path there today.
+- `src/coding_agent/extensions/api.zig` exposes public `zi.register_provider` / `zi.unregister_provider` bindings alongside the other `zi.*` registration seams.
+- `src/coding_agent/extensions/registries/provider_queue.zig` still owns the pre-bind queue; `src/coding_agent/extensions/runner.zig` now drains that queue at bind and notifies the bound session only when the active provider projection actually changes.
+- `src/ai/provider.zig` remains the live provider runtime registry. it is still host-side, mutable, and keyed by api identifier string, while extension claims stay keyed by provider name.
+- `src/coding_agent/model_registry.zig` now rebuilds a separate visible model catalog from built-ins, settings custom models, and active provider claims. ownership stays split: provider registry for runtime handles, model registry for visible catalog data.
+- `src/tui/ui_event.zig` + `src/tui/interactive.zig` now publish and consume deep-copied visible-model snapshots, so `/model` no longer reads the agent-owned registry directly from the tui thread.
 
 those facts matter because they show zi already has the right pieces, but not yet the full public provider contract: a load-time queue, a live provider registry, and a separate model catalog. this doc keeps those owners split instead of collapsing them into one bag.
 

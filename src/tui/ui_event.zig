@@ -2,6 +2,8 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const conversation_state_mod = @import("../agent3/conversation_state.zig");
 const runtime_host_mod = @import("../coding_agent/runtime_host.zig");
+const model_registry_mod = @import("../coding_agent/model_registry.zig");
+const ai_protocol = @import("../ai/protocol.zig");
 const theme_mod = @import("theme.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 
@@ -87,6 +89,10 @@ pub const UiEvent = union(enum) {
         commands: []ExtensionCommandEntry,
     },
 
+    visible_models_snapshot: struct {
+        models: []ai_protocol.Model,
+    },
+
     // --- /new outcomes ---
     session_new_started: void,
     session_fork_started: void,
@@ -168,6 +174,16 @@ pub const UiEvent = union(enum) {
         };
     }
 
+    pub fn takeVisibleModelsSnapshot(self: *UiEvent) ?[]ai_protocol.Model {
+        return switch (self.*) {
+            .visible_models_snapshot => |snapshot| blk: {
+                self.* = .{ .consumed = {} };
+                break :blk snapshot.models;
+            },
+            else => null,
+        };
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -200,6 +216,7 @@ pub const UiEvent = union(enum) {
                 }
                 allocator.free(u.commands);
             },
+            .visible_models_snapshot => |u| model_registry_mod.deinitOwnedModels(allocator, u.models),
             .session_new_started => {},
             .session_fork_started => {},
             .session_new_failed => |f| allocator.free(f.message),
@@ -233,6 +250,28 @@ test "UiEvent deinit frees conversation patch payload" {
         },
     } } };
     ev.deinit(testing.allocator);
+}
+
+test "UiEvent visible-model snapshot ownership transfers with take helper" {
+    const allocator = testing.allocator;
+    const models = try model_registry_mod.cloneOwnedModels(allocator, &.{.{
+        .id = "proxy-model",
+        .name = "Proxy Model",
+        .api = .openai_completions,
+        .provider = .{ .custom = "proxy-a" },
+        .base_url = "https://proxy-a.example",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 1024,
+    }});
+    var ev = UiEvent{ .visible_models_snapshot = .{ .models = models } };
+
+    const taken = ev.takeVisibleModelsSnapshot().?;
+    defer model_registry_mod.deinitOwnedModels(allocator, taken);
+
+    ev.deinit(allocator);
 }
 
 test "UiEvent takeConversationPatch disarms later cleanup" {

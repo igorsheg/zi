@@ -51,9 +51,9 @@ pub const AgentSession = struct {
     auth_storage: ?*auth_storage_mod.AuthStorage,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
     resource_loader: resources.ResourceLoader,
-    /// Borrowed ModelRegistry — lifetime owned by caller (main.zig in
-    /// the interactive path). Used by the TUI to bind `[]const Model`
-    /// at init, and by `/resume` for `restoreModelFromSession`.
+    /// Borrowed visible-model registry. Lifetime stays caller-owned,
+    /// but AgentSession is the rebuild owner on the agent thread. Used
+    /// for model resolution, restore, and TUI snapshot publication.
     model_registry: ?*model_registry_mod.ModelRegistry = null,
 
     /// Owned ExtensionRunner — current generation. Populated by the
@@ -463,6 +463,23 @@ pub const AgentSession = struct {
         };
     }
 
+    fn rebuildVisibleModelCatalogFromActiveProviders(self: *AgentSession) !void {
+        const registry = self.model_registry orelse return;
+        const current = self.agent.modelValue();
+        const provider_name = try self.allocator.dupe(u8, ai.json_util.providerToString(current.provider));
+        defer self.allocator.free(provider_name);
+        const model_id = try self.allocator.dupe(u8, current.id);
+        defer self.allocator.free(model_id);
+        const thinking_level = self.agent.thinkingLevel();
+
+        try registry.rebuildFromActiveProviderClaims(self._stream_closure.registry);
+        if (registry.findByProviderName(provider_name, model_id)) |refreshed| {
+            self.agent.setModel(refreshed);
+            self.agent.setThinkingLevel(clampThinkingLevelForModel(thinking_level, refreshed));
+        }
+        self.emitSessionEvent(.{ .visible_models_changed = {} });
+    }
+
     pub fn noteCompactionApplied(self: *AgentSession) void {
         self.context_usage_unknown_after_compaction = true;
     }
@@ -639,6 +656,7 @@ pub const AgentSession = struct {
             .get_context_usage = &runtimeGetContextUsage,
             .get_system_prompt = &runtimeGetSystemPrompt,
             .get_binding_info = &runtimeGetBindingInfo,
+            .provider_projection_changed = &runtimeProviderProjectionChanged,
         }, self._stream_closure.registry) catch {};
     }
 
@@ -698,6 +716,13 @@ pub const AgentSession = struct {
             .workspace_id = self.resource_loader.cwd,
             .session_id = self.session_store.sessionId(),
             .session_file = if (session_file.len == 0) null else session_file,
+        };
+    }
+
+    fn runtimeProviderProjectionChanged(session_ptr: *anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.rebuildVisibleModelCatalogFromActiveProviders() catch |err| {
+            std.log.scoped(.coding_agent).warn("failed to rebuild visible model catalog: {s}", .{@errorName(err)});
         };
     }
 
@@ -1013,6 +1038,87 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
     const thinking_entry = ca.session_store.writer.buffered_entries.items[1].entry;
     try testing.expect(thinking_entry.entry == .thinking_level_change);
     try testing.expectEqualStrings("high", thinking_entry.entry.thinking_level_change.thinking_level);
+}
+
+test "provider projection refreshes the current model from the rebuilt catalog" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    auth.setRuntimeApiKey("proxy-a", "test-key");
+
+    var model_registry = try model_registry_mod.ModelRegistry.init(alloc, &auth, &.{});
+    defer model_registry.deinit();
+
+    var fp = faux.FauxProvider.init(alloc);
+    var registry = ai.provider.Registry.init(alloc);
+    defer registry.deinit();
+    try registry.register("anthropic-messages", fp.provider(), null);
+
+    const claim_models = try alloc.alloc(ai.provider.ClaimModelRegistration, 1);
+    claim_models[0] = .{
+        .id = try alloc.dupe(u8, "proxy-model"),
+        .name = try alloc.dupe(u8, "Proxy Model v1"),
+        .reasoning = false,
+        .input = try alloc.dupe(ai.protocol.Model.InputType, &.{.text}),
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 2048,
+    };
+    try testing.expect(try registry.registerClaim(.{
+        .name = try alloc.dupe(u8, "proxy-a"),
+        .api = try alloc.dupe(u8, "anthropic-messages"),
+        .base_url = try alloc.dupe(u8, "https://proxy-a.example/v1"),
+        .owner_id = try alloc.dupe(u8, "ext-a"),
+        .generation = 1,
+        .models = claim_models,
+    }));
+    try model_registry.rebuildFromActiveProviderClaims(&registry);
+
+    const initial = model_registry.find(.{ .custom = "proxy-a" }, "proxy-model") orelse return error.MissingCatalogEntry;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const agent_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(agent_dir);
+
+    var ca = AgentSession.initTestSession(alloc, .{
+        .model = initial,
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoaderWithAgentDir(alloc, "/tmp/zi-test", agent_dir),
+        .registry = &registry,
+        .auth_storage = &auth,
+        .model_registry = &model_registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    const updated_models = try alloc.alloc(ai.provider.ClaimModelRegistration, 1);
+    updated_models[0] = .{
+        .id = try alloc.dupe(u8, "proxy-model"),
+        .name = try alloc.dupe(u8, "Proxy Model v2"),
+        .reasoning = false,
+        .input = try alloc.dupe(ai.protocol.Model.InputType, &.{.text}),
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+    try testing.expect(try registry.registerClaim(.{
+        .name = try alloc.dupe(u8, "proxy-a"),
+        .api = try alloc.dupe(u8, "anthropic-messages"),
+        .base_url = try alloc.dupe(u8, "https://proxy-a.example/v2"),
+        .owner_id = try alloc.dupe(u8, "ext-a"),
+        .generation = 1,
+        .models = updated_models,
+    }));
+
+    try ca.rebuildVisibleModelCatalogFromActiveProviders();
+
+    try testing.expectEqualStrings("Proxy Model v2", ca.agent.modelValue().name);
+    try testing.expectEqualStrings("https://proxy-a.example/v2", ca.agent.modelValue().base_url);
+    try testing.expectEqual(@as(u64, 8192), ca.agent.modelValue().context_window);
 }
 
 test "trySetModel persists defaults through settings manager" {

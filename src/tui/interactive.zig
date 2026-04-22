@@ -308,7 +308,8 @@ const ResumePickerFlow = struct {
 };
 
 /// Owns all transient heap-backed data for one `/model` overlay.
-/// Stable catalog models stay borrowed; derived search rows live here.
+/// Catalog models are borrowed from Interactive's TUI-owned snapshot;
+/// derived search rows live here.
 const ModelPickerFlow = struct {
     arena: std.heap.ArenaAllocator,
     rows: []Row = &.{},
@@ -482,11 +483,10 @@ pub const Interactive = struct {
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
     settings_manager: *settings_manager_mod.SettingsManager,
-    /// Borrowed slice of the session's ModelRegistry. Bound at init
-    /// from `ca.model_registry.getAll()`. Lifetime: AgentSession
-    /// outlives Interactive, and the registry is immutable for the
-    /// session lifetime, so the slice is stable.
-    model_catalog: []const ai_protocol.Model = &.{},
+    /// TUI-owned visible-model snapshot published from the agent
+    /// thread. `/model` UI reads only this slice, never the session
+    /// registry directly. Allocated with `msg_allocator`.
+    model_catalog: []ai_protocol.Model = &.{},
     model_picker_flow: ?ModelPickerFlow = null,
 
     // ── Settings pickers (/settings) ───────────────────────────────
@@ -515,7 +515,6 @@ pub const Interactive = struct {
     /// values; the long-lived agent thread wakes, drains, and dispatches
     /// them on the owner thread.
     request_queue: RequestQueue,
-    model_registry: ?*coding_agent_mod.ModelRegistry,
     memory_diagnostics: *const memory_debug.Diagnostics,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
     session_event_token: ?RuntimeHost.EventSubscriptionToken = null,
@@ -544,7 +543,6 @@ pub const Interactive = struct {
         cwd: []const u8,
         auth_storage: *auth_storage_mod.AuthStorage,
         settings_manager: *settings_manager_mod.SettingsManager,
-        model_registry: ?*coding_agent_mod.ModelRegistry,
     ) !Interactive {
         _ = allocator;
         const theme = themes_builtin.defaultForTerminal();
@@ -579,11 +577,10 @@ pub const Interactive = struct {
             .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
             .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
-            .model_registry = model_registry,
             .memory_diagnostics = memory_diagnostics,
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
-            .model_catalog = if (model_registry) |mr| mr.getAll() else &.{},
+            .model_catalog = &.{},
         };
         self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
@@ -646,6 +643,8 @@ pub const Interactive = struct {
             snapshot.deinit(self.msg_allocator);
             self.last_published_status_snapshot = null;
         }
+        coding_agent_mod.model_registry.deinitOwnedModels(self.msg_allocator, self.model_catalog);
+        self.model_catalog = &.{};
         self.status_data.deinit();
         self.input.deinit();
         logMailboxStats("snapshot", self.snapshot_event_queue.stats());
@@ -1180,10 +1179,17 @@ pub const Interactive = struct {
             return;
         }
 
+        if (ev.takeVisibleModelsSnapshot()) |models| {
+            self.applyVisibleModelsSnapshot(models);
+            self.tui.dirty = true;
+            return;
+        }
+
         switch (ev.*) {
             .consumed => {},
             .conversation_patch => unreachable,
             .queued_snapshot => unreachable,
+            .visible_models_snapshot => unreachable,
             .error_message => |e| {
                 self.status_text.setContent(e.message);
                 self.status_text.fg = self.theme.fg(.@"error");
@@ -1377,6 +1383,12 @@ pub const Interactive = struct {
         self.status_data.setThinkingLevel(snapshot.thinking_level);
         self.status_data.context_tokens = snapshot.context_tokens;
         self.status_data.context_window = snapshot.context_window;
+    }
+
+    fn applyVisibleModelsSnapshot(self: *Interactive, models: []ai_protocol.Model) void {
+        self.closeModelPickerFlow();
+        coding_agent_mod.model_registry.deinitOwnedModels(self.msg_allocator, self.model_catalog);
+        self.model_catalog = models;
     }
 
     fn applyTranscriptHideThinkingBlock(self: *Interactive) void {
@@ -2240,37 +2252,7 @@ pub const Interactive = struct {
     // ── Model picker (/model) ───────────────────────────────────
 
     fn switchModelDirect(self: *Interactive, pattern: []const u8) void {
-        // `/model <pattern>` goes through the same resolver as the
-        // CLI flag so users get identical semantics: canonical
-        // provider/id, inferred-provider-from-slash, alias-vs-dated
-        // preference, and fuzzy id/name matching. pi-mono parity.
-        const registry = self.model_registry orelse {
-            self.status_text.setContent("model registry unavailable");
-            self.status_text.fg = self.theme.fg(.@"error");
-            return;
-        };
-
-        // Scratch arena for resolver output — resolver owns warning/
-        // err strings and we display them inline, then drop them. This
-        // never crosses threads, so keep it on the TUI-local allocator.
-        var scratch = std.heap.ArenaAllocator.init(self.allocator);
-        defer scratch.deinit();
-        const result = ai_resolve.resolveCliModel(.{
-            .cli_model = pattern,
-            .registry = registry,
-            .allocator = scratch.allocator(),
-        });
-        if (result.err) |e| {
-            self.status_text.setContent(e);
-            self.status_text.fg = self.theme.fg(.@"error");
-            return;
-        }
-        const m = result.model orelse {
-            self.status_text.setContent("model not found");
-            self.status_text.fg = self.theme.fg(.@"error");
-            return;
-        };
-        self.applyModelSwitch(m);
+        self.queueModelPatternSwitch(pattern);
     }
 
     fn closeModelPickerFlow(self: *Interactive) void {
@@ -2333,7 +2315,14 @@ pub const Interactive = struct {
             return;
         };
 
-        self.applyModelSwitch(m);
+        const reference = std.fmt.allocPrint(self.msg_allocator, "{s}/{s}", .{ json_util.providerToString(m.provider), m.id }) catch {
+            self.status_text.setContent("out of memory");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        };
+        defer self.msg_allocator.free(reference);
+        self.queueModelPatternSwitch(reference);
     }
 
     fn onModelPickerCancel(ctx: ?*anyopaque) void {
@@ -2341,17 +2330,14 @@ pub const Interactive = struct {
         self.closeModelPickerFlow();
     }
 
-    /// Enqueue a /model switch through the AgentRequest queue
-    /// (zi-wub.16). The actual mutation runs on the agent thread
-    /// inside `handleSetModel`. Semantic state flows back via
-    /// `status_snapshot`; `.model_switched` / `.model_switch_failed`
-    /// are banner outcomes.
-    ///
-    /// Model is a static catalog value (its slices live forever in
-    /// `ai_models`), so we pass it by value into the request without
-    /// cloning the inner strings.
-    fn applyModelSwitch(self: *Interactive, m: ai_protocol.Model) void {
-        _ = self.dispatchIdleRequest(.{ .set_model = .{ .model = m } }, .{
+    fn queueModelPatternSwitch(self: *Interactive, pattern: []const u8) void {
+        const pattern_copy = self.msg_allocator.dupe(u8, pattern) catch {
+            self.status_text.setContent("out of memory");
+            self.status_text.fg = self.theme.fg(.@"error");
+            self.tui.dirty = true;
+            return;
+        };
+        _ = self.dispatchIdleRequest(.{ .set_model_by_pattern = .{ .pattern = pattern_copy } }, .{
             .busy_message = "cannot switch model while agent is running",
             .loader_message = "Switching model...",
             .spawn_failed_message = "failed to queue model switch",
@@ -2651,6 +2637,7 @@ pub const Interactive = struct {
             runner.bindLuaOwnerThread(std.Thread.getCurrentId());
             self.publishExtensionCommandsUpdate();
         }
+        self.publishVisibleModelsSnapshot();
         _ = self.publishConversationState();
         self.publishQueuedSnapshotIfChanged();
 
@@ -2727,6 +2714,10 @@ pub const Interactive = struct {
                     .set_model => |s| {
                         idle_processed = true;
                         self.handleSetModel(s.model);
+                    },
+                    .set_model_by_pattern => |s| {
+                        idle_processed = true;
+                        self.handleSetModelPattern(s.pattern);
                     },
                     .set_thinking_level => |s| {
                         idle_processed = true;
@@ -2849,6 +2840,7 @@ pub const Interactive = struct {
         };
         self.publishExtensionCommandsUpdate();
         self.publishThemeSnapshot();
+        self.publishVisibleModelsSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {
             log.warn("snapshot queue dropped new-session conversation state", .{});
@@ -2868,6 +2860,7 @@ pub const Interactive = struct {
         };
         self.publishExtensionCommandsUpdate();
         self.publishThemeSnapshot();
+        self.publishVisibleModelsSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {
             log.warn("snapshot queue dropped forked conversation state", .{});
@@ -2899,6 +2892,7 @@ pub const Interactive = struct {
 
         self.publishExtensionCommandsUpdate();
         self.publishThemeSnapshot();
+        self.publishVisibleModelsSnapshot();
         self.publishStatusSnapshot();
         if (!self.publishConversationState()) {
             log.warn("snapshot queue dropped resumed conversation state", .{});
@@ -3029,6 +3023,33 @@ pub const Interactive = struct {
         }
     }
 
+    fn handleSetModelPattern(self: *Interactive, pattern: []const u8) void {
+        const registry = self.runtime_host.currentSession().model_registry orelse {
+            const msg = self.msg_allocator.dupe(u8, "model registry unavailable") catch return;
+            _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
+            return;
+        };
+
+        var scratch = std.heap.ArenaAllocator.init(self.msg_allocator);
+        defer scratch.deinit();
+        const result = ai_resolve.resolveCliModel(.{
+            .cli_model = pattern,
+            .registry = registry,
+            .allocator = scratch.allocator(),
+        });
+        if (result.err) |err_msg| {
+            const msg = self.msg_allocator.dupe(u8, err_msg) catch return;
+            _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
+            return;
+        }
+        const model = result.model orelse {
+            const msg = self.msg_allocator.dupe(u8, "model not found") catch return;
+            _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
+            return;
+        };
+        self.handleSetModel(model);
+    }
+
     fn publishThemeSnapshot(self: *Interactive) void {
         _ = self.publishSnapshotUiEvent(.{ .theme_changed = self.runtime_host.selectedTheme() });
     }
@@ -3050,6 +3071,15 @@ pub const Interactive = struct {
         self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
         self.pending_image_banner.fg = self.theme.fg(.accent);
         self.pending_image_banner.bg = self.theme.bg(.tool_pending_bg);
+    }
+
+    fn publishVisibleModelsSnapshot(self: *Interactive) void {
+        const registry = self.runtime_host.currentSession().model_registry orelse {
+            _ = self.publishLifecycleUiEvent(.{ .visible_models_snapshot = .{ .models = &.{} } });
+            return;
+        };
+        const models = coding_agent_mod.model_registry.cloneOwnedModels(self.msg_allocator, registry.getAll()) catch return;
+        _ = self.publishLifecycleUiEvent(.{ .visible_models_snapshot = .{ .models = models } });
     }
 
     fn publishStatusSnapshot(self: *Interactive) void {
@@ -3197,6 +3227,10 @@ pub const Interactive = struct {
                 self.publishManualCompactionLifecycle(compaction);
                 self.publishStatusSnapshot();
                 _ = self.publishConversationState();
+            },
+            .visible_models_changed => {
+                self.publishVisibleModelsSnapshot();
+                self.publishStatusSnapshot();
             },
         }
     }

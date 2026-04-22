@@ -46,4 +46,5 @@ pub const SessionEvent = union(enum) {
     auto_retry_end: RetryEnd,
     compaction_start: CompactionStart,
     compaction_end: CompactionEnd,
+    visible_models_changed: void,
 };

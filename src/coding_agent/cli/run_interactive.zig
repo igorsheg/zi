@@ -138,7 +138,6 @@ pub fn run(
         runtime.cwd,
         runtime.auth_storage,
         runtime.settings_manager,
-        runtime.model_registry,
     );
     defer interactive.deinit();
 
