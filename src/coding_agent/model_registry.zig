@@ -809,6 +809,73 @@ test "rebuild includes active provider claim models with honest provider identit
     try testing.expectEqual(@as(usize, 2), claim_model.input.len);
 }
 
+test "rebuild keeps built-in visible provider identity while override claims survive generation teardown" {
+    const alloc = testing.allocator;
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    var reg = try ModelRegistry.init(alloc, &auth, &.{});
+    defer reg.deinit();
+
+    var providers = provider_mod.Registry.init(alloc);
+    defer providers.deinit();
+    const baseline = try alloc.create(provider_mod.Provider);
+    defer alloc.destroy(baseline);
+    baseline.* = .{
+        .ptr = undefined,
+        .vtable = &struct {
+            fn stream(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.StreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
+            fn streamSimple(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.SimpleStreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
+            fn getName(_: *anyopaque) []const u8 {
+                return "baseline";
+            }
+            fn deinit(_: *anyopaque) void {}
+            const table: provider_mod.Provider.VTable = .{
+                .stream = stream,
+                .stream_simple = streamSimple,
+                .get_name = getName,
+                .deinit = deinit,
+            };
+        }.table,
+    };
+    try providers.register("anthropic-messages", baseline.*, null);
+
+    const first: provider_mod.ClaimRegistration = .{
+        .name = try alloc.dupe(u8, "anthropic"),
+        .api = try alloc.dupe(u8, "anthropic-messages"),
+        .base_url = try alloc.dupe(u8, "https://gen1.example"),
+        .owner_id = try alloc.dupe(u8, "ext-shared"),
+        .generation = 1,
+    };
+    try testing.expect(try providers.registerClaim(first));
+
+    const second: provider_mod.ClaimRegistration = .{
+        .name = try alloc.dupe(u8, "anthropic"),
+        .api = try alloc.dupe(u8, "anthropic-messages"),
+        .base_url = try alloc.dupe(u8, "https://gen2.example"),
+        .owner_id = try alloc.dupe(u8, "ext-shared"),
+        .generation = 2,
+    };
+    try testing.expect(try providers.registerClaim(second));
+
+    try reg.rebuildFromActiveProviderClaims(&providers);
+    const built_in_before = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    try testing.expectEqualStrings(json_util.providerToString(built_in_before.provider), "anthropic");
+    try testing.expectEqualStrings("https://gen1.example", providers.activeClaimRegistrationByName("anthropic").?.base_url);
+
+    try providers.unregisterClaimsByGeneration(1);
+    try reg.rebuildFromActiveProviderClaims(&providers);
+
+    const built_in_after = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    try testing.expectEqualStrings(json_util.providerToString(built_in_after.provider), "anthropic");
+    try testing.expectEqualStrings("https://gen2.example", providers.activeClaimRegistrationByName("anthropic").?.base_url);
+
+    try providers.unregisterClaimsByGeneration(2);
+    try reg.rebuildFromActiveProviderClaims(&providers);
+
+    const built_in_restored = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    try testing.expectEqualStrings(json_util.providerToString(built_in_restored.provider), "anthropic");
+}
+
 test "claim-backed models report configured auth from provider api_key without leaking provider headers" {
     const alloc = testing.allocator;
     var auth = try auth_storage_mod.AuthStorage.create(alloc, null);

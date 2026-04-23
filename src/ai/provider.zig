@@ -217,7 +217,7 @@ const BaseUrlClaimProvider = struct {
 pub const Registry = struct {
     providers: std.StringHashMap(Provider),
     baseline: std.StringHashMap(Provider),
-    claim_index: std.StringHashMap(usize),
+    claim_index: std.StringHashMap(std.ArrayListUnmanaged(usize)),
     claims: std.ArrayListUnmanaged(Claim) = .empty,
     allocator: std.mem.Allocator,
 
@@ -225,7 +225,7 @@ pub const Registry = struct {
         return .{
             .providers = std.StringHashMap(Provider).init(allocator),
             .baseline = std.StringHashMap(Provider).init(allocator),
-            .claim_index = std.StringHashMap(usize).init(allocator),
+            .claim_index = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(allocator),
             .allocator = allocator,
         };
     }
@@ -236,7 +236,10 @@ pub const Registry = struct {
         self.baseline.deinit();
 
         var it = self.claim_index.iterator();
-        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.claim_index.deinit();
     }
 
@@ -252,17 +255,20 @@ pub const Registry = struct {
         var claim = try Claim.init(self.allocator, registration, delegate);
         errdefer claim.deinit(self.allocator);
 
-        if (self.claim_index.get(claim.registration.name)) |idx| {
-            const existing = &self.claims.items[idx];
-            if (!std.mem.eql(u8, existing.registration.owner_id, claim.registration.owner_id)) {
-                return false;
+        if (self.claim_index.getPtr(claim.registration.name)) |bucket| {
+            if (bucket.items.len > 0) {
+                const winner = &self.claims.items[bucket.items[0]];
+                if (!std.mem.eql(u8, winner.registration.owner_id, claim.registration.owner_id)) {
+                    return false;
+                }
             }
 
-            var old = existing.*;
-            existing.* = claim;
-            errdefer existing.* = old;
+            const idx = self.claims.items.len;
+            try self.claims.append(self.allocator, claim);
+            errdefer _ = self.claims.pop();
+            try bucket.append(self.allocator, idx);
+            errdefer _ = bucket.pop();
             try self.rebuildProjection();
-            old.deinit(self.allocator);
             return true;
         }
 
@@ -273,8 +279,14 @@ pub const Registry = struct {
         const key_dup = try self.allocator.dupe(u8, claim.registration.name);
         errdefer self.allocator.free(key_dup);
 
-        try self.claim_index.put(key_dup, idx);
+        var bucket: std.ArrayListUnmanaged(usize) = .empty;
+        errdefer bucket.deinit(self.allocator);
+        try bucket.append(self.allocator, idx);
+
+        try self.claim_index.put(key_dup, bucket);
         errdefer if (self.claim_index.fetchRemove(claim.registration.name)) |removed| {
+            var removed_bucket = removed.value;
+            removed_bucket.deinit(self.allocator);
             self.allocator.free(removed.key);
         };
 
@@ -283,17 +295,25 @@ pub const Registry = struct {
     }
 
     pub fn unregisterClaim(self: *Registry, name: []const u8, owner_id: []const u8, generation: u64) !bool {
-        const idx = self.claim_index.get(name) orelse return false;
-        const existing = self.claims.items[idx];
-        if (!std.mem.eql(u8, existing.registration.owner_id, owner_id)) return false;
-        if (existing.registration.generation != generation) return false;
+        const bucket = self.claim_index.getPtr(name) orelse return false;
+        if (bucket.items.len == 0) return false;
 
+        const winner = self.claims.items[bucket.items[0]];
+        if (!std.mem.eql(u8, winner.registration.owner_id, owner_id)) return false;
+        if (winner.registration.generation != generation) return false;
+
+        const idx = bucket.items[0];
+        _ = bucket.orderedRemove(0);
         var removed = self.claims.orderedRemove(idx);
 
-        const index_entry = self.claim_index.fetchRemove(name) orelse unreachable;
-        defer self.allocator.free(index_entry.key);
+        if (bucket.items.len == 0) {
+            const index_entry = self.claim_index.fetchRemove(name) orelse unreachable;
+            var removed_bucket = index_entry.value;
+            removed_bucket.deinit(self.allocator);
+            self.allocator.free(index_entry.key);
+        }
 
-        self.reindexClaimsFrom(idx);
+        try self.reindexClaimsFrom(idx);
         try self.rebuildProjection();
         removed.deinit(self.allocator);
         return true;
@@ -308,14 +328,23 @@ pub const Registry = struct {
                 continue;
             }
 
+            const name = self.claims.items[i].registration.name;
+            const bucket = self.claim_index.getPtr(name) orelse unreachable;
+            const bucket_idx = findBucketIndex(bucket.items, i) orelse unreachable;
+            _ = bucket.orderedRemove(bucket_idx);
+
             var removed = self.claims.orderedRemove(i);
-            const index_entry = self.claim_index.fetchRemove(removed.registration.name) orelse unreachable;
-            self.allocator.free(index_entry.key);
+            if (bucket.items.len == 0) {
+                const index_entry = self.claim_index.fetchRemove(removed.registration.name) orelse unreachable;
+                var removed_bucket = index_entry.value;
+                removed_bucket.deinit(self.allocator);
+                self.allocator.free(index_entry.key);
+            }
             removed.deinit(self.allocator);
             removed_any = true;
         }
         if (removed_any) {
-            self.reindexClaimsFrom(0);
+            try self.reindexClaimsFrom(0);
             try self.rebuildProjection();
         }
     }
@@ -355,14 +384,23 @@ pub const Registry = struct {
                 continue;
             }
 
+            const name = self.claims.items[i].registration.name;
+            const bucket = self.claim_index.getPtr(name) orelse unreachable;
+            const bucket_idx = findBucketIndex(bucket.items, i) orelse unreachable;
+            _ = bucket.orderedRemove(bucket_idx);
+
             var removed = self.claims.orderedRemove(i);
-            const index_entry = self.claim_index.fetchRemove(removed.registration.name) orelse unreachable;
-            self.allocator.free(index_entry.key);
+            if (bucket.items.len == 0) {
+                const index_entry = self.claim_index.fetchRemove(removed.registration.name) orelse unreachable;
+                var removed_bucket = index_entry.value;
+                removed_bucket.deinit(self.allocator);
+                self.allocator.free(index_entry.key);
+            }
             removed.deinit(self.allocator);
             removed_any = true;
         }
         if (removed_any) {
-            self.reindexClaimsFrom(0);
+            self.reindexClaimsFrom(0) catch {};
             self.rebuildProjection() catch {};
         }
     }
@@ -393,21 +431,38 @@ pub const Registry = struct {
         self.claims.deinit(self.allocator);
 
         var it = self.claim_index.iterator();
-        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.claim_index.clearRetainingCapacity();
     }
 
     fn claimByName(self: *const Registry, provider_name: []const u8) ?*const Claim {
-        const idx = self.claim_index.get(provider_name) orelse return null;
-        return &self.claims.items[idx];
+        const bucket = self.claim_index.get(provider_name) orelse return null;
+        if (bucket.items.len == 0) return null;
+        return &self.claims.items[bucket.items[0]];
     }
 
-    fn reindexClaimsFrom(self: *Registry, start: usize) void {
-        var i = start;
-        while (i < self.claims.items.len) : (i += 1) {
-            const value = self.claim_index.getPtr(self.claims.items[i].registration.name) orelse unreachable;
-            value.* = i;
+    fn reindexClaimsFrom(self: *Registry, start: usize) !void {
+        _ = start;
+
+        var bucket_it = self.claim_index.valueIterator();
+        while (bucket_it.next()) |bucket| {
+            bucket.clearRetainingCapacity();
         }
+
+        for (self.claims.items, 0..) |claim, idx| {
+            const bucket = self.claim_index.getPtr(claim.registration.name) orelse unreachable;
+            try bucket.append(self.allocator, idx);
+        }
+    }
+
+    fn findBucketIndex(items: []const usize, needle: usize) ?usize {
+        for (items, 0..) |item, idx| {
+            if (item == needle) return idx;
+        }
+        return null;
     }
 
     fn rebuildProjection(self: *Registry) !void {
@@ -652,6 +707,58 @@ test "Registry resolves provider claims by provider name before api projection" 
         null,
     );
     try testing.expectEqualStrings("https://baseline.example", baseline.last_base_url.?);
+
+    baseline.provider().deinit();
+}
+
+test "Registry teardown drops one generation and restores surviving same-name claim" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    const baseline = try RecordingProvider.create(testing.allocator, "baseline");
+    try reg.register("anthropic-messages", baseline.provider(), null);
+
+    const first = ClaimRegistration{
+        .name = try testing.allocator.dupe(u8, "anthropic"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://gen1.example"),
+        .owner_id = try testing.allocator.dupe(u8, "ext-gen1"),
+        .generation = 1,
+    };
+    try testing.expect(try reg.registerClaim(first));
+
+    const second = ClaimRegistration{
+        .name = try testing.allocator.dupe(u8, "anthropic"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://gen2.example"),
+        .owner_id = try testing.allocator.dupe(u8, "ext-gen1"),
+        .generation = 2,
+    };
+    try testing.expect(try reg.registerClaim(second));
+
+    try testing.expectEqual(@as(usize, 2), reg.activeClaimCount());
+    try testing.expectEqualStrings("https://gen1.example", reg.activeClaimRegistrationByName("anthropic").?.base_url);
+
+    try reg.unregisterClaimsByGeneration(1);
+
+    try testing.expectEqual(@as(usize, 1), reg.activeClaimCount());
+    try testing.expectEqualStrings("https://gen2.example", reg.activeClaimRegistrationByName("anthropic").?.base_url);
+    try testing.expectEqualStrings("anthropic", reg.get("anthropic-messages").?.getName());
+
+    reg.getForModel("anthropic-messages", "anthropic").?.streamSimple(
+        testing.allocator,
+        testModelWithProvider("https://baseline.example", .anthropic_messages, .anthropic),
+        .{ .messages = &.{} },
+        .{},
+        &noopEvent,
+        null,
+    );
+    try testing.expectEqualStrings("https://gen2.example", baseline.last_base_url.?);
+
+    try reg.unregisterClaimsByGeneration(2);
+    try testing.expectEqual(@as(usize, 0), reg.activeClaimCount());
+    try testing.expect(reg.activeClaimRegistrationByName("anthropic") == null);
+    try testing.expectEqualStrings("baseline", reg.get("anthropic-messages").?.getName());
 
     baseline.provider().deinit();
 }

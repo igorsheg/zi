@@ -37,6 +37,7 @@ after cutover, zi has one internal conversation/render pipeline:
 - requests and run controls mutate agent-owned state
 - runtime host publishes authoritative semantic snapshots
 - tui projection derives transcript/render state from those snapshots
+- internal optimizations such as delta-encoded updates are permitted only as host-private machinery layered over the snapshot stream; they must not compromise recoverability or truthfulness. a dropped or reordered optimization frame must always be recoverable from the next authoritative snapshot, and the tui projection must never depend on optimization completeness for correctness.
 
 ## forbidden compatibility theater
 
@@ -72,6 +73,7 @@ this adr is anchored to zi's existing runtime doctrine:
 - **authoritative publication** — runtime host is the publication point for conversation and queued snapshots.
 - **snapshot-driven projection** — tui conversation projection owns local render state, but it rebuilds and reconciles from owned snapshots rather than preserving a second live conversation model.
 - **real wire edges only** — serialization belongs at explicit observer, persistence, or external wire boundaries, not between internal owners that already share semantic structs.
+- **truthfulness over transport efficiency** — bounded or lossy transport channels must carry authoritative snapshots, not lossy deltas. internal optimizations such as patch encoding are host-private implementation details and must not become the truth-bearing contract.
 
 ## consequences
 

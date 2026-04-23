@@ -89,7 +89,7 @@ zi does not need pi-mono's exact internal storage layout. it does need the same 
 
 - the canonical registration key is provider name.
 - the same canonical root precedence rules apply here as everywhere else.
-- unregister must restore built-ins and reapply any remaining dynamic providers deterministically.
+- unregister must restore the next surviving same-name claim deterministically when one exists, and restore built-ins only when no surviving claim for that provider name remains.
 - provider registry ownership stays host-side; the extension namespace owns the claim and teardown responsibility.
 
 why:
@@ -97,7 +97,7 @@ why:
 - runtime-root precedence already says each registration class resolves collisions by canonical key under canonical root order, with first claimant winning (`docs/runtime-roots.md:10-15`, `docs/runtime-roots.md:121-143`). providers are not a special case.
 - lifecycle already says merged registries are shared views over namespace-owned registrations and names providers as one of those retained classes (`docs/extensions-lifecycle.md:10-18`, `docs/extensions-lifecycle.md:41-61`).
 - retained objects already split provider registrations from provider instances (`docs/extensions-retained-objects.md:77-79`). that split should survive the public api too.
-- pi-mono unregister semantics explicitly restore overridden built-ins when a named provider goes away (`types.ts:1197-1209`). deterministic reapplication is not extra polish; it is part of visible behavior.
+- pi-mono unregister semantics require deterministic restoration when a named provider claim goes away (`types.ts:1197-1209`). in zi, that means a surviving same-name claim becomes active again before baseline is restored; built-ins return only when no claim for that provider name remains. deterministic reapplication is not extra polish; it is part of visible behavior.
 
 current zi adds one constraint here: `src/ai/provider.zig:62-132` is api-keyed today, while pi-mono's public api is provider-name keyed (`types.ts:1195`, `types.ts:1210`, `types.ts:1350-1358`). this contract resolves that mismatch by making provider name the extension claim key while letting the host project those claims into whatever runtime lookup tables it needs.
 

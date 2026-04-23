@@ -62,6 +62,9 @@ pub const Agent = struct {
     default_stream_closure: ?*DefaultStreamClosure,
     state_pending_tool_calls: std.ArrayList([]const u8),
 
+    /// Monotonically increasing counter bumped only on semantic conversation mutations.
+    conversation_version: std.atomic.Value(u64),
+
     is_running: std.atomic.Value(bool),
     is_streaming: bool = false,
     error_message: ?[]const u8 = null,
@@ -162,6 +165,7 @@ pub const Agent = struct {
             .default_stream_bundle = default_stream_bundle,
             .default_stream_closure = default_stream_closure,
             .state_pending_tool_calls = .empty,
+            .conversation_version = std.atomic.Value(u64).init(0),
             .is_running = std.atomic.Value(bool).init(false),
             .abort_controller = .{},
         };
@@ -345,6 +349,7 @@ pub const Agent = struct {
 
         self.resetHistoryArena();
         self.clearInFlight();
+        self.bumpConversationVersion();
     }
 
     pub fn truncateCommitted(self: *Agent, new_len: usize) !void {
@@ -359,6 +364,7 @@ pub const Agent = struct {
         const new_shared = try SharedCommitted.fromMessages(self.allocator, current.flat[0..new_len]);
         self.shared_committed = new_shared;
         current.release();
+        self.bumpConversationVersion();
     }
 
     pub fn reset(self: *Agent) !void {
@@ -376,6 +382,7 @@ pub const Agent = struct {
         self.is_streaming = false;
         self.error_message = null;
         self.clearAllQueues();
+        self.bumpConversationVersion();
     }
 
     pub fn retainCommitted(self: *const Agent) *SharedCommitted {
@@ -399,12 +406,12 @@ pub const Agent = struct {
         };
     }
 
-    pub fn cloneInFlightTurn(self: *const Agent, allocator: std.mem.Allocator) !?conversation_state.InFlightTurn {
-        return self.in_flight.freeze(allocator);
+    pub fn currentConversationVersion(self: *const Agent) u64 {
+        return self.conversation_version.load(.acquire);
     }
 
-    pub fn currentFrontierLocator(self: *const Agent) ?conversation_state.FrontierLocator {
-        return self.in_flight.currentLocator();
+    fn bumpConversationVersion(self: *Agent) void {
+        _ = self.conversation_version.fetchAdd(1, .acq_rel);
     }
 
     pub fn prompt(self: *Agent, prompts: []const protocol.AgentMessage) !void {
@@ -602,6 +609,9 @@ pub const Agent = struct {
 
     fn processEvent(self: *Agent, event: protocol.AgentEvent) void {
         const effects = self.in_flight.applyEvent(event);
+        if (effects.did_mutate_conversation) {
+            self.bumpConversationVersion();
+        }
         self.applyConversationEffects(effects);
 
         for (self.listeners.items) |listener| {
@@ -1034,4 +1044,171 @@ test "default stream fallback emits assistant error lifecycle without panic" {
     try testing.expect(state.messages[1] == .assistant);
     try testing.expectEqual(ai.protocol.StopReason.@"error", state.messages[1].assistant.stop_reason);
     try testing.expect(state.error_message != null);
+}
+
+test "conversation_version bumps on semantic mutation" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "unknown",
+            .name = "unknown",
+            .api = .{ .custom = "unknown" },
+            .provider = .{ .custom = "unknown" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    try testing.expectEqual(@as(u64, 0), agent.currentConversationVersion());
+
+    try agent.setMessages(&.{.{ .user = .{
+        .content = .{ .text = "hello" },
+        .timestamp = 1,
+    } }});
+    try testing.expectEqual(@as(u64, 1), agent.currentConversationVersion());
+
+    try agent.setMessages(&.{.{ .user = .{
+        .content = .{ .text = "world" },
+        .timestamp = 2,
+    } }});
+    try testing.expectEqual(@as(u64, 2), agent.currentConversationVersion());
+}
+
+test "conversation_version bumps on hot frontier mutation without committed append" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "unknown",
+            .name = "unknown",
+            .api = .{ .custom = "unknown" },
+            .provider = .{ .custom = "unknown" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    try testing.expectEqual(@as(u64, 0), agent.currentConversationVersion());
+    try testing.expectEqual(@as(usize, 0), agent.messages().len);
+
+    const assistant = makeAssistantMessage();
+    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    try testing.expectEqual(@as(u64, 1), agent.currentConversationVersion());
+    try testing.expectEqual(@as(usize, 0), agent.messages().len);
+
+    agent.processEvent(.{ .message_update = .{
+        .message = .{ .assistant = assistant },
+        .assistant_message_event = .{ .text_start = .{
+            .content_index = 0,
+            .partial = assistant,
+        } },
+    } });
+    try testing.expectEqual(@as(u64, 2), agent.currentConversationVersion());
+    try testing.expectEqual(@as(usize, 0), agent.messages().len);
+}
+
+test "conversation_version bumps on tool execution frontier mutation" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "unknown",
+            .name = "unknown",
+            .api = .{ .custom = "unknown" },
+            .provider = .{ .custom = "unknown" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    const assistant = makeAssistantMessage();
+    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    try testing.expectEqual(@as(u64, 1), agent.currentConversationVersion());
+
+    agent.processEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+    } });
+    try testing.expectEqual(@as(u64, 2), agent.currentConversationVersion());
+
+    agent.processEvent(.{ .tool_execution_update = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+        .partial_result = .{ .content = &.{}, .is_error = false },
+    } });
+    try testing.expectEqual(@as(u64, 3), agent.currentConversationVersion());
+
+    agent.processEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .result = .{ .content = &.{}, .is_error = false },
+        .is_error = false,
+    } });
+    try testing.expectEqual(@as(u64, 4), agent.currentConversationVersion());
+}
+
+test "conversation_version does not double-bump on turn_end commit" {
+    var agent = try Agent.init(testing.allocator, .{
+        .model = .{
+            .id = "unknown",
+            .name = "unknown",
+            .api = .{ .custom = "unknown" },
+            .provider = .{ .custom = "unknown" },
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+    });
+    defer agent.deinit();
+
+    // Seed committed history so turn_end has something to append after
+    agent.processEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .text = "prompt" },
+        .timestamp = 1,
+    } } } });
+    const before_turn = agent.currentConversationVersion();
+
+    const assistant = makeAssistantMessage();
+    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
+    agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    agent.processEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+    } });
+    agent.processEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .result = .{ .content = &.{}, .is_error = false },
+        .is_error = false,
+    } });
+
+    const tool_result = makeToolResultMessage();
+    agent.processEvent(.{ .message_end = .{ .message = .{ .tool_result = tool_result } } });
+
+    // turn_end appends assistant + tool_result, but must only bump once
+    agent.processEvent(.{ .turn_end = .{
+        .message = .{ .assistant = assistant },
+        .tool_results = &.{tool_result},
+    } });
+
+    // user message (1), message_start (1), message_end assistant (1), tool_execution_start (1),
+    // tool_execution_end (1), message_end tool_result (1), turn_end (1) = 7 total
+    try testing.expectEqual(@as(u64, before_turn + 6), agent.currentConversationVersion());
+    try testing.expectEqual(@as(usize, 3), agent.messages().len);
 }

@@ -23,10 +23,12 @@ pub const ConversationView = struct {
     }
 };
 
-pub const ConversationViewSnapshot = struct {
+pub const ConversationSnapshotEnvelope = struct {
+    session_generation: u64 = 0,
+    conversation_version: u64 = 0,
     view: ConversationView,
 
-    pub fn deinit(self: *ConversationViewSnapshot, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ConversationSnapshotEnvelope, allocator: std.mem.Allocator) void {
         self.view.deinit(allocator);
         self.* = undefined;
     }
@@ -57,44 +59,10 @@ pub const InFlightTurn = struct {
     }
 };
 
-pub const FrontierContentKind = enum {
-    text,
-    thinking,
-};
-
-pub const ConversationPatch = union(enum) {
-    replace_all: ConversationViewSnapshot,
-    append_committed: struct {
-        committed: *SharedCommitted,
-    },
-    replace_frontier: struct {
-        frontier: InFlightTurn,
-    },
-    append_frontier_content: struct {
-        locator: FrontierLocator,
-        kind: FrontierContentKind,
-        content_index: usize,
-        delta: []u8,
-    },
-    commit_frontier: struct {
-        locator: FrontierLocator,
-    },
-
-    pub fn deinit(self: *ConversationPatch, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .replace_all => |*snapshot| snapshot.deinit(allocator),
-            .append_committed => |payload| payload.committed.release(),
-            .replace_frontier => |*payload| payload.frontier.deinit(allocator),
-            .append_frontier_content => |payload| allocator.free(payload.delta),
-            .commit_frontier => {},
-        }
-        self.* = undefined;
-    }
-};
-
 pub const ApplyEventResult = struct {
     immediate_commit: ?protocol.AgentMessage = null,
     turn_commit: ?TurnCommit = null,
+    did_mutate_conversation: bool = false,
 
     pub const TurnCommit = struct {
         assistant: protocol.AssistantMessage,
@@ -189,8 +157,9 @@ pub const InFlightState = struct {
                 .assistant => |assistant| {
                     self.replaceAssistant(assistant);
                     self.assistant_streaming = true;
+                    return .{ .did_mutate_conversation = true };
                 },
-                else => {},
+                else => return .{},
             },
             .message_update => |payload| switch (payload.message) {
                 .assistant => |assistant| {
@@ -205,8 +174,9 @@ pub const InFlightState = struct {
                         .toolcall_end => |tc| self.syncToolCall(tc.tool_call, true, null),
                         else => {},
                     }
+                    return .{ .did_mutate_conversation = true };
                 },
-                else => {},
+                else => return .{},
             },
             .message_end => |payload| switch (payload.message) {
                 .assistant => |assistant| {
@@ -218,20 +188,24 @@ pub const InFlightState = struct {
                             else => {},
                         };
                     }
+                    return .{ .did_mutate_conversation = true };
                 },
                 .tool_result => |tool_result| {
                     if (self.isActive()) {
                         self.setResultMessage(tool_result);
+                        return .{ .did_mutate_conversation = true };
                     } else {
-                        return .{ .immediate_commit = payload.message };
+                        return .{ .immediate_commit = payload.message, .did_mutate_conversation = true };
                     }
                 },
-                else => return .{ .immediate_commit = payload.message },
+                else => return .{ .immediate_commit = payload.message, .did_mutate_conversation = true },
             },
             .tool_execution_start => |payload| {
                 if (self.isActive()) {
                     self.markExecutionStarted(payload.tool_call_id, payload.tool_name, payload.args);
+                    return .{ .did_mutate_conversation = true };
                 }
+                return .{};
             },
             .tool_execution_update => |payload| {
                 if (self.isActive()) {
@@ -240,24 +214,31 @@ pub const InFlightState = struct {
                         payload.partial_result,
                         if (payload.partial_result) |result| result.is_error else false,
                     );
+                    return .{ .did_mutate_conversation = true };
                 }
+                return .{};
             },
             .tool_execution_end => |payload| {
                 if (self.isActive()) {
                     self.setFinalResult(payload.tool_call_id, payload.result, payload.is_error);
+                    return .{ .did_mutate_conversation = true };
                 }
+                return .{};
             },
             .turn_end => |payload| switch (payload.message) {
                 .assistant => |assistant| {
-                    const result: ApplyEventResult = .{ .turn_commit = .{
-                        .assistant = assistant,
-                        .tool_results = payload.tool_results,
-                        .error_message = assistant.error_message,
-                    } };
+                    const result: ApplyEventResult = .{
+                        .turn_commit = .{
+                            .assistant = assistant,
+                            .tool_results = payload.tool_results,
+                            .error_message = assistant.error_message,
+                        },
+                        .did_mutate_conversation = true,
+                    };
                     self.clear();
                     return result;
                 },
-                else => {},
+                else => return .{},
             },
             .agent_start, .turn_start => {},
             .agent_end => self.assistant_streaming = false,
@@ -273,10 +254,6 @@ pub const InFlightState = struct {
         self.assistant_streaming = false;
         for (self.tool_executions.items) |*tool| tool.deinit(self.allocator);
         self.tool_executions.clearRetainingCapacity();
-    }
-
-    pub fn currentLocator(self: *const InFlightState) ?FrontierLocator {
-        return self.locator;
     }
 
     pub fn isActive(self: *const InFlightState) bool {

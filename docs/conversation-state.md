@@ -4,9 +4,9 @@
 
 contract for `zi-5psf.3`.
 
-documents the current semantic conversation state model and the private mailbox shapes the tui consumes today.
+documents the semantic conversation state model and the private mailbox shapes the tui consumes.
 
-this does **not** close `zi-5psf.2`. the broader cutover still carries open design work, but the internal conversation path now uses landed `ConversationPatch` plus separate `QueuedMessageSnapshot` transport.
+this does **not** close `zi-5psf.2`. the broader cutover still carries open design work.
 
 cross-links:
 - [conversation/render v2 cutover doctrine](./adr/conversation-render-v2-cutover.md)
@@ -17,17 +17,19 @@ cross-links:
 ## decision
 
 - the agent runtime is the sole owner of live assistant and tool execution semantics.
-- the canonical render input today is snapshot-first, with `replace_all` used for cold sync and private conversation patches used for hot updates.
-- the main semantic shape today is cold committed history plus one optional hot in-flight turn.
+- the canonical render input across the agent→tui owner boundary is authoritative `ConversationSnapshotEnvelope` publication.
+- each publication carries `session_generation`, `conversation_version`, and the full `ConversationView` payload.
+- because each publication is authoritative, dropped intermediate mailbox entries are recoverable from the next snapshot. correctness does not depend on deltas.
+- the main semantic shape is cold committed history plus one optional hot in-flight turn.
 - queued steering and follow-up state is an adjacent snapshot family owned by run control, not tui-local reconstruction.
-- tui projection is a consumer of semantic snapshots plus private conversation patches. it derives render rows and local caches; it does not become a second conversation owner.
+- tui projection is a consumer of authoritative semantic snapshots. it derives render rows and local caches; it does not become a second conversation owner.
 
 more concretely:
 
 - `src/agent3/agent.zig` owns `shared_committed`, `in_flight`, and run-control queues.
-- `src/coding_agent/runtime_host.zig` publishes `ConversationPatch` (`replace_all` for full sync; frontier/commit deltas for hot updates) and `QueuedMessageSnapshot`.
-- `src/tui/ui_event.zig` carries those payloads across the mailbox as `.conversation_patch` and `.queued_snapshot`.
-- `src/tui/conversation_projection.zig` stores owned view/queued state, applies patches, and rebuilds or reconciles transcript state from that owned state.
+- `src/coding_agent/runtime_host.zig` publishes authoritative `ConversationSnapshotEnvelope` and `QueuedMessageSnapshot` values.
+- `src/tui/ui_event.zig` carries those authoritative snapshots across the mailbox as `.conversation_snapshot` and `.queued_snapshot`.
+- `src/tui/conversation_projection.zig` stores the last authoritative view and queued state, derives transcript rows from that snapshot, and keeps render-local caches.
 
 ## model
 
@@ -60,33 +62,31 @@ more concretely:
     │  └─────────────────────────────────────────────────────────┘  │
     └───────────────┬───────────────────────────────┬──────────────┘
                     │                               │
-                    │ publish `replace_all` / patch │ publish snapshot
+                    │ publish authoritative         │ publish queued
+                    │ conversation snapshot         │ snapshot
                     v                               v
-        ┌──────────────────────────┐    ┌──────────────────────────┐
-        │ `ConversationPatch`      │    │ `QueuedMessageSnapshot` │
-        │  - `replace_all` =>      │    │  { steering,            │
-        │    `ConversationViewSnapshot` │    follow_up, version } │
-        │  - frontier / commit     │    └──────────────┬──────────┘
-        │    deltas                │                   │
-        └──────────────┬───────────┘                   │
-                       │                               │
-                       └───────────────┬───────────────┘
-                                       v
-                           tui mailbox / `UiEvent`
-
-                     `.conversation_patch`  `.queued_snapshot`
-                                       │
+        ┌─────────────────────────────┐  ┌──────────────────────────┐
+        │ `ConversationSnapshotEnvelope`│  │ `QueuedMessageSnapshot` │
+        │  generation + version + view │  │  { steering,            │
+        │  (`ConversationView`)        │  │    follow_up, version } │
+        └───────────────┬──────────────┘  └──────────────┬──────────┘
+                        │                                │
+                        └───────────────┬────────────────┘
+                                        v
+                            tui mailbox / `UiEvent`
+                                        │
                                        v
                          ┌──────────────────────────────┐
                          │ tui projection               │
-                         │  owns last view/queue state  │
-                         │  applies patches             │
+                         │  owns last authoritative view│
                          │  derives transcript rows     │
                          │  keeps render-local cache    │
                          └──────────────┬───────────────┘
                                         v
                               transcript / render tree
 ```
+
+the mailbox carries this input via `UiEvent.conversation_snapshot`. because that payload is authoritative and versioned, the tui projection can always rebuild from the latest snapshot even if bounded mailbox delivery drops intermediate states.
 
 ## committed state
 
@@ -128,19 +128,21 @@ this is semantic state, not render policy. the agent tracks assistant/tool progr
 | `is_partial` | whether `result` is still partial and may be replaced by a later update. |
 | `is_error` | whether the current result state is error-shaped. |
 
-## `ConversationView` and `ConversationViewSnapshot`
+## `ConversationView` and `ConversationSnapshotEnvelope`
 
 `ConversationView` is the semantic conversation payload:
 
 - `committed: *SharedCommitted`
 - `in_flight: ?InFlightTurn`
 
-`ConversationViewSnapshot` is the full-sync payload carried by `ConversationPatch.replace_all`:
+`ConversationSnapshotEnvelope` is the mailbox payload:
 
+- `session_generation: u64`
+- `conversation_version: u64`
 - `view: ConversationView`
 
 notes:
-- today the envelope is intentionally thin. the semantic cut is `committed` plus optional `in_flight`, not a transport-heavy wrapper.
+- the envelope is intentionally thin. the semantic cut is `committed` plus optional `in_flight`, with ordering metadata beside it.
 - snapshot-first does **not** mean replaying the committed slice at token speed. the current code retains `SharedCommitted` and deep-clones only the hot frontier on publish.
 
 ## adjacent queued snapshot family
@@ -155,7 +157,7 @@ today they live beside it as `QueuedMessageSnapshot`:
 
 contract:
 - this is agent-owned run-control state.
-- it is published separately from the conversation patch stream.
+- it is published separately from the conversation snapshot stream.
 - the tui uses it to render pending steering and follow-up rows.
 - `version` is monotonic per run-control instance so the tui can drop stale queued publishes that arrive out of order.
 
@@ -173,11 +175,11 @@ lifecycle edges:
 - committed-only messages can append directly to `SharedCommitted`.
 - assistant turns commit on `turn_end`: the assistant message and that turn's `tool_results` move from frontier state into committed history together, then `in_flight` clears.
 - `setMessages`, `reset`, session replacement, and similar cold-path operations replace committed history and clear the hot frontier.
-- queued steering and follow-up mutate through run control, publish independently, and can change without a conversation patch publish.
+- queued steering and follow-up mutate through run control, publish independently, and can change without a conversation snapshot publish.
 
 ## relation to projection and rendering
 
-`src/tui/conversation_projection.zig` consumes conversation state in three buckets after applying `ConversationPatch` to its owned view state:
+`src/tui/conversation_projection.zig` reconciles render input into three buckets from the authoritative snapshot it holds:
 
 1. committed rows from `view.committed.flat`
 2. transient rows from `view.in_flight.assistant` and `view.in_flight.tool_executions`
@@ -187,25 +189,9 @@ that projector may retain rows, reuse committed metadata when the same `*SharedC
 
 those are projection optimizations and render concerns. they do not make the tui a semantic owner. if projection state is dropped, the tui rebuilds from snapshots.
 
-## transport note: the private patch vocabulary is current
+## transport note: the mailbox contract is snapshot-shaped
 
-`zi-5psf.2` also proposed a mailbox patch vocabulary:
-
-- `replace_all`
-- `append_committed`
-- `replace_frontier`
-- `append_frontier_content`
-- `commit_frontier`
-
-that vocabulary is now the landed private conversation mailbox contract.
-
-today's mailbox contract for conversation rendering is:
-- `ConversationPatch` via `UiEvent.conversation_patch`
-- separate `QueuedMessageSnapshot` via `UiEvent.queued_snapshot`
-
-`replace_all` remains the full resync path. queued state stays separate from the conversation patch stream.
-
-so this doc is still about the current semantic model and snapshot families. it is not a claim that this host-private patch transport is public api.
+the truth-bearing mailbox contract is authoritative `ConversationSnapshotEnvelope` publication plus separate `QueuedMessageSnapshot` publication. queued state stays separate from the conversation stream.
 
 ## non-goals
 
@@ -213,4 +199,4 @@ so this doc is still about the current semantic model and snapshot families. it 
 - this is not a public extension api or wire contract.
 - this does not freeze projection caches, transcript item ids, or renderer internals as semantic contract.
 - this does not redefine session persistence or external observer payloads.
-- this does not promise that `ConversationViewSnapshot` stays wrapper-identical forever; it only states what the tui consumes today.
+- this does not promise that `ConversationSnapshotEnvelope` stays wrapper-identical forever; it only states what the tui consumes today.

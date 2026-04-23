@@ -13,12 +13,12 @@ pub const ExtensionCommandEntry = struct {
 };
 
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
-/// mailbox-owned. Conversation changes cross as mailbox-owned semantic patches.
+/// mailbox-owned. Conversation changes cross as authoritative mailbox snapshots.
 pub const UiEvent = union(enum) {
     consumed: void,
 
     // --- conversation transport ---
-    conversation_patch: conversation_state_mod.ConversationPatch,
+    conversation_snapshot: conversation_state_mod.ConversationSnapshotEnvelope,
     queued_snapshot: runtime_host_mod.QueuedMessageSnapshot,
 
     // --- errors / status side effects ---
@@ -143,7 +143,7 @@ pub const UiEvent = union(enum) {
 
     pub fn isSnapshotEvent(self: UiEvent) bool {
         return switch (self) {
-            .conversation_patch,
+            .conversation_snapshot,
             .queued_snapshot,
             .theme_changed,
             .tool_running,
@@ -154,11 +154,11 @@ pub const UiEvent = union(enum) {
         };
     }
 
-    pub fn takeConversationPatch(self: *UiEvent) ?conversation_state_mod.ConversationPatch {
+    pub fn takeConversationSnapshot(self: *UiEvent) ?conversation_state_mod.ConversationSnapshotEnvelope {
         return switch (self.*) {
-            .conversation_patch => |patch| blk: {
+            .conversation_snapshot => |snapshot| blk: {
                 self.* = .{ .consumed = {} };
-                break :blk patch;
+                break :blk snapshot;
             },
             else => null,
         };
@@ -188,7 +188,7 @@ pub const UiEvent = union(enum) {
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .consumed => {},
-            .conversation_patch => |*patch| patch.deinit(allocator),
+            .conversation_snapshot => |*snapshot| snapshot.deinit(allocator),
             .queued_snapshot => |*snapshot| snapshot.deinit(allocator),
             .error_message => |e| allocator.free(e.message),
             .theme_changed => {},
@@ -241,14 +241,14 @@ pub const UiEvent = union(enum) {
 
 const testing = std.testing;
 
-test "UiEvent deinit frees conversation patch payload" {
+test "UiEvent deinit frees conversation snapshot payload" {
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
-    var ev = UiEvent{ .conversation_patch = .{ .replace_all = .{
+    var ev = UiEvent{ .conversation_snapshot = .{
         .view = .{
             .committed = shared,
             .in_flight = null,
         },
-    } } };
+    } };
     ev.deinit(testing.allocator);
 }
 
@@ -274,16 +274,16 @@ test "UiEvent visible-model snapshot ownership transfers with take helper" {
     ev.deinit(allocator);
 }
 
-test "UiEvent takeConversationPatch disarms later cleanup" {
+test "UiEvent takeConversationSnapshot disarms later cleanup" {
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
-    var ev = UiEvent{ .conversation_patch = .{ .replace_all = .{
+    var ev = UiEvent{ .conversation_snapshot = .{
         .view = .{
             .committed = shared,
             .in_flight = null,
         },
-    } } };
-    var patch = ev.takeConversationPatch().?;
-    defer patch.deinit(testing.allocator);
+    } };
+    var snapshot = ev.takeConversationSnapshot().?;
+    defer snapshot.deinit(testing.allocator);
 
     ev.deinit(testing.allocator);
 }
@@ -315,4 +315,25 @@ test "UiEvent snapshot classification matches lossy transport variants" {
 
     try testing.expect(snapshot.isSnapshotEvent());
     try testing.expect(!(UiEvent{ .request_worker_finished = {} }).isSnapshotEvent());
+}
+
+test "UiEvent conversation snapshot is mailbox payload for live conversation state" {
+    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
+    var ev = UiEvent{ .conversation_snapshot = .{
+        .session_generation = 2,
+        .conversation_version = 5,
+        .view = .{
+            .committed = shared,
+            .in_flight = null,
+        },
+    } };
+    try testing.expect(ev.isSnapshotEvent());
+
+    var taken = ev.takeConversationSnapshot().?;
+    defer taken.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 2), taken.session_generation);
+    try testing.expectEqual(@as(u64, 5), taken.conversation_version);
+
+    // After take, deinit of the event is a no-op for the payload.
+    ev.deinit(testing.allocator);
 }

@@ -68,7 +68,7 @@ const MouseCapture = union(enum) {
 const AgentSession = coding_agent_mod.AgentSession;
 const SessionEvent = coding_agent_mod.session_event.SessionEvent;
 const RuntimeHost = coding_agent_mod.RuntimeHost;
-const ConversationPatchPublisher = coding_agent_mod.ConversationPatchPublisher;
+const ConversationSnapshotPublisher = coding_agent_mod.ConversationSnapshotPublisher;
 const json_util = @import("../ai/json_util.zig");
 const SettingsAction = enum {
     open_thinking,
@@ -1141,14 +1141,14 @@ pub const Interactive = struct {
     }
 
     fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
-        if (ev.takeConversationPatch()) |patch| {
-            var owned_patch = patch;
+        if (ev.takeConversationSnapshot()) |snapshot| {
+            var owned = snapshot;
             const was_following_bottom = self.transcript.isFollowingBottom();
-            self.conversation_projection.applyPatch(
+            self.conversation_projection.replaceViewSnapshot(
                 &self.transcript,
                 self.active_editor,
                 self.resolver,
-                &owned_patch,
+                &owned,
                 .{
                     .theme = self.theme,
                     .retry_attempt = self.retry_attempt,
@@ -1189,7 +1189,7 @@ pub const Interactive = struct {
 
         switch (ev.*) {
             .consumed => {},
-            .conversation_patch => unreachable,
+            .conversation_snapshot => unreachable,
             .queued_snapshot => unreachable,
             .visible_models_snapshot => unreachable,
             .error_message => |e| {
@@ -2928,15 +2928,7 @@ pub const Interactive = struct {
     }
 
     fn publishConversationState(self: *Interactive) bool {
-        return self.runtime_host.publishConversationState(self.conversationPatchPublisher());
-    }
-
-    fn publishConversationFrontier(self: *Interactive) bool {
-        return self.runtime_host.publishConversationFrontier(self.conversationPatchPublisher());
-    }
-
-    fn publishConversationPatchForAgentEvent(self: *Interactive, event: AgentEvent) bool {
-        return self.runtime_host.publishConversationPatchForAgentEvent(event, self.conversationPatchPublisher());
+        return self.runtime_host.publishConversationState(self.conversationSnapshotPublisher());
     }
 
     fn publishQueuedSnapshot(self: *Interactive) bool {
@@ -2965,10 +2957,10 @@ pub const Interactive = struct {
         return @intCast(std.time.nanoTimestamp());
     }
 
-    /// Flush the latest conversation patch unconditionally for the
-    /// current raw agent event.
+    /// Flush the latest conversation snapshot unconditionally.
     fn flushPendingConversationPublish(self: *Interactive, event: AgentEvent) void {
-        const published = self.publishConversationPatchForAgentEvent(event);
+        _ = event;
+        const published = self.publishConversationState();
         self.publishQueuedSnapshotIfChanged();
         if (published) {
             self.last_conversation_publish_ns = monotonicNowNs();
@@ -2982,23 +2974,20 @@ pub const Interactive = struct {
     /// stream pause longer than the cadence leaves one pending snapshot
     /// deferred until the next event; acceptable for P1.
     fn maybePublishSoftConversation(self: *Interactive, event: AgentEvent) void {
-        const had_pending = self.conversation_publish_dirty;
+        _ = event;
         self.conversation_publish_dirty = true;
         const now = monotonicNowNs();
         const elapsed = now -% self.last_conversation_publish_ns;
         if (elapsed < soft_conversation_publish_cadence_ns) return;
-        const published = if (had_pending)
-            self.publishConversationFrontier()
-        else
-            self.publishConversationPatchForAgentEvent(event);
+        const published = self.publishConversationState();
         if (!published) return;
         self.last_conversation_publish_ns = now;
         self.conversation_publish_dirty = false;
     }
 
-    fn conversationPatchPublisher(self: *Interactive) ConversationPatchPublisher {
+    fn conversationSnapshotPublisher(self: *Interactive) ConversationSnapshotPublisher {
         return .{
-            .func = &publishConversationPatchToUi,
+            .func = &publishConversationSnapshotToUi,
             .ctx = @ptrCast(self),
         };
     }
@@ -3010,9 +2999,9 @@ pub const Interactive = struct {
         };
     }
 
-    fn publishConversationPatchToUi(patch: agent_mod.conversation_state.ConversationPatch, ctx: ?*anyopaque) bool {
+    fn publishConversationSnapshotToUi(envelope: agent_mod.conversation_state.ConversationSnapshotEnvelope, ctx: ?*anyopaque) bool {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        return self.publishSnapshotUiEvent(.{ .conversation_patch = patch });
+        return self.publishSnapshotUiEvent(.{ .conversation_snapshot = envelope });
     }
 
     fn publishQueuedSnapshotToUi(snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot, ctx: ?*anyopaque) bool {

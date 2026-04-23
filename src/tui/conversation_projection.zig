@@ -76,7 +76,7 @@ const ExtractedText = union(enum) {
 fn ownedViewSnapshotFromMessages(
     allocator: std.mem.Allocator,
     messages: []const agent_protocol.AgentMessage,
-) !conversation_state_mod.ConversationViewSnapshot {
+) !conversation_state_mod.ConversationSnapshotEnvelope {
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(allocator, messages);
     errdefer shared.release();
 
@@ -127,7 +127,7 @@ const CommittedProjectionCache = struct {
 
 pub const ProjectionState = struct {
     allocator: std.mem.Allocator,
-    view_snapshot: ?conversation_state_mod.ConversationViewSnapshot = null,
+    view_snapshot: ?conversation_state_mod.ConversationSnapshotEnvelope = null,
     queued_snapshot: ?control_mod.QueuedMessageSnapshot = null,
     committed_cache: ?CommittedProjectionCache = null,
     committed_cache_hits: u32 = 0,
@@ -154,11 +154,23 @@ pub const ProjectionState = struct {
         transcript: *Transcript,
         editor: EditorInterface,
         resolver: ToolRendererResolver,
-        snapshot: *conversation_state_mod.ConversationViewSnapshot,
+        snapshot: *conversation_state_mod.ConversationSnapshotEnvelope,
         options: RebuildOptions,
     ) void {
-        const owned = snapshot.*;
+        var owned = snapshot.*;
         snapshot.* = undefined;
+
+        // Reject stale snapshots by generation/version (authoritative ordering truth).
+        if (self.view_snapshot) |previous| {
+            if (owned.session_generation < previous.session_generation or
+                (owned.session_generation == previous.session_generation and
+                    owned.conversation_version < previous.conversation_version))
+            {
+                owned.deinit(self.allocator);
+                return;
+            }
+        }
+
         const must_reset_history = if (self.view_snapshot) |previous|
             !committedUserHistoryIsPrefix(previous.view.committed.flat, owned.view.committed.flat)
         else
@@ -176,44 +188,6 @@ pub const ProjectionState = struct {
         }
     }
 
-    pub fn applyPatch(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        patch: *conversation_state_mod.ConversationPatch,
-        options: RebuildOptions,
-    ) void {
-        switch (patch.*) {
-            .replace_all => |*snapshot| {
-                self.replaceViewSnapshot(transcript, editor, resolver, snapshot, options);
-                patch.* = undefined;
-            },
-            .append_committed => |payload| {
-                const committed = payload.committed;
-                patch.* = undefined;
-                self.replaceCommittedPointer(transcript, editor, resolver, committed, options);
-            },
-            .replace_frontier => |*payload| {
-                self.replaceFrontier(transcript, editor, resolver, &payload.frontier, options);
-                patch.* = undefined;
-            },
-            .append_frontier_content => |payload| {
-                const locator = payload.locator;
-                const kind = payload.kind;
-                const content_index = payload.content_index;
-                const delta = payload.delta;
-                patch.* = undefined;
-                defer self.allocator.free(delta);
-                self.appendFrontierContent(transcript, editor, resolver, locator, kind, content_index, delta, options);
-            },
-            .commit_frontier => |payload| {
-                patch.* = undefined;
-                self.commitFrontier(transcript, editor, resolver, payload.locator, options);
-            },
-        }
-    }
-
     fn canReuseCommittedCache(self: *const ProjectionState, retry_attempt: u32) bool {
         const snapshot = self.view_snapshot orelse return false;
         return self.canReuseCommittedCacheFor(snapshot.view.committed, retry_attempt);
@@ -228,112 +202,6 @@ pub const ProjectionState = struct {
         if (cache.committed != committed) return false;
         if (cache.retry_attempt != retry_attempt) return false;
         return true;
-    }
-
-    fn replaceCommittedPointer(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        committed: *conversation_state_mod.SharedCommitted,
-        options: RebuildOptions,
-    ) void {
-        if (self.view_snapshot == null) {
-            self.view_snapshot = .{ .view = .{
-                .committed = committed,
-                .in_flight = null,
-            } };
-            self.reconcileView(transcript, editor, resolver, options, false);
-            return;
-        }
-
-        const original = self.view_snapshot.?.view.committed;
-        self.view_snapshot.?.view.committed = committed;
-        original.release();
-        self.reconcileView(transcript, editor, resolver, options, false);
-    }
-
-    fn replaceFrontier(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        frontier: *conversation_state_mod.InFlightTurn,
-        options: RebuildOptions,
-    ) void {
-        var owned = frontier.*;
-        frontier.* = undefined;
-        errdefer owned.deinit(self.allocator);
-
-        if (self.view_snapshot == null) {
-            const shared = conversation_state_mod.SharedCommitted.empty(self.allocator) catch return;
-            self.view_snapshot = .{ .view = .{
-                .committed = shared,
-                .in_flight = null,
-            } };
-        }
-
-        if (self.view_snapshot.?.view.in_flight) |*current| current.deinit(self.allocator);
-        self.view_snapshot.?.view.in_flight = owned;
-        self.reconcileView(transcript, editor, resolver, options, self.canReuseCommittedCache(options.retry_attempt));
-    }
-
-    fn appendFrontierContent(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        locator: conversation_state_mod.FrontierLocator,
-        kind: conversation_state_mod.FrontierContentKind,
-        content_index: usize,
-        delta: []const u8,
-        options: RebuildOptions,
-    ) void {
-        if (self.view_snapshot == null) return;
-        const snapshot = &self.view_snapshot.?;
-        var turn = if (snapshot.view.in_flight) |*turn| turn else return;
-        if (!turn.locator.eql(locator)) return;
-        var assistant = if (turn.assistant) |*assistant| assistant else return;
-        if (content_index >= assistant.content.len) return;
-
-        const block: *agent_protocol.AssistantMessage.AssistantContentBlock = @constCast(&assistant.content[content_index]);
-        switch (block.*) {
-            .text => {
-                if (kind != .text) return;
-                const existing = block.text.text;
-                const next = appendOwnedBytes(self.allocator, existing, delta) catch return;
-                self.allocator.free(existing);
-                block.text.text = next;
-            },
-            .thinking => {
-                if (kind != .thinking) return;
-                const existing = block.thinking.thinking;
-                const next = appendOwnedBytes(self.allocator, existing, delta) catch return;
-                self.allocator.free(existing);
-                block.thinking.thinking = next;
-            },
-            else => return,
-        }
-
-        self.reconcileView(transcript, editor, resolver, options, self.canReuseCommittedCache(options.retry_attempt));
-    }
-
-    fn commitFrontier(
-        self: *ProjectionState,
-        transcript: *Transcript,
-        editor: EditorInterface,
-        resolver: ToolRendererResolver,
-        locator: conversation_state_mod.FrontierLocator,
-        options: RebuildOptions,
-    ) void {
-        if (self.view_snapshot == null) return;
-        const snapshot = &self.view_snapshot.?;
-        if (snapshot.view.in_flight) |current| {
-            if (!current.locator.eql(locator)) return;
-        } else return;
-        snapshot.view.in_flight.?.deinit(self.allocator);
-        snapshot.view.in_flight = null;
-        self.reconcileView(transcript, editor, resolver, options, self.canReuseCommittedCache(options.retry_attempt));
     }
 
     fn reconcileView(
@@ -435,7 +303,7 @@ pub const ProjectionState = struct {
         transcript: *Transcript,
         editor: EditorInterface,
         resolver: ToolRendererResolver,
-        view: *conversation_state_mod.ConversationViewSnapshot,
+        view: *conversation_state_mod.ConversationSnapshotEnvelope,
         queued: *control_mod.QueuedMessageSnapshot,
         options: RebuildOptions,
     ) void {
@@ -444,18 +312,11 @@ pub const ProjectionState = struct {
     }
 };
 
-fn appendOwnedBytes(allocator: std.mem.Allocator, existing: []const u8, delta: []const u8) ![]u8 {
-    const out = try allocator.alloc(u8, existing.len + delta.len);
-    @memcpy(out[0..existing.len], existing);
-    @memcpy(out[existing.len..], delta);
-    return out;
-}
-
 pub fn rebuildFromSnapshots(
     transcript: *Transcript,
     editor: EditorInterface,
     resolver: ToolRendererResolver,
-    view: ?conversation_state_mod.ConversationViewSnapshot,
+    view: ?conversation_state_mod.ConversationSnapshotEnvelope,
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
 ) void {
@@ -487,7 +348,7 @@ pub fn reconcileFromSnapshots(
     transcript: *Transcript,
     editor: EditorInterface,
     resolver: ToolRendererResolver,
-    view: ?conversation_state_mod.ConversationViewSnapshot,
+    view: ?conversation_state_mod.ConversationSnapshotEnvelope,
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
 ) void {
@@ -579,7 +440,7 @@ fn buildDesiredItems(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
     transcript: *Transcript,
-    view: ?conversation_state_mod.ConversationViewSnapshot,
+    view: ?conversation_state_mod.ConversationSnapshotEnvelope,
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
     hide_thinking_block: bool,
@@ -596,7 +457,7 @@ fn buildDesiredItemsFull(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
     transcript: *Transcript,
-    view: ?conversation_state_mod.ConversationViewSnapshot,
+    view: ?conversation_state_mod.ConversationSnapshotEnvelope,
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
     hide_thinking_block: bool,
@@ -653,7 +514,7 @@ fn buildDesiredItemsFromCommittedCache(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
     transcript: *Transcript,
-    view: ?conversation_state_mod.ConversationViewSnapshot,
+    view: ?conversation_state_mod.ConversationSnapshotEnvelope,
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
     hide_thinking_block: bool,
@@ -703,7 +564,7 @@ fn appendCommittedDesiredItems(
     resolver: ToolRendererResolver,
     transcript: *Transcript,
     desired_items: *std.ArrayList(DesiredItem),
-    view: conversation_state_mod.ConversationViewSnapshot,
+    view: conversation_state_mod.ConversationSnapshotEnvelope,
     options: RebuildOptions,
     live_tool_ids: []const []const u8,
     hide_thinking_block: bool,
@@ -746,7 +607,7 @@ fn appendTransientDesiredItems(
     resolver: ToolRendererResolver,
     transcript: *Transcript,
     desired_items: *std.ArrayList(DesiredItem),
-    view: ?conversation_state_mod.ConversationViewSnapshot,
+    view: ?conversation_state_mod.ConversationSnapshotEnvelope,
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
     live_tool_ids: []const []const u8,
@@ -2265,7 +2126,7 @@ test "replaceAllOwnedState preserves editor history on append-only user history"
 
 fn viewSnapshotRetainingCommitted(
     committed: *conversation_state_mod.SharedCommitted,
-) conversation_state_mod.ConversationViewSnapshot {
+) conversation_state_mod.ConversationSnapshotEnvelope {
     return .{ .view = .{
         .committed = committed.retain(),
         .in_flight = null,
@@ -2318,7 +2179,7 @@ test "replaceViewSnapshot reuses committed prefix on same committed pointer" {
     try testing.expect(assistant_row_v1 != transcript.items.items[1].deinit_ctx);
 }
 
-test "applyPatch appends frontier text without replacing committed rows" {
+test "replaceViewSnapshot converges frontier commit into committed history" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -2328,68 +2189,23 @@ test "applyPatch appends frontier text without replacing committed rows" {
     var mock_editor = editor_iface_mod.MockEditor{};
     const editor = mock_editor.editorInterface();
 
-    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
-        .{ .text = .{ .text = "work" } },
-    };
-    const assistant = makeAssistantMessage(&assistant_content, .toolUse, null);
-    const locator: conversation_state_mod.FrontierLocator = .{ .assistant_timestamp = assistant.assistant.timestamp };
-
-    var view = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
-    view.view.in_flight = .{
-        .locator = locator,
-        .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant.assistant),
-        .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
-    };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view, .{ .theme = themes_builtin.dark() });
-
-    const committed_row_ptr = transcript.items.items[0].deinit_ctx;
-    const active_row_ptr = transcript.items.items[1].deinit_ctx;
-
-    var patch = conversation_state_mod.ConversationPatch{ .append_frontier_content = .{
-        .locator = locator,
-        .kind = .text,
-        .content_index = 0,
-        .delta = try testing.allocator.dupe(u8, "ing"),
-    } };
-    projection.applyPatch(&transcript, editor, tool_display_mod.empty_resolver, &patch, .{ .theme = themes_builtin.dark() });
-
-    try testing.expectEqual(committed_row_ptr, transcript.items.items[0].deinit_ctx);
-    try testing.expect(active_row_ptr != transcript.items.items[1].deinit_ctx);
-    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
-    defer testing.allocator.free(rendered);
-    try testing.expect(std.mem.indexOf(u8, rendered, "working") != null);
-}
-
-test "applyPatch appends committed assistant then clears committed frontier" {
-    var transcript = Transcript.init(testing.allocator);
-    defer transcript.deinit();
-
-    var projection = ProjectionState.init(testing.allocator);
-    defer projection.deinit();
-
-    var mock_editor = editor_iface_mod.MockEditor{};
-    const editor = mock_editor.editorInterface();
-
+    const user_message = makeUserMessage("hello");
     const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
         .{ .text = .{ .text = "working" } },
     };
     const assistant_message = makeAssistantMessage(&assistant_content, .stop, null);
     const locator: conversation_state_mod.FrontierLocator = .{ .assistant_timestamp = assistant_message.assistant.timestamp };
 
-    var view = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
-    view.view.in_flight = .{
+    var frontier_view = try ownedViewSnapshotFromMessages(testing.allocator, &.{user_message});
+    frontier_view.view.in_flight = .{
         .locator = locator,
         .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant_message.assistant),
         .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &view, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &frontier_view, .{ .theme = themes_builtin.dark() });
 
-    const committed = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{assistant_message});
-    var append_patch = conversation_state_mod.ConversationPatch{ .append_committed = .{ .committed = committed } };
-    projection.applyPatch(&transcript, editor, tool_display_mod.empty_resolver, &append_patch, .{ .theme = themes_builtin.dark() });
-
-    var commit_patch = conversation_state_mod.ConversationPatch{ .commit_frontier = .{ .locator = locator } };
-    projection.applyPatch(&transcript, editor, tool_display_mod.empty_resolver, &commit_patch, .{ .theme = themes_builtin.dark() });
+    var committed_view = try ownedViewSnapshotFromMessages(testing.allocator, &.{ user_message, .{ .assistant = assistant_message.assistant } });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &committed_view, .{ .theme = themes_builtin.dark() });
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
     try testing.expect(projection.view_snapshot.?.view.in_flight == null);
@@ -2495,4 +2311,98 @@ test "replaceViewSnapshot after transcript+projection clear does full rebuild ag
 
     try testing.expectEqual(@as(u32, 0), projection.committed_cache_hits);
     try testing.expectEqual(@as(usize, 1), transcript.items.items.len);
+}
+
+test "replaceViewSnapshot rejects stale snapshots by generation and version" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
+    errdefer shared.release();
+
+    // Accept fresh envelope (gen 1, version 1).
+    var fresh = conversation_state_mod.ConversationSnapshotEnvelope{
+        .session_generation = 1,
+        .conversation_version = 1,
+        .view = .{ .committed = shared.retain(), .in_flight = null },
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &fresh, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
+
+    // Reject older version within same generation.
+    var stale_version = conversation_state_mod.ConversationSnapshotEnvelope{
+        .session_generation = 1,
+        .conversation_version = 0,
+        .view = .{ .committed = shared.retain(), .in_flight = null },
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &stale_version, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
+
+    // Reject older generation regardless of version.
+    var stale_gen = conversation_state_mod.ConversationSnapshotEnvelope{
+        .session_generation = 0,
+        .conversation_version = 5,
+        .view = .{ .committed = shared.retain(), .in_flight = null },
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &stale_gen, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
+
+    // Accept newer generation.
+    var newer_gen = conversation_state_mod.ConversationSnapshotEnvelope{
+        .session_generation = 2,
+        .conversation_version = 0,
+        .view = .{ .committed = shared.retain(), .in_flight = null },
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &newer_gen, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u64, 2), projection.view_snapshot.?.session_generation);
+    try testing.expectEqual(@as(u64, 0), projection.view_snapshot.?.conversation_version);
+
+    shared.release();
+}
+
+test "replaceViewSnapshot converges after dropped intermediate snapshot because final snapshot is authoritative" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var projection = ProjectionState.init(testing.allocator);
+    defer projection.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
+    errdefer shared.release();
+
+    // Initial authoritative snapshot (gen 1, version 1).
+    var initial = conversation_state_mod.ConversationSnapshotEnvelope{
+        .session_generation = 1,
+        .conversation_version = 1,
+        .view = .{ .committed = shared.retain(), .in_flight = null },
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &initial, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
+
+    // Simulate a dropped intermediate snapshot (version 2 never arrives).
+    // Instead, version 3 arrives directly — the projection must converge
+    // to the latest authoritative state without needing the missing frame.
+    var final = conversation_state_mod.ConversationSnapshotEnvelope{
+        .session_generation = 1,
+        .conversation_version = 3,
+        .view = .{ .committed = shared.retain(), .in_flight = null },
+    };
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &final, .{ .theme = themes_builtin.dark() });
+    try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
+    try testing.expectEqual(@as(u64, 3), projection.view_snapshot.?.conversation_version);
+
+    shared.release();
 }

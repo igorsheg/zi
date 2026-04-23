@@ -35,15 +35,14 @@ pub const CompactionExecutor = session_runner.CompactionExecutor;
 pub const LifecycleHooks = session_runner.LifecycleHooks;
 pub const Options = session_runner.Options;
 
-pub const ConversationPatchPublisher = struct {
-    func: *const fn (patch: conversation_state.ConversationPatch, ctx: ?*anyopaque) bool,
+pub const ConversationSnapshotPublisher = struct {
+    func: *const fn (envelope: conversation_state.ConversationSnapshotEnvelope, ctx: ?*anyopaque) bool,
     ctx: ?*anyopaque = null,
 
-    pub fn publish(self: ConversationPatchPublisher, patch: conversation_state.ConversationPatch) bool {
-        return self.func(patch, self.ctx);
+    pub fn publish(self: ConversationSnapshotPublisher, envelope: conversation_state.ConversationSnapshotEnvelope) bool {
+        return self.func(envelope, self.ctx);
     }
 };
-
 pub const QueuedSnapshotPublisher = struct {
     func: *const fn (snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) bool,
     ctx: ?*anyopaque = null,
@@ -64,6 +63,7 @@ pub const RuntimeHost = struct {
     agent_event_token: ?AgentSession.AgentEventSubscriptionToken = null,
     session_event_token: ?AgentSession.EventSubscriptionToken = null,
     next_extension_generation: extension_runner_mod.Generation,
+    session_generation: u64 = 1,
 
     pub const AgentEventHandler = struct {
         func: *const fn (event: agent_mod.protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -99,6 +99,7 @@ pub const RuntimeHost = struct {
             .agent_event_listeners = .empty,
             .session_event_listeners = .empty,
             .next_extension_generation = nextExtensionGenerationFor(session),
+            .session_generation = 1,
         };
         self.activateSessionLifecycle(.startup, null, null);
         return self;
@@ -363,7 +364,7 @@ pub const RuntimeHost = struct {
 
     pub fn publishConversationState(
         self: *RuntimeHost,
-        publisher: ConversationPatchPublisher,
+        publisher: ConversationSnapshotPublisher,
     ) bool {
         var publish_timer = profile.ScopedTimer.begin(.publish_conversation_state);
         defer publish_timer.end();
@@ -371,91 +372,13 @@ pub const RuntimeHost = struct {
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
 
-        if (!publisher.publish(.{ .replace_all = .{ .view = view } })) return false;
+        const envelope = conversation_state.ConversationSnapshotEnvelope{
+            .session_generation = self.session_generation,
+            .conversation_version = self.session.agent.currentConversationVersion(),
+            .view = view,
+        };
+        if (!publisher.publish(envelope)) return false;
         return true;
-    }
-
-    pub fn publishConversationFrontier(
-        self: *RuntimeHost,
-        publisher: ConversationPatchPublisher,
-    ) bool {
-        var frontier = self.session.agent.cloneInFlightTurn(self.msg_allocator) catch return false;
-        if (frontier == null) return false;
-        errdefer if (frontier) |*owned| owned.deinit(self.msg_allocator);
-
-        if (!publisher.publish(.{ .replace_frontier = .{ .frontier = frontier.? } })) return false;
-        return true;
-    }
-
-    pub fn publishConversationPatchForAgentEvent(
-        self: *RuntimeHost,
-        event: agent_mod.protocol.AgentEvent,
-        publisher: ConversationPatchPublisher,
-    ) bool {
-        switch (event) {
-            .agent_start, .turn_start, .agent_end => return true,
-            .message_start => |payload| switch (payload.message) {
-                .assistant => return self.publishConversationFrontier(publisher),
-                else => return true,
-            },
-            .message_update => |payload| switch (payload.message) {
-                .assistant => switch (payload.assistant_message_event) {
-                    .text_delta => |delta| {
-                        const locator = self.session.agent.currentFrontierLocator() orelse return false;
-                        const owned = self.msg_allocator.dupe(u8, delta.delta) catch return false;
-                        errdefer self.msg_allocator.free(owned);
-                        return publisher.publish(.{ .append_frontier_content = .{
-                            .locator = locator,
-                            .kind = .text,
-                            .content_index = delta.content_index,
-                            .delta = owned,
-                        } });
-                    },
-                    .thinking_delta => |delta| {
-                        const locator = self.session.agent.currentFrontierLocator() orelse return false;
-                        const owned = self.msg_allocator.dupe(u8, delta.delta) catch return false;
-                        errdefer self.msg_allocator.free(owned);
-                        return publisher.publish(.{ .append_frontier_content = .{
-                            .locator = locator,
-                            .kind = .thinking,
-                            .content_index = delta.content_index,
-                            .delta = owned,
-                        } });
-                    },
-                    else => return self.publishConversationFrontier(publisher),
-                },
-                else => return true,
-            },
-            .message_end => |payload| switch (payload.message) {
-                .assistant => return self.publishConversationFrontier(publisher),
-                .tool_result => {
-                    if (self.session.agent.currentFrontierLocator() != null) {
-                        return self.publishConversationFrontier(publisher);
-                    }
-                    const committed = self.session.agent.retainCommitted();
-                    errdefer committed.release();
-                    return publisher.publish(.{ .append_committed = .{ .committed = committed } });
-                },
-                else => {
-                    const committed = self.session.agent.retainCommitted();
-                    errdefer committed.release();
-                    return publisher.publish(.{ .append_committed = .{ .committed = committed } });
-                },
-            },
-            .tool_execution_start, .tool_execution_update, .tool_execution_end => {
-                return self.publishConversationFrontier(publisher);
-            },
-            .turn_end => |payload| switch (payload.message) {
-                .assistant => |assistant| {
-                    const locator = conversation_state.FrontierLocator.fromAssistant(assistant);
-                    const committed = self.session.agent.retainCommitted();
-                    errdefer committed.release();
-                    if (!publisher.publish(.{ .append_committed = .{ .committed = committed } })) return false;
-                    return publisher.publish(.{ .commit_frontier = .{ .locator = locator } });
-                },
-                else => return true,
-            },
-        }
     }
 
     pub fn publishQueuedSnapshot(
@@ -607,6 +530,7 @@ pub const RuntimeHost = struct {
         self.unbindSessionEvents();
         old.shutdownLifecycleOnAgentThread();
         self.session = next;
+        self.session_generation += 1;
         self.activateSessionLifecycle(reason, if (previous_snapshot) |*snap| .{ .snapshot = snap } else null, fork_parent_entry_id);
         if (previous_snapshot) |*snap| snap.deinit();
         old.deinit();
@@ -1049,16 +973,16 @@ test "runtime host publishes committed view and queued snapshots independently" 
         .timestamp = 1,
     } }});
 
-    var published_patch: ?conversation_state.ConversationPatch = null;
-    defer if (published_patch) |*patch| patch.deinit(testing.allocator);
+    var published_snapshot: ?conversation_state.ConversationSnapshotEnvelope = null;
+    defer if (published_snapshot) |*snapshot| snapshot.deinit(testing.allocator);
 
     var published_queued: ?control_mod.QueuedMessageSnapshot = null;
     defer if (published_queued) |*snapshot| snapshot.deinit(testing.allocator);
 
     const Capture = struct {
-        fn publishPatch(patch: conversation_state.ConversationPatch, ctx: ?*anyopaque) bool {
-            const out: *?conversation_state.ConversationPatch = @ptrCast(@alignCast(ctx.?));
-            out.* = patch;
+        fn publishSnapshot(envelope: conversation_state.ConversationSnapshotEnvelope, ctx: ?*anyopaque) bool {
+            const out: *?conversation_state.ConversationSnapshotEnvelope = @ptrCast(@alignCast(ctx.?));
+            out.* = envelope;
             return true;
         }
 
@@ -1078,22 +1002,19 @@ test "runtime host publishes committed view and queued snapshots independently" 
     } }));
 
     try testing.expect(host.publishConversationState(.{
-        .func = &Capture.publishPatch,
-        .ctx = @ptrCast(&published_patch),
+        .func = &Capture.publishSnapshot,
+        .ctx = @ptrCast(&published_snapshot),
     }));
     try testing.expect(host.publishQueuedSnapshot(.{
         .func = &Capture.publishQueued,
         .ctx = @ptrCast(&published_queued),
     }));
 
-    try testing.expect(published_patch != null);
-    switch (published_patch.?) {
-        .replace_all => |state| {
-            try testing.expectEqual(@as(usize, 1), state.view.committed.flat.len);
-            try testing.expectEqualStrings("hello", state.view.committed.flat[0].user.content.text);
-        },
-        else => return error.UnexpectedPatch,
-    }
+    try testing.expect(published_snapshot != null);
+    try testing.expectEqual(@as(u64, 1), published_snapshot.?.session_generation);
+    try testing.expectEqual(@as(u64, 0), published_snapshot.?.conversation_version);
+    try testing.expectEqual(@as(usize, 1), published_snapshot.?.view.committed.flat.len);
+    try testing.expectEqualStrings("hello", published_snapshot.?.view.committed.flat[0].user.content.text);
 
     try testing.expect(published_queued != null);
     try testing.expectEqual(@as(usize, 0), published_queued.?.steering.len);
@@ -1470,4 +1391,18 @@ test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads"
     try testing.expectEqual(@as(usize, 2), lines_out.items.len);
     try testing.expectEqualStrings("entry-42|shutdown", lines_out.items[0]);
     try testing.expectEqualStrings("entry-42|start", lines_out.items[1]);
+}
+
+test "session_generation bumps on newSession" {
+    const session = try createOwnedTestAgentSession(testing.allocator, null);
+    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
+    defer host.deinit();
+
+    try testing.expectEqual(@as(u64, 1), host.session_generation);
+
+    try host.newSession();
+    try testing.expectEqual(@as(u64, 2), host.session_generation);
+
+    try host.newSession();
+    try testing.expectEqual(@as(u64, 3), host.session_generation);
 }

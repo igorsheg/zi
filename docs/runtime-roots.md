@@ -11,6 +11,7 @@ it follows the [v2 cutover adr](./adr/extensions-v2-cutover.md) and the runtime 
 - every loader and registry reduces to one canonical ordered root list.
 - direct file/path inputs are ingress conveniences; precedence starts only after they normalize into roots.
 - collisions are resolved by **first claimant wins** in the relevant registration class, with the canonical root order deciding who claims first.
+  provider claims may keep same-name surviving registrations behind the active claimant, so teardown/unregister restores the next surviving claimant for that provider name deterministically instead of always falling straight to baseline.
 - package installation is not a second architecture. it materializes more roots on disk.
 
 ## runtime root
@@ -138,9 +139,10 @@ the default rule is:
 1. walk the canonical root list in order
 2. discover entries in deterministic within-root order
 3. first claimant for a key wins
-4. later claimants are ignored and may emit diagnostics
+4. later claimants are ignored and may emit diagnostics, unless that registration class explicitly keeps same-key surviving claims for deterministic restoration when the active claim is removed
 
 commands are the explicit exception above because their visible surface is ordered aggregation over colliding registrations, not silent drop.
+providers also keep the same visible first-claimant rule, but same-name claims may retain deterministic fallback state behind the active claimant so unregister/teardown can restore the next surviving claim before baseline.
 
 this keeps precedence out of ad hoc loader code.
 a loader decides only its key shape and whether its visible surface is first-claimant or ordered aggregation, not its own source order.
