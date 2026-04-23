@@ -765,7 +765,10 @@ pub const AgentSession = struct {
         max_tokens: u64,
     ) ![]u8 {
         const current_model = self.agent.modelValue();
-        const provider = self._stream_closure.registry.get(ai.provider.apiToString(current_model.api)) orelse return error.ProviderUnavailable;
+        const provider = self._stream_closure.registry.getForModel(
+            ai.provider.apiToString(current_model.api),
+            ai.json_util.providerToString(current_model.provider),
+        ) orelse return error.ProviderUnavailable;
 
         const user_messages = [_]ai.protocol.Message{.{ .user = .{
             .content = .{ .text = prompt_text },

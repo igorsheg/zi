@@ -290,6 +290,7 @@ const RegisterProviderError = error{
     InvalidConfig,
     MissingApi,
     InvalidApi,
+    BuiltinOverrideApiMismatch,
     MissingBaseUrl,
     InvalidBaseUrl,
     InvalidApiKey,
@@ -310,6 +311,7 @@ const RegisterProviderError = error{
     DeferredStreamSimple,
     DeferredStreamSimpleCamel,
     InvalidModels,
+    BuiltinOverrideModelsUnsupported,
     MissingModelId,
     InvalidModelId,
     MissingModelDisplayName,
@@ -340,6 +342,7 @@ fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.MissingConfig, error.InvalidConfig => "register_provider: expected config table as second argument",
             error.MissingApi => "register_provider: missing required field 'api'",
             error.InvalidApi => "register_provider: field 'api' must be a string",
+            error.BuiltinOverrideApiMismatch => "register_provider: field 'api' must match the built-in provider api family in this slice",
             error.MissingBaseUrl => "register_provider: missing required field 'base_url'",
             error.InvalidBaseUrl => "register_provider: field 'base_url' must be a string",
             error.InvalidApiKey => "register_provider: field 'api_key' must be a string",
@@ -360,6 +363,7 @@ fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.DeferredStreamSimple => "register_provider: field 'stream_simple' is deferred in this slice",
             error.DeferredStreamSimpleCamel => "register_provider: field 'streamSimple' is deferred in this slice",
             error.InvalidModels => "register_provider: field 'models' must be an array of model tables",
+            error.BuiltinOverrideModelsUnsupported => "register_provider: built-in provider overrides do not support field 'models' in this slice",
             error.MissingModelId, error.InvalidModelId => "register_provider: each model requires string field 'id'",
             error.MissingModelDisplayName, error.InvalidModelDisplayName => "register_provider: each model requires string field 'name'",
             error.InvalidModelApi => "register_provider: model field 'api' must be a string when present",
@@ -418,6 +422,14 @@ fn ziUnregisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn supportedBuiltinOverrideApi(provider_name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_name, "anthropic")) return "anthropic-messages";
+    if (std.mem.eql(u8, provider_name, "openai")) return "openai-responses";
+    if (std.mem.eql(u8, provider_name, "openrouter")) return "openai-completions";
+    if (std.mem.eql(u8, provider_name, "openai-codex")) return "openai-codex-responses";
+    return null;
+}
+
 fn buildProviderRegistration(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,
@@ -432,7 +444,23 @@ fn buildProviderRegistration(
     const name = a.dupe(u8, name_ptr[0..name_len]) catch return error.OutOfMemory;
     errdefer a.free(name);
 
-    const api_name = try requireProviderFieldString(L, 2, "api", a, error.MissingApi, error.InvalidApi);
+    const builtin_api = supportedBuiltinOverrideApi(name);
+    const api_name = blk: {
+        const explicit_api = try optionalProviderFieldString(L, 2, "api", a, error.InvalidApi);
+        if (explicit_api) |owned_api| {
+            if (builtin_api) |expected_api| {
+                if (!std.mem.eql(u8, owned_api, expected_api)) {
+                    a.free(owned_api);
+                    return error.BuiltinOverrideApiMismatch;
+                }
+            }
+            break :blk owned_api;
+        }
+        if (builtin_api) |expected_api| {
+            break :blk a.dupe(u8, expected_api) catch return error.OutOfMemory;
+        }
+        return error.MissingApi;
+    };
     errdefer a.free(api_name);
 
     const base_url = try requireProviderFieldString(L, 2, "base_url", a, error.MissingBaseUrl, error.InvalidBaseUrl);
@@ -460,11 +488,13 @@ fn buildProviderRegistration(
         for (models) |*model| model.deinit(a);
         if (models.len > 0) a.free(models);
     }
+    if (builtin_api != null and models.len > 0) return error.BuiltinOverrideModelsUnsupported;
 
     const oauth = try parseProviderOAuth(L, 2, a);
     errdefer if (oauth.name) |owned| a.free(owned);
 
     if (oauth.enabled) {
+        if (builtin_api != null) return error.UnsupportedOAuthBuiltinOverride;
         if (models.len == 0) return error.UnsupportedOAuthRequiresModels;
         _ = oauth_mod.resolveClaimOAuthTemplate(name, api_name, models) catch |err| switch (err) {
             error.BuiltinOverrideUnsupported => return error.UnsupportedOAuthBuiltinOverride,
@@ -1966,6 +1996,141 @@ test "zi.register_provider rejects deferred provider fields instead of silently 
         \\  assert(string.find(err, spec.field) ~= nil, tostring(err))
         \\end
     , "provider_reject_deferred_fields");
+
+    try testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
+}
+
+test "zi.register_provider infers built-in override api and restores the baseline" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testProviderLoadSource());
+    try state.doString(
+        \\assert(zi.register_provider("anthropic", {
+        \\  base_url = "https://queued.example",
+        \\}) == true)
+    , "builtin_provider_override_prebind");
+    runner.endLoadContext();
+
+    try testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
+    switch (runner.provider_queue.pending.items[0]) {
+        .register => |claim| {
+            try testing.expectEqualStrings("anthropic", claim.name);
+            try testing.expectEqualStrings("anthropic-messages", claim.api);
+            try testing.expectEqualStrings("https://queued.example", claim.base_url);
+            try testing.expectEqual(@as(usize, 0), claim.models.len);
+        },
+        else => return error.ExpectedQueuedProviderRegistration,
+    }
+
+    var baseline = ai.faux.FauxProvider.init(testing.allocator);
+    defer baseline.deinit();
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try provider_registry.register("anthropic-messages", baseline.provider(), null);
+
+    try runner.bindRuntime(.{
+        .session = undefined,
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testBindGetModel,
+        .is_idle = &testBindIsIdle,
+        .abort = &testBindAbort,
+        .has_pending_messages = &testBindHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testBindGetContextUsage,
+        .get_system_prompt = &testBindGetSystemPrompt,
+        .get_binding_info = &testBindGetBindingInfo,
+    }, &provider_registry);
+
+    const queued_claim = provider_registry.activeClaimRegistrationByName("anthropic") orelse return error.ExpectedQueuedProviderRegistration;
+    try testing.expectEqualStrings("anthropic-messages", queued_claim.api);
+    try testing.expectEqualStrings("https://queued.example", queued_claim.base_url);
+    try testing.expectEqual(@as(usize, 0), queued_claim.models.len);
+    try testing.expectEqualStrings("anthropic", provider_registry.get("anthropic-messages").?.getName());
+
+    runner.beginExecutionContext(runner.sourceForProvenance(testProviderProvenance()));
+    defer runner.endExecutionContext();
+
+    try state.doString(
+        \\assert(zi.register_provider("anthropic", {
+        \\  api = "anthropic-messages",
+        \\  base_url = "https://live.example",
+        \\  headers = { ["x-provider"] = "anthropic" },
+        \\}) == true)
+    , "builtin_provider_override_live");
+
+    const live_claim = provider_registry.activeClaimRegistrationByName("anthropic") orelse return error.ExpectedQueuedProviderRegistration;
+    try testing.expectEqualStrings("anthropic-messages", live_claim.api);
+    try testing.expectEqualStrings("https://live.example", live_claim.base_url);
+    try testing.expectEqual(@as(usize, 1), live_claim.headers.len);
+    try testing.expectEqualStrings("x-provider", live_claim.headers[0].key);
+    try testing.expectEqualStrings("anthropic", live_claim.headers[0].value);
+
+    try state.doString(
+        \\assert(zi.unregister_provider("anthropic") == true)
+    , "builtin_provider_override_unregister");
+
+    try testing.expect(provider_registry.activeClaimRegistrationByName("anthropic") == null);
+    try testing.expectEqualStrings("faux", provider_registry.get("anthropic-messages").?.getName());
+}
+
+test "zi.register_provider rejects unsupported built-in override extras" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\local ok, err = pcall(function()
+        \\  zi.register_provider("openai", {
+        \\    api = "anthropic-messages",
+        \\    base_url = "https://proxy.example",
+        \\  })
+        \\end)
+        \\assert(not ok)
+        \\assert(string.find(err, "field 'api'") ~= nil, tostring(err))
+    , "builtin_provider_override_reject_api_mismatch");
+
+    try state.doString(
+        \\local ok, err = pcall(function()
+        \\  zi.register_provider("openai", {
+        \\    base_url = "https://proxy.example",
+        \\    models = {
+        \\      {
+        \\        id = "gpt-5",
+        \\        name = "GPT-5",
+        \\        reasoning = true,
+        \\        input = { "text" },
+        \\        cost = { input = 0, output = 0, cache_read = 0, cache_write = 0 },
+        \\        context_window = 200000,
+        \\        max_tokens = 16384,
+        \\      }
+        \\    },
+        \\  })
+        \\end)
+        \\assert(not ok)
+        \\assert(string.find(err, "field 'models'") ~= nil, tostring(err))
+    , "builtin_provider_override_reject_models");
+
+    try state.doString(
+        \\local ok, err = pcall(function()
+        \\  zi.register_provider("anthropic", {
+        \\    base_url = "https://proxy.example",
+        \\    oauth = {},
+        \\  })
+        \\end)
+        \\assert(not ok)
+        \\assert(string.find(err, "field 'oauth'") ~= nil, tostring(err))
+    , "builtin_provider_override_reject_oauth");
 
     try testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
 }

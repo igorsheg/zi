@@ -325,6 +325,13 @@ pub const Registry = struct {
         return self.providers.get(api);
     }
 
+    pub fn getForModel(self: *const Registry, api: []const u8, provider_name: []const u8) ?Provider {
+        if (self.claimByName(provider_name)) |claim| {
+            if (std.mem.eql(u8, claim.registration.api, api)) return claim.provider;
+        }
+        return self.baseline.get(api) orelse self.providers.get(api);
+    }
+
     pub fn activeClaimCount(self: *const Registry) usize {
         return self.claims.items.len;
     }
@@ -497,11 +504,15 @@ const RecordingProvider = struct {
 };
 
 fn testModel(base_url: []const u8) protocol.Model {
+    return testModelWithProvider(base_url, .anthropic_messages, .anthropic);
+}
+
+fn testModelWithProvider(base_url: []const u8, api: protocol.Api, provider: protocol.Provider) protocol.Model {
     return .{
         .id = "model",
         .name = "Model",
-        .api = .anthropic_messages,
-        .provider = .anthropic,
+        .api = api,
+        .provider = provider,
         .base_url = base_url,
         .reasoning = false,
         .input = &.{.text},
@@ -595,6 +606,46 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
     reg.get("anthropic-messages").?.streamSimple(
         testing.allocator,
         testModel("https://baseline.example"),
+        .{ .messages = &.{} },
+        .{},
+        &noopEvent,
+        null,
+    );
+    try testing.expectEqualStrings("https://baseline.example", baseline.last_base_url.?);
+
+    baseline.provider().deinit();
+}
+
+test "Registry resolves provider claims by provider name before api projection" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    const baseline = try RecordingProvider.create(testing.allocator, "baseline");
+    try reg.register("openai-responses", baseline.provider(), null);
+
+    const claim = ClaimRegistration{
+        .name = try testing.allocator.dupe(u8, "openai"),
+        .api = try testing.allocator.dupe(u8, "openai-responses"),
+        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
+        .owner_id = try testing.allocator.dupe(u8, "ext-openai"),
+        .generation = 1,
+    };
+    try testing.expect(try reg.registerClaim(claim));
+    try testing.expectEqualStrings("openai", reg.get("openai-responses").?.getName());
+
+    reg.getForModel("openai-responses", "openai").?.streamSimple(
+        testing.allocator,
+        testModelWithProvider("https://baseline.example", .openai_responses, .openai),
+        .{ .messages = &.{} },
+        .{},
+        &noopEvent,
+        null,
+    );
+    try testing.expectEqualStrings("https://proxy.example", baseline.last_base_url.?);
+
+    reg.getForModel("openai-responses", "github-copilot").?.streamSimple(
+        testing.allocator,
+        testModelWithProvider("https://baseline.example", .openai_responses, .github_copilot),
         .{ .messages = &.{} },
         .{},
         &noopEvent,

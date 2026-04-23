@@ -38,7 +38,8 @@ pub const StreamClosure = struct {
     ) void {
         const self: *const StreamClosure = @ptrCast(@alignCast(ctx.?));
         const api_str = ai.provider.apiToString(model.api);
-        const prov = self.registry.get(api_str) orelse return;
+        const provider_str = ai.json_util.providerToString(model.provider);
+        const prov = self.registry.getForModel(api_str, provider_str) orelse return;
         var arena = std.heap.ArenaAllocator.init(stream_alloc);
         defer arena.deinit();
 

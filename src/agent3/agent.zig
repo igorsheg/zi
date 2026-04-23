@@ -660,7 +660,8 @@ const DefaultStreamClosure = struct {
     ) void {
         const self: *const DefaultStreamClosure = @ptrCast(@alignCast(ctx.?));
         const api_str = ai.provider.apiToString(model.api);
-        const prov = self.registry.get(api_str) orelse {
+        const provider_str = ai.json_util.providerToString(model.provider);
+        const prov = self.registry.getForModel(api_str, provider_str) orelse {
             emitMissingProviderError(allocator, model, api_str, callback, callback_ctx);
             return;
         };
