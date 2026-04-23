@@ -15,6 +15,7 @@ const generated = @import("../ai/models_generated.zig");
 const json_util = @import("../ai/json_util.zig");
 const provider_mod = @import("../ai/provider.zig");
 const auth_storage_mod = @import("auth/storage.zig");
+const resolve_config_value = @import("auth/resolve_config_value.zig");
 
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
@@ -24,6 +25,7 @@ pub const ModelRegistry = struct {
     /// active provider claim projection changes.
     models: []protocol.Model,
     auth: *auth_storage_mod.AuthStorage,
+    provider_registry: ?*const provider_mod.Registry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -35,6 +37,7 @@ pub const ModelRegistry = struct {
             .custom_models = &.{},
             .models = &.{},
             .auth = auth,
+            .provider_registry = null,
         };
         errdefer self.deinit();
 
@@ -59,6 +62,7 @@ pub const ModelRegistry = struct {
 
         deinitOwnedModels(self.allocator, self.models);
         self.models = rebuilt;
+        self.provider_registry = provider_registry;
     }
 
     /// Stable slice until the next rebuild. Caller must not mutate.
@@ -99,7 +103,14 @@ pub const ModelRegistry = struct {
     /// zi's AuthStorage is lock-protected and sync-friendly.
     pub fn hasConfiguredAuth(self: *const ModelRegistry, model: protocol.Model) bool {
         const provider_str = json_util.providerToString(model.provider);
-        return self.auth.hasAuth(provider_str);
+        if (self.auth.hasAuth(provider_str)) return true;
+        if (self.provider_registry) |registry| {
+            const claim = registry.activeClaimRegistrationByName(provider_str) orelse return false;
+            const config = claim.api_key orelse return false;
+            const resolved = resolve_config_value.resolveConfigValue(config) orelse return false;
+            if (resolved.len > 0) return true;
+        }
+        return false;
     }
 
     /// Caller-owned slice of models whose provider has configured auth.
@@ -796,6 +807,79 @@ test "rebuild includes active provider claim models with honest provider identit
     try testing.expectEqualStrings("Proxy Model", claim_model.name);
     try testing.expectEqualStrings("https://proxy-a.example", claim_model.base_url);
     try testing.expectEqual(@as(usize, 2), claim_model.input.len);
+}
+
+test "claim-backed models report configured auth from provider api_key without leaking provider headers" {
+    const alloc = testing.allocator;
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    var reg = try ModelRegistry.init(alloc, &auth, &.{});
+    defer reg.deinit();
+
+    var providers = provider_mod.Registry.init(alloc);
+    defer providers.deinit();
+    const baseline = try alloc.create(provider_mod.Provider);
+    defer alloc.destroy(baseline);
+    baseline.* = .{
+        .ptr = undefined,
+        .vtable = &struct {
+            fn stream(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.StreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
+            fn streamSimple(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.SimpleStreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
+            fn getName(_: *anyopaque) []const u8 {
+                return "baseline";
+            }
+            fn deinit(_: *anyopaque) void {}
+            const table: provider_mod.Provider.VTable = .{
+                .stream = stream,
+                .stream_simple = streamSimple,
+                .get_name = getName,
+                .deinit = deinit,
+            };
+        }.table,
+    };
+    try providers.register("anthropic-messages", baseline.*, null);
+
+    const claim_models = try alloc.alloc(provider_mod.ClaimModelRegistration, 1);
+    claim_models[0] = try testClaimModelRegistration(alloc);
+    claim_models[0].headers = blk: {
+        const headers = try alloc.alloc(protocol.Header, 1);
+        headers[0] = .{
+            .key = try alloc.dupe(u8, "x-model"),
+            .value = try alloc.dupe(u8, "model-visible"),
+        };
+        break :blk headers;
+    };
+    const provider_headers = blk: {
+        const headers = try alloc.alloc(protocol.Header, 1);
+        headers[0] = .{
+            .key = try alloc.dupe(u8, "x-provider"),
+            .value = try alloc.dupe(u8, "provider-secret"),
+        };
+        break :blk headers;
+    };
+    const claim: provider_mod.ClaimRegistration = .{
+        .name = try alloc.dupe(u8, "proxy-auth"),
+        .api = try alloc.dupe(u8, "anthropic-messages"),
+        .base_url = try alloc.dupe(u8, "https://proxy-auth.example"),
+        .api_key = try alloc.dupe(u8, "claim-key"),
+        .headers = provider_headers,
+        .owner_id = try alloc.dupe(u8, "ext-a"),
+        .generation = 1,
+        .models = claim_models,
+    };
+    try testing.expect(try providers.registerClaim(claim));
+
+    try reg.rebuildFromActiveProviderClaims(&providers);
+
+    const claim_model = reg.find(.{ .custom = "proxy-auth" }, "proxy-model") orelse return error.MissingCatalogEntry;
+    try testing.expect(reg.hasConfiguredAuth(claim_model));
+    try testing.expect(claim_model.headers != null);
+    try testing.expectEqual(@as(usize, 1), claim_model.headers.?.len);
+    try testing.expectEqualStrings("x-model", claim_model.headers.?[0].key);
+    try testing.expectEqualStrings("model-visible", claim_model.headers.?[0].value);
+    for (claim_model.headers.?) |header| {
+        try testing.expect(!std.mem.eql(u8, header.key, "x-provider"));
+    }
 }
 
 test "hasConfiguredAuth delegates to AuthStorage.hasAuth" {

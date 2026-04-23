@@ -87,6 +87,8 @@ pub const ClaimRegistration = struct {
     name: []const u8,
     api: []const u8,
     base_url: []const u8,
+    api_key: ?[]const u8 = null,
+    headers: []const protocol.Header = &.{},
     owner_id: []const u8,
     generation: u64,
     models: []ClaimModelRegistration = &.{},
@@ -95,6 +97,8 @@ pub const ClaimRegistration = struct {
         allocator.free(self.name);
         allocator.free(self.api);
         allocator.free(self.base_url);
+        if (self.api_key) |api_key| allocator.free(api_key);
+        freeHeaders(allocator, self.headers);
         allocator.free(self.owner_id);
         for (self.models) |*model| model.deinit(allocator);
         if (self.models.len > 0) allocator.free(self.models);
@@ -326,6 +330,11 @@ pub const Registry = struct {
         return &self.claims.items[index].registration;
     }
 
+    pub fn activeClaimRegistrationByName(self: *const Registry, provider_name: []const u8) ?*const ClaimRegistration {
+        const claim = self.claimByName(provider_name) orelse return null;
+        return &claim.registration;
+    }
+
     /// Unregister all providers with a given source_id.
     pub fn unregisterBySource(self: *Registry, source_id: []const u8) void {
         var i: usize = 0;
@@ -376,6 +385,11 @@ pub const Registry = struct {
         var it = self.claim_index.iterator();
         while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.claim_index.clearRetainingCapacity();
+    }
+
+    fn claimByName(self: *const Registry, provider_name: []const u8) ?*const Claim {
+        const idx = self.claim_index.get(provider_name) orelse return null;
+        return &self.claims.items[idx];
     }
 
     fn reindexClaimsFrom(self: *Registry, start: usize) void {

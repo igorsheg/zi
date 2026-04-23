@@ -9,6 +9,7 @@ const builtin_util = @import("tools/util.zig");
 const system_prompt_mod = @import("system_prompt.zig");
 const skills = @import("skills/root.zig");
 const auth_storage_mod = @import("auth/storage.zig");
+const resolve_config_value = @import("auth/resolve_config_value.zig");
 const settings_manager_mod = @import("settings/manager.zig");
 const storage = @import("../storage.zig");
 const extension_api = @import("extensions/api.zig");
@@ -38,22 +39,61 @@ pub const StreamClosure = struct {
         const self: *const StreamClosure = @ptrCast(@alignCast(ctx.?));
         const api_str = ai.provider.apiToString(model.api);
         const prov = self.registry.get(api_str) orelse return;
+        var arena = std.heap.ArenaAllocator.init(stream_alloc);
+        defer arena.deinit();
+
         var opts = options;
         if (opts.base.api_key == null or opts.base.api_key.?.len == 0) {
             opts.base.api_key = self.resolveApiKey(model);
         }
+        opts.base.headers = self.mergeClaimHeaders(model, arena.allocator(), opts.base.headers) catch opts.base.headers;
         if (self.max_tokens) |mt| opts.base.max_tokens = mt;
         prov.streamSimple(stream_alloc, model, stream_context, opts, callback, callback_ctx);
     }
 
     pub fn resolveApiKey(self: *const StreamClosure, model: ai.protocol.Model) []const u8 {
+        const provider_str = ai.json_util.providerToString(model.provider);
         if (self.auth_storage) |auth_storage| {
-            const provider_str = ai.json_util.providerToString(model.provider);
             if (auth_storage.getApiKey(provider_str)) |key| {
                 if (key.len > 0) return key;
             }
         }
-        return self.api_key;
+        const claim = self.registry.activeClaimRegistrationByName(provider_str) orelse return self.api_key;
+        const config = claim.api_key orelse return self.api_key;
+        const resolved = resolve_config_value.resolveConfigValue(config) orelse return self.api_key;
+        return if (resolved.len > 0) resolved else self.api_key;
+    }
+
+    fn mergeClaimHeaders(
+        self: *const StreamClosure,
+        model: ai.protocol.Model,
+        allocator: std.mem.Allocator,
+        request_headers: ?[]const ai.protocol.Header,
+    ) !?[]const ai.protocol.Header {
+        const provider_str = ai.json_util.providerToString(model.provider);
+        const claim = self.registry.activeClaimRegistrationByName(provider_str) orelse return request_headers;
+        if (claim.headers.len == 0) return request_headers;
+
+        var merged: std.ArrayListUnmanaged(ai.protocol.Header) = .empty;
+
+        for (claim.headers) |header| {
+            const resolved_value = resolve_config_value.resolveConfigValue(header.value) orelse continue;
+            try merged.append(allocator, .{
+                .key = try allocator.dupe(u8, header.key),
+                .value = try allocator.dupe(u8, resolved_value),
+            });
+        }
+        if (request_headers) |headers| {
+            for (headers) |header| {
+                try merged.append(allocator, .{
+                    .key = try allocator.dupe(u8, header.key),
+                    .value = try allocator.dupe(u8, header.value),
+                });
+            }
+        }
+
+        if (merged.items.len == 0) return null;
+        return merged.items;
     }
 };
 
@@ -484,4 +524,196 @@ fn collectGuidelines(
     }
 
     return guidelines[0..index];
+}
+
+const testing = std.testing;
+
+const StreamCaptureProvider = struct {
+    allocator: std.mem.Allocator,
+    last_base_url: ?[]const u8 = null,
+    last_api_key: ?[]const u8 = null,
+    last_headers: []const ai.protocol.Header = &.{},
+
+    const vtable: ai.provider.Provider.VTable = .{
+        .stream = streamImpl,
+        .stream_simple = streamSimpleImpl,
+        .get_name = getNameImpl,
+        .deinit = deinitImpl,
+    };
+
+    fn create(allocator: std.mem.Allocator) !*StreamCaptureProvider {
+        const self = try allocator.create(StreamCaptureProvider);
+        self.* = .{ .allocator = allocator };
+        return self;
+    }
+
+    fn provider(self: *StreamCaptureProvider) ai.provider.Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn getSelf(ptr: *anyopaque) *StreamCaptureProvider {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn clearCaptured(self: *StreamCaptureProvider) void {
+        if (self.last_base_url) |value| self.allocator.free(value);
+        if (self.last_api_key) |value| self.allocator.free(value);
+        for (self.last_headers) |header| {
+            self.allocator.free(header.key);
+            self.allocator.free(header.value);
+        }
+        if (self.last_headers.len > 0) self.allocator.free(self.last_headers);
+        self.last_base_url = null;
+        self.last_api_key = null;
+        self.last_headers = &.{};
+    }
+
+    fn capture(self: *StreamCaptureProvider, model: ai.protocol.Model, options: ai.protocol.SimpleStreamOptions) void {
+        self.clearCaptured();
+        self.last_base_url = self.allocator.dupe(u8, model.base_url) catch null;
+        if (options.base.api_key) |api_key| {
+            self.last_api_key = self.allocator.dupe(u8, api_key) catch null;
+        }
+        if (options.base.headers) |headers| {
+            const owned = self.allocator.alloc(ai.protocol.Header, headers.len) catch return;
+            var built: usize = 0;
+            for (headers, 0..) |header, i| {
+                const key = self.allocator.dupe(u8, header.key) catch {
+                    for (owned[0..built]) |captured| {
+                        self.allocator.free(captured.key);
+                        self.allocator.free(captured.value);
+                    }
+                    self.allocator.free(owned);
+                    return;
+                };
+                const value = self.allocator.dupe(u8, header.value) catch {
+                    self.allocator.free(key);
+                    for (owned[0..built]) |captured| {
+                        self.allocator.free(captured.key);
+                        self.allocator.free(captured.value);
+                    }
+                    self.allocator.free(owned);
+                    return;
+                };
+                owned[i] = .{ .key = key, .value = value };
+                built += 1;
+            }
+            self.last_headers = owned;
+        }
+    }
+
+    fn streamImpl(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        model: ai.protocol.Model,
+        _: ai.protocol.Context,
+        options: ai.protocol.StreamOptions,
+        _: ai.provider.EventCallback,
+        _: ?*anyopaque,
+    ) void {
+        const simple: ai.protocol.SimpleStreamOptions = .{ .base = options };
+        getSelf(ptr).capture(model, simple);
+    }
+
+    fn streamSimpleImpl(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        model: ai.protocol.Model,
+        _: ai.protocol.Context,
+        options: ai.protocol.SimpleStreamOptions,
+        _: ai.provider.EventCallback,
+        _: ?*anyopaque,
+    ) void {
+        getSelf(ptr).capture(model, options);
+    }
+
+    fn getNameImpl(_: *anyopaque) []const u8 {
+        return "stream-capture";
+    }
+
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self = getSelf(ptr);
+        self.clearCaptured();
+        self.allocator.destroy(self);
+    }
+};
+
+fn noopProviderEvent(_: ai.protocol.AssistantMessageEvent, _: ?*anyopaque) void {}
+
+test "stream closure resolves claim api_key and layers provider headers before request headers" {
+    resolve_config_value.clearCache();
+    defer resolve_config_value.clearCache();
+
+    var registry = ai.provider.Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    const capture = try StreamCaptureProvider.create(testing.allocator);
+    try registry.register("anthropic-messages", capture.provider(), null);
+    defer registry.get("anthropic-messages").?.deinit();
+
+    const claim_headers = try testing.allocator.alloc(ai.protocol.Header, 2);
+    claim_headers[0] = .{
+        .key = try testing.allocator.dupe(u8, "x-provider"),
+        .value = try testing.allocator.dupe(u8, "!printf provider-default"),
+    };
+    claim_headers[1] = .{
+        .key = try testing.allocator.dupe(u8, "x-claim"),
+        .value = try testing.allocator.dupe(u8, "claim-header"),
+    };
+
+    try testing.expect(try registry.registerClaim(.{
+        .name = try testing.allocator.dupe(u8, "proxy-auth"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://proxy-auth.example"),
+        .api_key = try testing.allocator.dupe(u8, "!printf claim-key"),
+        .headers = claim_headers,
+        .owner_id = try testing.allocator.dupe(u8, "ext-a"),
+        .generation = 1,
+    }));
+
+    var closure: StreamClosure = .{
+        .registry = &registry,
+        .auth_storage = null,
+        .api_key = "session-fallback",
+        .max_tokens = null,
+    };
+
+    const request_headers = [_]ai.protocol.Header{
+        .{ .key = "x-provider", .value = "request-override" },
+        .{ .key = "x-request", .value = "request-local" },
+    };
+    const model: ai.protocol.Model = .{
+        .id = "proxy-model",
+        .name = "Proxy Model",
+        .api = .anthropic_messages,
+        .provider = .{ .custom = "proxy-auth" },
+        .base_url = "https://visible-model.example",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 2048,
+    };
+
+    StreamClosure.streamFn(
+        @ptrCast(&closure),
+        testing.allocator,
+        model,
+        .{ .messages = &.{} },
+        .{ .base = .{ .headers = &request_headers } },
+        &noopProviderEvent,
+        null,
+    );
+
+    try testing.expectEqualStrings("https://proxy-auth.example", capture.last_base_url.?);
+    try testing.expectEqualStrings("claim-key", capture.last_api_key.?);
+    try testing.expectEqual(@as(usize, 4), capture.last_headers.len);
+    try testing.expectEqualStrings("x-provider", capture.last_headers[0].key);
+    try testing.expectEqualStrings("provider-default", capture.last_headers[0].value);
+    try testing.expectEqualStrings("x-claim", capture.last_headers[1].key);
+    try testing.expectEqualStrings("claim-header", capture.last_headers[1].value);
+    try testing.expectEqualStrings("x-provider", capture.last_headers[2].key);
+    try testing.expectEqualStrings("request-override", capture.last_headers[2].value);
+    try testing.expectEqualStrings("x-request", capture.last_headers[3].key);
+    try testing.expectEqualStrings("request-local", capture.last_headers[3].value);
 }

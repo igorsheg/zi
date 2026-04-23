@@ -291,6 +291,13 @@ const RegisterProviderError = error{
     InvalidApi,
     MissingBaseUrl,
     InvalidBaseUrl,
+    InvalidApiKey,
+    InvalidHeaders,
+    DeferredAuthHeader,
+    DeferredAuthHeaderCamel,
+    DeferredOAuth,
+    DeferredStreamSimple,
+    DeferredStreamSimpleCamel,
     InvalidModels,
     MissingModelId,
     InvalidModelId,
@@ -324,6 +331,13 @@ fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidApi => "register_provider: field 'api' must be a string",
             error.MissingBaseUrl => "register_provider: missing required field 'base_url'",
             error.InvalidBaseUrl => "register_provider: field 'base_url' must be a string",
+            error.InvalidApiKey => "register_provider: field 'api_key' must be a string",
+            error.InvalidHeaders => "register_provider: field 'headers' must be a string map",
+            error.DeferredAuthHeader => "register_provider: field 'auth_header' is deferred in this slice",
+            error.DeferredAuthHeaderCamel => "register_provider: field 'authHeader' is deferred in this slice",
+            error.DeferredOAuth => "register_provider: field 'oauth' is deferred in this slice",
+            error.DeferredStreamSimple => "register_provider: field 'stream_simple' is deferred in this slice",
+            error.DeferredStreamSimpleCamel => "register_provider: field 'streamSimple' is deferred in this slice",
             error.InvalidModels => "register_provider: field 'models' must be an array of model tables",
             error.MissingModelId, error.InvalidModelId => "register_provider: each model requires string field 'id'",
             error.MissingModelDisplayName, error.InvalidModelDisplayName => "register_provider: each model requires string field 'name'",
@@ -400,6 +414,20 @@ fn buildProviderRegistration(
     const base_url = try requireProviderFieldString(L, 2, "base_url", a, error.MissingBaseUrl, error.InvalidBaseUrl);
     errdefer a.free(base_url);
 
+    const api_key = try optionalProviderFieldString(L, 2, "api_key", a, error.InvalidApiKey);
+    errdefer if (api_key) |owned| a.free(owned);
+
+    const headers = try optionalProviderHeaders(L, 2, a);
+    errdefer {
+        for (headers) |header| {
+            a.free(header.key);
+            a.free(header.value);
+        }
+        if (headers.len > 0) a.free(headers);
+    }
+
+    try rejectDeferredProviderFields(L, 2);
+
     const owner_id = a.dupe(u8, currentProviderOwnerId(runner)) catch return error.OutOfMemory;
     errdefer a.free(owner_id);
 
@@ -413,6 +441,8 @@ fn buildProviderRegistration(
         .name = name,
         .api = api_name,
         .base_url = base_url,
+        .api_key = api_key,
+        .headers = headers,
         .owner_id = owner_id,
         .generation = runner.generation,
         .models = models,
@@ -1071,6 +1101,68 @@ fn optionalProviderFieldString(
     };
 }
 
+fn optionalProviderHeaders(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+) RegisterProviderError![]const ai.protocol.Header {
+    _ = c.lua_getfield(L, table_idx, "headers");
+    defer c.lua_pop(L, 1);
+
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return &.{},
+        c.LUA_TTABLE => {},
+        else => return error.InvalidHeaders,
+    }
+
+    const headers_idx = c.lua_gettop(L);
+    var headers: std.ArrayListUnmanaged(ai.protocol.Header) = .empty;
+    errdefer {
+        for (headers.items) |header| {
+            allocator.free(header.key);
+            allocator.free(header.value);
+        }
+        headers.deinit(allocator);
+    }
+
+    c.lua_pushnil(L);
+    while (c.lua_next(L, headers_idx) != 0) {
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -2) != c.LUA_TSTRING) return error.InvalidHeaders;
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidHeaders;
+        const key = allocator.dupe(u8, lstring(L, -2)) catch return error.OutOfMemory;
+        errdefer allocator.free(key);
+        const value = allocator.dupe(u8, lstring(L, -1)) catch return error.OutOfMemory;
+        errdefer allocator.free(value);
+        try headers.append(allocator, .{ .key = key, .value = value });
+    }
+
+    if (headers.items.len == 0) return &.{};
+    return headers.toOwnedSlice(allocator);
+}
+
+fn rejectDeferredProviderFields(
+    L: *c.lua_State,
+    table_idx: c_int,
+) RegisterProviderError!void {
+    try rejectDeferredProviderField(L, table_idx, "auth_header", error.DeferredAuthHeader);
+    try rejectDeferredProviderField(L, table_idx, "authHeader", error.DeferredAuthHeaderCamel);
+    try rejectDeferredProviderField(L, table_idx, "oauth", error.DeferredOAuth);
+    try rejectDeferredProviderField(L, table_idx, "stream_simple", error.DeferredStreamSimple);
+    try rejectDeferredProviderField(L, table_idx, "streamSimple", error.DeferredStreamSimpleCamel);
+}
+
+fn rejectDeferredProviderField(
+    L: *c.lua_State,
+    table_idx: c_int,
+    field: [:0]const u8,
+    err: RegisterProviderError,
+) RegisterProviderError!void {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TNIL) return err;
+}
+
 fn requireProviderFieldBool(
     L: *c.lua_State,
     table_idx: c_int,
@@ -1514,6 +1606,8 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
         \\assert(zi.register_provider("queued", {
         \\  api = "anthropic-messages",
         \\  base_url = "https://queued.example",
+        \\  api_key = "QUEUED_PROXY_API_KEY",
+        \\  headers = { ["x-provider"] = "queued-provider" },
         \\  models = {
         \\    {
         \\      id = "claude-sonnet-4-20250514",
@@ -1533,6 +1627,10 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
     try testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
     switch (runner.provider_queue.pending.items[0]) {
         .register => |claim| {
+            try testing.expectEqualStrings("QUEUED_PROXY_API_KEY", claim.api_key.?);
+            try testing.expectEqual(@as(usize, 1), claim.headers.len);
+            try testing.expectEqualStrings("x-provider", claim.headers[0].key);
+            try testing.expectEqualStrings("queued-provider", claim.headers[0].value);
             try testing.expectEqual(@as(usize, 1), claim.models.len);
             try testing.expectEqualStrings("claude-sonnet-4-20250514", claim.models[0].id);
             try testing.expectEqualStrings("Claude 4 Sonnet (queued)", claim.models[0].name);
@@ -1571,6 +1669,10 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
     try testing.expectEqual(@as(usize, 1), provider_registry.activeClaimCount());
     const queued_claim = provider_registry.activeClaimRegistrationAt(0);
     try testing.expectEqualStrings("queued", queued_claim.name);
+    try testing.expectEqualStrings("QUEUED_PROXY_API_KEY", queued_claim.api_key.?);
+    try testing.expectEqual(@as(usize, 1), queued_claim.headers.len);
+    try testing.expectEqualStrings("x-provider", queued_claim.headers[0].key);
+    try testing.expectEqualStrings("queued-provider", queued_claim.headers[0].value);
     try testing.expectEqual(@as(usize, 1), queued_claim.models.len);
     try testing.expectEqualStrings("claude-sonnet-4-20250514", queued_claim.models[0].id);
 
@@ -1609,6 +1711,40 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
 
     try testing.expectEqualStrings("queued", provider_registry.get("anthropic-messages").?.getName());
     try testing.expectEqual(@as(usize, 1), provider_registry.activeClaimCount());
+}
+
+test "zi.register_provider rejects deferred provider fields instead of silently dropping them" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\for _, spec in ipairs({
+        \\  { field = "auth_header", value = "true" },
+        \\  { field = "oauth", value = "{}" },
+        \\  { field = "stream_simple", value = "function() end" },
+        \\  { field = "streamSimple", value = "function() end" },
+        \\}) do
+        \\  local ok, err = pcall(function()
+        \\    local chunk = string.format([[
+        \\      return zi.register_provider("deferred", {
+        \\        api = "anthropic-messages",
+        \\        base_url = "https://proxy.example",
+        \\        %s = %s,
+        \\      })
+        \\    ]], spec.field, spec.value)
+        \\    assert(load(chunk))()
+        \\  end)
+        \\  assert(not ok, "expected error for " .. spec.field)
+        \\  assert(string.find(err, spec.field) ~= nil, tostring(err))
+        \\end
+    , "provider_reject_deferred_fields");
+
+    try testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
 }
 
 test "zi.register_tool registers a Lua-defined tool end-to-end" {
