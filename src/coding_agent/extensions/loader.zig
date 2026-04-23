@@ -341,9 +341,9 @@ fn loadBuiltinExtension(
     try state.loadChunk(BUILTIN_EXTENSION_SOURCE, chunk_name);
     const chunk_call_rc = lua_runtime.c.lua_pcallk(state.L, 0, 1, 0, 0, null);
     if (chunk_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, chunk_call_rc);
-    errdefer lua_runtime.c.lua_pop(state.L, 1);
 
     if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+        lua_runtime.c.lua_pop(state.L, 1);
         return error.ExtensionFactoryExpectedFunction;
     }
 
@@ -398,9 +398,9 @@ fn loadOne(
     try state.loadChunk(src, chunk_name);
     const chunk_call_rc = lua_runtime.c.lua_pcallk(state.L, 0, 1, 0, 0, null);
     if (chunk_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, chunk_call_rc);
-    errdefer lua_runtime.c.lua_pop(state.L, 1);
 
     if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+        lua_runtime.c.lua_pop(state.L, 1);
         return error.ExtensionFactoryExpectedFunction;
     }
 
@@ -697,6 +697,51 @@ test "loadAll continues after a broken extension" {
     try std.testing.expectEqual(@as(u32, 1), stats.failed);
 
     // Good extension still ran despite broken sibling.
+    try state.doString("assert(_good == 42)", "verify");
+}
+
+test "loadAll continues after a factory-time failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("extensions");
+    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try ext_dir.writeFile(.{
+        .sub_path = "broken.lua",
+        .data = "return function(zi)\n" ++
+            "  error(\"factory blew up\")\n" ++
+            "end\n",
+    });
+    try ext_dir.writeFile(.{ .sub_path = "good.lua", .data = "return function(zi) _good = 42 end" });
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const roots = [_]StaticExtensionRoot{.{
+        .source = .user,
+        .path = tmp_path,
+        .kind = .runtime_root,
+        .runtime_root_id = tmp_path,
+        .state_owner_id = tmp_path,
+    }};
+    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
+    defer freeExtensions(allocator, exts);
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    const stats = loadAll(allocator, &state, &runner, exts, &.{});
+    try std.testing.expectEqual(@as(u32, 2), stats.attempted);
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expectEqual(@as(u32, 1), stats.failed);
+
     try state.doString("assert(_good == 42)", "verify");
 }
 
