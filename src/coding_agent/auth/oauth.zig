@@ -2,6 +2,7 @@ const std = @import("std");
 const pkce = @import("pkce.zig");
 const callback_server = @import("callback_server.zig");
 const auth_types = @import("types.zig");
+const provider_mod = @import("../../ai/provider.zig");
 
 const log = std.log.scoped(.oauth);
 
@@ -137,19 +138,50 @@ pub fn login(
     }
 }
 
-// ── Built-in providers ──────────────────────────────────────────────────
+// ── Built-in providers + dynamic claim-backed registry ───────────────────
 
-pub const PROVIDERS = [_]OAuthProvider{
-    anthropic_provider,
-    openai_codex_provider,
+pub const ProviderListEntry = struct {
+    id: []const u8,
+    name: []const u8,
+
+    pub fn deinit(self: *ProviderListEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
 };
 
-pub fn findProvider(id: []const u8) ?OAuthProvider {
-    for (&PROVIDERS) |*p| {
-        if (std.mem.eql(u8, p.id, id)) return p.*;
+const ClaimOAuthTemplate = enum {
+    anthropic,
+    openai_codex,
+};
+
+pub const ResolveClaimOAuthTemplateError = error{
+    BuiltinOverrideUnsupported,
+    UnsupportedApiFamily,
+    ConflictingApiFamilies,
+};
+
+pub const SyncClaimProviderError = ResolveClaimOAuthTemplateError || error{OutOfMemory};
+
+const DynamicOAuthProvider = struct {
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    name: []const u8,
+    owner_id: []const u8,
+    generation: u64,
+    template: ClaimOAuthTemplate,
+
+    fn deinit(self: *DynamicOAuthProvider) void {
+        self.allocator.free(self.id);
+        self.allocator.free(self.name);
+        self.allocator.free(self.owner_id);
+        self.* = undefined;
     }
-    return null;
-}
+};
+
+var dynamic_provider_mutex: std.Thread.Mutex = .{};
+var dynamic_providers: std.ArrayListUnmanaged(DynamicOAuthProvider) = .empty;
 
 // ── Anthropic (Claude Pro/Max) ──────────────────────────────────────────
 // pi-mono source: packages/ai/src/utils/oauth/anthropic.ts
@@ -171,7 +203,8 @@ pub const anthropic_provider = OAuthProvider{
 
 fn anthropicBuildAuthorizeUrl(allocator: std.mem.Allocator, flow: *const FlowContext) ?[]u8 {
     // pi-mono: anthropic.ts:244-253
-    return std.fmt.allocPrint(allocator,
+    return std.fmt.allocPrint(
+        allocator,
         "{s}?code=true&client_id={s}&response_type=code&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}",
         .{
             ANTHROPIC_AUTHORIZE_URL,
@@ -227,7 +260,8 @@ pub const openai_codex_provider = OAuthProvider{
 
 fn codexBuildAuthorizeUrl(allocator: std.mem.Allocator, flow: *const FlowContext) ?[]u8 {
     // pi-mono: openai-codex.ts:174-193
-    return std.fmt.allocPrint(allocator,
+    return std.fmt.allocPrint(
+        allocator,
         "{s}?response_type=code&client_id={s}&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=zi",
         .{
             CODEX_AUTHORIZE_URL,
@@ -258,6 +292,221 @@ fn codexRefreshToken(allocator: std.mem.Allocator, credential: auth_types.OAuthC
         .{ .key = "refresh_token", .value = credential.refresh },
         .{ .key = "client_id", .value = CODEX_CLIENT_ID },
     });
+}
+
+const builtin_providers = [_]OAuthProvider{
+    anthropic_provider,
+    openai_codex_provider,
+};
+
+fn findBuiltinProvider(id: []const u8) ?OAuthProvider {
+    for (&builtin_providers) |*provider| {
+        if (std.mem.eql(u8, provider.id, id)) return provider.*;
+    }
+    return null;
+}
+
+fn templateForApi(api_name: []const u8) ?ClaimOAuthTemplate {
+    if (std.mem.eql(u8, api_name, "anthropic-messages")) return .anthropic;
+    if (std.mem.eql(u8, api_name, "openai-codex-responses")) return .openai_codex;
+    return null;
+}
+
+fn retagProvider(template: ClaimOAuthTemplate, id: []const u8, name: []const u8) OAuthProvider {
+    return switch (template) {
+        .anthropic => .{
+            .id = id,
+            .name = name,
+            .callback_port = anthropic_provider.callback_port,
+            .callback_path = anthropic_provider.callback_path,
+            .build_authorize_url = anthropic_provider.build_authorize_url,
+            .exchange_code = anthropic_provider.exchange_code,
+            .refresh_token = anthropic_provider.refresh_token,
+        },
+        .openai_codex => .{
+            .id = id,
+            .name = name,
+            .callback_port = openai_codex_provider.callback_port,
+            .callback_path = openai_codex_provider.callback_path,
+            .build_authorize_url = openai_codex_provider.build_authorize_url,
+            .exchange_code = openai_codex_provider.exchange_code,
+            .refresh_token = openai_codex_provider.refresh_token,
+        },
+    };
+}
+
+fn dupeProviderListEntry(allocator: std.mem.Allocator, id: []const u8, name: []const u8) !ProviderListEntry {
+    const id_dup = try allocator.dupe(u8, id);
+    errdefer allocator.free(id_dup);
+    const name_dup = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_dup);
+    return .{ .id = id_dup, .name = name_dup };
+}
+
+fn initDynamicProvider(
+    allocator: std.mem.Allocator,
+    claim: *const provider_mod.ClaimRegistration,
+    display_name: []const u8,
+    template: ClaimOAuthTemplate,
+) !DynamicOAuthProvider {
+    const id = try allocator.dupe(u8, claim.name);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, display_name);
+    errdefer allocator.free(name);
+    const owner_id = try allocator.dupe(u8, claim.owner_id);
+    errdefer allocator.free(owner_id);
+
+    return .{
+        .allocator = allocator,
+        .id = id,
+        .name = name,
+        .owner_id = owner_id,
+        .generation = claim.generation,
+        .template = template,
+    };
+}
+
+pub fn resolveClaimOAuthTemplate(
+    provider_name: []const u8,
+    api_name: []const u8,
+    models: []const provider_mod.ClaimModelRegistration,
+) ResolveClaimOAuthTemplateError!ClaimOAuthTemplate {
+    if (findBuiltinProvider(provider_name) != null) return error.BuiltinOverrideUnsupported;
+
+    const template = templateForApi(api_name) orelse return error.UnsupportedApiFamily;
+    for (models) |model| {
+        const effective_api = model.api orelse api_name;
+        const model_template = templateForApi(effective_api) orelse return error.UnsupportedApiFamily;
+        if (model_template != template) return error.ConflictingApiFamilies;
+    }
+    return template;
+}
+
+fn dynamicProviderIndexLocked(id: []const u8) ?usize {
+    for (dynamic_providers.items, 0..) |provider, idx| {
+        if (std.mem.eql(u8, provider.id, id)) return idx;
+    }
+    return null;
+}
+
+fn removeClaimProviderByOwnerLocked(id: []const u8, owner_id: []const u8) bool {
+    const idx = dynamicProviderIndexLocked(id) orelse return false;
+    const existing = dynamic_providers.items[idx];
+    if (!std.mem.eql(u8, existing.owner_id, owner_id)) return false;
+
+    var removed = dynamic_providers.orderedRemove(idx);
+    removed.deinit();
+    return true;
+}
+
+fn unregisterClaimProviderLocked(id: []const u8, owner_id: []const u8, generation: u64) bool {
+    const idx = dynamicProviderIndexLocked(id) orelse return false;
+    const existing = dynamic_providers.items[idx];
+    if (!std.mem.eql(u8, existing.owner_id, owner_id)) return false;
+    if (existing.generation != generation) return false;
+
+    var removed = dynamic_providers.orderedRemove(idx);
+    removed.deinit();
+    return true;
+}
+
+pub fn syncClaimProvider(allocator: std.mem.Allocator, claim: *const provider_mod.ClaimRegistration) SyncClaimProviderError!void {
+    dynamic_provider_mutex.lock();
+    defer dynamic_provider_mutex.unlock();
+
+    if (!claim.oauth_enabled) {
+        _ = removeClaimProviderByOwnerLocked(claim.name, claim.owner_id);
+        return;
+    }
+
+    const template = try resolveClaimOAuthTemplate(claim.name, claim.api, claim.models);
+    const display_name = claim.oauth_name orelse claim.name;
+
+    if (dynamicProviderIndexLocked(claim.name)) |idx| {
+        const existing = &dynamic_providers.items[idx];
+        std.debug.assert(std.mem.eql(u8, existing.owner_id, claim.owner_id));
+        const new_name = try allocator.dupe(u8, display_name);
+        allocator.free(existing.name);
+        existing.name = new_name;
+        existing.generation = claim.generation;
+        existing.template = template;
+        return;
+    }
+
+    const provider = try initDynamicProvider(allocator, claim, display_name, template);
+    errdefer {
+        var owned = provider;
+        owned.deinit();
+    }
+    try dynamic_providers.append(std.heap.page_allocator, provider);
+}
+
+pub fn unregisterClaimProvider(id: []const u8, owner_id: []const u8, generation: u64) bool {
+    dynamic_provider_mutex.lock();
+    defer dynamic_provider_mutex.unlock();
+    return unregisterClaimProviderLocked(id, owner_id, generation);
+}
+
+pub fn unregisterProvidersByGeneration(generation: u64) void {
+    dynamic_provider_mutex.lock();
+    defer dynamic_provider_mutex.unlock();
+
+    var i: usize = 0;
+    while (i < dynamic_providers.items.len) {
+        if (dynamic_providers.items[i].generation != generation) {
+            i += 1;
+            continue;
+        }
+        var removed = dynamic_providers.orderedRemove(i);
+        removed.deinit();
+    }
+}
+
+pub fn listProviders(allocator: std.mem.Allocator) ![]ProviderListEntry {
+    dynamic_provider_mutex.lock();
+    defer dynamic_provider_mutex.unlock();
+
+    const total = builtin_providers.len + dynamic_providers.items.len;
+    const entries = try allocator.alloc(ProviderListEntry, total);
+
+    var built: usize = 0;
+    errdefer {
+        for (entries[0..built]) |*entry| entry.deinit(allocator);
+        allocator.free(entries);
+    }
+
+    for (builtin_providers) |provider| {
+        entries[built] = try dupeProviderListEntry(allocator, provider.id, provider.name);
+        built += 1;
+    }
+    for (dynamic_providers.items) |provider| {
+        entries[built] = try dupeProviderListEntry(allocator, provider.id, provider.name);
+        built += 1;
+    }
+    return entries;
+}
+
+pub fn findProvider(id: []const u8) ?OAuthProvider {
+    if (findBuiltinProvider(id)) |provider| return provider;
+
+    dynamic_provider_mutex.lock();
+    defer dynamic_provider_mutex.unlock();
+
+    for (dynamic_providers.items) |provider| {
+        if (std.mem.eql(u8, provider.id, id)) {
+            return retagProvider(provider.template, provider.id, provider.name);
+        }
+    }
+    return null;
+}
+
+pub fn resetDynamicProvidersForTest() void {
+    dynamic_provider_mutex.lock();
+    defer dynamic_provider_mutex.unlock();
+
+    for (dynamic_providers.items) |*provider| provider.deinit();
+    dynamic_providers.deinit(std.heap.page_allocator);
+    dynamic_providers = .empty;
 }
 
 // ── Shared token exchange (JSON POST) ───────────────────────────────────
@@ -377,4 +626,40 @@ fn percentEncodeInto(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
             try out.append(allocator, hex[c & 0xf]);
         }
     }
+}
+
+const testing = std.testing;
+
+test "dynamic oauth providers list claim-visible ids and labels" {
+    resetDynamicProvidersForTest();
+    defer resetDynamicProvidersForTest();
+
+    var claim = provider_mod.ClaimRegistration{
+        .name = try testing.allocator.dupe(u8, "corp-ai"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try testing.allocator.dupe(u8, "Corporate Claude"),
+        .owner_id = try testing.allocator.dupe(u8, "state-123"),
+        .generation = 5,
+    };
+    defer claim.deinit(testing.allocator);
+
+    try syncClaimProvider(testing.allocator, &claim);
+
+    const providers = try listProviders(testing.allocator);
+    defer {
+        for (providers) |*provider| provider.deinit(testing.allocator);
+        testing.allocator.free(providers);
+    }
+
+    var saw_dynamic = false;
+    for (providers) |provider| {
+        if (!std.mem.eql(u8, provider.id, "corp-ai")) continue;
+        saw_dynamic = true;
+        try testing.expectEqualStrings("Corporate Claude", provider.name);
+    }
+    try testing.expect(saw_dynamic);
+    try testing.expect(findProvider("corp-ai") != null);
+    try testing.expect(findProvider("anthropic-messages") == null);
 }

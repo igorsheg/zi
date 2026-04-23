@@ -53,6 +53,7 @@ const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
 const session_core = @import("../../session/root.zig");
 const ai = @import("../../ai/root.zig");
+const oauth_mod = @import("../auth/oauth.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
@@ -293,9 +294,19 @@ const RegisterProviderError = error{
     InvalidBaseUrl,
     InvalidApiKey,
     InvalidHeaders,
+    InvalidOAuth,
+    InvalidOAuthName,
+    UnsupportedOAuthLogin,
+    UnsupportedOAuthRefreshToken,
+    UnsupportedOAuthRefreshTokenCamel,
+    UnsupportedOAuthGetApiKey,
+    UnsupportedOAuthModifyModels,
+    UnsupportedOAuthRequiresModels,
+    UnsupportedOAuthBuiltinOverride,
+    UnsupportedOAuthApiFamily,
+    UnsupportedOAuthMixedApiFamilies,
     DeferredAuthHeader,
     DeferredAuthHeaderCamel,
-    DeferredOAuth,
     DeferredStreamSimple,
     DeferredStreamSimpleCamel,
     InvalidModels,
@@ -333,9 +344,19 @@ fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidBaseUrl => "register_provider: field 'base_url' must be a string",
             error.InvalidApiKey => "register_provider: field 'api_key' must be a string",
             error.InvalidHeaders => "register_provider: field 'headers' must be a string map",
+            error.InvalidOAuth => "register_provider: field 'oauth' only supports optional string field 'name' in this slice",
+            error.InvalidOAuthName => "register_provider: field 'oauth.name' must be a string when present",
+            error.UnsupportedOAuthLogin => "register_provider: field 'oauth.login' is unsupported in this slice",
+            error.UnsupportedOAuthRefreshToken => "register_provider: field 'oauth.refresh_token' is unsupported in this slice",
+            error.UnsupportedOAuthRefreshTokenCamel => "register_provider: field 'oauth.refreshToken' is unsupported in this slice",
+            error.UnsupportedOAuthGetApiKey => "register_provider: field 'oauth.getApiKey' is unsupported in this slice",
+            error.UnsupportedOAuthModifyModels => "register_provider: field 'oauth.modifyModels' is unsupported in this slice",
+            error.UnsupportedOAuthRequiresModels => "register_provider: field 'oauth' requires claim-backed models in this slice",
+            error.UnsupportedOAuthBuiltinOverride => "register_provider: field 'oauth' does not support built-in provider override semantics in this slice",
+            error.UnsupportedOAuthApiFamily => "register_provider: field 'oauth' requires a built-in host oauth template for the claim api family in this slice",
+            error.UnsupportedOAuthMixedApiFamilies => "register_provider: field 'oauth' requires every claim-backed model to resolve to the same built-in oauth-capable api family",
             error.DeferredAuthHeader => "register_provider: field 'auth_header' is deferred in this slice",
             error.DeferredAuthHeaderCamel => "register_provider: field 'authHeader' is deferred in this slice",
-            error.DeferredOAuth => "register_provider: field 'oauth' is deferred in this slice",
             error.DeferredStreamSimple => "register_provider: field 'stream_simple' is deferred in this slice",
             error.DeferredStreamSimpleCamel => "register_provider: field 'streamSimple' is deferred in this slice",
             error.InvalidModels => "register_provider: field 'models' must be an array of model tables",
@@ -356,6 +377,9 @@ fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const accepted = runner.registerProviderClaim(claim) catch |err| {
         return luaError(L, switch (err) {
             error.UnknownApi => "register_provider: this slice only supports overriding an existing api",
+            error.BuiltinOverrideUnsupported => "register_provider: field 'oauth' does not support built-in provider override semantics in this slice",
+            error.UnsupportedApiFamily => "register_provider: field 'oauth' requires a built-in host oauth template for the claim api family in this slice",
+            error.ConflictingApiFamilies => "register_provider: field 'oauth' requires every claim-backed model to resolve to the same built-in oauth-capable api family",
             error.OutOfMemory => "register_provider: out of memory",
         });
     };
@@ -437,12 +461,26 @@ fn buildProviderRegistration(
         if (models.len > 0) a.free(models);
     }
 
+    const oauth = try parseProviderOAuth(L, 2, a);
+    errdefer if (oauth.name) |owned| a.free(owned);
+
+    if (oauth.enabled) {
+        if (models.len == 0) return error.UnsupportedOAuthRequiresModels;
+        _ = oauth_mod.resolveClaimOAuthTemplate(name, api_name, models) catch |err| switch (err) {
+            error.BuiltinOverrideUnsupported => return error.UnsupportedOAuthBuiltinOverride,
+            error.UnsupportedApiFamily => return error.UnsupportedOAuthApiFamily,
+            error.ConflictingApiFamilies => return error.UnsupportedOAuthMixedApiFamilies,
+        };
+    }
+
     return .{
         .name = name,
         .api = api_name,
         .base_url = base_url,
         .api_key = api_key,
         .headers = headers,
+        .oauth_enabled = oauth.enabled,
+        .oauth_name = oauth.name,
         .owner_id = owner_id,
         .generation = runner.generation,
         .models = models,
@@ -1141,13 +1179,58 @@ fn optionalProviderHeaders(
     return headers.toOwnedSlice(allocator);
 }
 
+const ProviderOAuthConfig = struct {
+    enabled: bool = false,
+    name: ?[]const u8 = null,
+};
+
+fn parseProviderOAuth(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+) RegisterProviderError!ProviderOAuthConfig {
+    _ = c.lua_getfield(L, table_idx, "oauth");
+    defer c.lua_pop(L, 1);
+
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return .{},
+        c.LUA_TTABLE => {},
+        else => return error.InvalidOAuth,
+    }
+
+    const oauth_idx = c.lua_gettop(L);
+    var oauth = ProviderOAuthConfig{ .enabled = true };
+    errdefer if (oauth.name) |owned| allocator.free(owned);
+
+    c.lua_pushnil(L);
+    while (c.lua_next(L, oauth_idx) != 0) {
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -2) != c.LUA_TSTRING) return error.InvalidOAuth;
+
+        const field = lstring(L, -2);
+        if (std.mem.eql(u8, field, "name")) {
+            if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOAuthName;
+            if (oauth.name) |owned| allocator.free(owned);
+            oauth.name = allocator.dupe(u8, lstring(L, -1)) catch return error.OutOfMemory;
+            continue;
+        }
+        if (std.mem.eql(u8, field, "login")) return error.UnsupportedOAuthLogin;
+        if (std.mem.eql(u8, field, "refresh_token")) return error.UnsupportedOAuthRefreshToken;
+        if (std.mem.eql(u8, field, "refreshToken")) return error.UnsupportedOAuthRefreshTokenCamel;
+        if (std.mem.eql(u8, field, "getApiKey")) return error.UnsupportedOAuthGetApiKey;
+        if (std.mem.eql(u8, field, "modifyModels")) return error.UnsupportedOAuthModifyModels;
+        return error.InvalidOAuth;
+    }
+
+    return oauth;
+}
+
 fn rejectDeferredProviderFields(
     L: *c.lua_State,
     table_idx: c_int,
 ) RegisterProviderError!void {
     try rejectDeferredProviderField(L, table_idx, "auth_header", error.DeferredAuthHeader);
     try rejectDeferredProviderField(L, table_idx, "authHeader", error.DeferredAuthHeaderCamel);
-    try rejectDeferredProviderField(L, table_idx, "oauth", error.DeferredOAuth);
     try rejectDeferredProviderField(L, table_idx, "stream_simple", error.DeferredStreamSimple);
     try rejectDeferredProviderField(L, table_idx, "streamSimple", error.DeferredStreamSimpleCamel);
 }
@@ -1624,7 +1707,7 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
         \\}) == true)
     , "provider_prebind");
 
-    try testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
+    try testing.expectEqual(@as(usize, 2), runner.provider_queue.count());
     switch (runner.provider_queue.pending.items[0]) {
         .register => |claim| {
             try testing.expectEqualStrings("QUEUED_PROXY_API_KEY", claim.api_key.?);
@@ -1713,6 +1796,147 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
     try testing.expectEqual(@as(usize, 1), provider_registry.activeClaimCount());
 }
 
+test "zi.register_provider retains minimal oauth metadata and rejects unsupported oauth semantics" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 7);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testProviderLoadSource());
+    defer runner.endLoadContext();
+
+    try state.doString(
+        \\assert(zi.register_provider("oauth-claim", {
+        \\  api = "anthropic-messages",
+        \\  base_url = "https://proxy.example",
+        \\  oauth = { name = "Corp Claude" },
+        \\  models = {
+        \\    {
+        \\      id = "claude-sonnet-4-20250514",
+        \\      name = "Corp Claude Sonnet",
+        \\      reasoning = true,
+        \\      input = { "text", "image" },
+        \\      cost = { input = 0, output = 0, cache_read = 0, cache_write = 0 },
+        \\      context_window = 200000,
+        \\      max_tokens = 16384,
+        \\    }
+        \\  },
+        \\}) == true)
+    , "provider_oauth_minimal_metadata");
+
+    try state.doString(
+        \\assert(zi.register_provider("oauth-claim-unnamed", {
+        \\  api = "anthropic-messages",
+        \\  base_url = "https://proxy-2.example",
+        \\  oauth = {},
+        \\  models = {
+        \\    {
+        \\      id = "claude-opus-4-6",
+        \\      name = "Unnamed OAuth Claim",
+        \\      reasoning = true,
+        \\      input = { "text", "image" },
+        \\      cost = { input = 0, output = 0, cache_read = 0, cache_write = 0 },
+        \\      context_window = 200000,
+        \\      max_tokens = 32000,
+        \\    }
+        \\  },
+        \\}) == true)
+    , "provider_oauth_minimal_metadata_unnamed");
+
+    try testing.expectEqual(@as(usize, 2), runner.provider_queue.count());
+    switch (runner.provider_queue.pending.items[0]) {
+        .register => |claim| {
+            try testing.expect(claim.oauth_enabled);
+            try testing.expectEqualStrings("Corp Claude", claim.oauth_name.?);
+        },
+        else => return error.ExpectedQueuedProviderRegistration,
+    }
+    switch (runner.provider_queue.pending.items[1]) {
+        .register => |claim| {
+            try testing.expect(claim.oauth_enabled);
+            try testing.expect(claim.oauth_name == null);
+        },
+        else => return error.ExpectedQueuedProviderRegistration,
+    }
+    const invalid_oauth_specs = .{
+        .{
+            "provider_oauth_login_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { login = function() end },
+            \\})
+        },
+        .{
+            "provider_oauth_refresh_token_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { refresh_token = function() end },
+            \\})
+        },
+        .{
+            "provider_oauth_refresh_token_camel_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { refreshToken = function() end },
+            \\})
+        },
+        .{
+            "provider_oauth_get_api_key_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { getApiKey = function() end },
+            \\})
+        },
+        .{
+            "provider_oauth_modify_models_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { modifyModels = function() end },
+            \\})
+        },
+        .{
+            "provider_oauth_requires_models_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = {},
+            \\})
+        },
+        .{
+            "provider_oauth_template_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "openai-responses",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = {},
+            \\  models = {
+            \\    {
+            \\      id = "gpt-4.1",
+            \\      name = "Broken",
+            \\      reasoning = false,
+            \\      input = { "text" },
+            \\      cost = { input = 0, output = 0, cache_read = 0, cache_write = 0 },
+            \\      context_window = 128000,
+            \\      max_tokens = 4096,
+            \\    }
+            \\  },
+            \\})
+        },
+    };
+
+    inline for (invalid_oauth_specs) |spec| {
+        try testing.expectError(error.LuaRuntime, state.doString(spec[1], spec[0]));
+    }
+    try testing.expectEqual(@as(usize, 2), runner.provider_queue.count());
+}
+
 test "zi.register_provider rejects deferred provider fields instead of silently dropping them" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
@@ -1725,7 +1949,6 @@ test "zi.register_provider rejects deferred provider fields instead of silently 
     try state.doString(
         \\for _, spec in ipairs({
         \\  { field = "auth_header", value = "true" },
-        \\  { field = "oauth", value = "{}" },
         \\  { field = "stream_simple", value = "function() end" },
         \\  { field = "streamSimple", value = "function() end" },
         \\}) do

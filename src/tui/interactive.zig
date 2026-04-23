@@ -504,6 +504,7 @@ pub const Interactive = struct {
     // ── Login state (/login) ────────────────────────────────────────
     login_picker: ListPicker = undefined,
     login_picker_items: [8]SelectItem = undefined,
+    login_picker_entries: [8]oauth_mod.ProviderListEntry = undefined,
     login_picker_count: usize = 0,
     login_picker_handle: ?tui_mod.OverlayHandle = null,
     login_thread: ?std.Thread = null,
@@ -634,6 +635,7 @@ pub const Interactive = struct {
         self.drainUiEvents();
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
+        self.clearLoginPickerEntries();
         self.clearPendingImages();
         self.pending_images.deinit(self.allocator);
         if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
@@ -2455,13 +2457,35 @@ pub const Interactive = struct {
 
     // ── Login picker (/login) ───────────────────────────────────
 
+    fn clearLoginPickerEntries(self: *Interactive) void {
+        var i: usize = 0;
+        while (i < self.login_picker_count) : (i += 1) {
+            self.login_picker_entries[i].deinit(self.msg_allocator);
+        }
+        self.login_picker_count = 0;
+    }
+
     fn showLoginPicker(self: *Interactive) void {
+        self.clearLoginPickerEntries();
+
+        const providers = oauth_mod.listProviders(self.msg_allocator) catch {
+            self.status_text.setContent("failed to load OAuth providers");
+            self.status_text.fg = self.theme.fg(.@"error");
+            return;
+        };
+        defer self.msg_allocator.free(providers);
+
         var count: usize = 0;
-        for (&oauth_mod.PROVIDERS) |*p| {
-            if (count >= self.login_picker_items.len) break;
+        for (providers) |provider| {
+            if (count >= self.login_picker_items.len) {
+                var dropped = provider;
+                dropped.deinit(self.msg_allocator);
+                continue;
+            }
+            self.login_picker_entries[count] = provider;
             self.login_picker_items[count] = .{
-                .value = p.id,
-                .label = p.name,
+                .value = provider.id,
+                .label = provider.name,
                 .description = null,
             };
             count += 1;

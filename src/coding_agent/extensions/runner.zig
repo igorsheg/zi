@@ -8,6 +8,7 @@ const ai = @import("../../ai/root.zig");
 const resource_types = @import("../resources/types.zig");
 const tool_def = @import("../tools/definition.zig");
 const context_mod = @import("context.zig");
+const oauth_mod = @import("../auth/oauth.zig");
 
 const log = std.log.scoped(.zi_runner);
 
@@ -527,6 +528,7 @@ pub const ExtensionRunner = struct {
                 registry.unregisterClaimsByGeneration(self.generation) catch |err| {
                     log.warn("failed to revoke provider claims for generation {d}: {s}", .{ self.generation, @errorName(err) });
                 };
+                oauth_mod.unregisterProvidersByGeneration(self.generation);
                 projection_changed = registry.activeClaimCount() != before;
             }
             if (projection_changed) self.notifyProviderProjectionChanged();
@@ -542,7 +544,11 @@ pub const ExtensionRunner = struct {
                 owned.deinit(self.allocator);
             }
             const accepted = try registry.registerClaim(claim);
-            if (accepted) self.notifyProviderProjectionChanged();
+            if (accepted) {
+                const active = registry.activeClaimRegistrationByName(claim.name) orelse unreachable;
+                try oauth_mod.syncClaimProvider(self.allocator, active);
+                self.notifyProviderProjectionChanged();
+            }
             return accepted;
         }
         errdefer {
@@ -558,7 +564,10 @@ pub const ExtensionRunner = struct {
             defer self.allocator.free(name);
             defer self.allocator.free(owner_id);
             const removed = try registry.unregisterClaim(name, owner_id, self.generation);
-            if (removed) self.notifyProviderProjectionChanged();
+            if (removed) {
+                _ = oauth_mod.unregisterClaimProvider(name, owner_id, self.generation);
+                self.notifyProviderProjectionChanged();
+            }
             return removed;
         }
         errdefer {
@@ -579,6 +588,8 @@ pub const ExtensionRunner = struct {
             switch (op.*) {
                 .register => |claim| {
                     if (try registry.registerClaim(claim)) {
+                        const active = registry.activeClaimRegistrationByName(claim.name) orelse unreachable;
+                        try oauth_mod.syncClaimProvider(self.allocator, active);
                         projection_changed = true;
                     } else {
                         var rejected = claim;
@@ -587,6 +598,7 @@ pub const ExtensionRunner = struct {
                 },
                 .unregister => |claim| {
                     if (try registry.unregisterClaim(claim.name, claim.owner_id, self.generation)) {
+                        _ = oauth_mod.unregisterClaimProvider(claim.name, claim.owner_id, self.generation);
                         projection_changed = true;
                     }
                     var owned = claim;
@@ -849,8 +861,11 @@ test "bindRuntime rejects double-bind" {
     try std.testing.expectError(error.AlreadyBound, result);
 }
 
-test "bindRuntime replays queued providers and unbindRuntime revokes the generation" {
+test "bindRuntime replays queued providers, registers oauth claims, and unbindRuntime revokes the generation" {
     const allocator = std.testing.allocator;
+    oauth_mod.resetDynamicProvidersForTest();
+    defer oauth_mod.resetDynamicProvidersForTest();
+
     var runner = ExtensionRunner.init(allocator, 9);
     defer runner.deinit();
 
@@ -865,6 +880,8 @@ test "bindRuntime replays queued providers and unbindRuntime revokes the generat
         .name = try allocator.dupe(u8, "proxy"),
         .api = try allocator.dupe(u8, "anthropic-messages"),
         .base_url = try allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try allocator.dupe(u8, "Proxy Login"),
         .owner_id = try allocator.dupe(u8, "state-123"),
         .generation = runner.generation,
     });
@@ -885,9 +902,12 @@ test "bindRuntime replays queued providers and unbindRuntime revokes the generat
 
     try std.testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
     try std.testing.expectEqualStrings("proxy", provider_registry.get("anthropic-messages").?.getName());
+    try std.testing.expect(oauth_mod.findProvider("proxy") != null);
+    try std.testing.expect(oauth_mod.findProvider("anthropic-messages") == null);
 
     runner.unbindRuntime();
     try std.testing.expectEqualStrings("faux", provider_registry.get("anthropic-messages").?.getName());
+    try std.testing.expect(oauth_mod.findProvider("proxy") == null);
 }
 
 test "ExtensionRunner owns four empty registries on init" {

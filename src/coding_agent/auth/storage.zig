@@ -641,6 +641,45 @@ test "set/get round-trip with in-memory backend" {
     try std.testing.expect(!storage.has("anthropic"));
 }
 
+test "oauth-backed claim providers resolve auth by visible claim name only" {
+    const allocator = std.testing.allocator;
+    oauth_mod.resetDynamicProvidersForTest();
+    defer oauth_mod.resetDynamicProvidersForTest();
+
+    var claim = ai.provider.ClaimRegistration{
+        .name = try allocator.dupe(u8, "proxy"),
+        .api = try allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try allocator.dupe(u8, "Proxy Login"),
+        .owner_id = try allocator.dupe(u8, "state-123"),
+        .generation = 3,
+    };
+    defer claim.deinit(allocator);
+    try oauth_mod.syncClaimProvider(allocator, &claim);
+
+    var storage = try AuthStorage.inMemory(allocator, null);
+    defer storage.deinit();
+
+    storage.set("anthropic-messages", .{ .oauth = .{
+        .refresh = "delegate-refresh",
+        .access = "delegate-access",
+        .expires = std.time.milliTimestamp() + 60_000,
+        .extras = std.json.ObjectMap.init(allocator),
+    } });
+    try std.testing.expect(storage.getApiKey("proxy") == null);
+
+    storage.set("proxy", .{ .oauth = .{
+        .refresh = "proxy-refresh",
+        .access = "proxy-access",
+        .expires = std.time.milliTimestamp() + 60_000,
+        .extras = std.json.ObjectMap.init(allocator),
+    } });
+    const key = storage.getApiKey("proxy");
+    try std.testing.expect(key != null);
+    try std.testing.expectEqualStrings("proxy-access", key.?);
+}
+
 test "hasAuth checks all tiers" {
     const allocator = std.testing.allocator;
 

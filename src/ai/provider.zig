@@ -89,6 +89,8 @@ pub const ClaimRegistration = struct {
     base_url: []const u8,
     api_key: ?[]const u8 = null,
     headers: []const protocol.Header = &.{},
+    oauth_enabled: bool = false,
+    oauth_name: ?[]const u8 = null,
     owner_id: []const u8,
     generation: u64,
     models: []ClaimModelRegistration = &.{},
@@ -99,6 +101,7 @@ pub const ClaimRegistration = struct {
         allocator.free(self.base_url);
         if (self.api_key) |api_key| allocator.free(api_key);
         freeHeaders(allocator, self.headers);
+        if (self.oauth_name) |oauth_name| allocator.free(oauth_name);
         allocator.free(self.owner_id);
         for (self.models) |*model| model.deinit(allocator);
         if (self.models.len > 0) allocator.free(self.models);
@@ -535,6 +538,8 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
         .name = try testing.allocator.dupe(u8, "proxy-a"),
         .api = try testing.allocator.dupe(u8, "anthropic-messages"),
         .base_url = try testing.allocator.dupe(u8, "https://proxy-a.example"),
+        .oauth_enabled = true,
+        .oauth_name = try testing.allocator.dupe(u8, "Proxy Login"),
         .owner_id = try testing.allocator.dupe(u8, "ext-a"),
         .generation = 1,
         .models = first_models,
@@ -553,6 +558,8 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
     try testing.expectEqual(@as(usize, 2), reg.activeClaimCount());
     const active_first = reg.activeClaimRegistrationAt(0);
     try testing.expectEqualStrings("proxy-a", active_first.name);
+    try testing.expect(active_first.oauth_enabled);
+    try testing.expectEqualStrings("Proxy Login", active_first.oauth_name.?);
     try testing.expectEqual(@as(usize, 1), active_first.models.len);
     try testing.expectEqualStrings("claude-sonnet-4-20250514", active_first.models[0].id);
     try testing.expectEqualStrings("Claude 4 Sonnet", active_first.models[0].name);
