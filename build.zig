@@ -5,6 +5,19 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse (optimize != .Debug);
 
+    const generate_models = b.addExecutable(.{
+        .name = "generate-models",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/generate-models.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const generate_models_run = b.addRunArtifact(generate_models);
+    generate_models_run.stdio = .inherit;
+    generate_models_run.addArg(b.pathFromRoot("src/ai/models_generated.zig"));
+    b.step("generate-models", "Generate AI model catalog").dependOn(&generate_models_run.step);
+
     // ── executable ──────────────────────────────────────────────────────
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -72,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .name = "zi",
         .root_module = exe_mod,
     });
+    exe.step.dependOn(&generate_models_run.step);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -89,6 +103,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);
     const tests = b.addTest(.{ .root_module = test_mod });
+    tests.step.dependOn(&generate_models_run.step);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }
