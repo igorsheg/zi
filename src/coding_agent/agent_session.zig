@@ -341,7 +341,7 @@ pub const AgentSession = struct {
     pub fn getAvailableThinkingLevelsForModel(model: ai.protocol.Model) []const protocol.ThinkingLevel {
         return if (!model.reasoning)
             &.{.off}
-        else if (ai.protocol.supportsXhigh(model))
+        else if (ai.models.supportsXhigh(model))
             &.{ .off, .minimal, .low, .medium, .high, .xhigh }
         else
             &.{ .off, .minimal, .low, .medium, .high };
@@ -350,7 +350,7 @@ pub const AgentSession = struct {
     fn clampThinkingLevelForModel(level: protocol.ThinkingLevel, model: ai.protocol.Model) protocol.ThinkingLevel {
         if (!model.reasoning) return .off;
         return switch (level) {
-            .xhigh => if (ai.protocol.supportsXhigh(model)) .xhigh else .high,
+            .xhigh => if (ai.models.supportsXhigh(model)) .xhigh else .high,
             else => level,
         };
     }

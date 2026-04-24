@@ -54,6 +54,7 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const ai_models = @import("models.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const provider_failure = @import("provider_failure.zig");
@@ -107,7 +108,7 @@ pub const OpenAICompletionsProvider = struct {
         callback_ctx: ?*anyopaque,
     ) void {
         const self: *OpenAICompletionsProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options.base, protocol.clampReasoning(options.reasoning, model), callback, callback_ctx);
+        self.streamImpl(allocator, model, context, options.base, ai_models.clampReasoning(options.reasoning, model), callback, callback_ctx);
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
@@ -923,7 +924,7 @@ fn buildRequestJson(
 
     try jw.objectField("messages");
     try jw.beginArray();
-    try writeMessages(&jw, model, context);
+    try writeMessages(allocator, &jw, model, context);
     try jw.endArray();
 
     if (context.tools) |tools| {
@@ -995,7 +996,7 @@ fn buildRequestJson(
     out.* = allocating.toArrayList();
 }
 
-fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protocol.Context) !void {
+fn writeMessages(allocator: std.mem.Allocator, jw: *std.json.Stringify, model: protocol.Model, context: protocol.Context) !void {
     if (context.system_prompt) |sys| {
         try jw.beginObject();
         try jw.objectField("role");
@@ -1036,11 +1037,11 @@ fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protoc
                                     // Tiny helper allocation, freed before the field closes.
                                     // data:<mime>;base64,<data>
                                     const data_url = try std.fmt.allocPrint(
-                                        std.heap.page_allocator,
+                                        allocator,
                                         "data:{s};base64,{s}",
                                         .{ ic.mime_type, ic.data },
                                     );
-                                    defer std.heap.page_allocator.free(data_url);
+                                    defer allocator.free(data_url);
                                     try jw.write(data_url);
                                     try jw.endObject();
                                 },
@@ -1053,7 +1054,7 @@ fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protoc
                 try jw.endObject();
             },
             .assistant => |a| {
-                try writeAssistantMessage(jw, a);
+                try writeAssistantMessage(allocator, jw, a);
             },
             .tool_result => |tr| {
                 try jw.beginObject();
@@ -1065,10 +1066,10 @@ fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protoc
                 // Concatenate text content blocks. Tiny scratch buffer,
                 // freed before return.
                 var concat: std.ArrayListUnmanaged(u8) = .empty;
-                defer concat.deinit(std.heap.page_allocator);
+                defer concat.deinit(allocator);
                 for (tr.content) |cb| {
                     switch (cb) {
-                        .text => |t| try concat.appendSlice(std.heap.page_allocator, t.text),
+                        .text => |t| try concat.appendSlice(allocator, t.text),
                         .image => {}, // skipped: phase 3a doesn't ship images-in-tool-results
                     }
                 }
@@ -1084,7 +1085,7 @@ fn writeMessages(jw: *std.json.Stringify, model: protocol.Model, context: protoc
     _ = model;
 }
 
-fn writeAssistantMessage(jw: *std.json.Stringify, a: protocol.AssistantMessage) !void {
+fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, a: protocol.AssistantMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("assistant");
@@ -1093,10 +1094,10 @@ fn writeAssistantMessage(jw: *std.json.Stringify, a: protocol.AssistantMessage) 
     // join("") which is just byte concatenation. Tiny scratch buffer,
     // freed before return.
     var text_concat: std.ArrayListUnmanaged(u8) = .empty;
-    defer text_concat.deinit(std.heap.page_allocator);
+    defer text_concat.deinit(allocator);
     for (a.content) |b| {
         switch (b) {
-            .text => |tc| if (tc.text.len > 0) try text_concat.appendSlice(std.heap.page_allocator, tc.text),
+            .text => |tc| if (tc.text.len > 0) try text_concat.appendSlice(allocator, tc.text),
             else => {},
         }
     }
@@ -1131,7 +1132,7 @@ fn writeAssistantMessage(jw: *std.json.Stringify, a: protocol.AssistantMessage) 
             try jw.objectField("arguments");
             // Stringify the JSON value as a string field. Tiny scratch
             // buffer, freed before return.
-            var args_buf: std.io.Writer.Allocating = .init(std.heap.page_allocator);
+            var args_buf: std.io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
             var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
             try inner.write(tc.arguments);

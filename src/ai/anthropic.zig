@@ -2,6 +2,7 @@ const AbortSignal = @import("../abort_signal.zig").AbortSignal;
 const AbortGuard = @import("../abort_guard.zig").AbortGuard;
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const ai_models = @import("models.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const provider_failure = @import("provider_failure.zig");
@@ -43,7 +44,7 @@ pub const AnthropicProvider = struct {
 
     fn streamSimpleImplWrapper(ptr: *anyopaque, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.SimpleStreamOptions, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options.base, protocol.clampReasoning(options.reasoning, model), options.thinking_budgets, callback, callback_ctx);
+        self.streamImpl(allocator, model, context, options.base, ai_models.clampReasoning(options.reasoning, model), options.thinking_budgets, callback, callback_ctx);
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {

@@ -14,13 +14,14 @@
 //! token and sends it as the `chatgpt-account-id` request header.
 //! Also sends `originator: pi` and `OpenAI-Beta: responses=experimental`.
 //!
-//! Intentionally NOT ported:
-//!   - websocket transport (`responses_websockets=2026-02-06` beta)
-//!   - reasoning effort clamping (tracked as zi-imj)
+//! Transport: `null`, `auto`, and `sse` use the SSE `/codex/responses`
+//! endpoint. `websocket` fails explicitly; the ChatGPT websocket beta is not
+//! implemented in this provider.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
+const ai_models = @import("models.zig");
 const ai_provider = @import("provider.zig");
 const core = @import("openai_responses_core.zig");
 
@@ -53,6 +54,8 @@ pub const OpenAICodexProvider = struct {
         callback_ctx: ?*anyopaque,
     ) void {
         _ = ptr;
+        if (!acceptCodexTransport(allocator, model, options.transport, callback, callback_ctx)) return;
+
         // Scratch arena for JWT decode; outlives streamCore (synchronous).
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
@@ -83,6 +86,8 @@ pub const OpenAICodexProvider = struct {
         callback_ctx: ?*anyopaque,
     ) void {
         _ = ptr;
+        if (!acceptCodexTransport(allocator, model, options.base.transport, callback, callback_ctx)) return;
+
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
@@ -91,7 +96,7 @@ pub const OpenAICodexProvider = struct {
         const user_agent = buildUserAgent(scratch.allocator()) catch "pi (zig)";
         const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent, options.base.session_id);
 
-        const clamped = protocol.clampReasoning(options.reasoning, model);
+        const clamped = ai_models.clampReasoning(options.reasoning, model);
         const effort: ?[]const u8 = if (clamped) |l|
             clampCodexReasoningEffort(model.id, protocol.thinkingLevelToString(l))
         else
@@ -116,6 +121,30 @@ pub const OpenAICodexProvider = struct {
 
     fn deinitImpl(_: *anyopaque) void {}
 };
+
+fn acceptCodexTransport(
+    allocator: std.mem.Allocator,
+    model: protocol.Model,
+    transport: ?protocol.Transport,
+    callback: ai_provider.EventCallback,
+    callback_ctx: ?*anyopaque,
+) bool {
+    switch (transport orelse .auto) {
+        .auto, .sse => return true,
+        .websocket => {
+            core.emitFailure(
+                allocator,
+                callback,
+                callback_ctx,
+                model,
+                "openai-codex-responses",
+                .{ .kind = .invalid_request },
+                "websocket transport is not supported by openai-codex-responses; use sse or auto",
+            );
+            return false;
+        },
+    }
+}
 
 /// Codex-specific request body builder. Passed to `CoreOptions.build_request`
 /// so the shared core uses it instead of `buildRequestJson`.
@@ -333,6 +362,60 @@ test "fillCodexHeaders matches the codex-required header set" {
     try testing.expectEqualStrings("session_id", headers[5].key);
     try testing.expectEqualStrings("session-abc", headers[5].value);
 }
+
+test "Codex provider rejects websocket transport before auth" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const model = protocol.Model{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
+    const ctx = protocol.Context{ .messages = &.{msg} };
+    var provider = OpenAICodexProvider.init(alloc);
+    var captured = ErrorCapture{};
+
+    provider.provider().stream(
+        alloc,
+        model,
+        ctx,
+        .{ .transport = .websocket },
+        ErrorCapture.callback,
+        &captured,
+    );
+
+    try testing.expect(captured.seen);
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, captured.failure_kind.?);
+    try testing.expect(std.mem.indexOf(u8, captured.message.?, "websocket transport is not supported") != null);
+}
+
+const ErrorCapture = struct {
+    seen: bool = false,
+    failure_kind: ?protocol.NormalizedFailure.Kind = null,
+    message: ?[]const u8 = null,
+
+    fn callback(event: protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
+        const self: *ErrorCapture = @ptrCast(@alignCast(ctx.?));
+        switch (event) {
+            .@"error" => |err| {
+                self.seen = true;
+                self.failure_kind = if (err.@"error".failure) |failure| failure.kind else null;
+                self.message = err.@"error".error_message;
+            },
+            else => {},
+        }
+    }
+};
 
 test "buildCodexRequestJson includes prompt_cache_key when session_id is set" {
     const alloc = testing.allocator;

@@ -218,8 +218,18 @@ const BaseUrlClaimProvider = struct {
 /// API registry — active projection keyed by Api identifier, with a
 /// separate name-keyed claim layer for extension-owned overrides.
 pub const Registry = struct {
+    const BaselineRegistration = struct {
+        provider: Provider,
+        source_id: ?[]const u8,
+
+        fn deinit(self: *BaselineRegistration, allocator: std.mem.Allocator) void {
+            if (self.source_id) |source_id| allocator.free(source_id);
+            self.* = undefined;
+        }
+    };
+
     providers: std.StringHashMap(Provider),
-    baseline: std.StringHashMap(Provider),
+    baseline: std.StringHashMap(BaselineRegistration),
     claim_index: std.StringHashMap(std.ArrayListUnmanaged(usize)),
     claims: std.ArrayListUnmanaged(Claim) = .empty,
     allocator: std.mem.Allocator,
@@ -227,7 +237,7 @@ pub const Registry = struct {
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{
             .providers = std.StringHashMap(Provider).init(allocator),
-            .baseline = std.StringHashMap(Provider).init(allocator),
+            .baseline = std.StringHashMap(BaselineRegistration).init(allocator),
             .claim_index = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(allocator),
             .allocator = allocator,
         };
@@ -236,6 +246,7 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry) void {
         self.providers.deinit();
         self.clearClaims();
+        self.clearBaseline();
         self.baseline.deinit();
 
         var it = self.claim_index.iterator();
@@ -247,24 +258,41 @@ pub const Registry = struct {
     }
 
     /// Register a built-in / baseline provider for an API identifier.
+    /// The registry owns duplicated `api` and `source_id` metadata, but not `prov`.
     pub fn register(self: *Registry, api: []const u8, prov: Provider, source_id: ?[]const u8) !void {
-        _ = source_id;
-        try self.baseline.put(api, prov);
+        const owned_api = try self.allocator.dupe(u8, api);
+        var api_transferred = false;
+        errdefer if (!api_transferred) self.allocator.free(owned_api);
+        const owned_source_id = if (source_id) |source| try self.allocator.dupe(u8, source) else null;
+        var source_transferred = false;
+        errdefer if (!source_transferred) if (owned_source_id) |source| self.allocator.free(source);
+
+        const entry = try self.baseline.getOrPut(owned_api);
+        if (entry.found_existing) {
+            self.allocator.free(owned_api);
+            api_transferred = true;
+            entry.value_ptr.deinit(self.allocator);
+        } else {
+            api_transferred = true;
+        }
+        entry.value_ptr.* = .{ .provider = prov, .source_id = owned_source_id };
+        source_transferred = true;
         try self.rebuildProjection();
     }
 
     pub fn registerClaim(self: *Registry, registration: ClaimRegistration) !bool {
-        const delegate = self.baseline.get(registration.api) orelse return error.UnknownApi;
-        var claim = try Claim.init(self.allocator, registration, delegate);
-        errdefer claim.deinit(self.allocator);
+        const delegate_registration = self.baseline.get(registration.api) orelse return error.UnknownApi;
 
-        if (self.claim_index.getPtr(claim.registration.name)) |bucket| {
+        if (self.claim_index.getPtr(registration.name)) |bucket| {
             if (bucket.items.len > 0) {
                 const winner = &self.claims.items[bucket.items[0]];
-                if (!std.mem.eql(u8, winner.registration.owner_id, claim.registration.owner_id)) {
+                if (!std.mem.eql(u8, winner.registration.owner_id, registration.owner_id)) {
                     return false;
                 }
             }
+
+            var claim = try Claim.init(self.allocator, registration, delegate_registration.provider);
+            errdefer claim.deinit(self.allocator);
 
             const idx = self.claims.items.len;
             try self.claims.append(self.allocator, claim);
@@ -274,6 +302,9 @@ pub const Registry = struct {
             try self.rebuildProjection();
             return true;
         }
+
+        var claim = try Claim.init(self.allocator, registration, delegate_registration.provider);
+        errdefer claim.deinit(self.allocator);
 
         const idx = self.claims.items.len;
         try self.claims.append(self.allocator, claim);
@@ -361,7 +392,8 @@ pub const Registry = struct {
         if (self.claimByName(provider_name)) |claim| {
             if (std.mem.eql(u8, claim.registration.api, api)) return claim.provider;
         }
-        return self.baseline.get(api) orelse self.providers.get(api);
+        if (self.baseline.get(api)) |registration| return registration.provider;
+        return self.providers.get(api);
     }
 
     pub fn activeClaimCount(self: *const Registry) usize {
@@ -377,8 +409,26 @@ pub const Registry = struct {
         return &claim.registration;
     }
 
-    /// Unregister all providers with a given source_id.
+    /// Unregister all providers and claims with a given source_id.
     pub fn unregisterBySource(self: *Registry, source_id: []const u8) void {
+        var baseline_removed = false;
+        while (true) {
+            var remove_key: ?[]const u8 = null;
+            var baseline_it = self.baseline.iterator();
+            while (baseline_it.next()) |entry| {
+                const entry_source = entry.value_ptr.source_id orelse continue;
+                if (std.mem.eql(u8, entry_source, source_id)) {
+                    remove_key = entry.key_ptr.*;
+                    break;
+                }
+            }
+            const key = remove_key orelse break;
+            var removed = self.baseline.fetchRemove(key) orelse unreachable;
+            removed.value.deinit(self.allocator);
+            self.allocator.free(removed.key);
+            baseline_removed = true;
+        }
+
         var i: usize = 0;
         var removed_any = false;
         while (i < self.claims.items.len) {
@@ -404,6 +454,8 @@ pub const Registry = struct {
         }
         if (removed_any) {
             self.reindexClaimsFrom(0) catch {};
+        }
+        if (removed_any or baseline_removed) {
             self.rebuildProjection() catch {};
         }
     }
@@ -426,12 +478,22 @@ pub const Registry = struct {
     pub fn clear(self: *Registry) void {
         self.providers.clearRetainingCapacity();
         self.clearClaims();
+        self.clearBaseline();
+    }
+
+    fn clearBaseline(self: *Registry) void {
+        var it = self.baseline.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.baseline.clearRetainingCapacity();
     }
 
     fn clearClaims(self: *Registry) void {
         for (self.claims.items) |*claim| claim.deinit(self.allocator);
         self.claims.deinit(self.allocator);
+        self.claims = .empty;
 
         var it = self.claim_index.iterator();
         while (it.next()) |entry| {
@@ -474,7 +536,7 @@ pub const Registry = struct {
 
         var baseline_it = self.baseline.iterator();
         while (baseline_it.next()) |entry| {
-            try self.providers.put(entry.key_ptr.*, entry.value_ptr.*);
+            try self.providers.put(entry.key_ptr.*, entry.value_ptr.provider);
         }
         for (self.claims.items) |claim| {
             try self.providers.put(claim.registration.api, claim.provider);
@@ -672,6 +734,59 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
     try testing.expectEqualStrings("https://baseline.example", baseline.last_base_url.?);
 
     baseline.provider().deinit();
+}
+
+test "Registry owns heap-allocated baseline identifiers and replacement metadata" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    const first = try RecordingProvider.create(testing.allocator, "first");
+    defer first.provider().deinit();
+    const second = try RecordingProvider.create(testing.allocator, "second");
+    defer second.provider().deinit();
+
+    const api = try testing.allocator.dupe(u8, "dynamic-api");
+    const first_source = try testing.allocator.dupe(u8, "source-one");
+    try reg.register(api, first.provider(), first_source);
+    testing.allocator.free(api);
+    testing.allocator.free(first_source);
+
+    try testing.expectEqualStrings("first", reg.get("dynamic-api").?.getName());
+
+    const replacement_api = try testing.allocator.dupe(u8, "dynamic-api");
+    const second_source = try testing.allocator.dupe(u8, "source-two");
+    try reg.register(replacement_api, second.provider(), second_source);
+    testing.allocator.free(replacement_api);
+    testing.allocator.free(second_source);
+
+    try testing.expectEqualStrings("second", reg.get("dynamic-api").?.getName());
+    reg.unregisterBySource("source-one");
+    try testing.expect(reg.get("dynamic-api") != null);
+    reg.unregisterBySource("source-two");
+    try testing.expect(reg.get("dynamic-api") == null);
+}
+
+test "Registry clear frees owned baseline and claim metadata" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    const baseline = try RecordingProvider.create(testing.allocator, "baseline");
+    defer baseline.provider().deinit();
+    try reg.register("anthropic-messages", baseline.provider(), "builtin-test");
+
+    try testing.expect(try reg.registerClaim(.{
+        .name = try testing.allocator.dupe(u8, "proxy-clear"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://clear.example"),
+        .owner_id = try testing.allocator.dupe(u8, "ext-clear"),
+        .generation = 1,
+    }));
+    try testing.expectEqual(@as(usize, 1), reg.activeClaimCount());
+
+    reg.clear();
+
+    try testing.expectEqual(@as(usize, 0), reg.activeClaimCount());
+    try testing.expect(reg.get("anthropic-messages") == null);
 }
 
 test "Registry resolves provider claims by provider name before api projection" {

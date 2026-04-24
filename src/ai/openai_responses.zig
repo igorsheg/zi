@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const ai_models = @import("models.zig");
 const ai_provider = @import("provider.zig");
 const core = @import("openai_responses_core.zig");
 
@@ -65,7 +66,7 @@ pub const OpenAIResponsesProvider = struct {
         callback_ctx: ?*anyopaque,
     ) void {
         _ = ptr;
-        const clamped = protocol.clampReasoning(options.reasoning, model);
+        const clamped = ai_models.clampReasoning(options.reasoning, model);
         const effort: ?[]const u8 = if (clamped) |l| protocol.thinkingLevelToString(l) else null;
         core.streamCore(allocator, model, context, options.base, .{
             .path = "/v1/responses",

@@ -58,6 +58,13 @@ pub fn supportsXhigh(model: protocol.Model) bool {
     return false;
 }
 
+/// Clamp xhigh → high for models that don't support it.
+pub fn clampReasoning(level: ?protocol.ThinkingLevel, model: protocol.Model) ?protocol.ThinkingLevel {
+    const l = level orelse return null;
+    if (l == .xhigh and !supportsXhigh(model)) return .high;
+    return l;
+}
+
 /// Check if two models are equal by id and provider.
 pub fn modelsAreEqual(a: ?protocol.Model, b: ?protocol.Model) bool {
     const ma = a orelse return false;
@@ -67,7 +74,6 @@ pub fn modelsAreEqual(a: ?protocol.Model, b: ?protocol.Model) bool {
 
 /// Total number of models in the catalog.
 pub const model_count = generated.models.len;
-
 
 test "find anthropic sonnet by id" {
     const m = getModelById("claude-sonnet-4-20250514") orelse
