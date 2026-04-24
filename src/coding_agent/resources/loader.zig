@@ -33,6 +33,7 @@ pub const ResourceLoader = struct {
     extended_skill_paths: []types.ResourcePath,
     extended_prompt_paths: []types.ResourcePath,
     extended_theme_paths: []types.ResourcePath,
+    extended_agents_paths: []types.ResourcePath,
 
     /// Canonical ordered extension roots used for discovery.
     /// Persisted so consumers can build shared `lua/` search paths.
@@ -86,6 +87,7 @@ pub const ResourceLoader = struct {
             .extended_skill_paths = &.{},
             .extended_prompt_paths = &.{},
             .extended_theme_paths = &.{},
+            .extended_agents_paths = &.{},
             .extension_roots = &.{},
         };
         errdefer self.deinit();
@@ -105,6 +107,7 @@ pub const ResourceLoader = struct {
         freeResourcePaths(self.allocator, self.extended_skill_paths);
         freeResourcePaths(self.allocator, self.extended_prompt_paths);
         freeResourcePaths(self.allocator, self.extended_theme_paths);
+        freeResourcePaths(self.allocator, self.extended_agents_paths);
     }
 
     pub fn getExtensions(self: *const ResourceLoader) types.LoadedExtensions {
@@ -149,11 +152,27 @@ pub const ResourceLoader = struct {
     }
 
     pub fn extendResources(self: *ResourceLoader, paths: types.ResourceExtensionPaths) !void {
+        const root_skill_paths = try runtimeRootAnchorPaths(self.allocator, paths.runtime_root_paths, "skills");
+        defer freeBorrowedMetadataResourcePaths(self.allocator, root_skill_paths);
+        const root_prompt_paths = try runtimeRootAnchorPaths(self.allocator, paths.runtime_root_paths, "prompts");
+        defer freeBorrowedMetadataResourcePaths(self.allocator, root_prompt_paths);
+        const root_theme_paths = try runtimeRootAnchorPaths(self.allocator, paths.runtime_root_paths, "themes");
+        defer freeBorrowedMetadataResourcePaths(self.allocator, root_theme_paths);
+        const root_agents_paths = try runtimeRootAnchorPaths(self.allocator, paths.runtime_root_paths, "agents");
+        defer freeBorrowedMetadataResourcePaths(self.allocator, root_agents_paths);
+
+        self.extended_skill_paths = try mergeResourcePaths(self.allocator, self.extended_skill_paths, root_skill_paths);
         self.extended_skill_paths = try mergeResourcePaths(self.allocator, self.extended_skill_paths, paths.skill_paths);
+        self.extended_prompt_paths = try mergeResourcePaths(self.allocator, self.extended_prompt_paths, root_prompt_paths);
         self.extended_prompt_paths = try mergeResourcePaths(self.allocator, self.extended_prompt_paths, paths.prompt_paths);
+        self.extended_theme_paths = try mergeResourcePaths(self.allocator, self.extended_theme_paths, root_theme_paths);
         self.extended_theme_paths = try mergeResourcePaths(self.allocator, self.extended_theme_paths, paths.theme_paths);
+        self.extended_agents_paths = try mergeResourcePaths(self.allocator, self.extended_agents_paths, root_agents_paths);
+        self.extended_agents_paths = try mergeResourcePaths(self.allocator, self.extended_agents_paths, paths.agents_paths);
         try self.reloadSkills();
+        try self.reloadPrompts();
         try self.reloadThemes();
+        try self.reloadAgents();
     }
 
     pub fn reload(self: *ResourceLoader) !void {
@@ -161,6 +180,7 @@ pub const ResourceLoader = struct {
 
         try self.reloadExtensions();
         try self.reloadSkills();
+        try self.reloadPrompts();
         try self.reloadThemes();
 
         self.system_prompt = if (self.system_prompt_source) |source|
@@ -173,7 +193,7 @@ pub const ResourceLoader = struct {
         else
             &.{};
 
-        self.agents_files = try loadAgentsFiles(self.allocator, self.cwd, self.agent_dir, self.injected_agents_files);
+        try self.reloadAgents();
     }
 
     fn reloadExtensions(self: *ResourceLoader) !void {
@@ -220,6 +240,46 @@ pub const ResourceLoader = struct {
             .diagnostics = try copyDiagnostics(self.allocator, loaded.diagnostics),
         };
         try applyExtendedSkillMetadata(self.allocator, self.skills.skills, self.extended_skill_paths);
+    }
+
+    fn reloadPrompts(self: *ResourceLoader) !void {
+        freeLoadedPrompts(self.allocator, self.prompts.prompts);
+        freeDiagnostics(self.allocator, self.prompts.diagnostics);
+        self.prompts = .{};
+
+        var prompts: std.ArrayListUnmanaged(types.PromptTemplate) = .empty;
+        errdefer freeLoadedPrompts(self.allocator, prompts.items);
+        var diagnostics: std.ArrayListUnmanaged(types.ResourceDiagnostic) = .empty;
+        errdefer freeDiagnostics(self.allocator, diagnostics.items);
+
+        const global_dir = try std.fs.path.join(self.allocator, &.{ self.agent_dir, "prompts" });
+        defer self.allocator.free(global_dir);
+        try loadPromptsFromPath(self, global_dir, .{ .source = "local", .scope = .user, .origin = .top_level, .base_dir = global_dir }, &prompts, &diagnostics);
+
+        const project_dir_root = try storage.getProjectDir(self.allocator, self.cwd);
+        defer self.allocator.free(project_dir_root);
+        const project_prompts_dir = try std.fs.path.join(self.allocator, &.{ project_dir_root, "prompts" });
+        defer self.allocator.free(project_prompts_dir);
+        try loadPromptsFromPath(self, project_prompts_dir, .{ .source = "local", .scope = .project, .origin = .top_level, .base_dir = project_prompts_dir }, &prompts, &diagnostics);
+
+        if (self.settings_manager) |settings| {
+            if (settings.getPromptTemplatePaths()) |paths| {
+                for (paths) |path| {
+                    const resolved = resolveResourcePath(self.allocator, self.cwd, path) catch continue;
+                    defer self.allocator.free(resolved);
+                    try loadPromptsFromPath(self, resolved, .{ .source = "settings", .scope = .temporary, .origin = .top_level, .base_dir = resolved }, &prompts, &diagnostics);
+                }
+            }
+        }
+
+        for (self.extended_prompt_paths) |entry| {
+            try loadPromptsFromPath(self, entry.path, entry.metadata, &prompts, &diagnostics);
+        }
+
+        self.prompts = .{
+            .prompts = try prompts.toOwnedSlice(self.allocator),
+            .diagnostics = try diagnostics.toOwnedSlice(self.allocator),
+        };
     }
 
     fn reloadThemes(self: *ResourceLoader) !void {
@@ -283,6 +343,12 @@ pub const ResourceLoader = struct {
         };
     }
 
+    fn reloadAgents(self: *ResourceLoader) !void {
+        freeAgentsFiles(self.allocator, self.agents_files);
+        self.agents_files = &.{};
+        self.agents_files = try loadAgentsFiles(self.allocator, self.cwd, self.agent_dir, self.injected_agents_files, self.extended_agents_paths);
+    }
+
     fn clearLoadedState(self: *ResourceLoader) void {
         freeStaticExtensionRoots(self.allocator, self.extension_roots);
         self.extension_roots = &.{};
@@ -292,6 +358,10 @@ pub const ResourceLoader = struct {
         freeLoadedSkills(self.allocator, self.skills.skills);
         freeDiagnostics(self.allocator, self.skills.diagnostics);
         self.skills = .{};
+
+        freeLoadedPrompts(self.allocator, self.prompts.prompts);
+        freeDiagnostics(self.allocator, self.prompts.diagnostics);
+        self.prompts = .{};
 
         freeLoadedThemes(self.allocator, self.themes.themes);
         freeDiagnostics(self.allocator, self.themes.diagnostics);
@@ -600,6 +670,7 @@ fn loadAgentsFiles(
     cwd: []const u8,
     agent_dir: []const u8,
     injected_agents_files: []const types.AgentsFile,
+    extended_agents_paths: []const types.ResourcePath,
 ) ![]types.AgentsFile {
     var files: std.ArrayListUnmanaged(types.AgentsFile) = .empty;
     errdefer {
@@ -650,7 +721,53 @@ fn loadAgentsFiles(
         try appendUniqueAgentsFile(allocator, &files, &seen_paths, duped);
     }
 
+    for (extended_agents_paths) |entry| {
+        try loadAgentsFilesFromPath(allocator, entry.path, &files, &seen_paths);
+    }
+
     return try files.toOwnedSlice(allocator);
+}
+
+fn loadAgentsFilesFromPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    files: *std.ArrayListUnmanaged(types.AgentsFile),
+    seen_paths: *std.StringHashMapUnmanaged(void),
+) !void {
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        try loadAgentsMdFile(allocator, path, entry.name, files, seen_paths);
+    }
+}
+
+fn loadAgentsMdFile(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    filename: []const u8,
+    files: *std.ArrayListUnmanaged(types.AgentsFile),
+    seen_paths: *std.StringHashMapUnmanaged(void),
+) !void {
+    const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
+    errdefer allocator.free(file_path);
+    const file = std.fs.openFileAbsolute(file_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            allocator.free(file_path);
+            return;
+        },
+        else => return err,
+    };
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    errdefer allocator.free(content);
+    try appendUniqueAgentsFile(allocator, files, seen_paths, .{ .path = file_path, .content = content });
 }
 
 fn appendUniqueAgentsFile(
@@ -670,25 +787,29 @@ fn appendUniqueAgentsFile(
 fn loadContextFileFromDir(allocator: std.mem.Allocator, dir: []const u8) !?types.AgentsFile {
     const candidates = [_][]const u8{ "AGENTS.md", "CLAUDE.md" };
     for (candidates) |filename| {
-        const path = try std.fs.path.join(allocator, &.{ dir, filename });
-        errdefer allocator.free(path);
-
-        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                allocator.free(path);
-                continue;
-            },
-            else => {
-                allocator.free(path);
-                continue;
-            },
-        };
-        defer file.close();
-
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-        return .{ .path = path, .content = content };
+        if (try loadContextFileCandidate(allocator, dir, filename)) |file| return file;
     }
     return null;
+}
+
+fn loadContextFileCandidate(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8) !?types.AgentsFile {
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
+    errdefer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            allocator.free(path);
+            return null;
+        },
+        else => {
+            allocator.free(path);
+            return null;
+        },
+    };
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    return .{ .path = path, .content = content };
 }
 
 fn copyLoadedExtensions(
@@ -795,6 +916,24 @@ fn freeLoadedSkill(allocator: std.mem.Allocator, skill: types.Skill) void {
     if (skill.source_info.base_dir) |base_dir| allocator.free(base_dir);
 }
 
+fn freeSourceInfo(allocator: std.mem.Allocator, source_info: types.SourceInfo) void {
+    allocator.free(source_info.path);
+    allocator.free(source_info.source);
+    if (source_info.base_dir) |base_dir| allocator.free(base_dir);
+}
+
+fn freeLoadedPrompts(allocator: std.mem.Allocator, loaded: []const types.PromptTemplate) void {
+    for (loaded) |prompt| freeLoadedPrompt(allocator, prompt);
+    if (loaded.len > 0) allocator.free(loaded);
+}
+
+fn freeLoadedPrompt(allocator: std.mem.Allocator, prompt: types.PromptTemplate) void {
+    allocator.free(prompt.name);
+    allocator.free(prompt.path);
+    allocator.free(prompt.content);
+    if (prompt.source_info) |source_info| freeSourceInfo(allocator, source_info);
+}
+
 fn freeLoadedThemes(allocator: std.mem.Allocator, loaded: []const types.Theme) void {
     for (loaded) |theme| freeLoadedTheme(allocator, theme);
     if (loaded.len > 0) allocator.free(loaded);
@@ -831,6 +970,105 @@ fn appendBuiltinTheme(
             .origin = .top_level,
         },
     });
+}
+
+fn ownedSourceInfo(allocator: std.mem.Allocator, path: []const u8, metadata: types.PathMetadata) !types.SourceInfo {
+    const owned_path = try allocator.dupe(u8, path);
+    const owned_source = allocator.dupe(u8, metadata.source) catch |err| {
+        allocator.free(owned_path);
+        return err;
+    };
+    var source_info: types.SourceInfo = .{
+        .path = owned_path,
+        .source = owned_source,
+        .scope = metadata.scope,
+        .origin = metadata.origin,
+        .base_dir = null,
+    };
+    errdefer freeSourceInfo(allocator, source_info);
+    source_info.base_dir = if (metadata.base_dir) |base_dir| try allocator.dupe(u8, base_dir) else null;
+    return source_info;
+}
+
+fn loadPromptsFromPath(
+    self: *ResourceLoader,
+    path: []const u8,
+    metadata: types.PathMetadata,
+    prompts: *std.ArrayListUnmanaged(types.PromptTemplate),
+    diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
+) !void {
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |dir_err| switch (dir_err) {
+        error.FileNotFound => return,
+        error.NotDir => {
+            if (!std.mem.endsWith(u8, path, ".md")) return;
+            try loadPromptFromFile(self.allocator, path, metadata, prompts, diagnostics);
+            return;
+        },
+        else => return dir_err,
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        const file_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
+        defer self.allocator.free(file_path);
+        try loadPromptFromFile(self.allocator, file_path, metadata, prompts, diagnostics);
+    }
+}
+
+fn loadPromptFromFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    metadata: types.PathMetadata,
+    prompts: *std.ArrayListUnmanaged(types.PromptTemplate),
+    diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
+) !void {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+        try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to open prompt file: {s}", .{@errorName(err)}), path));
+        return;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to read prompt file: {s}", .{@errorName(err)}), path));
+        return;
+    };
+    errdefer allocator.free(content);
+
+    const basename = std.fs.path.basename(path);
+    const name = if (std.mem.endsWith(u8, basename, ".md")) basename[0 .. basename.len - 3] else basename;
+    const owned_name = try allocator.dupe(u8, name);
+    const owned_path = allocator.dupe(u8, path) catch |err| {
+        allocator.free(owned_name);
+        return err;
+    };
+    var prompt: types.PromptTemplate = .{
+        .name = owned_name,
+        .path = owned_path,
+        .content = content,
+        .source_info = null,
+    };
+    errdefer freeLoadedPrompt(allocator, prompt);
+    prompt.source_info = try ownedSourceInfo(allocator, path, metadata);
+    try appendPromptUnique(allocator, prompts, diagnostics, prompt);
+}
+
+fn appendPromptUnique(
+    allocator: std.mem.Allocator,
+    prompts: *std.ArrayListUnmanaged(types.PromptTemplate),
+    diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
+    prompt: types.PromptTemplate,
+) !void {
+    for (prompts.items) |existing| {
+        if (std.mem.eql(u8, existing.name, prompt.name)) {
+            try diagnostics.append(allocator, try promptCollisionDiagnostic(allocator, existing, prompt));
+            freeLoadedPrompt(allocator, prompt);
+            return;
+        }
+    }
+    try prompts.append(allocator, prompt);
 }
 
 fn loadThemesFromPath(
@@ -921,6 +1159,22 @@ fn appendThemeUnique(
     }
 
     try themes.append(allocator, theme);
+}
+
+fn promptCollisionDiagnostic(allocator: std.mem.Allocator, winner: types.PromptTemplate, loser: types.PromptTemplate) !types.ResourceDiagnostic {
+    return .{
+        .kind = .collision,
+        .message = try std.fmt.allocPrint(allocator, "name \"{s}\" collision", .{loser.name}),
+        .path = try allocator.dupe(u8, loser.path),
+        .collision = .{
+            .resource_type = .prompt,
+            .name = try allocator.dupe(u8, loser.name),
+            .winner_path = try allocator.dupe(u8, winner.path),
+            .loser_path = try allocator.dupe(u8, loser.path),
+            .winner_source = if (winner.source_info) |info| try allocator.dupe(u8, info.source) else null,
+            .loser_source = if (loser.source_info) |info| try allocator.dupe(u8, info.source) else null,
+        },
+    };
 }
 
 fn collisionDiagnostic(allocator: std.mem.Allocator, winner: types.Theme, loser: types.Theme) !types.ResourceDiagnostic {
@@ -1107,6 +1361,38 @@ fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) voi
     if (values.len > 0) allocator.free(values);
 }
 
+fn runtimeRootAnchorPaths(
+    allocator: std.mem.Allocator,
+    roots: []const types.ResourcePath,
+    anchor: []const u8,
+) ![]types.ResourcePath {
+    if (roots.len == 0) return &.{};
+    const out = try allocator.alloc(types.ResourcePath, roots.len);
+    var i: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < i) : (j += 1) allocator.free(out[j].path);
+        allocator.free(out);
+    }
+    while (i < roots.len) : (i += 1) {
+        out[i] = .{
+            .path = try std.fs.path.join(allocator, &.{ roots[i].path, anchor }),
+            .metadata = .{
+                .source = roots[i].metadata.source,
+                .scope = roots[i].metadata.scope,
+                .origin = roots[i].metadata.origin,
+                .base_dir = roots[i].path,
+            },
+        };
+    }
+    return out;
+}
+
+fn freeBorrowedMetadataResourcePaths(allocator: std.mem.Allocator, paths: []types.ResourcePath) void {
+    for (paths) |entry| allocator.free(entry.path);
+    if (paths.len > 0) allocator.free(paths);
+}
+
 fn mergeResourcePaths(
     allocator: std.mem.Allocator,
     existing: []types.ResourcePath,
@@ -1138,8 +1424,9 @@ fn mergeResourcePaths(
         });
     }
 
+    const result = try merged.toOwnedSlice(allocator);
     freeResourcePaths(allocator, existing);
-    return try merged.toOwnedSlice(allocator);
+    return result;
 }
 
 fn freeResourcePaths(allocator: std.mem.Allocator, paths: []types.ResourcePath) void {
@@ -1276,13 +1563,21 @@ test "resource loader resolves prompt inputs and discovers agents files" {
     try project_tmp.dir.writeFile(.{ .sub_path = "repo/nested/CLAUDE.md", .data = "nested rules" });
     try project_tmp.dir.writeFile(.{ .sub_path = "repo/nested/.zi/skills/project-skill/SKILL.md", .data = "---\ndescription: project help\n---\nbody\n" });
     try project_tmp.dir.writeFile(.{ .sub_path = "append.txt", .data = "append from file" });
+    try project_tmp.dir.makePath("derived-root/skills/root-skill");
+    try project_tmp.dir.makePath("derived-root/prompts");
+    try project_tmp.dir.makePath("derived-root/agents");
     try project_tmp.dir.writeFile(.{ .sub_path = "extra-skill.md", .data = "---\nname: extra-skill\ndescription: extra help\n---\nbody\n" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "derived-root/skills/root-skill/SKILL.md", .data = "---\ndescription: root help\n---\nbody\n" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "derived-root/prompts/root-prompt.md", .data = "root prompt body" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "derived-root/agents/root-agent.md", .data = "root agent rules" });
     const cwd = try project_tmp.dir.realpathAlloc(allocator, "repo/nested");
     defer allocator.free(cwd);
     const append_path = try project_tmp.dir.realpathAlloc(allocator, "append.txt");
     defer allocator.free(append_path);
     const extra_skill_path = try project_tmp.dir.realpathAlloc(allocator, "extra-skill.md");
     defer allocator.free(extra_skill_path);
+    const derived_root_path = try project_tmp.dir.realpathAlloc(allocator, "derived-root");
+    defer allocator.free(derived_root_path);
 
     var loader = try ResourceLoader.init(allocator, .{
         .cwd = cwd,
@@ -1315,6 +1610,14 @@ test "resource loader resolves prompt inputs and discovers agents files" {
     try std.testing.expect(saw_nested);
 
     try loader.extendResources(.{
+        .runtime_root_paths = &.{.{
+            .path = derived_root_path,
+            .metadata = .{
+                .source = "extension:root",
+                .scope = .temporary,
+                .origin = .top_level,
+            },
+        }},
         .skill_paths = &.{.{
             .path = extra_skill_path,
             .metadata = .{
@@ -1326,15 +1629,35 @@ test "resource loader resolves prompt inputs and discovers agents files" {
     });
 
     const loaded_skills = loader.getSkills().skills;
-    try std.testing.expectEqual(@as(usize, 3), loaded_skills.len);
+    try std.testing.expectEqual(@as(usize, 4), loaded_skills.len);
     var saw_extension_skill = false;
+    var saw_root_skill = false;
     for (loaded_skills) |skill| {
         if (std.mem.eql(u8, skill.name, "extra-skill")) {
             saw_extension_skill = true;
             try std.testing.expectEqualStrings("extension:test", skill.source_info.source);
         }
+        if (std.mem.eql(u8, skill.name, "root-skill")) {
+            saw_root_skill = true;
+            try std.testing.expectEqualStrings("extension:root", skill.source_info.source);
+            try std.testing.expectEqualStrings(derived_root_path, skill.source_info.base_dir.?);
+        }
     }
     try std.testing.expect(saw_extension_skill);
+    try std.testing.expect(saw_root_skill);
+
+    const loaded_prompts = loader.getPrompts().prompts;
+    try std.testing.expectEqual(@as(usize, 1), loaded_prompts.len);
+    try std.testing.expectEqualStrings("root-prompt", loaded_prompts[0].name);
+    try std.testing.expectEqualStrings("root prompt body", loaded_prompts[0].content);
+    try std.testing.expectEqualStrings("extension:root", loaded_prompts[0].source_info.?.source);
+
+    const extended_agents_files = loader.getPromptInputs().agents_files;
+    var saw_root_agent = false;
+    for (extended_agents_files) |file| {
+        if (std.mem.eql(u8, file.content, "root agent rules")) saw_root_agent = true;
+    }
+    try std.testing.expect(saw_root_agent);
 }
 
 test "builtin root is last in canonical extension root order" {

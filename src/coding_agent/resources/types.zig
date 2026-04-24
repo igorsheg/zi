@@ -72,9 +72,11 @@ pub const ResourcePath = struct {
 };
 
 pub const ResourceExtensionPaths = struct {
+    runtime_root_paths: []const ResourcePath = &.{},
     skill_paths: []const ResourcePath = &.{},
     prompt_paths: []const ResourcePath = &.{},
     theme_paths: []const ResourcePath = &.{},
+    agents_paths: []const ResourcePath = &.{},
 };
 
 pub const ExtensionSource = enum {
