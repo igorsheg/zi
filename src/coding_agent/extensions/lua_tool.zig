@@ -61,7 +61,7 @@ pub const LuaToolCtx = struct {
 /// Allocates: one `LuaToolCtx` from `allocator`. Caller does not
 /// need to free it explicitly — the runner generation owns it.
 pub fn buildAgentTool(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
     ext_tool: tool_registry.ToolDefinition,
 ) !agent_protocol.AgentTool {
@@ -69,7 +69,7 @@ pub fn buildAgentTool(
         .lua => |r| r,
         .builtin => return error.NotALuaTool,
     };
-    const ctx = try allocator.create(LuaToolCtx);
+    const ctx = try runner.hookAllocator().create(LuaToolCtx);
     ctx.* = .{
         .runner = runner,
         .lua_ref = lua_ref,
@@ -572,7 +572,6 @@ test "lua tool ctx exposes binding from tool provenance" {
 
     const ext_tool = runner.tool_registry.get("binding").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-    defer testing.allocator.destroy(@as(*LuaToolCtx, @ptrCast(@alignCast(tool.ctx.?))));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -592,7 +591,7 @@ test "lua tool ctx exposes binding from tool provenance" {
     try testing.expectEqualStrings("root-123", result.details.object.get("runtime_root_id").?.string);
     try testing.expectEqualStrings("state-123", result.details.object.get("state_owner_id").?.string);
     try testing.expectEqual(@as(i64, 7), result.details.object.get("generation_id").?.integer);
-    try testing.expectEqualStrings("state-123::7::/workspace", result.details.object.get("namespace_id").?.string);
+    try testing.expectEqualStrings("state-123::7", result.details.object.get("namespace_id").?.string);
     try testing.expectEqualStrings("/workspace", result.details.object.get("workspace_id").?.string);
     try testing.expectEqualStrings("session-123", result.details.object.get("session_id").?.string);
     try testing.expectEqualStrings("/workspace/.zi/sessions/session-123.jsonl", result.details.object.get("session_file").?.string);
@@ -618,7 +617,6 @@ test "lua tool returning a string produces a single text content block" {
 
     const ext_tool = runner.tool_registry.get("echo").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-    defer testing.allocator.destroy(@as(*LuaToolCtx, @ptrCast(@alignCast(tool.ctx.?))));
 
     var args_obj = std.json.ObjectMap.init(testing.allocator);
     defer args_obj.deinit();
@@ -667,7 +665,6 @@ test "lua tool returning content array with is_error=true surfaces both" {
 
     const ext_tool = runner.tool_registry.get("fail").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-    defer testing.allocator.destroy(@as(*LuaToolCtx, @ptrCast(@alignCast(tool.ctx.?))));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -707,7 +704,6 @@ test "lua tool with a runtime error returns is_error with the error message" {
 
     const ext_tool = runner.tool_registry.get("explode").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-    defer testing.allocator.destroy(@as(*LuaToolCtx, @ptrCast(@alignCast(tool.ctx.?))));
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

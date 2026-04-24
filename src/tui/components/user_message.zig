@@ -230,7 +230,9 @@ fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
         while (end > 0 and buf.get(end - 1, @intCast(row)).grapheme.codepoint == ' ') : (end -= 1) {}
         for (0..end) |col| {
             const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
-            try out.append(allocator, @intCast(cp));
+            var encoded: [4]u8 = undefined;
+            const n = try std.unicode.utf8Encode(cp, &encoded);
+            try out.appendSlice(allocator, encoded[0..n]);
         }
     }
 

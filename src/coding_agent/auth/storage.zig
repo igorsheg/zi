@@ -13,11 +13,22 @@ const log = std.log.scoped(.auth_storage);
 /// Zig port of pi-mono's AuthStorage class.
 /// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:184
 pub const AuthStorage = struct {
+    pub const ExtensionOAuthRefreshHook = struct {
+        func: *const fn (
+            provider: []const u8,
+            credential: types.OAuthCredential,
+            allocator: std.mem.Allocator,
+            ctx: ?*anyopaque,
+        ) oauth_mod.ExchangeResult,
+        ctx: ?*anyopaque = null,
+    };
+
     data: types.AuthStorageData,
     backend: file_backend.Backend,
     allocator: std.mem.Allocator,
     runtime_overrides: std.StringHashMap([]const u8),
     fallback_resolver: ?*const fn (provider: []const u8) ?[]const u8 = null,
+    extension_oauth_refresh_hook: ?ExtensionOAuthRefreshHook = null,
     load_error: bool = false,
     /// In-process mutex protecting `data`, `runtime_overrides`,
     /// `fallback_resolver`, and `load_error` (zi-wub.27).
@@ -277,6 +288,12 @@ pub const AuthStorage = struct {
         self.fallback_resolver = resolver;
     }
 
+    pub fn setExtensionOAuthRefreshHook(self: *AuthStorage, hook: ?ExtensionOAuthRefreshHook) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.extension_oauth_refresh_hook = hook;
+    }
+
     /// Check if any form of auth is configured for a provider.
     /// Does NOT auto-refresh OAuth tokens — just checks availability.
     /// pi-mono source: auth-storage.ts:324-330
@@ -425,7 +442,13 @@ pub const AuthStorage = struct {
         // Actually exchange. The refresh helper allocates the new
         // credential strings with `self.allocator` so they survive
         // arena teardown — we hand them straight to data + persist.
-        const exchange = oauth_provider.refresh_token(self.allocator, base_cred);
+        const exchange = if (oauth_provider.kind.usesExtensionRefresh()) blk: {
+            const hook = self.extension_oauth_refresh_hook orelse {
+                log.warn("oauth refresh requested for extension-owned provider '{s}' without an agent-thread refresh hook", .{provider});
+                return null;
+            };
+            break :blk hook.func(provider, base_cred, self.allocator, hook.ctx);
+        } else oauth_provider.refresh_token(self.allocator, base_cred);
         switch (exchange) {
             .err => |msg| {
                 log.warn("oauth refresh failed for '{s}': {s}", .{ provider, msg });
@@ -678,6 +701,56 @@ test "oauth-backed claim providers resolve auth by visible claim name only" {
     const key = storage.getApiKey("proxy");
     try std.testing.expect(key != null);
     try std.testing.expectEqualStrings("proxy-access", key.?);
+}
+
+test "extension-owned oauth refresh uses the agent-thread hook and persists the returned credential" {
+    const allocator = std.testing.allocator;
+    oauth_mod.resetDynamicProvidersForTest();
+    defer oauth_mod.resetDynamicProvidersForTest();
+
+    var claim = ai.provider.ClaimRegistration{
+        .name = try allocator.dupe(u8, "proxy-refresh"),
+        .api = try allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try allocator.dupe(u8, "Proxy Refresh"),
+        .oauth_refresh_token_ref = 1,
+        .owner_id = try allocator.dupe(u8, "state-456"),
+        .generation = 4,
+    };
+    defer claim.deinit(allocator);
+    try oauth_mod.syncClaimProvider(allocator, &claim);
+
+    const Hook = struct {
+        fn refresh(provider: []const u8, credential: types.OAuthCredential, alloc: std.mem.Allocator, _: ?*anyopaque) oauth_mod.ExchangeResult {
+            if (!std.mem.eql(u8, provider, "proxy-refresh")) return .{ .err = "wrong provider" };
+            if (!std.mem.eql(u8, credential.refresh, "old-refresh")) return .{ .err = "wrong refresh token" };
+            return .{ .success = .{
+                .refresh = alloc.dupe(u8, "new-refresh") catch return .{ .err = "oom" },
+                .access = alloc.dupe(u8, "new-access") catch return .{ .err = "oom" },
+                .expires = std.time.milliTimestamp() + 60_000,
+                .extras = std.json.ObjectMap.init(alloc),
+            } };
+        }
+    };
+
+    var storage = try AuthStorage.inMemory(allocator, null);
+    defer storage.deinit();
+    storage.setExtensionOAuthRefreshHook(.{ .func = &Hook.refresh });
+    storage.set("proxy-refresh", .{ .oauth = .{
+        .refresh = "old-refresh",
+        .access = "old-access",
+        .expires = std.time.milliTimestamp() - 1,
+        .extras = std.json.ObjectMap.init(allocator),
+    } });
+
+    const key = storage.getApiKey("proxy-refresh");
+    try std.testing.expect(key != null);
+    try std.testing.expectEqualStrings("new-access", key.?);
+
+    const refreshed = storage.get("proxy-refresh") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("new-refresh", refreshed.oauth.refresh);
+    try std.testing.expectEqualStrings("new-access", refreshed.oauth.access);
 }
 
 test "hasAuth checks all tiers" {

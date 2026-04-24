@@ -125,6 +125,7 @@ fn dummyTool(allocator: std.mem.Allocator, name: []const u8, source_kind: []cons
         .parameters = .{ .object = std.json.ObjectMap.init(allocator) },
         .impl = .{ .lua = 1 },
         .source = .{ .kind = source_kind, .id = name },
+        .owned = true,
     };
 }
 

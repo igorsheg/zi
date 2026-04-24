@@ -737,7 +737,7 @@ const generated = @import("../ai/models_generated.zig");
 
 test "parseModelPattern handles colon-thinking-level suffix" {
     const alloc = std.testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     var reg = try ModelRegistry.init(alloc, &auth, &.{});
     defer reg.deinit();
@@ -756,7 +756,7 @@ test "parseModelPattern handles colon-thinking-level suffix" {
 
 test "findInitialModel walks defaults_per_provider in order" {
     const alloc = std.testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     // Authenticate both anthropic and openai. Anthropic is listed
     // first in `default_model_per_provider`, so the walk must pick
@@ -783,7 +783,7 @@ test "resolveCliModel infers provider from slash and strips the prefix" {
     // providers and could mis-route. Tests `resolveCliModel`'s
     // inferred-provider branch (model-resolver.ts:373-384).
     const alloc = std.testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     var reg = try ModelRegistry.init(alloc, &auth, &.{});
     defer reg.deinit();
@@ -803,7 +803,7 @@ test "resolveCliModel infers provider from slash and strips the prefix" {
 
 test "restoreModelFromSession falls back when saved model lacks auth" {
     const alloc = std.testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     // Only openai is authed — saved anthropic model will fall back.
     auth.setRuntimeApiKey("openai", "k");

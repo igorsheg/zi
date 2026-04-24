@@ -1660,7 +1660,13 @@ const TestCollector = struct {
                 self.text.appendSlice(self.allocator, d.delta) catch {};
                 if (d.partial.response_id) |rid| self.final_response_id = rid;
             },
-            .text_end => self.events.append(self.allocator, .text_end) catch {},
+            .text_end => |end| {
+                self.events.append(self.allocator, .text_end) catch {};
+                if (end.content.len > 0) {
+                    self.text.clearRetainingCapacity();
+                    self.text.appendSlice(self.allocator, end.content) catch {};
+                }
+            },
             .thinking_start => self.events.append(self.allocator, .thinking_start) catch {},
             .thinking_delta => |d| {
                 self.events.append(self.allocator, .thinking_delta) catch {};
@@ -2006,8 +2012,9 @@ test "writeInputOpts preserves same-model tool call ids" {
     }, ctx, false);
     try jw.endArray();
 
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"call_id\":\"call:raw\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"id\":\"fc_raw\"") != null);
+    const written = allocating.written();
+    try testing.expect(std.mem.indexOf(u8, written, "\"call_id\":\"call:raw\"") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "\"id\":\"fc_raw\"") != null);
 }
 
 test "writeInputOpts remaps foreign tool result ids to the replayed function call id" {
@@ -2049,8 +2056,9 @@ test "writeInputOpts remaps foreign tool result ids to the replayed function cal
     try writeInputOpts(alloc, &jw, test_model, ctx, false);
     try jw.endArray();
 
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"call_id\":\"call_bad\"") != null);
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.items, "\"call_id\":\"call_bad\""));
+    const written = allocating.written();
+    try testing.expect(std.mem.indexOf(u8, written, "\"call_id\":\"call_bad\"") != null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "\"call_id\":\"call_bad\""));
 }
 
 test "writeInputOpts inserts synthetic tool result and skips errored assistants" {
@@ -2105,8 +2113,9 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
     }, ctx, false);
     try jw.endArray();
 
-    try testing.expect(std.mem.indexOf(u8, out.items, "No result provided") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "should not replay") == null);
+    const written = allocating.written();
+    try testing.expect(std.mem.indexOf(u8, written, "No result provided") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "should not replay") == null);
 }
 
 test "writeInputOpts serializes invalid tool-result utf-8 as output text" {

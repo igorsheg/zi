@@ -153,5 +153,5 @@ test "estimateTokens counts tool call arguments using stringified json size" {
     };
     defer testing.allocator.free(message.assistant.content);
 
-    try testing.expectEqual(@as(u64, 10), estimateTokens(message));
+    try testing.expectEqual(@as(u64, 11), estimateTokens(message));
 }

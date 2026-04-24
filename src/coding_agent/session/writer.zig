@@ -16,6 +16,7 @@ pub const SessionWriter = struct {
     session_id: []const u8,
     session_file: []const u8,
     cwd: []const u8,
+    owns_cwd: bool,
     leaf_id: ?[]const u8,
     ids: std.StringHashMapUnmanaged(void),
     flushed: bool,
@@ -34,6 +35,8 @@ pub const SessionWriter = struct {
         const session_id = allocator.dupe(u8, &uuid_buf) catch @panic("OOM");
 
         const timestamp = time_util.isoTimestampNow(allocator) catch @panic("OOM");
+        const owned_cwd = allocator.dupe(u8, cwd) catch @panic("OOM");
+        const header_cwd = allocator.dupe(u8, owned_cwd) catch @panic("OOM");
 
         // Ensure directory exists
         std.fs.cwd().makePath(session_dir) catch {};
@@ -49,7 +52,7 @@ pub const SessionWriter = struct {
         const header = proto.SessionHeader{
             .id = session_id,
             .timestamp = timestamp,
-            .cwd = cwd,
+            .cwd = header_cwd,
         };
         var buffered: std.ArrayListUnmanaged(proto.FileEntry) = .empty;
         buffered.append(allocator, .{ .header = header }) catch @panic("OOM");
@@ -58,7 +61,8 @@ pub const SessionWriter = struct {
             .allocator = allocator,
             .session_id = session_id,
             .session_file = session_file,
-            .cwd = cwd,
+            .cwd = owned_cwd,
+            .owns_cwd = true,
             .leaf_id = null,
             .ids = .{},
             .flushed = false,
@@ -80,6 +84,7 @@ pub const SessionWriter = struct {
             .session_id = session_id,
             .session_file = "",
             .cwd = "",
+            .owns_cwd = false,
             .leaf_id = null,
             .ids = .{},
             .flushed = false,
@@ -99,6 +104,7 @@ pub const SessionWriter = struct {
             .session_id = session_id,
             .session_file = session_file,
             .cwd = cwd,
+            .owns_cwd = true,
             .leaf_id = leaf_id,
             .ids = .{},
             .flushed = true,
@@ -121,6 +127,7 @@ pub const SessionWriter = struct {
         if (self.leaf_id) |leaf_id| {
             if (!leaf_owned_by_ids) self.allocator.free(leaf_id);
         }
+        if (self.owns_cwd and self.cwd.len > 0) self.allocator.free(self.cwd);
         self.allocator.free(self.session_id);
         if (self.session_file.len > 0) self.allocator.free(self.session_file);
     }
@@ -135,6 +142,12 @@ pub const SessionWriter = struct {
         switch (msg) {
             .assistant => self.has_assistant = true,
             else => {},
+        }
+
+        if (!self.persist) {
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch {};
+            if (self.has_assistant) self.flushed = true;
+            return;
         }
 
         if (!self.has_assistant) {
@@ -221,7 +234,7 @@ pub const SessionWriter = struct {
     fn appendEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) void {
         const entry = self.createEntry(entry_data) orelse return;
 
-        if (!self.flushed) {
+        if (!self.persist or !self.flushed) {
             self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch {};
             return;
         }
@@ -233,14 +246,19 @@ pub const SessionWriter = struct {
     fn createEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) ?proto.SessionEntry {
         const entry_id = self.generateId() catch return null;
         const entry_timestamp = time_util.isoTimestampNow(self.allocator) catch return null;
+        const parent_id = if (self.leaf_id) |parent| self.allocator.dupe(u8, parent) catch return null else null;
+        const previous_leaf_id = self.leaf_id;
 
         const entry = proto.SessionEntry{
             .id = entry_id,
-            .parent_id = self.leaf_id,
+            .parent_id = parent_id,
             .timestamp = entry_timestamp,
             .entry = entry_data,
         };
 
+        if (previous_leaf_id) |parent| {
+            if (!self.ids.contains(parent)) self.allocator.free(parent);
+        }
         self.leaf_id = entry_id;
         self.ids.put(self.allocator, entry_id, {}) catch {};
 
@@ -268,12 +286,15 @@ pub const SessionWriter = struct {
         }
         fw.end() catch {};
         self.flushed = true;
+        for (self.buffered_entries.items) |entry| freeBufferedFileEntry(self.allocator, entry, self.session_id);
         self.buffered_entries.clearRetainingCapacity();
     }
 
     /// Append a single entry to the already-flushed file.
     fn appendToFile(self: *SessionWriter, entry: proto.SessionEntry) !void {
         if (!self.persist) return;
+        defer self.allocator.free(entry.timestamp);
+        defer if (entry.parent_id) |parent_id| self.allocator.free(parent_id);
         const file = try std.fs.openFileAbsolute(self.session_file, .{ .mode = .read_write });
         defer file.close();
         try file.seekFromEnd(0);
@@ -309,11 +330,12 @@ fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, s
         .header => |header| {
             if (!std.mem.eql(u8, header.id, session_id)) allocator.free(header.id);
             allocator.free(header.timestamp);
+            allocator.free(header.cwd);
             if (header.parent_session) |parent| allocator.free(parent);
         },
         .entry => |session_entry| {
-            allocator.free(session_entry.id);
             allocator.free(session_entry.timestamp);
+            if (session_entry.parent_id) |parent_id| allocator.free(parent_id);
         },
     }
 }

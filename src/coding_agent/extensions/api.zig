@@ -273,6 +273,7 @@ fn buildExtensionTool(
         .impl = .{ .lua = execute_ref },
         .source = currentRegistrationSource(runner),
         .render_result_ref = render_result_ref,
+        .owned = true,
     };
 }
 
@@ -297,10 +298,10 @@ const RegisterProviderError = error{
     InvalidHeaders,
     InvalidOAuth,
     InvalidOAuthName,
-    UnsupportedOAuthLogin,
-    UnsupportedOAuthRefreshToken,
-    UnsupportedOAuthRefreshTokenCamel,
-    UnsupportedOAuthGetApiKey,
+    InvalidOAuthLogin,
+    InvalidOAuthRefreshToken,
+    InvalidOAuthRefreshTokenCamel,
+    InvalidOAuthGetApiKey,
     UnsupportedOAuthModifyModels,
     UnsupportedOAuthRequiresModels,
     UnsupportedOAuthBuiltinOverride,
@@ -347,12 +348,12 @@ fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidBaseUrl => "register_provider: field 'base_url' must be a string",
             error.InvalidApiKey => "register_provider: field 'api_key' must be a string",
             error.InvalidHeaders => "register_provider: field 'headers' must be a string map",
-            error.InvalidOAuth => "register_provider: field 'oauth' only supports optional string field 'name' in this slice",
+            error.InvalidOAuth => "register_provider: field 'oauth' only supports optional string field 'name' plus function fields 'login', 'refresh_token', 'refreshToken', and 'getApiKey' in this slice",
             error.InvalidOAuthName => "register_provider: field 'oauth.name' must be a string when present",
-            error.UnsupportedOAuthLogin => "register_provider: field 'oauth.login' is unsupported in this slice",
-            error.UnsupportedOAuthRefreshToken => "register_provider: field 'oauth.refresh_token' is unsupported in this slice",
-            error.UnsupportedOAuthRefreshTokenCamel => "register_provider: field 'oauth.refreshToken' is unsupported in this slice",
-            error.UnsupportedOAuthGetApiKey => "register_provider: field 'oauth.getApiKey' is unsupported in this slice",
+            error.InvalidOAuthLogin => "register_provider: field 'oauth.login' must be a function",
+            error.InvalidOAuthRefreshToken => "register_provider: field 'oauth.refresh_token' must be a function",
+            error.InvalidOAuthRefreshTokenCamel => "register_provider: field 'oauth.refreshToken' must be a function",
+            error.InvalidOAuthGetApiKey => "register_provider: field 'oauth.getApiKey' must be a function",
             error.UnsupportedOAuthModifyModels => "register_provider: field 'oauth.modifyModels' is unsupported in this slice",
             error.UnsupportedOAuthRequiresModels => "register_provider: field 'oauth' requires claim-backed models in this slice",
             error.UnsupportedOAuthBuiltinOverride => "register_provider: field 'oauth' does not support built-in provider override semantics in this slice",
@@ -511,6 +512,9 @@ fn buildProviderRegistration(
         .headers = headers,
         .oauth_enabled = oauth.enabled,
         .oauth_name = oauth.name,
+        .oauth_login_ref = oauth.login_ref,
+        .oauth_refresh_token_ref = oauth.refresh_token_ref,
+        .oauth_get_api_key_ref = oauth.get_api_key_ref,
         .owner_id = owner_id,
         .generation = runner.generation,
         .models = models,
@@ -1212,6 +1216,9 @@ fn optionalProviderHeaders(
 const ProviderOAuthConfig = struct {
     enabled: bool = false,
     name: ?[]const u8 = null,
+    login_ref: ?c_int = null,
+    refresh_token_ref: ?c_int = null,
+    get_api_key_ref: ?c_int = null,
 };
 
 fn parseProviderOAuth(
@@ -1231,6 +1238,9 @@ fn parseProviderOAuth(
     const oauth_idx = c.lua_gettop(L);
     var oauth = ProviderOAuthConfig{ .enabled = true };
     errdefer if (oauth.name) |owned| allocator.free(owned);
+    errdefer if (oauth.login_ref) |ref| c.luaL_unref(L, c.LUA_REGISTRYINDEX, ref);
+    errdefer if (oauth.refresh_token_ref) |ref| c.luaL_unref(L, c.LUA_REGISTRYINDEX, ref);
+    errdefer if (oauth.get_api_key_ref) |ref| c.luaL_unref(L, c.LUA_REGISTRYINDEX, ref);
 
     c.lua_pushnil(L);
     while (c.lua_next(L, oauth_idx) != 0) {
@@ -1244,10 +1254,30 @@ fn parseProviderOAuth(
             oauth.name = allocator.dupe(u8, lstring(L, -1)) catch return error.OutOfMemory;
             continue;
         }
-        if (std.mem.eql(u8, field, "login")) return error.UnsupportedOAuthLogin;
-        if (std.mem.eql(u8, field, "refresh_token")) return error.UnsupportedOAuthRefreshToken;
-        if (std.mem.eql(u8, field, "refreshToken")) return error.UnsupportedOAuthRefreshTokenCamel;
-        if (std.mem.eql(u8, field, "getApiKey")) return error.UnsupportedOAuthGetApiKey;
+        if (std.mem.eql(u8, field, "login")) {
+            if (c.lua_type(L, -1) != c.LUA_TFUNCTION) return error.InvalidOAuthLogin;
+            c.lua_pushvalue(L, -1);
+            oauth.login_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+            continue;
+        }
+        if (std.mem.eql(u8, field, "refresh_token")) {
+            if (c.lua_type(L, -1) != c.LUA_TFUNCTION) return error.InvalidOAuthRefreshToken;
+            c.lua_pushvalue(L, -1);
+            oauth.refresh_token_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+            continue;
+        }
+        if (std.mem.eql(u8, field, "refreshToken")) {
+            if (c.lua_type(L, -1) != c.LUA_TFUNCTION) return error.InvalidOAuthRefreshTokenCamel;
+            c.lua_pushvalue(L, -1);
+            oauth.refresh_token_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+            continue;
+        }
+        if (std.mem.eql(u8, field, "getApiKey")) {
+            if (c.lua_type(L, -1) != c.LUA_TFUNCTION) return error.InvalidOAuthGetApiKey;
+            c.lua_pushvalue(L, -1);
+            oauth.get_api_key_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+            continue;
+        }
         if (std.mem.eql(u8, field, "modifyModels")) return error.UnsupportedOAuthModifyModels;
         return error.InvalidOAuth;
     }
@@ -1737,7 +1767,7 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
         \\}) == true)
     , "provider_prebind");
 
-    try testing.expectEqual(@as(usize, 2), runner.provider_queue.count());
+    try testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
     switch (runner.provider_queue.pending.items[0]) {
         .register => |claim| {
             try testing.expectEqualStrings("QUEUED_PROXY_API_KEY", claim.api_key.?);
@@ -1826,7 +1856,7 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
     try testing.expectEqual(@as(usize, 1), provider_registry.activeClaimCount());
 }
 
-test "zi.register_provider retains minimal oauth metadata and rejects unsupported oauth semantics" {
+test "zi.register_provider retains oauth callback refs and still rejects deferred oauth semantics" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -1842,7 +1872,15 @@ test "zi.register_provider retains minimal oauth metadata and rejects unsupporte
         \\assert(zi.register_provider("oauth-claim", {
         \\  api = "anthropic-messages",
         \\  base_url = "https://proxy.example",
-        \\  oauth = { name = "Corp Claude" },
+        \\  oauth = { name = "Corp Claude", login = function(callbacks)
+        \\    callbacks.onProgress("opening browser")
+        \\    callbacks.onAuth({ url = "https://example.com/oauth" })
+        \\    return { access = "access-token", refresh = "refresh-token", expires = 1234 }
+        \\  end, refresh_token = function(credentials)
+        \\    return { access = credentials.access .. "-next", refresh = credentials.refresh .. "-next", expires = credentials.expires + 1 }
+        \\  end, getApiKey = function(credentials)
+        \\    return credentials.access
+        \\  end },
         \\  models = {
         \\    {
         \\      id = "claude-sonnet-4-20250514",
@@ -1881,6 +1919,9 @@ test "zi.register_provider retains minimal oauth metadata and rejects unsupporte
         .register => |claim| {
             try testing.expect(claim.oauth_enabled);
             try testing.expectEqualStrings("Corp Claude", claim.oauth_name.?);
+            try testing.expect(claim.oauth_login_ref != null);
+            try testing.expect(claim.oauth_refresh_token_ref != null);
+            try testing.expect(claim.oauth_get_api_key_ref != null);
         },
         else => return error.ExpectedQueuedProviderRegistration,
     }
@@ -1892,38 +1933,6 @@ test "zi.register_provider retains minimal oauth metadata and rejects unsupporte
         else => return error.ExpectedQueuedProviderRegistration,
     }
     const invalid_oauth_specs = .{
-        .{
-            "provider_oauth_login_reject",
-            \\return zi.register_provider("broken", {
-            \\  api = "anthropic-messages",
-            \\  base_url = "https://proxy.example",
-            \\  oauth = { login = function() end },
-            \\})
-        },
-        .{
-            "provider_oauth_refresh_token_reject",
-            \\return zi.register_provider("broken", {
-            \\  api = "anthropic-messages",
-            \\  base_url = "https://proxy.example",
-            \\  oauth = { refresh_token = function() end },
-            \\})
-        },
-        .{
-            "provider_oauth_refresh_token_camel_reject",
-            \\return zi.register_provider("broken", {
-            \\  api = "anthropic-messages",
-            \\  base_url = "https://proxy.example",
-            \\  oauth = { refreshToken = function() end },
-            \\})
-        },
-        .{
-            "provider_oauth_get_api_key_reject",
-            \\return zi.register_provider("broken", {
-            \\  api = "anthropic-messages",
-            \\  base_url = "https://proxy.example",
-            \\  oauth = { getApiKey = function() end },
-            \\})
-        },
         .{
             "provider_oauth_modify_models_reject",
             \\return zi.register_provider("broken", {
@@ -1965,6 +1974,37 @@ test "zi.register_provider retains minimal oauth metadata and rejects unsupporte
         try testing.expectError(error.LuaRuntime, state.doString(spec[1], spec[0]));
     }
     try testing.expectEqual(@as(usize, 2), runner.provider_queue.count());
+
+    const invalid_oauth_shape_specs = .{
+        .{
+            "provider_oauth_refresh_token_non_function_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { refresh_token = "nope" },
+            \\})
+        },
+        .{
+            "provider_oauth_refresh_token_camel_non_function_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { refreshToken = "nope" },
+            \\})
+        },
+        .{
+            "provider_oauth_get_api_key_non_function_reject",
+            \\return zi.register_provider("broken", {
+            \\  api = "anthropic-messages",
+            \\  base_url = "https://proxy.example",
+            \\  oauth = { getApiKey = "nope" },
+            \\})
+        },
+    };
+
+    inline for (invalid_oauth_shape_specs) |spec| {
+        try testing.expectError(error.LuaRuntime, state.doString(spec[1], spec[0]));
+    }
 }
 
 test "zi.register_provider rejects deferred provider fields instead of silently dropping them" {
@@ -2065,19 +2105,21 @@ test "zi.register_provider infers built-in override api and restores the baselin
         \\}) == true)
     , "builtin_provider_override_live");
 
-    const live_claim = provider_registry.activeClaimRegistrationByName("anthropic") orelse return error.ExpectedQueuedProviderRegistration;
-    try testing.expectEqualStrings("anthropic-messages", live_claim.api);
-    try testing.expectEqualStrings("https://live.example", live_claim.base_url);
-    try testing.expectEqual(@as(usize, 1), live_claim.headers.len);
-    try testing.expectEqualStrings("x-provider", live_claim.headers[0].key);
-    try testing.expectEqualStrings("anthropic", live_claim.headers[0].value);
+    const active_claim = provider_registry.activeClaimRegistrationByName("anthropic") orelse return error.ExpectedQueuedProviderRegistration;
+    try testing.expectEqualStrings("anthropic-messages", active_claim.api);
+    try testing.expectEqualStrings("https://queued.example", active_claim.base_url);
+    try testing.expectEqual(@as(usize, 0), active_claim.headers.len);
 
     try state.doString(
         \\assert(zi.unregister_provider("anthropic") == true)
     , "builtin_provider_override_unregister");
 
-    try testing.expect(provider_registry.activeClaimRegistrationByName("anthropic") == null);
-    try testing.expectEqualStrings("faux", provider_registry.get("anthropic-messages").?.getName());
+    const restored_claim = provider_registry.activeClaimRegistrationByName("anthropic") orelse return error.ExpectedQueuedProviderRegistration;
+    try testing.expectEqualStrings("https://live.example", restored_claim.base_url);
+    try testing.expectEqual(@as(usize, 1), restored_claim.headers.len);
+    try testing.expectEqualStrings("x-provider", restored_claim.headers[0].key);
+    try testing.expectEqualStrings("anthropic", restored_claim.headers[0].value);
+    try testing.expectEqualStrings("anthropic", provider_registry.get("anthropic-messages").?.getName());
 }
 
 test "zi.register_provider rejects unsupported built-in override extras" {
@@ -2463,6 +2505,10 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     const first = try co.resumeWith(0);
     try testing.expectEqual(lua_runtime.Coroutine.Status.yielded, first.status);
     try testing.expect(runner.current_spawn_request != null);
+    defer if (runner.current_spawn_request) |*req| {
+        req.deinit(testing.allocator);
+        runner.current_spawn_request = null;
+    };
 
     const blocks = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
     const text = try testing.allocator.dupe(u8, "child output");
@@ -2471,15 +2517,15 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     try usage.put(try testing.allocator.dupe(u8, "input"), .{ .integer = 1 });
     var details = std.json.ObjectMap.init(testing.allocator);
     try details.put(try testing.allocator.dupe(u8, "usage"), .{ .object = usage });
-    runner.current_spawn_result = .{ .result = .{ .content = blocks, .is_error = false, .details = .{ .object = details } } };
+    const spawn_result: agent_protocol.AgentToolResult = .{ .content = blocks, .is_error = false, .details = .{ .object = details } };
+    runner.current_spawn_result = .{ .result = spawn_result };
     defer {
-        const res = runner.current_spawn_result.?.result;
-        for (res.content) |b| switch (b) {
+        for (spawn_result.content) |b| switch (b) {
             .text => |tb| testing.allocator.free(tb.text),
             else => {},
         };
-        testing.allocator.free(res.content);
-        lua_runtime.freeJsonValue(testing.allocator, res.details);
+        testing.allocator.free(spawn_result.content);
+        lua_runtime.freeJsonValue(testing.allocator, spawn_result.details);
     }
 
     c.lua_pushlightuserdata(co.L, &runner);

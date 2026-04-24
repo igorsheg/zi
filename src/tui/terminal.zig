@@ -41,6 +41,9 @@ pub const Terminal = struct {
     raw_mode: bool,
     kitty_active: bool,
     modify_other_keys_active: bool,
+    bracketed_paste_active: bool,
+    mouse_tracking_active: bool,
+    cursor_hidden: bool,
 
     pub fn init() Terminal {
         return .{
@@ -52,6 +55,9 @@ pub const Terminal = struct {
             .raw_mode = false,
             .kitty_active = false,
             .modify_other_keys_active = false,
+            .bracketed_paste_active = false,
+            .mouse_tracking_active = false,
+            .cursor_hidden = false,
         };
     }
 
@@ -100,16 +106,23 @@ pub const Terminal = struct {
 
     // --- Output helpers ---
 
+    fn canControlOutput(self: *const Terminal) bool {
+        return posix.isatty(self.fd_out);
+    }
+
     pub fn write(self: *Terminal, data: []const u8) void {
+        if (!self.canControlOutput()) return;
         writeAll(self.fd_out, data);
     }
 
     pub fn hideCursor(self: *Terminal) void {
-        self.write(ansi.hide_cursor);
+        if (!self.cursor_hidden) self.write(ansi.hide_cursor);
+        self.cursor_hidden = true;
     }
 
     pub fn showCursor(self: *Terminal) void {
-        self.write(ansi.show_cursor);
+        if (self.cursor_hidden) self.write(ansi.show_cursor);
+        self.cursor_hidden = false;
     }
 
     pub fn setCursorPos(self: *Terminal, col: u32, row: u32) void {
@@ -131,11 +144,13 @@ pub const Terminal = struct {
     // --- Keyboard protocol ---
 
     pub fn enableBracketedPaste(self: *Terminal) void {
-        self.write(ansi.bracketed_paste_enable);
+        if (!self.bracketed_paste_active) self.write(ansi.bracketed_paste_enable);
+        self.bracketed_paste_active = true;
     }
 
     pub fn disableBracketedPaste(self: *Terminal) void {
-        self.write(ansi.bracketed_paste_disable);
+        if (self.bracketed_paste_active) self.write(ansi.bracketed_paste_disable);
+        self.bracketed_paste_active = false;
     }
 
     /// Query kitty keyboard protocol support (CSI ? u).
@@ -167,14 +182,15 @@ pub const Terminal = struct {
 
     /// Enable SGR mouse tracking (button events + scroll wheel).
     pub fn enableMouseTracking(self: *Terminal) void {
-        self.write(ansi.mouse_tracking_enable);
+        if (!self.mouse_tracking_active) self.write(ansi.mouse_tracking_enable);
+        self.mouse_tracking_active = true;
     }
 
     /// Disable mouse tracking.
     pub fn disableMouseTracking(self: *Terminal) void {
-        self.write(ansi.mouse_tracking_disable);
+        if (self.mouse_tracking_active) self.write(ansi.mouse_tracking_disable);
+        self.mouse_tracking_active = false;
     }
-
 
     /// Read available input bytes (non-blocking if raw mode with MIN=0).
     pub fn readInput(self: *Terminal, buf: []u8) !usize {
@@ -244,4 +260,32 @@ test "Terminal deinit is idempotent on fresh instance" {
     t.deinit();
     try std.testing.expect(!t.raw_mode);
     try std.testing.expect(!t.kitty_active);
+    try std.testing.expect(!t.bracketed_paste_active);
+    try std.testing.expect(!t.mouse_tracking_active);
+    try std.testing.expect(!t.cursor_hidden);
+}
+
+test "Terminal deinit does not write control sequences to non-tty output" {
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[0]);
+
+    var t = Terminal.init();
+    t.fd_out = pipe[1];
+    t.hideCursor();
+    t.enableBracketedPaste();
+    t.enableMouseTracking();
+    t.enableKittyProtocol();
+    t.enableModifyOtherKeys();
+
+    t.deinit();
+    std.posix.close(pipe[1]);
+
+    var read_buf: [256]u8 = undefined;
+    const n = try std.posix.read(pipe[0], &read_buf);
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expect(!t.kitty_active);
+    try std.testing.expect(!t.modify_other_keys_active);
+    try std.testing.expect(!t.bracketed_paste_active);
+    try std.testing.expect(!t.mouse_tracking_active);
+    try std.testing.expect(!t.cursor_hidden);
 }

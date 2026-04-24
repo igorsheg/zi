@@ -410,6 +410,7 @@ const TranscriptLayout = struct {
     }
 
     fn maxScrollOffset(self: *const TranscriptLayout, visible_height: u32) u32 {
+        if (visible_height == 0) return 0;
         const total = self.totalHeight();
         return if (total > visible_height) total - visible_height else 0;
     }
@@ -1819,7 +1820,20 @@ test "Transcript renders assistant text and tool execution in order" {
     defer buf.deinit();
     transcript.render(buf.region());
 
-    try testing.expectEqual(@as(u21, 'h'), buf.get(1, 0).grapheme.codepoint);
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for (0..buf.height) |row| {
+        if (row > 0) try text.append(testing.allocator, '\n');
+        for (0..buf.width) |col| {
+            const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
+            if (cp == 0) continue;
+            try text.append(testing.allocator, @intCast(cp));
+        }
+    }
+    const flat = text.items;
+    const assistant_idx = std.mem.indexOf(u8, flat, "hello from assistant") orelse return error.TestUnexpectedResult;
+    const tool_idx_text = std.mem.indexOf(u8, flat, "bash") orelse return error.TestUnexpectedResult;
+    try testing.expect(assistant_idx < tool_idx_text);
 }
 
 test "tool execution model replacement preserves pending routing by tool_call_id" {
@@ -1947,7 +1961,8 @@ test "Transcript scrolls through tool output without repeating the first rows" {
     try setTestToolExecutionState(&transcript, tool, false, false, .{ .content = &content, .is_error = false }, false, false);
     transcript.clearToolRoutingAt(tool_idx);
     transcript.itemMutatedAt(tool_idx);
-    transcript.scrollBy(20, 3, 4);
+    transcript.scrollToBottom(20, 3);
+    transcript.scrollBy(20, 3, -3);
 
     var buf = try Buffer.init(testing.allocator, 20, 3);
     defer buf.deinit();

@@ -291,7 +291,7 @@ fn generateHistorySummary(
     );
 
     const max_tokens: u32 = @intCast(@max(@divTrunc(policy.reserve_tokens * 4, 5), 1024));
-    return try session.completeUserText(session.allocator, summarization_system_prompt, prompt_text, max_tokens);
+    return try session.completeUserText(allocator, summarization_system_prompt, prompt_text, max_tokens);
 }
 
 fn generateTurnPrefixSummary(
@@ -307,5 +307,5 @@ fn generateTurnPrefixSummary(
         .{ conversation, turn_prefix_summarization_prompt },
     );
     const max_tokens: u32 = @intCast(@max(@divTrunc(policy.reserve_tokens, 2), 512));
-    return try session.completeUserText(session.allocator, summarization_system_prompt, prompt_text, max_tokens);
+    return try session.completeUserText(allocator, summarization_system_prompt, prompt_text, max_tokens);
 }

@@ -9,8 +9,30 @@ const log = std.log.scoped(.oauth);
 /// Per-provider OAuth configuration.
 /// Shared PKCE + callback infra; per-provider hooks for protocol differences.
 pub const OAuthProvider = struct {
+    pub const Kind = enum {
+        builtin,
+        extension_login,
+        extension_refresh,
+        extension_login_refresh,
+
+        pub fn usesExtensionLogin(self: Kind) bool {
+            return switch (self) {
+                .extension_login, .extension_login_refresh => true,
+                else => false,
+            };
+        }
+
+        pub fn usesExtensionRefresh(self: Kind) bool {
+            return switch (self) {
+                .extension_refresh, .extension_login_refresh => true,
+                else => false,
+            };
+        }
+    };
+
     id: []const u8,
     name: []const u8,
+    kind: Kind = .builtin,
     callback_port: u16,
     callback_path: []const u8,
 
@@ -171,6 +193,7 @@ const DynamicOAuthProvider = struct {
     owner_id: []const u8,
     generation: u64,
     template: ClaimOAuthTemplate,
+    kind: OAuthProvider.Kind,
 
     fn deinit(self: *DynamicOAuthProvider) void {
         self.allocator.free(self.id);
@@ -317,6 +340,7 @@ fn retagProvider(template: ClaimOAuthTemplate, id: []const u8, name: []const u8)
         .anthropic => .{
             .id = id,
             .name = name,
+            .kind = .builtin,
             .callback_port = anthropic_provider.callback_port,
             .callback_path = anthropic_provider.callback_path,
             .build_authorize_url = anthropic_provider.build_authorize_url,
@@ -326,6 +350,7 @@ fn retagProvider(template: ClaimOAuthTemplate, id: []const u8, name: []const u8)
         .openai_codex => .{
             .id = id,
             .name = name,
+            .kind = .builtin,
             .callback_port = openai_codex_provider.callback_port,
             .callback_path = openai_codex_provider.callback_path,
             .build_authorize_url = openai_codex_provider.build_authorize_url,
@@ -348,6 +373,7 @@ fn initDynamicProvider(
     claim: *const provider_mod.ClaimRegistration,
     display_name: []const u8,
     template: ClaimOAuthTemplate,
+    kind: OAuthProvider.Kind,
 ) !DynamicOAuthProvider {
     const id = try allocator.dupe(u8, claim.name);
     errdefer allocator.free(id);
@@ -363,6 +389,7 @@ fn initDynamicProvider(
         .owner_id = owner_id,
         .generation = claim.generation,
         .template = template,
+        .kind = kind,
     };
 }
 
@@ -421,6 +448,14 @@ pub fn syncClaimProvider(allocator: std.mem.Allocator, claim: *const provider_mo
 
     const template = try resolveClaimOAuthTemplate(claim.name, claim.api, claim.models);
     const display_name = claim.oauth_name orelse claim.name;
+    const kind: OAuthProvider.Kind = if (claim.oauth_login_ref != null and claim.oauth_refresh_token_ref != null)
+        .extension_login_refresh
+    else if (claim.oauth_login_ref != null)
+        .extension_login
+    else if (claim.oauth_refresh_token_ref != null)
+        .extension_refresh
+    else
+        .builtin;
 
     if (dynamicProviderIndexLocked(claim.name)) |idx| {
         const existing = &dynamic_providers.items[idx];
@@ -430,10 +465,11 @@ pub fn syncClaimProvider(allocator: std.mem.Allocator, claim: *const provider_mo
         existing.name = new_name;
         existing.generation = claim.generation;
         existing.template = template;
+        existing.kind = kind;
         return;
     }
 
-    const provider = try initDynamicProvider(allocator, claim, display_name, template);
+    const provider = try initDynamicProvider(allocator, claim, display_name, template, kind);
     errdefer {
         var owned = provider;
         owned.deinit();
@@ -494,7 +530,9 @@ pub fn findProvider(id: []const u8) ?OAuthProvider {
 
     for (dynamic_providers.items) |provider| {
         if (std.mem.eql(u8, provider.id, id)) {
-            return retagProvider(provider.template, provider.id, provider.name);
+            var resolved = retagProvider(provider.template, provider.id, provider.name);
+            resolved.kind = provider.kind;
+            return resolved;
         }
     }
     return null;
@@ -660,6 +698,78 @@ test "dynamic oauth providers list claim-visible ids and labels" {
         try testing.expectEqualStrings("Corporate Claude", provider.name);
     }
     try testing.expect(saw_dynamic);
-    try testing.expect(findProvider("corp-ai") != null);
+    const dynamic = findProvider("corp-ai") orelse return error.ExpectedDynamicProvider;
+    try testing.expectEqual(OAuthProvider.Kind.builtin, dynamic.kind);
     try testing.expect(findProvider("anthropic-messages") == null);
+}
+
+test "dynamic oauth providers mark extension-login execution separately" {
+    resetDynamicProvidersForTest();
+    defer resetDynamicProvidersForTest();
+
+    var claim = provider_mod.ClaimRegistration{
+        .name = try testing.allocator.dupe(u8, "corp-login"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try testing.allocator.dupe(u8, "Corporate Login"),
+        .oauth_login_ref = 17,
+        .owner_id = try testing.allocator.dupe(u8, "state-456"),
+        .generation = 6,
+    };
+    defer claim.deinit(testing.allocator);
+
+    try syncClaimProvider(testing.allocator, &claim);
+
+    const provider = findProvider("corp-login") orelse return error.ExpectedDynamicProvider;
+    try testing.expectEqual(OAuthProvider.Kind.extension_login, provider.kind);
+}
+
+test "dynamic oauth providers mark extension-refresh execution separately" {
+    resetDynamicProvidersForTest();
+    defer resetDynamicProvidersForTest();
+
+    var claim = provider_mod.ClaimRegistration{
+        .name = try testing.allocator.dupe(u8, "corp-refresh"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try testing.allocator.dupe(u8, "Corporate Refresh"),
+        .oauth_refresh_token_ref = 23,
+        .owner_id = try testing.allocator.dupe(u8, "state-789"),
+        .generation = 7,
+    };
+    defer claim.deinit(testing.allocator);
+
+    try syncClaimProvider(testing.allocator, &claim);
+
+    const provider = findProvider("corp-refresh") orelse return error.ExpectedDynamicProvider;
+    try testing.expectEqual(OAuthProvider.Kind.extension_refresh, provider.kind);
+    try testing.expect(provider.kind.usesExtensionRefresh());
+    try testing.expect(!provider.kind.usesExtensionLogin());
+}
+
+test "dynamic oauth providers mark extension login and refresh execution separately" {
+    resetDynamicProvidersForTest();
+    defer resetDynamicProvidersForTest();
+
+    var claim = provider_mod.ClaimRegistration{
+        .name = try testing.allocator.dupe(u8, "corp-both"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try testing.allocator.dupe(u8, "Corporate Both"),
+        .oauth_login_ref = 17,
+        .oauth_refresh_token_ref = 29,
+        .owner_id = try testing.allocator.dupe(u8, "state-101"),
+        .generation = 8,
+    };
+    defer claim.deinit(testing.allocator);
+
+    try syncClaimProvider(testing.allocator, &claim);
+
+    const provider = findProvider("corp-both") orelse return error.ExpectedDynamicProvider;
+    try testing.expectEqual(OAuthProvider.Kind.extension_login_refresh, provider.kind);
+    try testing.expect(provider.kind.usesExtensionRefresh());
+    try testing.expect(provider.kind.usesExtensionLogin());
 }

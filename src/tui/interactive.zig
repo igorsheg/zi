@@ -35,6 +35,7 @@ const time_util = @import("../lib/time_util.zig");
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
+const request_mod = @import("../coding_agent/request.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
@@ -81,6 +82,7 @@ const IdleRequestDispatch = struct {
     spawn_failed_message: []const u8,
 };
 const auth_storage_mod = @import("../coding_agent/auth/storage.zig");
+const auth_types = @import("../coding_agent/auth/types.zig");
 const oauth_mod = @import("../coding_agent/auth/oauth.zig");
 const settings_manager_mod = @import("../coding_agent/settings/manager.zig");
 const ai_protocol = @import("../ai/protocol.zig");
@@ -208,13 +210,16 @@ test "UiSnapshotQueue drops newest snapshot traffic when bounded" {
     var q = try UiSnapshotQueue.init(std.testing.allocator);
     defer q.deinit();
 
-    try std.testing.expectEqual(.ok, q.trySend(.{ .theme_changed = themes_builtin.dark() }));
-    try std.testing.expectEqual(.dropped, q.trySend(.{ .theme_changed = themes_builtin.light() }));
+    var sent: usize = 0;
+    while (sent < ui_snapshot_queue_capacity) : (sent += 1) {
+        try std.testing.expectEqual(.ok, q.trySend(.{ .theme_changed = themes_builtin.dark().* }));
+    }
+    try std.testing.expectEqual(.dropped, q.trySend(.{ .theme_changed = themes_builtin.light().* }));
 
     const stats = q.stats();
-    try std.testing.expectEqual(@as(usize, 1), stats.pending_depth);
+    try std.testing.expectEqual(@as(usize, ui_snapshot_queue_capacity), stats.pending_depth);
     try std.testing.expectEqual(@as(usize, 1), stats.dropped_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.send_count);
+    try std.testing.expectEqual(@as(usize, ui_snapshot_queue_capacity), stats.send_count);
 }
 
 test "UiLifecycleQueue rejects overload and keeps wake semantics" {
@@ -621,6 +626,7 @@ pub const Interactive = struct {
             self.request_queue.close();
         }
 
+        self.runtime_host.setExtensionOAuthRefreshDispatcher(null);
         if (self.agent_event_token) |token| {
             self.runtime_host.unsubscribeAgentEvents(token);
             self.agent_event_token = null;
@@ -697,6 +703,10 @@ pub const Interactive = struct {
         self.active_editor.setStatusData(&self.status_data);
         self.agent_event_token = self.runtime_host.subscribeAgentEvents(&agentEventCallback, @ptrCast(self));
         self.session_event_token = self.runtime_host.subscribeEvents(&sessionEventCallback, @ptrCast(self));
+        self.runtime_host.setExtensionOAuthRefreshDispatcher(.{
+            .func = &dispatchExtensionOAuthRefreshViaRequestQueue,
+            .ctx = @ptrCast(self),
+        });
 
         self.detectGitBranch();
         try self.startAgentThread();
@@ -2569,16 +2579,51 @@ pub const Interactive = struct {
         const provider = ctx.provider;
         self.msg_allocator.destroy(ctx);
 
-        const result = oauth_mod.login(
-            self.msg_allocator,
-            provider,
-            .{
-                .on_auth = &onLoginAuth,
-                .on_progress = &onLoginProgress,
-                .ctx = @ptrCast(self),
-            },
-            &self.login_cancelled,
-        );
+        const result: oauth_mod.LoginResult = if (!provider.kind.usesExtensionLogin())
+            oauth_mod.login(
+                self.msg_allocator,
+                provider,
+                .{
+                    .on_auth = &onLoginAuth,
+                    .on_progress = &onLoginProgress,
+                    .ctx = @ptrCast(self),
+                },
+                &self.login_cancelled,
+            )
+        else blk: {
+            var response: request_mod.ExtensionOAuthLoginResponse = .{};
+            const provider_copy = self.msg_allocator.dupe(u8, provider.id) catch break :blk .{ .err = "out of memory" };
+            switch (self.request_queue.trySend(.{ .extension_oauth_login = .{
+                .provider_id = provider_copy,
+                .callbacks = .{
+                    .on_auth = &onLoginAuth,
+                    .on_progress = &onLoginProgress,
+                    .ctx = @ptrCast(self),
+                },
+                .response = &response,
+            } })) {
+                .ok => {},
+                .full => |rejected| {
+                    var req = rejected;
+                    req.deinit(self.msg_allocator);
+                    break :blk .{ .err = "login request queue is full" };
+                },
+                .closed => |rejected| {
+                    var req = rejected;
+                    req.deinit(self.msg_allocator);
+                    break :blk .{ .err = "login request queue is closed" };
+                },
+                .oom => break :blk .{ .err = "out of memory" },
+                .dropped => unreachable,
+            }
+            const result_from_agent: oauth_mod.LoginResult = switch (response.wait()) {
+                .success => |cred| .{ .success = cred },
+                .cancelled => .cancelled,
+                .err => |msg| .{ .err = msg },
+                .unsupported => .{ .err = "extension OAuth login is unsupported for this provider" },
+            };
+            break :blk result_from_agent;
+        };
 
         const provider_id = self.msg_allocator.dupe(u8, provider.id) catch return;
         switch (result) {
@@ -2643,6 +2688,46 @@ pub const Interactive = struct {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         const owned = self.msg_allocator.dupe(u8, msg) catch return;
         _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = owned, .kind = .info } });
+    }
+
+    fn dispatchExtensionOAuthRefreshViaRequestQueue(
+        provider_id: []const u8,
+        credential: auth_types.OAuthCredential,
+        result_allocator: std.mem.Allocator,
+        ctx: ?*anyopaque,
+    ) oauth_mod.ExchangeResult {
+        const self: *Interactive = @ptrCast(@alignCast(ctx.?));
+        var response: request_mod.ExtensionOAuthRefreshResponse = .{};
+        const provider_copy = self.msg_allocator.dupe(u8, provider_id) catch return .{ .err = "out of memory" };
+        const credential_copy = auth_types.cloneOAuthCredential(self.msg_allocator, credential) catch {
+            self.msg_allocator.free(provider_copy);
+            return .{ .err = "out of memory" };
+        };
+        switch (self.request_queue.trySend(.{ .extension_oauth_refresh = .{
+            .provider_id = provider_copy,
+            .credential = credential_copy,
+            .result_allocator = result_allocator,
+            .response = &response,
+        } })) {
+            .ok => {},
+            .full => |rejected| {
+                var req = rejected;
+                req.deinit(self.msg_allocator);
+                return .{ .err = "refresh request queue is full" };
+            },
+            .closed => |rejected| {
+                var req = rejected;
+                req.deinit(self.msg_allocator);
+                return .{ .err = "refresh request queue is closed" };
+            },
+            .oom => return .{ .err = "out of memory" },
+            .dropped => unreachable,
+        }
+        return switch (response.wait()) {
+            .success => |cred| .{ .success = cred },
+            .err => |msg| .{ .err = msg },
+            .unsupported => .{ .err = "extension OAuth refresh is unsupported for this provider" },
+        };
     }
 
     /// Long-lived agent owner thread entry point. This is the only
@@ -2764,6 +2849,23 @@ pub const Interactive = struct {
                             };
                             _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
                         };
+                    },
+                    .extension_oauth_login => |oauth| {
+                        idle_processed = true;
+                        const result: request_mod.ExtensionOAuthLoginResponse.Result = self.runtime_host.dispatchExtensionOAuthLogin(oauth.provider_id, oauth.callbacks) catch |err| blk: {
+                            const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch break :blk .unsupported;
+                            break :blk .{ .err = msg };
+                        };
+                        oauth.response.finish(result);
+                    },
+                    .extension_oauth_refresh => |oauth| {
+                        idle_processed = true;
+                        const exchange: oauth_mod.ExchangeResult = self.runtime_host.dispatchExtensionOAuthRefresh(oauth.provider_id, oauth.credential, oauth.result_allocator) catch |err| .{ .err = @errorName(err) };
+                        const result: request_mod.ExtensionOAuthRefreshResponse.Result = switch (exchange) {
+                            .success => |cred| .{ .success = cred },
+                            .err => |msg| .{ .err = msg },
+                        };
+                        oauth.response.finish(result);
                     },
                     .shutdown => {
                         req.deinit(self.msg_allocator);

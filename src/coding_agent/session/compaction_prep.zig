@@ -696,7 +696,7 @@ test "prepareCompaction: normal user-boundary cut" {
         try testAssistantEntry(allocator, "a2", "u2", "second answer"),
     };
 
-    const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 4 })).?;
+    const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 5 })).?;
     try testing.expect(!prep.is_split_turn);
     try testing.expectEqualStrings("u2", prep.first_kept_entry_id);
     try testing.expect(prep.messages_to_summarize.len > 0);

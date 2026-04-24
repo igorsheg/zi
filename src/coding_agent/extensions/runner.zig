@@ -9,6 +9,8 @@ const resource_types = @import("../resources/types.zig");
 const tool_def = @import("../tools/definition.zig");
 const context_mod = @import("context.zig");
 const oauth_mod = @import("../auth/oauth.zig");
+const auth_types = @import("../auth/types.zig");
+const request_mod = @import("../request.zig");
 
 const log = std.log.scoped(.zi_runner);
 
@@ -451,6 +453,11 @@ pub const ExtensionRunner = struct {
     /// freeze the UI behind long-running tools; "single owner
     /// thread + cross-thread inboxes" gives us correctness AND
     /// responsiveness for free.
+    pub fn isOnLuaThread(self: *const ExtensionRunner) bool {
+        const owner = self.lua_owner_thread.load(.acquire);
+        return owner != 0 and owner == std.Thread.getCurrentId();
+    }
+
     pub fn assertOnLuaThread(self: *ExtensionRunner) void {
         const tid = std.Thread.getCurrentId();
         // Try to claim ownership if it's still vacant. cmpxchgStrong
@@ -673,6 +680,273 @@ pub const ExtensionRunner = struct {
         }
     }
 
+    pub fn dispatchOAuthLogin(
+        self: *ExtensionRunner,
+        provider_id: []const u8,
+        callbacks: request_mod.ExtensionOAuthLoginCallbacks,
+        allocator: std.mem.Allocator,
+    ) !request_mod.ExtensionOAuthLoginResponse.Result {
+        self.assertOnLuaThread();
+
+        const registry = self._provider_registry orelse return error.MissingProviderRegistry;
+        const claim = registry.activeClaimRegistrationByName(provider_id) orelse return error.UnknownProvider;
+        const handler_ref = claim.oauth_login_ref orelse return .unsupported;
+        const state = self.lua_state orelse return error.MissingLuaState;
+        const provenance = self.findLoadedExtensionByStateOwner(claim.owner_id);
+
+        var co = try lua_runtime.Coroutine.init(state);
+        defer co.deinit();
+
+        _ = lua_runtime.c.lua_rawgeti(co.L, lua_runtime.c.LUA_REGISTRYINDEX, handler_ref);
+        if (lua_runtime.c.lua_type(co.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+            lua_runtime.c.lua_pop(co.L, 1);
+            return error.InvalidHandlerRef;
+        }
+
+        var invoke_ctx = OAuthLoginInvokeCtx{ .callbacks = callbacks };
+        pushOAuthLoginCallbacks(co.L, &invoke_ctx);
+
+        self.setModuleContext(state, provenance);
+        if (provenance) |prov| {
+            self.beginExecutionContext(self.sourceForProvenance(prov));
+            defer self.endExecutionContext();
+        }
+
+        const r = try co.resumeWith(1);
+        switch (r.status) {
+            .yielded => return error.UnexpectedYield,
+            .ok, .finished => {},
+        }
+
+        if (r.nresults == 0) return .cancelled;
+        const top = lua_runtime.c.lua_gettop(co.L);
+        defer lua_runtime.c.lua_settop(co.L, top - r.nresults);
+        return .{ .success = try parseOAuthCredential(co.L, top - r.nresults + 1, allocator) };
+    }
+
+    pub fn dispatchOAuthRefresh(
+        self: *ExtensionRunner,
+        provider_id: []const u8,
+        credential: auth_types.OAuthCredential,
+        allocator: std.mem.Allocator,
+    ) !oauth_mod.ExchangeResult {
+        self.assertOnLuaThread();
+
+        const registry = self._provider_registry orelse return error.MissingProviderRegistry;
+        const claim = registry.activeClaimRegistrationByName(provider_id) orelse return error.UnknownProvider;
+        const handler_ref = claim.oauth_refresh_token_ref orelse return .{ .err = "extension OAuth refresh is unsupported for this provider" };
+        const state = self.lua_state orelse return error.MissingLuaState;
+        const provenance = self.findLoadedExtensionByStateOwner(claim.owner_id);
+
+        var co = try lua_runtime.Coroutine.init(state);
+        defer co.deinit();
+
+        _ = lua_runtime.c.lua_rawgeti(co.L, lua_runtime.c.LUA_REGISTRYINDEX, handler_ref);
+        if (lua_runtime.c.lua_type(co.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+            lua_runtime.c.lua_pop(co.L, 1);
+            return error.InvalidHandlerRef;
+        }
+        pushOAuthCredentialTable(co.L, credential);
+
+        self.setModuleContext(state, provenance);
+        if (provenance) |prov| {
+            self.beginExecutionContext(self.sourceForProvenance(prov));
+            defer self.endExecutionContext();
+        }
+
+        const r = try co.resumeWith(1);
+        switch (r.status) {
+            .yielded => return error.UnexpectedYield,
+            .ok, .finished => {},
+        }
+
+        if (r.nresults == 0) return .{ .err = "missing OAuth credential" };
+        const top = lua_runtime.c.lua_gettop(co.L);
+        defer lua_runtime.c.lua_settop(co.L, top - r.nresults);
+        return .{ .success = try parseOAuthCredential(co.L, top - r.nresults + 1, allocator) };
+    }
+
+    pub fn dispatchOAuthGetApiKey(
+        self: *ExtensionRunner,
+        provider_id: []const u8,
+        credential: auth_types.OAuthCredential,
+        allocator: std.mem.Allocator,
+    ) !?[]const u8 {
+        self.assertOnLuaThread();
+
+        const registry = self._provider_registry orelse return error.MissingProviderRegistry;
+        const claim = registry.activeClaimRegistrationByName(provider_id) orelse return error.UnknownProvider;
+        const handler_ref = claim.oauth_get_api_key_ref orelse return null;
+        const state = self.lua_state orelse return error.MissingLuaState;
+        const provenance = self.findLoadedExtensionByStateOwner(claim.owner_id);
+
+        var co = try lua_runtime.Coroutine.init(state);
+        defer co.deinit();
+
+        _ = lua_runtime.c.lua_rawgeti(co.L, lua_runtime.c.LUA_REGISTRYINDEX, handler_ref);
+        if (lua_runtime.c.lua_type(co.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+            lua_runtime.c.lua_pop(co.L, 1);
+            return error.InvalidHandlerRef;
+        }
+        pushOAuthCredentialTable(co.L, credential);
+
+        self.setModuleContext(state, provenance);
+        if (provenance) |prov| {
+            self.beginExecutionContext(self.sourceForProvenance(prov));
+            defer self.endExecutionContext();
+        }
+
+        const r = try co.resumeWith(1);
+        switch (r.status) {
+            .yielded => return error.UnexpectedYield,
+            .ok, .finished => {},
+        }
+
+        if (r.nresults == 0) return null;
+        const top = lua_runtime.c.lua_gettop(co.L);
+        defer lua_runtime.c.lua_settop(co.L, top - r.nresults);
+        return try parseOAuthApiKeyResult(co.L, top - r.nresults + 1, allocator);
+    }
+
+    const OAuthLoginInvokeCtx = struct {
+        callbacks: request_mod.ExtensionOAuthLoginCallbacks,
+    };
+
+    fn pushOAuthLoginCallbacks(L: *lua_runtime.c.lua_State, invoke_ctx: *OAuthLoginInvokeCtx) void {
+        const c = lua_runtime.c;
+        c.lua_createtable(L, 0, 2);
+        c.lua_pushlightuserdata(L, invoke_ctx);
+        c.lua_pushcclosure(L, oauthLoginOnAuth, 1);
+        c.lua_setfield(L, -2, "onAuth");
+        if (invoke_ctx.callbacks.on_progress != null) {
+            c.lua_pushlightuserdata(L, invoke_ctx);
+            c.lua_pushcclosure(L, oauthLoginOnProgress, 1);
+            c.lua_setfield(L, -2, "onProgress");
+        }
+    }
+
+    fn oauthLoginOnAuth(L_opt: ?*lua_runtime.c.lua_State) callconv(.c) c_int {
+        const c = lua_runtime.c;
+        const L = L_opt.?;
+        const ctx_ptr = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse return c.luaL_error(L, "oauth.onAuth: missing context");
+        const invoke_ctx: *OAuthLoginInvokeCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (c.lua_type(L, 1) != c.LUA_TTABLE) return c.luaL_error(L, "oauth.onAuth: expected table");
+        _ = c.lua_getfield(L, 1, "url");
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return c.luaL_error(L, "oauth.onAuth: expected string field 'url'");
+        invoke_ctx.callbacks.on_auth(lstring(L, -1), invoke_ctx.callbacks.ctx);
+        return 0;
+    }
+
+    fn oauthLoginOnProgress(L_opt: ?*lua_runtime.c.lua_State) callconv(.c) c_int {
+        const c = lua_runtime.c;
+        const L = L_opt.?;
+        const ctx_ptr = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse return c.luaL_error(L, "oauth.onProgress: missing context");
+        const invoke_ctx: *OAuthLoginInvokeCtx = @ptrCast(@alignCast(ctx_ptr));
+        const progress = invoke_ctx.callbacks.on_progress orelse return 0;
+        if (c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "oauth.onProgress: expected string");
+        progress(lstring(L, 1), invoke_ctx.callbacks.ctx);
+        return 0;
+    }
+
+    fn pushOAuthCredentialTable(L: *lua_runtime.c.lua_State, credential: auth_types.OAuthCredential) void {
+        const c = lua_runtime.c;
+        c.lua_createtable(L, 0, 3 + @as(c_int, @intCast(credential.extras.count())));
+        _ = c.lua_pushlstring(L, credential.refresh.ptr, credential.refresh.len);
+        c.lua_setfield(L, -2, "refresh");
+        _ = c.lua_pushlstring(L, credential.access.ptr, credential.access.len);
+        c.lua_setfield(L, -2, "access");
+        c.lua_pushinteger(L, @intCast(credential.expires));
+        c.lua_setfield(L, -2, "expires");
+
+        var it = credential.extras.iterator();
+        while (it.next()) |entry| {
+            _ = c.lua_pushlstring(L, entry.key_ptr.*.ptr, entry.key_ptr.*.len);
+            lua_runtime.pushJsonValue(L, entry.value_ptr.*) catch unreachable;
+            c.lua_settable(L, -3);
+        }
+    }
+
+    fn parseOAuthApiKeyResult(
+        L: *lua_runtime.c.lua_State,
+        idx: c_int,
+        allocator: std.mem.Allocator,
+    ) !?[]const u8 {
+        const c = lua_runtime.c;
+        return switch (c.lua_type(L, idx)) {
+            c.LUA_TNIL => null,
+            c.LUA_TSTRING => try allocator.dupe(u8, lstring(L, idx)),
+            else => error.InvalidOAuthApiKey,
+        };
+    }
+
+    fn parseOAuthCredential(
+        L: *lua_runtime.c.lua_State,
+        idx: c_int,
+        allocator: std.mem.Allocator,
+    ) !auth_types.OAuthCredential {
+        const c = lua_runtime.c;
+        if (c.lua_type(L, idx) != c.LUA_TTABLE) return error.InvalidOAuthCredential;
+        const abs_idx = c.lua_absindex(L, idx);
+
+        _ = c.lua_getfield(L, abs_idx, "refresh");
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOAuthCredential;
+        const refresh = try allocator.dupe(u8, lstring(L, -1));
+        errdefer allocator.free(refresh);
+
+        _ = c.lua_getfield(L, abs_idx, "access");
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOAuthCredential;
+        const access = try allocator.dupe(u8, lstring(L, -1));
+        errdefer allocator.free(access);
+
+        _ = c.lua_getfield(L, abs_idx, "expires");
+        defer c.lua_pop(L, 1);
+        const expires: i64 = switch (c.lua_type(L, -1)) {
+            c.LUA_TNUMBER => if (c.lua_isinteger(L, -1) != 0)
+                @intCast(c.lua_tointegerx(L, -1, null))
+            else
+                @intFromFloat(c.lua_tonumberx(L, -1, null)),
+            else => return error.InvalidOAuthCredential,
+        };
+
+        var extras = std.json.ObjectMap.init(allocator);
+        errdefer {
+            var eit = extras.iterator();
+            while (eit.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                ai.json_util.freeJsonValue(allocator, e.value_ptr.*);
+            }
+            extras.deinit();
+        }
+
+        c.lua_pushnil(L);
+        while (c.lua_next(L, abs_idx) != 0) {
+            defer c.lua_pop(L, 1);
+            if (c.lua_type(L, -2) != c.LUA_TSTRING) continue;
+            const key = lstring(L, -2);
+            if (std.mem.eql(u8, key, "refresh") or std.mem.eql(u8, key, "access") or std.mem.eql(u8, key, "expires")) continue;
+            const duped_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(duped_key);
+            const value = try lua_runtime.luaValueToJson(L, -1, allocator);
+            try extras.put(duped_key, value);
+        }
+
+        return .{
+            .refresh = refresh,
+            .access = access,
+            .expires = expires,
+            .extras = extras,
+        };
+    }
+
+    fn lstring(L: *lua_runtime.c.lua_State, idx: c_int) []const u8 {
+        var len: usize = 0;
+        const ptr = lua_runtime.c.lua_tolstring(L, idx, &len) orelse return &.{};
+        return ptr[0..len];
+    }
+
     /// Record the private module root for an extension so that later
     /// execution entry points can resolve `require("helper")` relative
     /// to the extension's directory.
@@ -861,6 +1135,69 @@ test "bindRuntime rejects double-bind" {
     try std.testing.expectError(error.AlreadyBound, result);
 }
 
+test "dispatchOAuthGetApiKey executes the claim callback on the lua-owning thread" {
+    const allocator = std.testing.allocator;
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = ExtensionRunner.init(allocator, 11);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    try state.doString(
+        \\function oauth_get_api_key(credentials)
+        \\  return credentials.access .. "-api"
+        \\end
+    , "oauth_get_api_key_test");
+    _ = lua_runtime.c.lua_getglobal(state.L, "oauth_get_api_key");
+    const handler_ref = lua_runtime.c.luaL_ref(state.L, lua_runtime.c.LUA_REGISTRYINDEX);
+
+    var baseline = ai.faux.FauxProvider.init(allocator);
+    defer baseline.deinit();
+
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
+    try provider_registry.register("anthropic-messages", baseline.provider(), null);
+    try std.testing.expect(try provider_registry.registerClaim(.{
+        .name = try allocator.dupe(u8, "proxy-get-key"),
+        .api = try allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_get_api_key_ref = handler_ref,
+        .owner_id = try allocator.dupe(u8, "state-123"),
+        .generation = runner.generation,
+    }));
+
+    try runner.bindRuntime(.{
+        .session = undefined,
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
+    }, &provider_registry);
+
+    var credential = auth_types.OAuthCredential{
+        .refresh = try allocator.dupe(u8, "refresh-token"),
+        .access = try allocator.dupe(u8, "access-token"),
+        .expires = 1234,
+        .extras = std.json.ObjectMap.init(allocator),
+    };
+    defer auth_types.deinitOAuthCredential(allocator, &credential);
+
+    const api_key = try runner.dispatchOAuthGetApiKey("proxy-get-key", credential, allocator);
+    defer if (api_key) |key| allocator.free(key);
+    try std.testing.expect(api_key != null);
+    try std.testing.expectEqualStrings("access-token-api", api_key.?);
+}
+
 test "bindRuntime replays queued providers, registers oauth claims, and unbindRuntime revokes the generation" {
     const allocator = std.testing.allocator;
     oauth_mod.resetDynamicProvidersForTest();
@@ -935,6 +1272,7 @@ test "ExtensionRunner registries survive populated deinit" {
         .parameters = params,
         .impl = .{ .lua = 7 },
         .source = .{ .kind = "user", .id = "task.lua" },
+        .owned = true,
     });
     try std.testing.expect(accepted);
 

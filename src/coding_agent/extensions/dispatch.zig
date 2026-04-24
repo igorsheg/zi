@@ -517,14 +517,14 @@ test "dispatch paths expose binding from handler provenance" {
         \\  assert(ctx.binding.runtime_root_id == "root-123")
         \\  assert(ctx.binding.state_owner_id == "state-123")
         \\  assert(ctx.binding.generation_id == 7)
-        \\  assert(ctx.binding.namespace_id == "state-123::7::/workspace")
+        \\  assert(ctx.binding.namespace_id == "state-123::7")
         \\  assert(ctx.binding.workspace_id == "/workspace")
         \\  assert(ctx.binding.session_id == "session-123")
         \\  assert(ctx.binding.session_file == "/workspace/.zi/sessions/session-123.jsonl")
         \\end)
         \\zi.on("tool_call", function(event, ctx)
         \\  assert(ctx.binding ~= nil)
-        \\  assert(ctx.binding.namespace_id == "state-123::7::/workspace")
+        \\  assert(ctx.binding.namespace_id == "state-123::7")
         \\  return { block = true, reason = ctx.binding.session_id }
         \\end)
         \\zi.on("tool_result", function(event, ctx)
@@ -550,7 +550,7 @@ test "dispatch paths expose binding from handler provenance" {
     c.lua_pop(state.L, 1);
 
     try testing.expect(transformed == .object);
-    try testing.expectEqualStrings("state-123::7::/workspace", transformed.object.get("namespace_id").?.string);
+    try testing.expectEqualStrings("state-123::7", transformed.object.get("namespace_id").?.string);
     try testing.expectEqualStrings("/workspace/.zi/sessions/session-123.jsonl", transformed.object.get("session_file").?.string);
 }
 

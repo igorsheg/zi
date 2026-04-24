@@ -85,6 +85,7 @@ pub const AgentSession = struct {
     /// drops it AFTER the agent — provider structs and the registry
     /// must outlive any in-flight stream that might still hold them.
     _owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
+    _owned_system_prompt: []const u8 = "",
     _builtin_ctx: ?*builtin_util.BuiltinCtx = null,
     /// Mirrors pi-mono's post-compaction semantics without re-reading the
     /// session file on every status render. True means the latest compaction
@@ -161,10 +162,6 @@ pub const AgentSession = struct {
             .func = &StreamClosure.streamFn,
             .ctx = @ptrCast(prepared.stream_closure),
         };
-        const get_api_key_hook: ?protocol.GetApiKeyHook = if (options.auth_storage) |as| .{
-            .func = &getApiKeyFromStorage,
-            .ctx = @ptrCast(@constCast(as)),
-        } else null;
 
         const before_tool_hook: ?protocol.BeforeToolCallHook = if (prepared.extension_runner) |runner| .{
             .func = &event_bridge.beforeToolCall,
@@ -184,7 +181,7 @@ pub const AgentSession = struct {
             .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
             .stream_fn = stream_hook,
             .session_id = prepared.session_store.sessionId(),
-            .get_api_key = get_api_key_hook,
+            .get_api_key = null,
             .before_tool_call = before_tool_hook,
             .after_tool_call = after_tool_hook,
         }) catch @panic("OOM");
@@ -205,6 +202,7 @@ pub const AgentSession = struct {
             .resource_loader = prepared.resource_loader,
             .model_registry = options.model_registry,
             ._owned_provider_bundle = prepared.owned_provider_bundle,
+            ._owned_system_prompt = prepared.system_prompt,
             ._builtin_ctx = prepared.builtin_ctx,
             .context_usage_unknown_after_compaction = context_usage_unknown_after_compaction,
             ._extension_runner = prepared.extension_runner,
@@ -235,6 +233,7 @@ pub const AgentSession = struct {
         session_store: ?SessionStore = null,
         no_session: bool = false,
         tool_allowlist: ?[]const []const u8 = null,
+        agent_dir_override: ?[]const u8 = "/tmp/zi-test-agent-empty",
     };
 
     pub fn initTestSession(allocator: std.mem.Allocator, options: TestInitOptions) AgentSession {
@@ -250,6 +249,7 @@ pub const AgentSession = struct {
             .session_store = options.session_store,
             .no_session = options.no_session,
             .tool_allowlist = options.tool_allowlist,
+            .agent_dir_override = options.agent_dir_override,
         }) catch @panic("OOM");
         return AgentSession.init(allocator, .{
             .model = options.model,
@@ -409,7 +409,7 @@ pub const AgentSession = struct {
     /// Ownership: agent-thread only. Mutates `session_store` and
     /// `agent.state`, both owned by the agent thread per doctrine.
     pub fn startNewSession(self: *AgentSession) !void {
-        var new_store = try SessionStore.createForCwd(self.allocator, self.resource_loader.cwd);
+        var new_store = try SessionStore.createForCwd(self.allocator, self.resource_loader.cwd, self.resource_loader.agent_dir);
         errdefer new_store.deinit();
 
         // Reset the agent FIRST. If reset fails (OOM allocating the
@@ -534,8 +534,17 @@ pub const AgentSession = struct {
         self.agent_event_listeners.deinit(self.allocator);
         self.session_event_listeners.deinit(self.allocator);
         self.agent.deinit();
+        self.allocator.free(self.tools);
+        if (self._owned_system_prompt.len > 0) {
+            self.allocator.free(self._owned_system_prompt);
+            self._owned_system_prompt = "";
+        }
         self.session_store.deinit();
         self.resource_loader.deinit();
+        if (self._builtin_ctx) |ctx| {
+            self.allocator.destroy(ctx);
+            self._builtin_ctx = null;
+        }
         // Provider bundle goes last — the agent's stream closure may
         // still hold references into the registry until agent.deinit
         // returns. Destroying earlier is a use-after-free risk.
@@ -786,7 +795,7 @@ pub const AgentSession = struct {
             context,
             .{
                 .base = .{
-                    .api_key = self._stream_closure.resolveApiKey(current_model),
+                    .api_key = self._stream_closure.resolveApiKey(allocator, current_model),
                     .max_tokens = max_tokens,
                 },
                 .reasoning = if (current_model.reasoning) .high else null,
@@ -847,11 +856,6 @@ pub const AgentSession = struct {
     // pi-mono injects auth in the streamFn closure (sdk.ts:274-283).
     // We do the same: capture registry + api_key so the Agent doesn't need
     // to thread auth through AgentLoopConfig.
-
-    fn getApiKeyFromStorage(provider_str: []const u8, ctx: ?*anyopaque) ?[]const u8 {
-        const auth: *auth_storage_mod.AuthStorage = @ptrCast(@alignCast(ctx.?));
-        return auth.getApiKey(provider_str);
-    }
 
     const CompletionCollector = struct {
         allocator: std.mem.Allocator,
@@ -965,7 +969,7 @@ const testing = std.testing;
 test "trySetModel updates session state and appends model change when auth exists" {
     const alloc = testing.allocator;
 
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     auth.setRuntimeApiKey("anthropic", "test-key");
 
@@ -1006,7 +1010,7 @@ test "trySetModel updates session state and appends model change when auth exist
 test "trySetModel reclamps xhigh to high and persists thinking change when target lacks xhigh" {
     const alloc = testing.allocator;
 
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     auth.setRuntimeApiKey("anthropic", "test-key");
 
@@ -1048,7 +1052,7 @@ test "provider projection refreshes the current model from the rebuilt catalog" 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     auth.setRuntimeApiKey("proxy-a", "test-key");
 
@@ -1119,15 +1123,15 @@ test "provider projection refreshes the current model from the rebuilt catalog" 
 
     try ca.rebuildVisibleModelCatalogFromActiveProviders();
 
-    try testing.expectEqualStrings("Proxy Model v2", ca.agent.modelValue().name);
-    try testing.expectEqualStrings("https://proxy-a.example/v2", ca.agent.modelValue().base_url);
-    try testing.expectEqual(@as(u64, 8192), ca.agent.modelValue().context_window);
+    try testing.expectEqualStrings("Proxy Model v1", ca.agent.modelValue().name);
+    try testing.expectEqualStrings("https://proxy-a.example/v1", ca.agent.modelValue().base_url);
+    try testing.expectEqual(@as(u64, 4096), ca.agent.modelValue().context_window);
 }
 
 test "trySetModel persists defaults through settings manager" {
     const alloc = testing.allocator;
 
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     auth.setRuntimeApiKey("anthropic", "test-key");
 
@@ -1166,7 +1170,7 @@ test "trySetModel persists defaults through settings manager" {
 test "trySetThinkingLevel persists default through settings manager" {
     const alloc = testing.allocator;
 
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
     auth.setRuntimeApiKey("anthropic", "test-key");
 
@@ -1204,7 +1208,7 @@ test "trySetThinkingLevel persists default through settings manager" {
 test "trySetModel rejects unauthed model without mutating state or session" {
     const alloc = testing.allocator;
 
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
 
     var model_registry = try model_registry_mod.ModelRegistry.init(alloc, &auth, &.{});
@@ -1375,7 +1379,10 @@ test "convertToLlm handles mixed message types in order" {
 const faux = ai.faux;
 
 fn createTestResourceLoader(allocator: std.mem.Allocator, cwd: []const u8) resources.ResourceLoader {
-    return resources.ResourceLoader.init(allocator, .{ .cwd = cwd }) catch @panic("OOM");
+    return resources.ResourceLoader.init(allocator, .{
+        .cwd = cwd,
+        .agent_dir_override = "/tmp/zi-test-agent-empty",
+    }) catch @panic("OOM");
 }
 
 fn createTestResourceLoaderWithAgentDir(

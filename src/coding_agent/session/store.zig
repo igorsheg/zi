@@ -84,8 +84,8 @@ pub const SessionStore = struct {
     }
 
     /// Create a new persisted session for a cwd using zi's canonical session directory layout.
-    pub fn createForCwd(allocator: std.mem.Allocator, project_cwd: []const u8) !SessionStore {
-        const session_dir = try storage.getSessionDirForCwd(allocator, project_cwd, null);
+    pub fn createForCwd(allocator: std.mem.Allocator, project_cwd: []const u8, agent_dir_override: ?[]const u8) !SessionStore {
+        const session_dir = try storage.getSessionDirForCwd(allocator, project_cwd, agent_dir_override);
         defer allocator.free(session_dir);
         return SessionStore.create(allocator, session_dir, project_cwd);
     }
@@ -114,14 +114,23 @@ pub const SessionStore = struct {
         else
             null;
 
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        const owned_session_id = try allocator.dupe(u8, session_header.id);
+        errdefer allocator.free(owned_session_id);
+        const owned_cwd = try allocator.dupe(u8, session_header.cwd);
+        errdefer allocator.free(owned_cwd);
+        const owned_leaf_id = if (leaf_id) |id| try allocator.dupe(u8, id) else null;
+        errdefer if (owned_leaf_id) |id| allocator.free(id);
+
         return .{
             .allocator = allocator,
             .writer = writer_mod.SessionWriter.initContinue(
                 allocator,
-                try allocator.dupe(u8, path),
-                try allocator.dupe(u8, session_header.id),
-                try allocator.dupe(u8, session_header.cwd),
-                if (leaf_id) |id| try allocator.dupe(u8, id) else null,
+                owned_path,
+                owned_session_id,
+                owned_cwd,
+                owned_leaf_id,
             ),
             .cache_arena = cache_arena,
             .cached_entries = data.entries,
@@ -297,7 +306,6 @@ pub const SessionStore = struct {
     /// Whether the latest compaction on the current branch has not yet been
     /// followed by a successful assistant response with non-zero usage.
     pub fn contextUsageUnknownAfterCompaction(self: *SessionStore, allocator: std.mem.Allocator) bool {
-        if (self.cached_entries == null) return false;
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const branch = self.buildCurrentBranchAlloc(arena.allocator()) catch return false;
@@ -318,7 +326,29 @@ pub const SessionStore = struct {
     fn readIntoCache(self: *SessionStore) !reader_mod.SessionData {
         var cache_arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer cache_arena.deinit();
-        const data = try reader_mod.readSessionFile(cache_arena.allocator(), self.writer.session_file);
+        const cache_alloc = cache_arena.allocator();
+
+        const data = if (self.writer.session_file.len == 0) blk: {
+            const buffered = self.writer.buffered_entries.items;
+            var entry_count: usize = 0;
+            for (buffered) |item| switch (item) {
+                .entry => entry_count += 1,
+                .header => {},
+            };
+
+            const entries = try cache_alloc.alloc(proto.SessionEntry, entry_count);
+            var index: usize = 0;
+            var buffered_header: ?proto.SessionHeader = null;
+            for (buffered) |item| switch (item) {
+                .header => |value| buffered_header = value,
+                .entry => |value| {
+                    entries[index] = value;
+                    index += 1;
+                },
+            };
+            break :blk reader_mod.SessionData{ .header = buffered_header, .entries = entries };
+        } else try reader_mod.readSessionFile(cache_alloc, self.writer.session_file);
+
         self.clearCache();
         self.cache_arena = cache_arena;
         self.cached_entries = data.entries;
@@ -725,7 +755,11 @@ test "appendRuntimeDefaults seeds model change before thinking level change" {
 }
 
 test "applyCompaction appends summary and rebuilds current context" {
-    var store = SessionStore.createEphemeral(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var store = SessionStore.createEphemeral(allocator);
     defer store.deinit();
 
     store.appendMessage(testUserMessage("first", 1));

@@ -249,7 +249,7 @@ const Entry = struct {
         self.len = @intCast(n);
     }
 
-    fn slice(self: Entry) []const u8 {
+    fn slice(self: *const Entry) []const u8 {
         return self.bytes[0..self.len];
     }
 };

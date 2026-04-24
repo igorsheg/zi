@@ -42,6 +42,7 @@ pub const CreateOptions = struct {
     context_files: []const resources.types.AgentsFile = &.{},
     /// ResourceLoader bootstrap input: explicit extension roots/paths.
     extension_paths: []const []const u8 = &.{},
+    agent_dir_override: ?[]const u8 = null,
     max_tokens: ?u64 = 4096,
     tools: ?[]const tool_def.ToolDefinition = null,
     registry: ?*ai.provider.Registry = null,
@@ -79,6 +80,7 @@ pub fn createAgentSession(
         .system_prompt = options.system_prompt,
         .context_files = options.context_files,
         .extension_paths = options.extension_paths,
+        .agent_dir_override = options.agent_dir_override,
         .max_tokens = options.max_tokens,
         .tools = options.tools,
         .registry = options.registry,

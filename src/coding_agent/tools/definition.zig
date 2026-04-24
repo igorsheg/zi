@@ -38,6 +38,7 @@ pub const ToolDefinition = struct {
     impl: ToolImpl,
     source: RegistrationSource,
     render_result_ref: ?c_int = null,
+    owned: bool = false,
 };
 
 pub fn cloneOwned(allocator: std.mem.Allocator, def: ToolDefinition) !ToolDefinition {
@@ -85,10 +86,12 @@ pub fn cloneOwned(allocator: std.mem.Allocator, def: ToolDefinition) !ToolDefini
         .impl = def.impl,
         .source = def.source,
         .render_result_ref = def.render_result_ref,
+        .owned = true,
     };
 }
 
 pub fn freeOwned(allocator: std.mem.Allocator, def: *ToolDefinition) void {
+    if (!def.owned) return;
     allocator.free(def.name);
     allocator.free(def.label);
     allocator.free(def.description);
@@ -96,6 +99,7 @@ pub fn freeOwned(allocator: std.mem.Allocator, def: *ToolDefinition) void {
     for (def.prompt_guidelines) |guideline| allocator.free(guideline);
     if (def.prompt_guidelines.len > 0) allocator.free(def.prompt_guidelines);
     json_value.freeJsonValue(allocator, def.parameters);
+    def.owned = false;
 }
 
 pub fn toAgentTool(def: ToolDefinition) protocol.AgentTool {

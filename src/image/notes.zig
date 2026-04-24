@@ -12,11 +12,12 @@ pub fn formatDimensionNote(
 ) !?[]u8 {
     if (original.width == displayed.width and original.height == displayed.height) return null;
     const scale = @as(f64, @floatFromInt(original.width)) / @as(f64, @floatFromInt(displayed.width));
-    return std.fmt.allocPrint(
+    const note = try std.fmt.allocPrint(
         allocator,
         "[Image: original {d}x{d}, displayed at {d}x{d}. Multiply coordinates by {d:.2} to map to original image.]",
         .{ original.width, original.height, displayed.width, displayed.height, scale },
     );
+    return note;
 }
 
 test "formatDimensionNote mirrors pi-mono resized-image wording" {

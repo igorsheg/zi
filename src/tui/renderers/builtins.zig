@@ -650,11 +650,11 @@ test "edit renderer renders unified diff text without structured diff details" {
     var row3: [80]u8 = undefined;
     var row4: [80]u8 = undefined;
     var row5: [80]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 0, &row0), "--- a.txt") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 2, &row2), "@@ -1,3 +1,3 @@") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 3, &row3), "one") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "-two") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 5, &row5), "+TWO") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 1, &row0), "--- a.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 3, &row2), "@@ -1,3 +1,3 @@") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row3), "one") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 5, &row4), "-two") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 6, &row5), "+TWO") != null);
 }
 
 test "edit renderer shows malformed result message when tool result is missing" {
@@ -718,5 +718,5 @@ test "edit renderer shows malformed result message when tool result is missing" 
     edit_renderer.render_result_slice.?(&render_ctx, 0);
 
     var row: [80]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 0, &row), "malformed edit result") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 1, &row), "malformed edit result") != null);
 }

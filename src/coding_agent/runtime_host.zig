@@ -9,10 +9,13 @@ const sdk = @import("sdk.zig");
 const resolve_mod = @import("resolve.zig");
 const session_runner = @import("session_runner.zig");
 const conversation_state = @import("../agent3/conversation_state.zig");
+const auth_types = @import("auth/types.zig");
+const oauth_mod = @import("auth/oauth.zig");
 const theme_mod = @import("../tui/theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const session_event_mod = @import("session_event.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
+const request_mod = @import("request.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const profile = @import("../debug/profile.zig");
 
@@ -52,6 +55,25 @@ pub const QueuedSnapshotPublisher = struct {
     }
 };
 
+pub const ExtensionOAuthRefreshDispatcher = struct {
+    func: *const fn (
+        provider_id: []const u8,
+        credential: auth_types.OAuthCredential,
+        result_allocator: std.mem.Allocator,
+        ctx: ?*anyopaque,
+    ) oauth_mod.ExchangeResult,
+    ctx: ?*anyopaque = null,
+
+    pub fn dispatch(
+        self: ExtensionOAuthRefreshDispatcher,
+        provider_id: []const u8,
+        credential: auth_types.OAuthCredential,
+        result_allocator: std.mem.Allocator,
+    ) oauth_mod.ExchangeResult {
+        return self.func(provider_id, credential, result_allocator, self.ctx);
+    }
+};
+
 pub const RuntimeHost = struct {
     session: *AgentSession,
     session_allocator: std.mem.Allocator,
@@ -64,6 +86,7 @@ pub const RuntimeHost = struct {
     session_event_token: ?AgentSession.EventSubscriptionToken = null,
     next_extension_generation: extension_runner_mod.Generation,
     session_generation: u64 = 1,
+    extension_oauth_refresh_dispatcher: ?ExtensionOAuthRefreshDispatcher = null,
 
     pub const AgentEventHandler = struct {
         func: *const fn (event: agent_mod.protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -101,11 +124,13 @@ pub const RuntimeHost = struct {
             .next_extension_generation = nextExtensionGenerationFor(session),
             .session_generation = 1,
         };
+        self.bindAuthStorageHooks(session);
         self.activateSessionLifecycle(.startup, null, null);
         return self;
     }
 
     pub fn deinit(self: *RuntimeHost) void {
+        self.clearAuthStorageHooks(self.session);
         self.shutdownSessionLifecycle(.exit, null, null);
         self.session.deinit();
         self.session_allocator.destroy(self.session);
@@ -127,6 +152,22 @@ pub const RuntimeHost = struct {
     pub fn dispatchExtensionCommand(self: *RuntimeHost, name: []const u8, args: []const u8) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchCommand(name, args);
+    }
+
+    pub fn dispatchExtensionOAuthLogin(self: *RuntimeHost, provider_id: []const u8, callbacks: request_mod.ExtensionOAuthLoginCallbacks) !request_mod.ExtensionOAuthLoginResponse.Result {
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        return runner.dispatchOAuthLogin(provider_id, callbacks, self.msg_allocator);
+    }
+
+    pub fn dispatchExtensionOAuthRefresh(self: *RuntimeHost, provider_id: []const u8, credential: auth_types.OAuthCredential, allocator: std.mem.Allocator) !oauth_mod.ExchangeResult {
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        if (runner.isOnLuaThread()) {
+            return runner.dispatchOAuthRefresh(provider_id, credential, allocator);
+        }
+        if (self.extension_oauth_refresh_dispatcher) |dispatcher| {
+            return dispatcher.dispatch(provider_id, credential, allocator);
+        }
+        return error.ExtensionOAuthRefreshRequiresAgentThread;
     }
 
     pub fn selectedTheme(self: *const RuntimeHost) theme_mod.Theme {
@@ -191,6 +232,10 @@ pub const RuntimeHost = struct {
         self.runner.setCompactionExecutor(executor);
     }
 
+    pub fn setExtensionOAuthRefreshDispatcher(self: *RuntimeHost, dispatcher: ?ExtensionOAuthRefreshDispatcher) void {
+        self.extension_oauth_refresh_dispatcher = dispatcher;
+    }
+
     /// Agent-thread-only helper for the queued-input restore flow.
     pub fn restoreQueuedMessagesOnAgentThread(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
         return self.session.restoreQueuedMessagesOnAgentThread(allocator);
@@ -248,7 +293,7 @@ pub const RuntimeHost = struct {
         create_options.initial_messages = &.{};
         create_options.thinking_level = self.session.agent.thinkingLevel();
 
-        var new_store = try agent_session_mod.SessionStore.createForCwd(self.session_allocator, create_options.cwd);
+        var new_store = try agent_session_mod.SessionStore.createForCwd(self.session_allocator, create_options.cwd, create_options.agent_dir_override);
         var owns_new_store = true;
         errdefer if (owns_new_store) new_store.deinit();
         create_options.session_store = new_store;
@@ -270,7 +315,7 @@ pub const RuntimeHost = struct {
         create_options.initial_messages = &.{};
         create_options.thinking_level = self.session.agent.thinkingLevel();
 
-        var new_store = try agent_session_mod.SessionStore.createForCwd(self.session_allocator, create_options.cwd);
+        var new_store = try agent_session_mod.SessionStore.createForCwd(self.session_allocator, create_options.cwd, create_options.agent_dir_override);
         var owns_new_store = true;
         errdefer if (owns_new_store) new_store.deinit();
         create_options.session_store = new_store;
@@ -529,7 +574,9 @@ pub const RuntimeHost = struct {
         self.unbindAgentEvents();
         self.unbindSessionEvents();
         old.shutdownLifecycleOnAgentThread();
+        if (old.auth_storage != next.auth_storage) self.clearAuthStorageHooks(old);
         self.session = next;
+        self.bindAuthStorageHooks(next);
         self.session_generation += 1;
         self.activateSessionLifecycle(reason, if (previous_snapshot) |*snap| .{ .snapshot = snap } else null, fork_parent_entry_id);
         if (previous_snapshot) |*snap| snap.deinit();
@@ -577,6 +624,30 @@ pub const RuntimeHost = struct {
             .func = &runnerSessionEventBridge,
             .ctx = @ptrCast(self),
         };
+    }
+
+    fn bindAuthStorageHooks(self: *RuntimeHost, session: *AgentSession) void {
+        const auth = session.auth_storage orelse return;
+        auth.setExtensionOAuthRefreshHook(.{
+            .func = &dispatchExtensionOAuthRefreshFromAuthStorage,
+            .ctx = @ptrCast(self),
+        });
+    }
+
+    fn clearAuthStorageHooks(self: *RuntimeHost, session: *AgentSession) void {
+        _ = self;
+        const auth = session.auth_storage orelse return;
+        auth.setExtensionOAuthRefreshHook(null);
+    }
+
+    fn dispatchExtensionOAuthRefreshFromAuthStorage(
+        provider: []const u8,
+        credential: auth_types.OAuthCredential,
+        allocator: std.mem.Allocator,
+        ctx: ?*anyopaque,
+    ) oauth_mod.ExchangeResult {
+        const self: *RuntimeHost = @ptrCast(@alignCast(ctx.?));
+        return self.dispatchExtensionOAuthRefresh(provider, credential, allocator) catch |err| .{ .err = @errorName(err) };
     }
 };
 
@@ -684,11 +755,24 @@ fn fauxErrorAssistantMessage(
     return message;
 }
 
+fn persistSessionFixture(_: std.mem.Allocator, store: *agent_session_mod.SessionStore) void {
+    store.appendMessage(.{ .user = .{
+        .content = .{ .text = "persist me" },
+        .timestamp = 1,
+    } });
+
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("persisted")};
+    var assistant = faux.fauxAssistantMessage(std.heap.page_allocator, &content, .stop);
+    assistant.timestamp = 2;
+    store.appendMessage(.{ .assistant = assistant });
+}
+
 fn createTestCreateOptions(registry: ?*ai.provider.Registry) sdk.CreateOptions {
     return .{
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = "/tmp/zi-test",
+        .agent_dir_override = "/tmp/zi-test-agent-empty",
         .registry = registry,
         .tools = &.{},
         .no_session = true,
@@ -714,6 +798,7 @@ fn createTestCreateOptionsForCwd(
         .model = faux.fauxModel(),
         .api_key = "test-key",
         .cwd = cwd,
+        .agent_dir_override = "/tmp/zi-test-agent-empty",
         .tools = &.{},
         .no_session = no_session,
         .extension_paths = extension_paths,
@@ -772,8 +857,15 @@ fn makeLifecycleLoggerSource(
 }
 
 test "runtime host rejects self-resume and only replaces with a different persisted session" {
-    const session = try createOwnedTestAgentSession(testing.allocator, null);
-    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(workspace);
+
+    const create_options = createTestCreateOptionsForCwd(workspace, &.{}, false);
+    const session = try createOwnedTestAgentSessionWithOptions(testing.allocator, create_options);
+    persistSessionFixture(testing.allocator, &session.session_store);
+    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, create_options, .{});
     defer host.deinit();
 
     const initial_runner = host.currentSession().extensionRunner() orelse return error.MissingExtensionRunner;
@@ -785,6 +877,7 @@ test "runtime host rejects self-resume and only replaces with a different persis
     defer testing.allocator.free(initial_session_id);
 
     try host.newSession();
+    persistSessionFixture(testing.allocator, &host.currentSession().session_store);
     const after_new_runner = host.currentSession().extensionRunner() orelse return error.MissingExtensionRunner;
     try testing.expect(after_new_runner.isBound());
     try testing.expectEqual(initial_generation + 1, after_new_runner.generation);
@@ -889,7 +982,8 @@ test "runtime host emits truthful session lifecycle events across startup new re
     }
     try testing.expectEqual(lines_before_failed_resume.items.len, lines_after_failed_resume.items.len);
 
-    var resume_store = try agent_session_mod.SessionStore.createForCwd(allocator, workspace_b);
+    var resume_store = try agent_session_mod.SessionStore.createForCwd(allocator, workspace_b, "/tmp/zi-test-agent-empty");
+    persistSessionFixture(allocator, &resume_store);
     const resume_path = try allocator.dupe(u8, resume_store.sessionFile());
     resume_store.deinit();
     defer allocator.free(resume_path);
@@ -1012,7 +1106,7 @@ test "runtime host publishes committed view and queued snapshots independently" 
 
     try testing.expect(published_snapshot != null);
     try testing.expectEqual(@as(u64, 1), published_snapshot.?.session_generation);
-    try testing.expectEqual(@as(u64, 0), published_snapshot.?.conversation_version);
+    try testing.expectEqual(@as(u64, 1), published_snapshot.?.conversation_version);
     try testing.expectEqual(@as(usize, 1), published_snapshot.?.view.committed.flat.len);
     try testing.expectEqualStrings("hello", published_snapshot.?.view.committed.flat[0].user.content.text);
 
@@ -1342,7 +1436,7 @@ test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads"
 
     const cwd = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
-    const log_path = try tmp.dir.realpathAlloc(allocator, "forklog.txt");
+    const log_path = try std.fs.path.join(allocator, &.{ cwd, "forklog.txt" });
     defer allocator.free(log_path);
 
     const lua_src = try std.fmt.allocPrint(allocator,

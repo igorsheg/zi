@@ -98,9 +98,15 @@ fn prepareArguments(allocator: std.mem.Allocator, args: std.json.Value) !std.jso
     var normalized = try json_value.cloneJsonValue(allocator, args);
     var normalized_obj = &normalized.object;
 
-    var edits_array = if (normalized_obj.get("edits")) |value| switch (value) {
-        .array => |arr| arr,
-        else => return normalized,
+    var edits_array = if (normalized_obj.fetchSwapRemove("edits")) |kv| blk: {
+        allocator.free(kv.key);
+        switch (kv.value) {
+            .array => |arr| break :blk arr,
+            else => {
+                json_value.freeJsonValue(allocator, kv.value);
+                return normalized;
+            },
+        }
     } else std.json.Array.init(allocator);
 
     var folded_edit = std.json.ObjectMap.init(allocator);
@@ -113,9 +119,18 @@ fn prepareArguments(allocator: std.mem.Allocator, args: std.json.Value) !std.jso
     try edits_array.append(.{ .object = folded_edit });
 
     try normalized_obj.put(try allocator.dupe(u8, "edits"), .{ .array = edits_array });
-    _ = normalized_obj.swapRemove("old_str");
-    _ = normalized_obj.swapRemove("new_str");
-    _ = normalized_obj.swapRemove("replace_all");
+    if (normalized_obj.fetchSwapRemove("old_str")) |kv| {
+        allocator.free(kv.key);
+        json_value.freeJsonValue(allocator, kv.value);
+    }
+    if (normalized_obj.fetchSwapRemove("new_str")) |kv| {
+        allocator.free(kv.key);
+        json_value.freeJsonValue(allocator, kv.value);
+    }
+    if (normalized_obj.fetchSwapRemove("replace_all")) |kv| {
+        allocator.free(kv.key);
+        json_value.freeJsonValue(allocator, kv.value);
+    }
 
     _ = obj;
     return normalized;
@@ -930,7 +945,11 @@ test "prepareArguments leaves non-canonical input unchanged when it cannot fold 
     );
 
     const prepared = try prepareArguments(std.testing.allocator, input);
-    try std.testing.expect(prepared == input);
+    try std.testing.expect(prepared == .object);
+    try std.testing.expectEqualStrings("file.txt", prepared.object.get("path").?.string);
+    try std.testing.expectEqualStrings("before", prepared.object.get("old_str").?.string);
+    try std.testing.expect(prepared.object.get("new_str") == null);
+    try std.testing.expect(prepared.object.get("edits") == null);
 }
 
 test "execute returns unified diff in content without structured diff details" {

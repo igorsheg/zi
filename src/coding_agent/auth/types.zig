@@ -23,6 +23,55 @@ pub const OAuthCredential = struct {
     extras: std.json.ObjectMap,
 };
 
+pub fn freeOAuthCredential(allocator: std.mem.Allocator, cred: OAuthCredential) void {
+    allocator.free(cred.refresh);
+    allocator.free(cred.access);
+    var extras = cred.extras;
+    var eit = extras.iterator();
+    while (eit.next()) |e| {
+        allocator.free(e.key_ptr.*);
+        json_util.freeJsonValue(allocator, e.value_ptr.*);
+    }
+    extras.deinit();
+}
+
+pub fn deinitOAuthCredential(allocator: std.mem.Allocator, cred: *OAuthCredential) void {
+    freeOAuthCredential(allocator, cred.*);
+    cred.* = undefined;
+}
+
+pub fn cloneOAuthCredential(allocator: std.mem.Allocator, cred: OAuthCredential) !OAuthCredential {
+    const refresh = try allocator.dupe(u8, cred.refresh);
+    errdefer allocator.free(refresh);
+    const access = try allocator.dupe(u8, cred.access);
+    errdefer allocator.free(access);
+
+    var extras = std.json.ObjectMap.init(allocator);
+    errdefer {
+        var it = extras.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            json_util.freeJsonValue(allocator, entry.value_ptr.*);
+        }
+        extras.deinit();
+    }
+
+    var it = cred.extras.iterator();
+    while (it.next()) |entry| {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        const value = try json_util.cloneJsonValue(allocator, entry.value_ptr.*);
+        try extras.put(key, value);
+    }
+
+    return .{
+        .refresh = refresh,
+        .access = access,
+        .expires = cred.expires,
+        .extras = extras,
+    };
+}
+
 /// Tagged credential union matching pi-mono's AuthCredential.
 /// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:31
 pub const AuthCredential = union(enum) {
@@ -152,17 +201,7 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.Value) !AuthCredential
 fn freeOneCredential(allocator: std.mem.Allocator, cred: AuthCredential) void {
     switch (cred) {
         .api_key => |c| allocator.free(c.key),
-        .oauth => |c| {
-            allocator.free(c.refresh);
-            allocator.free(c.access);
-            var extras = c.extras;
-            var eit = extras.iterator();
-            while (eit.next()) |e| {
-                allocator.free(e.key_ptr.*);
-                json_util.freeJsonValue(allocator, e.value_ptr.*);
-            }
-            extras.deinit();
-        },
+        .oauth => |c| freeOAuthCredential(allocator, c),
     }
 }
 
@@ -219,17 +258,7 @@ pub fn deinitAuthStorageData(data: *AuthStorageData) void {
     while (it.next()) |entry| {
         switch (entry.value_ptr.*) {
             .api_key => |cred| allocator.free(cred.key),
-            .oauth => |cred| {
-                allocator.free(cred.refresh);
-                allocator.free(cred.access);
-                var extras = cred.extras;
-                var eit = extras.iterator();
-                while (eit.next()) |e| {
-                    allocator.free(e.key_ptr.*);
-                    json_util.freeJsonValue(allocator, e.value_ptr.*);
-                }
-                extras.deinit();
-            },
+            .oauth => |*cred| deinitOAuthCredential(allocator, cred),
         }
         allocator.free(entry.key_ptr.*);
     }
@@ -334,4 +363,3 @@ test "zi-kfg: malformed entries are skipped, valid entries survive" {
     try std.testing.expect(data.get("missing-type") == null);
     try std.testing.expect(data.get("wrong-type-on-key") == null);
 }
-

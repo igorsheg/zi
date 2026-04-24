@@ -203,7 +203,11 @@ fn buildCodexRequestJson(
 
 /// Extract chatgpt_account_id from a JWT access token.
 /// pi-mono: openai-codex-responses.ts:282-287
-fn extractAccountId(arena: std.mem.Allocator, token: []const u8) ![]const u8 {
+fn extractAccountId(allocator: std.mem.Allocator, token: []const u8) ![]const u8 {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+
     var parts = std.mem.splitScalar(u8, token, '.');
     _ = parts.next() orelse return error.InvalidAccessToken;
     const payload_b64 = parts.next() orelse return error.InvalidAccessToken;
@@ -220,7 +224,7 @@ fn extractAccountId(arena: std.mem.Allocator, token: []const u8) ![]const u8 {
     const id_val = auth_claim.object.get("chatgpt_account_id") orelse return error.MissingAccountId;
     if (id_val != .string or id_val.string.len == 0) return error.MissingAccountId;
 
-    return id_val.string;
+    return try allocator.dupe(u8, id_val.string);
 }
 
 fn requireAccountId(
@@ -302,6 +306,7 @@ test "extractAccountId returns the chatgpt account claim from oauth tokens" {
     const allocator = testing.allocator;
     const token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
     const account_id = try extractAccountId(allocator, token);
+    defer allocator.free(account_id);
     try testing.expectEqualStrings("acct_123", account_id);
 }
 

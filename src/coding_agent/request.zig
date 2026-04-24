@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const ai_protocol = @import("../ai/protocol.zig");
+const auth_types = @import("auth/types.zig");
 const message_memory = @import("../agent3/message_memory.zig");
 const mailbox_mod = @import("../runtime/mailbox.zig");
 
@@ -45,6 +46,92 @@ const mailbox_mod = @import("../runtime/mailbox.zig");
 /// not from the TUI-local state allocator or `agent_arena`. The
 /// agent-thread consumer frees with the same allocator after dispatch
 /// via `deinit`.
+pub const ExtensionOAuthLoginCallbacks = struct {
+    on_auth: *const fn (url: []const u8, ctx: ?*anyopaque) void,
+    on_progress: ?*const fn (msg: []const u8, ctx: ?*anyopaque) void = null,
+    ctx: ?*anyopaque = null,
+};
+
+pub const ExtensionOAuthLoginResponse = struct {
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    completed: bool = false,
+    result: ?Result = null,
+
+    pub const Result = union(enum) {
+        success: auth_types.OAuthCredential,
+        cancelled,
+        err: []const u8,
+        unsupported,
+
+        pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .success => |*cred| auth_types.deinitOAuthCredential(allocator, cred),
+                .err => |msg| allocator.free(msg),
+                .cancelled, .unsupported => {},
+            }
+            self.* = undefined;
+        }
+    };
+
+    pub fn finish(self: *ExtensionOAuthLoginResponse, result: Result) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(!self.completed);
+        self.result = result;
+        self.completed = true;
+        self.condition.broadcast();
+    }
+
+    pub fn wait(self: *ExtensionOAuthLoginResponse) Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.completed) {
+            self.condition.wait(&self.mutex);
+        }
+        return self.result.?;
+    }
+};
+
+pub const ExtensionOAuthRefreshResponse = struct {
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    completed: bool = false,
+    result: ?Result = null,
+
+    pub const Result = union(enum) {
+        success: auth_types.OAuthCredential,
+        err: []const u8,
+        unsupported,
+
+        pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .success => |*cred| auth_types.deinitOAuthCredential(allocator, cred),
+                .err, .unsupported => {},
+            }
+            self.* = undefined;
+        }
+    };
+
+    pub fn finish(self: *ExtensionOAuthRefreshResponse, result: Result) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(!self.completed);
+        self.result = result;
+        self.completed = true;
+        self.condition.broadcast();
+    }
+
+    pub fn wait(self: *ExtensionOAuthRefreshResponse) Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.completed) {
+            self.condition.wait(&self.mutex);
+        }
+        return self.result.?;
+    }
+};
+
 pub const AgentRequest = union(enum) {
     prompt: struct { content: ai_protocol.UserMessage.UserMessageContent },
     resume_session: struct {
@@ -72,6 +159,17 @@ pub const AgentRequest = union(enum) {
         name: []const u8,
         args: []const u8,
     },
+    extension_oauth_login: struct {
+        provider_id: []const u8,
+        callbacks: ExtensionOAuthLoginCallbacks,
+        response: *ExtensionOAuthLoginResponse,
+    },
+    extension_oauth_refresh: struct {
+        provider_id: []const u8,
+        credential: auth_types.OAuthCredential,
+        result_allocator: std.mem.Allocator,
+        response: *ExtensionOAuthRefreshResponse,
+    },
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
@@ -88,6 +186,11 @@ pub const AgentRequest = union(enum) {
             .extension_command => |ec| {
                 allocator.free(ec.name);
                 allocator.free(ec.args);
+            },
+            .extension_oauth_login => |oauth| allocator.free(oauth.provider_id),
+            .extension_oauth_refresh => |oauth| {
+                allocator.free(oauth.provider_id);
+                auth_types.freeOAuthCredential(allocator, oauth.credential);
             },
             .shutdown => {},
         }
@@ -247,4 +350,78 @@ test "RequestQueue extension_command round-trips owned name and args" {
     try std.testing.expectEqualStrings("my-cmd:1", buf[0].extension_command.name);
     try std.testing.expectEqualStrings("hello world", buf[0].extension_command.args);
     buf[0].deinit(allocator);
+}
+
+test "RequestQueue extension_oauth_login round-trips provider id and response cell" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    var response: ExtensionOAuthLoginResponse = .{};
+    const provider_id = try allocator.dupe(u8, "corp-ai");
+    q.push(.{ .extension_oauth_login = .{ .provider_id = provider_id, .callbacks = .{ .on_auth = undefined }, .response = &response } });
+
+    var buf: [2]AgentRequest = undefined;
+    const n = q.drainInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("corp-ai", buf[0].extension_oauth_login.provider_id);
+    try std.testing.expect(buf[0].extension_oauth_login.response == &response);
+    buf[0].deinit(allocator);
+}
+
+test "RequestQueue extension_oauth_refresh round-trips provider id and credential" {
+    const allocator = std.testing.allocator;
+    var q = try RequestQueue.init(allocator);
+    defer q.deinit();
+
+    var extras = std.json.ObjectMap.init(allocator);
+    defer extras.deinit();
+    var response: ExtensionOAuthRefreshResponse = .{};
+    const provider_id = try allocator.dupe(u8, "corp-ai");
+    q.push(.{ .extension_oauth_refresh = .{
+        .provider_id = provider_id,
+        .credential = .{
+            .refresh = try allocator.dupe(u8, "rt-1"),
+            .access = try allocator.dupe(u8, "at-1"),
+            .expires = 42,
+            .extras = extras.move(),
+        },
+        .result_allocator = allocator,
+        .response = &response,
+    } });
+
+    var buf: [2]AgentRequest = undefined;
+    const n = q.drainInto(&buf);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("corp-ai", buf[0].extension_oauth_refresh.provider_id);
+    try std.testing.expectEqualStrings("rt-1", buf[0].extension_oauth_refresh.credential.refresh);
+    try std.testing.expect(buf[0].extension_oauth_refresh.response == &response);
+    buf[0].deinit(allocator);
+}
+
+test "ExtensionOAuthLoginResponse lets a worker wait for agent-thread completion" {
+    const WaitCtx = struct {
+        response: *ExtensionOAuthLoginResponse,
+        result: ?ExtensionOAuthLoginResponse.Result = null,
+    };
+
+    const waiter = struct {
+        fn run(ctx: *WaitCtx) void {
+            ctx.result = ctx.response.wait();
+        }
+    };
+
+    var response: ExtensionOAuthLoginResponse = .{};
+    var ctx = WaitCtx{ .response = &response };
+    const thread = try std.Thread.spawn(.{}, waiter.run, .{&ctx});
+
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    response.finish(.unsupported);
+    thread.join();
+
+    try std.testing.expect(ctx.result != null);
+    switch (ctx.result.?) {
+        .unsupported => {},
+        else => return error.UnexpectedResult,
+    }
 }

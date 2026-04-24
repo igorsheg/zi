@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent3/root.zig");
 const session_runtime = @import("session/root.zig");
+const session_core = @import("../session/root.zig");
 const resources = @import("resources/root.zig");
 const tool_def = @import("tools/definition.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
@@ -24,6 +25,7 @@ pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 pub const StreamClosure = struct {
     registry: *ai.provider.Registry,
     auth_storage: ?*auth_storage_mod.AuthStorage,
+    extension_runner: ?*ExtensionRunner = null,
     api_key: []const u8,
     max_tokens: ?u64,
 
@@ -45,22 +47,39 @@ pub const StreamClosure = struct {
 
         var opts = options;
         if (opts.base.api_key == null or opts.base.api_key.?.len == 0) {
-            opts.base.api_key = self.resolveApiKey(model);
+            opts.base.api_key = self.resolveApiKey(arena.allocator(), model);
         }
         opts.base.headers = self.mergeClaimHeaders(model, arena.allocator(), opts.base.headers) catch opts.base.headers;
         if (self.max_tokens) |mt| opts.base.max_tokens = mt;
         prov.streamSimple(stream_alloc, model, stream_context, opts, callback, callback_ctx);
     }
 
-    pub fn resolveApiKey(self: *const StreamClosure, model: ai.protocol.Model) []const u8 {
+    pub fn resolveApiKey(self: *const StreamClosure, allocator: std.mem.Allocator, model: ai.protocol.Model) []const u8 {
         const provider_str = ai.json_util.providerToString(model.provider);
+        const claim = self.registry.activeClaimRegistrationByName(provider_str);
         if (self.auth_storage) |auth_storage| {
             if (auth_storage.getApiKey(provider_str)) |key| {
-                if (key.len > 0) return key;
+                if (key.len > 0) {
+                    if (claim) |active_claim| {
+                        if (active_claim.oauth_get_api_key_ref != null) {
+                            if (auth_storage.get(provider_str)) |credential| switch (credential) {
+                                .oauth => |oauth_credential| {
+                                    if (self.extension_runner) |runner| {
+                                        if (runner.dispatchOAuthGetApiKey(provider_str, oauth_credential, allocator) catch null) |derived_key| {
+                                            if (derived_key.len > 0) return derived_key;
+                                        }
+                                    }
+                                },
+                                else => {},
+                            };
+                        }
+                    }
+                    return key;
+                }
             }
         }
-        const claim = self.registry.activeClaimRegistrationByName(provider_str) orelse return self.api_key;
-        const config = claim.api_key orelse return self.api_key;
+        const active_claim = claim orelse return self.api_key;
+        const config = active_claim.api_key orelse return self.api_key;
         const resolved = resolve_config_value.resolveConfigValue(config) orelse return self.api_key;
         return if (resolved.len > 0) resolved else self.api_key;
     }
@@ -117,6 +136,7 @@ pub const PrepareOptions = struct {
     system_prompt: ?[]const u8 = null,
     context_files: []const resources.types.AgentsFile = &.{},
     extension_paths: []const []const u8 = &.{},
+    agent_dir_override: ?[]const u8 = null,
     max_tokens: ?u64 = 4096,
     tools: ?[]const tool_def.ToolDefinition = null,
     registry: ?*ai.provider.Registry = null,
@@ -136,11 +156,12 @@ pub fn prepareSessionDeps(
     var session_store = options.session_store orelse if (options.no_session)
         SessionStore.createEphemeral(allocator)
     else
-        try SessionStore.createForCwd(allocator, options.cwd);
+        try SessionStore.createForCwd(allocator, options.cwd, options.agent_dir_override);
     errdefer session_store.deinit();
 
     const resource_loader = options.resource_loader orelse try resources.ResourceLoader.init(allocator, .{
         .cwd = options.cwd,
+        .agent_dir_override = options.agent_dir_override,
         .settings_manager = options.settings_manager,
         .system_prompt = options.system_prompt,
         .append_system_prompt = options.append_system_prompt,
@@ -180,6 +201,7 @@ pub fn prepareSessionDeps(
     stream_closure.* = .{
         .registry = registry,
         .auth_storage = options.auth_storage,
+        .extension_runner = null,
         .api_key = options.api_key,
         .max_tokens = options.max_tokens,
     };
@@ -194,6 +216,8 @@ pub fn prepareSessionDeps(
     );
     errdefer extension_runtime.deinit(allocator);
 
+    stream_closure.extension_runner = extension_runtime.runner;
+
     const definitions = if (extension_runtime.runner) |runner|
         runner.tool_registry.items()
     else
@@ -201,6 +225,7 @@ pub fn prepareSessionDeps(
 
     const filtered = try filterToolDefinitions(allocator, definitions, options.tool_allowlist);
     defer filtered.deinit(allocator);
+    defer if (options.tools == null and builtin_ctx != null) allocator.free(@constCast(builtin_definitions));
 
     const tools = try buildAgentTools(allocator, filtered.items, extension_runtime.runner);
     errdefer allocator.free(tools);
@@ -641,6 +666,140 @@ const StreamCaptureProvider = struct {
 
 fn noopProviderEvent(_: ai.protocol.AssistantMessageEvent, _: ?*anyopaque) void {}
 
+test "stream closure derives request api key from oauth.getApiKey when the active claim provides one" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = ExtensionRunner.init(testing.allocator, 12);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    try state.doString(
+        \\function oauth_get_api_key(credentials)
+        \\  return credentials.access .. "-derived"
+        \\end
+    , "session_bootstrap_oauth_get_api_key");
+    _ = c.lua_getglobal(state.L, "oauth_get_api_key");
+    const handler_ref = c.luaL_ref(state.L, c.LUA_REGISTRYINDEX);
+
+    var registry = ai.provider.Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    const capture = try StreamCaptureProvider.create(testing.allocator);
+    defer capture.provider().deinit();
+    try registry.register("anthropic-messages", capture.provider(), null);
+
+    try testing.expect(try registry.registerClaim(.{
+        .name = try testing.allocator.dupe(u8, "proxy-oauth-key"),
+        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try testing.allocator.dupe(u8, "https://proxy-auth.example"),
+        .oauth_enabled = true,
+        .oauth_get_api_key_ref = handler_ref,
+        .owner_id = try testing.allocator.dupe(u8, "ext-a"),
+        .generation = runner.generation,
+    }));
+
+    const Hooks = struct {
+        fn getModel(_: *anyopaque) agent_mod.protocol.Model {
+            return .{
+                .id = "test-model",
+                .name = "Test Model",
+                .api = .{ .custom = "test-api" },
+                .provider = .{ .custom = "test-provider" },
+                .base_url = "",
+                .reasoning = false,
+                .input = &.{.text},
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+                .context_window = 1024,
+                .max_tokens = 1024,
+            };
+        }
+
+        fn isIdle(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn abort(_: *anyopaque) void {}
+
+        fn hasPendingMessages(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getContextUsage(_: *anyopaque) ?session_core.context_usage.ContextUsage {
+            return .{ .tokens = 64, .context_window = 1024, .percent = 6.25 };
+        }
+
+        fn getSystemPrompt(_: *anyopaque) []const u8 {
+            return "system";
+        }
+
+        fn getBindingInfo(_: *anyopaque) extension_runner_mod.ExtensionBindingInfo {
+            return .{
+                .workspace_id = "/workspace",
+                .session_id = "session-123",
+                .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+            };
+        }
+    };
+
+    try runner.bindRuntime(.{
+        .session = undefined,
+        .ui = null,
+        .command_actions = null,
+        .get_model = &Hooks.getModel,
+        .is_idle = &Hooks.isIdle,
+        .abort = &Hooks.abort,
+        .has_pending_messages = &Hooks.hasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &Hooks.getContextUsage,
+        .get_system_prompt = &Hooks.getSystemPrompt,
+        .get_binding_info = &Hooks.getBindingInfo,
+    }, &registry);
+
+    var auth = try auth_storage_mod.AuthStorage.inMemory(testing.allocator, null);
+    defer auth.deinit();
+    auth.set("proxy-oauth-key", .{ .oauth = .{
+        .refresh = "refresh-token",
+        .access = "access-token",
+        .expires = std.time.milliTimestamp() + 60_000,
+        .extras = std.json.ObjectMap.init(testing.allocator),
+    } });
+
+    var closure: StreamClosure = .{
+        .registry = &registry,
+        .auth_storage = &auth,
+        .extension_runner = &runner,
+        .api_key = "session-fallback",
+        .max_tokens = null,
+    };
+
+    const model: ai.protocol.Model = .{
+        .id = "proxy-model",
+        .name = "Proxy Model",
+        .api = .anthropic_messages,
+        .provider = .{ .custom = "proxy-oauth-key" },
+        .base_url = "https://visible-model.example",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 2048,
+    };
+
+    StreamClosure.streamFn(
+        @ptrCast(&closure),
+        testing.allocator,
+        model,
+        .{ .messages = &.{} },
+        .{ .base = .{} },
+        &noopProviderEvent,
+        null,
+    );
+
+    try testing.expectEqualStrings("access-token-derived", capture.last_api_key.?);
+}
+
 test "stream closure resolves claim api_key and layers provider headers before request headers" {
     resolve_config_value.clearCache();
     defer resolve_config_value.clearCache();
@@ -649,8 +808,8 @@ test "stream closure resolves claim api_key and layers provider headers before r
     defer registry.deinit();
 
     const capture = try StreamCaptureProvider.create(testing.allocator);
+    defer capture.provider().deinit();
     try registry.register("anthropic-messages", capture.provider(), null);
-    defer registry.get("anthropic-messages").?.deinit();
 
     const claim_headers = try testing.allocator.alloc(ai.protocol.Header, 2);
     claim_headers[0] = .{
@@ -675,6 +834,7 @@ test "stream closure resolves claim api_key and layers provider headers before r
     var closure: StreamClosure = .{
         .registry = &registry,
         .auth_storage = null,
+        .extension_runner = null,
         .api_key = "session-fallback",
         .max_tokens = null,
     };
