@@ -49,6 +49,7 @@ const json_util = @import("json_util.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const provider_failure = @import("provider_failure.zig");
+const request_transform = @import("request_transform.zig");
 const partial_json = @import("../json/partial.zig");
 const replay = @import("openai_responses_replay.zig");
 const AbortSignal = @import("../abort_signal.zig").AbortSignal;
@@ -141,6 +142,15 @@ pub fn streamCore(
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)});
         return;
     };
+    const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
+        .model = &model,
+        .stream_options = options,
+    }) catch |err| {
+        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to transform request: {s}", .{@errorName(err)});
+        return;
+    };
+    defer if (transformed_payload) |payload| allocator.free(payload);
+    const request_payload = transformed_payload orelse payload_buf.items;
 
     var auth_buf: [4096]u8 = undefined;
     const auth_value = core.auth.build(core.auth.ctx, &auth_buf, options.api_key) catch |err| {
@@ -205,13 +215,7 @@ pub fn streamCore(
     });
     defer abort_guard.stop();
 
-    const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
-        emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to allocate body: {s}", .{@errorName(err)});
-        return;
-    };
-    defer allocator.free(body_copy);
-
-    req.sendBodyComplete(body_copy) catch |err| {
+    req.sendBodyComplete(request_payload) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to send body: {s}", .{@errorName(err)});
         return;
     };

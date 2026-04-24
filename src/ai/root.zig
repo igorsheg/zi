@@ -12,6 +12,7 @@ pub const openai_responses_core = @import("openai_responses_core.zig");
 pub const openai_responses = @import("openai_responses.zig");
 pub const openai_codex = @import("openai_codex.zig");
 pub const provider_failure = @import("provider_failure.zig");
+pub const request_transform = @import("request_transform.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

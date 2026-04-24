@@ -57,6 +57,7 @@ const protocol = @import("protocol.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const provider_failure = @import("provider_failure.zig");
+const request_transform = @import("request_transform.zig");
 const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
@@ -136,6 +137,15 @@ pub const OpenAICompletionsProvider = struct {
             emitError(allocator, callback, callback_ctx, model, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
+        const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
+            .model = &model,
+            .stream_options = options,
+        }) catch |err| {
+            emitError(allocator, callback, callback_ctx, model, "failed to transform request: {s}", .{@errorName(err)});
+            return;
+        };
+        defer if (transformed_payload) |payload| allocator.free(payload);
+        const request_payload = transformed_payload orelse payload_buf.items;
 
         const api_key = options.api_key orelse {
             emitError(allocator, callback, callback_ctx, model, "no API key provided", .{});
@@ -203,13 +213,7 @@ pub const OpenAICompletionsProvider = struct {
         });
         defer abort_guard.stop();
 
-        const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
-            emitError(allocator, callback, callback_ctx, model, "failed to allocate body: {s}", .{@errorName(err)});
-            return;
-        };
-        defer allocator.free(body_copy);
-
-        req.sendBodyComplete(body_copy) catch |err| {
+        req.sendBodyComplete(request_payload) catch |err| {
             emitError(allocator, callback, callback_ctx, model, "failed to send body: {s}", .{@errorName(err)});
             return;
         };

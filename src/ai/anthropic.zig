@@ -5,6 +5,7 @@ const protocol = @import("protocol.zig");
 const sse = @import("sse.zig");
 const ai_provider = @import("provider.zig");
 const provider_failure = @import("provider_failure.zig");
+const request_transform = @import("request_transform.zig");
 const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
@@ -67,6 +68,24 @@ pub const AnthropicProvider = struct {
             emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
+
+        var decorators_buf: [1]request_transform.Decorator = undefined;
+        var decorator_count: usize = 0;
+        var metadata_context = AnthropicMetadataContext{ .metadata = options.metadata };
+        if (anthropicMetadataUserId(options.metadata) != null) {
+            decorators_buf[decorator_count] = .{ .func = addAnthropicMetadata, .ctx = @ptrCast(&metadata_context) };
+            decorator_count += 1;
+        }
+        const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
+            .model = &model,
+            .stream_options = options,
+            .decorators = decorators_buf[0..decorator_count],
+        }) catch |err| {
+            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to transform request: {s}", .{@errorName(err)});
+            return;
+        };
+        defer if (transformed_payload) |payload| allocator.free(payload);
+        const request_payload = transformed_payload orelse payload_buf.items;
 
         const api_key = options.api_key orelse {
             emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "no API key provided", .{});
@@ -156,14 +175,7 @@ pub const AnthropicProvider = struct {
         });
         defer abort_guard.stop();
 
-        // sendBodyComplete needs mutable slice
-        const body_copy = allocator.dupe(u8, payload_buf.items) catch |err| {
-            emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to allocate body: {s}", .{@errorName(err)});
-            return;
-        };
-        defer allocator.free(body_copy);
-
-        req.sendBodyComplete(body_copy) catch |err| {
+        req.sendBodyComplete(request_payload) catch |err| {
             emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to send body: {s}", .{@errorName(err)});
             return;
         };
@@ -610,6 +622,34 @@ fn adjustMaxTokensForThinking(
     return .{ .max_tokens = max_tokens, .thinking_budget = thinking_budget };
 }
 
+const AnthropicMetadataContext = struct {
+    metadata: ?std.json.Value,
+};
+
+fn anthropicMetadataUserId(metadata: ?std.json.Value) ?[]const u8 {
+    const value = metadata orelse return null;
+    if (value != .object) return null;
+    const user_id = value.object.get("user_id") orelse return null;
+    if (user_id != .string or user_id.string.len == 0) return null;
+    return user_id.string;
+}
+
+fn addAnthropicMetadata(
+    allocator: std.mem.Allocator,
+    payload: *std.json.Value,
+    _: *const protocol.Model,
+    ctx: ?*anyopaque,
+) !bool {
+    const metadata_context: *const AnthropicMetadataContext = @ptrCast(@alignCast(ctx.?));
+    const user_id = anthropicMetadataUserId(metadata_context.metadata) orelse return false;
+
+    var metadata = std.json.ObjectMap.init(allocator);
+    errdefer metadata.deinit();
+    try metadata.put("user_id", .{ .string = user_id });
+    try payload.object.put("metadata", .{ .object = metadata });
+    return true;
+}
+
 // =================================================================
 // JSON request building — uses std.json.Stringify
 // =================================================================
@@ -1008,6 +1048,43 @@ fn emitFailure(
 // =================================================================
 
 const testing = std.testing;
+
+fn testAnthropicModel() protocol.Model {
+    return .{
+        .id = "claude-test",
+        .name = "claude test",
+        .api = .anthropic_messages,
+        .provider = .anthropic,
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 0,
+        .max_tokens = 1024,
+    };
+}
+
+test "Anthropic request transform maps metadata user_id" {
+    const allocator = testing.allocator;
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(allocator);
+
+    var metadata = std.json.ObjectMap.init(allocator);
+    defer metadata.deinit();
+    try metadata.put("user_id", .{ .string = "user-123" });
+
+    const model = testAnthropicModel();
+    try buildRequestJson(allocator, &payload, model, .{ .messages = &.{} }, .{ .metadata = .{ .object = metadata } }, false, null, null);
+
+    var metadata_context = AnthropicMetadataContext{ .metadata = .{ .object = metadata } };
+    const transformed = try request_transform.transformJsonPayload(allocator, payload.items, .{
+        .model = &model,
+        .decorators = &.{.{ .func = addAnthropicMetadata, .ctx = @ptrCast(&metadata_context) }},
+    });
+    defer allocator.free(transformed.?);
+
+    try testing.expect(std.mem.indexOf(u8, transformed.?, "\"metadata\":{\"user_id\":\"user-123\"}") != null);
+}
 
 // Regression test for the streaming bug where Anthropic input_json_delta
 // events with embedded `{` / `}` inside their `partial_json` string

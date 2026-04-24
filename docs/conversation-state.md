@@ -2,11 +2,9 @@
 
 ## status
 
-contract for `zi-5psf.3`.
+contract for `zi-5psf.2`, `zi-5psf.3`, `zi-5psf.4`, and `zi-5psf.9`.
 
-documents the semantic conversation state model and the private mailbox shapes the tui consumes.
-
-this does **not** close `zi-5psf.2`. the broader cutover still carries open design work.
+documents the canonical semantic conversation state model, the agent-owned live state, the private snapshot mailbox shape the tui consumes, and the clone boundary that keeps committed history shared while cloning only hot frontier state per publish.
 
 cross-links:
 - [conversation/render v2 cutover doctrine](./adr/conversation-render-v2-cutover.md)

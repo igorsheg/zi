@@ -968,10 +968,10 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
     };
 }
 
-fn onPayloadAdapter(payload: std.json.Value, model: *const protocol.Model, ctx: ?*anyopaque) ?std.json.Value {
+fn onPayloadAdapter(allocator: std.mem.Allocator, payload: std.json.Value, model: *const protocol.Model, ctx: ?*anyopaque) ?std.json.Value {
     const config: *const protocol.AgentLoopConfig = @ptrCast(@alignCast(ctx orelse return null));
     const hook = config.on_payload orelse return null;
-    return hook.call(payload, model.*);
+    return hook.call(allocator, payload, model.*);
 }
 
 fn isAborted(signal: AbortSignal) bool {

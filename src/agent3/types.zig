@@ -361,11 +361,11 @@ pub const AfterToolCallHook = struct {
 ///
 /// See `docs/extensions.md`.
 pub const OnPayloadHook = struct {
-    func: *const fn (payload: std.json.Value, model: Model, ctx: ?*anyopaque) std.json.Value,
+    func: *const fn (allocator: std.mem.Allocator, payload: std.json.Value, model: Model, ctx: ?*anyopaque) std.json.Value,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: OnPayloadHook, payload: std.json.Value, model: Model) std.json.Value {
-        return self.func(payload, model, self.ctx);
+    pub fn call(self: OnPayloadHook, allocator: std.mem.Allocator, payload: std.json.Value, model: Model) std.json.Value {
+        return self.func(allocator, payload, model, self.ctx);
     }
 };
 

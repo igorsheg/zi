@@ -127,7 +127,7 @@ pub const StreamOptions = struct {
     metadata: ?std.json.Value = null,
     /// Optional callback for inspecting or replacing provider payloads before sending.
     /// Return null to keep the payload unchanged.
-    on_payload: ?*const fn (payload: std.json.Value, model: *const Model, ctx: ?*anyopaque) ?std.json.Value = null,
+    on_payload: ?*const fn (allocator: std.mem.Allocator, payload: std.json.Value, model: *const Model, ctx: ?*anyopaque) ?std.json.Value = null,
     on_payload_ctx: ?*anyopaque = null,
 };
 
