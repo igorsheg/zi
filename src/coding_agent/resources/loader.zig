@@ -336,37 +336,43 @@ pub const ResourceLoader = struct {
             try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, settings_manager.getGlobalExtensionPaths() orelse &.{}, .user);
         }
         const agent_root = try self.allocator.dupe(u8, self.agent_dir);
-        errdefer self.allocator.free(agent_root);
-        try roots.append(self.allocator, .{
+        appendStaticExtensionRootWithAfter(self.allocator, &roots, .{
             .source = .user,
             .path = agent_root,
             .kind = .runtime_root,
             .runtime_root_id = agent_root,
             .state_owner_id = agent_root,
-        });
+        }) catch |err| {
+            self.allocator.free(agent_root);
+            return err;
+        };
         if (self.settings_manager) |settings_manager| {
             try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, settings_manager.getProjectExtensionPaths() orelse &.{}, .project);
         }
 
         const project_dir = try storage.getProjectDir(self.allocator, self.cwd);
-        errdefer self.allocator.free(project_dir);
-        try roots.append(self.allocator, .{
+        appendStaticExtensionRootWithAfter(self.allocator, &roots, .{
             .source = .project,
             .path = project_dir,
             .kind = .runtime_root,
             .runtime_root_id = project_dir,
             .state_owner_id = project_dir,
-        });
+        }) catch |err| {
+            self.allocator.free(project_dir);
+            return err;
+        };
 
         const builtin_root = try self.allocator.dupe(u8, "<builtin>");
-        errdefer self.allocator.free(builtin_root);
-        try roots.append(self.allocator, .{
+        appendStaticExtensionRootWithAfter(self.allocator, &roots, .{
             .source = .builtin,
             .path = builtin_root,
             .kind = .builtin,
             .runtime_root_id = builtin_root,
             .state_owner_id = builtin_root,
-        });
+        }) catch |err| {
+            self.allocator.free(builtin_root);
+            return err;
+        };
 
         return try roots.toOwnedSlice(self.allocator);
     }
@@ -381,15 +387,77 @@ fn appendStaticExtensionRootPaths(
 ) !void {
     for (paths) |path| {
         const resolved = try resolveResourcePath(allocator, cwd, path);
-        errdefer allocator.free(resolved);
-
-        const kind = try classifyStaticExtensionRoot(allocator, resolved);
-        try roots.append(allocator, .{
+        const kind = classifyStaticExtensionRoot(allocator, resolved) catch |err| {
+            allocator.free(resolved);
+            return err;
+        };
+        appendStaticExtensionRootWithAfter(allocator, roots, .{
             .source = source,
             .path = resolved,
             .kind = kind,
             .runtime_root_id = resolved,
             .state_owner_id = resolved,
+        }) catch |err| {
+            allocator.free(resolved);
+            return err;
+        };
+    }
+}
+
+fn appendStaticExtensionRootWithAfter(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged(types.StaticExtensionRoot),
+    root: types.StaticExtensionRoot,
+) !void {
+    const start_len = roots.items.len;
+    try roots.append(allocator, root);
+    if (root.kind != .runtime_root) return;
+    appendAfterStaticExtensionRoots(allocator, roots, root) catch |err| {
+        var i = start_len + 1;
+        while (i < roots.items.len) : (i += 1) allocator.free(roots.items[i].path);
+        roots.shrinkRetainingCapacity(start_len);
+        return err;
+    };
+}
+
+fn appendAfterStaticExtensionRoots(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged(types.StaticExtensionRoot),
+    root: types.StaticExtensionRoot,
+) !void {
+    const after_dir = try std.fs.path.join(allocator, &.{ root.path, "after" });
+    defer allocator.free(after_dir);
+
+    var dir = std.fs.openDirAbsolute(after_dir, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+
+    var iter = dir.iterate();
+    while (iter.next() catch return) |entry| {
+        if (entry.kind != .directory) continue;
+        try names.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    for (names.items) |name| {
+        const path = try std.fs.path.join(allocator, &.{ after_dir, name });
+        errdefer allocator.free(path);
+        try roots.append(allocator, .{
+            .source = root.source,
+            .path = path,
+            .kind = .runtime_root,
+            .runtime_root_id = path,
+            .state_owner_id = path,
         });
     }
 }
@@ -991,7 +1059,11 @@ test "resource loader normalizes static extension ingress into canonical order" 
     var agent_tmp = std.testing.tmpDir(.{});
     defer agent_tmp.cleanup();
     try agent_tmp.dir.makePath("extensions");
+    try agent_tmp.dir.makePath("after/05-early/extensions");
+    try agent_tmp.dir.makePath("after/10-extra/extensions");
     try agent_tmp.dir.writeFile(.{ .sub_path = "extensions/user_global.lua", .data = "-- user global" });
+    try agent_tmp.dir.writeFile(.{ .sub_path = "after/05-early/extensions/user_after_early.lua", .data = "-- user after early" });
+    try agent_tmp.dir.writeFile(.{ .sub_path = "after/10-extra/extensions/user_after.lua", .data = "-- user after" });
     const agent_root = try agent_tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(agent_root);
 
@@ -1035,7 +1107,7 @@ test "resource loader normalizes static extension ingress into canonical order" 
     defer loader.deinit();
 
     const extensions = loader.getExtensions().extensions;
-    try std.testing.expectEqual(@as(usize, 6), extensions.len);
+    try std.testing.expectEqual(@as(usize, 8), extensions.len);
 
     try std.testing.expectEqualStrings("explicit", extensions[0].id);
     try std.testing.expectEqual(types.ExtensionSource.explicit, extensions[0].source);
@@ -1046,14 +1118,20 @@ test "resource loader normalizes static extension ingress into canonical order" 
     try std.testing.expectEqualStrings("user_global", extensions[2].id);
     try std.testing.expectEqual(types.ExtensionSource.user, extensions[2].source);
 
-    try std.testing.expectEqualStrings("settings_project", extensions[3].id);
-    try std.testing.expectEqual(types.ExtensionSource.project, extensions[3].source);
+    try std.testing.expectEqualStrings("user_after_early", extensions[3].id);
+    try std.testing.expectEqual(types.ExtensionSource.user, extensions[3].source);
 
-    try std.testing.expectEqualStrings("project_local", extensions[4].id);
-    try std.testing.expectEqual(types.ExtensionSource.project, extensions[4].source);
+    try std.testing.expectEqualStrings("user_after", extensions[4].id);
+    try std.testing.expectEqual(types.ExtensionSource.user, extensions[4].source);
 
-    try std.testing.expectEqualStrings("builtins", extensions[5].id);
-    try std.testing.expectEqual(types.ExtensionSource.builtin, extensions[5].source);
+    try std.testing.expectEqualStrings("settings_project", extensions[5].id);
+    try std.testing.expectEqual(types.ExtensionSource.project, extensions[5].source);
+
+    try std.testing.expectEqualStrings("project_local", extensions[6].id);
+    try std.testing.expectEqual(types.ExtensionSource.project, extensions[6].source);
+
+    try std.testing.expectEqualStrings("builtins", extensions[7].id);
+    try std.testing.expectEqual(types.ExtensionSource.builtin, extensions[7].source);
 }
 
 test "resource loader resolves prompt inputs and discovers agents files" {
