@@ -6,6 +6,7 @@ const extension_runner = @import("../extensions/runner.zig");
 const lua_runtime = @import("../extensions/lua_runtime.zig");
 const skills = @import("../skills/root.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
+const settings_types = @import("../settings/types.zig");
 const theme_json = @import("../../themes/json.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const tui_theme = @import("../../tui/theme.zig");
@@ -347,6 +348,7 @@ pub const ResourceLoader = struct {
             return err;
         };
         if (self.settings_manager) |settings_manager| {
+            try appendPackageStaticExtensionRoots(self.allocator, &roots, self.agent_dir, settings_manager.getGlobalPackages() orelse &.{}, .user);
             try appendStaticExtensionRootPaths(self.allocator, &roots, self.cwd, settings_manager.getProjectExtensionPaths() orelse &.{}, .project);
         }
 
@@ -361,6 +363,10 @@ pub const ResourceLoader = struct {
             self.allocator.free(project_dir);
             return err;
         };
+
+        if (self.settings_manager) |settings_manager| {
+            try appendPackageStaticExtensionRoots(self.allocator, &roots, project_dir, settings_manager.getProjectPackages() orelse &.{}, .project);
+        }
 
         const builtin_root = try self.allocator.dupe(u8, "<builtin>");
         appendStaticExtensionRootWithAfter(self.allocator, &roots, .{
@@ -402,6 +408,98 @@ fn appendStaticExtensionRootPaths(
             return err;
         };
     }
+}
+
+fn appendPackageStaticExtensionRoots(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged(types.StaticExtensionRoot),
+    base_dir: []const u8,
+    packages: []const settings_types.PackageSource,
+    source: types.ExtensionSource,
+) !void {
+    for (packages) |package| {
+        switch (package) {
+            .string => |package_source| try appendPackageRoot(allocator, roots, base_dir, package_source, null, source),
+            .filtered => |filter| try appendPackageRoot(allocator, roots, base_dir, filter.source, filter.extensions, source),
+        }
+    }
+}
+
+fn appendPackageRoot(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged(types.StaticExtensionRoot),
+    base_dir: []const u8,
+    package_source: []const u8,
+    extension_filter: ?[]const []const u8,
+    source: types.ExtensionSource,
+) !void {
+    const package_root = try resolveResourcePath(allocator, base_dir, package_source);
+    defer allocator.free(package_root);
+    std.fs.accessAbsolute(package_root, .{}) catch return;
+    const kind = try classifyStaticExtensionRoot(allocator, package_root);
+
+    if (extension_filter) |ids| {
+        if (ids.len == 0) return;
+        for (ids) |id| {
+            try appendFilteredPackageExtensionRoot(allocator, roots, package_root, id, source);
+        }
+        return;
+    }
+
+    const root_path = try allocator.dupe(u8, package_root);
+    appendStaticExtensionRootWithAfter(allocator, roots, .{
+        .source = source,
+        .path = root_path,
+        .kind = kind,
+        .runtime_root_id = root_path,
+        .state_owner_id = root_path,
+    }) catch |err| {
+        allocator.free(root_path);
+        return err;
+    };
+}
+
+fn appendFilteredPackageExtensionRoot(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged(types.StaticExtensionRoot),
+    package_root: []const u8,
+    extension_id: []const u8,
+    source: types.ExtensionSource,
+) !void {
+    const trimmed = std.mem.trim(u8, extension_id, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    const lua_file = try std.fmt.allocPrint(allocator, "{s}.lua", .{trimmed});
+    defer allocator.free(lua_file);
+    const lua_path = try std.fs.path.join(allocator, &.{ package_root, "extensions", lua_file });
+    defer allocator.free(lua_path);
+    const root_path = blk: {
+        std.fs.accessAbsolute(lua_path, .{}) catch {
+            const bundle_path = try std.fs.path.join(allocator, &.{ package_root, "extensions", trimmed });
+            const init_path = std.fs.path.join(allocator, &.{ bundle_path, "init.lua" }) catch |err| {
+                allocator.free(bundle_path);
+                return err;
+            };
+            defer allocator.free(init_path);
+            std.fs.accessAbsolute(init_path, .{}) catch {
+                allocator.free(bundle_path);
+                return;
+            };
+            break :blk bundle_path;
+        };
+        break :blk try allocator.dupe(u8, lua_path);
+    };
+
+    appendStaticExtensionRootWithAfter(allocator, roots, .{
+        .source = source,
+        .path = root_path,
+        .kind = .synthetic_extension,
+        .runtime_root_id = root_path,
+        .state_owner_id = root_path,
+    }) catch |err| {
+        allocator.free(root_path);
+        return err;
+    };
 }
 
 fn appendStaticExtensionRootWithAfter(
@@ -1061,17 +1159,22 @@ test "resource loader normalizes static extension ingress into canonical order" 
     try agent_tmp.dir.makePath("extensions");
     try agent_tmp.dir.makePath("after/05-early/extensions");
     try agent_tmp.dir.makePath("after/10-extra/extensions");
+    try agent_tmp.dir.makePath("pkg-user/extensions");
     try agent_tmp.dir.writeFile(.{ .sub_path = "extensions/user_global.lua", .data = "-- user global" });
     try agent_tmp.dir.writeFile(.{ .sub_path = "after/05-early/extensions/user_after_early.lua", .data = "-- user after early" });
     try agent_tmp.dir.writeFile(.{ .sub_path = "after/10-extra/extensions/user_after.lua", .data = "-- user after" });
+    try agent_tmp.dir.writeFile(.{ .sub_path = "pkg-user/extensions/user_package.lua", .data = "-- user package" });
     const agent_root = try agent_tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(agent_root);
 
     var project_tmp = std.testing.tmpDir(.{});
     defer project_tmp.cleanup();
     try project_tmp.dir.makePath("repo/.zi/extensions");
+    try project_tmp.dir.makePath("repo/.zi/pkg-project/extensions");
     try project_tmp.dir.makePath("settings_project_root/extensions");
     try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/extensions/project_local.lua", .data = "-- project local" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/pkg-project/extensions/project_package.lua", .data = "-- project package" });
+    try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/pkg-project/extensions/project_package_disabled.lua", .data = "-- project package disabled" });
     try project_tmp.dir.writeFile(.{ .sub_path = "explicit.lua", .data = "-- explicit" });
     try project_tmp.dir.writeFile(.{ .sub_path = "settings_user.lua", .data = "-- settings user" });
     try project_tmp.dir.writeFile(.{ .sub_path = "settings_project_root/extensions/settings_project.lua", .data = "-- settings project" });
@@ -1098,6 +1201,20 @@ test "resource loader normalizes static extension ingress into canonical order" 
     project_paths[0] = settings_project_root;
     settings_manager.setProjectExtensionPaths(project_paths);
 
+    const global_packages = try allocator.alloc(settings_types.PackageSource, 1);
+    defer allocator.free(global_packages);
+    global_packages[0] = .{ .string = "pkg-user" };
+    settings_manager.setPackages(global_packages);
+
+    const project_package_filter = [_][]const u8{"project_package"};
+    const project_packages = try allocator.alloc(settings_types.PackageSource, 1);
+    defer allocator.free(project_packages);
+    project_packages[0] = .{ .filtered = .{
+        .source = "pkg-project",
+        .extensions = &project_package_filter,
+    } };
+    settings_manager.setProjectPackages(project_packages);
+
     var loader = try ResourceLoader.init(allocator, .{
         .cwd = cwd,
         .agent_dir_override = agent_root,
@@ -1107,7 +1224,7 @@ test "resource loader normalizes static extension ingress into canonical order" 
     defer loader.deinit();
 
     const extensions = loader.getExtensions().extensions;
-    try std.testing.expectEqual(@as(usize, 8), extensions.len);
+    try std.testing.expectEqual(@as(usize, 10), extensions.len);
 
     try std.testing.expectEqualStrings("explicit", extensions[0].id);
     try std.testing.expectEqual(types.ExtensionSource.explicit, extensions[0].source);
@@ -1124,14 +1241,20 @@ test "resource loader normalizes static extension ingress into canonical order" 
     try std.testing.expectEqualStrings("user_after", extensions[4].id);
     try std.testing.expectEqual(types.ExtensionSource.user, extensions[4].source);
 
-    try std.testing.expectEqualStrings("settings_project", extensions[5].id);
-    try std.testing.expectEqual(types.ExtensionSource.project, extensions[5].source);
+    try std.testing.expectEqualStrings("user_package", extensions[5].id);
+    try std.testing.expectEqual(types.ExtensionSource.user, extensions[5].source);
 
-    try std.testing.expectEqualStrings("project_local", extensions[6].id);
+    try std.testing.expectEqualStrings("settings_project", extensions[6].id);
     try std.testing.expectEqual(types.ExtensionSource.project, extensions[6].source);
 
-    try std.testing.expectEqualStrings("builtins", extensions[7].id);
-    try std.testing.expectEqual(types.ExtensionSource.builtin, extensions[7].source);
+    try std.testing.expectEqualStrings("project_local", extensions[7].id);
+    try std.testing.expectEqual(types.ExtensionSource.project, extensions[7].source);
+
+    try std.testing.expectEqualStrings("project_package", extensions[8].id);
+    try std.testing.expectEqual(types.ExtensionSource.project, extensions[8].source);
+
+    try std.testing.expectEqualStrings("builtins", extensions[9].id);
+    try std.testing.expectEqual(types.ExtensionSource.builtin, extensions[9].source);
 }
 
 test "resource loader resolves prompt inputs and discovers agents files" {

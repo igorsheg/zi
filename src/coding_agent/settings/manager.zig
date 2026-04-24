@@ -633,6 +633,14 @@ pub const SettingsManager = struct {
         return self.settings.packages;
     }
 
+    pub fn getGlobalPackages(self: *const SettingsManager) ?[]const types.PackageSource {
+        return self.global_settings.packages;
+    }
+
+    pub fn getProjectPackages(self: *const SettingsManager) ?[]const types.PackageSource {
+        return self.project_settings.packages;
+    }
+
     pub fn setPackages(self: *SettingsManager, packages: []const types.PackageSource) void {
         self.global_settings.packages = packages;
         self.markModified(.packages, null);
