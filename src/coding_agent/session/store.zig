@@ -754,7 +754,7 @@ test "appendRuntimeDefaults seeds model change before thinking level change" {
     try std.testing.expectEqualStrings("high", buffered[1].entry.entry.thinking_level_change.thinking_level);
 }
 
-test "applyCompaction appends summary and rebuilds current context" {
+test "applyCompaction preserves artifact fields and rebuilds current context" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -765,13 +765,29 @@ test "applyCompaction appends summary and rebuilds current context" {
     store.appendMessage(testUserMessage("first", 1));
     store.appendMessage(testUserMessage("second", 2));
 
-    const rebuilt = try store.applyCompaction("summary", store.currentEntryId().?, 42, null, null);
+    var details_obj: std.json.ObjectMap = .init(allocator);
+    try details_obj.put("artifact", .{ .string = "file-index" });
+
+    const first_kept_id = store.currentEntryId().?;
+    const rebuilt = try store.applyCompaction("summary", first_kept_id, 42, .{ .object = details_obj }, true);
+
+    const entry = store.writer.buffered_entries.items[2].entry.entry.compaction;
+    try std.testing.expectEqualStrings("summary", entry.summary);
+    try std.testing.expectEqualStrings(first_kept_id, entry.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 42), entry.tokens_before);
+    try std.testing.expectEqual(true, entry.from_hook.?);
+    try std.testing.expectEqualStrings("file-index", entry.details.?.object.get("artifact").?.string);
 
     try std.testing.expectEqual(@as(usize, 2), rebuilt.messages.len);
     try std.testing.expect(rebuilt.messages[0] == .compaction_summary);
     try std.testing.expectEqualStrings("summary", rebuilt.messages[0].compaction_summary.summary);
     try std.testing.expect(rebuilt.messages[1] == .user);
     try std.testing.expectEqualStrings("second", rebuilt.messages[1].user.content.text);
+
+    store.appendMessage(testUserMessage("third", 3));
+    const rebuilt_with_later = try store.buildCurrentContext();
+    try std.testing.expectEqual(@as(usize, 3), rebuilt_with_later.messages.len);
+    try std.testing.expectEqualStrings("third", rebuilt_with_later.messages[2].user.content.text);
 }
 
 test "contextUsageUnknownAfterCompaction tracks post-compaction assistant usage" {
