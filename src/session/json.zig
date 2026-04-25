@@ -958,6 +958,67 @@ test "tool-result text serializes invalid utf-8 as a json string" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"text\":[") == null);
 }
 
+test "pi-mono compaction fixture round-trips parse serialize and buildContext" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const context = @import("context.zig");
+
+    const lines = [_][]const u8{
+        \\{"type":"message","id":"u1","parentId":null,"timestamp":"2025-01-01T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"summarized user"}],"timestamp":1700000000000}}
+        ,
+        \\{"type":"message","id":"a1","parentId":"u1","timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"summarized assistant"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":4000,"output":1000,"cacheRead":0,"cacheWrite":0,"totalTokens":5000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1700000001000}}
+        ,
+        \\{"type":"message","id":"u2","parentId":"a1","timestamp":"2025-01-01T00:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"kept user"}],"timestamp":1700000002000}}
+        ,
+        \\{"type":"compaction","id":"c1","parentId":"u2","timestamp":"2025-01-01T00:00:03.000Z","summary":"extension summary","firstKeptEntryId":"u2","tokensBefore":5000,"details":{"provider":"custom-compactor","turns":1},"fromHook":true}
+        ,
+        \\{"type":"message","id":"u3","parentId":"c1","timestamp":"2025-01-01T00:00:04.000Z","message":{"role":"user","content":[{"type":"text","text":"after compaction"}],"timestamp":1700000004000}}
+        ,
+    };
+
+    var entries: [lines.len]proto.SessionEntry = undefined;
+    for (lines, 0..) |line, index| {
+        entries[index] = (try parseFileEntry(allocator, line)).entry;
+    }
+
+    const compaction = entries[3].entry.compaction;
+    try std.testing.expectEqualStrings("extension summary", compaction.summary);
+    try std.testing.expectEqualStrings("u2", compaction.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 5000), compaction.tokens_before);
+    try std.testing.expectEqual(true, compaction.from_hook.?);
+    try std.testing.expectEqualStrings("custom-compactor", compaction.details.?.object.get("provider").?.string);
+
+    const serialized = try json_write.toOwnedSlice(std.testing.allocator, entries[3], writeEntry);
+    defer std.testing.allocator.free(serialized);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "\"fromHook\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "\"provider\":\"custom-compactor\"") != null);
+
+    const ctx = try context.buildSessionContext(allocator, &entries, .current);
+    try std.testing.expectEqual(@as(usize, 3), ctx.messages.len);
+    switch (ctx.messages[0]) {
+        .compaction_summary => |summary| {
+            try std.testing.expectEqualStrings("extension summary", summary.summary);
+            try std.testing.expectEqual(@as(u64, 5000), summary.tokens_before);
+        },
+        else => return error.ExpectedCompactionSummary,
+    }
+    switch (ctx.messages[1]) {
+        .user => |user| switch (user.content) {
+            .blocks => |blocks| try std.testing.expectEqualStrings("kept user", blocks[0].text.text),
+            .text => |text| try std.testing.expectEqualStrings("kept user", text),
+        },
+        else => return error.ExpectedUserMessage,
+    }
+    switch (ctx.messages[2]) {
+        .user => |user| switch (user.content) {
+            .blocks => |blocks| try std.testing.expectEqualStrings("after compaction", blocks[0].text.text),
+            .text => |text| try std.testing.expectEqualStrings("after compaction", text),
+        },
+        else => return error.ExpectedUserMessage,
+    }
+}
+
 test "session write-read-buildContext round-trip" {
     const allocator = std.testing.allocator;
     const context = @import("context.zig");
