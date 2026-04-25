@@ -20,7 +20,6 @@ const container_mod = @import("container.zig");
 const overlay_mod = @import("overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
-const themes_builtin = @import("../themes/builtin.zig");
 const app_meta = @import("../app_meta.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
@@ -207,6 +206,7 @@ const BuiltSubmitContent = struct {
 };
 
 test "UiSnapshotQueue drops newest snapshot traffic when bounded" {
+    const themes_builtin = @import("../themes/builtin.zig");
     var q = try UiSnapshotQueue.init(std.testing.allocator);
     defer q.deinit();
 
@@ -551,22 +551,21 @@ pub const Interactive = struct {
         settings_manager: *settings_manager_mod.SettingsManager,
     ) !Interactive {
         _ = allocator;
-        const theme = themes_builtin.defaultForTerminal();
         const state_allocator = memory_diagnostics.tui.allocator();
 
         var self: Interactive = .{
             .allocator = state_allocator,
             .msg_allocator = msg_allocator,
             .tui = try TUI.init(state_allocator),
-            .theme_storage = theme.*,
-            .theme = theme,
+            .theme_storage = undefined,
+            .theme = undefined,
             .cwd = cwd,
             .editor = editor_mod.Editor.init(state_allocator),
             .status_text = text_mod.Text.init(state_allocator),
             .pending_image_banner = text_mod.Text.init(state_allocator),
-            .greeter = .{ .theme = theme, .version = app_meta.version },
-            .footer = .{ .theme = theme },
-            .hotkeys_overlay = .{ .theme = theme },
+            .greeter = .{ .version = app_meta.version },
+            .footer = .{},
+            .hotkeys_overlay = .{},
             .transcript = Transcript.init(state_allocator),
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
@@ -595,7 +594,6 @@ pub const Interactive = struct {
         // NOTE: active_editor is bound in run() where self is at its final
         // address. Binding it here would capture a pointer to the local `self`
         // that becomes dangling after the by-value return.
-        self.applyTheme(theme.*);
         return self;
     }
 
