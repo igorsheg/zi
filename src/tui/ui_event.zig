@@ -59,6 +59,7 @@ pub const UiEvent = union(enum) {
         success: bool,
         attempt: u32,
         final_error: ?[]u8 = null,
+        failure_kind: ?ai.protocol.NormalizedFailure.Kind = null,
     },
 
     // --- prompt lifecycle ---

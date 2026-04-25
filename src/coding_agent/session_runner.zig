@@ -232,7 +232,7 @@ pub const SessionRunner = struct {
             );
             switch (classification.class) {
                 .retryable_transient => {
-                    if (!self.beginRetry(emitter, classification.error_message orelse assistant.error_message orelse "unknown error")) {
+                    if (!self.beginRetry(emitter, classification.error_message orelse assistant.error_message orelse "unknown error", classification.failure_kind)) {
                         return outcome;
                     }
 
@@ -291,7 +291,7 @@ pub const SessionRunner = struct {
             std.mem.eql(u8, assistant.model, model.id);
     }
 
-    fn beginRetry(self: *SessionRunner, emitter: EventEmitter, error_message: []const u8) bool {
+    fn beginRetry(self: *SessionRunner, emitter: EventEmitter, error_message: []const u8, failure_kind: ?ai.protocol.NormalizedFailure.Kind) bool {
         if (!self.retry_policy.enabled) return false;
 
         const next_attempt = self.retry_attempt + 1;
@@ -300,6 +300,7 @@ pub const SessionRunner = struct {
                 .success = false,
                 .attempt = self.retry_attempt,
                 .final_error = error_message,
+                .failure_kind = failure_kind,
             });
             return false;
         }

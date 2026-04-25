@@ -1268,11 +1268,12 @@ pub const Interactive = struct {
                 self.hideLoader();
                 if (!r.success) {
                     var buf: [160]u8 = undefined;
+                    const final_error = r.final_error orelse "unknown error";
                     const msg = std.fmt.bufPrint(
                         &buf,
                         "retry failed after {d} attempt{s}: {s}",
-                        .{ r.attempt, if (r.attempt == 1) "" else "s", r.final_error orelse "unknown error" },
-                    ) catch (r.final_error orelse "retry failed");
+                        .{ r.attempt, if (r.attempt == 1) "" else "s", userFacingFailureMessage(r.failure_kind, final_error) },
+                    ) catch userFacingFailureMessage(r.failure_kind, final_error);
                     self.status_text.setContent(msg);
                     self.status_text.fg = self.theme.fg(.@"error");
                 }
@@ -3317,6 +3318,7 @@ pub const Interactive = struct {
                     .success = retry.success,
                     .attempt = retry.attempt,
                     .final_error = final_error,
+                    .failure_kind = retry.failure_kind,
                 } });
             },
             .compaction_start => {
@@ -3458,6 +3460,8 @@ fn userFacingFailureMessage(
     return switch (failure_kind orelse return raw_message) {
         .auth => "authentication failed. run /login or refresh your credentials.",
         .context_overflow => "context window exceeded. compact the session or switch to a larger-context model.",
+        .rate_limited => "provider rate limit reached. wait and try again, or switch providers.",
+        .transient => "provider or network failure. try again shortly.",
         .invalid_request => if (string_util.containsCI(raw_message, "content_filter"))
             "request blocked by the provider safety filter. try rephrasing and try again."
         else

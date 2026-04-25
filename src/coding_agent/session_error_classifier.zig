@@ -13,6 +13,7 @@ pub const FailureClass = enum {
 pub const Classification = struct {
     class: FailureClass,
     error_message: ?[]const u8 = null,
+    failure_kind: ?ai.protocol.NormalizedFailure.Kind = null,
 };
 
 const overflow_needles = [_][]const u8{
@@ -89,6 +90,7 @@ pub fn classifyAssistantMessage(
                 .auth, .invalid_request, .fatal => .fatal,
             },
             .error_message = message.error_message,
+            .failure_kind = failure.kind,
         };
     }
 
@@ -167,6 +169,7 @@ test "classifyAssistantMessage prefers structured normalized failures over strin
 
     const classification = classifyAssistantMessage(&msg, null);
     try std.testing.expectEqual(FailureClass.retryable_transient, classification.class);
+    try std.testing.expectEqual(ai.protocol.NormalizedFailure.Kind.rate_limited, classification.failure_kind.?);
 }
 
 test "classifyAssistantMessage excludes throttling too many tokens from overflow" {

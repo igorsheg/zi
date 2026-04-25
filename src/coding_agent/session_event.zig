@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai_protocol = @import("../ai/protocol.zig");
 
 pub const RetryStart = struct {
     attempt: u32,
@@ -11,6 +12,7 @@ pub const RetryEnd = struct {
     success: bool,
     attempt: u32,
     final_error: ?[]const u8 = null,
+    failure_kind: ?ai_protocol.NormalizedFailure.Kind = null,
 };
 
 pub const CompactionReason = enum {
