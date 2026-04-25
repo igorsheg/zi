@@ -20,6 +20,7 @@ pub const ExecutionDiagnostic = union(enum) {
         provider: []const u8,
         env_hint: ?[]const u8,
     },
+    interactive_requires_tty,
 };
 
 pub const ExecutionResult = union(enum) {

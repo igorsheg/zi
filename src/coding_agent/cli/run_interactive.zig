@@ -40,6 +40,10 @@ pub fn run(
 ) !result.ExecutionResult {
     logging.setThreadLabel(.tui);
 
+    if (!std.posix.isatty(std.posix.STDIN_FILENO) or !std.posix.isatty(std.posix.STDOUT_FILENO)) {
+        return .{ .err = .interactive_requires_tty };
+    }
+
     const prepare_options: initial_message.PrepareOptions = .{
         .inline_image_policy = .{
             .auto_resize = runtime.settings_manager.getImageAutoResize(),

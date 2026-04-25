@@ -89,6 +89,9 @@ pub fn writeExecutionDiagnostic(writer: anytype, diagnostic: result.ExecutionDia
             }
             try writer.writeAll("\n");
         },
+        .interactive_requires_tty => try writer.writeAll(
+            "error: interactive mode requires a TTY on stdin and stdout. use -p/--print or --mode json/text for non-interactive runs\n",
+        ),
     }
 }
 
@@ -102,6 +105,7 @@ test "plan and execution diagnostics explain the finalized session-target contra
     try writeExecutionDiagnostic(&out.writer, .no_recent_session);
     try writeExecutionDiagnostic(&out.writer, .batch_prompt_sources_resolved_empty);
     try writeExecutionDiagnostic(&out.writer, .{ .batch_assistant_failed = "Request aborted" });
+    try writeExecutionDiagnostic(&out.writer, .interactive_requires_tty);
     const rendered = try out.toOwnedSlice();
     defer std.testing.allocator.free(rendered);
 
@@ -113,4 +117,5 @@ test "plan and execution diagnostics explain the finalized session-target contra
     try std.testing.expect(std.mem.indexOf(u8, rendered, "--continue") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "zi --resume") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Request aborted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "interactive mode requires a TTY") != null);
 }
