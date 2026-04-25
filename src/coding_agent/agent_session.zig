@@ -16,7 +16,9 @@ const session_bootstrap = @import("session_bootstrap.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
+const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
+const request_mod = @import("request.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -73,6 +75,10 @@ pub const AgentSession = struct {
     /// teardown order (unsubscribe → runner.deinit → state.deinit).
     /// Both fields are nil when Lua init fails; the agent still runs.
     _extension_lua_state: ?*lua_runtime.LuaState = null,
+    pending_extension_panel: ?extension_ui.Panel = null,
+    pending_extension_prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
+    pending_extension_surfaces: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
+    pending_extension_editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
 
     /// Subscription token for the extension event bridge. Separate
     /// from `_subscription_token` (session persistence) so the two
@@ -535,6 +541,10 @@ pub const AgentSession = struct {
         // same path here on whatever thread owns lua.
         self.deactivateLifecycle();
         self.destroyExtensionRuntime();
+        self.clearPendingExtensionPanel();
+        self.clearPendingExtensionPrompts();
+        self.clearPendingExtensionSurfaces();
+        self.clearPendingExtensionEditorActions();
         self.allocator.destroy(self._stream_closure);
         self.allocator.destroy(self._extension_runner_ref);
         self.agent_event_listeners.deinit(self.allocator);
@@ -675,6 +685,17 @@ pub const AgentSession = struct {
             .get_context_usage = &runtimeGetContextUsage,
             .get_system_prompt = &runtimeGetSystemPrompt,
             .get_binding_info = &runtimeGetBindingInfo,
+            .session_state_get = &runtimeSessionStateGet,
+            .session_state_set = &runtimeSessionStateSet,
+            .session_state_delete = &runtimeSessionStateDelete,
+            .show_panel = &runtimeShowPanel,
+            .publish_prompt = &runtimePublishPrompt,
+            .resolve_prompt = &runtimeResolvePrompt,
+            .cancel_prompts = &runtimeCancelPrompts,
+            .publish_surface = &runtimePublishSurface,
+            .revoke_surfaces = &runtimeRevokeSurfaces,
+            .publish_editor_action = &runtimePublishEditorAction,
+            .clear_editor_actions = &runtimeClearEditorActions,
             .provider_projection_changed = &runtimeProviderProjectionChanged,
         }, self._stream_closure.registry) catch {};
     }
@@ -794,6 +815,194 @@ pub const AgentSession = struct {
             .session_id = self.session_store.sessionId(),
             .session_file = if (session_file.len == 0) null else session_file,
         };
+    }
+
+    const extension_state_entry_type = "extension_state";
+
+    fn runtimeSessionStateGet(
+        session_ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        state_owner_id: []const u8,
+        key: []const u8,
+    ) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const branch = self.session_store.buildCurrentBranchAlloc(arena.allocator()) catch return null;
+        var latest: ?std.json.Value = null;
+        var deleted = false;
+
+        for (branch) |entry| {
+            const custom = switch (entry.entry) {
+                .custom => |custom| custom,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, custom.custom_type, extension_state_entry_type)) continue;
+            const data = custom.data orelse continue;
+            if (data != .object) continue;
+            const owner_value = data.object.get("state_owner_id") orelse continue;
+            const key_value = data.object.get("key") orelse continue;
+            if (owner_value != .string or key_value != .string) continue;
+            if (!std.mem.eql(u8, owner_value.string, state_owner_id)) continue;
+            if (!std.mem.eql(u8, key_value.string, key)) continue;
+
+            deleted = if (data.object.get("deleted")) |value| value == .bool and value.bool else false;
+            latest = data.object.get("value");
+        }
+
+        if (deleted) return null;
+        const value = latest orelse return null;
+        return ai.json_util.cloneJsonValue(allocator, value) catch null;
+    }
+
+    fn runtimeSessionStateSet(
+        session_ptr: *anyopaque,
+        state_owner_id: []const u8,
+        key: []const u8,
+        value: std.json.Value,
+    ) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        var data = std.json.ObjectMap.init(self.allocator);
+        errdefer {
+            const wrapped: std.json.Value = .{ .object = data };
+            ai.json_util.freeJsonValue(self.allocator, wrapped);
+        }
+
+        try data.put(try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
+        try data.put(try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
+        try data.put(try self.allocator.dupe(u8, "value"), try ai.json_util.cloneJsonValue(self.allocator, value));
+
+        self.session_store.appendCustomEntry(extension_state_entry_type, .{ .object = data });
+    }
+
+    fn runtimeSessionStateDelete(
+        session_ptr: *anyopaque,
+        state_owner_id: []const u8,
+        key: []const u8,
+    ) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        var data = std.json.ObjectMap.init(self.allocator);
+        errdefer {
+            const wrapped: std.json.Value = .{ .object = data };
+            ai.json_util.freeJsonValue(self.allocator, wrapped);
+        }
+
+        try data.put(try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
+        try data.put(try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
+        try data.put(try self.allocator.dupe(u8, "deleted"), .{ .bool = true });
+
+        self.session_store.appendCustomEntry(extension_state_entry_type, .{ .object = data });
+    }
+
+    fn runtimeShowPanel(session_ptr: *anyopaque, panel: extension_ui.Panel) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.clearPendingExtensionPanel();
+        self.pending_extension_panel = try extension_ui.Panel.clone(self.allocator, panel);
+    }
+
+    pub fn takePendingExtensionPanel(self: *AgentSession) ?extension_ui.Panel {
+        const panel = self.pending_extension_panel;
+        self.pending_extension_panel = null;
+        return panel;
+    }
+
+    fn clearPendingExtensionPanel(self: *AgentSession) void {
+        if (self.pending_extension_panel) |*panel| panel.deinit(self.allocator);
+        self.pending_extension_panel = null;
+    }
+
+    fn runtimePublishPrompt(session_ptr: *anyopaque, prompt: extension_ui.PromptRequest) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        var cloned = try extension_ui.PromptRequest.clone(self.allocator, prompt);
+        errdefer cloned.deinit(self.allocator);
+        try self.pending_extension_prompts.append(self.allocator, cloned);
+    }
+
+    fn runtimeResolvePrompt(session_ptr: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.emitSessionEvent(.{ .extension_prompt_request = .{ .prompt = prompt, .response = response } });
+    }
+
+    fn runtimeCancelPrompts(session_ptr: *anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.clearPendingExtensionPrompts();
+    }
+
+    pub fn pendingExtensionPromptCount(self: *const AgentSession) usize {
+        return self.pending_extension_prompts.items.len;
+    }
+
+    fn clearPendingExtensionPrompts(self: *AgentSession) void {
+        for (self.pending_extension_prompts.items) |*prompt| prompt.deinit(self.allocator);
+        self.pending_extension_prompts.deinit(self.allocator);
+        self.pending_extension_prompts = .empty;
+    }
+
+    fn runtimePublishSurface(session_ptr: *anyopaque, update: extension_ui.SurfaceUpdate) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        var cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
+        errdefer cloned.deinit(self.allocator);
+        try self.pending_extension_surfaces.append(self.allocator, cloned);
+    }
+
+    fn runtimeRevokeSurfaces(session_ptr: *anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.clearPendingExtensionSurfaces();
+    }
+
+    pub fn takePendingExtensionSurfaces(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.SurfaceUpdate {
+        const out = try allocator.alloc(extension_ui.SurfaceUpdate, self.pending_extension_surfaces.items.len);
+        errdefer allocator.free(out);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*update| update.deinit(allocator);
+        }
+        for (self.pending_extension_surfaces.items, 0..) |update, i| {
+            out[i] = try extension_ui.SurfaceUpdate.clone(allocator, update);
+            initialized += 1;
+        }
+        self.clearPendingExtensionSurfaces();
+        return out;
+    }
+
+    fn clearPendingExtensionSurfaces(self: *AgentSession) void {
+        for (self.pending_extension_surfaces.items) |*update| update.deinit(self.allocator);
+        self.pending_extension_surfaces.deinit(self.allocator);
+        self.pending_extension_surfaces = .empty;
+    }
+
+    fn runtimePublishEditorAction(session_ptr: *anyopaque, action: extension_ui.EditorAction) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        var cloned = try extension_ui.EditorAction.clone(self.allocator, action);
+        errdefer cloned.deinit(self.allocator);
+        try self.pending_extension_editor_actions.append(self.allocator, cloned);
+    }
+
+    fn runtimeClearEditorActions(session_ptr: *anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.clearPendingExtensionEditorActions();
+    }
+
+    pub fn takePendingExtensionEditorActions(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.EditorAction {
+        const out = try allocator.alloc(extension_ui.EditorAction, self.pending_extension_editor_actions.items.len);
+        errdefer allocator.free(out);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*action| action.deinit(allocator);
+        }
+        for (self.pending_extension_editor_actions.items, 0..) |action, i| {
+            out[i] = try extension_ui.EditorAction.clone(allocator, action);
+            initialized += 1;
+        }
+        self.clearPendingExtensionEditorActions();
+        return out;
+    }
+
+    fn clearPendingExtensionEditorActions(self: *AgentSession) void {
+        for (self.pending_extension_editor_actions.items) |*action| action.deinit(self.allocator);
+        self.pending_extension_editor_actions.deinit(self.allocator);
+        self.pending_extension_editor_actions = .empty;
     }
 
     fn runtimeProviderProjectionChanged(session_ptr: *anyopaque) void {

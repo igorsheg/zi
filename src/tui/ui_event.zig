@@ -5,6 +5,8 @@ const runtime_host_mod = @import("../coding_agent/runtime_host.zig");
 const model_registry_mod = @import("../coding_agent/model_registry.zig");
 const ai_protocol = @import("../ai/protocol.zig");
 const theme_mod = @import("theme.zig");
+const extension_ui = @import("../coding_agent/extensions/ui.zig");
+const request_mod = @import("../coding_agent/request.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 
 pub const ExtensionCommandEntry = struct {
@@ -88,6 +90,19 @@ pub const UiEvent = union(enum) {
 
     extension_commands_updated: struct {
         commands: []ExtensionCommandEntry,
+    },
+    extension_panel_shown: struct {
+        panel: extension_ui.Panel,
+    },
+    extension_surfaces_updated: struct {
+        updates: []extension_ui.SurfaceUpdate,
+    },
+    extension_editor_actions: struct {
+        actions: []extension_ui.EditorAction,
+    },
+    extension_prompt_requested: struct {
+        prompt: extension_ui.PromptRequest,
+        response: *request_mod.ExtensionPromptResponse,
     },
 
     visible_models_snapshot: struct {
@@ -217,6 +232,16 @@ pub const UiEvent = union(enum) {
                 }
                 allocator.free(u.commands);
             },
+            .extension_panel_shown => |*u| u.panel.deinit(allocator),
+            .extension_surfaces_updated => |u| {
+                for (u.updates) |*update| update.deinit(allocator);
+                allocator.free(u.updates);
+            },
+            .extension_editor_actions => |u| {
+                for (u.actions) |*action| action.deinit(allocator);
+                allocator.free(u.actions);
+            },
+            .extension_prompt_requested => |*u| u.prompt.deinit(allocator),
             .visible_models_snapshot => |u| model_registry_mod.deinitOwnedModels(allocator, u.models),
             .session_new_started => {},
             .session_fork_started => {},

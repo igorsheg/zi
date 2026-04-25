@@ -722,25 +722,37 @@ fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
 fn parseEventKind(name: []const u8) ?event_registry.EventKind {
     const Pair = struct { name: []const u8, kind: event_registry.EventKind };
     const table = [_]Pair{
-        // lifecycle
+        // startup/resource interceptors
+        .{ .name = "session_directory", .kind = .session_directory },
+        .{ .name = "resources_discover", .kind = .resources_discover },
+        // agent lifecycle and prompt/provider interceptors
         .{ .name = "agent_start", .kind = .agent_start },
         .{ .name = "agent_end", .kind = .agent_end },
+        .{ .name = "before_agent_start", .kind = .before_agent_start },
+        .{ .name = "input", .kind = .input },
+        .{ .name = "context", .kind = .context },
+        .{ .name = "before_provider_request", .kind = .before_provider_request },
         .{ .name = "turn_start", .kind = .turn_start },
         .{ .name = "turn_end", .kind = .turn_end },
         .{ .name = "message_start", .kind = .message_start },
         .{ .name = "message_update", .kind = .message_update },
         .{ .name = "message_end", .kind = .message_end },
-        // tool
+        // tool and host command execution
         .{ .name = "tool_execution_start", .kind = .tool_execution_start },
         .{ .name = "tool_execution_update", .kind = .tool_execution_update },
         .{ .name = "tool_execution_end", .kind = .tool_execution_end },
         .{ .name = "tool_call", .kind = .tool_call },
         .{ .name = "tool_result", .kind = .tool_result },
+        .{ .name = "user_bash", .kind = .user_bash },
         // session
         .{ .name = "session_start", .kind = .session_start },
         .{ .name = "session_shutdown", .kind = .session_shutdown },
         .{ .name = "session_before_switch", .kind = .session_before_switch },
         .{ .name = "session_before_fork", .kind = .session_before_fork },
+        .{ .name = "session_before_compact", .kind = .session_before_compact },
+        .{ .name = "session_compact", .kind = .session_compact },
+        .{ .name = "session_before_tree", .kind = .session_before_tree },
+        .{ .name = "session_tree", .kind = .session_tree },
         // meta
         .{ .name = "model_select", .kind = .model_select },
     };
@@ -2549,6 +2561,69 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     _ = c.lua_getfield(co.L, -1, "cancelled");
     try testing.expect(c.lua_toboolean(co.L, -1) != 0);
     c.lua_pop(co.L, 1);
+}
+
+test "zi.on accepts every reserved v2 event" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    const events = [_][]const u8{
+        "session_directory",
+        "resources_discover",
+        "agent_start",
+        "agent_end",
+        "before_agent_start",
+        "input",
+        "context",
+        "before_provider_request",
+        "turn_start",
+        "turn_end",
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "tool_call",
+        "tool_result",
+        "user_bash",
+        "session_start",
+        "session_shutdown",
+        "session_before_switch",
+        "session_before_fork",
+        "session_before_compact",
+        "session_compact",
+        "session_before_tree",
+        "session_tree",
+        "model_select",
+    };
+
+    inline for (events) |event_name| {
+        try testing.expect(parseEventKind(event_name) != null);
+    }
+    try testing.expectEqual(@as(usize, 28), events.len);
+
+    try state.doString(
+        \\local events = {
+        \\  "session_directory", "resources_discover",
+        \\  "agent_start", "agent_end", "before_agent_start", "input", "context", "before_provider_request",
+        \\  "turn_start", "turn_end", "message_start", "message_update", "message_end",
+        \\  "tool_execution_start", "tool_execution_update", "tool_execution_end", "tool_call", "tool_result", "user_bash",
+        \\  "session_start", "session_shutdown", "session_before_switch", "session_before_fork",
+        \\  "session_before_compact", "session_compact", "session_before_tree", "session_tree",
+        \\  "model_select",
+        \\}
+        \\for _, name in ipairs(events) do
+        \\  zi.on(name, function() end)
+        \\end
+    , "test_all_reserved_events");
+
+    try testing.expectEqual(@as(usize, 28), runner.event_registry.count());
 }
 
 test "zi.register_command registers a command end-to-end" {

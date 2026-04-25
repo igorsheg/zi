@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const ai_protocol = @import("../ai/protocol.zig");
 const auth_types = @import("auth/types.zig");
+const extension_ui = @import("extensions/ui.zig");
 const message_memory = @import("../agent3/message_memory.zig");
 const mailbox_mod = @import("../runtime/mailbox.zig");
 
@@ -50,6 +51,54 @@ pub const ExtensionOAuthLoginCallbacks = struct {
     on_auth: *const fn (url: []const u8, ctx: ?*anyopaque) void,
     on_progress: ?*const fn (msg: []const u8, ctx: ?*anyopaque) void = null,
     ctx: ?*anyopaque = null,
+};
+
+pub const ExtensionPromptResponse = struct {
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    completed: bool = false,
+    result: ?Result = null,
+
+    pub const OwnedValue = struct {
+        text: []const u8,
+        allocator: std.mem.Allocator,
+    };
+
+    pub const Result = union(enum) {
+        confirm: bool,
+        value: ?OwnedValue,
+
+        pub fn deinit(self: *Result) void {
+            switch (self.*) {
+                .value => |maybe| if (maybe) |value| value.allocator.free(value.text),
+                .confirm => {},
+            }
+            self.* = undefined;
+        }
+    };
+
+    pub fn defaultFor(kind: extension_ui.PromptKind) Result {
+        return switch (kind) {
+            .confirm => .{ .confirm = false },
+            .select, .input, .editor => .{ .value = null },
+        };
+    }
+
+    pub fn finish(self: *ExtensionPromptResponse, result: Result) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.completed) return;
+        self.result = result;
+        self.completed = true;
+        self.condition.broadcast();
+    }
+
+    pub fn wait(self: *ExtensionPromptResponse) Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.completed) self.condition.wait(&self.mutex);
+        return self.result.?;
+    }
 };
 
 pub const ExtensionOAuthLoginResponse = struct {

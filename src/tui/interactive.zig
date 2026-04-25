@@ -35,6 +35,7 @@ const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const request_mod = @import("../coding_agent/request.zig");
+const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
@@ -312,6 +313,63 @@ const ResumePickerFlow = struct {
     }
 };
 
+const ExtensionPromptFlow = struct {
+    arena: std.heap.ArenaAllocator,
+    prompt: extension_ui.PromptRequest,
+    response: *request_mod.ExtensionPromptResponse,
+    items: []SelectItem = &.{},
+    picker: ?ListPicker = null,
+    editor: ?editor_mod.Editor = null,
+    handle: ?tui_mod.OverlayHandle = null,
+
+    fn init(gpa: std.mem.Allocator, theme: *const theme_mod.Theme, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) !ExtensionPromptFlow {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const owned_prompt = try extension_ui.PromptRequest.clone(a, prompt);
+
+        switch (prompt.kind) {
+            .confirm, .select => {
+                const items = switch (prompt.kind) {
+                    .confirm => blk: {
+                        const confirm_items = try a.alloc(SelectItem, 2);
+                        confirm_items[0] = .{ .value = "yes", .label = "Yes" };
+                        confirm_items[1] = .{ .value = "no", .label = "No" };
+                        break :blk confirm_items;
+                    },
+                    .select => blk: {
+                        const select_items = try a.alloc(SelectItem, prompt.options.len);
+                        for (prompt.options, 0..) |option, i| {
+                            select_items[i] = .{ .value = option.id, .label = option.label };
+                        }
+                        break :blk select_items;
+                    },
+                    .input, .editor => unreachable,
+                };
+                var picker = ListPicker.init(theme);
+                picker.title = owned_prompt.title;
+                picker.list.max_visible = 8;
+                picker.setItems(items);
+                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .items = items, .picker = picker };
+            },
+            .input, .editor => {
+                var editor = editor_mod.Editor.init(a);
+                editor.setTheme(theme);
+                editor.setCwd(owned_prompt.title);
+                editor.setAutocompleteMaxVisible(0);
+                editor.setMaxVisibleLines(if (prompt.kind == .input) 1 else 8);
+                if (prompt.kind == .editor) editor.setText(owned_prompt.prefill orelse "");
+                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .editor = editor };
+            },
+        }
+    }
+
+    fn deinit(self: *ExtensionPromptFlow) void {
+        if (self.editor) |*editor| editor.deinit();
+        self.arena.deinit();
+    }
+};
+
 /// Owns all transient heap-backed data for one `/model` overlay.
 /// Catalog models are borrowed from Interactive's TUI-owned snapshot;
 /// derived search rows live here.
@@ -432,6 +490,10 @@ pub const Interactive = struct {
     active_editor_bound: bool = false,
     status_text: text_mod.Text,
     pending_image_banner: text_mod.Text,
+    extension_panel_text: text_mod.Text,
+    extension_header_text: text_mod.Text,
+    extension_footer_text: text_mod.Text,
+    extension_widget_above_text: text_mod.Text,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
@@ -493,6 +555,7 @@ pub const Interactive = struct {
     /// registry directly. Allocated with `msg_allocator`.
     model_catalog: []ai_protocol.Model = &.{},
     model_picker_flow: ?ModelPickerFlow = null,
+    extension_prompt_flow: ?ExtensionPromptFlow = null,
 
     // ── Settings pickers (/settings) ───────────────────────────────
     settings_picker: ListPicker = undefined,
@@ -563,6 +626,10 @@ pub const Interactive = struct {
             .editor = editor_mod.Editor.init(state_allocator),
             .status_text = text_mod.Text.init(state_allocator),
             .pending_image_banner = text_mod.Text.init(state_allocator),
+            .extension_panel_text = text_mod.Text.init(state_allocator),
+            .extension_header_text = text_mod.Text.init(state_allocator),
+            .extension_footer_text = text_mod.Text.init(state_allocator),
+            .extension_widget_above_text = text_mod.Text.init(state_allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
@@ -637,6 +704,7 @@ pub const Interactive = struct {
         self.lifecycle_event_queue.close();
 
         self.drainUiEvents();
+        self.closeExtensionPromptFlow(false);
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
         self.clearLoginPickerEntries();
@@ -669,6 +737,10 @@ pub const Interactive = struct {
         self.header_container.deinit();
         self.conversation_projection.deinit();
         self.transcript.deinit();
+        self.extension_widget_above_text.deinit();
+        self.extension_footer_text.deinit();
+        self.extension_header_text.deinit();
+        self.extension_panel_text.deinit();
         self.pending_image_banner.deinit();
         self.status_text.deinit();
         self.editor.deinit();
@@ -722,9 +794,13 @@ pub const Interactive = struct {
         // Populate container slots with their initial children.
         self.refreshGreeterVisibility();
         self.refreshPendingImageBanner();
+        self.header_container.addChild(self.extension_header_text.component());
         self.status_container.addChild(self.status_text.component());
+        self.widget_above_container.addChild(self.extension_widget_above_text.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
+        self.widget_below_container.addChild(self.extension_panel_text.component());
+        self.widget_below_container.addChild(self.extension_footer_text.component());
 
         // Set initial focus via TUI (source of truth for input routing)
         self.tui.setFocus(self.active_editor.component());
@@ -966,7 +1042,11 @@ pub const Interactive = struct {
                 return;
             }
             if (keybindings.matches(.select_cancel, key)) {
-                self.tui.hideOverlay();
+                if (self.extension_prompt_flow != null) {
+                    self.closeExtensionPromptFlow(true);
+                } else {
+                    self.tui.hideOverlay();
+                }
                 return;
             }
             return;
@@ -1327,6 +1407,18 @@ pub const Interactive = struct {
             },
             .extension_commands_updated => |u| {
                 self.applyExtensionCommandsUpdate(u.commands);
+            },
+            .extension_panel_shown => |u| {
+                self.applyExtensionPanel(u.panel);
+            },
+            .extension_surfaces_updated => |u| {
+                self.applyExtensionSurfaces(u.updates);
+            },
+            .extension_editor_actions => |u| {
+                self.applyExtensionEditorActions(u.actions);
+            },
+            .extension_prompt_requested => |u| {
+                self.showExtensionPrompt(u.prompt, u.response);
             },
             .session_new_started => {
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
@@ -2266,6 +2358,74 @@ pub const Interactive = struct {
         self.queueModelPatternSwitch(pattern);
     }
 
+    fn closeExtensionPromptFlow(self: *Interactive, resolve_default: bool) void {
+        if (self.extension_prompt_flow) |*flow| {
+            if (resolve_default) flow.response.finish(request_mod.ExtensionPromptResponse.defaultFor(flow.prompt.kind));
+            if (flow.handle) |h| {
+                flow.handle = null;
+                h.hide();
+            }
+            flow.deinit();
+        }
+        self.extension_prompt_flow = null;
+    }
+
+    fn showExtensionPrompt(self: *Interactive, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
+        self.closeExtensionPromptFlow(true);
+        var flow = ExtensionPromptFlow.init(self.allocator, self.theme, prompt, response) catch {
+            response.finish(request_mod.ExtensionPromptResponse.defaultFor(prompt.kind));
+            return;
+        };
+        errdefer flow.deinit();
+        if (flow.picker) |*picker| {
+            picker.on_select = &onExtensionPromptSelected;
+            picker.on_cancel = &onExtensionPromptCancelled;
+            picker.callback_ctx = @ptrCast(self);
+        }
+        if (flow.editor) |*editor| {
+            editor.setOnSubmit(&onExtensionPromptSubmitted, @ptrCast(self));
+        }
+        self.cancelTranscriptSelection();
+        self.extension_prompt_flow = flow;
+        const component = switch (self.extension_prompt_flow.?.prompt.kind) {
+            .confirm, .select => self.extension_prompt_flow.?.picker.?.component(),
+            .input, .editor => self.extension_prompt_flow.?.editor.?.component(),
+        };
+        self.extension_prompt_flow.?.handle = self.tui.showOverlay(
+            component,
+            self.bottomPanelOptions(),
+        );
+    }
+
+    fn onExtensionPromptSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.extension_prompt_flow) |*flow| {
+            switch (flow.prompt.kind) {
+                .confirm => flow.response.finish(.{ .confirm = std.mem.eql(u8, selection.item.value, "yes") }),
+                .select => {
+                    const value = self.msg_allocator.dupe(u8, selection.item.value) catch null;
+                    flow.response.finish(.{ .value = if (value) |text| .{ .text = text, .allocator = self.msg_allocator } else null });
+                },
+                .input, .editor => flow.response.finish(request_mod.ExtensionPromptResponse.defaultFor(flow.prompt.kind)),
+            }
+        }
+        self.closeExtensionPromptFlow(false);
+    }
+
+    fn onExtensionPromptSubmitted(text: []const u8, ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        if (self.extension_prompt_flow) |*flow| {
+            const value = self.msg_allocator.dupe(u8, text) catch null;
+            flow.response.finish(.{ .value = if (value) |owned| .{ .text = owned, .allocator = self.msg_allocator } else null });
+        }
+        self.closeExtensionPromptFlow(false);
+    }
+
+    fn onExtensionPromptCancelled(ctx: ?*anyopaque) void {
+        const self: *Interactive = @ptrCast(@alignCast(ctx));
+        self.closeExtensionPromptFlow(true);
+    }
+
     fn closeModelPickerFlow(self: *Interactive) void {
         if (self.model_picker_flow) |*flow| {
             if (flow.handle) |h| {
@@ -2848,6 +3008,21 @@ pub const Interactive = struct {
                             };
                             _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
                         };
+                        if (self.runtime_host.takePendingExtensionPanel(self.msg_allocator)) |panel| {
+                            _ = self.publishLifecycleUiEvent(.{ .extension_panel_shown = .{ .panel = panel } });
+                        }
+                        const updates = self.runtime_host.takePendingExtensionSurfaces(self.msg_allocator);
+                        if (updates.len > 0) {
+                            _ = self.publishLifecycleUiEvent(.{ .extension_surfaces_updated = .{ .updates = updates } });
+                        } else {
+                            self.msg_allocator.free(updates);
+                        }
+                        const actions = self.runtime_host.takePendingExtensionEditorActions(self.msg_allocator);
+                        if (actions.len > 0) {
+                            _ = self.publishLifecycleUiEvent(.{ .extension_editor_actions = .{ .actions = actions } });
+                        } else {
+                            self.msg_allocator.free(actions);
+                        }
                     },
                     .extension_oauth_login => |oauth| {
                         idle_processed = true;
@@ -2911,6 +3086,48 @@ pub const Interactive = struct {
             break :blk owned;
         };
         _ = self.publishLifecycleUiEvent(.{ .extension_commands_updated = .{ .commands = commands } });
+    }
+
+    fn applyExtensionPanel(self: *Interactive, panel: @import("../coding_agent/extensions/ui.zig").Panel) void {
+        const text = panel.flattenText(self.allocator) catch return;
+        defer self.allocator.free(text);
+        self.extension_panel_text.setContent(text);
+        self.tui.dirty = true;
+    }
+
+    fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
+        for (actions) |action| {
+            switch (action.kind) {
+                .set_text => if (action.text) |text| self.active_editor.setText(text),
+                .paste_text => if (action.text) |text| self.active_editor.handlePaste(text),
+                .clear_text => self.active_editor.clear(),
+                .get_text => {},
+            }
+        }
+        self.tui.dirty = true;
+    }
+
+    fn applyExtensionSurfaces(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
+        for (updates) |update| {
+            switch (update.kind) {
+                .status => self.status_data.setStatus(update.id, update.text),
+                .header => self.applySurfaceText(&self.extension_header_text, update),
+                .footer => self.applySurfaceText(&self.extension_footer_text, update),
+                .widget => if (update.placement != null and std.mem.eql(u8, update.placement.?, "aboveEditor"))
+                    self.applySurfaceText(&self.extension_widget_above_text, update)
+                else
+                    self.applySurfaceText(&self.extension_panel_text, update),
+                .working, .overlay => self.applySurfaceText(&self.extension_panel_text, update),
+                .title, .thinking_label => {},
+            }
+        }
+        self.tui.dirty = true;
+    }
+
+    fn applySurfaceText(self: *Interactive, text_component: *text_mod.Text, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
+        const text = update.flattenText(self.allocator) catch return;
+        defer self.allocator.free(text);
+        text_component.setContent(text);
     }
 
     /// TUI-thread application of the latest extension command surface.
@@ -3332,6 +3549,13 @@ pub const Interactive = struct {
             .visible_models_changed => {
                 self.publishVisibleModelsSnapshot();
                 self.publishStatusSnapshot();
+            },
+            .extension_prompt_request => |request| {
+                const prompt = extension_ui.PromptRequest.clone(self.msg_allocator, request.prompt) catch {
+                    request.response.finish(request_mod.ExtensionPromptResponse.defaultFor(request.prompt.kind));
+                    return;
+                };
+                _ = self.publishLifecycleUiEvent(.{ .extension_prompt_requested = .{ .prompt = prompt, .response = request.response } });
             },
         }
     }

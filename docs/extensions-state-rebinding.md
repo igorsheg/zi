@@ -167,6 +167,18 @@ implementation freedom:
 - session-persisted state may be implemented with explicit session metadata entries.
 - the public contract is the logical map and replay behavior, not the raw wire format.
 
+### lua session-state surface
+
+bound tool, command, observer, and interceptor contexts expose the session-persisted map through `ctx.state`:
+
+```lua
+ctx.state.get(key)         -- returns value or nil
+ctx.state.set(key, value)  -- writes value for this extension's state_owner_id
+ctx.state.delete(key)      -- writes a tombstone for this extension's state_owner_id
+```
+
+`ctx.state` is intentionally scoped to the current extension namespace's durable `state_owner_id`. extensions do not pass owner ids manually, and they do not receive raw session entries. the host replays state along the active branch, so fork/resume/tree operations see the value that belongs to that branch.
+
 ## flow contract
 
 ### startup bind

@@ -9,10 +9,10 @@
 //!     (most lifecycle events: agent_start, message_end, ...)
 //!   - **cancellable**: handlers run in order; the first that returns
 //!     `block = true` stops the chain. Mutations from earlier handlers
-//!     are visible to later ones. (`tool_call`, `session_before_*`)
-//!   - **transformable**: each handler's return value feeds the next.
-//!     The final value is what the agent sees. (`tool_result`,
-//!     `context`, `before_provider_request`)
+//!     are visible to later ones.
+//!   - **transformable** / **middleware** / **aggregate** variants are reserved
+//!     for v2 event classes whose concrete dispatch points land incrementally.
+//!     The registry stores their handlers now so API shape stays stable.
 //!
 //! D2 only stores the handlers — actual dispatch lives in D4. The
 //! semantics tag is recorded on the EventKind so the dispatcher can
@@ -28,27 +28,40 @@ const resource_types = @import("../../resources/types.zig");
 ///
 /// Order in this enum is NOT semantic; treat it as a tag set.
 pub const EventKind = enum {
-    // Lifecycle
+    // Startup/resource interceptors
+    session_directory,
+    resources_discover,
+
+    // Agent lifecycle and prompt/provider interceptors
     agent_start,
     agent_end,
+    before_agent_start,
+    input,
+    context,
+    before_provider_request,
     turn_start,
     turn_end,
     message_start,
     message_update,
     message_end,
 
-    // Tool
+    // Tool and host command execution
     tool_execution_start,
     tool_execution_update,
     tool_execution_end,
     tool_call,
     tool_result,
+    user_bash,
 
     // Session
     session_start,
     session_shutdown,
     session_before_switch,
     session_before_fork,
+    session_before_compact,
+    session_compact,
+    session_before_tree,
+    session_tree,
 
     // Meta
     model_select,
@@ -59,14 +72,42 @@ pub const EventKind = enum {
     /// the semantics of an existing event.
     pub fn semantics(self: EventKind) Semantics {
         return switch (self) {
-            .tool_call, .session_before_switch, .session_before_fork => .cancellable,
-            .tool_result => .transformable,
+            .session_directory,
+            .resources_discover,
+            .before_agent_start,
+            => .aggregate,
+
+            .input,
+            .tool_call,
+            => .middleware_cancellable,
+
+            .context,
+            .before_provider_request,
+            .tool_result,
+            => .middleware,
+
+            .user_bash,
+            .session_before_fork,
+            .session_before_compact,
+            .session_before_tree,
+            => .cancellable_aggregate,
+
+            .session_before_switch => .cancellable,
+
             else => .observer,
         };
     }
 };
 
-pub const Semantics = enum { observer, cancellable, transformable };
+pub const Semantics = enum {
+    observer,
+    cancellable,
+    transformable,
+    aggregate,
+    middleware,
+    middleware_cancellable,
+    cancellable_aggregate,
+};
 
 /// One subscription. The handler reference is opaque to the registry —
 /// concrete dispatch (D4) interprets it. For Lua handlers it's a
@@ -159,11 +200,19 @@ test "EventRegistry subscribes in order and dispatches correct chain" {
     try testing.expectEqualStrings("ext-c", me[0].source_id);
 }
 
+test "EventKind reserves the full v2 event surface" {
+    try testing.expectEqual(@as(usize, 28), @typeInfo(EventKind).@"enum".fields.len);
+}
+
 test "EventKind.semantics matches spec" {
-    try testing.expectEqual(Semantics.cancellable, EventKind.tool_call.semantics());
-    try testing.expectEqual(Semantics.transformable, EventKind.tool_result.semantics());
+    try testing.expectEqual(Semantics.aggregate, EventKind.resources_discover.semantics());
+    try testing.expectEqual(Semantics.middleware_cancellable, EventKind.tool_call.semantics());
+    try testing.expectEqual(Semantics.middleware, EventKind.tool_result.semantics());
+    try testing.expectEqual(Semantics.middleware, EventKind.before_provider_request.semantics());
     try testing.expectEqual(Semantics.observer, EventKind.message_end.semantics());
     try testing.expectEqual(Semantics.cancellable, EventKind.session_before_switch.semantics());
-    try testing.expectEqual(Semantics.cancellable, EventKind.session_before_fork.semantics());
+    try testing.expectEqual(Semantics.cancellable_aggregate, EventKind.session_before_fork.semantics());
+    try testing.expectEqual(Semantics.cancellable_aggregate, EventKind.session_before_compact.semantics());
+    try testing.expectEqual(Semantics.observer, EventKind.session_compact.semantics());
     try testing.expectEqual(Semantics.observer, EventKind.session_start.semantics());
 }

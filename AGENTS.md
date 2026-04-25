@@ -13,3 +13,11 @@ opentui is cloned locally at `.references/opentui/`. When you need to reference 
 - **max 3-5 tests per task.** if you need more, the task is too big or you're testing implementation.
 - **every test name states the behavior it verifies.** `test "session round-trips all 9 entry types"` not `test "parseEntry works"`.
 - **a test that can't break when behavior changes shouldn't exist.**
+
+# a smol contract
+
+Write programs that solve a well defined problem.
+Write programs that behave the way most users expect them to behave.
+Write programs that a single person can maintain.
+Write programs that compose with other smol tools.
+Write programs that can be finished.

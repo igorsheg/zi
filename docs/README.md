@@ -39,6 +39,7 @@ put it in a bead, pr, or `docs/archive/` if it still matters.
 - `extensions-providers.md` — provider registration, activation, and model-visibility contract
 - `extensions-commands-flags-actions.md` — command, shortcut, flag, and host-action contract
 - `extensions-conformance-matrix.md` — parity/conformance matrix against pi-mono capability classes
+- `extensions-example-parity-ledger.md` — product-level ledger against pi-mono extension examples
 - `extensions-cutover-boundaries.md` — repo-facing v2 cutover boundary plan for consumers and seams
 - `adr/extensions-v2-cutover.md` — root cutover doctrine for extension system v2
 - `adr/conversation-render-v2-cutover.md` — root cutover doctrine for conversation/render v2

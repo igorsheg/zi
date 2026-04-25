@@ -29,8 +29,11 @@ const agent_protocol = @import("../../agent3/types.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
 const ai = @import("../../ai/root.zig");
 const api = @import("api.zig");
+const lua_renderer = @import("lua_renderer.zig");
 const context_mod = @import("context.zig");
 const resource_types = @import("../resources/types.zig");
+const extension_ui = @import("ui.zig");
+const request_mod = @import("../request.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
 
@@ -596,6 +599,564 @@ test "lua tool ctx exposes binding from tool provenance" {
     try testing.expectEqualStrings("/workspace", result.details.object.get("workspace_id").?.string);
     try testing.expectEqualStrings("session-123", result.details.object.get("session_id").?.string);
     try testing.expectEqualStrings("/workspace/.zi/sessions/session-123.jsonl", result.details.object.get("session_file").?.string);
+}
+
+fn loadTodoExample(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) !void {
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+
+    const src = try std.fs.cwd().readFileAlloc(testing.allocator, "examples/extensions/todo.lua", 64 * 1024);
+    defer testing.allocator.free(src);
+    try state.loadChunk(src, "todo.lua");
+    if (c.lua_pcallk(state.L, 0, 1, 0, 0, null) != c.LUA_OK) return error.LuaRuntime;
+    if (c.lua_type(state.L, -1) != c.LUA_TFUNCTION) return error.LuaRuntime;
+    _ = c.lua_getglobal(state.L, "zi");
+    if (c.lua_pcallk(state.L, 1, 0, 0, 0, null) != c.LUA_OK) return error.LuaRuntime;
+    try testing.expect(runner.tool_registry.get("todo") != null);
+    try testing.expect(runner.command_registry.getByVisibleName("todos") != null);
+}
+
+fn todoArgs(allocator: std.mem.Allocator, action: []const u8, text: ?[]const u8, id: ?i64) !std.json.Value {
+    var obj = std.json.ObjectMap.init(allocator);
+    errdefer obj.deinit();
+    try obj.put("action", .{ .string = action });
+    if (text) |value| try obj.put("text", .{ .string = value });
+    if (id) |value| try obj.put("id", .{ .integer = value });
+    return .{ .object = obj };
+}
+
+test "todo example registers a tool, command, details, and renderer" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    api.installZiTable(&state, &runner);
+
+    try loadTodoExample(&state, &runner);
+
+    const ext_tool = runner.tool_registry.get("todo").?.*;
+    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const add_args = try todoArgs(allocator, "add", "write parity ledger", null);
+    const add_result = tool.execute(tool.ctx, allocator, "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(!add_result.is_error);
+    try testing.expectEqualStrings("Added todo #1: write parity ledger", add_result.content[0].text.text);
+    try testing.expect(add_result.details == .object);
+    const add_details = add_result.details.object;
+    try testing.expectEqualStrings("add", add_details.get("action").?.string);
+    try testing.expectEqual(@as(i64, 2), add_details.get("nextId").?.integer);
+    const add_todos = add_details.get("todos").?.array.items;
+    try testing.expectEqual(@as(usize, 1), add_todos.len);
+    try testing.expectEqual(@as(i64, 1), add_todos[0].object.get("id").?.integer);
+    try testing.expectEqualStrings("write parity ledger", add_todos[0].object.get("text").?.string);
+
+    const toggle_args = try todoArgs(allocator, "toggle", null, 1);
+    const toggle_result = tool.execute(tool.ctx, allocator, "todo-2", toggle_args, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(!toggle_result.is_error);
+    const toggle_todos = toggle_result.details.object.get("todos").?.array.items;
+    try testing.expect(toggle_todos[0].object.get("done").?.bool);
+
+    const list_args = try todoArgs(allocator, "list", null, null);
+    const list_result = tool.execute(tool.ctx, allocator, "todo-3", list_args, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(!list_result.is_error);
+    try testing.expectEqualStrings("[x] #1: write parity ledger", list_result.content[0].text.text);
+
+    const rendered = lua_renderer.dispatchRenderResultFromResult(testing.allocator, &runner, .{
+        .tool_name = "todo",
+        .args = list_args,
+        .result = list_result,
+        .width = 80,
+        .is_error = false,
+    }) orelse return error.MissingTodoRenderer;
+    defer rendered.deinit(testing.allocator);
+
+    try testing.expect(rendered.collapsed.len >= 2);
+    try testing.expectEqualStrings("1 todo(s):", rendered.collapsed[0][0].text);
+    try testing.expectEqualStrings("✓ ", rendered.collapsed[1][0].text);
+    try testing.expectEqualStrings("#1 ", rendered.collapsed[1][1].text);
+    try testing.expectEqualStrings("write parity ledger", rendered.collapsed[1][2].text);
+}
+
+const TestStateStore = struct {
+    allocator: std.mem.Allocator,
+    value: ?std.json.Value = null,
+    panel: ?extension_ui.Panel = null,
+    prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
+    surfaces: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
+    editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
+    cancel_count: usize = 0,
+    revoke_count: usize = 0,
+
+    fn deinit(self: *TestStateStore) void {
+        if (self.value) |value| ai.json_util.freeJsonValue(self.allocator, value);
+        self.value = null;
+        if (self.panel) |*panel| panel.deinit(self.allocator);
+        self.panel = null;
+        self.clearPrompts();
+        self.clearSurfaces();
+        self.clearEditorActions();
+    }
+
+    fn get(session: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) ?std.json.Value {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        const value = self.value orelse return null;
+        return ai.json_util.cloneJsonValue(allocator, value) catch null;
+    }
+
+    fn set(session: *anyopaque, _: []const u8, _: []const u8, value: std.json.Value) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (self.value) |old| ai.json_util.freeJsonValue(self.allocator, old);
+        self.value = try ai.json_util.cloneJsonValue(self.allocator, value);
+    }
+
+    fn delete(session: *anyopaque, _: []const u8, _: []const u8) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (self.value) |old| ai.json_util.freeJsonValue(self.allocator, old);
+        self.value = null;
+    }
+
+    fn showPanel(session: *anyopaque, panel: extension_ui.Panel) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (self.panel) |*old| old.deinit(self.allocator);
+        self.panel = try extension_ui.Panel.clone(self.allocator, panel);
+    }
+
+    fn publishPrompt(session: *anyopaque, prompt: extension_ui.PromptRequest) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        var cloned = try extension_ui.PromptRequest.clone(self.allocator, prompt);
+        errdefer cloned.deinit(self.allocator);
+        try self.prompts.append(self.allocator, cloned);
+    }
+
+    fn cancelPrompts(session: *anyopaque) void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        self.cancel_count += 1;
+        self.clearPrompts();
+    }
+
+    fn clearPrompts(self: *TestStateStore) void {
+        for (self.prompts.items) |*prompt| prompt.deinit(self.allocator);
+        self.prompts.deinit(self.allocator);
+        self.prompts = .empty;
+    }
+
+    fn publishSurface(session: *anyopaque, update: extension_ui.SurfaceUpdate) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        var cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
+        errdefer cloned.deinit(self.allocator);
+        try self.surfaces.append(self.allocator, cloned);
+    }
+
+    fn revokeSurfaces(session: *anyopaque) void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        self.revoke_count += 1;
+        self.clearSurfaces();
+    }
+
+    fn clearSurfaces(self: *TestStateStore) void {
+        for (self.surfaces.items) |*update| update.deinit(self.allocator);
+        self.surfaces.deinit(self.allocator);
+        self.surfaces = .empty;
+    }
+
+    fn publishEditorAction(session: *anyopaque, action: extension_ui.EditorAction) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        var cloned = try extension_ui.EditorAction.clone(self.allocator, action);
+        errdefer cloned.deinit(self.allocator);
+        try self.editor_actions.append(self.allocator, cloned);
+    }
+
+    fn resolvePrompt(session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        switch (prompt.kind) {
+            .confirm => response.finish(.{ .confirm = true }),
+            .select => {
+                const selected = if (prompt.options.len > 0) prompt.options[0].id else "";
+                const text = self.allocator.dupe(u8, selected) catch return response.finish(.{ .value = null });
+                response.finish(.{ .value = .{ .text = text, .allocator = self.allocator } });
+            },
+            .input => {
+                const text = self.allocator.dupe(u8, "typed") catch return response.finish(.{ .value = null });
+                response.finish(.{ .value = .{ .text = text, .allocator = self.allocator } });
+            },
+            .editor => {
+                const text = self.allocator.dupe(u8, "edited") catch return response.finish(.{ .value = null });
+                response.finish(.{ .value = .{ .text = text, .allocator = self.allocator } });
+            },
+        }
+    }
+
+    fn clearEditorActionsCallback(session: *anyopaque) void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        self.clearEditorActions();
+    }
+
+    fn clearEditorActions(self: *TestStateStore) void {
+        for (self.editor_actions.items) |*action| action.deinit(self.allocator);
+        self.editor_actions.deinit(self.allocator);
+        self.editor_actions = .empty;
+    }
+};
+
+fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
+    return .{
+        .session = @ptrCast(store),
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testGetModel,
+        .is_idle = &testIsIdle,
+        .abort = &testAbort,
+        .has_pending_messages = &testHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testGetContextUsage,
+        .get_system_prompt = &testGetSystemPrompt,
+        .get_binding_info = &testGetBindingInfo,
+        .session_state_get = &TestStateStore.get,
+        .session_state_set = &TestStateStore.set,
+        .session_state_delete = &TestStateStore.delete,
+        .show_panel = &TestStateStore.showPanel,
+        .publish_prompt = &TestStateStore.publishPrompt,
+        .cancel_prompts = &TestStateStore.cancelPrompts,
+        .publish_surface = &TestStateStore.publishSurface,
+        .revoke_surfaces = &TestStateStore.revokeSurfaces,
+        .publish_editor_action = &TestStateStore.publishEditorAction,
+        .clear_editor_actions = &TestStateStore.clearEditorActionsCallback,
+    };
+}
+
+fn bindTestRuntime(runner: *runner_mod.ExtensionRunner, store: *TestStateStore, provider_registry: *ai.provider.Registry) !void {
+    try runner.bindRuntime(bindRuntimeFields(store), provider_registry);
+}
+
+fn bindResolvingRuntime(runner: *runner_mod.ExtensionRunner, store: *TestStateStore, provider_registry: *ai.provider.Registry) !void {
+    var bound = bindRuntimeFields(store);
+    bound.resolve_prompt = &TestStateStore.resolvePrompt;
+    try runner.bindRuntime(bound, provider_registry);
+}
+
+test "extension command context publishes host-owned editor buffer actions" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 15);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "editor-actions",
+        \\  description = "editor-actions",
+        \\  handler = function(_, ctx)
+        \\    ctx.ui.set_editor_text("hello")
+        \\    ctx.ui.paste_to_editor(" world")
+        \\    ctx.ui.clear_editor_text()
+        \\    assert(ctx.ui.get_editor_text() == nil)
+        \\  end,
+        \\})
+    , "register_editor_action_command");
+
+    try runner.dispatchCommand("editor-actions", "");
+
+    try testing.expectEqual(@as(usize, 4), store.editor_actions.items.len);
+    try testing.expectEqual(extension_ui.EditorActionKind.set_text, store.editor_actions.items[0].kind);
+    try testing.expectEqualStrings("hello", store.editor_actions.items[0].text.?);
+    try testing.expectEqual(extension_ui.EditorActionKind.paste_text, store.editor_actions.items[1].kind);
+    try testing.expectEqualStrings(" world", store.editor_actions.items[1].text.?);
+    try testing.expectEqual(extension_ui.EditorActionKind.clear_text, store.editor_actions.items[2].kind);
+    try testing.expectEqual(extension_ui.EditorActionKind.get_text, store.editor_actions.items[3].kind);
+
+    runner.unbindRuntime();
+    try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
+}
+
+test "extension command context publishes host-owned status and surface leases" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 14);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "surfaces",
+        \\  description = "surfaces",
+        \\  handler = function(_, ctx)
+        \\    ctx.ui.set_status("demo", "ready")
+        \\    ctx.ui.set_title("Zi Demo")
+        \\    ctx.ui.set_widget("w", { { { text = "Widget" } } }, { placement = "aboveEditor" })
+        \\    ctx.ui.set_header({ { { text = "Header" } } })
+        \\    ctx.ui.set_footer({ { { text = "Footer" } } })
+        \\    ctx.ui.set_working("Working")
+        \\    ctx.ui.set_hidden_thinking_label("Thinking")
+        \\    ctx.ui.show_overlay("overlay", { { { text = "Overlay" } } })
+        \\  end,
+        \\})
+    , "register_surface_command");
+
+    try runner.dispatchCommand("surfaces", "");
+
+    try testing.expectEqual(@as(usize, 8), store.surfaces.items.len);
+    try testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[0].kind);
+    try testing.expectEqualStrings("demo", store.surfaces.items[0].id);
+    try testing.expectEqualStrings("ready", store.surfaces.items[0].text.?);
+    try testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[2].kind);
+    try testing.expectEqualStrings("aboveEditor", store.surfaces.items[2].placement.?);
+    try testing.expectEqualStrings("Widget", store.surfaces.items[2].lines[0][0].text);
+    try testing.expectEqual(extension_ui.SurfaceKind.header, store.surfaces.items[3].kind);
+    try testing.expectEqualStrings("Header", store.surfaces.items[3].lines[0][0].text);
+    try testing.expectEqual(extension_ui.SurfaceKind.footer, store.surfaces.items[4].kind);
+    try testing.expectEqualStrings("Footer", store.surfaces.items[4].lines[0][0].text);
+    try testing.expectEqual(extension_ui.SurfaceKind.overlay, store.surfaces.items[7].kind);
+    try testing.expectEqualStrings("overlay", store.surfaces.items[7].id);
+    try testing.expectEqualStrings("Overlay", store.surfaces.items[7].lines[0][0].text);
+
+    runner.unbindRuntime();
+    try testing.expectEqual(@as(usize, 1), store.revoke_count);
+    try testing.expectEqual(@as(usize, 0), store.surfaces.items.len);
+}
+
+test "extension command prompts can resolve through host response" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 16);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindResolvingRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "resolved-prompts",
+        \\  description = "resolved-prompts",
+        \\  handler = function(_, ctx)
+        \\    assert(ctx.ui.confirm("Confirm", "Continue?") == true)
+        \\    assert(ctx.ui.select("Pick", { "A", "B" }) == "A")
+        \\    assert(ctx.ui.input("Input", "placeholder") == "typed")
+        \\    assert(ctx.ui.editor("Editor", "prefill") == "edited")
+        \\  end,
+        \\})
+    , "register_resolved_prompt_command");
+
+    try runner.dispatchCommand("resolved-prompts", "");
+}
+
+test "extension command context publishes host-owned prompt requests with default outcomes" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 13);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "prompts",
+        \\  description = "prompts",
+        \\  handler = function(_, ctx)
+        \\    assert(ctx.ui.confirm("Confirm", "Continue?") == false)
+        \\    assert(ctx.ui.select("Pick", { "A", "B" }) == nil)
+        \\    assert(ctx.ui.input("Input", "placeholder") == nil)
+        \\    assert(ctx.ui.editor("Editor", "prefill") == nil)
+        \\  end,
+        \\})
+    , "register_prompt_command");
+
+    try runner.dispatchCommand("prompts", "");
+
+    try testing.expectEqual(@as(usize, 4), store.prompts.items.len);
+    try testing.expectEqual(extension_ui.PromptKind.confirm, store.prompts.items[0].kind);
+    try testing.expectEqualStrings("Confirm", store.prompts.items[0].title);
+    try testing.expectEqualStrings("Continue?", store.prompts.items[0].message.?);
+    try testing.expectEqual(extension_ui.PromptKind.select, store.prompts.items[1].kind);
+    try testing.expectEqualStrings("A", store.prompts.items[1].options[0].id);
+    try testing.expectEqualStrings("B", store.prompts.items[1].options[1].label);
+    try testing.expectEqual(extension_ui.PromptKind.input, store.prompts.items[2].kind);
+    try testing.expectEqualStrings("placeholder", store.prompts.items[2].placeholder.?);
+    try testing.expectEqual(extension_ui.PromptKind.editor, store.prompts.items[3].kind);
+    try testing.expectEqualStrings("prefill", store.prompts.items[3].prefill.?);
+
+    runner.unbindRuntime();
+    try testing.expectEqual(@as(usize, 1), store.cancel_count);
+    try testing.expectEqual(@as(usize, 0), store.prompts.items.len);
+}
+
+test "extension command context publishes a host-owned panel" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 11);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "panel",
+        \\  description = "panel",
+        \\  handler = function(_, ctx)
+        \\    assert(ctx.has_ui == true)
+        \\    ctx.ui.show_panel({
+        \\      id = "demo",
+        \\      title = "Demo",
+        \\      lines = { { { text = "✓ ", fg = "success" }, { text = "published", fg = "accent", dim = true } } },
+        \\      transient = true,
+        \\    })
+        \\  end,
+        \\})
+    , "register_panel_command");
+
+    try runner.dispatchCommand("panel", "");
+
+    const panel = store.panel orelse return error.MissingPanel;
+    try testing.expectEqualStrings("state-123", panel.state_owner_id);
+    try testing.expectEqual(@as(u64, 11), panel.generation);
+    try testing.expectEqualStrings("demo", panel.id);
+    try testing.expectEqualStrings("Demo", panel.title);
+    try testing.expect(panel.transient);
+    try testing.expectEqual(@as(usize, 1), panel.lines.len);
+    try testing.expectEqualStrings("✓ ", panel.lines[0][0].text);
+    try testing.expectEqualStrings("success", panel.lines[0][0].fg.?);
+    try testing.expectEqualStrings("published", panel.lines[0][1].text);
+    try testing.expect(panel.lines[0][1].dim);
+}
+
+test "todo command publishes hydrated todos as a host-owned panel" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 12);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+    try loadTodoExample(&state, &runner);
+
+    const ext_tool = runner.tool_registry.get("todo").?.*;
+    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const add_args = try todoArgs(arena.allocator(), "add", "ship panel", null);
+    const add_result = tool.execute(tool.ctx, arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(!add_result.is_error);
+
+    try runner.dispatchCommand("todos", "");
+
+    const panel = store.panel orelse return error.MissingPanel;
+    try testing.expectEqualStrings("todos", panel.id);
+    try testing.expectEqualStrings("Todos", panel.title);
+    try testing.expect(panel.transient);
+    try testing.expectEqualStrings("1 todo(s):", panel.lines[0][0].text);
+    try testing.expectEqualStrings("○ ", panel.lines[1][0].text);
+    try testing.expectEqualStrings("#1 ", panel.lines[1][1].text);
+    try testing.expectEqualStrings("ship panel", panel.lines[1][2].text);
+}
+
+test "todo example rehydrates from session state across extension generations" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    {
+        var state = try lua_runtime.LuaState.init(testing.allocator);
+        defer state.deinit();
+        var runner = runner_mod.ExtensionRunner.init(testing.allocator, 1);
+        defer runner.deinit();
+        runner.attachLuaState(&state);
+        runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+        var provider_registry = ai.provider.Registry.init(testing.allocator);
+        defer provider_registry.deinit();
+        try bindTestRuntime(&runner, &store, &provider_registry);
+        api.installZiTable(&state, &runner);
+        try loadTodoExample(&state, &runner);
+
+        const ext_tool = runner.tool_registry.get("todo").?.*;
+        const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const add_args = try todoArgs(arena.allocator(), "add", "persist me", null);
+        const add_result = tool.execute(tool.ctx, arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
+        try testing.expect(!add_result.is_error);
+    }
+
+    try testing.expect(store.value != null);
+
+    {
+        var state = try lua_runtime.LuaState.init(testing.allocator);
+        defer state.deinit();
+        var runner = runner_mod.ExtensionRunner.init(testing.allocator, 2);
+        defer runner.deinit();
+        runner.attachLuaState(&state);
+        runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+        var provider_registry = ai.provider.Registry.init(testing.allocator);
+        defer provider_registry.deinit();
+        try bindTestRuntime(&runner, &store, &provider_registry);
+        api.installZiTable(&state, &runner);
+        try loadTodoExample(&state, &runner);
+
+        const ext_tool = runner.tool_registry.get("todo").?.*;
+        const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const list_args = try todoArgs(arena.allocator(), "list", null, null);
+        const list_result = tool.execute(tool.ctx, arena.allocator(), "todo-2", list_args, abort_signal_mod.AbortSignal.none, null, null);
+        try testing.expect(!list_result.is_error);
+        try testing.expectEqualStrings("[ ] #1: persist me", list_result.content[0].text.text);
+    }
 }
 
 test "lua tool returning a string produces a single text content block" {

@@ -129,6 +129,7 @@ const CODEX_MODELS = [_]ManualModel{
     .{ .id = "gpt-5.2-codex", .name = "GPT-5.2 Codex", .reasoning = true, .has_image = true, .ci = 1.75, .co = 14, .cr = 0.175, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
     .{ .id = "gpt-5.3-codex", .name = "GPT-5.3 Codex", .reasoning = true, .has_image = true, .ci = 1.75, .co = 14, .cr = 0.175, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
     .{ .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .has_image = true, .ci = 2.5, .co = 15, .cr = 0.25, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
+    .{ .id = "gpt-5.5", .name = "GPT-5.5", .reasoning = true, .has_image = true, .ci = 5, .co = 30, .cr = 0.5, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
     .{ .id = "gpt-5.4-mini", .name = "GPT-5.4 Mini", .reasoning = true, .has_image = true, .ci = 0.75, .co = 4.5, .cr = 0.075, .cw = 0, .ctx = CODEX_CTX, .max_tok = CODEX_MAX },
     .{ .id = "gpt-5.3-codex-spark", .name = "GPT-5.3 Codex Spark", .reasoning = true, .has_image = false, .ci = 0, .co = 0, .cr = 0, .cw = 0, .ctx = 128_000, .max_tok = CODEX_MAX },
 };

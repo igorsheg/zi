@@ -11,6 +11,7 @@ const context_mod = @import("context.zig");
 const oauth_mod = @import("../auth/oauth.zig");
 const auth_types = @import("../auth/types.zig");
 const request_mod = @import("../request.zig");
+const extension_ui = @import("ui.zig");
 
 const log = std.log.scoped(.zi_runner);
 
@@ -67,6 +68,17 @@ pub const ExtensionRuntime = union(enum) {
         get_context_usage: *const fn (session: *anyopaque) ?session_core.context_usage.ContextUsage,
         get_system_prompt: *const fn (session: *anyopaque) []const u8,
         get_binding_info: *const fn (session: *anyopaque) ExtensionBindingInfo,
+        session_state_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, state_owner_id: []const u8, key: []const u8) ?std.json.Value = null,
+        session_state_set: ?*const fn (session: *anyopaque, state_owner_id: []const u8, key: []const u8, value: std.json.Value) anyerror!void = null,
+        session_state_delete: ?*const fn (session: *anyopaque, state_owner_id: []const u8, key: []const u8) anyerror!void = null,
+        show_panel: ?*const fn (session: *anyopaque, panel: extension_ui.Panel) anyerror!void = null,
+        publish_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest) anyerror!void = null,
+        resolve_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void = null,
+        cancel_prompts: ?*const fn (session: *anyopaque) void = null,
+        publish_surface: ?*const fn (session: *anyopaque, update: extension_ui.SurfaceUpdate) anyerror!void = null,
+        revoke_surfaces: ?*const fn (session: *anyopaque) void = null,
+        publish_editor_action: ?*const fn (session: *anyopaque, action: extension_ui.EditorAction) anyerror!void = null,
+        clear_editor_actions: ?*const fn (session: *anyopaque) void = null,
         provider_projection_changed: ?*const fn (session: *anyopaque) void = null,
     };
 };
@@ -535,6 +547,10 @@ pub const ExtensionRunner = struct {
 
     pub fn unbindRuntime(self: *ExtensionRunner) void {
         if (self.runtime == .bound) {
+            const bound = self.runtime.bound;
+            if (bound.cancel_prompts) |cancel| cancel(bound.session);
+            if (bound.revoke_surfaces) |revoke| revoke(bound.session);
+            if (bound.clear_editor_actions) |clear| clear(bound.session);
             var projection_changed = false;
             if (self._provider_registry) |registry| {
                 const before = registry.activeClaimCount();

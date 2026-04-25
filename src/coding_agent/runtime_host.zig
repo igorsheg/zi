@@ -5,6 +5,7 @@ const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const agent_session_mod = @import("agent_session.zig");
 const AgentSession = agent_session_mod.AgentSession;
+const extension_ui = @import("extensions/ui.zig");
 const sdk = @import("sdk.zig");
 const resolve_mod = @import("resolve.zig");
 const session_runner = @import("session_runner.zig");
@@ -153,6 +154,20 @@ pub const RuntimeHost = struct {
     pub fn dispatchExtensionCommand(self: *RuntimeHost, name: []const u8, args: []const u8) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchCommand(name, args);
+    }
+
+    pub fn takePendingExtensionPanel(self: *RuntimeHost, allocator: std.mem.Allocator) ?extension_ui.Panel {
+        var panel = self.session.takePendingExtensionPanel() orelse return null;
+        defer panel.deinit(self.session.allocator);
+        return extension_ui.Panel.clone(allocator, panel) catch null;
+    }
+
+    pub fn takePendingExtensionSurfaces(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.SurfaceUpdate {
+        return self.session.takePendingExtensionSurfaces(allocator) catch allocator.alloc(extension_ui.SurfaceUpdate, 0) catch &.{};
+    }
+
+    pub fn takePendingExtensionEditorActions(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.EditorAction {
+        return self.session.takePendingExtensionEditorActions(allocator) catch allocator.alloc(extension_ui.EditorAction, 0) catch &.{};
     }
 
     pub fn reloadExtensionsOnAgentThread(self: *RuntimeHost) !void {
