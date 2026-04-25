@@ -85,10 +85,11 @@ fn extractJsonError(value: std.json.Value) ParsedHttpError {
             else => {},
         }
     }
-    if (value.object.get("message")) |msg| {
-        if (msg == .string and msg.string.len > 0) return .{ .provider_message = msg.string };
-    }
-    return .{};
+    return .{
+        .provider_message = if (value.object.get("message")) |msg| if (msg == .string and msg.string.len > 0) msg.string else null else null,
+        .provider_code = if (value.object.get("code")) |code| if (code == .string and code.string.len > 0) code.string else null else null,
+        .provider_type = if (value.object.get("type")) |t| if (t == .string and t.string.len > 0) t.string else null else null,
+    };
 }
 
 fn cloneParsedHttpError(allocator: std.mem.Allocator, parsed: ParsedHttpError) !ParsedHttpError {
@@ -127,6 +128,15 @@ pub fn classifyProviderFailure(
     provider_code: ?[]const u8,
     provider_message: ?[]const u8,
 ) protocol.NormalizedFailure.Kind {
+    if (provider_type) |provider_type_value| {
+        if (isNonOverflowNeedle(provider_type_value)) return .rate_limited;
+    }
+    if (provider_code) |code| {
+        if (isNonOverflowNeedle(code)) return .rate_limited;
+    }
+    if (provider_message) |msg| {
+        if (isNonOverflowNeedle(msg)) return .rate_limited;
+    }
     if (provider_code) |code| {
         if (isOverflowNeedle(code)) return .context_overflow;
     }
@@ -197,6 +207,14 @@ fn httpStatusReason(status_code: u16) ?[]const u8 {
     };
 }
 
+fn isNonOverflowNeedle(text: []const u8) bool {
+    return string_util.containsAnyCI(text, &.{
+        "throttling error",
+        "rate limit",
+        "too many requests",
+    });
+}
+
 fn isOverflowNeedle(text: []const u8) bool {
     return string_util.containsAnyCI(text, &.{
         "prompt is too long",
@@ -250,4 +268,22 @@ test "classifyProviderFailure maps anthropic sse error types" {
     try testing.expectEqual(protocol.NormalizedFailure.Kind.auth, classifyProviderFailure("authentication_error", null, "bad key"));
     try testing.expectEqual(protocol.NormalizedFailure.Kind.rate_limited, classifyProviderFailure("rate_limit_error", null, "please slow down"));
     try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, classifyProviderFailure("invalid_request_error", null, "schema mismatch"));
+}
+
+test "normalizeHttpFailure extracts top-level provider metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const result = try normalizeHttpFailure(allocator, .bad_request, "{\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\",\"message\":\"context length exceeded\"}");
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, result.failure.kind);
+    try testing.expectEqualStrings("context_length_exceeded", result.failure.provider_code.?);
+    try testing.expectEqualStrings("invalid_request_error", result.failure.provider_type.?);
+}
+
+test "classifyProviderFailure keeps throttling token text retryable" {
+    try testing.expectEqual(
+        protocol.NormalizedFailure.Kind.rate_limited,
+        classifyProviderFailure("throttling_error", null, "Throttling error: Too many tokens, please wait before trying again."),
+    );
 }
