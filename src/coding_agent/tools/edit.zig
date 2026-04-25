@@ -23,6 +23,7 @@
 //! edit), file-tracker hookup for undo_edit.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("../../agent3/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
@@ -352,6 +353,9 @@ fn atomicWriteFile(path: []const u8, bytes: []const u8, mode: std.fs.File.Mode) 
     var atomic_file = try std.fs.cwd().atomicFile(path, .{ .mode = mode, .write_buffer = &write_buffer });
     defer atomic_file.deinit();
 
+    if (comptime builtin.os.tag != .windows) {
+        try atomic_file.file_writer.file.chmod(mode);
+    }
     try atomic_file.file_writer.interface.writeAll(bytes);
     try atomic_file.flush();
     try atomic_file.file_writer.file.sync();
@@ -950,6 +954,44 @@ test "prepareArguments leaves non-canonical input unchanged when it cannot fold 
     try std.testing.expectEqualStrings("before", prepared.object.get("old_str").?.string);
     try std.testing.expect(prepared.object.get("new_str") == null);
     try std.testing.expect(prepared.object.get("edits") == null);
+}
+
+test "atomic write preserves mode and replaces hardlink identity" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("target.txt", .{});
+    try file.writeAll("before\n");
+    try file.chmod(0o640);
+    file.close();
+
+    const target_path = try tmp.dir.realpathAlloc(testing.allocator, "target.txt");
+    defer testing.allocator.free(target_path);
+    const link_path = try std.fs.path.join(testing.allocator, &.{ std.fs.path.dirname(target_path).?, "linked.txt" });
+    defer testing.allocator.free(link_path);
+    try std.posix.link(target_path, link_path);
+
+    const before_target = try tmp.dir.statFile("target.txt");
+    const before_link = try tmp.dir.statFile("linked.txt");
+    try testing.expectEqual(before_target.inode, before_link.inode);
+
+    try atomicWriteFile(target_path, "after\n", before_target.mode);
+
+    const after_target = try tmp.dir.statFile("target.txt");
+    const after_link = try tmp.dir.statFile("linked.txt");
+    try testing.expect(after_target.inode != before_target.inode);
+    try testing.expectEqual(before_link.inode, after_link.inode);
+    try testing.expectEqual(before_target.mode, after_target.mode);
+
+    const target_contents = try tmp.dir.readFileAlloc(testing.allocator, "target.txt", 1024);
+    defer testing.allocator.free(target_contents);
+    const link_contents = try tmp.dir.readFileAlloc(testing.allocator, "linked.txt", 1024);
+    defer testing.allocator.free(link_contents);
+    try testing.expectEqualStrings("after\n", target_contents);
+    try testing.expectEqualStrings("before\n", link_contents);
 }
 
 test "execute returns unified diff in content without structured diff details" {
