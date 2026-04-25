@@ -3476,8 +3476,10 @@ fn convertAgentUiEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent
     switch (event) {
         .message_update => |mu| switch (mu.assistant_message_event) {
             .@"error" => |e| {
-                if (e.@"error".error_message) |msg| {
-                    const owned = allocator.dupe(u8, msg) catch return null;
+                const assistant = e.@"error";
+                if (assistant.error_message) |msg| {
+                    const display = userFacingFailureMessage(if (assistant.failure) |failure| failure.kind else null, msg);
+                    const owned = allocator.dupe(u8, display) catch return null;
                     return .{ .error_message = .{ .message = owned } };
                 }
                 return null;
