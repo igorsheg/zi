@@ -28,6 +28,7 @@ put it in a bead, pr, or `docs/archive/` if it still matters.
 - `agent-events-and-transport-boundaries.md` — public event/persistence/wire boundaries vs internal transport seams
 - `extensions.md` — extension model and links to v2 contracts
 - `runtime-roots.md` — runtime-root/discovery/precedence contract for extension v2
+- `theme-system.md` — custom theme JSON format, token names, and diagnostics
 - `extensions-lifecycle.md` — lifecycle, namespace, and scheduler contract for extension execution
 - `extensions-events.md` — observer/interceptor contract for extension-visible semantics
 - `extensions-retained-objects.md` — retained-object ownership and publication contract
