@@ -679,7 +679,9 @@ const LifecycleCollector = struct {
     allocator: std.mem.Allocator,
     retry_starts: std.ArrayListUnmanaged(RetryStart) = .empty,
     retry_ends: std.ArrayListUnmanaged(RetryEnd) = .empty,
+    compaction_starts: std.ArrayListUnmanaged(CompactionStart) = .empty,
     compaction_ends: std.ArrayListUnmanaged(CompactionEnd) = .empty,
+    compaction_starts_seen_before_first_end: usize = 0,
     retry_wait_finished_count: usize = 0,
 
     fn onRetryStart(event: RetryStart, ctx: ?*anyopaque) void {
@@ -697,14 +699,21 @@ const LifecycleCollector = struct {
         self.retry_ends.append(self.allocator, event) catch {};
     }
 
+    fn onCompactionStart(event: CompactionStart, ctx: ?*anyopaque) void {
+        const self: *LifecycleCollector = @ptrCast(@alignCast(ctx.?));
+        self.compaction_starts.append(self.allocator, event) catch {};
+    }
+
     fn onCompactionEnd(event: CompactionEnd, ctx: ?*anyopaque) void {
         const self: *LifecycleCollector = @ptrCast(@alignCast(ctx.?));
+        if (self.compaction_ends.items.len == 0) self.compaction_starts_seen_before_first_end = self.compaction_starts.items.len;
         self.compaction_ends.append(self.allocator, event) catch {};
     }
 
     fn deinit(self: *LifecycleCollector) void {
         self.retry_starts.deinit(self.allocator);
         self.retry_ends.deinit(self.allocator);
+        self.compaction_starts.deinit(self.allocator);
         self.compaction_ends.deinit(self.allocator);
     }
 };
@@ -1217,6 +1226,7 @@ test "runtime host recovers overflow with one compaction pass before retrying co
     host.setLifecycleHooks(.{
         .on_retry_start = &LifecycleCollector.onRetryStart,
         .on_retry_end = &LifecycleCollector.onRetryEnd,
+        .on_compaction_start = &LifecycleCollector.onCompactionStart,
         .on_compaction_end = &LifecycleCollector.onCompactionEnd,
         .ctx = @ptrCast(&collector),
     });
@@ -1227,6 +1237,9 @@ test "runtime host recovers overflow with one compaction pass before retrying co
     try testing.expectEqual(@as(usize, 2), fp.call_count);
     try testing.expectEqual(@as(usize, 1), compaction_spy.calls.items.len);
     try testing.expectEqual(CompactionReason.overflow, compaction_spy.calls.items[0]);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
+    try testing.expectEqual(CompactionReason.overflow, collector.compaction_starts.items[0].reason);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts_seen_before_first_end);
     try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
     try testing.expect(collector.compaction_ends.items[0].success);
     try testing.expect(!collector.compaction_ends.items[0].aborted);
@@ -1283,6 +1296,7 @@ test "runtime host runs threshold compaction after successful turn when context 
     });
     defer host.deinit();
     host.setLifecycleHooks(.{
+        .on_compaction_start = &LifecycleCollector.onCompactionStart,
         .on_compaction_end = &LifecycleCollector.onCompactionEnd,
         .ctx = @ptrCast(&collector),
     });
@@ -1292,6 +1306,9 @@ test "runtime host runs threshold compaction after successful turn when context 
     try testing.expectEqual(RunOutcome.success, outcome);
     try testing.expectEqual(@as(usize, 1), compaction_spy.calls.items.len);
     try testing.expectEqual(CompactionReason.threshold, compaction_spy.calls.items[0]);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
+    try testing.expectEqual(CompactionReason.threshold, collector.compaction_starts.items[0].reason);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts_seen_before_first_end);
     try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
     try testing.expectEqual(CompactionReason.threshold, collector.compaction_ends.items[0].reason);
     try testing.expect(collector.compaction_ends.items[0].success);
