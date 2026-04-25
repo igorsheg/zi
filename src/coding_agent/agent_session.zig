@@ -449,7 +449,10 @@ pub const AgentSession = struct {
             };
         }
 
-        return contextUsageFromMessages(model.context_window, self.agent.messages());
+        return contextUsageFromEstimate(model.context_window, session_core.context_usage.estimateContextTokensWithInFlight(
+            self.agent.messages(),
+            self.agent.inFlightState(),
+        ));
     }
 
     pub fn statusSnapshot(self: *const AgentSession) StatusSnapshot {
@@ -513,8 +516,7 @@ pub const AgentSession = struct {
         }
     }
 
-    fn contextUsageFromMessages(context_window: u64, messages: []const protocol.AgentMessage) ContextUsage {
-        const estimate = session_core.context_usage.estimateContextTokens(messages);
+    fn contextUsageFromEstimate(context_window: u64, estimate: session_core.context_usage.ContextUsageEstimate) ContextUsage {
         return .{
             .tokens = estimate.tokens,
             .context_window = context_window,

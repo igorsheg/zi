@@ -33,35 +33,65 @@ pub fn calculateContextTokens(usage: ai.protocol.Usage) u64 {
 /// pi-mono source:
 /// packages/coding-agent/src/core/compaction/compaction.ts:186-214
 pub fn estimateContextTokens(messages: []const agent.protocol.AgentMessage) ContextUsageEstimate {
-    const usage_info = getLastAssistantUsageInfo(messages);
+    var estimator = ContextUsageEstimator{};
+    for (messages) |message| estimator.observe(message);
+    return estimator.finish();
+}
 
-    if (usage_info == null) {
-        var estimated: u64 = 0;
-        for (messages) |message| {
-            estimated += estimateTokens(message);
+pub fn estimateContextTokensWithInFlight(
+    committed: []const agent.protocol.AgentMessage,
+    in_flight: *const agent.conversation_state.InFlightState,
+) ContextUsageEstimate {
+    var estimator = ContextUsageEstimator{};
+    for (committed) |message| estimator.observe(message);
+    if (in_flight.assistant) |assistant| {
+        estimator.observe(.{ .assistant = assistant });
+    }
+    for (in_flight.tool_executions.items) |execution| {
+        if (execution.result_message) |tool_result| {
+            estimator.observe(.{ .tool_result = tool_result });
+        }
+    }
+    return estimator.finish();
+}
+
+const ContextUsageEstimator = struct {
+    index: usize = 0,
+    pre_usage_tokens: u64 = 0,
+    usage_tokens: u64 = 0,
+    trailing_tokens: u64 = 0,
+    last_usage_index: ?usize = null,
+
+    fn observe(self: *ContextUsageEstimator, message: agent.protocol.AgentMessage) void {
+        if (getAssistantUsage(message)) |usage| {
+            self.usage_tokens = calculateContextTokens(usage);
+            self.trailing_tokens = 0;
+            self.last_usage_index = self.index;
+        } else if (self.last_usage_index == null) {
+            self.pre_usage_tokens += estimateTokens(message);
+        } else {
+            self.trailing_tokens += estimateTokens(message);
+        }
+        self.index += 1;
+    }
+
+    fn finish(self: ContextUsageEstimator) ContextUsageEstimate {
+        if (self.last_usage_index == null) {
+            return .{
+                .tokens = self.pre_usage_tokens,
+                .usage_tokens = 0,
+                .trailing_tokens = self.pre_usage_tokens,
+                .last_usage_index = null,
+            };
         }
         return .{
-            .tokens = estimated,
-            .usage_tokens = 0,
-            .trailing_tokens = estimated,
-            .last_usage_index = null,
+            .tokens = self.usage_tokens + self.trailing_tokens,
+            .usage_tokens = self.usage_tokens,
+            .trailing_tokens = self.trailing_tokens,
+            .last_usage_index = self.last_usage_index,
         };
     }
-
-    const info = usage_info.?;
-    const usage_tokens = calculateContextTokens(info.usage);
-    var trailing_tokens: u64 = 0;
-    for (messages[info.index + 1 ..]) |message| {
-        trailing_tokens += estimateTokens(message);
-    }
-
-    return .{
-        .tokens = usage_tokens + trailing_tokens,
-        .usage_tokens = usage_tokens,
-        .trailing_tokens = trailing_tokens,
-        .last_usage_index = info.index,
-    };
-}
+};
 
 /// pi-mono source:
 /// packages/coding-agent/src/core/compaction/compaction.ts:232-290
@@ -103,17 +133,6 @@ pub fn estimateTokens(message: agent.protocol.AgentMessage) u64 {
     return @intCast(@divTrunc(chars + 3, 4));
 }
 
-fn getLastAssistantUsageInfo(messages: []const agent.protocol.AgentMessage) ?struct { usage: ai.protocol.Usage, index: usize } {
-    var i: usize = messages.len;
-    while (i > 0) {
-        i -= 1;
-        if (getAssistantUsage(messages[i])) |usage| {
-            return .{ .usage = usage, .index = i };
-        }
-    }
-    return null;
-}
-
 fn getAssistantUsage(message: agent.protocol.AgentMessage) ?ai.protocol.Usage {
     switch (message) {
         .assistant => |assistant| switch (assistant.stop_reason) {
@@ -135,6 +154,49 @@ fn estimateJsonSize(value: std.json.Value) usize {
 }
 
 const testing = std.testing;
+
+test "estimateContextTokensWithInFlight uses assistant message-end usage before turn commit" {
+    var in_flight = agent.conversation_state.InFlightState.init(testing.allocator);
+    defer in_flight.deinit();
+
+    const committed = [_]agent.protocol.AgentMessage{.{ .user = .{
+        .content = .{ .text = "hello" },
+        .timestamp = 1,
+    } }};
+    const assistant = ai.protocol.AssistantMessage{
+        .content = &.{},
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "gpt-test",
+        .usage = .{
+            .input = 100,
+            .output = 20,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .stop,
+        .timestamp = 2,
+    };
+    const tool_result = agent.protocol.ToolResultMessage{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .content = &.{.{ .text = .{ .text = "abcdefgh" } }},
+        .is_error = false,
+        .timestamp = 3,
+    };
+
+    _ = in_flight.applyEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    _ = in_flight.applyEvent(.{ .message_end = .{ .message = .{ .tool_result = tool_result } } });
+
+    const estimate = estimateContextTokensWithInFlight(&committed, &in_flight);
+
+    try testing.expectEqual(@as(u64, 122), estimate.tokens);
+    try testing.expectEqual(@as(u64, 120), estimate.usage_tokens);
+    try testing.expectEqual(@as(u64, 2), estimate.trailing_tokens);
+    try testing.expectEqual(@as(?usize, 1), estimate.last_usage_index);
+}
 
 test "estimateTokens counts tool call arguments using stringified json size" {
     const parsed = try std.json.parseFromSlice(

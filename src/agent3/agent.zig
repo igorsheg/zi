@@ -289,6 +289,10 @@ pub const Agent = struct {
         return self.shared_committed.flat;
     }
 
+    pub fn inFlightState(self: *const Agent) *const conversation_state.InFlightState {
+        return &self.in_flight;
+    }
+
     pub fn latestAssistant(self: *const Agent) ?protocol.AssistantMessage {
         const flat = self.shared_committed.flat;
         var i = flat.len;

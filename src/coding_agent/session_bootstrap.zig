@@ -208,7 +208,6 @@ pub fn prepareSessionDeps(
 
     var extension_runtime = try buildExtensionRuntime(
         allocator,
-        options.cwd,
         resource_loader,
         builtin_definitions,
         options.tools != null,
@@ -232,7 +231,6 @@ pub fn prepareSessionDeps(
 
     const system_prompt = try buildSystemPrompt(
         allocator,
-        options.cwd,
         resource_loader,
         filtered.items,
     );
@@ -313,7 +311,6 @@ fn buildAgentTools(
 
 fn buildSystemPrompt(
     allocator: std.mem.Allocator,
-    cwd: []const u8,
     resource_loader: resources.ResourceLoader,
     definitions: []const tool_def.ToolDefinition,
 ) ![]const u8 {
@@ -336,7 +333,7 @@ fn buildSystemPrompt(
     if (prompt_inputs.system_prompt) |custom| {
         return system_prompt_mod.buildSystemPrompt(allocator, .{
             .custom_prompt = custom,
-            .cwd = cwd,
+            .cwd = resource_loader.cwd,
             .context_files = prompt_inputs.agents_files,
             .tool_names = tool_names,
             .tool_snippets = tool_snippets,
@@ -347,7 +344,7 @@ fn buildSystemPrompt(
     }
 
     return system_prompt_mod.buildSystemPrompt(allocator, .{
-        .cwd = cwd,
+        .cwd = resource_loader.cwd,
         .tool_names = tool_names,
         .tool_snippets = tool_snippets,
         .guidelines = prompt_guidelines,
@@ -387,7 +384,6 @@ const ExtensionRuntime = struct {
 
 fn buildExtensionRuntime(
     allocator: std.mem.Allocator,
-    cwd: []const u8,
     resource_loader: resources.ResourceLoader,
     builtin_definitions: []const tool_def.ToolDefinition,
     has_custom_tools: bool,
@@ -403,7 +399,7 @@ fn buildExtensionRuntime(
     const runner_ptr = allocator.create(ExtensionRunner) catch return runtime;
     errdefer allocator.destroy(runner_ptr);
     runner_ptr.* = ExtensionRunner.init(allocator, generation);
-    runner_ptr.cwd = cwd;
+    runner_ptr.cwd = resource_loader.cwd;
     runner_ptr.builtin_tool_definitions = if (has_custom_tools) &.{} else builtin_definitions;
     runner_ptr.attachLuaState(state_ptr);
     extension_api.installZiTable(state_ptr, runner_ptr);
@@ -553,6 +549,41 @@ fn collectGuidelines(
 }
 
 const testing = std.testing;
+
+test "system prompt is built from ResourceLoader-owned inputs" {
+    const allocator = testing.allocator;
+
+    var cwd_tmp = testing.tmpDir(.{});
+    defer cwd_tmp.cleanup();
+    const cwd = try cwd_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    var agent_tmp = testing.tmpDir(.{});
+    defer agent_tmp.cleanup();
+    const agent_dir = try agent_tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent_dir);
+
+    const context_files = [_]resources.types.AgentsFile{.{
+        .path = "AGENTS.md",
+        .content = "project guidance from loader",
+    }};
+    var resource_loader = try resources.ResourceLoader.init(allocator, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+        .system_prompt = "custom prompt from loader",
+        .append_system_prompt = "append prompt from loader",
+        .injected_agents_files = &context_files,
+    });
+    defer resource_loader.deinit();
+
+    const prompt = try buildSystemPrompt(allocator, resource_loader, &.{});
+    defer allocator.free(prompt);
+
+    try testing.expect(std.mem.indexOf(u8, prompt, "custom prompt from loader") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "append prompt from loader") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "project guidance from loader") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, cwd) != null);
+}
 
 const StreamCaptureProvider = struct {
     allocator: std.mem.Allocator,
