@@ -1317,6 +1317,44 @@ test "runtime host runs threshold compaction after successful turn when context 
     try testing.expect(!collector.compaction_ends.items[0].will_retry);
 }
 
+test "runtime host runs pre-prompt threshold compaction before sending next prompt" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    const response_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("ok")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &response_content, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    const session = try createOwnedTestAgentSession(allocator, &registry);
+    const prior_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("prior oversized context")};
+    var prior = faux.fauxAssistantMessage(allocator, &prior_content, .stop);
+    prior.usage.total_tokens = 112_000;
+    prior.usage.input = 112_000;
+    try session.agent.setMessages(&.{.{ .assistant = prior }});
+
+    var compaction_spy = CompactionSpy{ .allocator = allocator };
+    defer compaction_spy.deinit();
+
+    var host = try RuntimeHost.init(session, allocator, allocator, createTestCreateOptions(&registry), .{
+        .compaction_executor = .{
+            .func = &CompactionSpy.execute,
+            .ctx = @ptrCast(&compaction_spy),
+        },
+    });
+    defer host.deinit();
+
+    const outcome = try host.runUserContent(.{ .text = "continue" });
+
+    try testing.expectEqual(RunOutcome.success, outcome);
+    try testing.expectEqual(@as(usize, 1), compaction_spy.calls.items.len);
+    try testing.expectEqual(CompactionReason.threshold, compaction_spy.calls.items[0]);
+    try testing.expectEqual(@as(usize, 1), fp.call_count);
+}
+
 test "runtime host reports cancelled compaction as aborted without an error string" {
     const session = try createOwnedTestAgentSession(testing.allocator, null);
     var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{
