@@ -237,6 +237,7 @@ fn spawnResultToToolResult(allocator: std.mem.Allocator, spawn_result: spawn_typ
         lua_runtime.freeJsonValue(allocator, v);
     }
 
+    try out.put(try allocator.dupe(u8, "cancelled"), .{ .bool = spawn_result.cancelled });
     if (spawn_result.model) |m| try out.put(try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, m) });
     if (spawn_result.stop_reason) |sr| try out.put(try allocator.dupe(u8, "stop_reason"), .{ .string = try allocator.dupe(u8, sr) });
     if (spawn_result.error_message) |em| try out.put(try allocator.dupe(u8, "error_message"), .{ .string = try allocator.dupe(u8, em) });

@@ -1020,6 +1020,10 @@ pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.Agent
             _ = c.lua_pushlstring(L, v.string.ptr, v.string.len);
             c.lua_setfield(L, -2, "model");
         };
+        if (obj.get("cancelled")) |v| if (v == .bool) {
+            c.lua_pushboolean(L, if (v.bool) 1 else 0);
+            c.lua_setfield(L, -2, "cancelled");
+        };
         if (obj.get("usage")) |usage| {
             lua_runtime.pushJsonValue(L, usage) catch c.lua_createtable(L, 0, 0);
             c.lua_setfield(L, -2, "usage");
@@ -1047,8 +1051,10 @@ pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.Agent
     c.lua_setfield(L, -2, "final_text");
     _ = c.lua_pushlstring(L, "".ptr, 0);
     c.lua_setfield(L, -2, "stderr");
-    c.lua_pushboolean(L, if (result.is_error) 1 else 0);
-    c.lua_setfield(L, -2, "cancelled");
+    if (result.details != .object or result.details.object.get("cancelled") == null) {
+        c.lua_pushboolean(L, 0);
+        c.lua_setfield(L, -2, "cancelled");
+    }
 }
 
 fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
@@ -1075,6 +1081,9 @@ fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
 
     _ = c.lua_pushlstring(L, result.stderr_output.items.ptr, result.stderr_output.items.len);
     c.lua_setfield(L, -2, "stderr");
+
+    c.lua_pushboolean(L, if (result.cancelled) 1 else 0);
+    c.lua_setfield(L, -2, "cancelled");
 
     // usage subtable
     c.lua_createtable(L, 0, 7);
@@ -2446,6 +2455,7 @@ test "zi.spawn end-to-end: dispatches per-event callbacks via argv_override" {
         \\assert(count == 2, "expected 2 callbacks, got " .. tostring(count))
         \\assert(saw_text == "helo", "expected helo, got " .. tostring(saw_text))
         \\assert(r.exit_code == 0)
+        \\assert(r.cancelled == false)
         \\assert(r.final_text == "helo")
         \\assert(type(r.usage) == "table")
         \\assert(r.usage.turns == 2)
@@ -2516,6 +2526,7 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     var usage = std.json.ObjectMap.init(testing.allocator);
     try usage.put(try testing.allocator.dupe(u8, "input"), .{ .integer = 1 });
     var details = std.json.ObjectMap.init(testing.allocator);
+    try details.put(try testing.allocator.dupe(u8, "cancelled"), .{ .bool = true });
     try details.put(try testing.allocator.dupe(u8, "usage"), .{ .object = usage });
     const spawn_result: agent_protocol.AgentToolResult = .{ .content = blocks, .is_error = false, .details = .{ .object = details } };
     runner.current_spawn_result = .{ .result = spawn_result };
@@ -2534,6 +2545,9 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     try testing.expectEqual(lua_runtime.Coroutine.Status.finished, second.status);
     _ = c.lua_getfield(co.L, -1, "output");
     try testing.expectEqualStrings("child output", lstring(co.L, -1));
+    c.lua_pop(co.L, 1);
+    _ = c.lua_getfield(co.L, -1, "cancelled");
+    try testing.expect(c.lua_toboolean(co.L, -1) != 0);
     c.lua_pop(co.L, 1);
 }
 

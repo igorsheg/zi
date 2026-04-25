@@ -200,10 +200,18 @@ fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config:
         // call std.process.Child.kill here because that internally
         // waitpids and would race the main wait() at the end.
         if (config.signal) |sig| {
-            if (sig.isAborted()) break;
+            if (sig.isAborted()) {
+                result.cancelled = true;
+                break;
+            }
         }
 
-        const n = stdout_file.read(&read_buf) catch break;
+        const n = stdout_file.read(&read_buf) catch {
+            if (config.signal) |sig| {
+                if (sig.isAborted()) result.cancelled = true;
+            }
+            break;
+        };
         if (n == 0) break;
 
         var start: usize = 0;
@@ -226,6 +234,10 @@ fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config:
         if (start < n) {
             line_buf.appendSlice(allocator, read_buf[start..n]) catch {};
         }
+    }
+
+    if (config.signal) |sig| {
+        if (sig.isAborted()) result.cancelled = true;
     }
 
     // flush any trailing data without a final newline
@@ -652,6 +664,7 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
     // didn't sit through the 30s sleep.
     try testing.expect(elapsed_ms < 2000);
     try testing.expect(result.exit_code != 0);
+    try testing.expect(result.cancelled);
 }
 
 test "ziSpawn fires on_event for each parsed JSONL line via argv_override" {

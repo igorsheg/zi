@@ -107,6 +107,12 @@ pub const ExtensionRuntime = union(enum) {
 /// active slice swaps to generation N+1.
 pub const ExtensionRunnerRef = struct {
     current: ?*ExtensionRunner = null,
+
+    pub fn swap(self: *ExtensionRunnerRef, next: ?*ExtensionRunner) ?*ExtensionRunner {
+        const previous = self.current;
+        self.current = next;
+        return previous;
+    }
 };
 
 pub const SpawnRequest = struct {
@@ -628,6 +634,14 @@ pub const ExtensionRunner = struct {
 
     pub fn isBound(self: *const ExtensionRunner) bool {
         return self.runtime == .bound;
+    }
+
+    pub fn isReloadIdle(self: *const ExtensionRunner) bool {
+        return self.load_context == null and
+            self.execution_context == null and
+            self.current_signal == null and
+            self.current_update_callback == null and
+            self.current_spawn_request == null;
     }
 
     /// Dispatch an extension command by its visible invocation name.

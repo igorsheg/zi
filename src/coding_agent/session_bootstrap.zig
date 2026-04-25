@@ -21,11 +21,12 @@ const c = lua_runtime.c;
 
 pub const SessionStore = session_runtime.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
+pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 
 pub const StreamClosure = struct {
     registry: *ai.provider.Registry,
     auth_storage: ?*auth_storage_mod.AuthStorage,
-    extension_runner: ?*ExtensionRunner = null,
+    extension_runner_ref: *ExtensionRunnerRef,
     api_key: []const u8,
     max_tokens: ?u64,
 
@@ -64,7 +65,7 @@ pub const StreamClosure = struct {
                         if (active_claim.oauth_get_api_key_ref != null) {
                             if (auth_storage.get(provider_str)) |credential| switch (credential) {
                                 .oauth => |oauth_credential| {
-                                    if (self.extension_runner) |runner| {
+                                    if (self.extension_runner_ref.current) |runner| {
                                         if (runner.dispatchOAuthGetApiKey(provider_str, oauth_credential, allocator) catch null) |derived_key| {
                                             if (derived_key.len > 0) return derived_key;
                                         }
@@ -126,8 +127,104 @@ pub const PreparedDeps = struct {
     owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
     builtin_ctx: ?*builtin_util.BuiltinCtx = null,
     extension_runner: ?*ExtensionRunner = null,
+    extension_runner_ref: *ExtensionRunnerRef,
     extension_lua_state: ?*lua_runtime.LuaState = null,
 };
+
+pub const ExtensionSurface = struct {
+    system_prompt: []const u8,
+    tools: []const agent_mod.protocol.AgentTool,
+    builtin_ctx: ?*builtin_util.BuiltinCtx = null,
+    extension_runner: ?*ExtensionRunner = null,
+    extension_lua_state: ?*lua_runtime.LuaState = null,
+
+    pub fn deinit(self: *ExtensionSurface, allocator: std.mem.Allocator) void {
+        if (self.extension_runner) |runner| {
+            runner.deinit();
+            allocator.destroy(runner);
+            self.extension_runner = null;
+        }
+        if (self.extension_lua_state) |state| {
+            state.deinit();
+            allocator.destroy(state);
+            self.extension_lua_state = null;
+        }
+        if (self.system_prompt.len > 0) {
+            allocator.free(self.system_prompt);
+            self.system_prompt = "";
+        }
+        if (self.tools.len > 0) {
+            allocator.free(self.tools);
+            self.tools = &.{};
+        }
+        if (self.builtin_ctx) |ctx| {
+            allocator.destroy(ctx);
+            self.builtin_ctx = null;
+        }
+    }
+};
+
+pub const ReloadExtensionOptions = struct {
+    resource_loader: resources.ResourceLoader,
+    settings_manager: ?*settings_manager_mod.SettingsManager = null,
+    tools: ?[]const tool_def.ToolDefinition = null,
+    tool_allowlist: ?[]const []const u8 = null,
+    session_id: []const u8 = "",
+    extension_generation: extension_runner_mod.Generation,
+};
+
+const BuiltinDefinitions = struct {
+    definitions: []const tool_def.ToolDefinition,
+    ctx: ?*builtin_util.BuiltinCtx = null,
+    owns_definitions: bool = false,
+
+    fn takeCtx(self: *BuiltinDefinitions) ?*builtin_util.BuiltinCtx {
+        const ctx = self.ctx;
+        self.ctx = null;
+        return ctx;
+    }
+
+    fn deinitDefinitionsOnly(self: *BuiltinDefinitions, allocator: std.mem.Allocator) void {
+        if (self.owns_definitions and self.definitions.len > 0) {
+            allocator.free(@constCast(self.definitions));
+            self.definitions = &.{};
+            self.owns_definitions = false;
+        }
+    }
+
+    fn deinit(self: *BuiltinDefinitions, allocator: std.mem.Allocator) void {
+        self.deinitDefinitionsOnly(allocator);
+        if (self.ctx) |ctx| {
+            allocator.destroy(ctx);
+            self.ctx = null;
+        }
+    }
+};
+
+const BuiltinOptions = struct {
+    cwd: []const u8,
+    settings_manager: ?*settings_manager_mod.SettingsManager = null,
+    tools: ?[]const tool_def.ToolDefinition = null,
+    session_id: []const u8 = "",
+};
+
+fn buildBuiltinDefinitions(allocator: std.mem.Allocator, options: BuiltinOptions) !BuiltinDefinitions {
+    if (options.tools) |tools| return .{ .definitions = tools };
+
+    const image_auto_resize = if (options.settings_manager) |settings|
+        settings.getImageAutoResize()
+    else
+        true;
+    var bundle = try builtin_tools_mod.build(allocator, options.cwd, .{
+        .image_auto_resize = image_auto_resize,
+    });
+    bundle.ctx.session_id = options.session_id;
+    return .{
+        .definitions = bundle.definitions,
+        .ctx = bundle.ctx,
+        .owns_definitions = true,
+    };
+}
 
 pub const PrepareOptions = struct {
     api_key: []const u8 = "",
@@ -173,20 +270,14 @@ pub fn prepareSessionDeps(
         loader.deinit();
     }
 
-    const image_auto_resize = if (options.settings_manager) |settings|
-        settings.getImageAutoResize()
-    else
-        true;
-
-    var builtin_ctx: ?*builtin_util.BuiltinCtx = null;
-    const builtin_definitions = options.tools orelse blk: {
-        var bundle = builtin_tools_mod.build(allocator, options.cwd, .{
-            .image_auto_resize = image_auto_resize,
-        }) catch break :blk @as([]const tool_def.ToolDefinition, &.{});
-        bundle.ctx.session_id = session_store.sessionId();
-        builtin_ctx = bundle.ctx;
-        break :blk @as([]const tool_def.ToolDefinition, bundle.definitions);
-    };
+    var builtins = try buildBuiltinDefinitions(allocator, .{
+        .cwd = options.cwd,
+        .settings_manager = options.settings_manager,
+        .tools = options.tools,
+        .session_id = session_store.sessionId(),
+    });
+    errdefer builtins.deinit(allocator);
+    defer builtins.deinitDefinitionsOnly(allocator);
 
     var owned_provider_bundle: ?*ai.provider_defaults.Bundle = null;
     const registry: *ai.provider.Registry = options.registry orelse blk: {
@@ -196,12 +287,16 @@ pub fn prepareSessionDeps(
     };
     errdefer if (owned_provider_bundle) |bundle| bundle.deinit();
 
+    const extension_runner_ref = try allocator.create(ExtensionRunnerRef);
+    errdefer allocator.destroy(extension_runner_ref);
+    extension_runner_ref.* = .{};
+
     const stream_closure = try allocator.create(StreamClosure);
     errdefer allocator.destroy(stream_closure);
     stream_closure.* = .{
         .registry = registry,
         .auth_storage = options.auth_storage,
-        .extension_runner = null,
+        .extension_runner_ref = extension_runner_ref,
         .api_key = options.api_key,
         .max_tokens = options.max_tokens,
     };
@@ -209,22 +304,22 @@ pub fn prepareSessionDeps(
     var extension_runtime = try buildExtensionRuntime(
         allocator,
         resource_loader,
-        builtin_definitions,
+        builtins.definitions,
         options.tools != null,
         options.extension_generation,
     );
     errdefer extension_runtime.deinit(allocator);
 
-    stream_closure.extension_runner = extension_runtime.runner;
+    _ = extension_runner_ref.swap(extension_runtime.runner);
+    errdefer _ = extension_runner_ref.swap(null);
 
     const definitions = if (extension_runtime.runner) |runner|
         runner.tool_registry.items()
     else
-        builtin_definitions;
+        builtins.definitions;
 
     const filtered = try filterToolDefinitions(allocator, definitions, options.tool_allowlist);
     defer filtered.deinit(allocator);
-    defer if (options.tools == null and builtin_ctx != null) allocator.free(@constCast(builtin_definitions));
 
     const tools = try buildAgentTools(allocator, filtered.items, extension_runtime.runner);
     errdefer allocator.free(tools);
@@ -243,7 +338,57 @@ pub fn prepareSessionDeps(
         .system_prompt = system_prompt,
         .tools = tools,
         .owned_provider_bundle = owned_provider_bundle,
-        .builtin_ctx = builtin_ctx,
+        .builtin_ctx = builtins.takeCtx(),
+        .extension_runner = extension_runtime.takeRunner(),
+        .extension_runner_ref = extension_runner_ref,
+        .extension_lua_state = extension_runtime.takeLuaState(),
+    };
+}
+
+pub fn prepareExtensionSurface(
+    allocator: std.mem.Allocator,
+    options: ReloadExtensionOptions,
+) !ExtensionSurface {
+    var builtins = try buildBuiltinDefinitions(allocator, .{
+        .cwd = options.resource_loader.cwd,
+        .settings_manager = options.settings_manager,
+        .tools = options.tools,
+        .session_id = options.session_id,
+    });
+    errdefer builtins.deinit(allocator);
+    defer builtins.deinitDefinitionsOnly(allocator);
+
+    var extension_runtime = try buildExtensionRuntime(
+        allocator,
+        options.resource_loader,
+        builtins.definitions,
+        options.tools != null,
+        options.extension_generation,
+    );
+    errdefer extension_runtime.deinit(allocator);
+
+    const definitions = if (extension_runtime.runner) |runner|
+        runner.tool_registry.items()
+    else
+        builtins.definitions;
+
+    const filtered = try filterToolDefinitions(allocator, definitions, options.tool_allowlist);
+    defer filtered.deinit(allocator);
+
+    const tools = try buildAgentTools(allocator, filtered.items, extension_runtime.runner);
+    errdefer allocator.free(tools);
+
+    const system_prompt = try buildSystemPrompt(
+        allocator,
+        options.resource_loader,
+        filtered.items,
+    );
+    errdefer allocator.free(system_prompt);
+
+    return .{
+        .system_prompt = system_prompt,
+        .tools = tools,
+        .builtin_ctx = builtins.takeCtx(),
         .extension_runner = extension_runtime.takeRunner(),
         .extension_lua_state = extension_runtime.takeLuaState(),
     };
@@ -797,10 +942,11 @@ test "stream closure derives request api key from oauth.getApiKey when the activ
         .extras = std.json.ObjectMap.init(testing.allocator),
     } });
 
+    var runner_ref: ExtensionRunnerRef = .{ .current = &runner };
     var closure: StreamClosure = .{
         .registry = &registry,
         .auth_storage = &auth,
-        .extension_runner = &runner,
+        .extension_runner_ref = &runner_ref,
         .api_key = "session-fallback",
         .max_tokens = null,
     };
@@ -829,6 +975,20 @@ test "stream closure derives request api key from oauth.getApiKey when the activ
     );
 
     try testing.expectEqualStrings("access-token-derived", capture.last_api_key.?);
+
+    runner_ref.current = null;
+    capture.clearCaptured();
+    StreamClosure.streamFn(
+        @ptrCast(&closure),
+        testing.allocator,
+        model,
+        .{ .messages = &.{} },
+        .{ .base = .{} },
+        &noopProviderEvent,
+        null,
+    );
+
+    try testing.expectEqualStrings("access-token", capture.last_api_key.?);
 }
 
 test "stream closure resolves claim api_key and layers provider headers before request headers" {
@@ -862,10 +1022,11 @@ test "stream closure resolves claim api_key and layers provider headers before r
         .generation = 1,
     }));
 
+    var runner_ref: ExtensionRunnerRef = .{};
     var closure: StreamClosure = .{
         .registry = &registry,
         .auth_storage = null,
-        .extension_runner = null,
+        .extension_runner_ref = &runner_ref,
         .api_key = "session-fallback",
         .max_tokens = null,
     };

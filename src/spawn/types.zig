@@ -38,6 +38,7 @@ pub const SpawnResult = struct {
     output: std.ArrayList(u8),
     stderr_output: std.ArrayList(u8),
     usage: UsageStats = .{},
+    cancelled: bool = false,
     model: ?[]const u8 = null,
     stop_reason: ?[]const u8 = null,
     error_message: ?[]const u8 = null,

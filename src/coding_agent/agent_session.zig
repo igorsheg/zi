@@ -64,6 +64,7 @@ pub const AgentSession = struct {
     /// the agent so any final event observers can still fire against
     /// a live session.
     _extension_runner: ?*ExtensionRunner = null,
+    _extension_runner_ref: *ExtensionRunnerRef,
 
     /// Owned Lua state, paired 1:1 with `_extension_runner`. The
     /// runner BORROWS this — see `extensions/runner.zig` field doc.
@@ -144,6 +145,7 @@ pub const AgentSession = struct {
 
     pub const PreparedDeps = session_bootstrap.PreparedDeps;
     pub const StreamClosure = session_bootstrap.StreamClosure;
+    pub const ExtensionSurface = session_bootstrap.ExtensionSurface;
 
     pub const Options = struct {
         model: ai.protocol.Model,
@@ -163,14 +165,14 @@ pub const AgentSession = struct {
             .ctx = @ptrCast(prepared.stream_closure),
         };
 
-        const before_tool_hook: ?protocol.BeforeToolCallHook = if (prepared.extension_runner) |runner| .{
-            .func = &event_bridge.beforeToolCall,
-            .ctx = @ptrCast(runner),
-        } else null;
-        const after_tool_hook: ?protocol.AfterToolCallHook = if (prepared.extension_runner) |runner| .{
-            .func = &event_bridge.afterToolCall,
-            .ctx = @ptrCast(runner),
-        } else null;
+        const before_tool_hook: ?protocol.BeforeToolCallHook = .{
+            .func = &beforeToolCallFromRunnerRef,
+            .ctx = @ptrCast(prepared.extension_runner_ref),
+        };
+        const after_tool_hook: ?protocol.AfterToolCallHook = .{
+            .func = &afterToolCallFromRunnerRef,
+            .ctx = @ptrCast(prepared.extension_runner_ref),
+        };
 
         const agent = Agent.init(allocator, .{
             .system_prompt = prepared.system_prompt,
@@ -206,6 +208,7 @@ pub const AgentSession = struct {
             ._builtin_ctx = prepared.builtin_ctx,
             .context_usage_unknown_after_compaction = context_usage_unknown_after_compaction,
             ._extension_runner = prepared.extension_runner,
+            ._extension_runner_ref = prepared.extension_runner_ref,
             ._extension_lua_state = prepared.extension_lua_state,
         };
     }
@@ -533,6 +536,7 @@ pub const AgentSession = struct {
         self.deactivateLifecycle();
         self.destroyExtensionRuntime();
         self.allocator.destroy(self._stream_closure);
+        self.allocator.destroy(self._extension_runner_ref);
         self.agent_event_listeners.deinit(self.allocator);
         self.session_event_listeners.deinit(self.allocator);
         self.agent.deinit();
@@ -628,10 +632,10 @@ pub const AgentSession = struct {
             self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
         }
         if (self._extension_subscription_token == null) {
-            if (self._extension_runner) |runner| {
+            if (self._extension_runner != null) {
                 self._extension_subscription_token = self.agent.subscribe(
-                    &event_bridge.agentEventSink,
-                    @ptrCast(runner),
+                    &agentEventSinkFromRunnerRef,
+                    @ptrCast(self._extension_runner_ref),
                 );
             }
         }
@@ -653,6 +657,10 @@ pub const AgentSession = struct {
 
     fn bindExtensionRuntime(self: *AgentSession) void {
         const runner = self._extension_runner orelse return;
+        self.bindExtensionRuntimeFor(runner);
+    }
+
+    fn bindExtensionRuntimeFor(self: *AgentSession, runner: *ExtensionRunner) void {
         if (runner.isBound()) return;
 
         runner.bindRuntime(.{
@@ -677,8 +685,40 @@ pub const AgentSession = struct {
         }
     }
 
+    pub fn replaceExtensionSurfaceOnAgentThread(self: *AgentSession, next: ExtensionSurface) !void {
+        if (self.agent.isStreaming() or self.agent.hasQueuedMessages()) return error.SessionBusy;
+        if (self._extension_runner) |runner| {
+            if (!runner.isReloadIdle()) return error.SessionBusy;
+        }
+
+        var replacement = next;
+        errdefer replacement.deinit(self.allocator);
+        if (replacement.extension_runner) |runner| self.bindExtensionRuntimeFor(runner);
+
+        var old: ExtensionSurface = .{
+            .system_prompt = self._owned_system_prompt,
+            .tools = self.tools,
+            .builtin_ctx = self._builtin_ctx,
+            .extension_runner = self._extension_runner,
+            .extension_lua_state = self._extension_lua_state,
+        };
+
+        _ = self._extension_runner_ref.swap(replacement.extension_runner);
+        self._extension_runner = replacement.extension_runner;
+        self._extension_lua_state = replacement.extension_lua_state;
+        self.tools = replacement.tools;
+        self._owned_system_prompt = replacement.system_prompt;
+        self._builtin_ctx = replacement.builtin_ctx;
+        self.agent.replaceRuntimeInputs(replacement.system_prompt, replacement.tools);
+
+        replacement = .{ .system_prompt = "", .tools = &.{} };
+        if (old.extension_runner) |runner| runner.unbindRuntime();
+        old.deinit(self.allocator);
+    }
+
     fn destroyExtensionRuntime(self: *AgentSession) void {
         if (self._extension_runner) |runner| {
+            _ = self._extension_runner_ref.swap(null);
             runner.deinit();
             self.allocator.destroy(runner);
             self._extension_runner = null;
@@ -688,6 +728,32 @@ pub const AgentSession = struct {
             self.allocator.destroy(state);
             self._extension_lua_state = null;
         }
+    }
+
+    fn agentEventSinkFromRunnerRef(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
+        const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
+        const runner = ref.current orelse return;
+        event_bridge.agentEventSink(event, @ptrCast(runner));
+    }
+
+    fn beforeToolCallFromRunnerRef(
+        ctx_arg: protocol.BeforeToolCallContext,
+        signal: @import("../abort_signal.zig").AbortSignal,
+        ctx: ?*anyopaque,
+    ) ?protocol.BeforeToolCallResult {
+        const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
+        const runner = ref.current orelse return null;
+        return event_bridge.beforeToolCall(ctx_arg, signal, @ptrCast(runner));
+    }
+
+    fn afterToolCallFromRunnerRef(
+        ctx_arg: protocol.AfterToolCallContext,
+        signal: @import("../abort_signal.zig").AbortSignal,
+        ctx: ?*anyopaque,
+    ) ?protocol.AfterToolCallResult {
+        const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
+        const runner = ref.current orelse return null;
+        return event_bridge.afterToolCall(ctx_arg, signal, @ptrCast(runner));
     }
 
     fn runtimeGetModel(session_ptr: *anyopaque) protocol.Model {
@@ -824,7 +890,7 @@ pub const AgentSession = struct {
     /// dispatch. Returns null in modes without extensions or
     /// when the runner failed to initialize.
     pub fn extensionRunner(self: *AgentSession) ?*ExtensionRunner {
-        return self._extension_runner;
+        return self._extension_runner_ref.current;
     }
 
     pub fn sessionFlushed(self: *const AgentSession) bool {
@@ -1398,15 +1464,13 @@ fn createTestResourceLoaderWithAgentDir(
     }) catch @panic("OOM");
 }
 
-fn createAgentDirWithReadOverride(
+fn writeReadOverrideExtension(
     allocator: std.mem.Allocator,
     tmp: *std.testing.TmpDir,
     snippet: []const u8,
     guideline: []const u8,
     result_text: []const u8,
-) ![]const u8 {
-    try tmp.dir.makeDir("extensions");
-
+) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
@@ -1437,6 +1501,17 @@ fn createAgentDirWithReadOverride(
     const src = try out.toOwnedSlice();
     defer allocator.free(src);
     try tmp.dir.writeFile(.{ .sub_path = "extensions/read.lua", .data = src });
+}
+
+fn createAgentDirWithReadOverride(
+    allocator: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    snippet: []const u8,
+    guideline: []const u8,
+    result_text: []const u8,
+) ![]const u8 {
+    try tmp.dir.makeDir("extensions");
+    try writeReadOverrideExtension(allocator, tmp, snippet, guideline, result_text);
     return tmp.dir.realpathAlloc(allocator, ".");
 }
 
@@ -1865,6 +1940,63 @@ test "AgentSession: final prompt metadata comes from the winning tool definition
     try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Winning read guideline") != null);
     try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Read file contents") == null);
     try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Use read to examine files instead of cat or sed.") == null);
+}
+
+test "AgentSession: extension surface swap publishes the next runner generation" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const agent_dir = try createAgentDirWithReadOverride(
+        allocator,
+        &tmp,
+        "Reload v1 snippet",
+        "Reload v1 guideline",
+        "reload v1 result",
+    );
+    defer allocator.free(agent_dir);
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    var ca = AgentSession.initTestSession(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoaderWithAgentDir(allocator, "/tmp/zi-test", agent_dir),
+        .registry = &registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+
+    const initial_runner = ca.extensionRunner() orelse return error.MissingExtensionRunner;
+    try testing.expectEqual(@as(extension_runner_mod.Generation, 0), initial_runner.generation);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Reload v1 snippet") != null);
+
+    try writeReadOverrideExtension(
+        allocator,
+        &tmp,
+        "Reload v2 snippet",
+        "Reload v2 guideline",
+        "reload v2 result",
+    );
+    try ca.resource_loader.reload();
+    const next = try session_bootstrap.prepareExtensionSurface(allocator, .{
+        .resource_loader = ca.resource_loader,
+        .session_id = ca.session_store.sessionId(),
+        .extension_generation = 1,
+    });
+    try ca.replaceExtensionSurfaceOnAgentThread(next);
+
+    const swapped_runner = ca.extensionRunner() orelse return error.MissingExtensionRunner;
+    try testing.expectEqual(@as(extension_runner_mod.Generation, 1), swapped_runner.generation);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Reload v2 snippet") != null);
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Reload v1 snippet") == null);
 }
 
 // pi-mono test-harness.test.ts: "simple text response"

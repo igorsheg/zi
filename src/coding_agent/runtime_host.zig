@@ -17,6 +17,7 @@ const session_event_mod = @import("session_event.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const request_mod = @import("request.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
+const session_bootstrap = @import("session_bootstrap.zig");
 const profile = @import("../debug/profile.zig");
 
 pub const QueueKind = control_mod.QueueKind;
@@ -152,6 +153,24 @@ pub const RuntimeHost = struct {
     pub fn dispatchExtensionCommand(self: *RuntimeHost, name: []const u8, args: []const u8) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchCommand(name, args);
+    }
+
+    pub fn reloadExtensionsOnAgentThread(self: *RuntimeHost) !void {
+        if (self.session.agent.isStreaming() or self.session.agent.hasQueuedMessages()) return error.SessionBusy;
+        if (self.session.extensionRunner()) |runner| {
+            if (!runner.isReloadIdle()) return error.SessionBusy;
+        }
+
+        try self.session.resource_loader.reload();
+        const next = try session_bootstrap.prepareExtensionSurface(self.session_allocator, .{
+            .resource_loader = self.session.resource_loader,
+            .settings_manager = self.create_options.settings_manager,
+            .tools = self.create_options.tools,
+            .tool_allowlist = self.create_options.tool_allowlist,
+            .session_id = self.session.session_store.sessionId(),
+            .extension_generation = self.reserveExtensionGeneration(),
+        });
+        try self.session.replaceExtensionSurfaceOnAgentThread(next);
     }
 
     pub fn dispatchExtensionOAuthLogin(self: *RuntimeHost, provider_id: []const u8, callbacks: request_mod.ExtensionOAuthLoginCallbacks) !request_mod.ExtensionOAuthLoginResponse.Result {

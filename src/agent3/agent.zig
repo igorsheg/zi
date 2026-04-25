@@ -314,6 +314,11 @@ pub const Agent = struct {
         self.thinking_level = thinking_level;
     }
 
+    pub fn replaceRuntimeInputs(self: *Agent, system_prompt: []const u8, tools: []const protocol.AgentTool) void {
+        self.system_prompt = system_prompt;
+        self.tools = tools;
+    }
+
     pub fn clearError(self: *Agent) void {
         self.error_message = null;
     }
