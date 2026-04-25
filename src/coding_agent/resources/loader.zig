@@ -1125,7 +1125,9 @@ fn loadThemeFromFile(
     defer allocator.free(bytes);
 
     const loaded = theme_json.loadFromSlice(allocator, bytes) catch |err| {
-        try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to parse theme file: {s}", .{@errorName(err)}), path));
+        const detail = theme_json.formatLoadError(allocator, bytes, err) catch try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+        defer allocator.free(detail);
+        try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to parse theme file: {s}", .{detail}), path));
         return;
     };
     defer loaded.deinit(allocator);
