@@ -70,7 +70,7 @@ current event registry tags cover lifecycle, tool, session start/shutdown/switch
 | --- | --- | --- | --- | --- |
 | `hello.ts` | minimal custom tool | partial | `zi.register_tool` with lua execute and schema | add runnable zi example + boundary test. |
 | `todo.ts` | custom tool + command + persisted state + custom rendering + command output UI | shipped | `examples/extensions/todo.lua` ships tool, command registration, branch-replayed `ctx.state` persistence, tool-result details, `render_result`, and `/todos` host-owned command panel output via `ctx.ui.show_panel` | closed in `zi-rep0.4`. |
-| `tool-override.ts` | override builtin tools while preserving behavior/rendering where desired | partial | first-claimant tool registry plus builtin-family renderer inheritance | add example/test proving override precedence + inherited/fallback rendering. |
+| `tool-override.ts` | override builtin tools while preserving behavior/rendering where desired | shipped | `examples/extensions/tool_override.lua` overrides `read`; first-claimant registry keeps the extension definition when builtin `read` arrives later, and same-name builtin renderer fallback remains available when no `render_result` is supplied | closed in `zi-us3x`. |
 | `built-in-tool-renderer.ts`, `minimal-mode.ts` | override builtin tool rendering | blocked | host-owned tool renderer registry / renderer refs | `zi-0j8`. |
 | `truncated-tool.ts` | custom tool with output truncation policy | partial | custom tool plus helper/pattern for bounded output | add example once tool result rendering is stable. |
 | `dynamic-tools.ts` | register tools during lifecycle/runtime | partial | runtime-safe registration after bind, generation-owned registry update, prompt metadata refresh | verify live tool-list refresh on top of closed `zi-gxr`. |
@@ -118,7 +118,7 @@ current event registry tags cover lifecycle, tool, session start/shutdown/switch
 
 1. **foundation:** generation/reload (`zi-gxr`) and all-event reservation (`zi-xb8`) are closed; next foundation gaps are provider queue (`zi-c7v`) and flag registry (`zi-bbq`) when their vertical slices need them.
 2. **first vertical slice:** `todo.ts` parity is closed by `zi-rep0.4`: `examples/extensions/todo.lua` uses host-owned command panel output on top of the shipped tool, renderer, and branch-replayed `ctx.state` persistence.
-3. **tool surface:** finish builtin override/rendering semantics, including `built-in-tool-renderer.ts`, `minimal-mode.ts`, and `tool-override.ts` equivalents.
+3. **tool surface:** `tool-override.ts` equivalent is shipped; remaining work is custom builtin renderer replacement/minimal-mode semantics, including `built-in-tool-renderer.ts` and `minimal-mode.ts` equivalents.
 4. **command/config surface:** finish commands, flags, shortcuts, command actions, and editor-buffer actions.
 5. **event/interceptor surface:** ship `input`, `context`, `before_provider_request`, `resources_discover`, `user_bash`, session gates, and compaction/tree hooks.
 6. **retained ui primitives:** prompts, notifications, status, widgets, header/footer, title, editor modal, and overlays as host-owned records.

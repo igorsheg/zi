@@ -36,6 +36,10 @@ const extension_ui = @import("ui.zig");
 const request_mod = @import("../request.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
+const builtins_mod = @import("../tools/builtins.zig");
+const tool_def = @import("../tools/definition.zig");
+const tool_display = @import("../../tui/tool_display.zig");
+const builtin_renderers = @import("../../tui/renderers/builtins.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_tool);
@@ -601,19 +605,168 @@ test "lua tool ctx exposes binding from tool provenance" {
     try testing.expectEqualStrings("/workspace/.zi/sessions/session-123.jsonl", result.details.object.get("session_file").?.string);
 }
 
-fn loadTodoExample(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) !void {
+fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) !void {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
 
-    const src = try std.fs.cwd().readFileAlloc(testing.allocator, "examples/extensions/todo.lua", 64 * 1024);
-    defer testing.allocator.free(src);
-    try state.loadChunk(src, "todo.lua");
-    if (c.lua_pcallk(state.L, 0, 1, 0, 0, null) != c.LUA_OK) return error.LuaRuntime;
-    if (c.lua_type(state.L, -1) != c.LUA_TFUNCTION) return error.LuaRuntime;
-    _ = c.lua_getglobal(state.L, "zi");
-    if (c.lua_pcallk(state.L, 1, 0, 0, 0, null) != c.LUA_OK) return error.LuaRuntime;
+    try state.doString(
+        \\local todos = {}
+        \\local next_id = 1
+        \\
+        \\local function clone_todos()
+        \\  local out = {}
+        \\  for i, todo in ipairs(todos) do
+        \\    out[i] = { id = todo.id, text = todo.text, done = todo.done }
+        \\  end
+        \\  return out
+        \\end
+        \\
+        \\local function hydrate(ctx)
+        \\  if not ctx or not ctx.state then return end
+        \\  local saved = ctx.state.get("todos")
+        \\  if type(saved) == "table" then
+        \\    todos = saved.todos or {}
+        \\    next_id = saved.nextId or 1
+        \\  end
+        \\end
+        \\
+        \\local function persist(ctx)
+        \\  if ctx and ctx.state then
+        \\    ctx.state.set("todos", { todos = clone_todos(), nextId = next_id })
+        \\  end
+        \\end
+        \\
+        \\local function list_text()
+        \\  if #todos == 0 then return "No todos" end
+        \\  local lines = {}
+        \\  for i, todo in ipairs(todos) do
+        \\    lines[i] = string.format("[%s] #%d: %s", todo.done and "x" or " ", todo.id, todo.text)
+        \\  end
+        \\  return table.concat(lines, "\n")
+        \\end
+        \\
+        \\local function todo_lines()
+        \\  if #todos == 0 then return { { { text = "No todos", fg = "muted", dim = true } } } end
+        \\  local lines = { { { text = tostring(#todos) .. " todo(s):", fg = "muted" } } }
+        \\  for _, todo in ipairs(todos) do
+        \\    lines[#lines + 1] = {
+        \\      { text = todo.done and "✓ " or "○ ", fg = todo.done and "success" or "muted" },
+        \\      { text = "#" .. tostring(todo.id) .. " ", fg = "accent" },
+        \\      { text = todo.text, fg = todo.done and "muted" or "text", dim = todo.done },
+        \\    }
+        \\  end
+        \\  return lines
+        \\end
+        \\
+        \\local function details(action, err)
+        \\  return { action = action, todos = clone_todos(), nextId = next_id, error = err }
+        \\end
+        \\
+        \\local function find_todo(id)
+        \\  for _, todo in ipairs(todos) do
+        \\    if todo.id == id then return todo end
+        \\  end
+        \\  return nil
+        \\end
+        \\
+        \\zi.register_tool({
+        \\  name = "todo",
+        \\  label = "Todo",
+        \\  description = "Manage a todo list",
+        \\  parameters = {
+        \\    type = "object",
+        \\    properties = {
+        \\      action = { type = "string", enum = { "list", "add", "toggle", "clear" } },
+        \\      text = { type = "string" },
+        \\      id = { type = "number" },
+        \\    },
+        \\    required = { "action" },
+        \\  },
+        \\  execute = function(params, ctx)
+        \\    hydrate(ctx)
+        \\    local action = params.action
+        \\    if action == "list" then
+        \\      return { content = { { type = "text", text = list_text() } }, details = details("list") }
+        \\    end
+        \\    if action == "add" then
+        \\      local todo = { id = next_id, text = params.text, done = false }
+        \\      next_id = next_id + 1
+        \\      todos[#todos + 1] = todo
+        \\      persist(ctx)
+        \\      return { content = { { type = "text", text = string.format("Added todo #%d: %s", todo.id, todo.text) } }, details = details("add") }
+        \\    end
+        \\    if action == "toggle" then
+        \\      local todo = find_todo(params.id)
+        \\      todo.done = not todo.done
+        \\      persist(ctx)
+        \\      return { content = { { type = "text", text = string.format("Todo #%d %s", todo.id, todo.done and "completed" or "uncompleted") } }, details = details("toggle") }
+        \\    end
+        \\    return { content = { { type = "text", text = "Unknown action" } }, is_error = true, details = details("list", "unknown action") }
+        \\  end,
+        \\  render_result = function(result, ctx)
+        \\    local d = result.details
+        \\    if d.action == "list" then
+        \\      if #d.todos == 0 then return { lines = { { { text = "No todos", fg = "muted", dim = true } } } } end
+        \\      local lines = { { { text = tostring(#d.todos) .. " todo(s):", fg = "muted" } } }
+        \\      local limit = ctx.expanded and #d.todos or math.min(#d.todos, 5)
+        \\      for i = 1, limit do
+        \\        local todo = d.todos[i]
+        \\        lines[#lines + 1] = {
+        \\          { text = todo.done and "✓ " or "○ ", fg = todo.done and "success" or "muted" },
+        \\          { text = "#" .. tostring(todo.id) .. " ", fg = "accent" },
+        \\          { text = todo.text, fg = todo.done and "muted" or "text", dim = todo.done },
+        \\        }
+        \\      end
+        \\      return { lines = lines }
+        \\    end
+        \\    local text = result.content and result.content[1] and result.content[1].text or ""
+        \\    return { lines = { { { text = "✓ ", fg = "success" }, { text = text, fg = "muted" } } } }
+        \\  end,
+        \\})
+        \\
+        \\zi.on("session_start", function(_, ctx) hydrate(ctx) end)
+        \\zi.on("session_tree", function(_, ctx) hydrate(ctx) end)
+        \\
+        \\zi.register_command({
+        \\  name = "todos",
+        \\  description = "Show todos",
+        \\  handler = function(_, ctx)
+        \\    hydrate(ctx)
+        \\    ctx.ui.show_panel({ id = "todos", title = "Todos", lines = todo_lines(), transient = true })
+        \\  end,
+        \\})
+    , "todo-fixture");
     try testing.expect(runner.tool_registry.get("todo") != null);
     try testing.expect(runner.command_registry.getByVisibleName("todos") != null);
+}
+
+fn loadToolOverrideFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) !void {
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+
+    try state.doString(
+        \\zi.register_tool({
+        \\  name = "read",
+        \\  label = "read (audited)",
+        \\  description = "override read",
+        \\  parameters = {
+        \\    type = "object",
+        \\    properties = { path = { type = "string" } },
+        \\    required = { "path" },
+        \\  },
+        \\  execute = function(params)
+        \\    if params.path == ".env" then
+        \\      return {
+        \\        content = { { type = "text", text = "Access denied: .env" } },
+        \\        is_error = true,
+        \\        details = { blocked = true },
+        \\      }
+        \\    end
+        \\    return { content = { { type = "text", text = "ok" } }, details = { blocked = false } }
+        \\  end,
+        \\})
+    , "tool-override-fixture");
+    try testing.expect(runner.tool_registry.get("read") != null);
 }
 
 fn todoArgs(allocator: std.mem.Allocator, action: []const u8, text: ?[]const u8, id: ?i64) !std.json.Value {
@@ -625,7 +778,7 @@ fn todoArgs(allocator: std.mem.Allocator, action: []const u8, text: ?[]const u8,
     return .{ .object = obj };
 }
 
-test "todo example registers a tool, command, details, and renderer" {
+test "tool override example keeps extension read while preserving builtin renderer fallback" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -635,7 +788,59 @@ test "todo example registers a tool, command, details, and renderer" {
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
     api.installZiTable(&state, &runner);
 
-    try loadTodoExample(&state, &runner);
+    try loadToolOverrideFixture(&state, &runner);
+
+    const override = runner.tool_registry.get("read") orelse return error.MissingOverride;
+    try testing.expectEqualStrings("project", override.source.kind);
+    try testing.expect(override.impl == .lua);
+    try testing.expect(override.render_result_ref == null);
+
+    var builtins = try builtins_mod.build(testing.allocator, ".", .{});
+    defer builtins.deinit();
+    var read_builtin: ?tool_def.ToolDefinition = null;
+    for (builtins.definitions) |definition| {
+        if (std.mem.eql(u8, definition.name, "read")) {
+            read_builtin = try tool_def.cloneOwned(testing.allocator, definition);
+            break;
+        }
+    }
+    var cloned_builtin = read_builtin orelse return error.MissingReadBuiltin;
+    defer tool_def.freeOwned(testing.allocator, &cloned_builtin);
+    try testing.expect(!(try runner.tool_registry.register(cloned_builtin)));
+
+    const static_entries: []const tool_display.Registration = &.{
+        .{ .tool_name = "read", .renderer = builtin_renderers.read_renderer },
+    };
+    const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
+    const renderer = resolver.resolve("read");
+    try testing.expect(renderer.render_call != null);
+    try testing.expect(renderer.render_result_slice != null);
+
+    const ext_tool = override.*;
+    const agent_tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var args_obj = std.json.ObjectMap.init(allocator);
+    try args_obj.put("path", .{ .string = ".env" });
+    const result = agent_tool.execute(agent_tool.ctx, allocator, "read-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(result.is_error);
+    try testing.expectEqualStrings("Access denied: .env", result.content[0].text.text);
+    try testing.expect(result.details.object.get("blocked").?.bool);
+}
+
+test "todo fixture registers a tool, command, details, and renderer" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    api.installZiTable(&state, &runner);
+
+    try loadTodoFixture(&state, &runner);
 
     const ext_tool = runner.tool_registry.get("todo").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
@@ -1085,7 +1290,7 @@ test "todo command publishes hydrated todos as a host-owned panel" {
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
     api.installZiTable(&state, &runner);
-    try loadTodoExample(&state, &runner);
+    try loadTodoFixture(&state, &runner);
 
     const ext_tool = runner.tool_registry.get("todo").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
@@ -1107,7 +1312,7 @@ test "todo command publishes hydrated todos as a host-owned panel" {
     try testing.expectEqualStrings("ship panel", panel.lines[1][2].text);
 }
 
-test "todo example rehydrates from session state across extension generations" {
+test "todo fixture rehydrates from session state across extension generations" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1122,7 +1327,7 @@ test "todo example rehydrates from session state across extension generations" {
         defer provider_registry.deinit();
         try bindTestRuntime(&runner, &store, &provider_registry);
         api.installZiTable(&state, &runner);
-        try loadTodoExample(&state, &runner);
+        try loadTodoFixture(&state, &runner);
 
         const ext_tool = runner.tool_registry.get("todo").?.*;
         const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
@@ -1146,7 +1351,7 @@ test "todo example rehydrates from session state across extension generations" {
         defer provider_registry.deinit();
         try bindTestRuntime(&runner, &store, &provider_registry);
         api.installZiTable(&state, &runner);
-        try loadTodoExample(&state, &runner);
+        try loadTodoFixture(&state, &runner);
 
         const ext_tool = runner.tool_registry.get("todo").?.*;
         const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
