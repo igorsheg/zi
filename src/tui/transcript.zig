@@ -861,6 +861,34 @@ pub const ToolExecution = struct {
     }
 };
 
+test "tool execution renderSlice starts inside a wrapped tool result" {
+    var buffer = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
+    defer buffer.deinit();
+
+    const content = try testing.allocator.alloc(AgentToolResult.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(u8, "abcdef\nXYZ\n") } };
+    var tool = ToolExecution{
+        .allocator = testing.allocator,
+        .theme = themes_builtin.dark(),
+        .expanded = true,
+        .model = .{
+            .tool_call_id = try testing.allocator.dupe(u8, "call-1"),
+            .tool_name = try testing.allocator.dupe(u8, "bash"),
+            .result = .{ .content = content },
+            .is_partial = false,
+            .execution_started = true,
+            .args_complete = true,
+        },
+    };
+    defer tool.model.deinit(testing.allocator);
+
+    tool.renderSlice(buffer.region(), 3);
+
+    try testing.expectEqual(@as(u21, 'e'), buffer.get(1, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'f'), buffer.get(2, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'X'), buffer.get(1, 1).grapheme.codepoint);
+}
+
 // ── Markdown wrapper deinit ───────────────────────────────────────
 
 fn deinitMarkdown(ctx: *anyopaque, allocator: std.mem.Allocator) void {
