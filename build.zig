@@ -52,14 +52,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const lua_c_sources = [_][]const u8{
-        "src/lapi.c",     "src/lauxlib.c", "src/lbaselib.c", "src/lcode.c",
-        "src/lcorolib.c", "src/lctype.c",  "src/ldblib.c",   "src/ldebug.c",
-        "src/ldo.c",      "src/ldump.c",   "src/lfunc.c",    "src/lgc.c",
-        "src/linit.c",    "src/liolib.c",  "src/llex.c",     "src/lmathlib.c",
-        "src/lmem.c",     "src/loadlib.c", "src/lobject.c",  "src/lopcodes.c",
-        "src/loslib.c",   "src/lparser.c", "src/lstate.c",   "src/lstring.c",
-        "src/lstrlib.c",  "src/ltable.c",  "src/ltablib.c",  "src/ltm.c",
-        "src/lundump.c",  "src/lutf8lib.c", "src/lvm.c",     "src/lzio.c",
+        "src/lapi.c",     "src/lauxlib.c",  "src/lbaselib.c", "src/lcode.c",
+        "src/lcorolib.c", "src/lctype.c",   "src/ldblib.c",   "src/ldebug.c",
+        "src/ldo.c",      "src/ldump.c",    "src/lfunc.c",    "src/lgc.c",
+        "src/linit.c",    "src/liolib.c",   "src/llex.c",     "src/lmathlib.c",
+        "src/lmem.c",     "src/loadlib.c",  "src/lobject.c",  "src/lopcodes.c",
+        "src/loslib.c",   "src/lparser.c",  "src/lstate.c",   "src/lstring.c",
+        "src/lstrlib.c",  "src/ltable.c",   "src/ltablib.c",  "src/ltm.c",
+        "src/lundump.c",  "src/lutf8lib.c", "src/lvm.c",      "src/lzio.c",
     };
     const lua_cflags = [_][]const u8{
         "-std=gnu99",
@@ -85,7 +85,6 @@ pub fn build(b: *std.Build) void {
         .name = "zi",
         .root_module = exe_mod,
     });
-    exe.step.dependOn(&generate_models_run.step);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -103,7 +102,6 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);
     const tests = b.addTest(.{ .root_module = test_mod });
-    tests.step.dependOn(&generate_models_run.step);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }
