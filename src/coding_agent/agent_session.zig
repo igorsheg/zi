@@ -79,6 +79,7 @@ pub const AgentSession = struct {
     pending_extension_prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
     pending_extension_surfaces: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
     pending_extension_editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
+    pending_tool_projection_refresh: bool = false,
 
     /// Subscription token for the extension event bridge. Separate
     /// from `_subscription_token` (session persistence) so the two
@@ -697,6 +698,7 @@ pub const AgentSession = struct {
             .publish_editor_action = &runtimePublishEditorAction,
             .clear_editor_actions = &runtimeClearEditorActions,
             .provider_projection_changed = &runtimeProviderProjectionChanged,
+            .tool_projection_changed = &runtimeToolProjectionChanged,
         }, self._stream_closure.registry) catch {};
     }
 
@@ -1012,6 +1014,45 @@ pub const AgentSession = struct {
         };
     }
 
+    fn runtimeToolProjectionChanged(session_ptr: *anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        if (self.agent.isStreaming() or self.agent.hasQueuedMessages()) {
+            self.pending_tool_projection_refresh = true;
+            return;
+        }
+        self.rebuildVisibleToolsAndPromptFromRunner() catch |err| {
+            self.pending_tool_projection_refresh = true;
+            std.log.scoped(.coding_agent).warn("failed to rebuild visible tool projection: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn flushPendingToolProjectionRefresh(self: *AgentSession) void {
+        if (!self.pending_tool_projection_refresh) return;
+        if (self.agent.isStreaming() or self.agent.hasQueuedMessages()) return;
+        self.rebuildVisibleToolsAndPromptFromRunner() catch |err| {
+            std.log.scoped(.coding_agent).warn("failed to refresh visible tool projection: {s}", .{@errorName(err)});
+            return;
+        };
+        self.pending_tool_projection_refresh = false;
+    }
+
+    fn rebuildVisibleToolsAndPromptFromRunner(self: *AgentSession) !void {
+        const runner = self._extension_runner orelse return;
+        const definitions = runner.tool_registry.items();
+        const tools = try session_bootstrap.buildAgentTools(self.allocator, definitions, runner);
+        errdefer self.allocator.free(tools);
+        const system_prompt = try session_bootstrap.buildSystemPrompt(self.allocator, self.resource_loader, definitions);
+        errdefer self.allocator.free(system_prompt);
+
+        const old_tools = self.tools;
+        const old_system_prompt = self._owned_system_prompt;
+        self.tools = tools;
+        self._owned_system_prompt = system_prompt;
+        self.agent.replaceRuntimeInputs(system_prompt, tools);
+        if (old_tools.len > 0) self.allocator.free(old_tools);
+        if (old_system_prompt.len > 0) self.allocator.free(old_system_prompt);
+    }
+
     /// Run a new text prompt. Wires session persistence, then delegates to Agent.prompt.
     pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
         try self.runUserContent(.{ .text = prompt_text });
@@ -1019,6 +1060,7 @@ pub const AgentSession = struct {
 
     /// Run a new user message with explicit text/image content blocks.
     pub fn runUserContent(self: *AgentSession, user_content: ai.protocol.UserMessage.UserMessageContent) !void {
+        self.flushPendingToolProjectionRefresh();
         self.wireSubscription();
 
         const user_msg = protocol.AgentMessage{
@@ -1036,6 +1078,7 @@ pub const AgentSession = struct {
     /// If transcript ends with assistant (nothing to continue from),
     /// returns NeedsPrompt so the caller can provide one.
     pub fn continueSession(self: *AgentSession) !void {
+        self.flushPendingToolProjectionRefresh();
         self.wireSubscription();
         self.agent.continueTurn() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
@@ -2149,6 +2192,61 @@ test "AgentSession: final prompt metadata comes from the winning tool definition
     try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Winning read guideline") != null);
     try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Read file contents") == null);
     try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Use read to examine files instead of cat or sed.") == null);
+}
+
+test "AgentSession refreshes visible tools and prompt after runtime tool registration" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("extensions");
+    try tmp.dir.writeFile(.{ .sub_path = "extensions/dynamic.lua", .data = "return function(zi)\n" ++
+        "  zi.register_command({\n" ++
+        "    name = \"add_dynamic_tool\",\n" ++
+        "    description = \"add a dynamic tool\",\n" ++
+        "    handler = function(args, ctx)\n" ++
+        "      return zi.register_tool({\n" ++
+        "        name = \"runtime_echo\",\n" ++
+        "        label = \"Runtime Echo\",\n" ++
+        "        description = \"registered after bind\",\n" ++
+        "        prompt_snippet = \"Runtime echo prompt metadata\",\n" ++
+        "        parameters = { type = \"object\", properties = {}, required = {} },\n" ++
+        "        execute = function(params, ctx) return { content = { { type = \"text\", text = \"ok\" } } } end,\n" ++
+        "      })\n" ++
+        "    end,\n" ++
+        "  })\n" ++
+        "end\n" });
+    const agent_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent_dir);
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    var ca = AgentSession.initTestSession(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = "/tmp/zi-test",
+        .resource_loader = createTestResourceLoaderWithAgentDir(allocator, "/tmp/zi-test", agent_dir),
+        .registry = &registry,
+        .no_session = true,
+    });
+    defer ca.deinit();
+    ca.activateLifecycle();
+
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Runtime echo prompt metadata") == null);
+    try (ca.extensionRunner() orelse return error.MissingExtensionRunner).dispatchCommand("add_dynamic_tool", "");
+
+    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Runtime echo prompt metadata") != null);
+    var found = false;
+    for (ca.tools) |tool| {
+        if (std.mem.eql(u8, tool.name, "runtime_echo")) found = true;
+    }
+    try testing.expect(found);
 }
 
 test "AgentSession: extension surface swap publishes the next runner generation" {

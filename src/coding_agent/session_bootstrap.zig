@@ -427,7 +427,7 @@ fn filterToolDefinitions(
     return .{ .items = filtered[0..count], .owned_slice = true };
 }
 
-fn buildAgentTools(
+pub fn buildAgentTools(
     allocator: std.mem.Allocator,
     definitions: []const tool_def.ToolDefinition,
     extension_runner: ?*ExtensionRunner,
@@ -454,7 +454,7 @@ fn buildAgentTools(
     return tools[0..count];
 }
 
-fn buildSystemPrompt(
+pub fn buildSystemPrompt(
     allocator: std.mem.Allocator,
     resource_loader: resources.ResourceLoader,
     definitions: []const tool_def.ToolDefinition,

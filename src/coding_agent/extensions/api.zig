@@ -163,6 +163,8 @@ fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return 1;
     }
 
+    runner.notifyToolProjectionChanged();
+
     c.lua_pushboolean(L, 1);
     return 1;
 }
@@ -1755,6 +1757,11 @@ fn testBindGetBindingInfo(_: *anyopaque) runner_mod.ExtensionBindingInfo {
     };
 }
 
+fn testToolProjectionChanged(session_ptr: *anyopaque) void {
+    const count: *usize = @ptrCast(@alignCast(session_ptr));
+    count.* += 1;
+}
+
 fn testProviderProvenance() @import("../resources/types.zig").ExtensionProvenance {
     return .{
         .runtime_root_id = "root-123",
@@ -2307,6 +2314,59 @@ test "zi.register_tool first-registered-wins drops later duplicates" {
         "first registration",
         runner.tool_registry.get("task").?.description,
     );
+}
+
+test "zi.register_tool after bind refreshes visible tool projection for accepted claims only" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    var baseline = ai.faux.FauxProvider.init(testing.allocator);
+    defer baseline.deinit();
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try provider_registry.register("anthropic-messages", baseline.provider(), null);
+
+    var projection_changes: usize = 0;
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&projection_changes),
+        .ui = null,
+        .command_actions = null,
+        .get_model = &testBindGetModel,
+        .is_idle = &testBindIsIdle,
+        .abort = &testBindAbort,
+        .has_pending_messages = &testBindHasPendingMessages,
+        .shutdown = null,
+        .get_context_usage = &testBindGetContextUsage,
+        .get_system_prompt = &testBindGetSystemPrompt,
+        .get_binding_info = &testBindGetBindingInfo,
+        .tool_projection_changed = &testToolProjectionChanged,
+    }, &provider_registry);
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\local first = zi.register_tool({
+        \\  name = "runtime_echo",
+        \\  description = "runtime registration",
+        \\  parameters = { type = "object" },
+        \\  execute = function() end,
+        \\})
+        \\local duplicate = zi.register_tool({
+        \\  name = "runtime_echo",
+        \\  description = "duplicate registration",
+        \\  parameters = { type = "object" },
+        \\  execute = function() end,
+        \\})
+        \\assert(first == true, "runtime registration should be accepted")
+        \\assert(duplicate == false, "duplicate runtime registration should fail open")
+    , "test_runtime_register_tool");
+
+    try testing.expectEqual(@as(usize, 1), runner.tool_registry.count());
+    try testing.expectEqual(@as(usize, 1), projection_changes);
+    try testing.expectEqualStrings("runtime registration", runner.tool_registry.get("runtime_echo").?.description);
 }
 
 test "zi.on subscribes a Lua handler to the right event chain" {

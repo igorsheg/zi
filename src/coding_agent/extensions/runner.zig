@@ -80,6 +80,7 @@ pub const ExtensionRuntime = union(enum) {
         publish_editor_action: ?*const fn (session: *anyopaque, action: extension_ui.EditorAction) anyerror!void = null,
         clear_editor_actions: ?*const fn (session: *anyopaque) void = null,
         provider_projection_changed: ?*const fn (session: *anyopaque) void = null,
+        tool_projection_changed: ?*const fn (session: *anyopaque) void = null,
     };
 };
 
@@ -645,6 +646,15 @@ pub const ExtensionRunner = struct {
             .stub => return,
         };
         const callback = bound.provider_projection_changed orelse return;
+        callback(bound.session);
+    }
+
+    pub fn notifyToolProjectionChanged(self: *ExtensionRunner) void {
+        const bound = switch (self.runtime) {
+            .bound => |runtime| runtime,
+            .stub => return,
+        };
+        const callback = bound.tool_projection_changed orelse return;
         callback(bound.session);
     }
 
