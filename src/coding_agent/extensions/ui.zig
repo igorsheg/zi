@@ -121,6 +121,11 @@ pub const SurfaceKind = enum {
     overlay,
 };
 
+pub const SurfaceLifetime = enum {
+    session,
+    until_input,
+};
+
 pub const SurfaceUpdate = struct {
     state_owner_id: []const u8,
     generation: u64,
@@ -129,6 +134,7 @@ pub const SurfaceUpdate = struct {
     text: ?[]const u8 = null,
     lines: []const []const TextSpan = &.{},
     placement: ?[]const u8 = null,
+    lifetime: SurfaceLifetime = .session,
 
     pub fn clone(allocator: std.mem.Allocator, update: SurfaceUpdate) !SurfaceUpdate {
         const state_owner_id = try allocator.dupe(u8, update.state_owner_id);
@@ -156,6 +162,7 @@ pub const SurfaceUpdate = struct {
             .text = text,
             .lines = lines,
             .placement = placement,
+            .lifetime = update.lifetime,
         };
     }
 

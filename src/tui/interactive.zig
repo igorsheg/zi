@@ -495,6 +495,8 @@ pub const Interactive = struct {
     extension_footer_text: text_mod.Text,
     extension_widget_above_text: text_mod.Text,
     extension_widget_below_text: text_mod.Text,
+    extension_header_active: bool = false,
+    extension_header_lifetime: @import("../coding_agent/extensions/ui.zig").SurfaceLifetime = .session,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
@@ -795,9 +797,8 @@ pub const Interactive = struct {
         self.active_editor.setAutocompleteProvider(self.autocomplete_provider.provider());
 
         // Populate container slots with their initial children.
-        self.refreshGreeterVisibility();
+        self.refreshHeaderVisibility();
         self.refreshPendingImageBanner();
-        self.header_container.addChild(self.extension_header_text.component());
         self.status_container.addChild(self.status_text.component());
         self.widget_above_container.addChild(self.extension_widget_above_text.component());
         self.editor_container.addChild(self.active_editor.component());
@@ -809,16 +810,18 @@ pub const Interactive = struct {
         // Set initial focus via TUI (source of truth for input routing)
         self.tui.setFocus(self.active_editor.component());
 
-        // Build root tree matching pi-mono slot structure:
-        // headerContainer → chat(flex) → pending → status → widget_above → editor(focused) → widget_below → footer
-        self.tui.root.addChild(self.header_container.component()); // [0] headerContainer
-        self.tui.root.addChild(self.transcript.component()); // [1] chat (flex)
-        self.tui.root.addChild(self.pending_container.component()); // [2] pendingContainer
-        self.tui.root.addChild(self.status_container.component()); // [3] statusContainer
+        // Build root tree matching pi-mono slot structure, adapted for a
+        // full-screen TUI: transcript remains the flex region while the header
+        // is a composer/onboarding surface near the editor, not top chrome.
+        // chat(flex) → pending → status → header → widget_above → editor(focused) → widget_below
+        self.tui.root.addChild(self.transcript.component()); // [0] chat (flex)
+        self.tui.root.addChild(self.pending_container.component()); // [1] pendingContainer
+        self.tui.root.addChild(self.status_container.component()); // [2] statusContainer
+        self.tui.root.addChild(self.header_container.component()); // [3] composer header/onboarding
         self.tui.root.addChild(self.widget_above_container.component()); // [4] widgetAboveContainer
         self.tui.root.addChild(self.editor_container.component()); // [5] editorContainer
         self.tui.root.addChild(self.widget_below_container.component()); // [6] widgetBelowContainer
-        self.tui.root.flex_child_index = 1; // transcript is flex
+        self.tui.root.flex_child_index = 0; // transcript is flex
         self.tui.root.focused_child_index = 5; // editorContainer for cursor y-offset
 
         // RuntimeHost emits extension `session_start` before the TUI tree exists.
@@ -1023,7 +1026,7 @@ pub const Interactive = struct {
         // Bare \n = newline insertion (some terminals send this for shift+enter)
         if (seq.len == 1 and seq[0] == '\n') {
             self.active_editor.insertText("\n");
-            self.refreshGreeterVisibility();
+            self.refreshHeaderVisibility();
             self.tui.dirty = true;
             return;
         }
@@ -1039,7 +1042,7 @@ pub const Interactive = struct {
     fn onInputPaste(content: []const u8, raw_ctx: *anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(raw_ctx));
         self.active_editor.handlePaste(content);
-        self.refreshGreeterVisibility();
+        self.refreshHeaderVisibility();
         self.tui.dirty = true;
     }
 
@@ -1150,7 +1153,7 @@ pub const Interactive = struct {
 
         // Route to focused component via TUI
         if (self.tui.handleInput(key)) {
-            self.refreshGreeterVisibility();
+            self.refreshHeaderVisibility();
             self.tui.dirty = true;
         }
     }
@@ -1590,7 +1593,7 @@ pub const Interactive = struct {
     fn clearComposerDraft(self: *Interactive) void {
         self.active_editor.clear();
         self.clearPendingImages();
-        self.refreshGreeterVisibility();
+        self.refreshHeaderVisibility();
     }
 
     fn clearPendingImages(self: *Interactive) void {
@@ -1650,7 +1653,7 @@ pub const Interactive = struct {
                     return;
                 };
                 self.refreshPendingImageBanner();
-                self.refreshGreeterVisibility();
+                self.refreshHeaderVisibility();
 
                 var status_buf: [96]u8 = undefined;
                 const pending_count = self.pending_images.items.len;
@@ -1681,13 +1684,21 @@ pub const Interactive = struct {
         return if (h > fixed_total) h - fixed_total else 0;
     }
 
-    fn refreshGreeterVisibility(self: *Interactive) void {
-        if (!self.greeter_dismissed and self.composerHasPendingInput()) {
-            self.greeter_dismissed = true;
+    fn refreshHeaderVisibility(self: *Interactive) void {
+        if (self.composerHasPendingInput()) {
+            if (self.extension_header_active and self.extension_header_lifetime == .until_input) {
+                self.extension_header_active = false;
+                self.extension_header_text.setContent("");
+            }
+            if (!self.extension_header_active and !self.greeter_dismissed) {
+                self.greeter_dismissed = true;
+            }
         }
-        self.widget_above_container.clear();
-        if (!self.greeter_dismissed) {
-            self.widget_above_container.addChild(self.greeter.component());
+        self.header_container.clear();
+        if (self.extension_header_active) {
+            self.header_container.addChild(self.extension_header_text.component());
+        } else if (!self.greeter_dismissed) {
+            self.header_container.addChild(self.greeter.component());
         }
     }
 
@@ -1839,7 +1850,7 @@ pub const Interactive = struct {
 
     fn onEditorChange(_: []const u8, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.refreshGreeterVisibility();
+        self.refreshHeaderVisibility();
         self.tui.dirty = true;
     }
 
@@ -1867,7 +1878,7 @@ pub const Interactive = struct {
         _ = self.publishQueuedSnapshot();
 
         self.active_editor.clear();
-        self.refreshGreeterVisibility();
+        self.refreshHeaderVisibility();
         self.tui.dirty = true;
     }
 
@@ -1914,7 +1925,7 @@ pub const Interactive = struct {
         }
 
         self.active_editor.setText(buf.items);
-        self.refreshGreeterVisibility();
+        self.refreshHeaderVisibility();
         self.status_text.setContent(if (count == 1) "restored 1 queued message" else "restored queued messages");
         self.status_text.fg = self.theme.fg(.success);
         self.tui.dirty = true;
@@ -2018,7 +2029,7 @@ pub const Interactive = struct {
         const cmd = self.command_registry.findCommand(name) orelse return false;
 
         self.active_editor.clear();
-        self.refreshGreeterVisibility();
+        self.refreshHeaderVisibility();
         self.tui.dirty = true;
 
         // Built-in commands with Interactive access
@@ -3139,7 +3150,12 @@ pub const Interactive = struct {
         for (updates) |update| {
             switch (update.kind) {
                 .status => self.status_data.setStatus(update.id, update.text),
-                .header => self.applySurfaceText(&self.extension_header_text, update),
+                .header => {
+                    self.applySurfaceText(&self.extension_header_text, update);
+                    self.extension_header_active = surfaceHasContent(update);
+                    self.extension_header_lifetime = update.lifetime;
+                    self.refreshHeaderVisibility();
+                },
                 .footer => self.applySurfaceText(&self.extension_footer_text, update),
                 .widget => if (update.placement != null and std.mem.eql(u8, update.placement.?, "belowEditor"))
                     self.applySurfaceText(&self.extension_widget_below_text, update)
@@ -3156,6 +3172,11 @@ pub const Interactive = struct {
         const text = update.flattenText(self.allocator) catch return;
         defer self.allocator.free(text);
         text_component.setContent(text);
+    }
+
+    fn surfaceHasContent(update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) bool {
+        if (update.text) |text| if (text.len > 0) return true;
+        return update.lines.len > 0;
     }
 
     /// TUI-thread application of the latest extension command surface.

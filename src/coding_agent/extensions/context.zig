@@ -293,6 +293,7 @@ fn parseSurface(
         .text = try readOptionalArgString(arena, L, value_idx),
         .lines = try readSurfaceLines(arena, L, value_idx),
         .placement = try readSurfacePlacement(arena, L, value_idx + 1),
+        .lifetime = try readSurfaceLifetime(L, value_idx + 1),
     };
 }
 
@@ -309,6 +310,19 @@ fn readSurfaceLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]co
 fn readSurfacePlacement(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
     if (c.lua_type(L, idx) != c.LUA_TTABLE) return null;
     return try readOptionalStringField(arena, L, idx, "placement");
+}
+
+fn readSurfaceLifetime(L: *c.lua_State, idx: c_int) !extension_ui.SurfaceLifetime {
+    if (c.lua_type(L, idx) != c.LUA_TTABLE) return .session;
+    _ = c.lua_getfield(L, idx, "lifetime");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .session;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return .session;
+    const value = ptr[0..len];
+    if (std.mem.eql(u8, value, "until_input")) return .until_input;
+    if (std.mem.eql(u8, value, "session")) return .session;
+    return .session;
 }
 
 fn ctxUiConfirm(L_opt: ?*c.lua_State) callconv(.c) c_int {

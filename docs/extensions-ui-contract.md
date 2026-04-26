@@ -161,6 +161,7 @@ a slot lease says:
 - what semantic payload to render there
 - whether a renderer ref is attached
 - ordering / visibility hints
+- lifetime hints such as `session` or `until_input`
 
 it does **not** say:
 
@@ -197,6 +198,11 @@ this publication is a boundary object, not store access:
 - the tui consumes semantic publications (`surface`, `prompt`, `editor_action`, notification, panel, etc.) and materializes local components from them.
 - the tui must not read an `ExtensionUiStore`, `ExtensionRunner`, lua registry, or mailbox internals to discover ui state.
 - lua extensions call capability functions (`ctx.ui.set_widget`, `ctx.ui.show_panel`, `ctx.ui.confirm`, etc.); they never observe the store or transport shape.
+
+surface lifetimes are semantic hints, not direct component commands:
+
+- `session` means the lease persists until replaced, cleared, revoked, or unbound.
+- `until_input` means the host may clear the surface when the composer receives user input. zi's built-in greeter/onboarding header uses this policy; extension headers default to `session` unless they opt in.
 
 closed primitive families are intentional. extensibility happens through host-defined slots, semantic payloads, renderer refs, presentation documents, and deliberately added versioned families — not through raw tui component reach-through.
 
