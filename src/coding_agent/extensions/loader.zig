@@ -999,6 +999,96 @@ fn commandExampleGetBindingInfo(_: *anyopaque) runner_mod.ExtensionBindingInfo {
     };
 }
 
+fn commandExampleAssistantMessage() ai.protocol.AssistantMessage {
+    return .{
+        .content = &.{},
+        .api = .{ .custom = "test-api" },
+        .provider = .{ .custom = "test-provider" },
+        .model = "test-model",
+        .usage = .{
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+}
+
+test "example status line extension updates status across session and turn events" {
+    const allocator = std.testing.allocator;
+    const status_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/status_line.lua");
+    defer allocator.free(status_path);
+
+    var state_owner_buf: [256]u8 = undefined;
+    const state_owner_id = try std.fmt.bufPrint(&state_owner_buf, "example::{s}", .{"status_line"});
+    const ext = LoadedExtension{
+        .id = "status_line",
+        .path = status_path,
+        .source = .user,
+        .provenance = .{
+            .runtime_root_id = "examples/extensions",
+            .extension_id = "status_line",
+            .state_owner_id = state_owner_id,
+            .root_kind = .runtime_root,
+        },
+    };
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    var store = CommandExampleStore{ .allocator = allocator };
+    defer store.deinit();
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&store),
+        .get_model = &commandExampleGetModel,
+        .is_idle = &commandExampleIsIdle,
+        .abort = &commandExampleAbort,
+        .has_pending_messages = &commandExampleHasPendingMessages,
+        .get_context_usage = &commandExampleGetContextUsage,
+        .get_system_prompt = &commandExampleGetSystemPrompt,
+        .get_binding_info = &commandExampleGetBindingInfo,
+        .publish_surface = &CommandExampleStore.publishSurface,
+    }, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, &.{ext}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    try event_bridge.dispatchSessionStart(.{
+        .runner = &runner,
+        .workspace_id = "/workspace",
+        .session_id = "session-123",
+        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+    }, null, .startup, null);
+    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[0].kind);
+    try std.testing.expectEqualStrings("status-demo", store.surfaces.items[0].id);
+    try std.testing.expectEqualStrings("Ready", store.surfaces.items[0].text.?);
+
+    try event_bridge.handleAgentEvent(&runner, .{ .turn_start = {} });
+    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[1].kind);
+    try std.testing.expectEqualStrings("status-demo", store.surfaces.items[1].id);
+    try std.testing.expectEqualStrings("● Turn 1...", store.surfaces.items[1].text.?);
+
+    try event_bridge.handleAgentEvent(&runner, .{ .turn_end = .{
+        .message = .{ .assistant = commandExampleAssistantMessage() },
+        .tool_results = &.{},
+    } });
+    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[2].kind);
+    try std.testing.expectEqualStrings("status-demo", store.surfaces.items[2].id);
+    try std.testing.expectEqualStrings("✓ Turn 1 complete", store.surfaces.items[2].text.?);
+}
+
 test "example custom header extension publishes a host-owned header surface" {
     const allocator = std.testing.allocator;
     const header_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/custom_header.lua");

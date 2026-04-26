@@ -489,6 +489,7 @@ pub const Interactive = struct {
     active_editor: EditorInterface = undefined,
     active_editor_bound: bool = false,
     status_text: text_mod.Text,
+    extension_status_text: text_mod.Text,
     pending_image_banner: text_mod.Text,
     extension_panel_text: text_mod.Text,
     extension_header_text: text_mod.Text,
@@ -628,6 +629,7 @@ pub const Interactive = struct {
             .cwd = cwd,
             .editor = editor_mod.Editor.init(state_allocator),
             .status_text = text_mod.Text.init(state_allocator),
+            .extension_status_text = text_mod.Text.init(state_allocator),
             .pending_image_banner = text_mod.Text.init(state_allocator),
             .extension_panel_text = text_mod.Text.init(state_allocator),
             .extension_header_text = text_mod.Text.init(state_allocator),
@@ -747,6 +749,7 @@ pub const Interactive = struct {
         self.extension_header_text.deinit();
         self.extension_panel_text.deinit();
         self.pending_image_banner.deinit();
+        self.extension_status_text.deinit();
         self.status_text.deinit();
         self.editor.deinit();
         self.tui.deinit();
@@ -799,7 +802,7 @@ pub const Interactive = struct {
         // Populate container slots with their initial children.
         self.refreshHeaderVisibility();
         self.refreshPendingImageBanner();
-        self.status_container.addChild(self.status_text.component());
+        self.refreshStatusContainer();
         self.widget_above_container.addChild(self.extension_widget_above_text.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
@@ -1709,8 +1712,7 @@ pub const Interactive = struct {
         self.loader.setMessage(message);
         self.loader.start();
         self.loader_active = true;
-        self.status_container.clear();
-        self.status_container.addChild(self.loader.component());
+        self.refreshStatusContainer();
     }
 
     fn showRetryLoader(self: *Interactive, attempt: u32, max_attempts: u32, delay_ms: u64, cancellable: bool) void {
@@ -1730,16 +1732,14 @@ pub const Interactive = struct {
         self.loader.setMessage(message);
         self.loader.start();
         self.loader_active = true;
-        self.status_container.clear();
-        self.status_container.addChild(self.loader.component());
+        self.refreshStatusContainer();
     }
 
     fn hideLoader(self: *Interactive) void {
         if (!self.loader_active) return;
         self.loader.stop();
         self.loader_active = false;
-        self.status_container.clear();
-        self.status_container.addChild(self.status_text.component());
+        self.refreshStatusContainer();
         // Don't blank status_text — preserve any error/abort message
         // that was set while the loader was active.
     }
@@ -3149,7 +3149,10 @@ pub const Interactive = struct {
     fn applyExtensionSurfaces(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
         for (updates) |update| {
             switch (update.kind) {
-                .status => self.status_data.setStatus(update.id, update.text),
+                .status => {
+                    self.status_data.setStatus(update.id, update.text);
+                    self.refreshExtensionStatusText();
+                },
                 .header => {
                     self.applySurfaceText(&self.extension_header_text, update);
                     self.extension_header_active = surfaceHasContent(update);
@@ -3166,6 +3169,23 @@ pub const Interactive = struct {
             }
         }
         self.tui.dirty = true;
+    }
+
+    fn refreshStatusContainer(self: *Interactive) void {
+        self.status_container.clear();
+        if (self.loader_active) {
+            self.status_container.addChild(self.loader.component());
+        } else {
+            self.status_container.addChild(self.status_text.component());
+        }
+        self.status_container.addChild(self.extension_status_text.component());
+    }
+
+    fn refreshExtensionStatusText(self: *Interactive) void {
+        const text = self.status_data.formatExtensionStatuses(self.allocator, " ") catch return;
+        defer self.allocator.free(text);
+        self.extension_status_text.setContent(text);
+        self.refreshStatusContainer();
     }
 
     fn applySurfaceText(self: *Interactive, text_component: *text_mod.Text, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
@@ -3557,6 +3577,7 @@ pub const Interactive = struct {
             _ = self.publishUiEvent(ui_event);
         }
         self.publishStatusSnapshotForAgentEvent(event);
+        self.publishPendingExtensionUi();
     }
 
     /// Session event callback — runs on the AGENT THREAD.

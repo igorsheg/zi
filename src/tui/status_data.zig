@@ -82,6 +82,52 @@ pub const StatusData = struct {
         }
     }
 
+    pub const ExtensionStatusItem = struct {
+        key: []const u8,
+        text: []const u8,
+    };
+
+    pub fn collectExtensionStatuses(self: *const StatusData, allocator: std.mem.Allocator) ![]ExtensionStatusItem {
+        var items = try allocator.alloc(ExtensionStatusItem, self.extension_statuses.count());
+        errdefer allocator.free(items);
+
+        var iter = self.extension_statuses.iterator();
+        var i: usize = 0;
+        while (iter.next()) |entry| : (i += 1) {
+            items[i] = .{ .key = entry.key_ptr.*, .text = entry.value_ptr.* };
+        }
+        std.mem.sort(ExtensionStatusItem, items, {}, extensionStatusLessThan);
+        return items;
+    }
+
+    pub fn formatExtensionStatuses(self: *const StatusData, allocator: std.mem.Allocator, separator: []const u8) ![]u8 {
+        const items = try self.collectExtensionStatuses(allocator);
+        defer allocator.free(items);
+        if (items.len == 0) return try allocator.dupe(u8, "");
+
+        var total: usize = 0;
+        for (items, 0..) |item, i| {
+            if (i > 0) total += separator.len;
+            total += item.text.len;
+        }
+
+        var out = try allocator.alloc(u8, total);
+        var pos: usize = 0;
+        for (items, 0..) |item, i| {
+            if (i > 0) {
+                @memcpy(out[pos..][0..separator.len], separator);
+                pos += separator.len;
+            }
+            @memcpy(out[pos..][0..item.text.len], item.text);
+            pos += item.text.len;
+        }
+        return out;
+    }
+
+    fn extensionStatusLessThan(_: void, a: ExtensionStatusItem, b: ExtensionStatusItem) bool {
+        return std.mem.lessThan(u8, a.key, b.key);
+    }
+
     fn replaceOwnedField(self: *StatusData, field: *[]const u8, value: []const u8) void {
         const owned = if (value.len > 0)
             self.allocator.dupe(u8, value) catch return
@@ -114,4 +160,17 @@ test "StatusData extension status set and remove" {
 
     sd.setStatus("lsp", null);
     try testing.expect(sd.extension_statuses.get("lsp") == null);
+}
+
+test "StatusData formats extension status values in key order" {
+    var sd = StatusData.init(testing.allocator);
+    defer sd.deinit();
+
+    sd.setStatus("zeta", "last");
+    sd.setStatus("alpha", "first");
+    sd.setStatus("middle", "middle");
+
+    const formatted = try sd.formatExtensionStatuses(testing.allocator, " ");
+    defer testing.allocator.free(formatted);
+    try testing.expectEqualStrings("first middle last", formatted);
 }

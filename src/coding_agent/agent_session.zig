@@ -639,9 +639,10 @@ pub const AgentSession = struct {
     }
 
     fn wireSubscription(self: *AgentSession) void {
-        if (self._subscription_token == null) {
-            self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
-        }
+        // Extension observers run before session listeners/persistence so
+        // event-time retained UI publications exist before RuntimeHost/TUI
+        // listeners drain them. This also matches the pi-mono ordering noted
+        // on eventListener below: extensions → listeners → persistence.
         if (self._extension_subscription_token == null) {
             if (self._extension_runner != null) {
                 self._extension_subscription_token = self.agent.subscribe(
@@ -649,6 +650,9 @@ pub const AgentSession = struct {
                     @ptrCast(self._extension_runner_ref),
                 );
             }
+        }
+        if (self._subscription_token == null) {
+            self._subscription_token = self.agent.subscribe(&eventListener, @ptrCast(self));
         }
     }
 
