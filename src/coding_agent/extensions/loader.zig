@@ -9,6 +9,7 @@ const agent_protocol = @import("../../agent3/types.zig");
 const ai = @import("../../ai/root.zig");
 const extension_ui = @import("ui.zig");
 const session_core = @import("../../session/root.zig");
+const event_bridge = @import("event_bridge.zig");
 
 const log = std.log.scoped(.extensions);
 
@@ -927,11 +928,33 @@ test "example commands extension dispatches through host-owned command ui" {
 }
 
 const CommandExampleStore = struct {
+    allocator: std.mem.Allocator = std.testing.allocator,
     panel: ?extension_ui.Panel = null,
+    editor_action: ?extension_ui.EditorAction = null,
+    surfaces: std.ArrayList(extension_ui.SurfaceUpdate) = .empty,
+
+    fn deinit(self: *CommandExampleStore) void {
+        if (self.editor_action) |*action| action.deinit(self.allocator);
+        self.editor_action = null;
+        for (self.surfaces.items) |*surface| surface.deinit(self.allocator);
+        self.surfaces.deinit(self.allocator);
+    }
 
     fn showPanel(session: *anyopaque, panel: extension_ui.Panel) anyerror!void {
         const self: *CommandExampleStore = @ptrCast(@alignCast(session));
         self.panel = panel;
+    }
+
+    fn publishEditorAction(session: *anyopaque, action: extension_ui.EditorAction) anyerror!void {
+        const self: *CommandExampleStore = @ptrCast(@alignCast(session));
+        if (self.editor_action) |*existing| existing.deinit(self.allocator);
+        self.editor_action = try extension_ui.EditorAction.clone(self.allocator, action);
+    }
+
+    fn publishSurface(session: *anyopaque, update: extension_ui.SurfaceUpdate) anyerror!void {
+        const self: *CommandExampleStore = @ptrCast(@alignCast(session));
+        const cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
+        try self.surfaces.append(self.allocator, cloned);
     }
 };
 
@@ -974,6 +997,126 @@ fn commandExampleGetBindingInfo(_: *anyopaque) runner_mod.ExtensionBindingInfo {
         .session_id = "session-123",
         .session_file = "/workspace/.zi/sessions/session-123.jsonl",
     };
+}
+
+test "example widget placement extension publishes above and below editor widgets" {
+    const allocator = std.testing.allocator;
+    const widget_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/widget_placement.lua");
+    defer allocator.free(widget_path);
+
+    var state_owner_buf: [256]u8 = undefined;
+    const state_owner_id = try std.fmt.bufPrint(&state_owner_buf, "example::{s}", .{"widget_placement"});
+    const ext = LoadedExtension{
+        .id = "widget_placement",
+        .path = widget_path,
+        .source = .user,
+        .provenance = .{
+            .runtime_root_id = "examples/extensions",
+            .extension_id = "widget_placement",
+            .state_owner_id = state_owner_id,
+            .root_kind = .runtime_root,
+        },
+    };
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    var store = CommandExampleStore{ .allocator = allocator };
+    defer store.deinit();
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&store),
+        .get_model = &commandExampleGetModel,
+        .is_idle = &commandExampleIsIdle,
+        .abort = &commandExampleAbort,
+        .has_pending_messages = &commandExampleHasPendingMessages,
+        .get_context_usage = &commandExampleGetContextUsage,
+        .get_system_prompt = &commandExampleGetSystemPrompt,
+        .get_binding_info = &commandExampleGetBindingInfo,
+        .publish_surface = &CommandExampleStore.publishSurface,
+    }, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, &.{ext}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    try event_bridge.dispatchSessionStart(.{
+        .runner = &runner,
+        .workspace_id = "/workspace",
+        .session_id = "session-123",
+        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+    }, null, .startup, null);
+
+    try std.testing.expectEqual(@as(usize, 2), store.surfaces.items.len);
+    try std.testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[0].kind);
+    try std.testing.expectEqualStrings("widget-above", store.surfaces.items[0].id);
+    try std.testing.expectEqualStrings("aboveEditor", store.surfaces.items[0].placement.?);
+    try std.testing.expectEqualStrings("Above editor widget", store.surfaces.items[0].lines[0][0].text);
+    try std.testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[1].kind);
+    try std.testing.expectEqualStrings("widget-below", store.surfaces.items[1].id);
+    try std.testing.expectEqualStrings("belowEditor", store.surfaces.items[1].placement.?);
+    try std.testing.expectEqualStrings("Below editor widget", store.surfaces.items[1].lines[0][0].text);
+}
+
+test "example qna extension writes a question prompt through editor actions" {
+    const allocator = std.testing.allocator;
+    const qna_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/qna.lua");
+    defer allocator.free(qna_path);
+
+    var state_owner_buf: [256]u8 = undefined;
+    const state_owner_id = try std.fmt.bufPrint(&state_owner_buf, "example::{s}", .{"qna"});
+    const ext = LoadedExtension{
+        .id = "qna",
+        .path = qna_path,
+        .source = .user,
+        .provenance = .{
+            .runtime_root_id = "examples/extensions",
+            .extension_id = "qna",
+            .state_owner_id = state_owner_id,
+            .root_kind = .runtime_root,
+        },
+    };
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    var store = CommandExampleStore{ .allocator = allocator };
+    defer store.deinit();
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&store),
+        .get_model = &commandExampleGetModel,
+        .is_idle = &commandExampleIsIdle,
+        .abort = &commandExampleAbort,
+        .has_pending_messages = &commandExampleHasPendingMessages,
+        .get_context_usage = &commandExampleGetContextUsage,
+        .get_system_prompt = &commandExampleGetSystemPrompt,
+        .get_binding_info = &commandExampleGetBindingInfo,
+        .publish_editor_action = &CommandExampleStore.publishEditorAction,
+    }, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, &.{ext}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expect(runner.command_registry.getByVisibleName("qna") != null);
+
+    try runner.dispatchCommand("qna", "What changed?");
+    const action = store.editor_action orelse return error.MissingEditorAction;
+    try std.testing.expectEqual(.set_text, action.kind);
+    try std.testing.expectEqualStrings(state_owner_id, action.state_owner_id);
+    try std.testing.expectEqualStrings("Question: What changed?\n\nAnswer: ", action.text.?);
 }
 
 test "loadAll stamps provenance on top-level registrations outside factory" {
