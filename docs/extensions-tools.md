@@ -450,7 +450,7 @@ practical consequences:
 | today | v2 meaning | note |
 | --- | --- | --- |
 | `zi.register_tool(def)` | `zi.tools.register(def)` | first-class tool registration stays, but lives under an explicit tool namespace and accepts the full definition model above |
-| `render_result` | `presentation.result` | one result slot inside the tool definition's presentation class |
+| `render_result` | `presentation.result` | first shipped result-slot vertical: a pure Lua hook returns a host-owned line/span presentation document; empty string means zero result rows for minimal collapsed presentation |
 | no public call-render hook for extension tools | `presentation.call` | v2 makes the call slot public too |
 | `ctx.update(partial)` | split into `ctx.progress.*` and `ctx.result.update(patch)` | progress and partial semantic result become different families |
 | `zi.spawn(...)` | leaves the tool contract | child-agent work belongs to first-class subagents; generic process work belongs to `zi.system.process`; tools may call those surfaces from `execute`, but `zi.spawn` is not the doctrine shape |

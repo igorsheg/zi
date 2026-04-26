@@ -1,7 +1,9 @@
 //! Lua-driven tool renderers.
 //!
-//! Bridges `zi.register_tool({ render_result = fn(result, ctx) ... })`
-//! to an owned, width-agnostic span tree.
+//! Bridges the first vertical of zi's host-owned presentation contract:
+//! `zi.register_tool({ render_result = fn(result, ctx) ... })` is the
+//! tool `result` presentation slot and returns an owned, width-agnostic
+//! presentation document.
 //!
 //! Since zi-wub.5/.6 the agent thread is the single owner of
 //! `lua_state`, so any `render_result` dispatch must happen there.
@@ -364,8 +366,10 @@ fn runOne(
 fn parseReturnValue(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) RenderError![]const Line {
     const ty = c.lua_type(L, idx);
     if (ty == c.LUA_TSTRING) {
-        // shortcut: single plain line
+        // shortcut: a non-empty string is a single plain line. An empty
+        // string is the minimal-mode convention for "no result rows".
         const text = try dupeLuaString(arena, L, idx);
+        if (text.len == 0) return &.{};
         const spans = try arena.alloc(Span, 1);
         spans[0] = .{ .text = text };
         const lines = try arena.alloc(Line, 1);
@@ -602,6 +606,39 @@ test "dispatchRenderResult parses structured spans with theme roles" {
     try testing.expectEqualStrings(" done", out.collapsed[0][1].text);
     try testing.expectEqual(theme_mod.FgColor.dim, out.collapsed[0][1].fg.?);
     try testing.expectEqualStrings("simple string line", out.collapsed[1][0].text);
+}
+
+test "dispatchRenderResult treats empty collapsed output as zero-row minimal presentation" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.register_tool({
+        \\  name = "minimal",
+        \\  description = "minimal",
+        \\  parameters = { type = "object" },
+        \\  execute = function() end,
+        \\  render_result = function(result, ctx)
+        \\    return ctx.expanded and "expanded output" or ""
+        \\  end,
+        \\})
+    , "register");
+
+    const out = dispatchRenderResult(testing.allocator, &runner, .{
+        .tool_name = "minimal",
+        .args = .null,
+        .result = .null,
+        .width = 80,
+        .is_error = false,
+    }) orelse return error.TestUnexpectedResult;
+    defer out.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), out.collapsed.len);
+    try testing.expectEqualStrings("expanded output", out.expanded[0][0].text);
 }
 
 test "dispatchRenderResult passes ctx.expanded differently to collapsed and expanded runs" {
