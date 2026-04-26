@@ -44,6 +44,7 @@ const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
 const session_store_mod = @import("../coding_agent/session/store.zig");
+const session_index_worker_mod = @import("session_index_worker.zig");
 const SessionStore = session_store_mod.SessionStore;
 const storage = @import("../storage.zig");
 const logging = @import("../logging.zig");
@@ -266,46 +267,59 @@ const ResumePickerFlow = struct {
     picker: ListPicker,
     handle: ?tui_mod.OverlayHandle = null,
     restore_session_model: bool = true,
+    generation: u64 = 0,
 
     const Row = struct {
         item: SelectItem,
         path: []const u8,
     };
 
-    fn init(gpa: std.mem.Allocator, theme: *const theme_mod.Theme, cwd: []const u8) !ResumePickerFlow {
+    fn initLoading(
+        gpa: std.mem.Allocator,
+        theme: *const theme_mod.Theme,
+        restore_session_model: bool,
+        generation: u64,
+    ) !ResumePickerFlow {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
-        const a = arena.allocator();
-        const sessions = try session_store_mod.listSessions(a, cwd);
-        const rows = try a.alloc(Row, sessions.len);
-        const items = try a.alloc(SelectItem, sessions.len);
-
-        for (sessions, 0..) |session, i| {
-            const item: SelectItem = .{
-                .value = session.session_id,
-                .label = session.first_message,
-                .description = try std.fmt.allocPrint(a, "{d} msgs \xC2\xB7 {s}", .{
-                    session.message_count,
-                    time_util.relativeTimeLabel(session.timestamp),
-                }),
-            };
-            rows[i] = .{ .item = item, .path = session.path };
-            items[i] = item;
-        }
 
         var picker = ListPicker.init(theme);
         picker.title = "Resume session";
         picker.list.max_visible = 10;
         picker.setSearchPlaceholder("Filter sessions");
-        picker.setEmptyText("No matching sessions");
-        picker.setSearchableItems(items, null);
+        picker.setEmptyText("Loading sessions...");
+        picker.setSearchableItems(&.{}, null);
 
         return .{
             .arena = arena,
-            .rows = rows,
-            .items = items,
             .picker = picker,
+            .restore_session_model = restore_session_model,
+            .generation = generation,
         };
+    }
+
+    fn populate(self: *ResumePickerFlow, summaries: []const session_store_mod.SessionInfo) !void {
+        const a = self.arena.allocator();
+        const rows = try a.alloc(Row, summaries.len);
+        const items = try a.alloc(SelectItem, summaries.len);
+
+        for (summaries, 0..) |session, i| {
+            const item: SelectItem = .{
+                .value = try a.dupe(u8, session.session_id),
+                .label = try a.dupe(u8, session.first_message),
+                .description = try std.fmt.allocPrint(a, "{d} msgs \xC2\xB7 {s}", .{
+                    session.message_count,
+                    time_util.relativeTimeLabel(session.timestamp),
+                }),
+            };
+            rows[i] = .{ .item = item, .path = try a.dupe(u8, session.path) };
+            items[i] = item;
+        }
+
+        self.rows = rows;
+        self.items = items;
+        self.picker.setEmptyText("No matching sessions");
+        self.picker.setSearchableItems(items, null);
     }
 
     fn deinit(self: *ResumePickerFlow) void {
@@ -548,6 +562,8 @@ pub const Interactive = struct {
 
     // ── Flow-owned transient pickers ────────────────────────────
     resume_picker_flow: ?ResumePickerFlow = null,
+    resume_picker_generation: u64 = 0,
+    session_index_worker: session_index_worker_mod.SessionIndexWorker,
 
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
@@ -652,6 +668,7 @@ pub const Interactive = struct {
             .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
             .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
+            .session_index_worker = try session_index_worker_mod.SessionIndexWorker.init(msg_allocator),
             .memory_diagnostics = memory_diagnostics,
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
@@ -678,6 +695,8 @@ pub const Interactive = struct {
             if (self.login_thread) |t| t.join();
             self.login_thread = null;
         }
+        self.session_index_worker.stop();
+
         // Stop the long-lived agent owner thread. Abort first if a
         // prompt is mid-flight so the owner loop can reach its next
         // request boundary, then enqueue an ordered shutdown, close the
@@ -727,6 +746,8 @@ pub const Interactive = struct {
         logMailboxStats("snapshot", self.snapshot_event_queue.stats());
         logMailboxStats("lifecycle", self.lifecycle_event_queue.stats());
         logMailboxStats("request", self.request_queue.stats());
+        logMailboxStats("session_index", self.session_index_worker.stats());
+        self.session_index_worker.deinit();
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
         // Any unexpectedly undrained requests are mailbox-owned here;
@@ -754,6 +775,17 @@ pub const Interactive = struct {
     fn startAgentThread(self: *Interactive) !void {
         if (self.agent_thread != null) return;
         self.agent_thread = try std.Thread.spawn(.{}, agentThreadFn, .{self});
+    }
+
+    fn startSessionIndexWorker(self: *Interactive) !void {
+        self.session_index_worker.setPublisher(&publishSessionIndexUiEvent, @ptrCast(self));
+        try self.session_index_worker.start();
+        self.session_index_worker.warmResumeSessions(self.cwd) catch {};
+    }
+
+    fn publishSessionIndexUiEvent(ctx: ?*anyopaque, event: UiEvent) bool {
+        const self: *Interactive = @ptrCast(@alignCast(ctx.?));
+        return self.publishLifecycleUiEvent(event);
     }
 
     /// Main loop — runs on the main thread.
@@ -784,6 +816,7 @@ pub const Interactive = struct {
 
         self.detectGitBranch();
         try self.startAgentThread();
+        try self.startSessionIndexWorker();
 
         // Prime the status chips via the agent-owned snapshot path before the
         // first frame. This keeps model/thinking/context reads off the TUI
@@ -1403,6 +1436,12 @@ pub const Interactive = struct {
                 self.status_line.setPrimary(f.message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             },
+            .resume_sessions_loaded => |r| {
+                self.applyResumeSessionsLoaded(r.generation, r.sessions);
+            },
+            .resume_sessions_failed => |f| {
+                self.applyResumeSessionsFailed(f.generation, f.message);
+            },
             .extension_commands_updated => |u| {
                 self.applyExtensionCommandsUpdate(u.commands);
             },
@@ -1481,6 +1520,39 @@ pub const Interactive = struct {
         self.closeModelPickerFlow();
         coding_agent_mod.model_registry.deinitOwnedModels(self.msg_allocator, self.model_catalog);
         self.model_catalog = models;
+    }
+
+    fn applyResumeSessionsLoaded(self: *Interactive, generation: u64, sessions: []const session_store_mod.SessionInfo) void {
+        if (generation != self.resume_picker_generation) return;
+        const flow = if (self.resume_picker_flow) |*flow| flow else return;
+        if (flow.generation != generation) return;
+
+        if (sessions.len == 0) {
+            flow.picker.setEmptyText("No sessions found");
+            flow.picker.setSearchableItems(&.{}, null);
+            self.status_line.setPrimary("no sessions found", self.theme.fg(.muted));
+            self.tui.dirty = true;
+            return;
+        }
+
+        flow.populate(sessions) catch {
+            self.closeResumePickerFlow();
+            self.status_line.setPrimary("failed to render sessions", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+            return;
+        };
+        self.tui.dirty = true;
+    }
+
+    fn applyResumeSessionsFailed(self: *Interactive, generation: u64, message: []const u8) void {
+        if (generation != self.resume_picker_generation) return;
+        if (self.resume_picker_flow) |*flow| {
+            if (flow.generation != generation) return;
+            flow.picker.setEmptyText(message);
+            flow.picker.setSearchableItems(&.{}, null);
+        }
+        self.status_line.setPrimary(message, self.theme.fg(.@"error"));
+        self.tui.dirty = true;
     }
 
     fn applyTranscriptHideThinkingBlock(self: *Interactive) void {
@@ -2241,36 +2313,38 @@ pub const Interactive = struct {
     }
 
     fn showSessionPicker(self: *Interactive, restore_session_model: bool) void {
-        // zi-wub.26: cwd lives on the TUI side (Interactive was
-        // constructed with it; editor.cwd is the canonical copy).
-        // Reading from ca.session_store.writer.cwd would reach into
-        // agent-owned state from the TUI thread, violating the
-        // doctrine. The session store path tracks the *current*
-        // session's cwd which in zi is always the process cwd
-        // (we don't support per-session cwd switching), so this is
-        // strictly equivalent.
         self.closeResumePickerFlow();
-        var flow = ResumePickerFlow.init(self.allocator, self.theme, self.cwd) catch {
-            self.status_line.setPrimary("failed to list sessions", self.theme.fg(.@"error"));
+        self.resume_picker_generation +%= 1;
+        const generation = self.resume_picker_generation;
+
+        var flow = ResumePickerFlow.initLoading(
+            self.allocator,
+            self.theme,
+            restore_session_model,
+            generation,
+        ) catch {
+            self.status_line.setPrimary("failed to open resume picker", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
             return;
         };
         errdefer flow.deinit();
 
-        if (flow.rows.len == 0) {
-            self.status_line.setPrimary("no sessions found", self.theme.fg(.muted));
-            return;
-        }
-
         flow.picker.on_select = &onSessionSelected;
         flow.picker.on_cancel = &onSessionPickerCancel;
         flow.picker.callback_ctx = @ptrCast(self);
-        flow.restore_session_model = restore_session_model;
         self.cancelTranscriptSelection();
         self.resume_picker_flow = flow;
         self.resume_picker_flow.?.handle = self.tui.showOverlay(
             self.resume_picker_flow.?.picker.component(),
             self.bottomPanelOptions(),
         );
+        self.tui.dirty = true;
+
+        self.session_index_worker.listResumeSessions(generation, self.cwd) catch {
+            self.closeResumePickerFlow();
+            self.status_line.setPrimary("failed to queue session listing", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+        };
     }
 
     fn onSessionSelected(selection: PickerSelection, ctx: ?*anyopaque) void {

@@ -7,6 +7,7 @@ const ai_protocol = @import("../ai/protocol.zig");
 const theme_mod = @import("theme.zig");
 const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const request_mod = @import("../coding_agent/request.zig");
+const session_store_mod = @import("../coding_agent/session/store.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 
 pub const ExtensionCommandEntry = struct {
@@ -85,6 +86,14 @@ pub const UiEvent = union(enum) {
         restore_warning: ?[]u8 = null,
     },
     session_resume_failed: struct {
+        message: []u8,
+    },
+    resume_sessions_loaded: struct {
+        generation: u64,
+        sessions: []session_store_mod.SessionInfo,
+    },
+    resume_sessions_failed: struct {
+        generation: u64,
         message: []u8,
     },
 
@@ -225,6 +234,8 @@ pub const UiEvent = union(enum) {
                 if (s.restore_warning) |warning| allocator.free(warning);
             },
             .session_resume_failed => |f| allocator.free(f.message),
+            .resume_sessions_loaded => |r| session_store_mod.freeSessionInfos(allocator, r.sessions),
+            .resume_sessions_failed => |f| allocator.free(f.message),
             .extension_commands_updated => |u| {
                 for (u.commands) |cmd| {
                     allocator.free(cmd.name);
