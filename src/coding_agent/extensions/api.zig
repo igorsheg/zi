@@ -125,6 +125,7 @@ fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.MissingParameters => "register_tool: missing required field 'parameters'",
             error.MissingExecute => "register_tool: missing required field 'execute'",
             error.InvalidExecute => "register_tool: 'execute' must be a function",
+            error.InvalidRenderCall => "register_tool: 'render_call' must be a function",
             error.InvalidRenderResult => "register_tool: 'render_result' must be a function",
             error.InvalidName => "register_tool: 'name' must be a string",
             error.InvalidDescription => "register_tool: 'description' must be a string",
@@ -155,6 +156,7 @@ fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
         });
         // Release the captured Lua function refs since we won't use them.
         if (built.impl == .lua) c.luaL_unref(L, c.LUA_REGISTRYINDEX, built.impl.lua);
+        if (built.render_call_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
         if (built.render_result_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
         freeBuiltTool(runner.allocator, &built);
         c.lua_pushboolean(L, 0);
@@ -177,6 +179,7 @@ const BuildError = error{
     InvalidPromptGuidelines,
     InvalidParameters,
     InvalidExecute,
+    InvalidRenderCall,
     InvalidRenderResult,
     OutOfMemory,
     UnsupportedLuaType,
@@ -226,19 +229,27 @@ fn buildExtensionTool(
     const parameters = try lua_runtime.luaValueToJson(L, -1, a);
     errdefer lua_runtime.freeJsonValue(a, parameters);
 
-    // Optional `render_result` function — validated type-only here.
-    // We capture its ref AFTER `execute` to keep the ref-last
-    // discipline; taking it before execute would leak on
-    // `MissingExecute`.
+    // Optional presentation-slot functions — validated type-only here.
+    // We capture refs AFTER `execute` to keep ref-last discipline;
+    // taking them before execute would leak on `MissingExecute`.
+    var has_render_call = false;
+    _ = c.lua_getfield(L, 1, "render_call");
+    if (c.lua_type(L, -1) == c.LUA_TFUNCTION) {
+        has_render_call = true;
+    } else if (c.lua_type(L, -1) != c.LUA_TNIL) {
+        c.lua_pop(L, 1);
+        return error.InvalidRenderCall;
+    }
+
     var has_render_result = false;
     _ = c.lua_getfield(L, 1, "render_result");
     if (c.lua_type(L, -1) == c.LUA_TFUNCTION) {
         has_render_result = true;
     } else if (c.lua_type(L, -1) != c.LUA_TNIL) {
-        c.lua_pop(L, 1);
+        c.lua_pop(L, 2);
         return error.InvalidRenderResult;
     }
-    // Leave on stack for now; we'll ref it after execute validates.
+    // Leave on stack for now; we'll ref them after execute validates.
 
     // execute: required, must be a function. luaL_ref pops the
     // function from the stack and returns a registry slot. We do
@@ -246,17 +257,23 @@ fn buildExtensionTool(
     // ref on a later failure.
     _ = c.lua_getfield(L, 1, "execute");
     if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 2); // execute (nil) + render_result
+        c.lua_pop(L, 3); // execute (nil) + render_result + render_call
         return error.MissingExecute;
     }
     if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
-        c.lua_pop(L, 2);
+        c.lua_pop(L, 3);
         return error.InvalidExecute;
     }
     const execute_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
 
-    // Now ref render_result (still at top of stack if present).
+    // Now ref render_result then render_call (still on stack if present).
     const render_result_ref: ?c_int = if (has_render_result)
+        c.luaL_ref(L, c.LUA_REGISTRYINDEX)
+    else blk: {
+        c.lua_pop(L, 1); // the nil value we left on stack
+        break :blk null;
+    };
+    const render_call_ref: ?c_int = if (has_render_call)
         c.luaL_ref(L, c.LUA_REGISTRYINDEX)
     else blk: {
         c.lua_pop(L, 1); // the nil value we left on stack
@@ -272,6 +289,7 @@ fn buildExtensionTool(
         .prompt_guidelines = prompt_guidelines,
         .impl = .{ .lua = execute_ref },
         .source = currentRegistrationSource(runner),
+        .render_call_ref = render_call_ref,
         .render_result_ref = render_result_ref,
         .owned = true,
     };

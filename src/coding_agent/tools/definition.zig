@@ -37,6 +37,7 @@ pub const ToolDefinition = struct {
     prompt_guidelines: []const []const u8 = &.{},
     impl: ToolImpl,
     source: RegistrationSource,
+    render_call_ref: ?c_int = null,
     render_result_ref: ?c_int = null,
     owned: bool = false,
 };
@@ -85,6 +86,7 @@ pub fn cloneOwned(allocator: std.mem.Allocator, def: ToolDefinition) !ToolDefini
         .prompt_guidelines = prompt_guidelines,
         .impl = def.impl,
         .source = def.source,
+        .render_call_ref = def.render_call_ref,
         .render_result_ref = def.render_result_ref,
         .owned = true,
     };

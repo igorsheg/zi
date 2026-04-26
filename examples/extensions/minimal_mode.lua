@@ -12,6 +12,17 @@ return function(zi)
       },
       required = { "path" },
     },
+    render_call = function(args)
+      local path = args.path or "..."
+      return {
+        lines = {
+          {
+            { text = "read ", fg = "toolTitle", bold = true },
+            { text = path, fg = "accent" },
+          },
+        },
+      }
+    end,
     execute = function(params, ctx)
       local path = params.path or ""
       local cwd = (ctx and ctx.cwd) or "."

@@ -1,9 +1,9 @@
 //! Lua-driven tool renderers.
 //!
 //! Bridges the first vertical of zi's host-owned presentation contract:
-//! `zi.register_tool({ render_result = fn(result, ctx) ... })` is the
-//! tool `result` presentation slot and returns an owned, width-agnostic
-//! presentation document.
+//! `zi.register_tool({ render_call = ..., render_result = ... })` maps
+//! to the tool `call` and `result` presentation slots and returns owned,
+//! width-agnostic presentation documents.
 //!
 //! Since zi-wub.5/.6 the agent thread is the single owner of
 //! `lua_state`, so any `render_result` dispatch must happen there.
@@ -104,6 +104,12 @@ pub const LuaRenderState = struct {
 // Dispatch
 // ─────────────────────────────────────────────────────────────────
 
+pub const DispatchCallInput = struct {
+    tool_name: []const u8,
+    args: std.json.Value,
+    width: u32,
+};
+
 pub const DispatchInput = struct {
     tool_name: []const u8,
     args: std.json.Value,
@@ -111,6 +117,42 @@ pub const DispatchInput = struct {
     width: u32,
     is_error: bool,
 };
+
+/// Run the render_call hook for `tool_name` if one exists, and return
+/// an owned presentation document. Returns null on missing hook or any
+/// failure so callers can fall back to builtin/default call rendering.
+pub fn dispatchRenderCall(
+    allocator: std.mem.Allocator,
+    runner: *runner_mod.ExtensionRunner,
+    input: DispatchCallInput,
+) ?*LuaRenderState {
+    const tool = runner.tool_registry.get(input.tool_name) orelse return null;
+    const ref = tool.render_call_ref orelse return null;
+    const state_ptr = runner.lua_state orelse return null;
+
+    runner.assertOnLuaThread();
+    runner.setModuleContext(state_ptr, tool.source.provenance);
+
+    const out_state = allocator.create(LuaRenderState) catch return null;
+    out_state.* = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .collapsed = &.{},
+        .expanded = &.{},
+    };
+
+    out_state.collapsed = runOneCall(state_ptr, ref, input, false, out_state.arena.allocator()) catch |err| {
+        log.warn("render_call (collapsed) failed for '{s}': {s}", .{ input.tool_name, @errorName(err) });
+        out_state.deinit(allocator);
+        return null;
+    };
+    out_state.expanded = runOneCall(state_ptr, ref, input, true, out_state.arena.allocator()) catch |err| {
+        log.warn("render_call (expanded) failed for '{s}': {s}", .{ input.tool_name, @errorName(err) });
+        out_state.deinit(allocator);
+        return null;
+    };
+
+    return out_state;
+}
 
 /// Input variant that takes an `AgentToolResult` directly instead
 /// of a pre-built json.Value. Used by the transcript, which holds
@@ -313,6 +355,45 @@ const RenderError = error{
     PushFailed,
 };
 
+fn runOneCall(
+    state: *lua_runtime.LuaState,
+    ref: c_int,
+    input: DispatchCallInput,
+    expanded: bool,
+    arena: std.mem.Allocator,
+) RenderError![]const Line {
+    var co = lua_runtime.Coroutine.init(state) catch return error.CoroutineFailed;
+    defer co.deinit();
+
+    _ = c.lua_rawgeti(co.L, c.LUA_REGISTRYINDEX, ref);
+    if (c.lua_type(co.L, -1) != c.LUA_TFUNCTION) {
+        c.lua_pop(co.L, 1);
+        return error.NotAFunction;
+    }
+
+    lua_runtime.pushJsonValue(co.L, input.args) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.PushFailed,
+    };
+
+    c.lua_createtable(co.L, 0, 2);
+    c.lua_pushinteger(co.L, @intCast(input.width));
+    c.lua_setfield(co.L, -2, "width");
+    c.lua_pushboolean(co.L, if (expanded) 1 else 0);
+    c.lua_setfield(co.L, -2, "expanded");
+
+    const r = co.resumeWith(2) catch return error.CoroutineFailed;
+    switch (r.status) {
+        .yielded => return error.CoroutineFailed,
+        .ok, .finished => {},
+    }
+    if (r.nresults == 0) return &.{};
+
+    const top = c.lua_gettop(co.L);
+    defer c.lua_settop(co.L, top - r.nresults);
+    return parseReturnValue(arena, co.L, top);
+}
+
 fn runOne(
     state: *lua_runtime.LuaState,
     ref: c_int,
@@ -499,6 +580,73 @@ fn parseBgColor(name: []const u8) ?theme_mod.BgColor {
 
 const testing = std.testing;
 const api = @import("api.zig");
+
+test "dispatchRenderCall parses args into an owned call presentation document" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.register_tool({
+        \\  name = "callable",
+        \\  description = "callable",
+        \\  parameters = { type = "object" },
+        \\  execute = function() end,
+        \\  render_call = function(args, ctx)
+        \\    return {
+        \\      lines = { { { text = "call ", fg = "muted" }, { text = args.path, fg = "accent", bold = true } } }
+        \\    }
+        \\  end,
+        \\})
+    , "register");
+
+    var args_obj = std.json.ObjectMap.init(testing.allocator);
+    defer args_obj.deinit();
+    try args_obj.put("path", .{ .string = "src/main.zig" });
+
+    const out = dispatchRenderCall(testing.allocator, &runner, .{
+        .tool_name = "callable",
+        .args = .{ .object = args_obj },
+        .width = 80,
+    }) orelse return error.TestUnexpectedResult;
+    defer out.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), out.collapsed.len);
+    try testing.expectEqualStrings("call ", out.collapsed[0][0].text);
+    try testing.expectEqual(theme_mod.FgColor.muted, out.collapsed[0][0].fg.?);
+    try testing.expectEqualStrings("src/main.zig", out.collapsed[0][1].text);
+    try testing.expectEqual(theme_mod.FgColor.accent, out.collapsed[0][1].fg.?);
+    try testing.expect(out.collapsed[0][1].bold);
+}
+
+test "dispatchRenderCall on lua error returns null for fallback" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.register_tool({
+        \\  name = "bad_call",
+        \\  description = "bad",
+        \\  parameters = { type = "object" },
+        \\  execute = function() end,
+        \\  render_call = function() error("nope") end,
+        \\})
+    , "register");
+
+    const out = dispatchRenderCall(testing.allocator, &runner, .{
+        .tool_name = "bad_call",
+        .args = .null,
+        .width = 80,
+    });
+    try testing.expect(out == null);
+}
 
 test "dispatchRenderResult with no hook returns null" {
     var state = try lua_runtime.LuaState.init(testing.allocator);

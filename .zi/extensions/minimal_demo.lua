@@ -9,6 +9,16 @@ return function(zi)
         message = { type = "string", description = "Message to show when expanded" },
       },
     },
+    render_call = function(args)
+      return {
+        lines = {
+          {
+            { text = "minimal_demo ", fg = "toolTitle", bold = true },
+            { text = args.message or "default message", fg = "accent" },
+          },
+        },
+      }
+    end,
     execute = function(params)
       local message = params.message or "hello from the minimal presentation demo"
       return {
