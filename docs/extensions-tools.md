@@ -105,6 +105,10 @@ v2 tool definitions carry these classes directly.
 
 corollaries:
 
+- tool result `details` is an **open envelope**.
+  extensions may return arbitrary JSON there.
+  zi may additionally recognize versioned semantic families such as `{ kind = "diff", version = 2, ... }` for host-owned presentation and builtin-family renderer inheritance.
+  unknown or malformed details must fail open to generic content rendering, not reject the tool result.
 - `prepare` is public for builtin and extension tools equally.
   v2 does not keep a richer builtin-only prepare seam.
 - `presentation` is public for `call` and `result` separately.

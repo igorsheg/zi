@@ -12,6 +12,8 @@ const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const json_util = @import("../../ai/json_util.zig");
+const diff_view = @import("../../lib/diff_view.zig");
+const tool_result_details = @import("../../lib/tool_result_details.zig");
 const agent_protocol = @import("../../agent3/root.zig").protocol;
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
@@ -216,15 +218,94 @@ fn rebuildLiteralSurface(surface: *OwnedSurface, text: []const u8, collapsed_exc
 }
 
 fn rebuildEditSurface(surface: *OwnedSurface, ctx: *const ToolStateContext) !void {
-    if (ctx.result == null) {
+    const result = ctx.result orelse {
         try rebuildLiteralSurface(surface, "malformed edit result: missing tool result", &TAIL_5);
         return;
+    };
+
+    var details = tool_result_details.diffFromJsonValue(surface.allocator, result.details) catch {
+        try rebuildTextSurface(surface, ctx.result, .plain, &DIFF_COLLAPSED);
+        return;
+    };
+    defer details.deinit();
+
+    var view = try diff_view.buildView(surface.allocator, details.document());
+    defer view.deinit();
+
+    try rebuildDiffSurface(surface, view);
+}
+
+fn rebuildDiffSurface(surface: *OwnedSurface, view: diff_view.DiffView) !void {
+    surface.stats = .{ .added = view.stats.added, .removed = view.stats.removed };
+
+    if (view.files.len == 1) {
+        surface.setHeaderOwned(try surface.allocator.dupe(u8, view.files[0].path));
+    } else {
+        surface.setHeaderOwned(try std.fmt.allocPrint(surface.allocator, "{d} files", .{view.files.len}));
     }
 
-    // Diagnostic mode: bypass structured diff decoding/render prep and
-    // render the unified diff text directly so we can isolate whether the
-    // structuredDiff payload/path is causing the TUI stall.
-    try rebuildTextSurface(surface, ctx.result, .plain, &DIFF_COLLAPSED);
+    var max_gutter: usize = 0;
+    for (view.files, 0..) |file, file_index| {
+        if (view.files.len > 1) {
+            const file_text = try surface.allocator.dupe(u8, file.path);
+            surface.owned_texts.append(surface.allocator, file_text) catch |err| {
+                surface.allocator.free(file_text);
+                return err;
+            };
+            try surface.rows.append(surface.allocator, .{ .text = file_text, .highlight = false });
+        }
+
+        for (file.rows) |row| {
+            if (row.kind == .gap) {
+                try surface.rows.append(surface.allocator, .{ .is_elision = true, .elision_count = row.gap_count });
+                continue;
+            }
+
+            const text = try surface.allocator.dupe(u8, row.text);
+            surface.owned_texts.append(surface.allocator, text) catch |err| {
+                surface.allocator.free(text);
+                return err;
+            };
+
+            const gutter = try formatDiffGutter(surface.allocator, row);
+            if (gutter) |g| {
+                surface.owned_gutters.append(surface.allocator, g) catch |err| {
+                    surface.allocator.free(g);
+                    return err;
+                };
+                max_gutter = @max(max_gutter, g.len);
+            }
+
+            try surface.rows.append(surface.allocator, .{
+                .gutter = gutter,
+                .text = text,
+                .style = switch (row.kind) {
+                    .context => .context,
+                    .added => .added,
+                    .removed => .removed,
+                    .gap => .none,
+                },
+            });
+        }
+
+        if (file_index + 1 < view.files.len) {
+            try surface.rows.append(surface.allocator, .{ .is_elision = true, .elision_count = 1 });
+        }
+    }
+
+    surface.gutter_width = @intCast(max_gutter);
+    try surface.setCollapsedExcerpts(&DIFF_COLLAPSED);
+}
+
+fn formatDiffGutter(allocator: Allocator, row: diff_view.Row) !?[]u8 {
+    const line_no = switch (row.kind) {
+        .removed => row.old_lineno,
+        .added => row.new_lineno,
+        .context => row.new_lineno orelse row.old_lineno,
+        .gap => null,
+    };
+    const resolved = line_no orelse return null;
+    return try std.fmt.allocPrint(allocator, "{d}", .{resolved});
 }
 
 fn renderTitle(
@@ -655,6 +736,72 @@ test "edit renderer renders unified diff text without structured diff details" {
     try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row3), "one") != null);
     try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 5, &row4), "-two") != null);
     try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 6, &row5), "+TWO") != null);
+}
+
+test "edit renderer uses structured diff details when available" {
+    const diff_mod = @import("../../lib/diff.zig");
+
+    var doc = try diff_mod.buildDocument(testing.allocator, &[_]diff_mod.Input{.{
+        .old_path = "a.txt",
+        .new_path = "a.txt",
+        .old_text = "one\ntwo\nthree\n",
+        .new_text = "one\nTWO\nthree\n",
+    }}, .{});
+    defer doc.deinit();
+
+    const details = try tool_result_details.diffToJsonValue(testing.allocator, doc.document);
+    defer json_util.freeJsonValue(testing.allocator, details);
+
+    const content = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
+    defer {
+        testing.allocator.free(content[0].text.text);
+        testing.allocator.free(content);
+    }
+    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(u8, "fallback unified text") } };
+
+    const result = agent_protocol.AgentToolResult{
+        .content = content,
+        .details = details,
+        .is_error = false,
+    };
+
+    const state = try prepareRendererStateForTest(testing.allocator, edit_renderer, result, false);
+    defer if (state) |resolved| {
+        if (edit_renderer.deinit_state) |deinit_fn| deinit_fn(resolved, testing.allocator);
+    };
+
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 12);
+    defer buf.deinit();
+
+    var ctx = ToolRenderContext{
+        .tool_name = "edit",
+        .tool_call_id = "call-structured",
+        .args = .null,
+        .result = result,
+        .is_partial = false,
+        .is_error = false,
+        .expanded = true,
+        .execution_started = true,
+        .args_complete = true,
+        .theme = themes_builtin.dark(),
+        .allocator = testing.allocator,
+        .state = state,
+        .region = buf.region(),
+        .width = buf.width,
+    };
+
+    edit_renderer.render_result_slice.?(&ctx, 0);
+
+    var row0: [80]u8 = undefined;
+    var row1: [80]u8 = undefined;
+    var row2: [80]u8 = undefined;
+    var row3: [80]u8 = undefined;
+    var row4: [80]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 0, &row0), "+1 -1") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 1, &row1), "a.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 2, &row2), "one") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 3, &row3), "two") != null);
+    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "TWO") != null);
 }
 
 test "edit renderer shows malformed result message when tool result is missing" {

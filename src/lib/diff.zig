@@ -1,8 +1,9 @@
 //! Line-level diff component.
 //!
-//! Produces a structured document diff from one or more file changes.
-//! The core Myers line-diff and hunk grouping behavior stays identical;
-//! only the canonical data model is widened from one file to many.
+//! Produces an arena-owned semantic diff document. The public model is
+//! block-oriented: replacements are first-class hunk blocks rather than a
+//! delete/insert side channel. Unified text, JSON, and TUI projections derive
+//! from this model.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,11 +14,74 @@ pub const DiffOp = enum {
     delete,
 };
 
-pub const DiffLine = struct {
-    op: DiffOp,
+pub const Line = struct {
     text: []const u8,
-    old_lineno: ?u32 = null,
-    new_lineno: ?u32 = null,
+};
+
+pub const ContextBlock = struct {
+    old_start: u32,
+    new_start: u32,
+    lines: []const Line,
+};
+
+pub const DeleteBlock = struct {
+    old_start: u32,
+    lines: []const Line,
+};
+
+pub const InsertBlock = struct {
+    new_start: u32,
+    lines: []const Line,
+};
+
+pub const ReplaceBlock = struct {
+    old_start: u32,
+    new_start: u32,
+    old_lines: []const Line,
+    new_lines: []const Line,
+};
+
+pub const HunkBlock = union(enum) {
+    context: ContextBlock,
+    delete: DeleteBlock,
+    insert: InsertBlock,
+    replace: ReplaceBlock,
+
+    pub fn oldCount(self: HunkBlock) u32 {
+        return switch (self) {
+            .context => |b| @intCast(b.lines.len),
+            .delete => |b| @intCast(b.lines.len),
+            .insert => 0,
+            .replace => |b| @intCast(b.old_lines.len),
+        };
+    }
+
+    pub fn newCount(self: HunkBlock) u32 {
+        return switch (self) {
+            .context => |b| @intCast(b.lines.len),
+            .delete => 0,
+            .insert => |b| @intCast(b.lines.len),
+            .replace => |b| @intCast(b.new_lines.len),
+        };
+    }
+
+    pub fn oldStart(self: HunkBlock) ?u32 {
+        return switch (self) {
+            .context => |b| b.old_start,
+            .delete => |b| b.old_start,
+            .insert => null,
+            .replace => |b| b.old_start,
+        };
+    }
+
+    pub fn newStart(self: HunkBlock) ?u32 {
+        return switch (self) {
+            .context => |b| b.new_start,
+            .delete => null,
+            .insert => |b| b.new_start,
+            .replace => |b| b.new_start,
+        };
+    }
 };
 
 pub const Hunk = struct {
@@ -25,7 +89,7 @@ pub const Hunk = struct {
     old_count: u32,
     new_start: u32,
     new_count: u32,
-    lines: []const DiffLine,
+    blocks: []const HunkBlock,
 };
 
 pub const Stats = struct {
@@ -43,8 +107,6 @@ pub const FileChange = struct {
     new_path: []const u8,
     hunks: []const Hunk,
     stats: Stats,
-    owns_paths: bool = false,
-    owns_line_text: bool = false,
 };
 
 pub const Input = struct {
@@ -57,32 +119,41 @@ pub const Input = struct {
 pub const DiffDocument = struct {
     changes: []const FileChange,
     stats: Stats,
-    allocator: Allocator,
+};
 
-    pub fn deinit(self: *DiffDocument) void {
-        for (self.changes) |change| {
-            if (change.owns_paths) {
-                self.allocator.free(change.old_path);
-                self.allocator.free(change.new_path);
-            }
-            for (change.hunks) |h| {
-                if (change.owns_line_text) {
-                    for (h.lines) |line| self.allocator.free(line.text);
-                }
-                self.allocator.free(h.lines);
-            }
-            self.allocator.free(change.hunks);
-        }
-        self.allocator.free(self.changes);
+pub const OwnedDocument = struct {
+    document: DiffDocument,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *OwnedDocument) void {
+        self.arena.deinit();
+        self.* = undefined;
     }
 };
 
-const RawOp = struct {
-    kind: DiffOp,
-    idx: u32,
+const RawOp = union(enum) {
+    equal: struct { old_index: u32, new_index: u32 },
+    delete: u32,
+    insert: u32,
 };
 
-fn myers(
+const Range = struct {
+    start: u32,
+    end: u32,
+
+    fn len(self: Range) u32 {
+        return self.end - self.start;
+    }
+};
+
+const Opcode = union(enum) {
+    equal: struct { old: Range, new: Range },
+    delete: struct { old: Range, new_at: u32 },
+    insert: struct { old_at: u32, new: Range },
+    replace: struct { old: Range, new: Range },
+};
+
+fn myersOps(
     allocator: Allocator,
     a: []const []const u8,
     b: []const []const u8,
@@ -169,16 +240,16 @@ fn myers(
         const prev_y: i64 = prev_x - prev_k;
 
         while (x > prev_x and y > prev_y) {
-            try ops_rev.append(allocator, .{ .kind = .equal, .idx = @intCast(x - 1) });
+            try ops_rev.append(allocator, .{ .equal = .{ .old_index = @intCast(x - 1), .new_index = @intCast(y - 1) } });
             x -= 1;
             y -= 1;
         }
         if (d_walk > 0) {
             if (x > prev_x) {
-                try ops_rev.append(allocator, .{ .kind = .delete, .idx = @intCast(x - 1) });
+                try ops_rev.append(allocator, .{ .delete = @intCast(x - 1) });
                 x -= 1;
             } else {
-                try ops_rev.append(allocator, .{ .kind = .insert, .idx = @intCast(y - 1) });
+                try ops_rev.append(allocator, .{ .insert = @intCast(y - 1) });
                 y -= 1;
             }
         }
@@ -191,6 +262,104 @@ fn myers(
     return ops;
 }
 
+fn appendOpcode(opcodes: *std.ArrayList(Opcode), allocator: Allocator, opcode: Opcode) !void {
+    switch (opcode) {
+        .equal => |eq| {
+            if (opcodes.items.len > 0 and opcodes.items[opcodes.items.len - 1] == .equal) {
+                const last = &opcodes.items[opcodes.items.len - 1].equal;
+                if (last.old.end == eq.old.start and last.new.end == eq.new.start) {
+                    last.old.end = eq.old.end;
+                    last.new.end = eq.new.end;
+                    return;
+                }
+            }
+        },
+        .delete => |del| {
+            if (opcodes.items.len > 0 and opcodes.items[opcodes.items.len - 1] == .delete) {
+                const last = &opcodes.items[opcodes.items.len - 1].delete;
+                if (last.old.end == del.old.start and last.new_at == del.new_at) {
+                    last.old.end = del.old.end;
+                    return;
+                }
+            }
+        },
+        .insert => |ins| {
+            if (opcodes.items.len > 0 and opcodes.items[opcodes.items.len - 1] == .insert) {
+                const last = &opcodes.items[opcodes.items.len - 1].insert;
+                if (last.old_at == ins.old_at and last.new.end == ins.new.start) {
+                    last.new.end = ins.new.end;
+                    return;
+                }
+            }
+        },
+        .replace => {},
+    }
+    try opcodes.append(allocator, opcode);
+}
+
+fn compactReplacements(allocator: Allocator, opcodes: []const Opcode) ![]Opcode {
+    var out: std.ArrayList(Opcode) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < opcodes.len) {
+        if (i + 1 < opcodes.len and opcodes[i] == .delete and opcodes[i + 1] == .insert) {
+            const del = opcodes[i].delete;
+            const ins = opcodes[i + 1].insert;
+            if (del.new_at == ins.new.start and ins.old_at == del.old.end) {
+                try out.append(allocator, .{ .replace = .{ .old = del.old, .new = ins.new } });
+                i += 2;
+                continue;
+            }
+        }
+        try out.append(allocator, opcodes[i]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn myersOpcodes(
+    allocator: Allocator,
+    a: []const []const u8,
+    b: []const []const u8,
+) ![]Opcode {
+    const raw_ops = try myersOps(allocator, a, b);
+    defer allocator.free(raw_ops);
+
+    var opcodes: std.ArrayList(Opcode) = .empty;
+    defer opcodes.deinit(allocator);
+
+    var old_cursor: u32 = 0;
+    var new_cursor: u32 = 0;
+    for (raw_ops) |op| switch (op) {
+        .equal => |eq| {
+            try appendOpcode(&opcodes, allocator, .{ .equal = .{
+                .old = .{ .start = eq.old_index, .end = eq.old_index + 1 },
+                .new = .{ .start = eq.new_index, .end = eq.new_index + 1 },
+            } });
+            old_cursor = eq.old_index + 1;
+            new_cursor = eq.new_index + 1;
+        },
+        .delete => |old_index| {
+            try appendOpcode(&opcodes, allocator, .{ .delete = .{
+                .old = .{ .start = old_index, .end = old_index + 1 },
+                .new_at = new_cursor,
+            } });
+            old_cursor = old_index + 1;
+        },
+        .insert => |new_index| {
+            try appendOpcode(&opcodes, allocator, .{ .insert = .{
+                .old_at = old_cursor,
+                .new = .{ .start = new_index, .end = new_index + 1 },
+            } });
+            new_cursor = new_index + 1;
+        },
+    };
+
+    return compactReplacements(allocator, opcodes.items);
+}
+
 fn splitLines(allocator: Allocator, s: []const u8) ![][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(allocator);
@@ -199,137 +368,195 @@ fn splitLines(allocator: Allocator, s: []const u8) ![][]const u8 {
     return list.toOwnedSlice(allocator);
 }
 
-fn diffLinesRaw(
-    allocator: Allocator,
-    a_lines: []const []const u8,
-    b_lines: []const []const u8,
-) ![]DiffLine {
-    const ops = try myers(allocator, a_lines, b_lines);
-    defer allocator.free(ops);
-
-    const out = try allocator.alloc(DiffLine, ops.len);
-    var old_lineno: u32 = 1;
-    var new_lineno: u32 = 1;
-    for (ops, 0..) |op, i| {
-        out[i] = switch (op.kind) {
-            .equal => .{ .op = .equal, .text = a_lines[op.idx], .old_lineno = old_lineno, .new_lineno = new_lineno },
-            .delete => .{ .op = .delete, .text = a_lines[op.idx], .old_lineno = old_lineno },
-            .insert => .{ .op = .insert, .text = b_lines[op.idx], .new_lineno = new_lineno },
-        };
-        switch (op.kind) {
-            .equal => {
-                old_lineno += 1;
-                new_lineno += 1;
-            },
-            .delete => old_lineno += 1,
-            .insert => new_lineno += 1,
-        }
-    }
-    return out;
-}
-
 const DEFAULT_CTX: u32 = 3;
 
-fn buildHunks(
+fn opcodeHasChanges(opcode: Opcode) bool {
+    return opcode != .equal;
+}
+
+fn findNextChange(opcodes: []const Opcode, start: usize) ?usize {
+    var i = start;
+    while (i < opcodes.len) : (i += 1) {
+        if (opcodeHasChanges(opcodes[i])) return i;
+    }
+    return null;
+}
+
+fn ownLines(allocator: Allocator, source: []const []const u8, range: Range) ![]Line {
+    const lines = try allocator.alloc(Line, range.len());
+    var out_index: usize = 0;
+    var source_index = range.start;
+    errdefer {
+        for (lines[0..out_index]) |line| allocator.free(line.text);
+        allocator.free(lines);
+    }
+    while (source_index < range.end) : (source_index += 1) {
+        lines[out_index] = .{ .text = try allocator.dupe(u8, source[source_index]) };
+        out_index += 1;
+    }
+    return lines;
+}
+
+fn appendContextBlock(
     allocator: Allocator,
-    flat: []const DiffLine,
+    blocks: *std.ArrayList(HunkBlock),
+    eq: @FieldType(Opcode, "equal"),
+    offset: u32,
+    len: u32,
+    a_lines: []const []const u8,
+) !void {
+    if (len == 0) return;
+    try blocks.append(allocator, .{ .context = .{
+        .old_start = eq.old.start + offset + 1,
+        .new_start = eq.new.start + offset + 1,
+        .lines = try ownLines(allocator, a_lines, .{ .start = eq.old.start + offset, .end = eq.old.start + offset + len }),
+    } });
+}
+
+fn appendOpcodeBlock(
+    allocator: Allocator,
+    blocks: *std.ArrayList(HunkBlock),
+    opcode: Opcode,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
+) !void {
+    switch (opcode) {
+        .equal => |eq| try appendContextBlock(allocator, blocks, eq, 0, eq.old.len(), a_lines),
+        .delete => |del| try blocks.append(allocator, .{ .delete = .{
+            .old_start = del.old.start + 1,
+            .lines = try ownLines(allocator, a_lines, del.old),
+        } }),
+        .insert => |ins| try blocks.append(allocator, .{ .insert = .{
+            .new_start = ins.new.start + 1,
+            .lines = try ownLines(allocator, b_lines, ins.new),
+        } }),
+        .replace => |rep| try blocks.append(allocator, .{ .replace = .{
+            .old_start = rep.old.start + 1,
+            .new_start = rep.new.start + 1,
+            .old_lines = try ownLines(allocator, a_lines, rep.old),
+            .new_lines = try ownLines(allocator, b_lines, rep.new),
+        } }),
+    }
+}
+
+fn makeHunk(allocator: Allocator, blocks_in: []const HunkBlock) !Hunk {
+    const blocks = try allocator.dupe(HunkBlock, blocks_in);
+
+    var old_start: u32 = 0;
+    var new_start: u32 = 0;
+    var old_count: u32 = 0;
+    var new_count: u32 = 0;
+    for (blocks) |block| {
+        if (block.oldStart()) |ln| {
+            if (old_start == 0) old_start = ln;
+        }
+        if (block.newStart()) |ln| {
+            if (new_start == 0) new_start = ln;
+        }
+        old_count += block.oldCount();
+        new_count += block.newCount();
+    }
+
+    return .{
+        .old_start = if (old_count == 0) 0 else old_start,
+        .old_count = old_count,
+        .new_start = if (new_count == 0) 0 else new_start,
+        .new_count = new_count,
+        .blocks = blocks,
+    };
+}
+
+fn buildHunksFromOpcodes(
+    document_allocator: Allocator,
+    opcodes: []const Opcode,
+    a_lines: []const []const u8,
+    b_lines: []const []const u8,
     ctx: u32,
 ) ![]Hunk {
     var hunks: std.ArrayList(Hunk) = .empty;
-    errdefer {
-        for (hunks.items) |h| allocator.free(h.lines);
-        hunks.deinit(allocator);
-    }
+    errdefer hunks.deinit(document_allocator);
 
-    var i: usize = 0;
-    while (i < flat.len) {
-        while (i < flat.len and flat[i].op == .equal) : (i += 1) {}
-        if (i >= flat.len) break;
+    var i = findNextChange(opcodes, 0) orelse return hunks.toOwnedSlice(document_allocator);
+    while (i < opcodes.len) {
+        var blocks: std.ArrayList(HunkBlock) = .empty;
+        defer blocks.deinit(document_allocator);
 
-        const hunk_start: usize = i -| ctx;
-
-        var j = i;
-        while (j < flat.len) {
-            while (j < flat.len and flat[j].op != .equal) : (j += 1) {}
-            var k = j;
-            while (k < flat.len and k - j < 2 * ctx and flat[k].op == .equal) : (k += 1) {}
-            if (k < flat.len and flat[k].op != .equal) {
-                j = k;
-                continue;
-            }
-            break;
+        if (i > 0 and opcodes[i - 1] == .equal) {
+            const eq = opcodes[i - 1].equal;
+            const keep = @min(ctx, eq.old.len());
+            try appendContextBlock(document_allocator, &blocks, eq, eq.old.len() - keep, keep, a_lines);
         }
-        const hunk_end: usize = @min(flat.len, j + ctx);
 
-        const span = flat[hunk_start..hunk_end];
-        const lines_copy = try allocator.dupe(DiffLine, span);
-
-        var old_start: u32 = 0;
-        var new_start: u32 = 0;
-        var old_count: u32 = 0;
-        var new_count: u32 = 0;
-        for (span) |dl| {
-            if (dl.old_lineno) |ln| {
-                if (old_start == 0) old_start = ln;
-                old_count += 1;
-            }
-            if (dl.new_lineno) |ln| {
-                if (new_start == 0) new_start = ln;
-                new_count += 1;
+        while (i < opcodes.len) {
+            switch (opcodes[i]) {
+                .equal => |eq| {
+                    const next_change = findNextChange(opcodes, i + 1);
+                    if (next_change == null) {
+                        try appendContextBlock(document_allocator, &blocks, eq, 0, @min(ctx, eq.old.len()), a_lines);
+                        i += 1;
+                        break;
+                    }
+                    if (eq.old.len() > 2 * ctx) {
+                        try appendContextBlock(document_allocator, &blocks, eq, 0, ctx, a_lines);
+                        i = next_change.?;
+                        break;
+                    }
+                    try appendContextBlock(document_allocator, &blocks, eq, 0, eq.old.len(), a_lines);
+                    i += 1;
+                },
+                else => {
+                    try appendOpcodeBlock(document_allocator, &blocks, opcodes[i], a_lines, b_lines);
+                    i += 1;
+                },
             }
         }
-        try hunks.append(allocator, .{
-            .old_start = if (old_count == 0) 0 else old_start,
-            .old_count = old_count,
-            .new_start = if (new_count == 0) 0 else new_start,
-            .new_count = new_count,
-            .lines = lines_copy,
-        });
 
-        i = hunk_end;
+        try hunks.append(document_allocator, try makeHunk(document_allocator, blocks.items));
+        i = findNextChange(opcodes, i) orelse break;
     }
 
-    return hunks.toOwnedSlice(allocator);
+    return hunks.toOwnedSlice(document_allocator);
 }
 
 pub const BuildOptions = struct {
     context: u32 = DEFAULT_CTX,
 };
 
-pub fn buildFile(
-    allocator: Allocator,
+fn buildFile(
+    document_allocator: Allocator,
+    scratch_allocator: Allocator,
     old_path: []const u8,
     new_path: []const u8,
     old_text: []const u8,
     new_text: []const u8,
     options: BuildOptions,
 ) !FileChange {
-    const a_lines = try splitLines(allocator, old_text);
-    defer allocator.free(a_lines);
-    const b_lines = try splitLines(allocator, new_text);
-    defer allocator.free(b_lines);
+    const a_lines = try splitLines(scratch_allocator, old_text);
+    defer scratch_allocator.free(a_lines);
+    const b_lines = try splitLines(scratch_allocator, new_text);
+    defer scratch_allocator.free(b_lines);
 
-    const flat = try diffLinesRaw(allocator, a_lines, b_lines);
-    defer allocator.free(flat);
+    const opcodes = try myersOpcodes(scratch_allocator, a_lines, b_lines);
+    defer scratch_allocator.free(opcodes);
 
-    const hunks = try buildHunks(allocator, flat, options.context);
-    errdefer {
-        for (hunks) |h| allocator.free(h.lines);
-        allocator.free(hunks);
-    }
+    const hunks = try buildHunksFromOpcodes(document_allocator, opcodes, a_lines, b_lines, options.context);
 
     var stats = Stats{};
     for (hunks) |h| {
-        for (h.lines) |dl| switch (dl.op) {
-            .insert => stats.added += 1,
-            .delete => stats.removed += 1,
-            .equal => {},
+        for (h.blocks) |block| switch (block) {
+            .context => {},
+            .delete => |b| stats.removed += @intCast(b.lines.len),
+            .insert => |b| stats.added += @intCast(b.lines.len),
+            .replace => |b| {
+                stats.removed += @intCast(b.old_lines.len);
+                stats.added += @intCast(b.new_lines.len);
+            },
         };
     }
 
     return .{
-        .old_path = old_path,
-        .new_path = new_path,
+        .old_path = try document_allocator.dupe(u8, old_path),
+        .new_path = try document_allocator.dupe(u8, new_path),
         .hunks = hunks,
         .stats = stats,
     };
@@ -339,21 +566,17 @@ pub fn buildDocument(
     allocator: Allocator,
     inputs: []const Input,
     options: BuildOptions,
-) !DiffDocument {
-    const changes = try allocator.alloc(FileChange, inputs.len);
-    errdefer allocator.free(changes);
+) !OwnedDocument {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const document_allocator = arena.allocator();
 
-    var built: usize = 0;
-    errdefer {
-        for (changes[0..built]) |change| {
-            for (change.hunks) |h| allocator.free(h.lines);
-            allocator.free(change.hunks);
-        }
-    }
+    const changes = try document_allocator.alloc(FileChange, inputs.len);
 
     var stats = Stats{};
     for (inputs, 0..) |input, i| {
         changes[i] = try buildFile(
+            document_allocator,
             allocator,
             input.old_path,
             input.new_path,
@@ -361,67 +584,77 @@ pub fn buildDocument(
             input.new_text,
             options,
         );
-        built += 1;
         stats.add(changes[i].stats);
     }
 
     return .{
-        .changes = changes,
-        .stats = stats,
-        .allocator = allocator,
+        .document = .{
+            .changes = changes,
+            .stats = stats,
+        },
+        .arena = arena,
     };
 }
 
 const testing = std.testing;
 
-test "myers: identical inputs → all equal ops" {
+test "myers opcodes coalesce identical input into one equal opcode" {
     const a = [_][]const u8{ "foo", "bar", "baz" };
-    const ops = try myers(testing.allocator, &a, &a);
-    defer testing.allocator.free(ops);
-    try testing.expectEqual(@as(usize, 3), ops.len);
-    for (ops) |op| try testing.expectEqual(DiffOp.equal, op.kind);
+    const opcodes = try myersOpcodes(testing.allocator, &a, &a);
+    defer testing.allocator.free(opcodes);
+    try testing.expectEqual(@as(usize, 1), opcodes.len);
+    try testing.expect(opcodes[0] == .equal);
+    try testing.expectEqual(@as(u32, 0), opcodes[0].equal.old.start);
+    try testing.expectEqual(@as(u32, 3), opcodes[0].equal.old.end);
+    try testing.expectEqual(@as(u32, 0), opcodes[0].equal.new.start);
+    try testing.expectEqual(@as(u32, 3), opcodes[0].equal.new.end);
 }
 
-test "myers: single line modification → delete + insert" {
+test "myers opcodes represent a single line modification as replace" {
     const a = [_][]const u8{ "foo", "bar", "baz" };
     const b = [_][]const u8{ "foo", "BAR", "baz" };
-    const ops = try myers(testing.allocator, &a, &b);
-    defer testing.allocator.free(ops);
-    try testing.expectEqual(@as(usize, 4), ops.len);
-    try testing.expectEqual(DiffOp.equal, ops[0].kind);
-    try testing.expectEqual(DiffOp.delete, ops[1].kind);
-    try testing.expectEqual(DiffOp.insert, ops[2].kind);
-    try testing.expectEqual(DiffOp.equal, ops[3].kind);
+    const opcodes = try myersOpcodes(testing.allocator, &a, &b);
+    defer testing.allocator.free(opcodes);
+    try testing.expectEqual(@as(usize, 3), opcodes.len);
+    try testing.expect(opcodes[0] == .equal);
+    try testing.expect(opcodes[1] == .replace);
+    try testing.expect(opcodes[2] == .equal);
+    try testing.expectEqual(@as(u32, 1), opcodes[1].replace.old.start);
+    try testing.expectEqual(@as(u32, 2), opcodes[1].replace.old.end);
+    try testing.expectEqual(@as(u32, 1), opcodes[1].replace.new.start);
+    try testing.expectEqual(@as(u32, 2), opcodes[1].replace.new.end);
 }
 
-test "buildFile: produces single hunk with context for small edit" {
+test "buildFile produces one hunk with first-class replace block" {
     const a = "line1\nline2\nline3\nline4\nline5\n";
     const b = "line1\nline2\nLINE3\nline4\nline5\n";
-    const change = try buildFile(testing.allocator, "test.txt", "test.txt", a, b, .{});
-    defer {
-        for (change.hunks) |h| testing.allocator.free(h.lines);
-        testing.allocator.free(change.hunks);
-    }
+    var doc = try buildDocument(testing.allocator, &[_]Input{.{ .old_path = "test.txt", .new_path = "test.txt", .old_text = a, .new_text = b }}, .{});
+    defer doc.deinit();
+    const change = doc.document.changes[0];
 
     try testing.expectEqual(@as(usize, 1), change.hunks.len);
     try testing.expectEqual(@as(u32, 1), change.stats.added);
     try testing.expectEqual(@as(u32, 1), change.stats.removed);
 
     const h = change.hunks[0];
-    var deletes: u32 = 0;
-    var inserts: u32 = 0;
-    var equals: u32 = 0;
-    for (h.lines) |dl| switch (dl.op) {
-        .delete => deletes += 1,
-        .insert => inserts += 1,
-        .equal => equals += 1,
+    var contexts: u32 = 0;
+    var replaces: u32 = 0;
+    for (h.blocks) |block| switch (block) {
+        .context => contexts += 1,
+        .replace => |rep| {
+            replaces += 1;
+            try testing.expectEqual(@as(u32, 3), rep.old_start);
+            try testing.expectEqual(@as(u32, 3), rep.new_start);
+            try testing.expectEqual(@as(usize, 1), rep.old_lines.len);
+            try testing.expectEqual(@as(usize, 1), rep.new_lines.len);
+        },
+        else => {},
     };
-    try testing.expectEqual(@as(u32, 1), deletes);
-    try testing.expectEqual(@as(u32, 1), inserts);
-    try testing.expectEqual(@as(u32, 5), equals);
+    try testing.expect(contexts > 0);
+    try testing.expectEqual(@as(u32, 1), replaces);
 }
 
-test "buildDocument: aggregates multiple file changes" {
+test "buildDocument aggregates multiple file changes" {
     const inputs = [_]Input{
         .{ .old_path = "a.txt", .new_path = "a.txt", .old_text = "foo\nbar\n", .new_text = "foo\nBAR\n" },
         .{ .old_path = "b.txt", .new_path = "b.txt", .old_text = "one\ntwo\n", .new_text = "one\ntwo\nthree\n" },
@@ -430,12 +663,12 @@ test "buildDocument: aggregates multiple file changes" {
     var doc = try buildDocument(testing.allocator, &inputs, .{});
     defer doc.deinit();
 
-    try testing.expectEqual(@as(usize, 2), doc.changes.len);
-    try testing.expectEqual(@as(u32, 2), doc.stats.added);
-    try testing.expectEqual(@as(u32, 1), doc.stats.removed);
+    try testing.expectEqual(@as(usize, 2), doc.document.changes.len);
+    try testing.expectEqual(@as(u32, 2), doc.document.stats.added);
+    try testing.expectEqual(@as(u32, 1), doc.document.stats.removed);
 }
 
-test "buildFile: two distant edits produce two hunks" {
+test "buildFile two distant edits produce two hunks" {
     const a =
         \\l1
         \\l2
@@ -460,15 +693,12 @@ test "buildFile: two distant edits produce two hunks" {
         \\L9
         \\l10
     ;
-    const change = try buildFile(testing.allocator, "f", "f", a, b, .{});
-    defer {
-        for (change.hunks) |h| testing.allocator.free(h.lines);
-        testing.allocator.free(change.hunks);
-    }
-    try testing.expectEqual(@as(usize, 2), change.hunks.len);
+    var doc = try buildDocument(testing.allocator, &[_]Input{.{ .old_path = "f", .new_path = "f", .old_text = a, .new_text = b }}, .{});
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 2), doc.document.changes[0].hunks.len);
 }
 
-test "buildFile: close edits merge into one hunk" {
+test "buildFile close edits merge into one hunk" {
     const a =
         \\l1
         \\l2
@@ -485,10 +715,7 @@ test "buildFile: close edits merge into one hunk" {
         \\l5
         \\l6
     ;
-    const change = try buildFile(testing.allocator, "f", "f", a, b, .{});
-    defer {
-        for (change.hunks) |h| testing.allocator.free(h.lines);
-        testing.allocator.free(change.hunks);
-    }
-    try testing.expectEqual(@as(usize, 1), change.hunks.len);
+    var doc = try buildDocument(testing.allocator, &[_]Input{.{ .old_path = "f", .new_path = "f", .old_text = a, .new_text = b }}, .{});
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 1), doc.document.changes[0].hunks.len);
 }

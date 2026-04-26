@@ -16,16 +16,15 @@ pub fn toUnified(allocator: std.mem.Allocator, document: diff.DiffDocument) ![]u
             try w.writeAll(" +");
             try writeRange(w, h.new_start, h.new_count);
             try w.writeAll(" @@\n");
-            for (h.lines) |dl| {
-                const prefix: u8 = switch (dl.op) {
-                    .equal => ' ',
-                    .insert => '+',
-                    .delete => '-',
-                };
-                try w.writeByte(prefix);
-                try w.writeAll(dl.text);
-                try w.writeByte('\n');
-            }
+            for (h.blocks) |block| switch (block) {
+                .context => |ctx| for (ctx.lines) |line| try writeLine(w, ' ', line),
+                .delete => |del| for (del.lines) |line| try writeLine(w, '-', line),
+                .insert => |ins| for (ins.lines) |line| try writeLine(w, '+', line),
+                .replace => |rep| {
+                    for (rep.old_lines) |line| try writeLine(w, '-', line);
+                    for (rep.new_lines) |line| try writeLine(w, '+', line);
+                },
+            };
         }
         if (change_index + 1 < document.changes.len) try w.writeByte('\n');
     }
@@ -35,6 +34,12 @@ pub fn toUnified(allocator: std.mem.Allocator, document: diff.DiffDocument) ![]u
 
 fn writeRange(w: *std.Io.Writer, start: u32, count: u32) !void {
     try w.print("{d},{d}", .{ start, count });
+}
+
+fn writeLine(w: *std.Io.Writer, prefix: u8, line: diff.Line) !void {
+    try w.writeByte(prefix);
+    try w.writeAll(line.text);
+    try w.writeByte('\n');
 }
 
 const testing = std.testing;
@@ -47,7 +52,7 @@ test "toUnified: emits multiple file sections" {
     var doc = try diff.buildDocument(testing.allocator, &inputs, .{});
     defer doc.deinit();
 
-    const out = try toUnified(testing.allocator, doc);
+    const out = try toUnified(testing.allocator, doc.document);
     defer testing.allocator.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "--- a.txt\n+++ a.txt\n@@ ") != null);
@@ -62,7 +67,7 @@ test "toUnified: no-change document still emits headers per file" {
     var doc = try diff.buildDocument(testing.allocator, &inputs, .{});
     defer doc.deinit();
 
-    const out = try toUnified(testing.allocator, doc);
+    const out = try toUnified(testing.allocator, doc.document);
     defer testing.allocator.free(out);
 
     try testing.expectEqualStrings("--- f\n+++ f\n", out);

@@ -72,18 +72,57 @@ fn buildFileView(allocator: Allocator, change: diff.FileChange) !FileView {
         }
         previous_hunk_end = hunk.old_start + hunk.old_count;
 
-        for (hunk.lines) |line| {
-            try rows_list.append(allocator, .{
-                .kind = switch (line.op) {
-                    .equal => .context,
-                    .insert => .added,
-                    .delete => .removed,
-                },
-                .text = line.text,
-                .old_lineno = line.old_lineno,
-                .new_lineno = line.new_lineno,
-            });
-        }
+        for (hunk.blocks) |block| switch (block) {
+            .context => |ctx| {
+                for (ctx.lines, 0..) |line, line_index| {
+                    const offset: u32 = @intCast(line_index);
+                    try rows_list.append(allocator, .{
+                        .kind = .context,
+                        .text = line.text,
+                        .old_lineno = ctx.old_start + offset,
+                        .new_lineno = ctx.new_start + offset,
+                    });
+                }
+            },
+            .delete => |del| {
+                for (del.lines, 0..) |line, line_index| {
+                    const offset: u32 = @intCast(line_index);
+                    try rows_list.append(allocator, .{
+                        .kind = .removed,
+                        .text = line.text,
+                        .old_lineno = del.old_start + offset,
+                    });
+                }
+            },
+            .insert => |ins| {
+                for (ins.lines, 0..) |line, line_index| {
+                    const offset: u32 = @intCast(line_index);
+                    try rows_list.append(allocator, .{
+                        .kind = .added,
+                        .text = line.text,
+                        .new_lineno = ins.new_start + offset,
+                    });
+                }
+            },
+            .replace => |rep| {
+                for (rep.old_lines, 0..) |line, line_index| {
+                    const offset: u32 = @intCast(line_index);
+                    try rows_list.append(allocator, .{
+                        .kind = .removed,
+                        .text = line.text,
+                        .old_lineno = rep.old_start + offset,
+                    });
+                }
+                for (rep.new_lines, 0..) |line, line_index| {
+                    const offset: u32 = @intCast(line_index);
+                    try rows_list.append(allocator, .{
+                        .kind = .added,
+                        .text = line.text,
+                        .new_lineno = rep.new_start + offset,
+                    });
+                }
+            },
+        };
     }
 
     return .{
@@ -129,7 +168,7 @@ test "diff_view inserts gap rows between distant hunks" {
     var document = try diff.buildDocument(testing.allocator, &inputs, .{});
     defer document.deinit();
 
-    var view = try buildView(testing.allocator, document);
+    var view = try buildView(testing.allocator, document.document);
     defer view.deinit();
 
     try testing.expectEqual(@as(usize, 1), view.files.len);
@@ -151,7 +190,7 @@ test "diff_view keeps per-file paths separate from row content" {
     var document = try diff.buildDocument(testing.allocator, &inputs, .{});
     defer document.deinit();
 
-    var view = try buildView(testing.allocator, document);
+    var view = try buildView(testing.allocator, document.document);
     defer view.deinit();
 
     try testing.expectEqual(@as(usize, 2), view.files.len);

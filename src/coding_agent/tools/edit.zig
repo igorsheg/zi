@@ -29,6 +29,7 @@ const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const diff_mod = @import("../../lib/diff.zig");
 const diff_unified = @import("../../lib/diff_unified.zig");
+const tool_result_details = @import("../../lib/tool_result_details.zig");
 const lock_registry = @import("lock_registry.zig");
 const json_value = @import("../../json/value.zig");
 
@@ -284,17 +285,20 @@ fn execute(
         return util.errorf(allocator, "diff failed: {s}", .{@errorName(err)});
     defer doc.deinit();
 
-    const unified = diff_unified.toUnified(allocator, doc) catch
-        return util.errorResult(allocator, "diff serialize failed");
+    const details = tool_result_details.diffToJsonValue(allocator, doc.document) catch
+        return util.errorResult(allocator, "diff details serialize failed");
+    errdefer json_value.freeJsonValue(allocator, details);
 
-    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch {
-        allocator.free(unified);
+    const unified = diff_unified.toUnified(allocator, doc.document) catch
+        return util.errorResult(allocator, "diff serialize failed");
+    errdefer allocator.free(unified);
+
+    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
         return util.errorResult(allocator, "alloc failed");
-    };
     blocks[0] = .{ .text = .{ .text = unified } };
     return .{
         .content = blocks,
-        .details = .null,
+        .details = details,
         .is_error = false,
     };
 }
@@ -994,7 +998,7 @@ test "atomic write preserves mode and replaces hardlink identity" {
     try testing.expectEqualStrings("before\n", link_contents);
 }
 
-test "execute returns unified diff in content without structured diff details" {
+test "execute returns unified diff content with structured diff details" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1045,7 +1049,12 @@ test "execute returns unified diff in content without structured diff details" {
     try testing.expect(std.mem.indexOf(u8, unified, "-two\n") != null);
     try testing.expect(std.mem.indexOf(u8, unified, "+TWO\n") != null);
 
-    try testing.expect(result.details == .null);
+    try testing.expect(result.details == .object);
+    try testing.expectEqualStrings("diff", result.details.object.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 2), result.details.object.get("version").?.integer);
+    const diff_details = result.details.object.get("diff").?;
+    try testing.expectEqual(@as(i64, 1), diff_details.object.get("stats").?.object.get("added").?.integer);
+    try testing.expectEqual(@as(i64, 1), diff_details.object.get("stats").?.object.get("removed").?.integer);
 
     const final_contents = try tmp.dir.readFileAlloc(testing.allocator, "note.txt", 1024);
     defer testing.allocator.free(final_contents);
