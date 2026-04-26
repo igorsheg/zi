@@ -1,8 +1,14 @@
 const std = @import("std");
 const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_tool = @import("lua_tool.zig");
 const runner_mod = @import("runner.zig");
 const tool_def = @import("../tools/definition.zig");
+const abort_signal_mod = @import("../../abort_signal.zig");
+const agent_protocol = @import("../../agent3/types.zig");
+const ai = @import("../../ai/root.zig");
+const extension_ui = @import("ui.zig");
+const session_core = @import("../../session/root.zig");
 
 const log = std.log.scoped(.extensions);
 
@@ -813,6 +819,161 @@ test "loadAll calls factory with zi and stamps source provenance" {
     try std.testing.expectEqualStrings(tmp_path, loaded.runtime_root_id);
     try std.testing.expectEqualStrings("provenance", loaded.extension_id);
     try std.testing.expectEqualStrings(expected_state_owner, loaded.state_owner_id);
+}
+
+test "example hello extension loads and greets through the tool boundary" {
+    const allocator = std.testing.allocator;
+    const hello_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/hello.lua");
+    defer allocator.free(hello_path);
+
+    var state_owner_buf: [256]u8 = undefined;
+    const state_owner_id = try std.fmt.bufPrint(&state_owner_buf, "example::{s}", .{"hello"});
+    const ext = LoadedExtension{
+        .id = "hello",
+        .path = hello_path,
+        .source = .user,
+        .provenance = .{
+            .runtime_root_id = "examples/extensions",
+            .extension_id = "hello",
+            .state_owner_id = state_owner_id,
+            .root_kind = .runtime_root,
+        },
+    };
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, &.{ext}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+
+    const ext_tool = runner.tool_registry.get("greet") orelse return error.MissingHelloTool;
+    const tool = try lua_tool.buildAgentTool(allocator, &runner, ext_tool.*);
+
+    var args_obj = std.json.ObjectMap.init(allocator);
+    defer args_obj.deinit();
+    try args_obj.put("name", .{ .string = "zi" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = tool.execute(tool.ctx, arena.allocator(), "hello-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expectEqualStrings("Hello, zi!", result.content[0].text.text);
+}
+
+test "example commands extension dispatches through host-owned command ui" {
+    const allocator = std.testing.allocator;
+    const commands_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/commands.lua");
+    defer allocator.free(commands_path);
+
+    var state_owner_buf: [256]u8 = undefined;
+    const state_owner_id = try std.fmt.bufPrint(&state_owner_buf, "example::{s}", .{"commands"});
+    const ext = LoadedExtension{
+        .id = "commands",
+        .path = commands_path,
+        .source = .user,
+        .provenance = .{
+            .runtime_root_id = "examples/extensions",
+            .extension_id = "commands",
+            .state_owner_id = state_owner_id,
+            .root_kind = .runtime_root,
+        },
+    };
+
+    var state = try lua_runtime.LuaState.init(allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+
+    var store = CommandExampleStore{};
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
+    try runner.bindRuntime(.{
+        .session = @ptrCast(&store),
+        .get_model = &commandExampleGetModel,
+        .is_idle = &commandExampleIsIdle,
+        .abort = &commandExampleAbort,
+        .has_pending_messages = &commandExampleHasPendingMessages,
+        .get_context_usage = &commandExampleGetContextUsage,
+        .get_system_prompt = &commandExampleGetSystemPrompt,
+        .get_binding_info = &commandExampleGetBindingInfo,
+        .show_panel = &CommandExampleStore.showPanel,
+    }, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    const stats = loadAll(allocator, &state, &runner, &.{ext}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
+    try std.testing.expect(runner.command_registry.getByVisibleName("hello") != null);
+
+    try runner.dispatchCommand("hello", "matrix");
+    const panel = store.panel orelse return error.MissingCommandPanel;
+    try std.testing.expectEqualStrings("hello-command", panel.id);
+    try std.testing.expectEqualStrings("Hello command", panel.title);
+    try std.testing.expect(panel.transient);
+    try std.testing.expectEqual(@as(usize, 1), panel.lines.len);
+    try std.testing.expectEqualStrings("Hello, ", panel.lines[0][0].text);
+    try std.testing.expectEqualStrings("matrix", panel.lines[0][1].text);
+    try std.testing.expectEqualStrings("!", panel.lines[0][2].text);
+}
+
+const CommandExampleStore = struct {
+    panel: ?extension_ui.Panel = null,
+
+    fn showPanel(session: *anyopaque, panel: extension_ui.Panel) anyerror!void {
+        const self: *CommandExampleStore = @ptrCast(@alignCast(session));
+        self.panel = panel;
+    }
+};
+
+fn commandExampleGetModel(_: *anyopaque) agent_protocol.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = .{ .custom = "test-api" },
+        .provider = .{ .custom = "test-provider" },
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 1024,
+    };
+}
+
+fn commandExampleIsIdle(_: *anyopaque) bool {
+    return true;
+}
+
+fn commandExampleAbort(_: *anyopaque) void {}
+
+fn commandExampleHasPendingMessages(_: *anyopaque) bool {
+    return false;
+}
+
+fn commandExampleGetContextUsage(_: *anyopaque) ?session_core.context_usage.ContextUsage {
+    return null;
+}
+
+fn commandExampleGetSystemPrompt(_: *anyopaque) []const u8 {
+    return "system";
+}
+
+fn commandExampleGetBindingInfo(_: *anyopaque) runner_mod.ExtensionBindingInfo {
+    return .{
+        .workspace_id = "/workspace",
+        .session_id = "session-123",
+        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
+    };
 }
 
 test "loadAll stamps provenance on top-level registrations outside factory" {

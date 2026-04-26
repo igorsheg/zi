@@ -1,0 +1,23 @@
+return function(zi)
+  zi.register_command({
+    name = "hello",
+    description = "Show a greeting from an extension command.",
+    handler = function(args, ctx)
+      local target = args
+      if target == nil or target == "" then target = "zi" end
+
+      ctx.ui.show_panel({
+        id = "hello-command",
+        title = "Hello command",
+        lines = {
+          {
+            { text = "Hello, ", fg = "toolTitle", bold = true },
+            { text = tostring(target), fg = "accent" },
+            { text = "!", fg = "toolTitle", bold = true },
+          },
+        },
+        transient = true,
+      })
+    end,
+  })
+end
