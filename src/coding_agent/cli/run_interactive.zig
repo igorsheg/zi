@@ -160,8 +160,7 @@ pub fn run(
     });
 
     if (needs_auth) {
-        interactive.status_text.setContent("no API key — use /login to authenticate");
-        interactive.status_text.fg = interactive.theme.fg(.warning);
+        interactive.status_line.setPrimary("no API key — use /login to authenticate", interactive.theme.fg(.warning));
     }
 
     try interactive.run();

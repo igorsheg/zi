@@ -8,11 +8,11 @@ const terminal_mod = @import("terminal.zig");
 const keys_mod = @import("keys.zig");
 const component_mod = @import("component.zig");
 const text_mod = @import("components/text.zig");
+const status_line_mod = @import("components/status_line.zig");
 const greeter_mod = @import("components/greeter.zig");
 const footer_mod = @import("components/footer.zig");
 const editor_mod = @import("components/editor.zig");
 const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
-const loader_mod = @import("components/loader.zig");
 const ui_event_mod = @import("ui_event.zig");
 const transcript_mod = @import("transcript.zig");
 const conversation_projection_mod = @import("conversation_projection.zig");
@@ -99,7 +99,7 @@ const CursorState = component_mod.CursorState;
 const UiEvent = ui_event_mod.UiEvent;
 const Transcript = transcript_mod.Transcript;
 const ToolRendererResolver = tool_display_mod.ToolRendererResolver;
-const Loader = loader_mod.Loader;
+const StatusLine = status_line_mod.StatusLine;
 const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
 const StatusData = status_data_mod.StatusData;
@@ -488,8 +488,7 @@ pub const Interactive = struct {
     /// Initialized in run() after self.editor is set up.
     active_editor: EditorInterface = undefined,
     active_editor_bound: bool = false,
-    status_text: text_mod.Text,
-    extension_status_text: text_mod.Text,
+    status_line: StatusLine,
     pending_image_banner: text_mod.Text,
     extension_panel_text: text_mod.Text,
     extension_header_text: text_mod.Text,
@@ -524,7 +523,6 @@ pub const Interactive = struct {
     /// `ProjectionState.replaceQueuedSnapshot` version filtering.
     last_published_queued_version: u64 = 0,
     runtime_host: RuntimeHost,
-    loader: Loader = .{},
     loader_active: bool = false,
     retry_active: bool = false,
     retry_waiting: bool = false,
@@ -628,8 +626,7 @@ pub const Interactive = struct {
             .theme = undefined,
             .cwd = cwd,
             .editor = editor_mod.Editor.init(state_allocator),
-            .status_text = text_mod.Text.init(state_allocator),
-            .extension_status_text = text_mod.Text.init(state_allocator),
+            .status_line = StatusLine.init(state_allocator),
             .pending_image_banner = text_mod.Text.init(state_allocator),
             .extension_panel_text = text_mod.Text.init(state_allocator),
             .extension_header_text = text_mod.Text.init(state_allocator),
@@ -749,8 +746,7 @@ pub const Interactive = struct {
         self.extension_header_text.deinit();
         self.extension_panel_text.deinit();
         self.pending_image_banner.deinit();
-        self.extension_status_text.deinit();
-        self.status_text.deinit();
+        self.status_line.deinit();
         self.editor.deinit();
         self.tui.deinit();
     }
@@ -802,7 +798,9 @@ pub const Interactive = struct {
         // Populate container slots with their initial children.
         self.refreshHeaderVisibility();
         self.refreshPendingImageBanner();
-        self.refreshStatusContainer();
+        self.status_line.setStatusData(&self.status_data);
+        self.status_line.setTheme(self.theme);
+        self.status_container.addChild(self.status_line.component());
         self.widget_above_container.addChild(self.extension_widget_above_text.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
@@ -881,8 +879,7 @@ pub const Interactive = struct {
             },
             .resume_session => |session_resume| {
                 const path_copy = self.msg_allocator.dupe(u8, session_resume.path) catch {
-                    self.status_text.setContent("out of memory");
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
                     self.tui.dirty = true;
                     self.startup_action = .none;
                     return;
@@ -967,8 +964,7 @@ pub const Interactive = struct {
     }
 
     fn showAgentRequestQueueFull(self: *Interactive) void {
-        self.status_text.setContent("agent request queue full; try again");
-        self.status_text.fg = self.theme.fg(.@"error");
+        self.status_line.setPrimary("agent request queue full; try again", self.theme.fg(.@"error"));
         self.tui.dirty = true;
     }
 
@@ -1076,8 +1072,7 @@ pub const Interactive = struct {
             }
             if (self.is_streaming) {
                 self.runtime_host.abortCurrentRun();
-                self.status_text.setContent("aborted");
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary("aborted", self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             }
             return;
@@ -1096,8 +1091,7 @@ pub const Interactive = struct {
             }
             if (self.is_streaming) {
                 self.runtime_host.abortCurrentRun();
-                self.status_text.setContent("aborted");
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary("aborted", self.theme.fg(.@"error"));
                 self.tui.dirty = true;
                 return;
             }
@@ -1297,8 +1291,7 @@ pub const Interactive = struct {
             .queued_snapshot => unreachable,
             .visible_models_snapshot => unreachable,
             .error_message => |e| {
-                self.status_text.setContent(e.message);
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary(e.message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             },
             .theme_changed => |theme| {
@@ -1308,24 +1301,20 @@ pub const Interactive = struct {
             .assistant_run_finished => |m| {
                 self.tui.dirty = true;
                 if (m.is_aborted) {
-                    self.status_text.setContent(m.error_message orelse "aborted");
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary(m.error_message orelse "aborted", self.theme.fg(.@"error"));
                 } else if (m.error_message) |msg| {
-                    self.status_text.setContent(userFacingFailureMessage(m.failure_kind, msg));
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary(userFacingFailureMessage(m.failure_kind, msg), self.theme.fg(.@"error"));
                 }
             },
             .tool_running => |t| {
-                self.status_text.setContent(t.tool_name);
-                self.status_text.fg = self.theme.fg(.accent);
+                self.status_line.setPrimary(t.tool_name, self.theme.fg(.accent));
                 self.tui.dirty = true;
             },
             .login_progress => |l| {
-                self.status_text.setContent(l.message);
-                self.status_text.fg = switch (l.kind) {
+                self.status_line.setPrimary(l.message, switch (l.kind) {
                     .auth_url => self.theme.fg(.accent),
                     .info => self.theme.fg(.muted),
-                };
+                });
                 self.tui.dirty = true;
             },
             .login_complete => |l| {
@@ -1333,11 +1322,9 @@ pub const Interactive = struct {
                 self.login_thread = null;
 
                 if (l.success) {
-                    self.status_text.setContent(l.message);
-                    self.status_text.fg = self.theme.fg(.success);
+                    self.status_line.setPrimary(l.message, self.theme.fg(.success));
                 } else {
-                    self.status_text.setContent(l.message);
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary(l.message, self.theme.fg(.@"error"));
                 }
                 self.tui.dirty = true;
             },
@@ -1370,8 +1357,7 @@ pub const Interactive = struct {
                         "retry failed after {d} attempt{s}: {s}",
                         .{ r.attempt, if (r.attempt == 1) "" else "s", userFacingFailureMessage(r.failure_kind, final_error) },
                     ) catch userFacingFailureMessage(r.failure_kind, final_error);
-                    self.status_text.setContent(msg);
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary(msg, self.theme.fg(.@"error"));
                 }
                 self.tui.dirty = true;
             },
@@ -1380,12 +1366,11 @@ pub const Interactive = struct {
                 self.hideLoader();
                 self.tui.setFocus(self.active_editor.component());
                 switch (p.outcome) {
-                    .success => self.status_text.setContent(""),
+                    .success => self.status_line.clearPrimary(),
                     .assistant_error, .aborted => {},
                 }
                 if (p.internal_error) |msg| {
-                    self.status_text.setContent(msg);
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary(msg, self.theme.fg(.@"error"));
                 }
                 self.tui.dirty = true;
             },
@@ -1393,7 +1378,7 @@ pub const Interactive = struct {
                 // Long-lived agent owner loop finished an idle request drain.
                 // Hide the loader only when the TUI actually has a pending
                 // request banner to unwind; individual success/failure events
-                // still own status_text and focus.
+                // still own primary status and focus.
                 if (self.request_in_flight) {
                     self.request_in_flight = false;
                     self.hideLoader();
@@ -1408,17 +1393,14 @@ pub const Interactive = struct {
                 // the one they're about to talk to. Otherwise default
                 // to the success banner.
                 if (r.restore_warning) |w| {
-                    self.status_text.setContent(w);
-                    self.status_text.fg = self.theme.fg(.warning);
+                    self.status_line.setPrimary(w, self.theme.fg(.warning));
                 } else {
-                    self.status_text.setContent("session resumed");
-                    self.status_text.fg = self.theme.fg(.success);
+                    self.status_line.setPrimary("session resumed", self.theme.fg(.success));
                 }
                 self.tui.dirty = true;
             },
             .session_resume_failed => |f| {
-                self.status_text.setContent(f.message);
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary(f.message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             },
             .extension_commands_updated => |u| {
@@ -1438,29 +1420,24 @@ pub const Interactive = struct {
             },
             .session_new_started => {
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                self.status_text.setContent("new session started");
-                self.status_text.fg = self.theme.fg(.success);
+                self.status_line.setPrimary("new session started", self.theme.fg(.success));
                 self.tui.dirty = true;
             },
             .session_fork_started => {
                 self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                self.status_text.setContent("session forked");
-                self.status_text.fg = self.theme.fg(.success);
+                self.status_line.setPrimary("session forked", self.theme.fg(.success));
                 self.tui.dirty = true;
             },
             .session_new_failed => |f| {
-                self.status_text.setContent(f.message);
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary(f.message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             },
             .session_compacted => {
-                self.status_text.setContent("session compacted; ctx updates after next response");
-                self.status_text.fg = self.theme.fg(.success);
+                self.status_line.setPrimary("session compacted; ctx updates after next response", self.theme.fg(.success));
                 self.tui.dirty = true;
             },
             .session_compaction_failed => |f| {
-                self.status_text.setContent(f.message);
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary(f.message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             },
             .status_snapshot => |s| {
@@ -1468,29 +1445,25 @@ pub const Interactive = struct {
                 self.tui.dirty = true;
             },
             .model_switch_failed => |m| {
-                self.status_text.setContent(m.message);
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary(m.message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             },
             .model_switched => |m| {
                 var buf: [80]u8 = undefined;
                 const label = if (m.model_id.len > 0) m.model_id else "model switched";
                 const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{label}) catch "model switched";
-                self.status_text.setContent(msg);
-                self.status_text.fg = self.theme.fg(.success);
+                self.status_line.setPrimary(msg, self.theme.fg(.success));
                 self.tui.dirty = true;
             },
             .thinking_level_changed => |t| {
                 var buf: [96]u8 = undefined;
                 const level = if (t.level.len > 0) t.level else "off";
                 const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{level}) catch "thinking level updated";
-                self.status_text.setContent(msg);
-                self.status_text.fg = self.theme.fg(.success);
+                self.status_line.setPrimary(msg, self.theme.fg(.success));
                 self.tui.dirty = true;
             },
             .thinking_level_change_failed => |t| {
-                self.status_text.setContent(t.message);
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary(t.message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
             },
         }
@@ -1585,8 +1558,7 @@ pub const Interactive = struct {
         defer self.allocator.free(text);
 
         clipboard_mod.copyText(text);
-        self.status_text.setContent("copied selection");
-        self.status_text.fg = self.theme.fg(.success);
+        self.status_line.setPrimary("copied selection", self.theme.fg(.success));
     }
 
     fn composerHasPendingInput(self: *Interactive) bool {
@@ -1617,15 +1589,13 @@ pub const Interactive = struct {
 
     fn handlePasteImageShortcut(self: *Interactive) void {
         if (self.is_streaming or self.request_in_flight) {
-            self.status_text.setContent("cannot paste image while agent is running");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("cannot paste image while agent is running", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         }
 
         const raw = self.clipboard_image_reader(self.allocator) orelse {
-            self.status_text.setContent("clipboard has no image");
-            self.status_text.fg = self.theme.fg(.muted);
+            self.status_line.setPrimary("clipboard has no image", self.theme.fg(.muted));
             self.tui.dirty = true;
             return;
         };
@@ -1634,8 +1604,7 @@ pub const Interactive = struct {
         const prepared = prepareClipboardImageAttachment(self.allocator, raw, .{
             .auto_resize = self.settings_manager.getImageAutoResize(),
         }) catch {
-            self.status_text.setContent("out of memory");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
@@ -1643,15 +1612,13 @@ pub const Interactive = struct {
         switch (prepared) {
             .rejected => |message| {
                 defer self.allocator.free(message);
-                self.status_text.setContent(message);
-                self.status_text.fg = self.theme.fg(.warning);
+                self.status_line.setPrimary(message, self.theme.fg(.warning));
             },
             .attach => |attachment| {
                 self.pending_images.append(self.allocator, attachment) catch {
                     var failed_attachment = attachment;
                     failed_attachment.deinit(self.allocator);
-                    self.status_text.setContent("out of memory");
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
                     self.tui.dirty = true;
                     return;
                 };
@@ -1664,8 +1631,7 @@ pub const Interactive = struct {
                     "attached clipboard image"
                 else
                     std.fmt.bufPrint(&status_buf, "attached clipboard image ({d} pending)", .{pending_count}) catch "attached clipboard image";
-                self.status_text.setContent(status);
-                self.status_text.fg = self.theme.fg(.success);
+                self.status_line.setPrimary(status, self.theme.fg(.success));
             },
         }
         self.tui.dirty = true;
@@ -1706,13 +1672,9 @@ pub const Interactive = struct {
     }
 
     fn showLoader(self: *Interactive, message: []const u8) void {
-        self.loader.shimmer_edge_fg = self.theme.fg(.muted);
-        self.loader.message_fg = self.theme.fg(.dim);
-        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
-        self.loader.setMessage(message);
-        self.loader.start();
+        self.status_line.setWorking(message);
         self.loader_active = true;
-        self.refreshStatusContainer();
+        self.tui.dirty = true;
     }
 
     fn showRetryLoader(self: *Interactive, attempt: u32, max_attempts: u32, delay_ms: u64, cancellable: bool) void {
@@ -1726,22 +1688,18 @@ pub const Interactive = struct {
             ) catch "Retrying…"
         else
             std.fmt.bufPrint(&buf, "Retrying ({d}/{d})…", .{ attempt, max_attempts }) catch "Retrying…";
-        self.loader.shimmer_edge_fg = self.theme.fg(.warning);
-        self.loader.message_fg = self.theme.fg(.dim);
-        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
-        self.loader.setMessage(message);
-        self.loader.start();
+        self.status_line.setWorking(message);
         self.loader_active = true;
-        self.refreshStatusContainer();
+        self.tui.dirty = true;
     }
 
     fn hideLoader(self: *Interactive) void {
         if (!self.loader_active) return;
-        self.loader.stop();
+        self.status_line.clearWorking();
         self.loader_active = false;
-        self.refreshStatusContainer();
-        // Don't blank status_text — preserve any error/abort message
-        // that was set while the loader was active.
+        self.tui.dirty = true;
+        // Don't blank primary status — preserve any error/abort message
+        // that was set while working was active.
     }
 
     fn detectGitBranch(self: *Interactive) void {
@@ -1866,8 +1824,7 @@ pub const Interactive = struct {
         switch (self.runtime_host.enqueueQueuedText(queue_kind, text)) {
             .ok => {},
             .closed, .oom => {
-                self.status_text.setContent("agent unavailable");
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary("agent unavailable", self.theme.fg(.@"error"));
                 self.tui.dirty = true;
                 return;
             },
@@ -1886,8 +1843,7 @@ pub const Interactive = struct {
         // Atomic take-and-clear on the TUI thread (safe — run-control's
         // mailbox serializes it against the agent thread's drain).
         var snapshot = self.runtime_host.takeQueuedMessagesAndClear(self.msg_allocator) catch {
-            self.status_text.setContent("failed to restore queued messages");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("failed to restore queued messages", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
@@ -1900,8 +1856,7 @@ pub const Interactive = struct {
     fn applyRestoredQueuedInputs(self: *Interactive, snapshot: *const coding_agent_mod.runtime_host.QueuedMessageSnapshot) void {
         const count = snapshot.steering.len + snapshot.follow_up.len;
         if (count == 0) {
-            self.status_text.setContent("no queued messages");
-            self.status_text.fg = self.theme.fg(.muted);
+            self.status_line.setPrimary("no queued messages", self.theme.fg(.muted));
             self.tui.dirty = true;
             return;
         }
@@ -1926,15 +1881,13 @@ pub const Interactive = struct {
 
         self.active_editor.setText(buf.items);
         self.refreshHeaderVisibility();
-        self.status_text.setContent(if (count == 1) "restored 1 queued message" else "restored queued messages");
-        self.status_text.fg = self.theme.fg(.success);
+        self.status_line.setPrimary(if (count == 1) "restored 1 queued message" else "restored queued messages", self.theme.fg(.success));
         self.tui.dirty = true;
     }
 
     fn submitUserContent(self: *Interactive, content: ai_protocol.UserMessage.UserMessageContent) bool {
         if (self.request_in_flight) {
-            self.status_text.setContent("agent is busy");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("agent is busy", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return false;
         }
@@ -1955,8 +1908,7 @@ pub const Interactive = struct {
                 var failed_req = rejected;
                 failed_req.deinit(self.msg_allocator);
                 self.tui.setFocus(self.active_editor.component());
-                self.status_text.setContent("agent unavailable");
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary("agent unavailable", self.theme.fg(.@"error"));
                 self.tui.dirty = true;
                 return false;
             },
@@ -1978,8 +1930,7 @@ pub const Interactive = struct {
 
         if (queued_kind) |kind| {
             if (self.pending_images.items.len > 0) {
-                self.status_text.setContent("cannot queue images while agent is streaming");
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary("cannot queue images while agent is streaming", self.theme.fg(.@"error"));
                 self.tui.dirty = true;
                 return;
             }
@@ -1988,8 +1939,7 @@ pub const Interactive = struct {
         }
 
         var built = buildSubmittedUserContent(self.allocator, text, self.pending_images.items) catch {
-            self.status_text.setContent("out of memory");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
@@ -2045,7 +1995,7 @@ pub const Interactive = struct {
                 // would take the cache-hit path and hand reconcile
                 // metadata-only items against a wiped transcript.
                 self.conversation_projection.clear();
-                self.status_text.setContent("");
+                self.status_line.clearPrimary();
                 self.tui.dirty = true;
                 return true;
             }
@@ -2075,8 +2025,7 @@ pub const Interactive = struct {
             }
             if (std.mem.eql(u8, name, "fork")) {
                 if (args.len == 0) {
-                    self.status_text.setContent("usage: /fork <entry-id>");
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary("usage: /fork <entry-id>", self.theme.fg(.@"error"));
                     self.tui.dirty = true;
                     return true;
                 }
@@ -2122,21 +2071,18 @@ pub const Interactive = struct {
             .builtin => |handler| {
                 var cmd_ctx = slash_commands_mod.CommandContext{ ._reserved = @ptrCast(self) };
                 handler(args, &cmd_ctx) catch {
-                    self.status_text.setContent("command failed");
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary("command failed", self.theme.fg(.@"error"));
                 };
             },
             .extension => {
                 const name_copy = self.msg_allocator.dupe(u8, name) catch {
-                    self.status_text.setContent("out of memory");
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
                     self.tui.dirty = true;
                     return true;
                 };
                 const args_copy = self.msg_allocator.dupe(u8, args) catch {
                     self.msg_allocator.free(name_copy);
-                    self.status_text.setContent("out of memory");
-                    self.status_text.fg = self.theme.fg(.@"error");
+                    self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
                     self.tui.dirty = true;
                     return true;
                 };
@@ -2147,8 +2093,7 @@ pub const Interactive = struct {
                 });
             },
             .prompt_template, .skill => {
-                self.status_text.setContent("not yet implemented");
-                self.status_text.fg = self.theme.fg(.warning);
+                self.status_line.setPrimary("not yet implemented", self.theme.fg(.warning));
             },
         }
 
@@ -2165,8 +2110,7 @@ pub const Interactive = struct {
         const scratch = arena.allocator();
 
         const path = self.memory_diagnostics.writeSnapshotFile(scratch, self.cwd, null) catch {
-            self.status_text.setContent("failed to write memory diagnostics");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("failed to write memory diagnostics", self.theme.fg(.@"error"));
             return;
         };
 
@@ -2184,8 +2128,7 @@ pub const Interactive = struct {
             std.fmt.bufPrint(&status_buf, "wrote memory diagnostics: ~/.zi/agent/{s}", .{rel}) catch path
         else
             std.fmt.bufPrint(&status_buf, "wrote memory diagnostics: {s}", .{path}) catch path;
-        self.status_text.setContent(msg);
-        self.status_text.fg = self.theme.fg(.success);
+        self.status_line.setPrimary(msg, self.theme.fg(.success));
     }
 
     fn bottomPanelOptions(self: *Interactive) overlay_mod.OverlayOptions {
@@ -2256,8 +2199,7 @@ pub const Interactive = struct {
         if (self.is_streaming or self.request_in_flight) {
             var rejected = req;
             rejected.deinit(self.msg_allocator);
-            self.status_text.setContent(options.busy_message);
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary(options.busy_message, self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return false;
         }
@@ -2274,8 +2216,7 @@ pub const Interactive = struct {
             .closed, .oom => |rejected| {
                 var failed_req = rejected;
                 failed_req.deinit(self.msg_allocator);
-                self.status_text.setContent(options.spawn_failed_message);
-                self.status_text.fg = self.theme.fg(.@"error");
+                self.status_line.setPrimary(options.spawn_failed_message, self.theme.fg(.@"error"));
                 self.tui.dirty = true;
                 return false;
             },
@@ -2310,15 +2251,13 @@ pub const Interactive = struct {
         // strictly equivalent.
         self.closeResumePickerFlow();
         var flow = ResumePickerFlow.init(self.allocator, self.theme, self.cwd) catch {
-            self.status_text.setContent("failed to list sessions");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("failed to list sessions", self.theme.fg(.@"error"));
             return;
         };
         errdefer flow.deinit();
 
         if (flow.rows.len == 0) {
-            self.status_text.setContent("no sessions found");
-            self.status_text.fg = self.theme.fg(.muted);
+            self.status_line.setPrimary("no sessions found", self.theme.fg(.muted));
             return;
         }
 
@@ -2343,8 +2282,7 @@ pub const Interactive = struct {
 
         const selected_path = path orelse {
             self.closeResumePickerFlow();
-            self.status_text.setContent("session not found");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("session not found", self.theme.fg(.@"error"));
             return;
         };
 
@@ -2352,8 +2290,7 @@ pub const Interactive = struct {
         // payload slices must be thread-safe allocated).
         const path_copy = self.msg_allocator.dupe(u8, selected_path) catch {
             self.closeResumePickerFlow();
-            self.status_text.setContent("out of memory");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
             return;
         };
         const restore_session_model = self.resume_picker_flow.?.restore_session_model;
@@ -2461,15 +2398,13 @@ pub const Interactive = struct {
     fn showModelPicker(self: *Interactive) void {
         self.closeModelPickerFlow();
         var flow = ModelPickerFlow.init(self.allocator, self.theme, self.model_catalog, self.auth_storage) catch {
-            self.status_text.setContent("failed to build model picker");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("failed to build model picker", self.theme.fg(.@"error"));
             return;
         };
         errdefer flow.deinit();
 
         if (flow.rows.len == 0) {
-            self.status_text.setContent("no models available");
-            self.status_text.fg = self.theme.fg(.muted);
+            self.status_line.setPrimary("no models available", self.theme.fg(.muted));
             return;
         }
 
@@ -2502,14 +2437,12 @@ pub const Interactive = struct {
         self.closeModelPickerFlow();
 
         const m = selected_model orelse {
-            self.status_text.setContent("model not found");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("model not found", self.theme.fg(.@"error"));
             return;
         };
 
         const reference = std.fmt.allocPrint(self.msg_allocator, "{s}/{s}", .{ json_util.providerToString(m.provider), m.id }) catch {
-            self.status_text.setContent("out of memory");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
@@ -2524,8 +2457,7 @@ pub const Interactive = struct {
 
     fn queueModelPatternSwitch(self: *Interactive, pattern: []const u8) void {
         const pattern_copy = self.msg_allocator.dupe(u8, pattern) catch {
-            self.status_text.setContent("out of memory");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
@@ -2580,8 +2512,7 @@ pub const Interactive = struct {
                 self.hide_thinking_block = !self.hide_thinking_block;
                 self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
                 self.applyTranscriptHideThinkingBlock();
-                self.status_text.setContent(if (self.hide_thinking_block) "thinking hidden" else "thinking shown");
-                self.status_text.fg = self.theme.fg(.success);
+                self.status_line.setPrimary(if (self.hide_thinking_block) "thinking hidden" else "thinking shown", self.theme.fg(.success));
                 self.tui.dirty = true;
             },
         }
@@ -2594,8 +2525,7 @@ pub const Interactive = struct {
 
     fn showThinkingLevelPicker(self: *Interactive) void {
         const model = currentStatusModel(self) orelse {
-            self.status_text.setContent("current model unavailable");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("current model unavailable", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
@@ -2659,8 +2589,7 @@ pub const Interactive = struct {
         self.clearLoginPickerEntries();
 
         const providers = oauth_mod.listProviders(self.msg_allocator) catch {
-            self.status_text.setContent("failed to load OAuth providers");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("failed to load OAuth providers", self.theme.fg(.@"error"));
             return;
         };
         defer self.msg_allocator.free(providers);
@@ -2683,8 +2612,7 @@ pub const Interactive = struct {
         self.login_picker_count = count;
 
         if (count == 0) {
-            self.status_text.setContent("no OAuth providers available");
-            self.status_text.fg = self.theme.fg(.muted);
+            self.status_line.setPrimary("no OAuth providers available", self.theme.fg(.muted));
             return;
         }
 
@@ -2712,26 +2640,22 @@ pub const Interactive = struct {
 
     fn startLogin(self: *Interactive, provider_id: []const u8) void {
         if (self.login_thread != null) {
-            self.status_text.setContent("login already in progress");
-            self.status_text.fg = self.theme.fg(.warning);
+            self.status_line.setPrimary("login already in progress", self.theme.fg(.warning));
             return;
         }
 
         const provider = oauth_mod.findProvider(provider_id) orelse {
-            self.status_text.setContent("unknown OAuth provider");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("unknown OAuth provider", self.theme.fg(.@"error"));
             return;
         };
 
         self.login_cancelled.store(false, .release);
 
-        self.status_text.setContent("starting login...");
-        self.status_text.fg = self.theme.fg(.muted);
+        self.status_line.setPrimary("starting login...", self.theme.fg(.muted));
         self.tui.dirty = true;
 
         const login_ctx = self.msg_allocator.create(LoginContext) catch {
-            self.status_text.setContent("failed to start login");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("failed to start login", self.theme.fg(.@"error"));
             return;
         };
         login_ctx.* = .{
@@ -2741,8 +2665,7 @@ pub const Interactive = struct {
 
         self.login_thread = std.Thread.spawn(.{}, loginThreadFn, .{login_ctx}) catch {
             self.msg_allocator.destroy(login_ctx);
-            self.status_text.setContent("failed to spawn login thread");
-            self.status_text.fg = self.theme.fg(.@"error");
+            self.status_line.setPrimary("failed to spawn login thread", self.theme.fg(.@"error"));
             return;
         };
     }
@@ -2843,11 +2766,11 @@ pub const Interactive = struct {
     }
 
     // zi-wub.17: login-thread callbacks. These run on the login
-    // thread, so they MUST NOT touch TUI-owned state (status_text,
+    // thread, so they MUST NOT touch TUI-owned state (status_line,
     // tui.dirty, etc). Instead they publish a `login_progress` event
     // on the snapshot queue with an msg_allocator-owned payload; the TUI
     // thread consumes it from the normal drain loop. Single-owner
-    // invariant for status_text is restored — only the TUI thread
+    // invariant for status_line is restored — only the TUI thread
     // writes it.
     fn onLoginAuth(url: []const u8, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
@@ -3151,7 +3074,6 @@ pub const Interactive = struct {
             switch (update.kind) {
                 .status => {
                     self.status_data.setStatus(update.id, update.text);
-                    self.refreshExtensionStatusText();
                 },
                 .header => {
                     self.applySurfaceText(&self.extension_header_text, update);
@@ -3169,23 +3091,6 @@ pub const Interactive = struct {
             }
         }
         self.tui.dirty = true;
-    }
-
-    fn refreshStatusContainer(self: *Interactive) void {
-        self.status_container.clear();
-        if (self.loader_active) {
-            self.status_container.addChild(self.loader.component());
-        } else {
-            self.status_container.addChild(self.status_text.component());
-        }
-        self.status_container.addChild(self.extension_status_text.component());
-    }
-
-    fn refreshExtensionStatusText(self: *Interactive) void {
-        const text = self.status_data.formatExtensionStatuses(self.allocator, " ") catch return;
-        defer self.allocator.free(text);
-        self.extension_status_text.setContent(text);
-        self.refreshStatusContainer();
     }
 
     fn applySurfaceText(self: *Interactive, text_component: *text_mod.Text, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
@@ -3466,9 +3371,7 @@ pub const Interactive = struct {
             self.editor.setTheme(self.theme);
         }
         self.transcript.theme = self.theme;
-        self.loader.shimmer_edge_fg = self.theme.fg(.muted);
-        self.loader.message_fg = self.theme.fg(.dim);
-        self.loader.shimmer_peak_fg = Color.rgb(0xF2, 0xF1, 0xEF);
+        self.status_line.setTheme(self.theme);
         self.pending_image_banner.fg = self.theme.fg(.accent);
         self.pending_image_banner.bg = self.theme.bg(.tool_pending_bg);
     }
