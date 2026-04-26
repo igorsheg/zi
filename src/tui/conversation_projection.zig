@@ -1013,7 +1013,6 @@ fn createAssistantMessageRow(
     return .{
         .renderable = TranscriptRenderable.init(assistant_message_component_mod.AssistantMessage, am),
         .kind = .assistant_message,
-        .extra_height = 1,
         .deinit_ctx = @ptrCast(am),
         .deinit_fn = deinitAssistantMessageRow,
     };
@@ -1047,7 +1046,6 @@ pub fn createUserMessageRow(
     return .{
         .renderable = TranscriptRenderable.init(user_message_component_mod.UserMessage, msg),
         .kind = kind,
-        .extra_height = 1,
         .deinit_ctx = @ptrCast(msg),
         .deinit_fn = deinitUserMessageRow,
     };
@@ -1136,7 +1134,6 @@ fn createToolExecutionRowParts(
         .renderable = TranscriptRenderable.init(transcript_mod.ToolExecution, te),
         .kind = .tool_execution,
         .tool_call_id = te.model.tool_call_id.?,
-        .extra_height = 1,
         .deinit_ctx = @ptrCast(te),
         .deinit_fn = deinitToolExecutionRow,
     };
@@ -1507,7 +1504,6 @@ fn createMarkdownRow(
     md.setContent(content);
     return .{
         .renderable = TranscriptRenderable.init(Markdown, md),
-        .extra_height = 1,
         .deinit_ctx = @ptrCast(md),
         .deinit_fn = deinitMarkdown,
     };

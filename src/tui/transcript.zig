@@ -136,9 +136,6 @@ pub const TranscriptItem = struct {
     /// Owned cleanup context. Called on item removal/transcript clear.
     deinit_ctx: ?*anyopaque = null,
     deinit_fn: ?DeinitFn = null,
-    /// Extra height added outside the renderable (e.g., spacer before user message).
-    extra_height: u32 = 0,
-
     pub fn deinit(self: *TranscriptItem, allocator: std.mem.Allocator) void {
         if (self.deinit_fn) |f| f(self.deinit_ctx.?, allocator);
     }
@@ -618,8 +615,8 @@ pub const ToolExecution = struct {
         return Color.default;
     }
 
-    // Vertical padding inside the bg box (pi-mono: Box(paddingX=1, paddingY=1))
-    const padding_y: u32 = 1;
+    // Transcript owns vertical spacing between rows; tools keep only horizontal content inset.
+    const padding_y: u32 = 0;
 
     pub fn measure(self: *ToolExecution, width: u32) Measurement {
         if (width == 0) return .{ .min_height = 0, .preferred_height = 0 };
@@ -882,7 +879,7 @@ test "tool execution renderSlice starts inside a wrapped tool result" {
     };
     defer tool.model.deinit(testing.allocator);
 
-    tool.renderSlice(buffer.region(), 3);
+    tool.renderSlice(buffer.region(), 2);
 
     try testing.expectEqual(@as(u21, 'e'), buffer.get(1, 0).grapheme.codepoint);
     try testing.expectEqual(@as(u21, 'f'), buffer.get(2, 0).grapheme.codepoint);
@@ -925,6 +922,8 @@ pub const Transcript = struct {
     /// Fast lookup: retained item_id → item index for retained reconciliation.
     retained_items: std.AutoHashMapUnmanaged(ItemId, usize) = .empty,
     layout: TranscriptLayout,
+    /// Parent-owned vertical gap inserted between transcript child items.
+    child_gap_rows: u32 = 1,
 
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = undefined,
@@ -955,7 +954,7 @@ pub const Transcript = struct {
 
     fn measureLayoutItem(ctx: *anyopaque, index: usize, width: u32) u32 {
         const self: *Transcript = @ptrCast(@alignCast(ctx));
-        return self.itemHeight(&self.items.items[index], width);
+        return self.itemHeight(index, &self.items.items[index], width);
     }
 
     fn ensureLayout(self: *Transcript, width: u32) void {
@@ -965,6 +964,14 @@ pub const Transcript = struct {
 
     fn syncScrollAfterLayout(self: *Transcript) void {
         self.layout.clampScroll(self.last_visible_height);
+    }
+
+    pub fn setChildGapRows(self: *Transcript, rows: u32) void {
+        if (self.child_gap_rows == rows) return;
+        self.child_gap_rows = rows;
+        self.layout.invalidateAll();
+        self.ensureLayout(self.last_render_width);
+        self.syncScrollAfterLayout();
     }
 
     fn remeasureItem(self: *Transcript, index: usize) void {
@@ -1424,7 +1431,7 @@ pub const Transcript = struct {
         if (idx >= self.items.items.len) return;
         const item_start = self.layout.prefixHeightBefore(idx);
         const item = &self.items.items[idx];
-        self.renderItem(item, region, absolute_row - item_start, region.height, width);
+        self.renderItem(idx, item, region, absolute_row - item_start, region.height, width);
     }
 
     fn rowSelectedColumnRange(self: *Transcript, absolute_row: u32, max_cols: u32) ?struct { start_col: u32, end_col: u32 } {
@@ -1542,7 +1549,7 @@ pub const Transcript = struct {
             const remaining = item_h - skipped;
             const visible_h = @min(remaining, h - screen_y);
             const row_region = region.sub(0, screen_y, w, visible_h);
-            self.renderItem(item, row_region, skipped, visible_h, w);
+            self.renderItem(idx, item, row_region, skipped, visible_h, w);
 
             screen_y += visible_h;
             skipped = 0;
@@ -1550,17 +1557,17 @@ pub const Transcript = struct {
         self.renderSelectionOverlay(region);
     }
 
-    fn renderItem(self: *Transcript, item: *TranscriptItem, row_region: Region, skipped: u32, _: u32, w: u32) void {
-        const row_skip = skipped;
-        if (item.extra_height > 0 and row_skip < item.extra_height) {
-            const spacer_visible = item.extra_height - row_skip;
-            if (row_region.height > spacer_visible) {
-                const sub = row_region.sub(0, spacer_visible, w, row_region.height - spacer_visible);
+    fn renderItem(self: *Transcript, index: usize, item: *TranscriptItem, row_region: Region, skipped: u32, _: u32, w: u32) void {
+        const gap_rows = self.gapBeforeItem(index);
+        if (gap_rows > 0 and skipped < gap_rows) {
+            const gap_visible = gap_rows - skipped;
+            if (row_region.height > gap_visible) {
+                const sub = row_region.sub(0, gap_visible, w, row_region.height - gap_visible);
                 self.renderRenderableRows(item.renderable, sub, 0);
             }
             return;
         }
-        self.renderRenderableRows(item.renderable, row_region, row_skip -| item.extra_height);
+        self.renderRenderableRows(item.renderable, row_region, skipped -| gap_rows);
     }
 
     fn renderRenderableRows(self: *Transcript, renderable: TranscriptRenderable, row_region: Region, skipped: u32) void {
@@ -1569,9 +1576,12 @@ pub const Transcript = struct {
         renderable.renderSlice(row_region, skipped);
     }
 
-    fn itemHeight(self: *Transcript, item: *TranscriptItem, width: u32) u32 {
-        _ = self;
-        return @max(1, item.renderable.measure(width).preferred_height) + item.extra_height;
+    fn gapBeforeItem(self: *const Transcript, index: usize) u32 {
+        return if (index == 0) 0 else self.child_gap_rows;
+    }
+
+    fn itemHeight(self: *const Transcript, index: usize, item: *TranscriptItem, width: u32) u32 {
+        return @max(1, item.renderable.measure(width).preferred_height) + self.gapBeforeItem(index);
     }
 };
 
@@ -1634,7 +1644,6 @@ fn appendTestAssistantRow(transcript: *Transcript) !usize {
     const item: TranscriptItem = .{
         .renderable = TranscriptRenderable.init(assistant_message_mod.AssistantMessage, assistant),
         .kind = .assistant_message,
-        .extra_height = 1,
         .deinit_ctx = @ptrCast(assistant),
         .deinit_fn = deinitAssistantMessage,
     };
@@ -1739,7 +1748,6 @@ fn appendTestToolExecutionRow(
         .renderable = TranscriptRenderable.init(ToolExecution, tool),
         .kind = .tool_execution,
         .tool_call_id = tool.model.tool_call_id.?,
-        .extra_height = 1,
         .deinit_ctx = @ptrCast(tool),
         .deinit_fn = ToolExecution.deinitItem,
     };
@@ -1784,7 +1792,6 @@ fn appendTestUserRow(
     const item: TranscriptItem = .{
         .renderable = TranscriptRenderable.init(user_message_mod.UserMessage, msg),
         .kind = kind,
-        .extra_height = 1,
         .deinit_ctx = @ptrCast(msg),
         .deinit_fn = deinitUserMessage,
     };
@@ -1997,9 +2004,45 @@ test "Transcript scrolls through tool output without repeating the first rows" {
     transcript.render(buf.region());
 
     try testing.expectEqual(@as(u21, 'l'), buf.get(1, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '2'), buf.get(5, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '1'), buf.get(5, 0).grapheme.codepoint);
     try testing.expectEqual(@as(u21, 'l'), buf.get(1, 1).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '3'), buf.get(5, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '2'), buf.get(5, 1).grapheme.codepoint);
+}
+
+test "Transcript item gap is parent-owned spacing between children" {
+    const OneLine = struct {
+        ch: u21,
+
+        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
+            if (first_row > 0 or region.height == 0) return;
+            region.set(0, 0, .{ .grapheme = .{ .codepoint = self.ch } });
+        }
+
+        pub fn measure(_: *@This(), _: u32) component_mod.Measurement {
+            return .{ .min_height = 1, .preferred_height = 1 };
+        }
+
+        pub fn renderable(self: *@This()) TranscriptRenderable {
+            return TranscriptRenderable.init(@This(), self);
+        }
+    };
+
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+    var first = OneLine{ .ch = 'A' };
+    var second = OneLine{ .ch = 'B' };
+    transcript.addRenderable(first.renderable());
+    transcript.addRenderable(second.renderable());
+
+    try testing.expectEqual(@as(u32, 3), transcript.totalHeight(10));
+
+    var buf = try Buffer.init(testing.allocator, 10, 3);
+    defer buf.deinit();
+    transcript.render(buf.region());
+
+    try testing.expectEqual(@as(u21, 'A'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, ' '), buf.get(0, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'B'), buf.get(0, 2).grapheme.codepoint);
 }
 
 test "Transcript preserves visible anchor when earlier items grow" {
@@ -2032,7 +2075,7 @@ test "Transcript preserves visible anchor when earlier items grow" {
     var second = Box{ .height = 3, .ch = 'B' };
     transcript.addRenderable(first.renderable());
     transcript.addRenderable(second.renderable());
-    transcript.scrollBy(10, 2, 3);
+    transcript.scrollBy(10, 2, 4);
 
     var before = try Buffer.init(testing.allocator, 10, 2);
     defer before.deinit();
@@ -2066,7 +2109,7 @@ test "ToolExecution collapsed plain text renderer shows overflow hint row" {
     defer buf.deinit();
     transcript.render(buf.region());
 
-    try testing.expectEqual(@as(u21, '.'), buf.get(1, 8).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, '.'), buf.get(1, 6).grapheme.codepoint);
 }
 
 test "Transcript removeRenderable removes item by identity and fixes indices" {
