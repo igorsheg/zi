@@ -179,6 +179,27 @@ editor capabilities split in two:
 extensions may use the first class.
 the host owns the second class.
 
+### publication boundary
+
+extension ui publication is not command-owned.
+
+any extension execution boundary that can mutate host-owned ui must publish or schedule publication of the affected semantic families before the host considers that boundary quiescent. examples include:
+
+- startup / `session_start`
+- session replacement lifecycle (`new`, `resume`, `fork`, `reload`)
+- extension commands
+- observer events such as `model_select`
+- future tool/event/job/subagent callbacks that expose `ctx.ui`
+
+this publication is a boundary object, not store access:
+
+- the agent-side extension runtime owns retained ui records, namespace/generation cleanup, dirty-family tracking, and any pending action queues.
+- the tui consumes semantic publications (`surface`, `prompt`, `editor_action`, notification, panel, etc.) and materializes local components from them.
+- the tui must not read an `ExtensionUiStore`, `ExtensionRunner`, lua registry, or mailbox internals to discover ui state.
+- lua extensions call capability functions (`ctx.ui.set_widget`, `ctx.ui.show_panel`, `ctx.ui.confirm`, etc.); they never observe the store or transport shape.
+
+closed primitive families are intentional. extensibility happens through host-defined slots, semantic payloads, renderer refs, presentation documents, and deliberately added versioned families — not through raw tui component reach-through.
+
 ### 6. transcript family
 
 transcript-facing ui uses semantic attachment and presentation records.

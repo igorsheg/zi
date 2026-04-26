@@ -494,6 +494,7 @@ pub const Interactive = struct {
     extension_header_text: text_mod.Text,
     extension_footer_text: text_mod.Text,
     extension_widget_above_text: text_mod.Text,
+    extension_widget_below_text: text_mod.Text,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
@@ -630,6 +631,7 @@ pub const Interactive = struct {
             .extension_header_text = text_mod.Text.init(state_allocator),
             .extension_footer_text = text_mod.Text.init(state_allocator),
             .extension_widget_above_text = text_mod.Text.init(state_allocator),
+            .extension_widget_below_text = text_mod.Text.init(state_allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
@@ -737,6 +739,7 @@ pub const Interactive = struct {
         self.header_container.deinit();
         self.conversation_projection.deinit();
         self.transcript.deinit();
+        self.extension_widget_below_text.deinit();
         self.extension_widget_above_text.deinit();
         self.extension_footer_text.deinit();
         self.extension_header_text.deinit();
@@ -799,6 +802,7 @@ pub const Interactive = struct {
         self.widget_above_container.addChild(self.extension_widget_above_text.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
+        self.widget_below_container.addChild(self.extension_widget_below_text.component());
         self.widget_below_container.addChild(self.extension_panel_text.component());
         self.widget_below_container.addChild(self.extension_footer_text.component());
 
@@ -816,6 +820,12 @@ pub const Interactive = struct {
         self.tui.root.addChild(self.widget_below_container.component()); // [6] widgetBelowContainer
         self.tui.root.flex_child_index = 1; // transcript is flex
         self.tui.root.focused_child_index = 5; // editorContainer for cursor y-offset
+
+        // RuntimeHost emits extension `session_start` before the TUI tree exists.
+        // Drain the semantic UI publications once after slots are materialized so
+        // lifecycle-time retained surfaces (widgets/status/header/footer/etc.)
+        // are visible without waiting for an extension command.
+        self.publishPendingExtensionUi();
 
         self.tui.dirty = true;
         self.performStartupAction();
@@ -3008,21 +3018,7 @@ pub const Interactive = struct {
                             };
                             _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
                         };
-                        if (self.runtime_host.takePendingExtensionPanel(self.msg_allocator)) |panel| {
-                            _ = self.publishLifecycleUiEvent(.{ .extension_panel_shown = .{ .panel = panel } });
-                        }
-                        const updates = self.runtime_host.takePendingExtensionSurfaces(self.msg_allocator);
-                        if (updates.len > 0) {
-                            _ = self.publishLifecycleUiEvent(.{ .extension_surfaces_updated = .{ .updates = updates } });
-                        } else {
-                            self.msg_allocator.free(updates);
-                        }
-                        const actions = self.runtime_host.takePendingExtensionEditorActions(self.msg_allocator);
-                        if (actions.len > 0) {
-                            _ = self.publishLifecycleUiEvent(.{ .extension_editor_actions = .{ .actions = actions } });
-                        } else {
-                            self.msg_allocator.free(actions);
-                        }
+                        self.publishPendingExtensionUi();
                     },
                     .extension_oauth_login => |oauth| {
                         idle_processed = true;
@@ -3051,6 +3047,13 @@ pub const Interactive = struct {
                 req.deinit(self.msg_allocator);
             }
 
+            if (idle_processed) {
+                // Session replacement, model events, oauth callbacks, and future
+                // observer paths may run extension code outside command dispatch.
+                // Publish any semantic UI records those callbacks produced before
+                // telling the TUI thread the idle batch is finished.
+                self.publishPendingExtensionUi();
+            }
             if (idle_processed and !prompt_processed) {
                 _ = self.publishLifecycleUiEvent(.{ .request_worker_finished = {} });
             }
@@ -3088,6 +3091,31 @@ pub const Interactive = struct {
         _ = self.publishLifecycleUiEvent(.{ .extension_commands_updated = .{ .commands = commands } });
     }
 
+    /// Publish agent-owned extension UI publications across the TUI boundary.
+    ///
+    /// This is intentionally a semantic publication drain, not TUI access to an
+    /// extension UI store. The TUI consumes owned publication records and
+    /// materializes them locally; the agent/runtime remains the retained-object
+    /// owner. Call this after any agent-thread extension execution boundary that
+    /// may have mutated UI state (startup lifecycle, commands, future observers).
+    fn publishPendingExtensionUi(self: *Interactive) void {
+        if (self.runtime_host.takePendingExtensionPanel(self.msg_allocator)) |panel| {
+            _ = self.publishLifecycleUiEvent(.{ .extension_panel_shown = .{ .panel = panel } });
+        }
+        const updates = self.runtime_host.takePendingExtensionSurfaces(self.msg_allocator);
+        if (updates.len > 0) {
+            _ = self.publishLifecycleUiEvent(.{ .extension_surfaces_updated = .{ .updates = updates } });
+        } else {
+            self.msg_allocator.free(updates);
+        }
+        const actions = self.runtime_host.takePendingExtensionEditorActions(self.msg_allocator);
+        if (actions.len > 0) {
+            _ = self.publishLifecycleUiEvent(.{ .extension_editor_actions = .{ .actions = actions } });
+        } else {
+            self.msg_allocator.free(actions);
+        }
+    }
+
     fn applyExtensionPanel(self: *Interactive, panel: @import("../coding_agent/extensions/ui.zig").Panel) void {
         const text = panel.flattenText(self.allocator) catch return;
         defer self.allocator.free(text);
@@ -3113,10 +3141,10 @@ pub const Interactive = struct {
                 .status => self.status_data.setStatus(update.id, update.text),
                 .header => self.applySurfaceText(&self.extension_header_text, update),
                 .footer => self.applySurfaceText(&self.extension_footer_text, update),
-                .widget => if (update.placement != null and std.mem.eql(u8, update.placement.?, "aboveEditor"))
-                    self.applySurfaceText(&self.extension_widget_above_text, update)
+                .widget => if (update.placement != null and std.mem.eql(u8, update.placement.?, "belowEditor"))
+                    self.applySurfaceText(&self.extension_widget_below_text, update)
                 else
-                    self.applySurfaceText(&self.extension_panel_text, update),
+                    self.applySurfaceText(&self.extension_widget_above_text, update),
                 .working, .overlay => self.applySurfaceText(&self.extension_panel_text, update),
                 .title, .thinking_label => {},
             }
