@@ -1421,6 +1421,78 @@ test "extension command context publishes host-owned prompt requests with defaul
     try testing.expectEqual(@as(usize, 0), store.prompts.items.len);
 }
 
+test "extension command resumes after yieldable host result" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 20);
+    defer runner.deinit();
+    runner.enable_test_async = true;
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "async-test",
+        \\  description = "async-test",
+        \\  handler = function(_, ctx)
+        \\    local first = ctx.__test_async()
+        \\    local second = ctx.__test_async()
+        \\    _async_result = first .. ":" .. second
+        \\  end,
+        \\})
+    , "register_async_test_command");
+
+    try runner.dispatchCommand("async-test", "");
+    try testing.expectEqual(@as(usize, 1), runner.pending_async.count());
+    try runner.completeTestAsync(1, "one");
+    try testing.expectEqual(@as(usize, 1), runner.pending_async.count());
+    try runner.completeTestAsync(2, "two");
+    try testing.expectEqual(@as(usize, 0), runner.pending_async.count());
+
+    _ = c.lua_getglobal(state.L, "_async_result");
+    defer c.lua_pop(state.L, 1);
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(state.L, -1, &len) orelse return error.MissingAsyncResult;
+    try testing.expectEqualStrings("one:two", ptr[0..len]);
+}
+
+test "extension command rejects arbitrary coroutine yield" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 20);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "bad-yield",
+        \\  description = "bad-yield",
+        \\  handler = function() coroutine.yield() end,
+        \\})
+    , "register_bad_yield_command");
+
+    try testing.expectError(error.UnexpectedYield, runner.dispatchCommand("bad-yield", ""));
+}
+
 test "extension command context publishes a host-owned panel" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();

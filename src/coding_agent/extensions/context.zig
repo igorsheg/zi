@@ -18,7 +18,7 @@ pub fn pushExtensionContext(
     runner: *runner_mod.ExtensionRunner,
     provenance: ?resource_types.ExtensionProvenance,
 ) !void {
-    c.lua_createtable(L, 0, 11);
+    c.lua_createtable(L, 0, 12);
 
     _ = c.lua_pushlstring(L, runner.cwd.ptr, runner.cwd.len);
     c.lua_setfield(L, -2, "cwd");
@@ -44,6 +44,11 @@ pub fn pushExtensionContext(
 
     pushContextBinding(L, runner, provenance);
     c.lua_setfield(L, -2, "binding");
+
+    if (runner.enable_test_async) {
+        pushMethod(L, runner, &ctxTestAsync);
+        c.lua_setfield(L, -2, "__test_async");
+    }
 
     switch (runner.runtime) {
         .bound => |bound| {
@@ -995,6 +1000,31 @@ fn ctxSessionMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
             return 1;
         },
     }
+}
+
+fn ctxTestAsync(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id = runner.beginTestAsync();
+    return c.lua_yieldk(L, 0, @intCast(id), ctxTestAsyncContinue);
+}
+
+fn ctxTestAsyncContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) callconv(.c) c_int {
+    _ = status;
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id: runner_mod.AsyncOpId = @intCast(ctx);
+    var result = runner.takeCompletedAsync(id) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    defer result.deinit(runner.allocator);
+    switch (result) {
+        .@"test" => |value| {
+            _ = c.lua_pushlstring(L, value.ptr, value.len);
+        },
+    }
+    return 1;
 }
 
 fn pushContextBinding(

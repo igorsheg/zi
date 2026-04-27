@@ -25,6 +25,40 @@ const log = std.log.scoped(.zi_runner);
 /// event. The generation is u64 to ensure monotonicity even across very long
 /// sessions (practically infinite).
 pub const Generation = u64;
+pub const AsyncOpId = u64;
+
+pub const AsyncKind = enum {
+    @"test",
+};
+
+pub const AsyncStart = struct {
+    id: AsyncOpId,
+    kind: AsyncKind,
+};
+
+pub const AsyncResult = union(AsyncKind) {
+    @"test": []const u8,
+
+    pub fn deinit(self: *AsyncResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .@"test" => |value| allocator.free(value),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const PendingAsync = struct {
+    id: AsyncOpId,
+    kind: AsyncKind,
+    co: lua_runtime.Coroutine,
+    provenance: ?resource_types.ExtensionProvenance,
+    generation: Generation,
+
+    pub fn deinit(self: *PendingAsync) void {
+        self.co.deinit();
+        self.* = undefined;
+    }
+};
 
 pub const ExtensionBindingInfo = struct {
     workspace_id: []const u8,
@@ -263,6 +297,12 @@ pub const ExtensionRunner = struct {
     /// execution contract landed here.
     current_spawn_request: ?SpawnRequest = null,
     current_spawn_result: ?SpawnOutcome = null,
+
+    next_async_id: AsyncOpId = 1,
+    current_async_start: ?AsyncStart = null,
+    pending_async: std.AutoHashMapUnmanaged(AsyncOpId, PendingAsync) = .empty,
+    completed_async: std.AutoHashMapUnmanaged(AsyncOpId, AsyncResult) = .empty,
+    enable_test_async: bool = false,
 
     loaded_extensions: std.ArrayListUnmanaged(resource_types.ExtensionProvenance) = .empty,
     load_context: ?LoadContext = null,
@@ -517,6 +557,7 @@ pub const ExtensionRunner = struct {
         // memory safety. Order matters only when v2 adds tool ctx
         // wrappers that hold zig pointers into runner state; D9
         // will revisit this.
+        self.clearAsyncState();
         self.provider_queue.deinit();
         self.command_registry.deinit();
         self.event_registry.deinit();
@@ -689,7 +730,8 @@ pub const ExtensionRunner = struct {
         const cmd = self.command_registry.getByVisibleName(name) orelse return error.UnknownCommand;
 
         var co = try lua_runtime.Coroutine.init(state);
-        defer co.deinit();
+        var co_owned = true;
+        defer if (co_owned) co.deinit();
 
         _ = lua_runtime.c.lua_rawgeti(co.L, lua_runtime.c.LUA_REGISTRYINDEX, cmd.lua_ref);
         if (lua_runtime.c.lua_type(co.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
@@ -714,7 +756,11 @@ pub const ExtensionRunner = struct {
 
         const r = try co.resumeWith(2);
         switch (r.status) {
-            .yielded => return error.UnexpectedYield,
+            .yielded => {
+                try self.suspendYieldedCommand(&co, cmd.source.provenance);
+                co_owned = false;
+                return;
+            },
             .ok, .finished => {},
         }
 
@@ -723,6 +769,82 @@ pub const ExtensionRunner = struct {
         if (r.nresults > 0) {
             lua_runtime.c.lua_settop(co.L, top - r.nresults);
         }
+    }
+
+    fn suspendYieldedCommand(self: *ExtensionRunner, co: *lua_runtime.Coroutine, provenance: ?resource_types.ExtensionProvenance) !void {
+        const start = self.current_async_start orelse return error.UnexpectedYield;
+        self.current_async_start = null;
+        try self.pending_async.put(self.allocator, start.id, .{
+            .id = start.id,
+            .kind = start.kind,
+            .co = co.*,
+            .provenance = provenance,
+            .generation = self.generation,
+        });
+    }
+
+    pub fn beginTestAsync(self: *ExtensionRunner) AsyncOpId {
+        const id = self.next_async_id;
+        self.next_async_id += 1;
+        self.current_async_start = .{ .id = id, .kind = .@"test" };
+        return id;
+    }
+
+    pub fn takeCompletedAsync(self: *ExtensionRunner, id: AsyncOpId) ?AsyncResult {
+        const kv = self.completed_async.fetchRemove(id) orelse return null;
+        return kv.value;
+    }
+
+    pub fn completeTestAsync(self: *ExtensionRunner, id: AsyncOpId, value: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned);
+        try self.resumeAsync(id, .{ .@"test" = owned });
+    }
+
+    pub fn resumeAsync(self: *ExtensionRunner, id: AsyncOpId, result: AsyncResult) !void {
+        self.assertOnLuaThread();
+        const pending_kv = self.pending_async.fetchRemove(id) orelse {
+            var dropped = result;
+            dropped.deinit(self.allocator);
+            return;
+        };
+        var pending = pending_kv.value;
+        var pending_owned = true;
+        defer if (pending_owned) pending.deinit();
+
+        if (pending.generation != self.generation) {
+            var dropped = result;
+            dropped.deinit(self.allocator);
+            return;
+        }
+
+        try self.completed_async.put(self.allocator, id, result);
+        errdefer if (self.completed_async.fetchRemove(id)) |kv| {
+            var dropped = kv.value;
+            dropped.deinit(self.allocator);
+        };
+
+        const r = try pending.co.resumeWith(0);
+        switch (r.status) {
+            .yielded => {
+                try self.suspendYieldedCommand(&pending.co, pending.provenance);
+                pending_owned = false;
+            },
+            .ok, .finished => {
+                const top = lua_runtime.c.lua_gettop(pending.co.L);
+                if (r.nresults > 0) lua_runtime.c.lua_settop(pending.co.L, top - r.nresults);
+            },
+        }
+    }
+
+    fn clearAsyncState(self: *ExtensionRunner) void {
+        if (self.current_async_start != null) self.current_async_start = null;
+        var pending_it = self.pending_async.iterator();
+        while (pending_it.next()) |entry| entry.value_ptr.deinit();
+        self.pending_async.deinit(self.allocator);
+        var completed_it = self.completed_async.iterator();
+        while (completed_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.completed_async.deinit(self.allocator);
     }
 
     pub fn dispatchOAuthLogin(
