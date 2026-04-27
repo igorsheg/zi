@@ -354,8 +354,8 @@ const ExtensionPromptFlow = struct {
                         break :blk confirm_items;
                     },
                     .select => blk: {
-                        const select_items = try a.alloc(SelectItem, prompt.options.len);
-                        for (prompt.options, 0..) |option, i| {
+                        const select_items = try a.alloc(SelectItem, owned_prompt.options.len);
+                        for (owned_prompt.options, 0..) |option, i| {
                             select_items[i] = .{ .value = option.id, .label = option.label };
                         }
                         break :blk select_items;

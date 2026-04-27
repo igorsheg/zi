@@ -1183,6 +1183,65 @@ test "extension command prompts can resolve through host response" {
     try runner.dispatchCommand("resolved-prompts", "");
 }
 
+test "lua question tool publishes host-owned select prompt request" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 17);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_tool({
+        \\  name = "question_test",
+        \\  description = "question_test",
+        \\  parameters = { type = "object", properties = {} },
+        \\  execute = function(args, ctx)
+        \\    local answer = ctx.ui.select(args.question, args.options)
+        \\    return {
+        \\      content = { { type = "text", text = answer or "cancelled" } },
+        \\      details = { answer = answer },
+        \\    }
+        \\  end,
+        \\})
+    , "register_question_test_tool");
+
+    const ext_tool = runner.tool_registry.get("question_test").?.*;
+    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"question":"Pick one","options":["Alpha","Beta"]}
+    , .{});
+
+    const result = tool.execute(
+        tool.ctx,
+        arena.allocator(),
+        "id-question",
+        args,
+        abort_signal_mod.AbortSignal.none,
+        null,
+        null,
+    );
+
+    try testing.expect(!result.is_error);
+    try testing.expectEqual(@as(usize, 1), store.prompts.items.len);
+    try testing.expectEqual(extension_ui.PromptKind.select, store.prompts.items[0].kind);
+    try testing.expectEqualStrings("Pick one", store.prompts.items[0].title);
+    try testing.expectEqualStrings("Alpha", store.prompts.items[0].options[0].id);
+    try testing.expectEqualStrings("Beta", store.prompts.items[0].options[1].label);
+}
+
 test "extension command context publishes host-owned prompt requests with default outcomes" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
