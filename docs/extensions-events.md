@@ -109,6 +109,12 @@ these are the public observer classes for v2.
 | `tool_execution_update` | `tool_call_id`, `tool_name`, `args`, `partial_result` | zero or more partial updates |
 | `tool_execution_end` | `tool_call_id`, `tool_name`, `result`, `is_error` | final tool execution outcome |
 | `model_select` | `model`, `previous_model?`, `source` | emitted for explicit set, cycling, and restore |
+| `job_start` | `job_id`, `kind`, `label?`, `cwd?`, `state` | generic retained job entered running/queued-visible state after scheduler commit |
+| `job_update` | `job_id`, `kind`, `progress?`, `output?`, `state` | coalescible progress/output publication for a committed retained job |
+| `job_end` | `job_id`, `kind`, `result?`, `error?`, `state`, `usage?` | terminal generic retained job publication; hard flush point |
+| `subagent_start` | `subagent_id`, `job_id?`, `label?`, `model?`, `cwd?`, `state` | child-agent retained state was committed; isolated child run is visible |
+| `subagent_update` | `subagent_id`, `job_id?`, `progress?`, `message?`, `tool_summary?`, `state` | coalescible semantic child progress; not raw child transport passthrough |
+| `subagent_end` | `subagent_id`, `job_id?`, `result?`, `error?`, `usage?`, `state` | terminal child-agent publication; hard flush point before default presentation settles |
 | `session_compact` | `compaction_entry`, `from_extension` | survives as the post-compaction observer |
 | `session_tree` | `new_leaf_id?`, `old_leaf_id?`, `summary_entry?`, `from_extension?` | survives as the post-tree-navigation observer |
 
@@ -120,6 +126,20 @@ zi needs both the pre and post edges:
 - `session_compact` and `session_tree` are where other extensions can observe the committed session mutation.
 
 without the post events, one extension could customize a session operation but another extension could not reliably react to the fact that the operation actually committed.
+
+### job and subagent observer rules
+
+`job_*` and `subagent_*` are observe-only classes over committed retained state.
+
+they are not a public copy of raw child process output, raw `AgentEvent`, jsonl transport, scheduler internals, or child transcript deltas.
+
+rules:
+
+- `*_start` publishes after the scheduler / retained-object commit that makes the job or child agent visible.
+- `*_update` may coalesce high-frequency progress, output, or child summary churn.
+- `*_end` is terminal and must flush; observers see the final retained state, result/error shape, and usage if available.
+- subagent payloads may summarize child messages, tool usage, and progress, but child-internal transport remains private.
+- default transcript presentation may consume the same retained state; observers do not own child ui trees.
 
 ## interceptor classes
 

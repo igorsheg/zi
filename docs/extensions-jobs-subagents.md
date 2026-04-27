@@ -266,18 +266,13 @@ practical consequence:
 
 ## event fit
 
-subagents also need observer publication in the event contract.
+subagents and generic jobs have explicit observer publication in the event contract.
 
-the event docs should grow explicit observer classes for subagent semantics, not reuse raw transport events.
-
-the minimum set is:
+`extensions-events.md` defines:
 
 - `subagent_start`
 - `subagent_update`
 - `subagent_end`
-
-and, if generic jobs become public observer classes too:
-
 - `job_start`
 - `job_update`
 - `job_end`
@@ -287,6 +282,7 @@ rules:
 - these are observe-only classes.
 - payloads are semantic subagent/job objects, not raw `AgentEvent` passthrough.
 - publication happens after retained-state commit, so observers see committed state.
+- update events may coalesce progress churn; terminal events are hard flush points.
 - child-internal tool/message transport may feed these payloads, but is not itself the public event type system.
 
 ## parity target from pi-mono
@@ -330,7 +326,7 @@ this contract replaces or tightens these current seams:
 this contract does not define:
 
 - the final lua surface spelling for each subagent/job call
-- detailed payload schemas for `subagent_*` or `job_*` events
+- final detailed payload schemas beyond the semantic cores in `extensions-events.md`
 - the full generic job api surface beyond its role and ownership class
 - custom ui authoring for child presentation
 - persistent state migration across generation changes

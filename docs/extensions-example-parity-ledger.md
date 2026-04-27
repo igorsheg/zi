@@ -17,7 +17,7 @@ zi's v2 docs intentionally keep the architecture different:
 - extensions execute on the agent-owned lua runtime; the tui renders host-owned state and does not call lua directly (`docs/extensions.md:20-24`).
 - raw `custom()` component trees, raw editor replacement, and raw terminal input listeners are excluded across the lua boundary (`docs/extensions-ui-contract.md:90-92`).
 - advanced ui remains possible only through host-owned surfaces, renderer refs, retained handles, or semantic records (`docs/extensions-ui-contract.md:81-89`).
-- subagent/job observer classes are called out as incomplete (`docs/extensions-jobs-subagents.md:267-290`).
+- subagent/job observer classes are closed at the contract layer as semantic observe-only `job_*` / `subagent_*` events, but implementation remains future work (`docs/extensions-events.md:93-143`; `docs/extensions-jobs-subagents.md:267-290`).
 
 ## status labels
 
@@ -76,7 +76,7 @@ current event registry tags cover lifecycle, tool, session start/shutdown/switch
 | `dynamic-tools.ts` | register tools during lifecycle/runtime | shipped | `examples/extensions/dynamic_tools.lua` registers `echo_session` from `session_start` and more echo tools from `/add-echo-tool`; accepted runtime registrations update the generation-owned registry and refresh the session's visible tool list + prompt metadata, while duplicate claims keep first-claimant semantics and fail open | closed in dynamic runtime registration slice. |
 | `antigravity-image-gen.ts` | external integration tool with files/images | partial | tool execution + image/file result semantics | depends on image/result rendering parity; likely after tool renderer slice. |
 | `ssh.ts` | delegate tool operations to remote host | partial | tool override + subprocess/system substrate + policy hooks | after `zi.system`/job substrate decision. |
-| `subagent/` | first-class delegated child agents | blocked | retained subagent/job scheduler, progress, observer events, default transcript rendering | define/implement `subagent_*` / `job_*` events; docs mark this open (`docs/extensions-jobs-subagents.md:267-290`). |
+| `subagent/` | first-class delegated child agents | blocked | retained subagent/job scheduler, progress, observer events, default transcript rendering | event contract is defined; implementation still needs retained scheduler/state, dispatch, and default transcript rendering. |
 | `permission-gate.ts`, `protected-paths.ts` | block or modify tool calls | partial | `tool_call` middleware/cancellable + host-owned ui confirm/select request records | complete event dispatch coverage + interactive prompt materialization. |
 | `confirm-destructive.ts`, `dirty-repo-guard.ts` | veto session switch/fork/new operations | partial | `session_before_switch`, `session_before_fork`, future compact/tree gates + host-owned ui prompt requests | complete event dispatch, interactive prompt materialization, and command/session-control context. |
 | `sandbox/` | OS-level sandbox wrapping tool execution | blocked | tool-call/user-bash interception plus process sandbox substrate | requires `user_bash` event and system/job substrate. |
@@ -125,7 +125,7 @@ current event registry tags cover lifecycle, tool, session start/shutdown/switch
 5. **event/interceptor surface:** ship `input`, `context`, `before_provider_request`, `resources_discover`, `user_bash`, session gates, and compaction/tree hooks.
 6. **retained ui primitives:** prompts, notifications, status, widgets, header/footer, title, editor modal, and overlays as host-owned records.
 7. **providers:** prove provider registration, oauth, model projection, reload/rebind, and unregister/claim restoration.
-8. **jobs/subagents:** replace today's `zi.spawn`-centric model with first-class retained jobs/subagents and observer events.
+8. **jobs/subagents:** replace today's `zi.spawn`-centric model with first-class retained jobs/subagents, dispatch the now-defined observer events, and add default presentation.
 9. **advanced ui/editor parity:** decide constrained retained overlay/editor extension points for games and modal editors, or mark specific raw seams as deliberate non-goals with product alternatives.
 10. **example suite:** every shipped class gets a runnable zi example and 2-4 boundary tests per slice.
 
