@@ -112,9 +112,20 @@ pub const AssistantMessage = struct {
 
     pub fn setHideThinkingBlock(self: *AssistantMessage, hide: bool) !void {
         if (self.hide_thinking_block == hide) return;
+        try self.rebuildRenderBlocks(hide, self.hidden_thinking_label);
+    }
 
+    pub fn setHiddenThinkingLabel(self: *AssistantMessage, label: []const u8) !void {
+        if (std.mem.eql(u8, self.hidden_thinking_label, label)) return;
+        try self.rebuildRenderBlocks(self.hide_thinking_block, label);
+    }
+
+    fn rebuildRenderBlocks(self: *AssistantMessage, hide: bool, label: []const u8) !void {
         var new_render_blocks: std.ArrayListUnmanaged(RenderBlock) = .empty;
         errdefer deinitRenderBlocksList(&new_render_blocks, self.allocator);
+        const previous_label = self.hidden_thinking_label;
+        self.hidden_thinking_label = label;
+        errdefer self.hidden_thinking_label = previous_label;
         try self.buildRenderBlocks(&new_render_blocks, self.model, hide);
 
         self.deinitRenderBlocks();
@@ -340,6 +351,16 @@ test "assistant message renders stable row model and hidden thinking label" {
     defer testing.allocator.free(hidden_text);
     try testing.expect(std.mem.indexOf(u8, hidden_text, "Thinking...") != null);
     try testing.expect(std.mem.indexOf(u8, hidden_text, "ponder") == null);
+
+    try msg.setHiddenThinkingLabel("Pondering...");
+    var custom_label_buf = try Buffer.init(testing.allocator, 40, 8);
+    defer custom_label_buf.deinit();
+    msg.render(custom_label_buf.region());
+
+    const custom_label_text = try bufferText(&custom_label_buf, testing.allocator);
+    defer testing.allocator.free(custom_label_text);
+    try testing.expect(std.mem.indexOf(u8, custom_label_text, "Pondering...") != null);
+    try testing.expect(std.mem.indexOf(u8, custom_label_text, "Thinking...") == null);
 }
 
 test "assistant message animation hooks are static" {

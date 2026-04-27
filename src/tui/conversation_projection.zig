@@ -34,6 +34,7 @@ const testing = std.testing;
 pub const RebuildOptions = struct {
     theme: *const Theme,
     retry_attempt: u32 = 0,
+    hidden_thinking_label: []const u8 = "Thinking...",
 };
 
 const DesiredItem = struct {
@@ -618,7 +619,7 @@ fn appendTransientDesiredItems(
             try appendDesiredItem(
                 allocator,
                 desired_items,
-                buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids, options.theme, hide_thinking_block),
+                buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids, options.theme, hide_thinking_block, options.hidden_thinking_label),
             );
         }
         for (turn.tool_executions) |tool| {
@@ -714,13 +715,14 @@ fn buildActiveAssistantDesiredItem(
     live_tool_ids: []const []const u8,
     theme: *const Theme,
     hide_thinking_block: bool,
+    hidden_thinking_label: []const u8,
 ) !DesiredItem {
     const item_id = activeAssistantId(assistant);
     const semantic_version = activeAssistantSemanticVersion(assistant);
     if (transcript.hasRetainedMatch(item_id, semantic_version)) {
         return .{ .item_id = item_id, .semantic_version = semantic_version };
     }
-    var row = try createAssistantMessageRow(allocator, assistant, live_tool_ids, theme, hide_thinking_block);
+    var row = try createAssistantMessageRow(allocator, assistant, live_tool_ids, theme, hide_thinking_block, hidden_thinking_label);
     row.retained_item_id = item_id;
     row.retained_semantic_version = semantic_version;
     return .{ .item_id = item_id, .semantic_version = semantic_version, .row = row };
@@ -932,7 +934,7 @@ fn buildMessageRow(
 ) !TranscriptItem {
     return switch (message) {
         .user => try buildUserRow(allocator, message, options.theme),
-        .assistant => |assistant| try createAssistantMessageRow(allocator, assistant, live_tool_ids, options.theme, hide_thinking_block),
+        .assistant => |assistant| try createAssistantMessageRow(allocator, assistant, live_tool_ids, options.theme, hide_thinking_block, options.hidden_thinking_label),
         .compaction_summary => |summary| try buildSummaryRow(allocator, options.theme, "Compaction summary", summary.summary),
         .branch_summary => |summary| try buildSummaryRow(allocator, options.theme, "Branch summary", summary.summary),
         .custom => |custom| if (custom.display)
@@ -998,6 +1000,7 @@ fn createAssistantMessageRow(
     live_tool_ids: []const []const u8,
     theme: *const Theme,
     hide_thinking_block: bool,
+    hidden_thinking_label: []const u8,
 ) !TranscriptItem {
     var model = try buildAssistantRowModel(allocator, assistant, live_tool_ids);
     errdefer model.deinit(allocator);
@@ -1009,6 +1012,7 @@ fn createAssistantMessageRow(
     errdefer am.deinit();
     am.theme = theme;
     am.hide_thinking_block = hide_thinking_block;
+    am.hidden_thinking_label = hidden_thinking_label;
     try am.setOwnedModel(&model);
     return .{
         .renderable = TranscriptRenderable.init(assistant_message_component_mod.AssistantMessage, am),

@@ -617,6 +617,7 @@ pub const Interactive = struct {
     last_ctrl_c_ns: i128 = 0,
     tool_output_expanded: bool = false,
     hide_thinking_block: bool = false,
+    extension_hidden_thinking_label: ?[]u8 = null,
     greeter_dismissed: bool = false,
     /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
     input: input_buffer_mod.InputBuffer,
@@ -747,6 +748,10 @@ pub const Interactive = struct {
         coding_agent_mod.model_registry.deinitOwnedModels(self.msg_allocator, self.model_catalog);
         self.model_catalog = &.{};
         self.status_data.deinit();
+        if (self.extension_hidden_thinking_label) |label| {
+            self.allocator.free(label);
+            self.extension_hidden_thinking_label = null;
+        }
         self.input.deinit();
         logMailboxStats("snapshot", self.snapshot_event_queue.stats());
         logMailboxStats("lifecycle", self.lifecycle_event_queue.stats());
@@ -1293,6 +1298,7 @@ pub const Interactive = struct {
                 .{
                     .theme = self.theme,
                     .retry_attempt = self.retry_attempt,
+                    .hidden_thinking_label = self.currentHiddenThinkingLabel(),
                 },
             );
             if (was_following_bottom) {
@@ -1313,6 +1319,7 @@ pub const Interactive = struct {
                 .{
                     .theme = self.theme,
                     .retry_attempt = self.retry_attempt,
+                    .hidden_thinking_label = self.currentHiddenThinkingLabel(),
                 },
             );
             if (was_following_bottom) {
@@ -1570,8 +1577,13 @@ pub const Interactive = struct {
         for (self.transcript.items.items, 0..) |_, idx| {
             const assistant = self.transcript.assistantMessageAt(idx) orelse continue;
             assistant.setHideThinkingBlock(self.hide_thinking_block) catch continue;
+            assistant.setHiddenThinkingLabel(self.currentHiddenThinkingLabel()) catch continue;
             self.transcript.itemMutatedAt(idx);
         }
+    }
+
+    fn currentHiddenThinkingLabel(self: *const Interactive) []const u8 {
+        return self.extension_hidden_thinking_label orelse "Thinking...";
     }
 
     const TranscriptMouseZone = struct {
@@ -3180,7 +3192,7 @@ pub const Interactive = struct {
                 .working, .overlay => self.applySurfaceText(&self.extension_panel_text, update),
                 .notification => self.applyNotificationSurface(update),
                 .title => if (update.text) |title| self.tui.terminal.setTitle(title),
-                .thinking_label => {},
+                .thinking_label => self.applyHiddenThinkingLabelSurface(update),
             }
         }
         self.tui.dirty = true;
@@ -3195,6 +3207,21 @@ pub const Interactive = struct {
     fn applyNotificationSurface(_: *Interactive, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
         const message = update.text orelse return;
         terminal_notify.notify("Zi", message);
+    }
+
+    fn applyHiddenThinkingLabelSurface(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
+        if (self.extension_hidden_thinking_label) |old| {
+            self.allocator.free(old);
+            self.extension_hidden_thinking_label = null;
+        }
+        if (update.text) |label| {
+            self.extension_hidden_thinking_label = self.allocator.dupe(u8, label) catch null;
+        }
+        for (self.transcript.items.items, 0..) |_, idx| {
+            const assistant = self.transcript.assistantMessageAt(idx) orelse continue;
+            assistant.setHiddenThinkingLabel(self.currentHiddenThinkingLabel()) catch continue;
+            self.transcript.itemMutatedAt(idx);
+        }
     }
 
     fn surfaceHasContent(update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) bool {
