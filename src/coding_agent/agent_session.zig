@@ -694,6 +694,8 @@ pub const AgentSession = struct {
             .session_state_set = &runtimeSessionStateSet,
             .session_state_delete = &runtimeSessionStateDelete,
             .session_info_get = &runtimeSessionInfoGet,
+            .session_name_get = &runtimeSessionNameGet,
+            .session_name_set = &runtimeSessionNameSet,
             .session_tool_results_get = &runtimeSessionToolResultsGet,
             .show_panel = &runtimeShowPanel,
             .publish_prompt = &runtimePublishPrompt,
@@ -837,7 +839,7 @@ pub const AgentSession = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const branch = self.session_store.buildCurrentBranchAlloc(arena.allocator()) catch return null;
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(arena.allocator()) catch return null;
         var latest: ?std.json.Value = null;
         var deleted = false;
 
@@ -910,12 +912,40 @@ pub const AgentSession = struct {
         obj.put(allocator.dupe(u8, "cwd") catch return null, .{ .string = allocator.dupe(u8, self.resource_loader.cwd) catch return null }) catch return null;
         const session_file = self.session_store.sessionFile();
         obj.put(allocator.dupe(u8, "file") catch return null, if (session_file.len > 0) .{ .string = allocator.dupe(u8, session_file) catch return null } else .null) catch return null;
+        const name = latestSessionName(self, allocator);
+        defer if (name) |value| allocator.free(value);
+        obj.put(allocator.dupe(u8, "name") catch return null, if (name) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
         return .{ .object = obj };
+    }
+
+    fn runtimeSessionNameGet(session_ptr: *anyopaque, allocator: std.mem.Allocator) ?[]const u8 {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        return latestSessionName(self, allocator);
+    }
+
+    fn runtimeSessionNameSet(session_ptr: *anyopaque, name: ?[]const u8) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.session_store.appendSessionInfo(name);
+    }
+
+    fn latestSessionName(self: *AgentSession, allocator: std.mem.Allocator) ?[]const u8 {
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
+        defer allocator.free(branch);
+        var i = branch.len;
+        while (i > 0) {
+            i -= 1;
+            const info = switch (branch[i].entry) {
+                .session_info => |si| si,
+                else => continue,
+            };
+            return if (info.name) |name| allocator.dupe(u8, name) catch null else null;
+        }
+        return null;
     }
 
     fn runtimeSessionToolResultsGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8) ?std.json.Value {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        const branch = self.session_store.buildCurrentBranchAlloc(allocator) catch return null;
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
         defer allocator.free(branch);
         var arr = std.json.Array.init(allocator);
         for (branch) |entry| {

@@ -896,6 +896,7 @@ const TestStateStore = struct {
     prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
     surfaces: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
     editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
+    session_name: ?[]const u8 = null,
     cancel_count: usize = 0,
     revoke_count: usize = 0,
 
@@ -907,6 +908,8 @@ const TestStateStore = struct {
         self.clearPrompts();
         self.clearSurfaces();
         self.clearEditorActions();
+        if (self.session_name) |name| self.allocator.free(name);
+        self.session_name = null;
     }
 
     fn get(session: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) ?std.json.Value {
@@ -928,12 +931,24 @@ const TestStateStore = struct {
     }
 
     fn sessionInfo(session: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
-        _ = session;
         var obj = std.json.ObjectMap.init(allocator);
         obj.put(allocator.dupe(u8, "id") catch return null, .{ .string = allocator.dupe(u8, "session-test") catch return null }) catch return null;
         obj.put(allocator.dupe(u8, "cwd") catch return null, .{ .string = allocator.dupe(u8, "/tmp/project") catch return null }) catch return null;
         obj.put(allocator.dupe(u8, "file") catch return null, .null) catch return null;
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        obj.put(allocator.dupe(u8, "name") catch return null, if (self.session_name) |name| .{ .string = allocator.dupe(u8, name) catch return null } else .null) catch return null;
         return .{ .object = obj };
+    }
+
+    fn sessionName(session: *anyopaque, allocator: std.mem.Allocator) ?[]const u8 {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        return if (self.session_name) |name| allocator.dupe(u8, name) catch null else null;
+    }
+
+    fn setSessionName(session: *anyopaque, name: ?[]const u8) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (self.session_name) |old| self.allocator.free(old);
+        self.session_name = if (name) |value| try self.allocator.dupe(u8, value) else null;
     }
 
     fn sessionToolResults(session: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8) ?std.json.Value {
@@ -1054,6 +1069,8 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_state_set = &TestStateStore.set,
         .session_state_delete = &TestStateStore.delete,
         .session_info_get = &TestStateStore.sessionInfo,
+        .session_name_get = &TestStateStore.sessionName,
+        .session_name_set = &TestStateStore.setSessionName,
         .session_tool_results_get = &TestStateStore.sessionToolResults,
         .show_panel = &TestStateStore.showPanel,
         .publish_prompt = &TestStateStore.publishPrompt,
@@ -1100,6 +1117,12 @@ test "extension command context exposes read-only session surface" {
         \\    local info = ctx.session.info()
         \\    assert(info.id == "session-test")
         \\    assert(info.cwd == "/tmp/project")
+        \\    assert(ctx.session.name() == nil)
+        \\    assert(ctx.session.rename("demo") == true)
+        \\    assert(ctx.session.name() == "demo")
+        \\    assert(ctx.session.info().name == "demo")
+        \\    assert(ctx.session.rename("") == true)
+        \\    assert(ctx.session.name() == nil)
         \\    local results = ctx.session.tool_results("todo")
         \\    assert(#results == 1)
         \\    assert(results[1].tool_name == "todo")

@@ -226,7 +226,10 @@ pub const SessionWriter = struct {
 
     /// Append a session info entry (display name, etc).
     pub fn appendSessionInfo(self: *SessionWriter, name: ?[]const u8) void {
-        self.appendEntry(.{ .session_info = .{ .name = name } });
+        const owned_name = if (name) |value| self.allocator.dupe(u8, value) catch return else null;
+        const was_flushed = self.flushed;
+        defer if (was_flushed) if (owned_name) |value| self.allocator.free(value);
+        self.appendEntry(.{ .session_info = .{ .name = owned_name } });
     }
 
     /// Shared logic for appending any non-message entry type.
@@ -336,6 +339,10 @@ fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, s
         .entry => |session_entry| {
             allocator.free(session_entry.timestamp);
             if (session_entry.parent_id) |parent_id| allocator.free(parent_id);
+            switch (session_entry.entry) {
+                .session_info => |info| if (info.name) |name| allocator.free(name),
+                else => {},
+            }
         },
     }
 }

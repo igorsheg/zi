@@ -286,6 +286,43 @@ pub const SessionStore = struct {
         return context_mod.buildBranchEntries(allocator, data.entries, selection);
     }
 
+    /// Build the current user-visible branch, including entries buffered in
+    /// memory before the first assistant response flushes the session file.
+    ///
+    /// `buildCurrentBranchAlloc` intentionally remains the persisted/cache
+    /// branch reader used by storage-oriented paths. Extension-facing session
+    /// APIs should use this method so read-after-write semantics are consistent
+    /// before and after flush.
+    pub fn buildCurrentVisibleBranchAlloc(self: *SessionStore, allocator: std.mem.Allocator) ![]const proto.SessionEntry {
+        const persisted = self.buildCurrentBranchAlloc(allocator) catch |err| switch (err) {
+            error.FileNotFound => &.{},
+            else => return err,
+        };
+        defer allocator.free(persisted);
+
+        var buffered_count: usize = 0;
+        for (self.writer.buffered_entries.items) |item| switch (item) {
+            .entry => buffered_count += 1,
+            .header => {},
+        };
+
+        if (buffered_count == 0) return try allocator.dupe(proto.SessionEntry, persisted);
+
+        const all = try allocator.alloc(proto.SessionEntry, persisted.len + buffered_count);
+        @memcpy(all[0..persisted.len], persisted);
+        var index = persisted.len;
+        for (self.writer.buffered_entries.items) |item| switch (item) {
+            .entry => |entry| {
+                all[index] = entry;
+                index += 1;
+            },
+            .header => {},
+        };
+        const visible = try context_mod.buildBranchEntries(allocator, all, .current);
+        allocator.free(all);
+        return visible;
+    }
+
     pub fn buildCurrentBranchAlloc(self: *SessionStore, allocator: std.mem.Allocator) ![]const proto.SessionEntry {
         return self.buildBranchEntriesAlloc(allocator, .current);
     }
@@ -691,6 +728,26 @@ fn testAssistantMessageWithUsage(allocator: std.mem.Allocator, text: []const u8,
         .stop_reason = .stop,
         .timestamp = timestamp,
     } };
+}
+
+test "current visible branch includes buffered session metadata before flush" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(session_dir);
+
+    var store = SessionStore.create(std.testing.allocator, session_dir, "/tmp/project");
+    defer store.deinit();
+
+    store.appendSessionInfo("test1");
+
+    const branch = try store.buildCurrentVisibleBranchAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(branch);
+
+    try std.testing.expectEqual(@as(usize, 1), branch.len);
+    try std.testing.expect(branch[0].entry == .session_info);
+    try std.testing.expectEqualStrings("test1", branch[0].entry.session_info.name.?);
 }
 
 test "listSessionsInDir returns empty slice for empty directory" {

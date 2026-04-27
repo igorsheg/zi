@@ -835,7 +835,7 @@ fn ctxStateDelete(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
 fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     const has_session = switch (runner.runtime) {
-        .bound => |bound| bound.session_info_get != null or bound.session_tool_results_get != null,
+        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null,
         .stub => false,
     };
     if (!has_session) {
@@ -843,9 +843,13 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
         return;
     }
 
-    c.lua_createtable(L, 0, 2);
+    c.lua_createtable(L, 0, 4);
     pushMethod(L, runner, &ctxSessionInfo);
     c.lua_setfield(L, -2, "info");
+    pushMethod(L, runner, &ctxSessionName);
+    c.lua_setfield(L, -2, "name");
+    pushMethod(L, runner, &ctxSessionRename);
+    c.lua_setfield(L, -2, "rename");
     pushMethod(L, runner, &ctxSessionToolResults);
     c.lua_setfield(L, -2, "tool_results");
 }
@@ -869,6 +873,58 @@ fn ctxSessionInfo(L_opt: ?*c.lua_State) callconv(.c) c_int {
         },
         .stub => {
             c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionName(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_name_get orelse {
+                c.lua_pushnil(L);
+                return 1;
+            };
+            const name = getter(bound.session, runner.allocator) orelse {
+                c.lua_pushnil(L);
+                return 1;
+            };
+            defer runner.allocator.free(name);
+            _ = c.lua_pushlstring(L, name.ptr, name.len);
+            return 1;
+        },
+        .stub => {
+            c.lua_pushnil(L);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionRename(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    }
+    const name = readKeyArg(L) orelse "";
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const setter = bound.session_name_set orelse {
+                c.lua_pushboolean(L, 0);
+                return 1;
+            };
+            setter(bound.session, if (name.len == 0) null else name) catch {
+                c.lua_pushboolean(L, 0);
+                return 1;
+            };
+            c.lua_pushboolean(L, 1);
+            return 1;
+        },
+        .stub => {
+            c.lua_pushboolean(L, 0);
             return 1;
         },
     }
