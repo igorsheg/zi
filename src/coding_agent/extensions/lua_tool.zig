@@ -1176,6 +1176,16 @@ test "extension command prompts can resolve through host response" {
         \\    assert(ctx.ui.select("Pick", { "A", "B" }) == "A")
         \\    assert(ctx.ui.input("Input", "placeholder") == "typed")
         \\    assert(ctx.ui.editor("Editor", "prefill") == "edited")
+        \\    local selected = ctx.ui.prompt({
+        \\      kind = "select",
+        \\      title = "Pick object",
+        \\      options = { { label = "Lua", value = "lua" }, { label = "Zig", value = "zig" } },
+        \\    })
+        \\    assert(selected.status == "submitted")
+        \\    assert(selected.value == "lua")
+        \\    local typed = ctx.ui.prompt({ kind = "input", title = "Name", placeholder = "my-app", default = "zi" })
+        \\    assert(typed.status == "submitted")
+        \\    assert(typed.value == "typed")
         \\  end,
         \\})
     , "register_resolved_prompt_command");
@@ -1268,13 +1278,15 @@ test "extension command context publishes host-owned prompt requests with defaul
         \\    assert(ctx.ui.select("Pick", { "A", "B" }) == nil)
         \\    assert(ctx.ui.input("Input", "placeholder") == nil)
         \\    assert(ctx.ui.editor("Editor", "prefill") == nil)
+        \\    local cancelled = ctx.ui.prompt({ kind = "select", title = "Pick object", options = { { label = "Lua", value = "lua" } } })
+        \\    assert(cancelled.status == "cancelled")
         \\  end,
         \\})
     , "register_prompt_command");
 
     try runner.dispatchCommand("prompts", "");
 
-    try testing.expectEqual(@as(usize, 4), store.prompts.items.len);
+    try testing.expectEqual(@as(usize, 5), store.prompts.items.len);
     try testing.expectEqual(extension_ui.PromptKind.confirm, store.prompts.items[0].kind);
     try testing.expectEqualStrings("Confirm", store.prompts.items[0].title);
     try testing.expectEqualStrings("Continue?", store.prompts.items[0].message.?);
@@ -1285,6 +1297,9 @@ test "extension command context publishes host-owned prompt requests with defaul
     try testing.expectEqualStrings("placeholder", store.prompts.items[2].placeholder.?);
     try testing.expectEqual(extension_ui.PromptKind.editor, store.prompts.items[3].kind);
     try testing.expectEqualStrings("prefill", store.prompts.items[3].prefill.?);
+    try testing.expectEqual(extension_ui.PromptKind.select, store.prompts.items[4].kind);
+    try testing.expectEqualStrings("lua", store.prompts.items[4].options[0].id);
+    try testing.expectEqualStrings("Lua", store.prompts.items[4].options[0].label);
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 1), store.cancel_count);

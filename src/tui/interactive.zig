@@ -374,7 +374,7 @@ const ExtensionPromptFlow = struct {
                 editor.setCwd(owned_prompt.title);
                 editor.setAutocompleteMaxVisible(0);
                 editor.setMaxVisibleLines(if (prompt.kind == .input) 1 else 8);
-                if (prompt.kind == .editor) editor.setText(owned_prompt.prefill orelse "");
+                if (owned_prompt.prefill) |prefill| editor.setText(prefill);
                 return .{ .arena = arena, .prompt = owned_prompt, .response = response, .editor = editor };
             },
         }
@@ -578,6 +578,7 @@ pub const Interactive = struct {
     model_catalog: []ai_protocol.Model = &.{},
     model_picker_flow: ?ModelPickerFlow = null,
     extension_prompt_flow: ?ExtensionPromptFlow = null,
+    extension_prompt_close_after_submit: bool = false,
 
     // ── Settings pickers (/settings) ───────────────────────────────
     settings_picker: ListPicker = undefined,
@@ -1098,6 +1099,10 @@ pub const Interactive = struct {
         // Overlays own Esc/Ctrl+C for dismiss — app-level handlers are fallbacks.
         if (self.tui.hasOverlay()) {
             if (self.tui.handleInput(key)) {
+                if (self.extension_prompt_close_after_submit) {
+                    self.extension_prompt_close_after_submit = false;
+                    self.closeExtensionPromptFlow(false);
+                }
                 self.tui.dirty = true;
                 return;
             }
@@ -2429,6 +2434,7 @@ pub const Interactive = struct {
             flow.deinit();
         }
         self.extension_prompt_flow = null;
+        self.extension_prompt_close_after_submit = false;
     }
 
     fn showExtensionPrompt(self: *Interactive, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
@@ -2478,8 +2484,8 @@ pub const Interactive = struct {
         if (self.extension_prompt_flow) |*flow| {
             const value = self.msg_allocator.dupe(u8, text) catch null;
             flow.response.finish(.{ .value = if (value) |owned| .{ .text = owned, .allocator = self.msg_allocator } else null });
+            self.extension_prompt_close_after_submit = true;
         }
-        self.closeExtensionPromptFlow(false);
     }
 
     fn onExtensionPromptCancelled(ctx: ?*anyopaque) void {

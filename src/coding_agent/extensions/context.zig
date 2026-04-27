@@ -113,6 +113,8 @@ fn pushUiApi(
         c.lua_setfield(L, -2, "show_panel");
     }
     if (runner.runtime.bound.publish_prompt != null) {
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiPrompt);
+        c.lua_setfield(L, -2, "prompt");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiConfirm);
         c.lua_setfield(L, -2, "confirm");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSelect);
@@ -365,6 +367,18 @@ fn readSurfaceLifetime(L: *c.lua_State, idx: c_int) !extension_ui.SurfaceLifetim
     return .session;
 }
 
+fn ctxUiPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const kind = readPromptKindArg(L, 1) orelse {
+        pushPromptEnvelope(L, .{ .value = null });
+        return 1;
+    };
+    var result = requestPromptFromArgs(L, kind) catch request_mod.ExtensionPromptResponse.defaultFor(kind);
+    defer result.deinit();
+    pushPromptEnvelope(L, result);
+    return 1;
+}
+
 fn ctxUiConfirm(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     var result = requestPromptFromArgs(L, .confirm) catch request_mod.ExtensionPromptResponse.Result{ .confirm = false };
@@ -407,9 +421,30 @@ fn pushPromptValueResult(L: *c.lua_State, result: request_mod.ExtensionPromptRes
     c.lua_pushnil(L);
 }
 
+fn pushPromptEnvelope(L: *c.lua_State, result: request_mod.ExtensionPromptResponse.Result) void {
+    c.lua_createtable(L, 0, 2);
+    switch (result) {
+        .confirm => |confirmed| {
+            _ = c.lua_pushlstring(L, "submitted", "submitted".len);
+            c.lua_setfield(L, -2, "status");
+            c.lua_pushboolean(L, if (confirmed) 1 else 0);
+            c.lua_setfield(L, -2, "value");
+        },
+        .value => |maybe_value| if (maybe_value) |value| {
+            _ = c.lua_pushlstring(L, "submitted", "submitted".len);
+            c.lua_setfield(L, -2, "status");
+            _ = c.lua_pushlstring(L, value.text.ptr, value.text.len);
+            c.lua_setfield(L, -2, "value");
+        } else {
+            _ = c.lua_pushlstring(L, "cancelled", "cancelled".len);
+            c.lua_setfield(L, -2, "status");
+        },
+    }
+}
+
 fn requestPromptFromArgs(L: *c.lua_State, kind: extension_ui.PromptKind) !request_mod.ExtensionPromptResponse.Result {
     const runner = stateRunnerFromUpvalue(L);
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) return request_mod.ExtensionPromptResponse.defaultFor(kind);
+    if (c.lua_type(L, 1) != c.LUA_TSTRING and c.lua_type(L, 1) != c.LUA_TTABLE) return request_mod.ExtensionPromptResponse.defaultFor(kind);
 
     const bound = switch (runner.runtime) {
         .bound => |bound| bound,
@@ -437,7 +472,9 @@ fn parsePrompt(
     state_owner_id: []const u8,
     generation: runner_mod.Generation,
 ) !extension_ui.PromptRequest {
-    const title = try dupeLuaString(arena, L, 1);
+    const is_table = c.lua_type(L, 1) == c.LUA_TTABLE;
+    const prompt_idx = if (is_table) c.lua_absindex(L, 1) else 1;
+    const title = if (is_table) try readStringField(arena, L, prompt_idx, "title", "") else try dupeLuaString(arena, L, 1);
     const id = try std.fmt.allocPrint(arena, "{s}:{d}:{s}", .{ state_owner_id, generation, promptKindString(kind) });
     return switch (kind) {
         .confirm => .{
@@ -446,7 +483,7 @@ fn parsePrompt(
             .id = id,
             .kind = kind,
             .title = title,
-            .message = try readOptionalArgString(arena, L, 2),
+            .message = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "message") else try readOptionalArgString(arena, L, 2),
         },
         .select => .{
             .state_owner_id = try arena.dupe(u8, state_owner_id),
@@ -454,7 +491,7 @@ fn parsePrompt(
             .id = id,
             .kind = kind,
             .title = title,
-            .options = try readSelectOptions(arena, L, 2),
+            .options = if (is_table) try readSelectOptionsField(arena, L, prompt_idx) else try readSelectOptions(arena, L, 2),
         },
         .input => .{
             .state_owner_id = try arena.dupe(u8, state_owner_id),
@@ -462,7 +499,8 @@ fn parsePrompt(
             .id = id,
             .kind = kind,
             .title = title,
-            .placeholder = try readOptionalArgString(arena, L, 2),
+            .placeholder = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "placeholder") else try readOptionalArgString(arena, L, 2),
+            .prefill = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "default") else null,
         },
         .editor => .{
             .state_owner_id = try arena.dupe(u8, state_owner_id),
@@ -470,7 +508,7 @@ fn parsePrompt(
             .id = id,
             .kind = kind,
             .title = title,
-            .prefill = try readOptionalArgString(arena, L, 2),
+            .prefill = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "prefill") else try readOptionalArgString(arena, L, 2),
         },
     };
 }
@@ -480,18 +518,52 @@ fn readOptionalArgString(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) 
     return try dupeLuaString(arena, L, idx);
 }
 
+fn readPromptKindArg(L: *c.lua_State, idx: c_int) ?extension_ui.PromptKind {
+    if (c.lua_type(L, idx) != c.LUA_TTABLE) return null;
+    const abs_idx = c.lua_absindex(L, idx);
+    _ = c.lua_getfield(L, abs_idx, "kind");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return null;
+    const value = ptr[0..len];
+    if (std.mem.eql(u8, value, "confirm")) return .confirm;
+    if (std.mem.eql(u8, value, "select")) return .select;
+    if (std.mem.eql(u8, value, "input")) return .input;
+    if (std.mem.eql(u8, value, "editor")) return .editor;
+    return null;
+}
+
+fn readSelectOptionsField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const extension_ui.SelectOption {
+    _ = c.lua_getfield(L, idx, "options");
+    defer c.lua_pop(L, 1);
+    return try readSelectOptions(arena, L, -1);
+}
+
 fn readSelectOptions(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const extension_ui.SelectOption {
     if (c.lua_type(L, idx) != c.LUA_TTABLE) return &.{};
-    const n = c.lua_rawlen(L, idx);
+    const abs_idx = c.lua_absindex(L, idx);
+    const n = c.lua_rawlen(L, abs_idx);
     const options = try arena.alloc(extension_ui.SelectOption, @intCast(n));
     var i: c.lua_Integer = 1;
     while (i <= @as(c.lua_Integer, @intCast(n))) : (i += 1) {
-        _ = c.lua_rawgeti(L, idx, i);
+        _ = c.lua_rawgeti(L, abs_idx, i);
         defer c.lua_pop(L, 1);
-        const value = if (c.lua_type(L, -1) == c.LUA_TSTRING) try dupeLuaString(arena, L, -1) else "";
-        options[@intCast(i - 1)] = .{ .id = value, .label = value };
+        options[@intCast(i - 1)] = try readSelectOption(arena, L, -1);
     }
     return options;
+}
+
+fn readSelectOption(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui.SelectOption {
+    if (c.lua_type(L, idx) == c.LUA_TSTRING) {
+        const value = try dupeLuaString(arena, L, idx);
+        return .{ .id = value, .label = value };
+    }
+    if (c.lua_type(L, idx) != c.LUA_TTABLE) return .{ .id = "", .label = "" };
+    const abs_idx = c.lua_absindex(L, idx);
+    const id = if (try readOptionalStringField(arena, L, abs_idx, "value")) |value| value else try readStringField(arena, L, abs_idx, "id", "");
+    const label = try readStringField(arena, L, abs_idx, "label", id);
+    return .{ .id = id, .label = label };
 }
 
 fn promptKindString(kind: extension_ui.PromptKind) []const u8 {
