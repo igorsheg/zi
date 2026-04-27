@@ -260,6 +260,17 @@ pub fn dispatchObserverHandler(
 /// onto it. Stack on entry: main has payload at payload_idx.
 /// Stack on success: coroutine has [handler, payload], main is
 /// unchanged (xmove was preceded by lua_pushvalue).
+pub fn pushHandlerAndContextForBridge(
+    state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
+    co: *lua_runtime.Coroutine,
+    handler_ref: c_int,
+    provenance: ?resource_types.ExtensionProvenance,
+    payload_idx: c_int,
+) DispatchError!void {
+    return pushHandlerAndContext(state, runner, co, handler_ref, provenance, payload_idx);
+}
+
 fn pushHandlerAndContext(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,

@@ -3037,6 +3037,7 @@ pub const Interactive = struct {
                             req.deinit(self.msg_allocator);
                             continue;
                         };
+                        self.publishPendingExtensionUi();
                         _ = self.publishLifecycleUiEvent(.{ .prompt_worker_finished = .{ .outcome = outcome } });
                     },
                     .resume_session => |r| {

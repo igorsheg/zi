@@ -39,6 +39,13 @@ const event_registry = @import("registries/event_registry.zig");
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_bridge);
 
+pub const InputMiddlewareResult = union(enum) {
+    continue_,
+    transform: []const u8,
+    handled: ?[]const u8,
+    blocked: ?[]const u8,
+};
+
 /// Adapter matching `agent_protocol.AgentEventSink`. Pass this and
 /// a `*ExtensionRunner` as the ctx to `agent.subscribe`. The runner
 /// must already have `lua_state` attached or the bridge no-ops.
@@ -316,6 +323,55 @@ fn pushModelSelectPayload(
 
     _ = c.lua_pushlstring(L, source.ptr, source.len);
     c.lua_setfield(L, -2, "source");
+}
+
+pub fn dispatchInput(
+    runner: *runner_mod.ExtensionRunner,
+    text: []const u8,
+    queued_kind: ?[]const u8,
+    allocator: std.mem.Allocator,
+) !InputMiddlewareResult {
+    const state = runner.lua_state orelse return error.NoState;
+    runner.assertOnLuaThread();
+
+    const handlers = runner.event_registry.handlers(.input);
+    if (handlers.len == 0) return .continue_;
+
+    try pushInputPayload(state.L, text, queued_kind);
+    defer c.lua_pop(state.L, 1);
+
+    for (handlers) |h| {
+        var co = try lua_runtime.Coroutine.init(state);
+        defer co.deinit();
+
+        try dispatch.pushHandlerAndContextForBridge(state, runner, &co, h.lua_ref, h.provenance, -1);
+        const r = try co.resumeWith(2);
+        switch (r.status) {
+            .yielded => return error.UnexpectedYield,
+            .ok, .finished => {},
+        }
+        if (r.nresults == 0) continue;
+
+        const top = c.lua_gettop(co.L);
+        defer c.lua_settop(co.L, top - r.nresults);
+        const top_idx = top;
+        if (c.lua_type(co.L, top_idx) == c.LUA_TNIL) continue;
+        if (c.lua_type(co.L, top_idx) != c.LUA_TTABLE) continue;
+
+        if (try readBlockResult(co.L, top_idx, allocator)) |result| return result;
+        if (try readInputActionResult(co.L, top_idx, allocator)) |result| return result;
+    }
+
+    _ = c.lua_getfield(state.L, -1, "text");
+    defer c.lua_pop(state.L, 1);
+    if (c.lua_type(state.L, -1) == c.LUA_TSTRING) {
+        var len: usize = 0;
+        const ptr = c.lua_tolstring(state.L, -1, &len) orelse return .continue_;
+        const mutated = ptr[0..len];
+        if (!std.mem.eql(u8, mutated, text)) return .{ .transform = try allocator.dupe(u8, mutated) };
+    }
+
+    return .continue_;
 }
 
 pub fn dispatchSessionBeforeSwitch(
@@ -746,7 +802,58 @@ fn afterToolCallImpl(
     return result;
 }
 
+fn readBlockResult(L: *c.lua_State, idx: c_int, allocator: std.mem.Allocator) !?InputMiddlewareResult {
+    _ = c.lua_getfield(L, idx, "block");
+    const blocked = c.lua_toboolean(L, -1) != 0;
+    c.lua_pop(L, 1);
+    if (!blocked) return null;
+    return .{ .blocked = try readOptionalStringFieldOwned(L, idx, "reason", allocator) };
+}
+
+fn readInputActionResult(L: *c.lua_State, idx: c_int, allocator: std.mem.Allocator) !?InputMiddlewareResult {
+    _ = c.lua_getfield(L, idx, "action");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return null;
+    const action = ptr[0..len];
+    if (std.mem.eql(u8, action, "continue")) return .continue_;
+    if (std.mem.eql(u8, action, "handled")) return .{ .handled = try readOptionalStringFieldOwned(L, idx, "reason", allocator) };
+    if (std.mem.eql(u8, action, "transform")) {
+        const text = try readOptionalStringFieldOwned(L, idx, "text", allocator) orelse return .continue_;
+        return .{ .transform = text };
+    }
+    return null;
+}
+
+fn readOptionalStringFieldOwned(L: *c.lua_State, idx: c_int, field: [:0]const u8, allocator: std.mem.Allocator) !?[]const u8 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return null;
+    return try allocator.dupe(u8, ptr[0..len]);
+}
+
 // -- payload builders ---------------------------------------------------------
+
+fn pushInputPayload(L: *c.lua_State, text: []const u8, queued_kind: ?[]const u8) !void {
+    c.lua_createtable(L, 0, 5);
+    _ = c.lua_pushlstring(L, "input".ptr, "input".len);
+    c.lua_setfield(L, -2, "type");
+    _ = c.lua_pushlstring(L, text.ptr, text.len);
+    c.lua_setfield(L, -2, "text");
+    _ = c.lua_pushlstring(L, "user".ptr, "user".len);
+    c.lua_setfield(L, -2, "source");
+    c.lua_pushboolean(L, if (queued_kind != null) 1 else 0);
+    c.lua_setfield(L, -2, "queued");
+    if (queued_kind) |kind| {
+        _ = c.lua_pushlstring(L, kind.ptr, kind.len);
+    } else {
+        c.lua_pushnil(L);
+    }
+    c.lua_setfield(L, -2, "queue_kind");
+}
 
 /// Push `{ tool_call = {id, name}, tool_name, args }` onto the stack.
 fn pushToolCallPayload(
@@ -969,6 +1076,77 @@ test "event_bridge tool_execution_start exposes tool_name and args to handler" {
 }
 
 // -- D6: tool_call / tool_result hooks ----------------------------------------
+
+test "input middleware transforms text before agent submission" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.on("input", function(event, ctx)
+        \\  if string.sub(event.text, 1, 7) == "?quick " then
+        \\    return { action = "transform", text = "Brief: " .. string.sub(event.text, 8) }
+        \\  end
+        \\end)
+    , "subscribe_input_transform");
+
+    const result = try dispatchInput(&runner, "?quick hello", null, testing.allocator);
+    switch (result) {
+        .transform => |text| {
+            defer testing.allocator.free(text);
+            try testing.expectEqualStrings("Brief: hello", text);
+        },
+        else => return error.ExpectedTransform,
+    }
+}
+
+test "input middleware handled action stops agent submission" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.on("input", function(event, ctx)
+        \\  if event.text == "ping" then return { action = "handled" } end
+        \\end)
+    , "subscribe_input_handled");
+
+    const result = try dispatchInput(&runner, "ping", null, testing.allocator);
+    try testing.expect(result == .handled);
+}
+
+test "input middleware treats event text mutation as transform" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.on("input", function(event, ctx)
+        \\  event.text = "mutated"
+        \\end)
+    , "subscribe_input_mutation");
+
+    const result = try dispatchInput(&runner, "original", null, testing.allocator);
+    switch (result) {
+        .transform => |text| {
+            defer testing.allocator.free(text);
+            try testing.expectEqualStrings("mutated", text);
+        },
+        else => return error.ExpectedTransform,
+    }
+}
 
 test "beforeToolCall blocks tool execution when handler returns block=true" {
     var state = try lua_runtime.LuaState.init(testing.allocator);

@@ -425,6 +425,17 @@ pub const RuntimeHost = struct {
     }
 
     pub fn runUserContent(self: *RuntimeHost, content: ai.protocol.UserMessage.UserMessageContent) !RunOutcome {
+        const runner = self.session.extensionRunner();
+        if (runner) |extension_runner| {
+            if (content == .text) {
+                switch (event_bridge.dispatchInput(extension_runner, content.text, null, self.msg_allocator) catch .continue_) {
+                    .continue_ => {},
+                    .transform => |text| return self.runner.runUserContent(self.session, self.runnerEventEmitter(), .{ .text = text }),
+                    .handled => return .success,
+                    .blocked => return .success,
+                }
+            }
+        }
         return self.runner.runUserContent(self.session, self.runnerEventEmitter(), content);
     }
 
