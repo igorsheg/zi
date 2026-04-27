@@ -337,12 +337,17 @@ const ExtensionPromptFlow = struct {
     picker: ?ListPicker = null,
     editor: ?editor_mod.Editor = null,
     handle: ?tui_mod.OverlayHandle = null,
+    deadline_ns: ?i128 = null,
 
     fn init(gpa: std.mem.Allocator, theme: *const theme_mod.Theme, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) !ExtensionPromptFlow {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
         const owned_prompt = try extension_ui.PromptRequest.clone(a, prompt);
+        const deadline_ns = if (owned_prompt.timeout_ms) |ms|
+            std.time.nanoTimestamp() + @as(i128, @intCast(ms)) * std.time.ns_per_ms
+        else
+            null;
 
         switch (prompt.kind) {
             .confirm, .select => {
@@ -366,7 +371,7 @@ const ExtensionPromptFlow = struct {
                 picker.title = owned_prompt.title;
                 picker.list.max_visible = 8;
                 picker.setItems(items);
-                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .items = items, .picker = picker };
+                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .items = items, .picker = picker, .deadline_ns = deadline_ns };
             },
             .input, .editor => {
                 var editor = editor_mod.Editor.init(a);
@@ -375,7 +380,7 @@ const ExtensionPromptFlow = struct {
                 editor.setAutocompleteMaxVisible(0);
                 editor.setMaxVisibleLines(if (prompt.kind == .input) 1 else 8);
                 if (owned_prompt.prefill) |prefill| editor.setText(prefill);
-                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .editor = editor };
+                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .editor = editor, .deadline_ns = deadline_ns };
             },
         }
     }
@@ -903,6 +908,7 @@ pub const Interactive = struct {
 
             self.input.checkTimeout(&onInputSequence, @ptrCast(self));
             self.finishKittyNegotiationIfDue();
+            self.finishExtensionPromptIfTimedOut();
 
             if (self.tui.checkResize()) {
                 self.cancelTranscriptSelection();
@@ -1837,6 +1843,9 @@ pub const Interactive = struct {
         if (self.tui.nextAnimationDeadline(now_ns)) |deadline| {
             next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
         }
+        if (self.extension_prompt_flow) |flow| {
+            if (flow.deadline_ns) |deadline| next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
+        }
 
         return next_deadline;
     }
@@ -2435,6 +2444,16 @@ pub const Interactive = struct {
         }
         self.extension_prompt_flow = null;
         self.extension_prompt_close_after_submit = false;
+    }
+
+    fn finishExtensionPromptIfTimedOut(self: *Interactive) void {
+        if (self.extension_prompt_flow) |*flow| {
+            const deadline = flow.deadline_ns orelse return;
+            if (std.time.nanoTimestamp() < deadline) return;
+            flow.response.finish(.timeout);
+            self.closeExtensionPromptFlow(false);
+            self.tui.dirty = true;
+        }
     }
 
     fn showExtensionPrompt(self: *Interactive, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {

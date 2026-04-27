@@ -439,6 +439,10 @@ fn pushPromptEnvelope(L: *c.lua_State, result: request_mod.ExtensionPromptRespon
             _ = c.lua_pushlstring(L, "cancelled", "cancelled".len);
             c.lua_setfield(L, -2, "status");
         },
+        .timeout => {
+            _ = c.lua_pushlstring(L, "timeout", "timeout".len);
+            c.lua_setfield(L, -2, "status");
+        },
     }
 }
 
@@ -484,6 +488,7 @@ fn parsePrompt(
             .kind = kind,
             .title = title,
             .message = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "message") else try readOptionalArgString(arena, L, 2),
+            .timeout_ms = try readPromptTimeoutMs(L, if (is_table) prompt_idx else 3),
         },
         .select => .{
             .state_owner_id = try arena.dupe(u8, state_owner_id),
@@ -492,6 +497,7 @@ fn parsePrompt(
             .kind = kind,
             .title = title,
             .options = if (is_table) try readSelectOptionsField(arena, L, prompt_idx) else try readSelectOptions(arena, L, 2),
+            .timeout_ms = try readPromptTimeoutMs(L, if (is_table) prompt_idx else 3),
         },
         .input => .{
             .state_owner_id = try arena.dupe(u8, state_owner_id),
@@ -501,6 +507,7 @@ fn parsePrompt(
             .title = title,
             .placeholder = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "placeholder") else try readOptionalArgString(arena, L, 2),
             .prefill = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "default") else null,
+            .timeout_ms = try readPromptTimeoutMs(L, if (is_table) prompt_idx else 3),
         },
         .editor => .{
             .state_owner_id = try arena.dupe(u8, state_owner_id),
@@ -509,6 +516,7 @@ fn parsePrompt(
             .kind = kind,
             .title = title,
             .prefill = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "prefill") else try readOptionalArgString(arena, L, 2),
+            .timeout_ms = try readPromptTimeoutMs(L, if (is_table) prompt_idx else 3),
         },
     };
 }
@@ -516,6 +524,18 @@ fn parsePrompt(
 fn readOptionalArgString(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
     if (c.lua_type(L, idx) != c.LUA_TSTRING) return null;
     return try dupeLuaString(arena, L, idx);
+}
+
+fn readPromptTimeoutMs(L: *c.lua_State, idx: c_int) !?u64 {
+    if (c.lua_type(L, idx) != c.LUA_TTABLE) return null;
+    const abs_idx = c.lua_absindex(L, idx);
+    _ = c.lua_getfield(L, abs_idx, "timeout_ms");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TNUMBER) return null;
+    var isnum: c_int = 0;
+    const value = c.lua_tointegerx(L, -1, &isnum);
+    if (isnum == 0 or value <= 0) return null;
+    return @intCast(value);
 }
 
 fn readPromptKindArg(L: *c.lua_State, idx: c_int) ?extension_ui.PromptKind {

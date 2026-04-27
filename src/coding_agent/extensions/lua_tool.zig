@@ -980,6 +980,7 @@ const TestStateStore = struct {
 
     fn resolvePrompt(session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (prompt.timeout_ms == 1) return response.finish(.timeout);
         switch (prompt.kind) {
             .confirm => response.finish(.{ .confirm = true }),
             .select => {
@@ -1186,6 +1187,8 @@ test "extension command prompts can resolve through host response" {
         \\    local typed = ctx.ui.prompt({ kind = "input", title = "Name", placeholder = "my-app", default = "zi" })
         \\    assert(typed.status == "submitted")
         \\    assert(typed.value == "typed")
+        \\    local timed_out = ctx.ui.prompt({ kind = "confirm", title = "Timed", timeout_ms = 1 })
+        \\    assert(timed_out.status == "timeout")
         \\  end,
         \\})
     , "register_resolved_prompt_command");
@@ -1278,7 +1281,7 @@ test "extension command context publishes host-owned prompt requests with defaul
         \\    assert(ctx.ui.select("Pick", { "A", "B" }) == nil)
         \\    assert(ctx.ui.input("Input", "placeholder") == nil)
         \\    assert(ctx.ui.editor("Editor", "prefill") == nil)
-        \\    local cancelled = ctx.ui.prompt({ kind = "select", title = "Pick object", options = { { label = "Lua", value = "lua" } } })
+        \\    local cancelled = ctx.ui.prompt({ kind = "select", title = "Pick object", options = { { label = "Lua", value = "lua" } }, timeout_ms = 5000 })
         \\    assert(cancelled.status == "cancelled")
         \\  end,
         \\})
@@ -1300,6 +1303,7 @@ test "extension command context publishes host-owned prompt requests with defaul
     try testing.expectEqual(extension_ui.PromptKind.select, store.prompts.items[4].kind);
     try testing.expectEqualStrings("lua", store.prompts.items[4].options[0].id);
     try testing.expectEqualStrings("Lua", store.prompts.items[4].options[0].label);
+    try testing.expectEqual(@as(?u64, 5000), store.prompts.items[4].timeout_ms);
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 1), store.cancel_count);

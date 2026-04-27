@@ -28,6 +28,7 @@ pub const PromptRequest = struct {
     placeholder: ?[]const u8 = null,
     prefill: ?[]const u8 = null,
     options: []const SelectOption = &.{},
+    timeout_ms: ?u64 = null,
 
     pub fn clone(allocator: std.mem.Allocator, prompt: PromptRequest) !PromptRequest {
         const state_owner_id = try allocator.dupe(u8, prompt.state_owner_id);
@@ -64,6 +65,7 @@ pub const PromptRequest = struct {
             .placeholder = placeholder,
             .prefill = prefill,
             .options = options,
+            .timeout_ms = prompt.timeout_ms,
         };
     }
 

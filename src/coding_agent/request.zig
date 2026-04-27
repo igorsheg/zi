@@ -67,11 +67,12 @@ pub const ExtensionPromptResponse = struct {
     pub const Result = union(enum) {
         confirm: bool,
         value: ?OwnedValue,
+        timeout,
 
         pub fn deinit(self: *Result) void {
             switch (self.*) {
                 .value => |maybe| if (maybe) |value| value.allocator.free(value.text),
-                .confirm => {},
+                .confirm, .timeout => {},
             }
             self.* = undefined;
         }
