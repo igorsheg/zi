@@ -133,6 +133,8 @@ fn pushUiApi(
         c.lua_setfield(L, -2, "get_editor_text");
     }
     if (runner.runtime.bound.publish_surface != null) {
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotify);
+        c.lua_setfield(L, -2, "notify");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetStatus);
         c.lua_setfield(L, -2, "set_status");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetTitle);
@@ -208,6 +210,12 @@ fn publishEditorActionFromArgs(L: *c.lua_State, kind: extension_ui.EditorActionK
     try callback(bound.session, action);
 }
 
+fn ctxUiNotify(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    publishNotificationFromArgs(L) catch {};
+    return 0;
+}
+
 fn ctxUiSetStatus(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     publishSurfaceFromArgs(L, .status) catch {};
@@ -270,6 +278,29 @@ fn publishSurfaceFromArgs(L: *c.lua_State, kind: extension_ui.SurfaceKind) !void
     try callback(bound.session, update);
 }
 
+fn publishNotificationFromArgs(L: *c.lua_State) !void {
+    const runner = stateRunnerFromUpvalue(L);
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
+    const callback = bound.publish_surface orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const kind = try readNotificationKind(aa, L, 2);
+    const update = extension_ui.SurfaceUpdate{
+        .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
+        .generation = runner.generation,
+        .kind = .notification,
+        .id = kind,
+        .text = try readOptionalArgString(aa, L, 1),
+        .lifetime = .until_input,
+    };
+    try callback(bound.session, update);
+}
+
 fn parseSurface(
     arena: std.mem.Allocator,
     L: *c.lua_State,
@@ -300,6 +331,15 @@ fn parseSurface(
 fn readStringArg(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, default: []const u8) ![]const u8 {
     if (c.lua_type(L, idx) != c.LUA_TSTRING) return try arena.dupe(u8, default);
     return try dupeLuaString(arena, L, idx);
+}
+
+fn readNotificationKind(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
+    if (c.lua_type(L, idx) != c.LUA_TSTRING) return try arena.dupe(u8, "info");
+    const value = try dupeLuaString(arena, L, idx);
+    if (std.mem.eql(u8, value, "info")) return value;
+    if (std.mem.eql(u8, value, "warning")) return value;
+    if (std.mem.eql(u8, value, "error")) return value;
+    return try arena.dupe(u8, "info");
 }
 
 fn readSurfaceLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {

@@ -119,6 +119,7 @@ pub const SurfaceKind = enum {
     header,
     footer,
     overlay,
+    notification,
 };
 
 pub const SurfaceLifetime = enum {

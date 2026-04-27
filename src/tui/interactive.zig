@@ -5,6 +5,7 @@ const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");
 const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal.zig");
+const terminal_notify = @import("terminal_notify.zig");
 const keys_mod = @import("keys.zig");
 const component_mod = @import("component.zig");
 const div_mod = @import("components/div.zig");
@@ -3177,6 +3178,7 @@ pub const Interactive = struct {
                 else
                     self.applySurfaceText(&self.extension_widget_above_text, update),
                 .working, .overlay => self.applySurfaceText(&self.extension_panel_text, update),
+                .notification => self.applyNotificationSurface(update),
                 .title, .thinking_label => {},
             }
         }
@@ -3187,6 +3189,11 @@ pub const Interactive = struct {
         const text = update.flattenText(self.allocator) catch return;
         defer self.allocator.free(text);
         text_component.setContent(text);
+    }
+
+    fn applyNotificationSurface(_: *Interactive, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
+        const message = update.text orelse return;
+        terminal_notify.notify("Zi", message);
     }
 
     fn surfaceHasContent(update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) bool {

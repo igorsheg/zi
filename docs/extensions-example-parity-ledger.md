@@ -40,7 +40,9 @@ zi's v2 docs intentionally keep the architecture different:
 - `on`
 - `spawn`
 
-source: `src/coding_agent/extensions/api.zig:68-102`.
+`ctx.ui` also exposes host-owned UI methods from bound extension contexts, including `notify`, panels, prompts, retained surfaces, and editor actions.
+
+source: `src/coding_agent/extensions/api.zig:68-102`; `src/coding_agent/extensions/context.zig:91-153`.
 
 current event registry tags cover lifecycle, tool, session start/shutdown/switch/fork, and model select (`src/coding_agent/extensions/registries/event_registry.zig:30-55`). the v2 events doc defines a wider target including resource discovery, input/context/provider transforms, user bash, compaction, and tree hooks (`docs/extensions-events.md:128-142`).
 
@@ -87,7 +89,7 @@ current event registry tags cover lifecycle, tool, session start/shutdown/switch
 | `handoff.ts` | command + custom loader ui + editor prompt + session handoff | partial | command + working surface + editor modal request + editor buffer action + handoff host action | handoff action. |
 | `qna.ts` | prompt-generator command: extract questions from last assistant message, run model completion, show working/notification UI, then mutate editor buffer | partial | `examples/extensions/qna.lua` is only a seed that proves command-driven editor mutation through host-owned `ctx.ui.set_editor_text`; full qna parity needs semantic branch/message reads, extension-initiated model completion without exposing raw provider auth, notification/working UI, and async/cancellable command execution | `zi-2wn2` closed only the editor-action sub-capability; create a full qna bead after those seams exist. |
 | `status-line.ts` | keyed status item from lifecycle/turn events | shipped | `examples/extensions/status_line.lua` publishes a `status-demo` item on `session_start`, `turn_start`, and `turn_end` through host-owned `ctx.ui.set_status` surface updates | closed in `zi-1bmm`; richer styling remains future scope. |
-| `model-status.ts` | model-select status item plus notification | partial | `model_select` event + keyed `ctx.ui.set_status` are available; full parity still needs notification surface for the model-change toast | notification primitive. |
+| `model-status.ts` | model-select status item plus notification | shipped | `examples/extensions/model_status.lua` observes `model_select`, publishes a host-owned notification for non-restore changes, and updates keyed `ctx.ui.set_status("model", ...)` | closed in `zi-3n5c` on top of notification surface `zi-noyv`. |
 | `widget-placement.ts` | widgets above/below editor | shipped | `examples/extensions/widget_placement.lua` handles `session_start` and publishes above/below editor widgets through host-owned `ctx.ui.set_widget` surface updates with placement metadata | closed in `zi-0scq`; richer arbitration/styling remains future scope. |
 | `hidden-thinking-label.ts` | customize collapsed thinking label | partial | singleton thinking-label surface intent | materialization in thinking-block renderer. |
 | `custom-header.ts` | claim/restore header | shipped | `examples/extensions/custom_header.lua` claims the header on `session_start` with host-owned `ctx.ui.set_header` line/span payloads and registers `/builtin-header` to restore the built-in header surface | closed in `zi-uo7u`; raw component factories remain deliberately excluded. |
@@ -95,7 +97,8 @@ current event registry tags cover lifecycle, tool, session start/shutdown/switch
 | `summarize.ts` | command/event producing transient ui output | blocked | command + retained panel/widget/notification + model/tool access | ui surfaces + context usage/model helpers. |
 | `send-user-message.ts` | send/steer/follow-up user messages from extensions | blocked | host action for idle send, steering, and queued follow-up | command actions across request boundary. |
 | `shutdown-command.ts`, `reload-runtime.ts` | command-triggered shutdown/reload | partial | command-only `ExtensionCommandContext` actions | command action tests on top of closed `zi-gxr`. |
-| `notify.ts`, `titlebar-spinner.ts` | terminal/desktop notification and title changes | blocked | notification and title surfaces | retained notification/title api; terminal-specific materialization optional. |
+| `notify.ts` | notify when agent is ready for input | shipped | `examples/extensions/notify.lua` publishes `ctx.ui.notify` as a host-owned semantic notification surface from `agent_end`; TUI materializes through a terminal-native notification backend using OSC 777 / OSC 99 / OSC 9 with tmux passthrough | closed in `zi-noyv`; OS-specific non-terminal toast backends remain optional future polish. |
+| `titlebar-spinner.ts` | terminal title changes | partial | title surface intents exist via `ctx.ui.set_title`; richer terminal title/spinner materialization remains host-owned | terminal-specific materialization optional. |
 | `timed-confirm.ts` | abortable confirm/select ui | partial | prompt request records with cancellation/default resolution | timeout/abort semantics. |
 | `rpc-demo.ts` | exercise extension ui via rpc host | blocked | same retained ui primitives over non-tui host | rpc-host materialization for retained ui primitives. |
 | `question.ts`, `questionnaire.ts` | interactive tool asks user for input/selection | partial | prompt/select/input/editor request records callable from lua tool/event contexts | runnable example parity and rpc-host materialization; raw custom ui excluded. |

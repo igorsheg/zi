@@ -5,6 +5,7 @@ pub const grapheme = @import("grapheme.zig");
 pub const keys = @import("keys.zig");
 pub const renderer = @import("renderer.zig");
 pub const terminal = @import("terminal.zig");
+pub const terminal_notify = @import("terminal_notify.zig");
 pub const component = @import("component.zig");
 pub const components = @import("components/root.zig");
 pub const display_wrap = @import("display_wrap.zig");

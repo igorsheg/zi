@@ -1112,6 +1112,7 @@ test "extension command context publishes host-owned status and surface leases" 
         \\  name = "surfaces",
         \\  description = "surfaces",
         \\  handler = function(_, ctx)
+        \\    ctx.ui.notify("Ready for input", "warning")
         \\    ctx.ui.set_status("demo", "ready")
         \\    ctx.ui.set_title("Zi Demo")
         \\    ctx.ui.set_widget("w", { { { text = "Widget" } } }, { placement = "aboveEditor" })
@@ -1126,20 +1127,23 @@ test "extension command context publishes host-owned status and surface leases" 
 
     try runner.dispatchCommand("surfaces", "");
 
-    try testing.expectEqual(@as(usize, 8), store.surfaces.items.len);
-    try testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[0].kind);
-    try testing.expectEqualStrings("demo", store.surfaces.items[0].id);
-    try testing.expectEqualStrings("ready", store.surfaces.items[0].text.?);
-    try testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[2].kind);
-    try testing.expectEqualStrings("aboveEditor", store.surfaces.items[2].placement.?);
-    try testing.expectEqualStrings("Widget", store.surfaces.items[2].lines[0][0].text);
-    try testing.expectEqual(extension_ui.SurfaceKind.header, store.surfaces.items[3].kind);
-    try testing.expectEqualStrings("Header", store.surfaces.items[3].lines[0][0].text);
-    try testing.expectEqual(extension_ui.SurfaceKind.footer, store.surfaces.items[4].kind);
-    try testing.expectEqualStrings("Footer", store.surfaces.items[4].lines[0][0].text);
-    try testing.expectEqual(extension_ui.SurfaceKind.overlay, store.surfaces.items[7].kind);
-    try testing.expectEqualStrings("overlay", store.surfaces.items[7].id);
-    try testing.expectEqualStrings("Overlay", store.surfaces.items[7].lines[0][0].text);
+    try testing.expectEqual(@as(usize, 9), store.surfaces.items.len);
+    try testing.expectEqual(extension_ui.SurfaceKind.notification, store.surfaces.items[0].kind);
+    try testing.expectEqualStrings("warning", store.surfaces.items[0].id);
+    try testing.expectEqualStrings("Ready for input", store.surfaces.items[0].text.?);
+    try testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[1].kind);
+    try testing.expectEqualStrings("demo", store.surfaces.items[1].id);
+    try testing.expectEqualStrings("ready", store.surfaces.items[1].text.?);
+    try testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[3].kind);
+    try testing.expectEqualStrings("aboveEditor", store.surfaces.items[3].placement.?);
+    try testing.expectEqualStrings("Widget", store.surfaces.items[3].lines[0][0].text);
+    try testing.expectEqual(extension_ui.SurfaceKind.header, store.surfaces.items[4].kind);
+    try testing.expectEqualStrings("Header", store.surfaces.items[4].lines[0][0].text);
+    try testing.expectEqual(extension_ui.SurfaceKind.footer, store.surfaces.items[5].kind);
+    try testing.expectEqualStrings("Footer", store.surfaces.items[5].lines[0][0].text);
+    try testing.expectEqual(extension_ui.SurfaceKind.overlay, store.surfaces.items[8].kind);
+    try testing.expectEqualStrings("overlay", store.surfaces.items[8].id);
+    try testing.expectEqualStrings("Overlay", store.surfaces.items[8].lines[0][0].text);
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 1), store.revoke_count);
