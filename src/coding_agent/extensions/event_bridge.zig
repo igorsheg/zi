@@ -46,6 +46,13 @@ pub const InputMiddlewareResult = union(enum) {
     blocked: ?[]const u8,
 };
 
+pub const BeforeAgentStartOptions = struct {
+    cwd: []const u8,
+    selected_tools: []const []const u8,
+    skills: []const resource_types.Skill,
+    append_system_prompt: []const []const u8,
+};
+
 /// Adapter matching `agent_protocol.AgentEventSink`. Pass this and
 /// a `*ExtensionRunner` as the ctx to `agent.subscribe`. The runner
 /// must already have `lua_state` attached or the bridge no-ops.
@@ -323,6 +330,52 @@ fn pushModelSelectPayload(
 
     _ = c.lua_pushlstring(L, source.ptr, source.len);
     c.lua_setfield(L, -2, "source");
+}
+
+pub fn dispatchBeforeAgentStart(
+    runner: *runner_mod.ExtensionRunner,
+    system_prompt: []const u8,
+    options: BeforeAgentStartOptions,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    const state = runner.lua_state orelse return error.NoState;
+    runner.assertOnLuaThread();
+
+    const handlers = runner.event_registry.handlers(.before_agent_start);
+    if (handlers.len == 0) return try allocator.dupe(u8, system_prompt);
+
+    try pushBeforeAgentStartPayload(state.L, system_prompt, options);
+    defer c.lua_pop(state.L, 1);
+
+    for (handlers) |h| {
+        var co = try lua_runtime.Coroutine.init(state);
+        defer co.deinit();
+
+        try dispatch.pushHandlerAndContextForBridge(state, runner, &co, h.lua_ref, h.provenance, -1);
+        const r = try co.resumeWith(2);
+        switch (r.status) {
+            .yielded => return error.UnexpectedYield,
+            .ok, .finished => {},
+        }
+        if (r.nresults > 0) {
+            const top = c.lua_gettop(co.L);
+            defer c.lua_settop(co.L, top - r.nresults);
+            const top_idx = top;
+            if (c.lua_type(co.L, top_idx) == c.LUA_TTABLE) {
+                if (try readOptionalStringFieldOwned(co.L, top_idx, "system_prompt", allocator)) |prompt| {
+                    defer allocator.free(prompt);
+                    setPayloadSystemPrompt(state.L, -1, prompt);
+                }
+            }
+        }
+
+        if (try readPayloadSystemPrompt(state.L, -1, allocator)) |prompt| {
+            defer allocator.free(prompt);
+            setPayloadSystemPrompt(state.L, -1, prompt);
+        }
+    }
+
+    return try readPayloadSystemPrompt(state.L, -1, allocator) orelse try allocator.dupe(u8, system_prompt);
 }
 
 pub fn dispatchInput(
@@ -837,6 +890,59 @@ fn readOptionalStringFieldOwned(L: *c.lua_State, idx: c_int, field: [:0]const u8
 
 // -- payload builders ---------------------------------------------------------
 
+fn readPayloadSystemPrompt(L: *c.lua_State, idx: c_int, allocator: std.mem.Allocator) !?[]const u8 {
+    return readOptionalStringFieldOwned(L, idx, "system_prompt", allocator);
+}
+
+fn setPayloadSystemPrompt(L: *c.lua_State, idx: c_int, prompt: []const u8) void {
+    const abs_idx = c.lua_absindex(L, idx);
+    _ = c.lua_pushlstring(L, prompt.ptr, prompt.len);
+    c.lua_setfield(L, abs_idx, "system_prompt");
+}
+
+fn pushBeforeAgentStartPayload(L: *c.lua_State, system_prompt: []const u8, options: BeforeAgentStartOptions) !void {
+    c.lua_createtable(L, 0, 3);
+    _ = c.lua_pushlstring(L, "before_agent_start".ptr, "before_agent_start".len);
+    c.lua_setfield(L, -2, "type");
+    _ = c.lua_pushlstring(L, system_prompt.ptr, system_prompt.len);
+    c.lua_setfield(L, -2, "system_prompt");
+    try pushSystemPromptOptions(L, options);
+    c.lua_setfield(L, -2, "system_prompt_options");
+}
+
+fn pushSystemPromptOptions(L: *c.lua_State, options: BeforeAgentStartOptions) !void {
+    c.lua_createtable(L, 0, 4);
+    _ = c.lua_pushlstring(L, options.cwd.ptr, options.cwd.len);
+    c.lua_setfield(L, -2, "cwd");
+
+    c.lua_createtable(L, @intCast(options.selected_tools.len), 0);
+    for (options.selected_tools, 0..) |name, i| {
+        _ = c.lua_pushlstring(L, name.ptr, name.len);
+        c.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    c.lua_setfield(L, -2, "selected_tools");
+
+    c.lua_createtable(L, @intCast(options.skills.len), 0);
+    for (options.skills, 0..) |skill, i| {
+        c.lua_createtable(L, 0, 3);
+        _ = c.lua_pushlstring(L, skill.name.ptr, skill.name.len);
+        c.lua_setfield(L, -2, "name");
+        _ = c.lua_pushlstring(L, skill.description.ptr, skill.description.len);
+        c.lua_setfield(L, -2, "description");
+        _ = c.lua_pushlstring(L, skill.file_path.ptr, skill.file_path.len);
+        c.lua_setfield(L, -2, "file_path");
+        c.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    c.lua_setfield(L, -2, "skills");
+
+    c.lua_createtable(L, @intCast(options.append_system_prompt.len), 0);
+    for (options.append_system_prompt, 0..) |append, i| {
+        _ = c.lua_pushlstring(L, append.ptr, append.len);
+        c.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    c.lua_setfield(L, -2, "append_system_prompt");
+}
+
 fn pushInputPayload(L: *c.lua_State, text: []const u8, queued_kind: ?[]const u8) !void {
     c.lua_createtable(L, 0, 5);
     _ = c.lua_pushlstring(L, "input".ptr, "input".len);
@@ -1076,6 +1182,72 @@ test "event_bridge tool_execution_start exposes tool_name and args to handler" {
 }
 
 // -- D6: tool_call / tool_result hooks ----------------------------------------
+
+test "before_agent_start transforms system prompt from return table" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.on("before_agent_start", function(event, ctx)
+        \\  return { system_prompt = event.system_prompt .. "\nmarker" }
+        \\end)
+    , "subscribe_before_agent_start_return");
+
+    const result = try dispatchBeforeAgentStart(&runner, "base", .{ .cwd = ".", .selected_tools = &.{}, .skills = &.{}, .append_system_prompt = &.{} }, testing.allocator);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("base\nmarker", result);
+}
+
+test "before_agent_start chains mutation across handlers" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.on("before_agent_start", function(event, ctx)
+        \\  event.system_prompt = event.system_prompt .. " one"
+        \\end)
+        \\zi.on("before_agent_start", function(event, ctx)
+        \\  event.system_prompt = event.system_prompt .. " two"
+        \\end)
+    , "subscribe_before_agent_start_mutation");
+
+    const result = try dispatchBeforeAgentStart(&runner, "base", .{ .cwd = ".", .selected_tools = &.{}, .skills = &.{}, .append_system_prompt = &.{} }, testing.allocator);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("base one two", result);
+}
+
+test "before_agent_start exposes selected tools and skills" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\zi.on("before_agent_start", function(event, ctx)
+        \\  local opts = event.system_prompt_options
+        \\  return { system_prompt = event.system_prompt .. " " .. opts.selected_tools[1] .. " " .. opts.skills[1].name }
+        \\end)
+    , "subscribe_before_agent_start_options");
+
+    const tool_names = [_][]const u8{"bash"};
+    const skill_list = [_]resource_types.Skill{.{ .name = "zig", .description = "zig skill", .file_path = "zig.md", .base_dir = ".", .source_info = .{ .path = "zig.md", .source = "test" } }};
+    const result = try dispatchBeforeAgentStart(&runner, "base", .{ .cwd = ".", .selected_tools = &tool_names, .skills = &skill_list, .append_system_prompt = &.{} }, testing.allocator);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("base bash zig", result);
+}
 
 test "input middleware transforms text before agent submission" {
     var state = try lua_runtime.LuaState.init(testing.allocator);

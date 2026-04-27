@@ -17,6 +17,7 @@ const extension_api = @import("extensions/api.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const lua_tool_mod = @import("extensions/lua_tool.zig");
+const event_bridge = @import("extensions/event_bridge.zig");
 const c = lua_runtime.c;
 
 pub const SessionStore = session_runtime.store.SessionStore;
@@ -324,12 +325,16 @@ pub fn prepareSessionDeps(
     const tools = try buildAgentTools(allocator, filtered.items, extension_runtime.runner);
     errdefer allocator.free(tools);
 
-    const system_prompt = try buildSystemPrompt(
+    const base_system_prompt = try buildSystemPrompt(
         allocator,
         resource_loader,
         filtered.items,
     );
+    errdefer allocator.free(base_system_prompt);
+
+    const system_prompt = try customizeSystemPrompt(allocator, resource_loader, filtered.items, extension_runtime.runner, base_system_prompt);
     errdefer allocator.free(system_prompt);
+    allocator.free(base_system_prompt);
 
     return .{
         .session_store = session_store,
@@ -378,12 +383,16 @@ pub fn prepareExtensionSurface(
     const tools = try buildAgentTools(allocator, filtered.items, extension_runtime.runner);
     errdefer allocator.free(tools);
 
-    const system_prompt = try buildSystemPrompt(
+    const base_system_prompt = try buildSystemPrompt(
         allocator,
         options.resource_loader,
         filtered.items,
     );
+    errdefer allocator.free(base_system_prompt);
+
+    const system_prompt = try customizeSystemPrompt(allocator, options.resource_loader, filtered.items, extension_runtime.runner, base_system_prompt);
     errdefer allocator.free(system_prompt);
+    allocator.free(base_system_prompt);
 
     return .{
         .system_prompt = system_prompt,
@@ -452,6 +461,25 @@ pub fn buildAgentTools(
         count += 1;
     }
     return tools[0..count];
+}
+
+fn customizeSystemPrompt(
+    allocator: std.mem.Allocator,
+    resource_loader: resources.ResourceLoader,
+    definitions: []const tool_def.ToolDefinition,
+    runner: ?*ExtensionRunner,
+    base_system_prompt: []const u8,
+) ![]const u8 {
+    const extension_runner = runner orelse return try allocator.dupe(u8, base_system_prompt);
+    const tool_names = try toolNameSlice(allocator, definitions);
+    defer allocator.free(tool_names);
+    const prompt_inputs = resource_loader.getPromptInputs();
+    return try event_bridge.dispatchBeforeAgentStart(extension_runner, base_system_prompt, .{
+        .cwd = resource_loader.cwd,
+        .selected_tools = tool_names,
+        .skills = resource_loader.getSkills().skills,
+        .append_system_prompt = prompt_inputs.append_system_prompt,
+    }, allocator);
 }
 
 pub fn buildSystemPrompt(
