@@ -3130,6 +3130,15 @@ pub const Interactive = struct {
                         };
                         oauth.response.finish(result);
                     },
+                    .extension_async_result => |async_result| {
+                        idle_processed = true;
+                        self.runtime_host.deliverExtensionAsyncResult(async_result.id, async_result.result) catch |err| {
+                            const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
+                            _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
+                        };
+                        req.* = .{ .refresh_status_snapshot = {} };
+                        self.publishPendingExtensionUi();
+                    },
                     .shutdown => {
                         req.deinit(self.msg_allocator);
                         self.discardAgentRequests(buf[i + 1 .. n]);

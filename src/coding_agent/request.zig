@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const ai_protocol = @import("../ai/protocol.zig");
 const auth_types = @import("auth/types.zig");
+const extension_runner = @import("extensions/runner.zig");
 const extension_ui = @import("extensions/ui.zig");
 const message_memory = @import("../agent3/message_memory.zig");
 const mailbox_mod = @import("../runtime/mailbox.zig");
@@ -220,6 +221,10 @@ pub const AgentRequest = union(enum) {
         result_allocator: std.mem.Allocator,
         response: *ExtensionOAuthRefreshResponse,
     },
+    extension_async_result: struct {
+        id: extension_runner.AsyncOpId,
+        result: extension_runner.AsyncResult,
+    },
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
@@ -242,6 +247,7 @@ pub const AgentRequest = union(enum) {
                 allocator.free(oauth.provider_id);
                 auth_types.freeOAuthCredential(allocator, oauth.credential);
             },
+            .extension_async_result => |*async_result| async_result.result.deinit(allocator),
             .shutdown => {},
         }
     }

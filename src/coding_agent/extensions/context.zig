@@ -42,6 +42,9 @@ pub fn pushExtensionContext(
     pushSessionApi(L, runner);
     c.lua_setfield(L, -2, "session");
 
+    pushAiApi(L, runner);
+    c.lua_setfield(L, -2, "ai");
+
     pushContextBinding(L, runner, provenance);
     c.lua_setfield(L, -2, "binding");
 
@@ -838,6 +841,12 @@ fn ctxStateDelete(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn pushAiApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
+    c.lua_createtable(L, 0, 1);
+    pushMethod(L, runner, &ctxAiComplete);
+    c.lua_setfield(L, -2, "complete");
+}
+
 fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     const has_session = switch (runner.runtime) {
         .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null,
@@ -1002,6 +1011,94 @@ fn ctxSessionMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
     }
 }
 
+fn ctxAiComplete(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const request = parseAiCompleteRequest(runner.allocator, L) catch {
+        pushAiCompleteError(L, "ctx.ai.complete: invalid request");
+        return 1;
+    };
+    const id = runner.beginAiCompleteAsync(request);
+    return c.lua_yieldk(L, 0, @intCast(id), ctxAiCompleteContinue);
+}
+
+fn ctxAiCompleteContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) callconv(.c) c_int {
+    _ = status;
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id: runner_mod.AsyncOpId = @intCast(ctx);
+    var result = runner.takeCompletedAsync(id) orelse {
+        pushAiCompleteError(L, "ctx.ai.complete: missing async result");
+        return 1;
+    };
+    defer result.deinit(runner.allocator);
+    switch (result) {
+        .ai_complete => |value| pushAiCompleteResult(L, value),
+        else => pushAiCompleteError(L, "ctx.ai.complete: unexpected async result"),
+    }
+    return 1;
+}
+
+fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.AiCompleteRequest {
+    if (c.lua_type(L, 1) == c.LUA_TSTRING) {
+        const prompt = try dupeLuaString(allocator, L, 1);
+        return .{ .prompt = prompt };
+    }
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return error.InvalidRequest;
+    const idx = c.lua_absindex(L, 1);
+    _ = c.lua_getfield(L, idx, "prompt");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidRequest;
+    const prompt = try dupeLuaString(allocator, L, -1);
+    errdefer allocator.free(prompt);
+
+    var system_prompt: ?[]const u8 = null;
+    _ = c.lua_getfield(L, idx, "system_prompt");
+    if (c.lua_type(L, -1) == c.LUA_TSTRING) system_prompt = try dupeLuaString(allocator, L, -1);
+    c.lua_pop(L, 1);
+    errdefer if (system_prompt) |value| allocator.free(value);
+
+    var max_tokens: ?u64 = null;
+    _ = c.lua_getfield(L, idx, "max_tokens");
+    if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+        const raw = c.lua_tointegerx(L, -1, null);
+        if (raw > 0) max_tokens = @intCast(raw);
+    }
+    c.lua_pop(L, 1);
+
+    return .{ .prompt = prompt, .system_prompt = system_prompt, .max_tokens = max_tokens };
+}
+
+fn pushAiCompleteResult(L: *c.lua_State, result: runner_mod.AiCompleteResult) void {
+    c.lua_createtable(L, 0, 2);
+    switch (result) {
+        .completed => |completed| {
+            _ = c.lua_pushlstring(L, "completed", "completed".len);
+            c.lua_setfield(L, -2, "status");
+            _ = c.lua_pushlstring(L, completed.text.ptr, completed.text.len);
+            c.lua_setfield(L, -2, "text");
+        },
+        .err => |msg| {
+            _ = c.lua_pushlstring(L, "error", "error".len);
+            c.lua_setfield(L, -2, "status");
+            _ = c.lua_pushlstring(L, msg.ptr, msg.len);
+            c.lua_setfield(L, -2, "error");
+        },
+        .cancelled => {
+            _ = c.lua_pushlstring(L, "cancelled", "cancelled".len);
+            c.lua_setfield(L, -2, "status");
+        },
+    }
+}
+
+fn pushAiCompleteError(L: *c.lua_State, msg: []const u8) void {
+    c.lua_createtable(L, 0, 2);
+    _ = c.lua_pushlstring(L, "error", "error".len);
+    c.lua_setfield(L, -2, "status");
+    _ = c.lua_pushlstring(L, msg.ptr, msg.len);
+    c.lua_setfield(L, -2, "error");
+}
+
 fn ctxTestAsync(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
@@ -1023,6 +1120,7 @@ fn ctxTestAsyncContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext
         .@"test" => |value| {
             _ = c.lua_pushlstring(L, value.ptr, value.len);
         },
+        else => c.lua_pushnil(L),
     }
     return 1;
 }

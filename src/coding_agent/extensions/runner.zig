@@ -29,11 +29,61 @@ pub const AsyncOpId = u64;
 
 pub const AsyncKind = enum {
     @"test",
+    ai_complete,
+};
+
+pub const AiCompleteRequest = struct {
+    prompt: []const u8,
+    system_prompt: ?[]const u8 = null,
+    max_tokens: ?u64 = null,
+
+    pub fn deinit(self: *AiCompleteRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        if (self.system_prompt) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const AiCompleteResult = union(enum) {
+    completed: struct { text: []const u8 },
+    err: []const u8,
+    cancelled,
+
+    pub fn deinit(self: *AiCompleteResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .completed => |completed| allocator.free(completed.text),
+            .err => |msg| allocator.free(msg),
+            .cancelled => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const AsyncRequest = union(AsyncKind) {
+    @"test": void,
+    ai_complete: AiCompleteRequest,
+
+    pub fn deinit(self: *AsyncRequest, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .@"test" => {},
+            .ai_complete => |*request| request.deinit(allocator),
+        }
+        self.* = undefined;
+    }
 };
 
 pub const AsyncStart = struct {
     id: AsyncOpId,
-    kind: AsyncKind,
+    request: AsyncRequest,
+
+    pub fn kind(self: AsyncStart) AsyncKind {
+        return std.meta.activeTag(self.request);
+    }
+
+    pub fn deinit(self: *AsyncStart, allocator: std.mem.Allocator) void {
+        self.request.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 pub const AsyncDispatcher = struct {
@@ -43,10 +93,12 @@ pub const AsyncDispatcher = struct {
 
 pub const AsyncResult = union(AsyncKind) {
     @"test": []const u8,
+    ai_complete: AiCompleteResult,
 
     pub fn deinit(self: *AsyncResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .@"test" => |value| allocator.free(value),
+            .ai_complete => |*result| result.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -783,7 +835,7 @@ pub const ExtensionRunner = struct {
         self.current_async_start = null;
         try self.pending_async.put(self.allocator, start.id, .{
             .id = start.id,
-            .kind = start.kind,
+            .kind = start.kind(),
             .co = co.*,
             .provenance = provenance,
             .generation = self.generation,
@@ -794,19 +846,31 @@ pub const ExtensionRunner = struct {
     fn submitAsyncStart(self: *ExtensionRunner, start: AsyncStart) !void {
         if (self.async_dispatcher) |dispatcher| {
             dispatcher.submit(dispatcher.ptr, self, start) catch |err| {
+                var failed_start = start;
+                failed_start.deinit(self.allocator);
                 if (self.pending_async.fetchRemove(start.id)) |kv| {
                     var pending = kv.value;
                     pending.deinit();
                 }
                 return err;
             };
+        } else {
+            var unsubmitted = start;
+            unsubmitted.deinit(self.allocator);
         }
     }
 
     pub fn beginTestAsync(self: *ExtensionRunner) AsyncOpId {
         const id = self.next_async_id;
         self.next_async_id += 1;
-        self.current_async_start = .{ .id = id, .kind = .@"test" };
+        self.current_async_start = .{ .id = id, .request = .{ .@"test" = {} } };
+        return id;
+    }
+
+    pub fn beginAiCompleteAsync(self: *ExtensionRunner, request: AiCompleteRequest) AsyncOpId {
+        const id = self.next_async_id;
+        self.next_async_id += 1;
+        self.current_async_start = .{ .id = id, .request = .{ .ai_complete = request } };
         return id;
     }
 

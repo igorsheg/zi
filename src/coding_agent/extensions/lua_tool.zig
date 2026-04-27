@@ -1421,6 +1421,48 @@ test "extension command context publishes host-owned prompt requests with defaul
     try testing.expectEqual(@as(usize, 0), store.prompts.items.len);
 }
 
+test "extension command resumes after ai completion result" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 20);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "ai-complete-test",
+        \\  description = "ai-complete-test",
+        \\  handler = function(_, ctx)
+        \\    local result = ctx.ai.complete({ prompt = "hello", system_prompt = "system", max_tokens = 12 })
+        \\    _ai_complete_result = result.status .. ":" .. result.text
+        \\  end,
+        \\})
+    , "register_ai_complete_test_command");
+
+    try runner.dispatchCommand("ai-complete-test", "");
+    try testing.expectEqual(@as(usize, 1), runner.pending_async.count());
+    const pending = runner.pending_async.get(1) orelse return error.MissingAsyncRequest;
+    try testing.expectEqual(runner_mod.AsyncKind.ai_complete, pending.kind);
+    try runner.resumeAsync(1, .{ .ai_complete = .{ .completed = .{ .text = try testing.allocator.dupe(u8, "world") } } });
+    try testing.expectEqual(@as(usize, 0), runner.pending_async.count());
+
+    _ = c.lua_getglobal(state.L, "_ai_complete_result");
+    defer c.lua_pop(state.L, 1);
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(state.L, -1, &len) orelse return error.MissingAsyncResult;
+    try testing.expectEqualStrings("completed:world", ptr[0..len]);
+}
+
 test "extension command resumes after yieldable host result" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
