@@ -39,6 +39,9 @@ pub fn pushExtensionContext(
     pushStateApi(L, runner, provenance);
     c.lua_setfield(L, -2, "state");
 
+    pushSessionApi(L, runner);
+    c.lua_setfield(L, -2, "session");
+
     pushContextBinding(L, runner, provenance);
     c.lua_setfield(L, -2, "binding");
 
@@ -828,6 +831,75 @@ fn ctxStateDelete(L_opt: ?*c.lua_State) callconv(.c) c_int {
         .stub => {},
     }
     return 0;
+}
+
+fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
+    const has_session = switch (runner.runtime) {
+        .bound => |bound| bound.session_info_get != null or bound.session_tool_results_get != null,
+        .stub => false,
+    };
+    if (!has_session) {
+        c.lua_pushnil(L);
+        return;
+    }
+
+    c.lua_createtable(L, 0, 2);
+    pushMethod(L, runner, &ctxSessionInfo);
+    c.lua_setfield(L, -2, "info");
+    pushMethod(L, runner, &ctxSessionToolResults);
+    c.lua_setfield(L, -2, "tool_results");
+}
+
+fn ctxSessionInfo(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_info_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionToolResults(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const tool_name = readKeyArg(L) orelse {
+        c.lua_createtable(L, 0, 0);
+        return 1;
+    };
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_tool_results_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator, tool_name) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
 }
 
 fn pushContextBinding(

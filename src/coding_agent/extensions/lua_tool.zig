@@ -927,6 +927,32 @@ const TestStateStore = struct {
         self.value = null;
     }
 
+    fn sessionInfo(session: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
+        _ = session;
+        var obj = std.json.ObjectMap.init(allocator);
+        obj.put(allocator.dupe(u8, "id") catch return null, .{ .string = allocator.dupe(u8, "session-test") catch return null }) catch return null;
+        obj.put(allocator.dupe(u8, "cwd") catch return null, .{ .string = allocator.dupe(u8, "/tmp/project") catch return null }) catch return null;
+        obj.put(allocator.dupe(u8, "file") catch return null, .null) catch return null;
+        return .{ .object = obj };
+    }
+
+    fn sessionToolResults(session: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8) ?std.json.Value {
+        _ = session;
+        var arr = std.json.Array.init(allocator);
+        if (std.mem.eql(u8, tool_name, "todo")) {
+            var details = std.json.ObjectMap.init(allocator);
+            details.put(allocator.dupe(u8, "nextId") catch return null, .{ .integer = 2 }) catch return null;
+            var obj = std.json.ObjectMap.init(allocator);
+            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-1") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "tool_call_id") catch return null, .{ .string = allocator.dupe(u8, "call-1") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "tool_name") catch return null, .{ .string = allocator.dupe(u8, "todo") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "details") catch return null, .{ .object = details }) catch return null;
+            obj.put(allocator.dupe(u8, "is_error") catch return null, .{ .bool = false }) catch return null;
+            arr.append(.{ .object = obj }) catch return null;
+        }
+        return .{ .array = arr };
+    }
+
     fn showPanel(session: *anyopaque, panel: extension_ui.Panel) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         if (self.panel) |*old| old.deinit(self.allocator);
@@ -1027,6 +1053,8 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_state_get = &TestStateStore.get,
         .session_state_set = &TestStateStore.set,
         .session_state_delete = &TestStateStore.delete,
+        .session_info_get = &TestStateStore.sessionInfo,
+        .session_tool_results_get = &TestStateStore.sessionToolResults,
         .show_panel = &TestStateStore.showPanel,
         .publish_prompt = &TestStateStore.publishPrompt,
         .cancel_prompts = &TestStateStore.cancelPrompts,
@@ -1045,6 +1073,42 @@ fn bindResolvingRuntime(runner: *runner_mod.ExtensionRunner, store: *TestStateSt
     var bound = bindRuntimeFields(store);
     bound.resolve_prompt = &TestStateStore.resolvePrompt;
     try runner.bindRuntime(bound, provider_registry);
+}
+
+test "extension command context exposes read-only session surface" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 20);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "session-surface",
+        \\  description = "session-surface",
+        \\  handler = function(_, ctx)
+        \\    local info = ctx.session.info()
+        \\    assert(info.id == "session-test")
+        \\    assert(info.cwd == "/tmp/project")
+        \\    local results = ctx.session.tool_results("todo")
+        \\    assert(#results == 1)
+        \\    assert(results[1].tool_name == "todo")
+        \\    assert(results[1].details.nextId == 2)
+        \\  end,
+        \\})
+    , "register_session_surface_command");
+
+    try runner.dispatchCommand("session-surface", "");
 }
 
 test "extension command context publishes host-owned editor buffer actions" {

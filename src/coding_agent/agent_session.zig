@@ -693,6 +693,8 @@ pub const AgentSession = struct {
             .session_state_get = &runtimeSessionStateGet,
             .session_state_set = &runtimeSessionStateSet,
             .session_state_delete = &runtimeSessionStateDelete,
+            .session_info_get = &runtimeSessionInfoGet,
+            .session_tool_results_get = &runtimeSessionToolResultsGet,
             .show_panel = &runtimeShowPanel,
             .publish_prompt = &runtimePublishPrompt,
             .resolve_prompt = &runtimeResolvePrompt,
@@ -899,6 +901,61 @@ pub const AgentSession = struct {
         try data.put(try self.allocator.dupe(u8, "deleted"), .{ .bool = true });
 
         self.session_store.appendCustomEntry(extension_state_entry_type, .{ .object = data });
+    }
+
+    fn runtimeSessionInfoGet(session_ptr: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        var obj = std.json.ObjectMap.init(allocator);
+        obj.put(allocator.dupe(u8, "id") catch return null, .{ .string = allocator.dupe(u8, self.session_store.sessionId()) catch return null }) catch return null;
+        obj.put(allocator.dupe(u8, "cwd") catch return null, .{ .string = allocator.dupe(u8, self.resource_loader.cwd) catch return null }) catch return null;
+        const session_file = self.session_store.sessionFile();
+        obj.put(allocator.dupe(u8, "file") catch return null, if (session_file.len > 0) .{ .string = allocator.dupe(u8, session_file) catch return null } else .null) catch return null;
+        return .{ .object = obj };
+    }
+
+    fn runtimeSessionToolResultsGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const branch = self.session_store.buildCurrentBranchAlloc(allocator) catch return null;
+        defer allocator.free(branch);
+        var arr = std.json.Array.init(allocator);
+        for (branch) |entry| {
+            const msg = switch (entry.entry) {
+                .message => |m| m.message,
+                else => continue,
+            };
+            if (msg != .tool_result) continue;
+            const tr = msg.tool_result;
+            if (!std.mem.eql(u8, tr.tool_name, tool_name)) continue;
+            arr.append(sessionToolResultJson(allocator, entry.id, tr) catch return null) catch return null;
+        }
+        return .{ .array = arr };
+    }
+
+    fn sessionToolResultJson(allocator: std.mem.Allocator, entry_id: []const u8, tr: ai.protocol.ToolResultMessage) !std.json.Value {
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry_id) });
+        try obj.put(try allocator.dupe(u8, "tool_call_id"), .{ .string = try allocator.dupe(u8, tr.tool_call_id) });
+        try obj.put(try allocator.dupe(u8, "tool_name"), .{ .string = try allocator.dupe(u8, tr.tool_name) });
+        try obj.put(try allocator.dupe(u8, "is_error"), .{ .bool = tr.is_error });
+        if (tr.details) |details| {
+            try obj.put(try allocator.dupe(u8, "details"), try ai.json_util.cloneJsonValue(allocator, details));
+        } else {
+            try obj.put(try allocator.dupe(u8, "details"), .null);
+        }
+        var content = std.json.Array.init(allocator);
+        for (tr.content) |block| {
+            switch (block) {
+                .text => |text| {
+                    var block_obj = std.json.ObjectMap.init(allocator);
+                    try block_obj.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
+                    try block_obj.put(try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text.text) });
+                    try content.append(.{ .object = block_obj });
+                },
+                .image => {},
+            }
+        }
+        try obj.put(try allocator.dupe(u8, "content"), .{ .array = content });
+        return .{ .object = obj };
     }
 
     fn runtimeShowPanel(session_ptr: *anyopaque, panel: extension_ui.Panel) !void {
