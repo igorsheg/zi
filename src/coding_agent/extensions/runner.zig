@@ -36,6 +36,11 @@ pub const AsyncStart = struct {
     kind: AsyncKind,
 };
 
+pub const AsyncDispatcher = struct {
+    ptr: *anyopaque,
+    submit: *const fn (ptr: *anyopaque, runner: *ExtensionRunner, start: AsyncStart) anyerror!void,
+};
+
 pub const AsyncResult = union(AsyncKind) {
     @"test": []const u8,
 
@@ -302,6 +307,7 @@ pub const ExtensionRunner = struct {
     current_async_start: ?AsyncStart = null,
     pending_async: std.AutoHashMapUnmanaged(AsyncOpId, PendingAsync) = .empty,
     completed_async: std.AutoHashMapUnmanaged(AsyncOpId, AsyncResult) = .empty,
+    async_dispatcher: ?AsyncDispatcher = null,
     enable_test_async: bool = false,
 
     loaded_extensions: std.ArrayListUnmanaged(resource_types.ExtensionProvenance) = .empty,
@@ -757,8 +763,9 @@ pub const ExtensionRunner = struct {
         const r = try co.resumeWith(2);
         switch (r.status) {
             .yielded => {
-                try self.suspendYieldedCommand(&co, cmd.source.provenance);
+                const start = try self.suspendYieldedCommand(&co, cmd.source.provenance);
                 co_owned = false;
+                try self.submitAsyncStart(start);
                 return;
             },
             .ok, .finished => {},
@@ -771,7 +778,7 @@ pub const ExtensionRunner = struct {
         }
     }
 
-    fn suspendYieldedCommand(self: *ExtensionRunner, co: *lua_runtime.Coroutine, provenance: ?resource_types.ExtensionProvenance) !void {
+    fn suspendYieldedCommand(self: *ExtensionRunner, co: *lua_runtime.Coroutine, provenance: ?resource_types.ExtensionProvenance) !AsyncStart {
         const start = self.current_async_start orelse return error.UnexpectedYield;
         self.current_async_start = null;
         try self.pending_async.put(self.allocator, start.id, .{
@@ -781,6 +788,19 @@ pub const ExtensionRunner = struct {
             .provenance = provenance,
             .generation = self.generation,
         });
+        return start;
+    }
+
+    fn submitAsyncStart(self: *ExtensionRunner, start: AsyncStart) !void {
+        if (self.async_dispatcher) |dispatcher| {
+            dispatcher.submit(dispatcher.ptr, self, start) catch |err| {
+                if (self.pending_async.fetchRemove(start.id)) |kv| {
+                    var pending = kv.value;
+                    pending.deinit();
+                }
+                return err;
+            };
+        }
     }
 
     pub fn beginTestAsync(self: *ExtensionRunner) AsyncOpId {
@@ -827,8 +847,9 @@ pub const ExtensionRunner = struct {
         const r = try pending.co.resumeWith(0);
         switch (r.status) {
             .yielded => {
-                try self.suspendYieldedCommand(&pending.co, pending.provenance);
+                const start = try self.suspendYieldedCommand(&pending.co, pending.provenance);
                 pending_owned = false;
+                try self.submitAsyncStart(start);
             },
             .ok, .finished => {
                 const top = lua_runtime.c.lua_gettop(pending.co.L);
