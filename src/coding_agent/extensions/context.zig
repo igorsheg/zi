@@ -835,7 +835,7 @@ fn ctxStateDelete(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
 fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     const has_session = switch (runner.runtime) {
-        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null,
+        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null,
         .stub => false,
     };
     if (!has_session) {
@@ -843,7 +843,7 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
         return;
     }
 
-    c.lua_createtable(L, 0, 4);
+    c.lua_createtable(L, 0, 5);
     pushMethod(L, runner, &ctxSessionInfo);
     c.lua_setfield(L, -2, "info");
     pushMethod(L, runner, &ctxSessionName);
@@ -852,6 +852,8 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_setfield(L, -2, "rename");
     pushMethod(L, runner, &ctxSessionToolResults);
     c.lua_setfield(L, -2, "tool_results");
+    pushMethod(L, runner, &ctxSessionMessages);
+    c.lua_setfield(L, -2, "messages");
 }
 
 fn ctxSessionInfo(L_opt: ?*c.lua_State) callconv(.c) c_int {
@@ -944,6 +946,43 @@ fn ctxSessionToolResults(L_opt: ?*c.lua_State) callconv(.c) c_int {
                 return 1;
             };
             const value = getter(bound.session, runner.allocator, tool_name) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    var limit: usize = 50;
+    var include_tools = true;
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        _ = c.lua_getfield(L, 1, "limit");
+        if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+            const raw = c.lua_tointegerx(L, -1, null);
+            if (raw > 0) limit = @intCast(@min(raw, 500));
+        }
+        c.lua_pop(L, 1);
+        _ = c.lua_getfield(L, 1, "include_tools");
+        if (c.lua_type(L, -1) == c.LUA_TBOOLEAN) include_tools = c.lua_toboolean(L, -1) != 0;
+        c.lua_pop(L, 1);
+    }
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_messages_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator, limit, include_tools) orelse {
                 c.lua_createtable(L, 0, 0);
                 return 1;
             };

@@ -75,6 +75,7 @@ pub const ExtensionRuntime = union(enum) {
         session_name_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator) ?[]const u8 = null,
         session_name_set: ?*const fn (session: *anyopaque, name: ?[]const u8) anyerror!void = null,
         session_tool_results_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8) ?std.json.Value = null,
+        session_messages_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, limit: usize, include_tools: bool) ?std.json.Value = null,
         show_panel: ?*const fn (session: *anyopaque, panel: extension_ui.Panel) anyerror!void = null,
         publish_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest) anyerror!void = null,
         resolve_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void = null,

@@ -968,6 +968,25 @@ const TestStateStore = struct {
         return .{ .array = arr };
     }
 
+    fn sessionMessages(session: *anyopaque, allocator: std.mem.Allocator, limit: usize, include_tools: bool) ?std.json.Value {
+        _ = session;
+        _ = include_tools;
+        var arr = std.json.Array.init(allocator);
+        if (limit != 1) {
+            var first = std.json.ObjectMap.init(allocator);
+            first.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-1") catch return null }) catch return null;
+            first.put(allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "user") catch return null }) catch return null;
+            first.put(allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hello") catch return null }) catch return null;
+            arr.append(.{ .object = first }) catch return null;
+        }
+        var second = std.json.ObjectMap.init(allocator);
+        second.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-2") catch return null }) catch return null;
+        second.put(allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "assistant") catch return null }) catch return null;
+        second.put(allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hi") catch return null }) catch return null;
+        arr.append(.{ .object = second }) catch return null;
+        return .{ .array = arr };
+    }
+
     fn showPanel(session: *anyopaque, panel: extension_ui.Panel) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         if (self.panel) |*old| old.deinit(self.allocator);
@@ -1072,6 +1091,7 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_name_get = &TestStateStore.sessionName,
         .session_name_set = &TestStateStore.setSessionName,
         .session_tool_results_get = &TestStateStore.sessionToolResults,
+        .session_messages_get = &TestStateStore.sessionMessages,
         .show_panel = &TestStateStore.showPanel,
         .publish_prompt = &TestStateStore.publishPrompt,
         .cancel_prompts = &TestStateStore.cancelPrompts,
@@ -1127,6 +1147,10 @@ test "extension command context exposes read-only session surface" {
         \\    assert(#results == 1)
         \\    assert(results[1].tool_name == "todo")
         \\    assert(results[1].details.nextId == 2)
+        \\    local messages = ctx.session.messages({ limit = 1 })
+        \\    assert(#messages == 1)
+        \\    assert(messages[1].role == "assistant")
+        \\    assert(messages[1].text == "hi")
         \\  end,
         \\})
     , "register_session_surface_command");

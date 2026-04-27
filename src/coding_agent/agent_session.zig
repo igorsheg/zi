@@ -697,6 +697,7 @@ pub const AgentSession = struct {
             .session_name_get = &runtimeSessionNameGet,
             .session_name_set = &runtimeSessionNameSet,
             .session_tool_results_get = &runtimeSessionToolResultsGet,
+            .session_messages_get = &runtimeSessionMessagesGet,
             .show_panel = &runtimeShowPanel,
             .publish_prompt = &runtimePublishPrompt,
             .resolve_prompt = &runtimeResolvePrompt,
@@ -959,6 +960,86 @@ pub const AgentSession = struct {
             arr.append(sessionToolResultJson(allocator, entry.id, tr) catch return null) catch return null;
         }
         return .{ .array = arr };
+    }
+
+    fn runtimeSessionMessagesGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, include_tools: bool) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
+        defer allocator.free(branch);
+        var all = std.json.Array.init(allocator);
+        for (branch) |entry| {
+            const msg = switch (entry.entry) {
+                .message => |m| m.message,
+                else => continue,
+            };
+            appendSessionMessageJson(allocator, &all, entry.id, msg, include_tools) catch return null;
+        }
+        if (all.items.len <= limit) return .{ .array = all };
+        const start = all.items.len - limit;
+        for (all.items[0..start]) |value| ai.json_util.freeJsonValue(allocator, value);
+        var out = std.json.Array.init(allocator);
+        for (all.items[start..]) |value| out.append(value) catch return null;
+        all.deinit();
+        return .{ .array = out };
+    }
+
+    fn appendSessionMessageJson(allocator: std.mem.Allocator, arr: *std.json.Array, entry_id: []const u8, msg: protocol.AgentMessage, include_tools: bool) !void {
+        switch (msg) {
+            .user => |user| try arr.append(try sessionUserMessageJson(allocator, entry_id, user)),
+            .assistant => |assistant| {
+                var text = std.ArrayList(u8).empty;
+                defer text.deinit(allocator);
+                for (assistant.content) |block| switch (block) {
+                    .text => |t| {
+                        if (text.items.len > 0) try text.append(allocator, '\n');
+                        try text.appendSlice(allocator, t.text);
+                    },
+                    .tool_call => |call| if (include_tools) try arr.append(try sessionToolCallJson(allocator, entry_id, call)),
+                    .thinking => {},
+                };
+                if (text.items.len > 0) try arr.append(try sessionRoleTextJson(allocator, entry_id, "assistant", text.items));
+            },
+            .tool_result => |tr| if (include_tools) try arr.append(try sessionToolResultMessageJson(allocator, entry_id, tr)),
+            .compaction_summary, .branch_summary, .custom => {},
+        }
+    }
+
+    fn sessionUserMessageJson(allocator: std.mem.Allocator, entry_id: []const u8, user: ai.protocol.UserMessage) !std.json.Value {
+        const text = switch (user.content) {
+            .text => |text| text,
+            .blocks => |blocks| blk: {
+                for (blocks) |block| switch (block) {
+                    .text => |text| break :blk text.text,
+                    .image => {},
+                };
+                break :blk "";
+            },
+        };
+        return sessionRoleTextJson(allocator, entry_id, "user", text);
+    }
+
+    fn sessionRoleTextJson(allocator: std.mem.Allocator, entry_id: []const u8, role: []const u8, text: []const u8) !std.json.Value {
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry_id) });
+        try obj.put(try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, role) });
+        try obj.put(try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+        return .{ .object = obj };
+    }
+
+    fn sessionToolCallJson(allocator: std.mem.Allocator, entry_id: []const u8, call: ai.protocol.ToolCall) !std.json.Value {
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry_id) });
+        try obj.put(try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "tool_call") });
+        try obj.put(try allocator.dupe(u8, "tool_call_id"), .{ .string = try allocator.dupe(u8, call.id) });
+        try obj.put(try allocator.dupe(u8, "tool_name"), .{ .string = try allocator.dupe(u8, call.name) });
+        try obj.put(try allocator.dupe(u8, "args"), try ai.json_util.cloneJsonValue(allocator, call.arguments));
+        return .{ .object = obj };
+    }
+
+    fn sessionToolResultMessageJson(allocator: std.mem.Allocator, entry_id: []const u8, tr: ai.protocol.ToolResultMessage) !std.json.Value {
+        var value = try sessionToolResultJson(allocator, entry_id, tr);
+        try value.object.put(try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "tool_result") });
+        return value;
     }
 
     fn sessionToolResultJson(allocator: std.mem.Allocator, entry_id: []const u8, tr: ai.protocol.ToolResultMessage) !std.json.Value {
