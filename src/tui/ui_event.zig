@@ -65,6 +65,12 @@ pub const UiEvent = union(enum) {
         failure_kind: ?ai.protocol.NormalizedFailure.Kind = null,
     },
 
+    // --- compaction lifecycle ---
+    compaction_start: struct {
+        reason: runtime_host_mod.CompactionReason,
+    },
+    compaction_end: void,
+
     // --- prompt lifecycle ---
     prompt_worker_finished: struct {
         outcome: RunOutcome,
@@ -230,6 +236,8 @@ pub const UiEvent = union(enum) {
             .retry_end => |r| {
                 if (r.final_error) |msg| allocator.free(msg);
             },
+            .compaction_start => {},
+            .compaction_end => {},
             .session_resumed => |s| {
                 if (s.restore_warning) |warning| allocator.free(warning);
             },

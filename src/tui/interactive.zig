@@ -547,6 +547,7 @@ pub const Interactive = struct {
     last_published_queued_version: u64 = 0,
     runtime_host: RuntimeHost,
     loader_active: bool = false,
+    compaction_loader_active: bool = false,
     retry_active: bool = false,
     retry_waiting: bool = false,
     retry_attempt: u32 = 0,
@@ -1422,6 +1423,12 @@ pub const Interactive = struct {
                 }
                 self.tui.dirty = true;
             },
+            .compaction_start => |c| {
+                self.showCompactionLoader(c.reason);
+            },
+            .compaction_end => {
+                self.finishCompactionLoader();
+            },
             .prompt_worker_finished => |p| {
                 self.is_streaming = false;
                 self.hideLoader();
@@ -1789,6 +1796,30 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
+    fn showCompactionLoader(self: *Interactive, reason: coding_agent_mod.session_event.CompactionReason) void {
+        const message = switch (reason) {
+            .manual => "Compacting session…",
+            .threshold => "Auto-compacting…",
+            .overflow => "Context overflow detected, auto-compacting…",
+        };
+        self.status_line.setWorking(message);
+        self.loader_active = true;
+        self.compaction_loader_active = true;
+        self.tui.dirty = true;
+    }
+
+    fn finishCompactionLoader(self: *Interactive) void {
+        if (!self.compaction_loader_active) return;
+        self.compaction_loader_active = false;
+        if (self.is_streaming) {
+            self.status_line.setWorking("Working…");
+            self.loader_active = true;
+        } else {
+            self.hideLoader();
+        }
+        self.tui.dirty = true;
+    }
+
     fn showRetryLoader(self: *Interactive, attempt: u32, max_attempts: u32, delay_ms: u64, cancellable: bool) void {
         var buf: [128]u8 = undefined;
         const delay_seconds = @divTrunc(delay_ms + 500, 1000);
@@ -1809,6 +1840,7 @@ pub const Interactive = struct {
         if (!self.loader_active) return;
         self.status_line.clearWorking();
         self.loader_active = false;
+        self.compaction_loader_active = false;
         self.tui.dirty = true;
         // Don't blank primary status — preserve any error/abort message
         // that was set while working was active.
@@ -3662,10 +3694,12 @@ pub const Interactive = struct {
                     .failure_kind = retry.failure_kind,
                 } });
             },
-            .compaction_start => {
+            .compaction_start => |compaction| {
+                _ = self.publishLifecycleUiEvent(.{ .compaction_start = .{ .reason = compaction.reason } });
                 self.publishStatusSnapshot();
             },
             .compaction_end => |compaction| {
+                _ = self.publishLifecycleUiEvent(.{ .compaction_end = {} });
                 self.publishManualCompactionLifecycle(compaction);
                 self.publishStatusSnapshot();
                 _ = self.publishConversationState();
