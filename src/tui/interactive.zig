@@ -3179,7 +3179,8 @@ pub const Interactive = struct {
                     self.applySurfaceText(&self.extension_widget_above_text, update),
                 .working, .overlay => self.applySurfaceText(&self.extension_panel_text, update),
                 .notification => self.applyNotificationSurface(update),
-                .title, .thinking_label => {},
+                .title => if (update.text) |title| self.tui.terminal.setTitle(title),
+                .thinking_label => {},
             }
         }
         self.tui.dirty = true;
