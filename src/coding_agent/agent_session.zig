@@ -14,6 +14,8 @@ const settings_types_mod = @import("settings/types.zig");
 const model_registry_mod = @import("model_registry.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
+const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
+const ai_completion = @import("ai_completion.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const extension_ui = @import("extensions/ui.zig");
@@ -1258,6 +1260,37 @@ pub const AgentSession = struct {
         };
     }
 
+    pub fn buildAiCompleteWorkerRequest(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+        id: extension_runner_mod.AsyncOpId,
+        request: extension_runner_mod.AiCompleteRequest,
+    ) !ai_complete_worker_mod.Request {
+        const current_model = self.agent.modelValue();
+        const provider = self._stream_closure.registry.getForModel(
+            ai.provider.apiToString(current_model.api),
+            ai.json_util.providerToString(current_model.provider),
+        ) orelse return error.ProviderUnavailable;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const api_key = self._stream_closure.resolveApiKey(arena.allocator(), current_model);
+        var built = ai_complete_worker_mod.Request{
+            .id = id,
+            .provider = provider,
+            .model = current_model,
+            .prompt = try allocator.dupe(u8, request.prompt),
+            .system_prompt = null,
+            .api_key = null,
+            .headers = null,
+            .max_tokens = request.max_tokens,
+        };
+        errdefer built.deinit(allocator);
+        if (request.system_prompt) |value| built.system_prompt = try allocator.dupe(u8, value);
+        if (api_key.len > 0) built.api_key = try allocator.dupe(u8, api_key);
+        built.headers = try self._stream_closure.mergeClaimHeaders(current_model, allocator, null);
+        return built;
+    }
+
     pub fn completeUserText(
         self: *AgentSession,
         allocator: std.mem.Allocator,
@@ -1271,37 +1304,25 @@ pub const AgentSession = struct {
             ai.json_util.providerToString(current_model.provider),
         ) orelse return error.ProviderUnavailable;
 
-        const user_messages = [_]ai.protocol.Message{.{ .user = .{
-            .content = .{ .text = prompt_text },
-            .timestamp = std.time.milliTimestamp(),
-        } }};
-        const context = ai.protocol.Context{
+        const api_key = self._stream_closure.resolveApiKey(allocator, current_model);
+        const result = ai_completion.runPreparedTextCompletion(allocator, .{
+            .provider = provider,
+            .model = current_model,
+            .prompt = prompt_text,
             .system_prompt = system_prompt,
-            .messages = &user_messages,
-        };
-
-        var collector = CompletionCollector{ .allocator = allocator };
-        provider.streamSimple(
-            allocator,
-            current_model,
-            context,
-            .{
-                .base = .{
-                    .api_key = self._stream_closure.resolveApiKey(allocator, current_model),
-                    .max_tokens = max_tokens,
-                },
-                .reasoning = if (current_model.reasoning) .high else null,
+            .api_key = if (api_key.len > 0) api_key else null,
+            .max_tokens = max_tokens,
+            .reasoning = if (current_model.reasoning) .high else null,
+        });
+        return switch (result) {
+            .completed => |completed| completed.text,
+            .err => |msg| {
+                defer allocator.free(msg);
+                std.log.scoped(.coding_agent).warn("completion failed: {s}", .{msg});
+                return error.ProviderCompletionFailed;
             },
-            &CompletionCollector.callback,
-            @ptrCast(&collector),
-        );
-
-        if (collector.error_message) |msg| {
-            defer allocator.free(msg);
-            std.log.scoped(.coding_agent).warn("completion failed: {s}", .{msg});
-            return error.ProviderCompletionFailed;
-        }
-        return collector.text orelse error.MissingCompletionText;
+            .cancelled => error.MissingCompletionText,
+        };
     }
 
     /// Get session file path (valid after first flush).
@@ -1349,38 +1370,6 @@ pub const AgentSession = struct {
     // We do the same: capture registry + api_key so the Agent doesn't need
     // to thread auth through AgentLoopConfig.
 
-    const CompletionCollector = struct {
-        allocator: std.mem.Allocator,
-        text: ?[]u8 = null,
-        error_message: ?[]u8 = null,
-
-        fn callback(event: ai.protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
-            const self: *CompletionCollector = @ptrCast(@alignCast(ctx.?));
-            switch (event) {
-                .done => |done| {
-                    self.text = collectText(self.allocator, done.message) catch null;
-                },
-                .@"error" => |err| {
-                    if (err.@"error".error_message) |msg| {
-                        self.error_message = self.allocator.dupe(u8, msg) catch null;
-                    } else {
-                        self.error_message = self.allocator.dupe(u8, "provider error") catch null;
-                    }
-                },
-                else => {},
-            }
-        }
-
-        fn collectText(allocator: std.mem.Allocator, msg: ai.protocol.AssistantMessage) ![]u8 {
-            var out: std.ArrayList(u8) = .empty;
-            errdefer out.deinit(allocator);
-            for (msg.content) |block| switch (block) {
-                .text => |t| try out.appendSlice(allocator, t.text),
-                else => {},
-            };
-            return out.toOwnedSlice(allocator);
-        }
-    };
 };
 
 // ── convertToLlm ──────────────────────────────────────────────────────────

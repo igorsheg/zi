@@ -86,7 +86,7 @@ pub const StreamClosure = struct {
         return if (resolved.len > 0) resolved else self.api_key;
     }
 
-    fn mergeClaimHeaders(
+    pub fn mergeClaimHeaders(
         self: *const StreamClosure,
         model: ai.protocol.Model,
         allocator: std.mem.Allocator,

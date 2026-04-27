@@ -49,6 +49,14 @@ pub const AiCompleteResult = union(enum) {
     err: []const u8,
     cancelled,
 
+    pub fn clone(self: AiCompleteResult, allocator: std.mem.Allocator) !AiCompleteResult {
+        return switch (self) {
+            .completed => |completed| .{ .completed = .{ .text = try allocator.dupe(u8, completed.text) } },
+            .err => |msg| .{ .err = try allocator.dupe(u8, msg) },
+            .cancelled => .cancelled,
+        };
+    }
+
     pub fn deinit(self: *AiCompleteResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .completed => |completed| allocator.free(completed.text),
@@ -94,6 +102,13 @@ pub const AsyncDispatcher = struct {
 pub const AsyncResult = union(AsyncKind) {
     @"test": []const u8,
     ai_complete: AiCompleteResult,
+
+    pub fn clone(self: AsyncResult, allocator: std.mem.Allocator) !AsyncResult {
+        return switch (self) {
+            .@"test" => |value| .{ .@"test" = try allocator.dupe(u8, value) },
+            .ai_complete => |result| .{ .ai_complete = try result.clone(allocator) },
+        };
+    }
 
     pub fn deinit(self: *AsyncResult, allocator: std.mem.Allocator) void {
         switch (self.*) {

@@ -157,8 +157,15 @@ pub const RuntimeHost = struct {
     }
 
     pub fn deliverExtensionAsyncResult(self: *RuntimeHost, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) !void {
+        var original = result;
+        defer original.deinit(self.msg_allocator);
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
-        try runner.resumeAsync(id, result);
+        const owned = try result.clone(runner.allocator);
+        errdefer {
+            var failed = owned;
+            failed.deinit(runner.allocator);
+        }
+        try runner.resumeAsync(id, owned);
     }
 
     pub fn takePendingExtensionPanel(self: *RuntimeHost, allocator: std.mem.Allocator) ?extension_ui.Panel {

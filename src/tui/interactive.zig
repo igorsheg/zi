@@ -16,6 +16,7 @@ const footer_mod = @import("components/footer.zig");
 const editor_mod = @import("components/editor.zig");
 const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
 const ui_event_mod = @import("ui_event.zig");
+const ai_complete_worker_mod = @import("../coding_agent/extensions/ai_complete_worker.zig");
 const transcript_mod = @import("transcript.zig");
 const conversation_projection_mod = @import("conversation_projection.zig");
 const container_mod = @import("container.zig");
@@ -37,6 +38,7 @@ const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const request_mod = @import("../coding_agent/request.zig");
+const extension_runner_mod = @import("../coding_agent/extensions/runner.zig");
 const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
@@ -57,6 +59,7 @@ const coding_agent_mod = @import("../coding_agent/root.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentRequest = coding_agent_mod.AgentRequest;
 const RequestQueue = coding_agent_mod.RequestQueue;
+const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 const agent_protocol = agent_mod.protocol;
 const RetryPolicy = coding_agent_mod.runtime_host.RetryPolicy;
 const CompactionPolicy = coding_agent_mod.runtime_host.CompactionPolicy;
@@ -577,6 +580,7 @@ pub const Interactive = struct {
     resume_picker_flow: ?ResumePickerFlow = null,
     resume_picker_generation: u64 = 0,
     session_index_worker: session_index_worker_mod.SessionIndexWorker,
+    ai_complete_worker: ?ai_complete_worker_mod.AiCompleteWorker = null,
 
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
@@ -690,6 +694,7 @@ pub const Interactive = struct {
             .settings_manager = settings_manager,
             .model_catalog = &.{},
         };
+        self.ai_complete_worker = try ai_complete_worker_mod.AiCompleteWorker.init(msg_allocator);
         self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
@@ -712,6 +717,7 @@ pub const Interactive = struct {
             self.login_thread = null;
         }
         self.session_index_worker.stop();
+        if (self.ai_complete_worker) |*worker| worker.worker.stop();
 
         // Stop the long-lived agent owner thread. Abort first if a
         // prompt is mid-flight so the owner loop can reach its next
@@ -768,6 +774,8 @@ pub const Interactive = struct {
         logMailboxStats("request", self.request_queue.stats());
         logMailboxStats("session_index", self.session_index_worker.stats());
         self.session_index_worker.deinit();
+        if (self.ai_complete_worker) |*worker| worker.deinit();
+        self.ai_complete_worker = null;
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
         // Any unexpectedly undrained requests are mailbox-owned here;
@@ -838,6 +846,10 @@ pub const Interactive = struct {
         self.detectGitBranch();
         try self.startAgentThread();
         try self.startSessionIndexWorker();
+        if (self.ai_complete_worker) |*worker| {
+            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &submitAiCompleteResult });
+            try worker.start();
+        }
 
         // Prime the status chips via the agent-owned snapshot path before the
         // first frame. This keeps model/thinking/context reads off the TUI
@@ -3021,6 +3033,36 @@ pub const Interactive = struct {
         self.runtime_host.shutdownCurrentSessionOnAgentThread();
     }
 
+    fn submitAiCompleteResult(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) bool {
+        const self: *Interactive = @ptrCast(@alignCast(ptr));
+        switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = id, .result = result } })) {
+            .ok, .dropped => return true,
+            .full, .closed, .oom => |rejected| {
+                var failed = rejected;
+                failed.deinit(self.msg_allocator);
+                return false;
+            },
+        }
+    }
+
+    fn submitExtensionAsyncFromRunner(ptr: *anyopaque, runner: *ExtensionRunner, start: extension_runner_mod.AsyncStart) anyerror!void {
+        const self: *Interactive = @ptrCast(@alignCast(ptr));
+        var owned_start = start;
+        defer owned_start.deinit(runner.allocator);
+        switch (owned_start.request) {
+            .ai_complete => |request| {
+                const worker_request = try self.runtime_host.currentSession().buildAiCompleteWorkerRequest(self.msg_allocator, owned_start.id, request);
+                errdefer {
+                    var failed = worker_request;
+                    failed.deinit(self.msg_allocator);
+                }
+                const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
+                try worker.submit(worker_request);
+            },
+            else => {},
+        }
+    }
+
     fn enqueueAgentShutdown(self: *Interactive) void {
         switch (self.request_queue.trySend(.{ .shutdown = {} })) {
             .ok, .dropped => {},
@@ -3104,6 +3146,9 @@ pub const Interactive = struct {
                     },
                     .extension_command => |ec| {
                         idle_processed = true;
+                        if (self.runtime_host.currentSession().extensionRunner()) |runner| {
+                            runner.async_dispatcher = .{ .ptr = @ptrCast(self), .submit = &submitExtensionAsyncFromRunner };
+                        }
                         self.runtime_host.dispatchExtensionCommand(ec.name, ec.args) catch |err| {
                             const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch {
                                 // OOM: skip publishing error message, keep draining.
