@@ -547,11 +547,14 @@ pub const Interactive = struct {
     last_published_queued_version: u64 = 0,
     runtime_host: RuntimeHost,
     loader_active: bool = false,
+    built_in_working_message: []const u8 = "Working…",
     compaction_loader_active: bool = false,
+    compaction_loader_reason: coding_agent_mod.session_event.CompactionReason = .manual,
     retry_active: bool = false,
     retry_waiting: bool = false,
     retry_attempt: u32 = 0,
     retry_max_attempts: u32 = 0,
+    retry_delay_ms: u64 = 0,
 
     pending_images: std.ArrayListUnmanaged(PendingImageAttachment) = .empty,
     clipboard_image_reader: ClipboardImageReader = clipboard_mod.readImage,
@@ -1395,22 +1398,21 @@ pub const Interactive = struct {
                 self.retry_waiting = true;
                 self.retry_attempt = r.attempt;
                 self.retry_max_attempts = r.max_attempts;
-                self.showRetryLoader(r.attempt, r.max_attempts, r.delay_ms, true);
-                self.tui.dirty = true;
+                self.retry_delay_ms = r.delay_ms;
+                self.refreshBuiltInStatus();
             },
             .retry_wait_finished => {
                 self.retry_waiting = false;
-                if (self.retry_active) {
-                    self.showRetryLoader(self.retry_attempt, self.retry_max_attempts, 0, false);
-                }
-                self.tui.dirty = true;
+                self.retry_delay_ms = 0;
+                self.refreshBuiltInStatus();
             },
             .retry_end => |r| {
                 self.retry_active = false;
                 self.retry_waiting = false;
                 self.retry_attempt = 0;
                 self.retry_max_attempts = 0;
-                self.hideLoader();
+                self.retry_delay_ms = 0;
+                self.refreshBuiltInStatus();
                 if (!r.success) {
                     var buf: [160]u8 = undefined;
                     const final_error = r.final_error orelse "unknown error";
@@ -1791,59 +1793,55 @@ pub const Interactive = struct {
     }
 
     fn showLoader(self: *Interactive, message: []const u8) void {
-        self.status_line.setWorking(message);
-        self.loader_active = true;
-        self.tui.dirty = true;
+        self.built_in_working_message = message;
+        self.refreshBuiltInStatus();
     }
 
     fn showCompactionLoader(self: *Interactive, reason: coding_agent_mod.session_event.CompactionReason) void {
-        const message = switch (reason) {
-            .manual => "Compacting session…",
-            .threshold => "Auto-compacting…",
-            .overflow => "Context overflow detected, auto-compacting…",
-        };
-        self.status_line.setWorking(message);
-        self.loader_active = true;
         self.compaction_loader_active = true;
-        self.tui.dirty = true;
+        self.compaction_loader_reason = reason;
+        self.refreshBuiltInStatus();
     }
 
     fn finishCompactionLoader(self: *Interactive) void {
         if (!self.compaction_loader_active) return;
         self.compaction_loader_active = false;
-        if (self.is_streaming) {
-            self.status_line.setWorking("Working…");
-            self.loader_active = true;
-        } else {
-            self.hideLoader();
-        }
-        self.tui.dirty = true;
-    }
-
-    fn showRetryLoader(self: *Interactive, attempt: u32, max_attempts: u32, delay_ms: u64, cancellable: bool) void {
-        var buf: [128]u8 = undefined;
-        const delay_seconds = @divTrunc(delay_ms + 500, 1000);
-        const message = if (cancellable)
-            std.fmt.bufPrint(
-                &buf,
-                "Retrying ({d}/{d}) in {d}s… (Esc to cancel)",
-                .{ attempt, max_attempts, delay_seconds },
-            ) catch "Retrying…"
-        else
-            std.fmt.bufPrint(&buf, "Retrying ({d}/{d})…", .{ attempt, max_attempts }) catch "Retrying…";
-        self.status_line.setWorking(message);
-        self.loader_active = true;
-        self.tui.dirty = true;
+        self.refreshBuiltInStatus();
     }
 
     fn hideLoader(self: *Interactive) void {
-        if (!self.loader_active) return;
-        self.status_line.clearWorking();
-        self.loader_active = false;
-        self.compaction_loader_active = false;
-        self.tui.dirty = true;
+        self.refreshBuiltInStatus();
         // Don't blank primary status — preserve any error/abort message
         // that was set while working was active.
+    }
+
+    fn refreshBuiltInStatus(self: *Interactive) void {
+        if (self.compaction_loader_active) {
+            const message = switch (self.compaction_loader_reason) {
+                .manual => "Compacting session…",
+                .threshold => "Auto-compacting…",
+                .overflow => "Context overflow detected, auto-compacting…",
+            };
+            self.status_line.setWorking(message);
+            self.loader_active = true;
+        } else if (self.retry_waiting) {
+            var buf: [128]u8 = undefined;
+            const delay_seconds = @divTrunc(self.retry_delay_ms + 500, 1000);
+            const message = std.fmt.bufPrint(
+                &buf,
+                "Retrying ({d}/{d}) in {d}s… (Esc to cancel)",
+                .{ self.retry_attempt, self.retry_max_attempts, delay_seconds },
+            ) catch "Retrying…";
+            self.status_line.setWorking(message);
+            self.loader_active = true;
+        } else if (self.is_streaming or self.request_in_flight) {
+            self.status_line.setWorking(self.built_in_working_message);
+            self.loader_active = true;
+        } else if (self.loader_active) {
+            self.status_line.clearWorking();
+            self.loader_active = false;
+        }
+        self.tui.dirty = true;
     }
 
     fn detectGitBranch(self: *Interactive) void {
