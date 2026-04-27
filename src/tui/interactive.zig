@@ -7,6 +7,7 @@ const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal.zig");
 const keys_mod = @import("keys.zig");
 const component_mod = @import("component.zig");
+const div_mod = @import("components/div.zig");
 const text_mod = @import("components/text.zig");
 const status_line_mod = @import("components/status_line.zig");
 const greeter_mod = @import("components/greeter.zig");
@@ -514,6 +515,8 @@ pub const Interactive = struct {
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
+    transcript_container: container_mod.Container,
+    transcript_bottom_padding: div_mod.Div = div_mod.Div.init(1),
     conversation_projection: conversation_projection_mod.ProjectionState,
     resolver: ToolRendererResolver,
     status_data: StatusData,
@@ -653,6 +656,7 @@ pub const Interactive = struct {
             .footer = .{},
             .hotkeys_overlay = .{},
             .transcript = Transcript.init(state_allocator),
+            .transcript_container = container_mod.Container.init(state_allocator),
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
             .status_data = StatusData.init(state_allocator),
@@ -759,6 +763,7 @@ pub const Interactive = struct {
         self.status_container.deinit();
         self.pending_container.deinit();
         self.header_container.deinit();
+        self.transcript_container.deinit();
         self.conversation_projection.deinit();
         self.transcript.deinit();
         self.extension_widget_below_text.deinit();
@@ -844,11 +849,15 @@ pub const Interactive = struct {
         // Set initial focus via TUI (source of truth for input routing)
         self.tui.setFocus(self.active_editor.component());
 
+        self.transcript_container.addChild(self.transcript.component());
+        self.transcript_container.addChild(self.transcript_bottom_padding.component());
+        self.transcript_container.flex_child_index = 0;
+
         // Build root tree matching pi-mono slot structure, adapted for a
         // full-screen TUI: transcript remains the flex region while the header
         // is a composer/onboarding surface near the editor, not top chrome.
         // chat(flex) → pending → status → header → widget_above → editor(focused) → widget_below
-        self.tui.root.addChild(self.transcript.component()); // [0] chat (flex)
+        self.tui.root.addChild(self.transcript_container.component()); // [0] chat (flex, with bottom padding)
         self.tui.root.addChild(self.pending_container.component()); // [1] pendingContainer
         self.tui.root.addChild(self.status_container.component()); // [2] statusContainer
         self.tui.root.addChild(self.header_container.component()); // [3] composer header/onboarding
@@ -1573,7 +1582,14 @@ pub const Interactive = struct {
     };
 
     fn transcriptRect(self: *Interactive) ?ChildRect {
-        return self.tui.root.childRect(1);
+        const wrapper = self.tui.root.childRect(0) orelse return null;
+        const inner = self.transcript_container.childRect(0) orelse return null;
+        return .{
+            .x = wrapper.x + inner.x,
+            .y = wrapper.y + inner.y,
+            .width = inner.width,
+            .height = inner.height,
+        };
     }
 
     fn transcriptMouseZone(self: *Interactive, event: keys_mod.MouseEvent, allow_outside: bool) ?TranscriptMouseZone {

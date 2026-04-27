@@ -1,5 +1,6 @@
 pub const text = @import("text.zig");
 pub const editor = @import("editor.zig");
+pub const div = @import("div.zig");
 pub const markdown = @import("markdown.zig");
 pub const assistant_message = @import("assistant_message.zig");
 pub const user_message = @import("user_message.zig");
