@@ -90,7 +90,7 @@ return function(zi)
     name = "hello",
     description = "Show a greeting.",
     handler = function(args, ctx)
-      ctx.ui.show_panel({
+      ctx.ui.report({
         id = "hello-command",
         title = "hello",
         body = "hello, " .. (args or "zi"),

@@ -52,8 +52,8 @@ return function(zi)
     handler = function(args, ctx)
       local tool_name = normalize_tool_name(args)
       if not tool_name then
-        if ctx and ctx.ui and ctx.ui.show_panel then
-          ctx.ui.show_panel({
+        if ctx and ctx.ui and ctx.ui.report then
+          ctx.ui.report({
             id = "dynamic-tools-usage",
             title = "Dynamic tools",
             body = "Usage: /add-echo-tool <lowercase_name>",
@@ -64,8 +64,8 @@ return function(zi)
       end
 
       local created = register_echo_tool(tool_name, "Echo " .. tool_name, "[" .. tool_name .. "] ")
-      if ctx and ctx.ui and ctx.ui.show_panel then
-        ctx.ui.show_panel({
+      if ctx and ctx.ui and ctx.ui.report then
+        ctx.ui.report({
           id = "dynamic-tools-result",
           title = "Dynamic tools",
           body = (created and "Registered tool: " or "Tool already registered: ") .. tool_name,

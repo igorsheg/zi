@@ -13,7 +13,7 @@ zi.register_command({
   handler = function(_, ctx)
     local models = ctx.models and ctx.models.list and ctx.models.list() or {}
     if #models == 0 then
-      ctx.ui.set_footer("No model catalog available")
+      ctx.ui.message("No model catalog available")
       return
     end
 
@@ -42,7 +42,7 @@ zi.register_command({
       )
     end
 
-    ctx.ui.show_panel({
+    ctx.ui.report({
       id = "models",
       title = "Model catalog",
       body = table.concat(lines, "\n"),
@@ -57,17 +57,17 @@ zi.register_command({
     local raw = tostring(args or "")
     local sep = string.find(raw, "::", 1, true)
     if not sep then
-      ctx.ui.set_footer("Usage: /ask-model <model> :: <prompt>")
+      ctx.ui.message("Usage: /ask-model <model> :: <prompt>")
       return
     end
     local model_ref = string.gsub(string.sub(raw, 1, sep - 1), "^%s*(.-)%s*$", "%1")
     local prompt = string.gsub(string.sub(raw, sep + 2), "^%s*(.-)%s*$", "%1")
     if model_ref == "" or prompt == "" then
-      ctx.ui.set_footer("Usage: /ask-model <model> :: <prompt>")
+      ctx.ui.message("Usage: /ask-model <model> :: <prompt>")
       return
     end
 
-    ctx.ui.set_footer("Completing with " .. model_ref .. "…")
+    ctx.ui.message("Completing with " .. model_ref .. "…")
     local result = ctx.ai.complete({
       model = model_ref,
       prompt = prompt,
@@ -76,9 +76,9 @@ zi.register_command({
     })
 
     if result.status == "completed" then
-      ctx.ui.show_panel({ id = "ask-model", title = "AI completion: " .. model_ref, body = result.text })
+      ctx.ui.report({ id = "ask-model", title = "AI completion: " .. model_ref, body = result.text })
     else
-      ctx.ui.set_footer("AI completion failed: " .. tostring(result.error or result.status))
+      ctx.ui.message("AI completion failed: " .. tostring(result.error or result.status))
     end
   end,
 })

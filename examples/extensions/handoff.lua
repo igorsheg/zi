@@ -56,7 +56,7 @@ zi.register_command({
       end
     end
 
-    ctx.ui.show_panel({
+    ctx.ui.report({
       id = "handoff",
       title = "Session handoff",
       body = table.concat(lines, "\n"),

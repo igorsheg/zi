@@ -35,11 +35,11 @@ zi.register_command({
     local limit = parse_limit(args)
     local messages = ctx.session.messages({ limit = limit, include_tools = false })
     if #messages == 0 then
-      ctx.ui.set_footer("No messages to summarize", { lifetime = "until_input" })
+      ctx.ui.message("No messages to summarize", { lifetime = "until_input" })
       return
     end
 
-    ctx.ui.set_footer("Generating summary…", { lifetime = "until_input" })
+    ctx.ui.message("Generating summary…", { lifetime = "until_input" })
     local result = ctx.ai.complete({
       system_prompt = "You summarize coding-agent sessions. Be concise, concrete, and preserve decisions, files, and next steps.",
       prompt = "Summarize this conversation for handoff. Include: key decisions, files/areas discussed, current state, and next steps.\n\n" .. serialize_messages(messages),
@@ -47,11 +47,11 @@ zi.register_command({
     })
 
     if result.status ~= "completed" then
-      ctx.ui.set_footer("Summary failed: " .. tostring(result.error or result.status), { lifetime = "until_input" })
+      ctx.ui.message("Summary failed: " .. tostring(result.error or result.status), { lifetime = "until_input" })
       return
     end
 
-    ctx.ui.show_panel({
+    ctx.ui.report({
       id = "summary",
       title = "Session summary",
       body = result.text ~= "" and result.text or "No summary",

@@ -17,27 +17,27 @@ zi.register_command({
 
     if name == "--clear" then
       if ctx.session.rename("") then
-        ctx.ui.set_footer("Session name cleared", { lifetime = "until_input" })
+        ctx.ui.message("Session name cleared", { lifetime = "until_input" })
       else
-        ctx.ui.set_footer("Failed to clear session name", { lifetime = "until_input" })
+        ctx.ui.message("Failed to clear session name", { lifetime = "until_input" })
       end
       return
     end
 
     if name ~= "" then
       if ctx.session.rename(name) then
-        ctx.ui.set_footer("Session named: " .. name, { lifetime = "until_input" })
+        ctx.ui.message("Session named: " .. name, { lifetime = "until_input" })
       else
-        ctx.ui.set_footer("Failed to name session", { lifetime = "until_input" })
+        ctx.ui.message("Failed to name session", { lifetime = "until_input" })
       end
       return
     end
 
     local current = ctx.session.name()
     if current then
-      ctx.ui.set_footer("Session: " .. current, { lifetime = "until_input" })
+      ctx.ui.message("Session: " .. current, { lifetime = "until_input" })
     else
-      ctx.ui.set_footer("No session name set", { lifetime = "until_input" })
+      ctx.ui.message("No session name set", { lifetime = "until_input" })
     end
   end,
 })

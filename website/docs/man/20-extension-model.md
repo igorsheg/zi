@@ -8,7 +8,7 @@ Use extensions for things like:
 - adding slash commands
 - customizing prompts
 - reacting to session, message, tool, and model events
-- publishing status/footer/header/widget/panel UI
+- publishing message, status, progress, and report UI
 - asking side-channel model questions
 - registering provider/model claims
 - storing per-session extension state

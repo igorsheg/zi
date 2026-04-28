@@ -18,8 +18,8 @@ local function label_binding(binding)
 end
 
 local function footer(ctx, text)
-  if ctx and ctx.ui and ctx.ui.set_footer then
-    ctx.ui.set_footer(text)
+  if ctx and ctx.ui and ctx.ui.message then
+    ctx.ui.message(text)
   end
 end
 

@@ -13,7 +13,7 @@ zi.on("input", function(event, ctx)
   if string.sub(event.text, 1, 7) == "?quick " then
     local query = string.gsub(string.sub(event.text, 8), "^%s+", "")
     if query == "" then
-      ctx.ui.notify("Usage: ?quick <question>", "warning")
+      ctx.ui.message("Usage: ?quick <question>", { kind = "warning" })
       return { action = "handled" }
     end
 
@@ -24,12 +24,12 @@ zi.on("input", function(event, ctx)
   end
 
   if string.lower(event.text) == "ping" then
-    ctx.ui.set_footer("pong", { lifetime = "until_input" })
+    ctx.ui.message("pong", { lifetime = "until_input" })
     return { action = "handled" }
   end
 
   if string.lower(event.text) == "time" then
-    ctx.ui.set_footer(os.date("%Y-%m-%d %H:%M:%S"), { lifetime = "until_input" })
+    ctx.ui.message(os.date("%Y-%m-%d %H:%M:%S"), { lifetime = "until_input" })
     return { action = "handled" }
   end
 

@@ -121,20 +121,14 @@ fn pushUiApi(
 
     c.lua_createtable(L, 0, 16);
     if (runner.runtime.bound.show_panel != null) {
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiShowPanel);
-        c.lua_setfield(L, -2, "show_panel");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiReport);
+        c.lua_setfield(L, -2, "report");
     }
     if (runner.runtime.bound.publish_prompt != null) {
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiPrompt);
         c.lua_setfield(L, -2, "prompt");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiConfirm);
-        c.lua_setfield(L, -2, "confirm");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSelect);
-        c.lua_setfield(L, -2, "select");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiInput);
-        c.lua_setfield(L, -2, "input");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiEditor);
-        c.lua_setfield(L, -2, "editor");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiPick);
+        c.lua_setfield(L, -2, "pick");
     }
     if (runner.runtime.bound.publish_editor_action != null) {
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetEditorText);
@@ -147,24 +141,12 @@ fn pushUiApi(
         c.lua_setfield(L, -2, "get_editor_text");
     }
     if (runner.runtime.bound.publish_surface != null) {
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotify);
-        c.lua_setfield(L, -2, "notify");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetStatus);
-        c.lua_setfield(L, -2, "set_status");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetTitle);
-        c.lua_setfield(L, -2, "set_title");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetWidget);
-        c.lua_setfield(L, -2, "set_widget");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetHeader);
-        c.lua_setfield(L, -2, "set_header");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetFooter);
-        c.lua_setfield(L, -2, "set_footer");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetWorking);
-        c.lua_setfield(L, -2, "set_working");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetHiddenThinkingLabel);
-        c.lua_setfield(L, -2, "set_hidden_thinking_label");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiShowOverlay);
-        c.lua_setfield(L, -2, "show_overlay");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiMessage);
+        c.lua_setfield(L, -2, "message");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiStatus);
+        c.lua_setfield(L, -2, "status");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiProgress);
+        c.lua_setfield(L, -2, "progress");
     }
 }
 
@@ -224,75 +206,25 @@ fn publishEditorActionFromArgs(L: *c.lua_State, kind: extension_ui.EditorActionK
     try callback(bound.session, action);
 }
 
-fn ctxUiNotify(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxUiMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    publishNotificationFromArgs(L) catch {};
+    publishMessageFromArgs(L) catch {};
     return 0;
 }
 
-fn ctxUiSetStatus(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxUiStatus(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    publishSurfaceFromArgs(L, .status) catch {};
+    publishStatusFromArgs(L) catch {};
     return 0;
 }
 
-fn ctxUiSetTitle(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxUiProgress(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    publishSurfaceFromArgs(L, .title) catch {};
+    publishProgressFromArgs(L) catch {};
     return 0;
 }
 
-fn ctxUiSetWidget(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    publishSurfaceFromArgs(L, .widget) catch {};
-    return 0;
-}
-
-fn ctxUiSetHeader(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    publishSurfaceFromArgs(L, .header) catch {};
-    return 0;
-}
-
-fn ctxUiSetFooter(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    publishSurfaceFromArgs(L, .footer) catch {};
-    return 0;
-}
-
-fn ctxUiSetWorking(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    publishSurfaceFromArgs(L, .working) catch {};
-    return 0;
-}
-
-fn ctxUiSetHiddenThinkingLabel(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    publishSurfaceFromArgs(L, .thinking_label) catch {};
-    return 0;
-}
-
-fn ctxUiShowOverlay(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    publishSurfaceFromArgs(L, .overlay) catch {};
-    return 0;
-}
-
-fn publishSurfaceFromArgs(L: *c.lua_State, kind: extension_ui.SurfaceKind) !void {
-    const runner = stateRunnerFromUpvalue(L);
-    const bound = switch (runner.runtime) {
-        .bound => |bound| bound,
-        .stub => return,
-    };
-    const callback = bound.publish_surface orelse return;
-
-    var arena = std.heap.ArenaAllocator.init(runner.allocator);
-    defer arena.deinit();
-    const update = try parseSurface(arena.allocator(), L, kind, stateOwnerFromUpvalue(L), runner.generation);
-    try callback(bound.session, update);
-}
-
-fn publishNotificationFromArgs(L: *c.lua_State) !void {
+fn publishMessageFromArgs(L: *c.lua_State) !void {
     const runner = stateRunnerFromUpvalue(L);
     const bound = switch (runner.runtime) {
         .bound => |bound| bound,
@@ -303,67 +235,109 @@ fn publishNotificationFromArgs(L: *c.lua_State) !void {
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
-    const kind = try readNotificationKind(aa, L, 2);
     const update = extension_ui.SurfaceUpdate{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
-        .kind = .notification,
-        .id = kind,
+        .kind = .footer,
+        .id = try readMessageKind(aa, L, 2),
         .text = try readOptionalArgString(aa, L, 1),
-        .lifetime = .until_input,
+        .lifetime = try readSurfaceLifetime(L, 2),
     };
     try callback(bound.session, update);
 }
 
-fn parseSurface(
-    arena: std.mem.Allocator,
-    L: *c.lua_State,
-    kind: extension_ui.SurfaceKind,
-    state_owner_id: []const u8,
-    generation: runner_mod.Generation,
-) !extension_ui.SurfaceUpdate {
-    const id = switch (kind) {
-        .status, .widget, .overlay => try readStringArg(arena, L, 1, "default"),
-        else => try arena.dupe(u8, @tagName(kind)),
+fn publishStatusFromArgs(L: *c.lua_State) !void {
+    const runner = stateRunnerFromUpvalue(L);
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
     };
-    const value_idx: c_int = switch (kind) {
-        .status, .widget, .overlay => 2,
-        else => 1,
-    };
-    return .{
-        .state_owner_id = try arena.dupe(u8, state_owner_id),
-        .generation = generation,
-        .kind = kind,
+    const callback = bound.publish_surface orelse return;
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
+
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const spec_idx = c.lua_absindex(L, 1);
+    const id = try readStringField(aa, L, spec_idx, "id", "default");
+    const text = try readStatusText(aa, L, spec_idx);
+    const update = extension_ui.SurfaceUpdate{
+        .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
+        .generation = runner.generation,
+        .kind = .status,
         .id = id,
-        .text = try readOptionalArgString(arena, L, value_idx),
-        .lines = try readSurfaceLines(arena, L, value_idx),
-        .placement = try readSurfacePlacement(arena, L, value_idx + 1),
-        .lifetime = try readSurfaceLifetime(L, value_idx + 1),
+        .text = text,
+        .lifetime = try readSurfaceLifetime(L, spec_idx),
     };
+    try callback(bound.session, update);
 }
 
-fn readStringArg(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, default: []const u8) ![]const u8 {
-    if (c.lua_type(L, idx) != c.LUA_TSTRING) return try arena.dupe(u8, default);
-    return try dupeLuaString(arena, L, idx);
+fn publishProgressFromArgs(L: *c.lua_State) !void {
+    const runner = stateRunnerFromUpvalue(L);
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
+    const callback = bound.publish_surface orelse return;
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
+
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const spec_idx = c.lua_absindex(L, 1);
+    const id = try readStringField(aa, L, spec_idx, "id", "progress");
+    const text = try formatProgressText(aa, L, spec_idx);
+    const update = extension_ui.SurfaceUpdate{
+        .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
+        .generation = runner.generation,
+        .kind = .working,
+        .id = id,
+        .text = text,
+        .lifetime = try readSurfaceLifetime(L, spec_idx),
+    };
+    try callback(bound.session, update);
 }
 
-fn readNotificationKind(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
-    if (c.lua_type(L, idx) != c.LUA_TSTRING) return try arena.dupe(u8, "info");
-    const value = try dupeLuaString(arena, L, idx);
-    if (std.mem.eql(u8, value, "info")) return value;
-    if (std.mem.eql(u8, value, "warning")) return value;
-    if (std.mem.eql(u8, value, "error")) return value;
+fn readMessageKind(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
+    if (c.lua_type(L, idx) != c.LUA_TTABLE) return try arena.dupe(u8, "info");
+    if (try readOptionalStringField(arena, L, idx, "kind")) |kind| {
+        if (std.mem.eql(u8, kind, "info")) return kind;
+        if (std.mem.eql(u8, kind, "warning")) return kind;
+        if (std.mem.eql(u8, kind, "error")) return kind;
+        if (std.mem.eql(u8, kind, "success")) return kind;
+    }
     return try arena.dupe(u8, "info");
 }
 
-fn readSurfaceLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
-    if (c.lua_type(L, idx) != c.LUA_TTABLE) return &.{};
-    return try readPanelLinesAtStack(arena, L, idx);
+fn readStatusText(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
+    if (try readOptionalStringField(arena, L, idx, "text")) |text| return text;
+    if (try readOptionalStringField(arena, L, idx, "value")) |value| return value;
+    return null;
 }
 
-fn readSurfacePlacement(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
-    if (c.lua_type(L, idx) != c.LUA_TTABLE) return null;
-    return try readOptionalStringField(arena, L, idx, "placement");
+fn formatProgressText(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
+    if (try readOptionalStringField(arena, L, idx, "text")) |text| return text;
+    const title = try readStringField(arena, L, idx, "title", "Progress");
+    const detail = try readOptionalStringField(arena, L, idx, "detail");
+    const current = readOptionalNumberField(L, idx, "current");
+    const total = readOptionalNumberField(L, idx, "total");
+    if (current) |cur| {
+        if (total) |tot| {
+            if (detail) |d| return try std.fmt.allocPrint(arena, "{s} {d}/{d} — {s}", .{ title, cur, tot, d });
+            return try std.fmt.allocPrint(arena, "{s} {d}/{d}", .{ title, cur, tot });
+        }
+        if (detail) |d| return try std.fmt.allocPrint(arena, "{s} {d} — {s}", .{ title, cur, d });
+        return try std.fmt.allocPrint(arena, "{s} {d}", .{ title, cur });
+    }
+    if (detail) |d| return try std.fmt.allocPrint(arena, "{s} — {s}", .{ title, d });
+    return title;
+}
+
+fn readOptionalNumberField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?i64 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TNUMBER) return null;
+    return @intFromFloat(c.lua_tonumberx(L, -1, null));
 }
 
 fn readSurfaceLifetime(L: *c.lua_State, idx: c_int) !extension_ui.SurfaceLifetime {
@@ -391,46 +365,12 @@ fn ctxUiPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn ctxUiConfirm(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxUiPick(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    var result = requestPromptFromArgs(L, .confirm) catch request_mod.ExtensionPromptResponse.Result{ .confirm = false };
+    var result = requestPromptFromArgs(L, .select) catch request_mod.ExtensionPromptResponse.defaultFor(.select);
     defer result.deinit();
-    c.lua_pushboolean(L, if (result == .confirm and result.confirm) 1 else 0);
+    pushPromptEnvelope(L, result);
     return 1;
-}
-
-fn ctxUiSelect(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    var result = requestPromptFromArgs(L, .select) catch request_mod.ExtensionPromptResponse.Result{ .value = null };
-    defer result.deinit();
-    pushPromptValueResult(L, result);
-    return 1;
-}
-
-fn ctxUiInput(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    var result = requestPromptFromArgs(L, .input) catch request_mod.ExtensionPromptResponse.Result{ .value = null };
-    defer result.deinit();
-    pushPromptValueResult(L, result);
-    return 1;
-}
-
-fn ctxUiEditor(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    var result = requestPromptFromArgs(L, .editor) catch request_mod.ExtensionPromptResponse.Result{ .value = null };
-    defer result.deinit();
-    pushPromptValueResult(L, result);
-    return 1;
-}
-
-fn pushPromptValueResult(L: *c.lua_State, result: request_mod.ExtensionPromptResponse.Result) void {
-    if (result == .value) {
-        if (result.value) |value| {
-            _ = c.lua_pushlstring(L, value.text.ptr, value.text.len);
-            return;
-        }
-    }
-    c.lua_pushnil(L);
 }
 
 fn pushPromptEnvelope(L: *c.lua_State, result: request_mod.ExtensionPromptResponse.Result) void {
@@ -607,7 +547,7 @@ fn promptKindString(kind: extension_ui.PromptKind) []const u8 {
     };
 }
 
-fn ctxUiShowPanel(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxUiReport(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
     if (c.lua_type(L, 1) != c.LUA_TTABLE) return 0;

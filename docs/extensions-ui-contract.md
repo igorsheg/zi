@@ -197,7 +197,7 @@ this publication is a boundary object, not store access:
 - the agent-side extension runtime owns retained ui records, namespace/generation cleanup, dirty-family tracking, and any pending action queues.
 - the tui consumes semantic publications (`surface`, `prompt`, `editor_action`, notification, panel, etc.) and materializes local components from them.
 - the tui must not read an `ExtensionUiStore`, `ExtensionRunner`, lua registry, or mailbox internals to discover ui state.
-- lua extensions call capability functions (`ctx.ui.set_widget`, `ctx.ui.show_panel`, `ctx.ui.confirm`, etc.); they never observe the store or transport shape.
+- lua extensions call semantic capability functions (`ctx.ui.message`, `ctx.ui.status`, `ctx.ui.progress`, `ctx.ui.report`, `ctx.ui.prompt`, `ctx.ui.pick`, etc.); they never observe the store or transport shape.
 
 surface lifetimes are semantic hints, not direct component commands:
 

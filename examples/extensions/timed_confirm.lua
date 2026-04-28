@@ -12,11 +12,11 @@ zi.register_command({
     })
 
     if result.status == "submitted" and result.value then
-      ctx.ui.notify("Confirmed by user", "info")
+      ctx.ui.message("Confirmed by user", { kind = "info" })
     elseif result.status == "timeout" then
-      ctx.ui.notify("Confirmation timed out", "warning")
+      ctx.ui.message("Confirmation timed out", { kind = "warning" })
     else
-      ctx.ui.notify("Confirmation cancelled", "info")
+      ctx.ui.message("Confirmation cancelled", { kind = "info" })
     end
   end,
 })
@@ -33,11 +33,11 @@ zi.register_command({
     })
 
     if result.status == "submitted" then
-      ctx.ui.notify("Selected: " .. result.value, "info")
+      ctx.ui.message("Selected: " .. result.value, { kind = "info" })
     elseif result.status == "timeout" then
-      ctx.ui.notify("Selection timed out", "warning")
+      ctx.ui.message("Selection timed out", { kind = "warning" })
     else
-      ctx.ui.notify("Selection cancelled", "info")
+      ctx.ui.message("Selection cancelled", { kind = "info" })
     end
   end,
 })

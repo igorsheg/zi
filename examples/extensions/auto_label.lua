@@ -21,7 +21,7 @@ zi.on("message", function(event, ctx)
   end
 
   if ctx.session.label(message.entry_id, label) then
-    ctx.ui.set_footer("Labeled " .. message.entry_id .. " as " .. label)
+    ctx.ui.message("Labeled " .. message.entry_id .. " as " .. label)
   end
 end)
 
@@ -49,7 +49,7 @@ zi.register_command({
 
     local labels = ctx.session.labels(opts)
     if #labels == 0 then
-      ctx.ui.show_panel({ title = "Labels", body = "No labels found." })
+      ctx.ui.report({ title = "Labels", body = "No labels found." })
       return
     end
 
@@ -57,7 +57,7 @@ zi.register_command({
     for _, item in ipairs(labels) do
       table.insert(lines, string.format("%s: %s", item.label or "<cleared>", preview_entry(ctx.session.entry(item.target_entry_id))))
     end
-    ctx.ui.show_panel({ title = "Labels", body = table.concat(lines, "\n") })
+    ctx.ui.report({ title = "Labels", body = table.concat(lines, "\n") })
   end,
 })
 
@@ -67,7 +67,7 @@ zi.register_command({
   handler = function(_, ctx)
     local entries = ctx.session.entries({ label = "decision", limit = 20 })
     if #entries == 0 then
-      ctx.ui.show_panel({ title = "Decisions", body = "No decisions found." })
+      ctx.ui.report({ title = "Decisions", body = "No decisions found." })
       return
     end
 
@@ -75,6 +75,6 @@ zi.register_command({
     for _, entry in ipairs(entries) do
       table.insert(lines, "- " .. preview_entry(entry))
     end
-    ctx.ui.show_panel({ title = "Decisions", body = table.concat(lines, "\n") })
+    ctx.ui.report({ title = "Decisions", body = table.concat(lines, "\n") })
   end,
 })

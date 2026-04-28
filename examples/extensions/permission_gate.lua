@@ -54,7 +54,7 @@ zi.on("tool_call", function(event, ctx)
   })
 
   if result.status == "submitted" and result.value == true then
-    ctx.ui.notify("Dangerous command allowed", "warning")
+    ctx.ui.message("Dangerous command allowed", { kind = "warning" })
     return nil
   end
 

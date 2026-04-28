@@ -12,7 +12,7 @@ zi.register_command({
     })
 
     if result.status ~= "completed" then
-      ctx.ui.show_panel({
+      ctx.ui.report({
         title = "git status",
         body = result.error or result.status,
       })
@@ -27,7 +27,7 @@ zi.register_command({
       body = body .. "\n\nstderr:\n" .. result.stderr
     end
 
-    ctx.ui.show_panel({
+    ctx.ui.report({
       title = "git status",
       body = body,
     })

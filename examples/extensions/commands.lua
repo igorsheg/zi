@@ -6,7 +6,7 @@ return function(zi)
       local target = args
       if target == nil or target == "" then target = "zi" end
 
-      ctx.ui.show_panel({
+      ctx.ui.report({
         id = "hello-command",
         title = "Hello command",
         body = "Hello, " .. tostring(target) .. "!",

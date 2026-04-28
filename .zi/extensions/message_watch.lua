@@ -7,12 +7,12 @@
 zi.on("message", function(event, ctx)
   local message = event.message or {}
   if message.role == "user" and message.text then
-    ctx.ui.set_footer("Last user message: " .. string.sub(message.text, 1, 80))
+    ctx.ui.message("Last user message: " .. string.sub(message.text, 1, 80))
   elseif message.role == "assistant" and message.text then
-    ctx.ui.set_footer("Assistant replied: " .. string.sub(message.text, 1, 80))
+    ctx.ui.message("Assistant replied: " .. string.sub(message.text, 1, 80))
   elseif message.role == "tool_call" then
-    ctx.ui.set_footer("Tool requested: " .. tostring(message.tool_name or "unknown"))
+    ctx.ui.message("Tool requested: " .. tostring(message.tool_name or "unknown"))
   elseif message.role == "tool_result" then
-    ctx.ui.set_footer("Tool finished: " .. tostring(message.tool_name or "unknown"))
+    ctx.ui.message("Tool finished: " .. tostring(message.tool_name or "unknown"))
   end
 end)

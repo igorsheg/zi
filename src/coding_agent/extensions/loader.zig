@@ -1088,7 +1088,7 @@ test "example status line extension updates status across session and turn event
     try std.testing.expectEqualStrings("✓ Turn 1 complete", store.surfaces.items[2].text.?);
 }
 
-test "example custom header extension publishes a host-owned header surface" {
+test "example custom header extension publishes a semantic report" {
     const allocator = std.testing.allocator;
     const header_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/custom_header.lua");
     defer allocator.free(header_path);
@@ -1128,13 +1128,12 @@ test "example custom header extension publishes a host-owned header surface" {
         .get_context_usage = &commandExampleGetContextUsage,
         .get_system_prompt = &commandExampleGetSystemPrompt,
         .get_binding_info = &commandExampleGetBindingInfo,
-        .publish_surface = &CommandExampleStore.publishSurface,
+        .show_panel = &CommandExampleStore.showPanel,
     }, &provider_registry);
     api.installZiTable(&state, &runner);
 
     const stats = loadAll(allocator, &state, &runner, &.{ext}, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
-    try std.testing.expect(runner.command_registry.getByVisibleName("builtin-header") != null);
 
     try event_bridge.dispatchSessionStart(.{
         .runner = &runner,
@@ -1143,20 +1142,14 @@ test "example custom header extension publishes a host-owned header surface" {
         .session_file = "/workspace/.zi/sessions/session-123.jsonl",
     }, null, .startup, null);
 
-    try std.testing.expectEqual(@as(usize, 1), store.surfaces.items.len);
-    try std.testing.expectEqual(extension_ui.SurfaceKind.header, store.surfaces.items[0].kind);
-    try std.testing.expectEqualStrings("header", store.surfaces.items[0].id);
-    try std.testing.expectEqualStrings("  ██████████████", store.surfaces.items[0].lines[1][0].text);
-    try std.testing.expectEqualStrings("accent", store.surfaces.items[0].lines[1][0].fg.?);
-    try std.testing.expectEqual(extension_ui.SurfaceLifetime.until_input, store.surfaces.items[0].lifetime);
-
-    try runner.dispatchCommand("builtin-header", "");
-    try std.testing.expectEqual(@as(usize, 2), store.surfaces.items.len);
-    try std.testing.expectEqual(extension_ui.SurfaceKind.header, store.surfaces.items[1].kind);
-    try std.testing.expectEqual(@as(usize, 0), store.surfaces.items[1].lines.len);
+    const panel = store.panel orelse return error.MissingPanel;
+    try std.testing.expectEqualStrings("welcome", panel.id);
+    try std.testing.expectEqualStrings("zi coding agent", panel.title);
+    try std.testing.expectEqualStrings("Welcome. Extension UI is semantic and host-owned.", panel.lines[0][0].text);
+    try std.testing.expect(panel.transient);
 }
 
-test "example widget placement extension publishes above and below editor widgets" {
+test "example widget placement extension publishes semantic status" {
     const allocator = std.testing.allocator;
     const widget_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/widget_placement.lua");
     defer allocator.free(widget_path);
@@ -1210,15 +1203,10 @@ test "example widget placement extension publishes above and below editor widget
         .session_file = "/workspace/.zi/sessions/session-123.jsonl",
     }, null, .startup, null);
 
-    try std.testing.expectEqual(@as(usize, 2), store.surfaces.items.len);
-    try std.testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[0].kind);
-    try std.testing.expectEqualStrings("widget-above", store.surfaces.items[0].id);
-    try std.testing.expectEqualStrings("aboveEditor", store.surfaces.items[0].placement.?);
-    try std.testing.expectEqualStrings("Above editor widget", store.surfaces.items[0].lines[0][0].text);
-    try std.testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[1].kind);
-    try std.testing.expectEqualStrings("widget-below", store.surfaces.items[1].id);
-    try std.testing.expectEqualStrings("belowEditor", store.surfaces.items[1].placement.?);
-    try std.testing.expectEqualStrings("Below editor widget", store.surfaces.items[1].lines[0][0].text);
+    try std.testing.expectEqual(@as(usize, 1), store.surfaces.items.len);
+    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[0].kind);
+    try std.testing.expectEqualStrings("widget-demo", store.surfaces.items[0].id);
+    try std.testing.expectEqualStrings("Extension UI ready", store.surfaces.items[0].text.?);
 }
 
 test "example qna extension writes a question prompt through editor actions" {

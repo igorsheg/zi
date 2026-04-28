@@ -46,7 +46,7 @@ zi.register_tool({
       }
     end
 
-    if not ctx.has_ui or not ctx.ui or not ctx.ui.select then
+    if not ctx.has_ui or not ctx.ui or not ctx.ui.pick then
       return {
         content = { { type = "text", text = "Error: UI not available" } },
         details = { question = question, options = options, answer = nil },
@@ -54,7 +54,8 @@ zi.register_tool({
       }
     end
 
-    local answer = ctx.ui.select(question, options)
+    local result = ctx.ui.pick({ title = question, options = options })
+    local answer = result.status == "submitted" and result.value or nil
     if answer == nil then
       return {
         content = { { type = "text", text = "User cancelled the selection" } },

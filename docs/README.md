@@ -37,6 +37,8 @@ put it in a bead, pr, or `docs/archive/` if it still matters.
 - `extensions-tools.md` — tool definition, phases, overrides, and renderer inheritance contract
 - `extensions-jobs-subagents.md` — jobs/subagents/`zi.system` contract
 - `extensions-ui-contract.md` — host-owned ui and custom presentation contract
+- `extensions-ui-primitives.md` — semantic public `ctx.ui` lua primitives
+- `extensions-ui-substrate-map.md` — ui slots/components research and semantic api design map
 - `extensions-state-rebinding.md` — state scopes, persistence, and rebinding contract
 - `extensions-providers.md` — provider registration, activation, and model-visibility contract
 - `extensions-commands-flags-actions.md` — command, shortcut, flag, and host-action contract

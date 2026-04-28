@@ -40,7 +40,7 @@ Need: rewrite messages before a provider call
 Need: rewrite the provider request
 : Use [`before_provider_request`](api.html#events).
 
-Need: show status, footer text, a panel, or a prompt
+Need: show feedback, status, progress, a report, or a prompt
 : Use [context ui api](context.html#context-ui-api).
 
 Need: remember a per-session choice
@@ -87,7 +87,7 @@ return function(zi)
     description = "Save a session note.",
     handler = function(args, ctx)
       local ok = ctx.session.append_note({ kind = "manual", body = tostring(args or "") })
-      if ctx.ui then ctx.ui.set_footer(ok and "note saved" or "note failed") end
+      if ctx.ui then ctx.ui.message(ok and "note saved" or "note failed") end
     end,
   })
 end
@@ -115,7 +115,7 @@ An event is for policy or reaction.
 zi.on("message", function(event, ctx)
   local message = event.message or {}
   if message.role == "assistant" and ctx.ui then
-    ctx.ui.set_footer("assistant replied")
+    ctx.ui.message("assistant replied")
   end
 end)
 ```
@@ -126,7 +126,7 @@ end)
 : Minimal tool registration.
 
 `commands.lua`
-: Slash command with a host-owned panel.
+: Slash command with a host-owned report.
 
 `dynamic_tools.lua`
 : Dynamic tool registration from an event or command.
@@ -153,10 +153,10 @@ end)
 : Durable message labels, label queries, and entry lookup.
 
 `git_status.lua`
-: Yieldable `zi.system` command execution with host-owned panel output.
+: Yieldable `zi.system` command execution with host-owned report output.
 
-`notify.lua`
-: Notification surface.
+`message.lua`
+: Short feedback through `ctx.ui.message`.
 
 `question.lua`, `questionnaire.lua`, `timed_confirm.lua`
 : Host-owned prompts.

@@ -744,7 +744,7 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  description = "Show todos",
         \\  handler = function(_, ctx)
         \\    hydrate(ctx)
-        \\    ctx.ui.show_panel({ id = "todos", title = "Todos", body = list_text(), transient = true })
+        \\    ctx.ui.report({ id = "todos", title = "Todos", body = list_text(), transient = true })
         \\  end,
         \\})
     , "todo-fixture");
@@ -1449,7 +1449,7 @@ test "extension command context publishes host-owned editor buffer actions" {
     try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
 }
 
-test "extension command context publishes host-owned status and surface leases" {
+test "extension command context publishes semantic ui message status and progress" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1471,38 +1471,25 @@ test "extension command context publishes host-owned status and surface leases" 
         \\  name = "surfaces",
         \\  description = "surfaces",
         \\  handler = function(_, ctx)
-        \\    ctx.ui.notify("Ready for input", "warning")
-        \\    ctx.ui.set_status("demo", "ready")
-        \\    ctx.ui.set_title("Zi Demo")
-        \\    ctx.ui.set_widget("w", { { { text = "Widget" } } }, { placement = "aboveEditor" })
-        \\    ctx.ui.set_header({ { { text = "Header" } } })
-        \\    ctx.ui.set_footer({ { { text = "Footer" } } })
-        \\    ctx.ui.set_working("Working")
-        \\    ctx.ui.set_hidden_thinking_label("Thinking")
-        \\    ctx.ui.show_overlay("overlay", { { { text = "Overlay" } } })
+        \\    ctx.ui.message("Ready for input", { kind = "warning", lifetime = "until_input" })
+        \\    ctx.ui.status({ id = "demo", text = "ready" })
+        \\    ctx.ui.progress({ id = "index", title = "Indexing", current = 2, total = 4, detail = "src" })
         \\  end,
         \\})
     , "register_surface_command");
 
     try runner.dispatchCommand("surfaces", "");
 
-    try testing.expectEqual(@as(usize, 9), store.surfaces.items.len);
-    try testing.expectEqual(extension_ui.SurfaceKind.notification, store.surfaces.items[0].kind);
+    try testing.expectEqual(@as(usize, 3), store.surfaces.items.len);
+    try testing.expectEqual(extension_ui.SurfaceKind.footer, store.surfaces.items[0].kind);
     try testing.expectEqualStrings("warning", store.surfaces.items[0].id);
     try testing.expectEqualStrings("Ready for input", store.surfaces.items[0].text.?);
     try testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[1].kind);
     try testing.expectEqualStrings("demo", store.surfaces.items[1].id);
     try testing.expectEqualStrings("ready", store.surfaces.items[1].text.?);
-    try testing.expectEqual(extension_ui.SurfaceKind.widget, store.surfaces.items[3].kind);
-    try testing.expectEqualStrings("aboveEditor", store.surfaces.items[3].placement.?);
-    try testing.expectEqualStrings("Widget", store.surfaces.items[3].lines[0][0].text);
-    try testing.expectEqual(extension_ui.SurfaceKind.header, store.surfaces.items[4].kind);
-    try testing.expectEqualStrings("Header", store.surfaces.items[4].lines[0][0].text);
-    try testing.expectEqual(extension_ui.SurfaceKind.footer, store.surfaces.items[5].kind);
-    try testing.expectEqualStrings("Footer", store.surfaces.items[5].lines[0][0].text);
-    try testing.expectEqual(extension_ui.SurfaceKind.overlay, store.surfaces.items[8].kind);
-    try testing.expectEqualStrings("overlay", store.surfaces.items[8].id);
-    try testing.expectEqualStrings("Overlay", store.surfaces.items[8].lines[0][0].text);
+    try testing.expectEqual(extension_ui.SurfaceKind.working, store.surfaces.items[2].kind);
+    try testing.expectEqualStrings("index", store.surfaces.items[2].id);
+    try testing.expectEqualStrings("Indexing 2/4 — src", store.surfaces.items[2].text.?);
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 1), store.revoke_count);
@@ -1531,10 +1518,14 @@ test "extension command prompts can resolve through host response" {
         \\  name = "resolved-prompts",
         \\  description = "resolved-prompts",
         \\  handler = function(_, ctx)
-        \\    assert(ctx.ui.confirm("Confirm", "Continue?") == true)
-        \\    assert(ctx.ui.select("Pick", { "A", "B" }) == "A")
-        \\    assert(ctx.ui.input("Input", "placeholder") == "typed")
-        \\    assert(ctx.ui.editor("Editor", "prefill") == "edited")
+        \\    local confirmed = ctx.ui.prompt({ kind = "confirm", title = "Confirm", message = "Continue?" })
+        \\    assert(confirmed.status == "submitted" and confirmed.value == true)
+        \\    local picked = ctx.ui.pick({ title = "Pick", options = { "A", "B" } })
+        \\    assert(picked.status == "submitted" and picked.value == "A")
+        \\    local input = ctx.ui.prompt({ kind = "input", title = "Input", placeholder = "placeholder" })
+        \\    assert(input.status == "submitted" and input.value == "typed")
+        \\    local edited = ctx.ui.prompt({ kind = "editor", title = "Editor", prefill = "prefill" })
+        \\    assert(edited.status == "submitted" and edited.value == "edited")
         \\    local selected = ctx.ui.prompt({
         \\      kind = "select",
         \\      title = "Pick object",
@@ -1577,7 +1568,8 @@ test "lua question tool publishes host-owned select prompt request" {
         \\  description = "question_test",
         \\  parameters = { type = "object", properties = {} },
         \\  execute = function(args, ctx)
-        \\    local answer = ctx.ui.select(args.question, args.options)
+        \\    local picked = ctx.ui.pick({ title = args.question, options = args.options })
+        \\    local answer = picked.status == "submitted" and picked.value or nil
         \\    return {
         \\      content = { { type = "text", text = answer or "cancelled" } },
         \\      details = { answer = answer },
@@ -1635,10 +1627,14 @@ test "extension command context publishes host-owned prompt requests with defaul
         \\  name = "prompts",
         \\  description = "prompts",
         \\  handler = function(_, ctx)
-        \\    assert(ctx.ui.confirm("Confirm", "Continue?") == false)
-        \\    assert(ctx.ui.select("Pick", { "A", "B" }) == nil)
-        \\    assert(ctx.ui.input("Input", "placeholder") == nil)
-        \\    assert(ctx.ui.editor("Editor", "prefill") == nil)
+        \\    local confirmed = ctx.ui.prompt({ kind = "confirm", title = "Confirm", message = "Continue?" })
+        \\    assert(confirmed.status == "submitted" and confirmed.value == false)
+        \\    local picked = ctx.ui.pick({ title = "Pick", options = { "A", "B" } })
+        \\    assert(picked.status == "cancelled")
+        \\    local input = ctx.ui.prompt({ kind = "input", title = "Input", placeholder = "placeholder" })
+        \\    assert(input.status == "cancelled")
+        \\    local edited = ctx.ui.prompt({ kind = "editor", title = "Editor", prefill = "prefill" })
+        \\    assert(edited.status == "cancelled")
         \\    local cancelled = ctx.ui.prompt({ kind = "select", title = "Pick object", options = { { label = "Lua", value = "lua" } }, timeout_ms = 5000 })
         \\    assert(cancelled.status == "cancelled")
         \\  end,
@@ -1912,7 +1908,7 @@ test "extension command context publishes a host-owned panel" {
         \\  description = "panel",
         \\  handler = function(_, ctx)
         \\    assert(ctx.has_ui == true)
-        \\    ctx.ui.show_panel({
+        \\    ctx.ui.report({
         \\      id = "demo",
         \\      title = "Demo",
         \\      body = "✓ published",
@@ -1957,7 +1953,7 @@ test "extension panel body is split into visible lines" {
         \\  name = "panel-body",
         \\  description = "panel-body",
         \\  handler = function(_, ctx)
-        \\    ctx.ui.show_panel({ title = "Body", body = "one\ntwo\n" })
+        \\    ctx.ui.report({ title = "Body", body = "one\ntwo\n" })
         \\  end,
         \\})
     , "register_panel_body_command");

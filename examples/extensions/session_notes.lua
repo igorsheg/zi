@@ -20,7 +20,7 @@ zi.register_command({
       body = rest
     end
     if body == "" then
-      ctx.ui.set_footer("Usage: /note [@entry-id] <text>")
+      ctx.ui.message("Usage: /note [@entry-id] <text>")
       return
     end
 
@@ -32,9 +32,9 @@ zi.register_command({
     })
 
     if ok then
-      ctx.ui.set_footer("Saved session note")
+      ctx.ui.message("Saved session note")
     else
-      ctx.ui.set_footer("Failed to save session note")
+      ctx.ui.message("Failed to save session note")
     end
   end,
 })
@@ -45,7 +45,7 @@ zi.register_command({
   handler = function(_, ctx)
     local notes = ctx.session.notes({ kind = "manual", limit = 10 })
     if #notes == 0 then
-      ctx.ui.set_footer("No manual session notes")
+      ctx.ui.message("No manual session notes")
       return
     end
 
@@ -57,7 +57,7 @@ zi.register_command({
       lines[#lines + 1] = ""
     end
 
-    ctx.ui.show_panel({
+    ctx.ui.report({
       id = "session-notes",
       title = "Session notes",
       body = table.concat(lines, "\n"),

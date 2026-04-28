@@ -4,7 +4,7 @@
 -- a semantic UI intent; the host/TUI owns materialization.
 
 zi.on("agent_end", function(_, ctx)
-  if ctx.ui and ctx.ui.notify then
-    ctx.ui.notify("Ready for input", "info")
+  if ctx.ui and ctx.ui.message then
+    ctx.ui.message("Ready for input", { kind = "info" })
   end
 end)

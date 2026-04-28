@@ -51,50 +51,23 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 
 The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
 
-`ctx.ui.show_panel({ id, title, body, transient })`
-: Show a host-owned panel. `body` is plain text; zi owns splitting and rendering.
+`ctx.ui.message(text, opts?)`
+: Publish short feedback. The host chooses a visible, low-disruption placement.
 
-`ctx.ui.notify(text, kind)`
-: Publish a notification. `kind` is `info`, `warning`, or `error`; unknown kinds fall back to `info`.
+`ctx.ui.status({ id, text, value, lifetime? })`
+: Publish compact retained state by stable id. `text` or `value` is shown; nil clears the item.
 
-`ctx.ui.set_status(id, value, opts?)`
-: Publish a keyed status item.
+`ctx.ui.progress({ id, title, current?, total?, detail?, text?, lifetime? })`
+: Publish retained progress/working state. The host formats and places it.
 
-`ctx.ui.set_title(value, opts?)`
-: Publish title intent.
+`ctx.ui.report({ id, title, body, transient? })`
+: Publish a readable document/report. `body` is plain text; zi owns splitting, scrolling, and rendering.
 
-`ctx.ui.set_widget(id, value, opts?)`
-: Publish a widget surface.
-
-`ctx.ui.set_header(value, opts?)`
-: Publish header content.
-
-`ctx.ui.set_footer(value, opts?)`
-: Publish footer content.
-
-`ctx.ui.set_working(value, opts?)`
-: Publish working/loading text.
-
-`ctx.ui.set_hidden_thinking_label(value, opts?)`
-: Publish hidden-thinking label text.
-
-`ctx.ui.show_overlay(id, value, opts?)`
-: Publish an overlay surface.
-
-`ctx.ui.confirm(...)`
-: Request boolean confirmation from the host.
-
-`ctx.ui.input(...)`
-: Request single-line text input.
-
-`ctx.ui.select(...)`
-: Request selection from stable options.
-
-`ctx.ui.editor(...)`
-: Request multi-line editor input.
+`ctx.ui.pick({ title, options, timeout_ms? })`
+: Request selection from stable options. Returns the same envelope shape as `ctx.ui.prompt`.
 
 `ctx.ui.prompt({ kind = "confirm"|"select"|"input"|"editor", ... })`
-: Generic prompt request. Returns an envelope with `status` and, when submitted, `value`.
+: Generic modal interaction request. Returns an envelope with `status` and, when submitted, `value`.
 
 `ctx.ui.set_editor_text(text)`
 : Set host editor text.

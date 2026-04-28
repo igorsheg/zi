@@ -163,8 +163,8 @@ return function(zi)
     description = "Show all todos on the current session branch",
     handler = function(_, ctx)
       hydrate(ctx)
-      if ctx and ctx.ui and ctx.ui.show_panel then
-        ctx.ui.show_panel({
+      if ctx and ctx.ui and ctx.ui.report then
+        ctx.ui.report({
           id = "todos",
           title = "Todos",
           body = list_text(),
