@@ -104,7 +104,8 @@ these are the public observer classes for v2.
 | `turn_end` | `turn_index`, timestamp, `message`, `tool_results` | one assistant turn settles |
 | `message_start` | `message` | emitted for user, assistant, and tool-result messages |
 | `message_update` | `message`, `assistant_message_event` | assistant streaming deltas only |
-| `message_end` | `message` | final publication for that message |
+| `message_end` | `message` | final raw lifecycle publication for that message |
+| `message` | `message.entry_id`, `message.role`, semantic message fields | durable semantic message observer, dispatched after session persistence; `entry_id` links to [extension session api](./extensions-session.md) helpers |
 | `tool_execution_start` | `tool_call_id`, `tool_name`, `args` | fires before tool-call interception outcome is known |
 | `tool_execution_update` | `tool_call_id`, `tool_name`, `args`, `partial_result` | zero or more partial updates |
 | `tool_execution_end` | `tool_call_id`, `tool_name`, `result`, `is_error` | final tool execution outcome |
@@ -269,6 +270,7 @@ input
 
 notes:
 
+- raw `message_end` is a lifecycle edge; the semantic `message` observer is the durable post-persistence edge and includes `message.entry_id`.
 - `message_update*` and `tool_execution_update*` are zero-or-more.
 - `tool_execution_start` fires before `tool_call` settles.
   blocked tool calls still produce a balanced execution end.
@@ -282,6 +284,7 @@ zi v2 keeps these asymmetries on purpose:
 
 - `session_shutdown` carries a `reason`.
   zi's lifecycle doc already makes shutdown reason product-significant for reload, new, resume, and fork; the public event should expose that instead of collapsing distinct flows into one empty post-fact edge.
+- semantic `message` is split from raw `message_end`; it carries a durable session entry id so extensions can compose notes, labels, and entry lookup without touching jsonl or transcript rows.
 - `resources_discover` contributes runtime roots, not just loose skill/prompt/theme path lists.
   zi v2 has an explicit runtime-root system, so the extension seam should speak the same abstraction.
 - aggregate reducers are explicit and precedence-aligned.

@@ -17,6 +17,7 @@ const editor_mod = @import("components/editor.zig");
 const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
 const ui_event_mod = @import("ui_event.zig");
 const ai_complete_worker_mod = @import("../coding_agent/extensions/ai_complete_worker.zig");
+const system_worker_mod = @import("../coding_agent/extensions/system_worker.zig");
 const transcript_mod = @import("transcript.zig");
 const conversation_projection_mod = @import("conversation_projection.zig");
 const container_mod = @import("container.zig");
@@ -581,6 +582,7 @@ pub const Interactive = struct {
     resume_picker_generation: u64 = 0,
     session_index_worker: session_index_worker_mod.SessionIndexWorker,
     ai_complete_worker: ?ai_complete_worker_mod.AiCompleteWorker = null,
+    system_worker: ?system_worker_mod.SystemWorker = null,
 
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
@@ -695,6 +697,7 @@ pub const Interactive = struct {
             .model_catalog = &.{},
         };
         self.ai_complete_worker = try ai_complete_worker_mod.AiCompleteWorker.init(msg_allocator);
+        self.system_worker = try system_worker_mod.SystemWorker.init(msg_allocator);
         self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
@@ -718,6 +721,7 @@ pub const Interactive = struct {
         }
         self.session_index_worker.stop();
         if (self.ai_complete_worker) |*worker| worker.worker.stop();
+        if (self.system_worker) |*worker| worker.worker.stop();
 
         // Stop the long-lived agent owner thread. Abort first if a
         // prompt is mid-flight so the owner loop can reach its next
@@ -776,6 +780,8 @@ pub const Interactive = struct {
         self.session_index_worker.deinit();
         if (self.ai_complete_worker) |*worker| worker.deinit();
         self.ai_complete_worker = null;
+        if (self.system_worker) |*worker| worker.deinit();
+        self.system_worker = null;
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
         // Any unexpectedly undrained requests are mailbox-owned here;
@@ -847,7 +853,11 @@ pub const Interactive = struct {
         try self.startAgentThread();
         try self.startSessionIndexWorker();
         if (self.ai_complete_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &submitAiCompleteResult });
+            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &submitExtensionAsyncResult });
+            try worker.start();
+        }
+        if (self.system_worker) |*worker| {
+            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &submitExtensionAsyncResult });
             try worker.start();
         }
 
@@ -3033,7 +3043,7 @@ pub const Interactive = struct {
         self.runtime_host.shutdownCurrentSessionOnAgentThread();
     }
 
-    fn submitAiCompleteResult(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) bool {
+    fn submitExtensionAsyncResult(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) bool {
         const self: *Interactive = @ptrCast(@alignCast(ptr));
         switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = id, .result = result } })) {
             .ok, .dropped => return true,
@@ -3058,6 +3068,15 @@ pub const Interactive = struct {
                 }
                 const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
                 try worker.submit(worker_request);
+            },
+            .system => |request| {
+                const cloned = try request.clone(self.msg_allocator);
+                errdefer {
+                    var failed = cloned;
+                    failed.deinit(self.msg_allocator);
+                }
+                const worker = if (self.system_worker) |*worker| worker else return error.SystemWorkerUnavailable;
+                try worker.submit(.{ .id = owned_start.id, .system = cloned });
             },
             else => {},
         }

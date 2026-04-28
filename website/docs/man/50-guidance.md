@@ -46,7 +46,7 @@ Need: show status, footer text, a panel, or a prompt
 Need: remember a per-session choice
 : Use [context state api](context.html#context-state-api).
 
-Need: inspect the transcript or session notes
+Need: inspect the transcript, attach notes, label important entries, or query labeled entries
 : Use [context session api](context.html#context-session-api).
 
 Need: ask a side-channel model question
@@ -54,6 +54,9 @@ Need: ask a side-channel model question
 
 Need: expose a model/provider
 : Use [providers](api.html#providers).
+
+Need: run a bounded OS command from extension code
+: Use [`zi.system`](context.html#system-command-helper).
 
 Need: delegate work to a child zi run
 : Use [spawn helper](context.html#spawn-helper).
@@ -88,6 +91,22 @@ return function(zi)
     end,
   })
 end
+```
+
+A semantic message observer can attach durable session metadata without touching raw jsonl or UI rows.
+
+```lua
+zi.on("message", function(event, ctx)
+  local message = event.message or {}
+  if message.role == "user" and message.text and message.text:match("decision") then
+    ctx.session.label(message.entry_id, "decision")
+    ctx.session.append_note({
+      kind = "observation",
+      body = "possible decision",
+      source_entry_id = message.entry_id,
+    })
+  end
+end)
 ```
 
 An event is for policy or reaction.
@@ -129,6 +148,12 @@ end)
 
 `session_notes.lua`
 : Session note storage and retrieval.
+
+`auto_label.lua`
+: Durable message labels, label queries, and entry lookup.
+
+`git_status.lua`
+: Yieldable `zi.system` command execution with host-owned panel output.
 
 `notify.lua`
 : Notification surface.

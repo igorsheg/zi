@@ -33,18 +33,6 @@ return function(zi)
     return table.concat(lines, "\n")
   end
 
-  local function todo_lines()
-    if #todos == 0 then return { { { text = "No todos", fg = "muted", dim = true } } } end
-    local lines = { { { text = tostring(#todos) .. " todo(s):", fg = "muted" } } }
-    for _, todo in ipairs(todos) do
-      lines[#lines + 1] = {
-        { text = todo.done and "✓ " or "○ ", fg = todo.done and "success" or "muted" },
-        { text = "#" .. tostring(todo.id) .. " ", fg = "accent" },
-        { text = todo.text, fg = todo.done and "muted" or "text", dim = todo.done },
-      }
-    end
-    return lines
-  end
 
   local function details(action, err)
     return { action = action, todos = clone_todos(), nextId = next_id, error = err }
@@ -179,7 +167,7 @@ return function(zi)
         ctx.ui.show_panel({
           id = "todos",
           title = "Todos",
-          lines = todo_lines(),
+          body = list_text(),
           transient = true,
         })
         return

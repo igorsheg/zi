@@ -31,6 +31,8 @@ put it in a bead, pr, or `docs/archive/` if it still matters.
 - `theme-system.md` — custom theme JSON format, token names, and diagnostics
 - `extensions-lifecycle.md` — lifecycle, namespace, and scheduler contract for extension execution
 - `extensions-events.md` — observer/interceptor contract for extension-visible semantics
+- `extensions-session.md` — semantic session context, durable entry ids, notes, labels, and entry lookup
+- `extensions-system.md` — yieldable system command API for extensions
 - `extensions-retained-objects.md` — retained-object ownership and publication contract
 - `extensions-tools.md` — tool definition, phases, overrides, and renderer inheritance contract
 - `extensions-jobs-subagents.md` — jobs/subagents/`zi.system` contract

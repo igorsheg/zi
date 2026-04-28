@@ -670,19 +670,6 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  return table.concat(lines, "\n")
         \\end
         \\
-        \\local function todo_lines()
-        \\  if #todos == 0 then return { { { text = "No todos", fg = "muted", dim = true } } } end
-        \\  local lines = { { { text = tostring(#todos) .. " todo(s):", fg = "muted" } } }
-        \\  for _, todo in ipairs(todos) do
-        \\    lines[#lines + 1] = {
-        \\      { text = todo.done and "✓ " or "○ ", fg = todo.done and "success" or "muted" },
-        \\      { text = "#" .. tostring(todo.id) .. " ", fg = "accent" },
-        \\      { text = todo.text, fg = todo.done and "muted" or "text", dim = todo.done },
-        \\    }
-        \\  end
-        \\  return lines
-        \\end
-        \\
         \\local function details(action, err)
         \\  return { action = action, todos = clone_todos(), nextId = next_id, error = err }
         \\end
@@ -757,7 +744,7 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  description = "Show todos",
         \\  handler = function(_, ctx)
         \\    hydrate(ctx)
-        \\    ctx.ui.show_panel({ id = "todos", title = "Todos", lines = todo_lines(), transient = true })
+        \\    ctx.ui.show_panel({ id = "todos", title = "Todos", body = list_text(), transient = true })
         \\  end,
         \\})
     , "todo-fixture");
@@ -1681,6 +1668,91 @@ test "extension command context publishes host-owned prompt requests with defaul
     try testing.expectEqual(@as(usize, 0), store.prompts.items.len);
 }
 
+test "extension command resumes after zi.system result" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 29);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+
+    const Capture = struct {
+        argv0: ?[]u8 = null,
+        cwd: ?[]u8 = null,
+        stdin: ?[]u8 = null,
+        env_value: ?[]u8 = null,
+        timeout_ms: ?u64 = null,
+
+        fn submit(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, start: runner_mod.AsyncStart) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var owned = start;
+            defer owned.deinit(testing.allocator);
+            switch (owned.request) {
+                .system => |request| {
+                    self.argv0 = try testing.allocator.dupe(u8, request.argv[0]);
+                    if (request.cwd) |cwd| self.cwd = try testing.allocator.dupe(u8, cwd);
+                    if (request.stdin) |stdin| self.stdin = try testing.allocator.dupe(u8, stdin);
+                    for (request.env) |pair| if (std.mem.eql(u8, pair.key, "FOO")) {
+                        self.env_value = try testing.allocator.dupe(u8, pair.value);
+                    };
+                    self.timeout_ms = request.timeout_ms;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture = Capture{};
+    defer {
+        if (capture.argv0) |value| testing.allocator.free(value);
+        if (capture.cwd) |value| testing.allocator.free(value);
+        if (capture.stdin) |value| testing.allocator.free(value);
+        if (capture.env_value) |value| testing.allocator.free(value);
+    }
+    runner.async_dispatcher = .{ .ptr = @ptrCast(&capture), .submit = &Capture.submit };
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "system-test",
+        \\  description = "system-test",
+        \\  handler = function(_, ctx)
+        \\    local result = zi.system({ "/bin/sh", "-c", "cat" }, { cwd = ctx.cwd, stdin = "hello", env = { FOO = "bar" }, timeout_ms = 1234 })
+        \\    _system_result = result.status .. ":" .. result.code .. ":" .. result.stdout .. ":" .. result.stderr
+        \\  end,
+        \\})
+    , "register_system_test_command");
+
+    try runner.dispatchCommand("system-test", "");
+    try testing.expectEqual(@as(usize, 1), runner.pending_async.count());
+    const pending = runner.pending_async.get(1) orelse return error.MissingAsyncRequest;
+    try testing.expectEqual(runner_mod.AsyncKind.system, pending.kind);
+    try testing.expectEqualStrings("/bin/sh", capture.argv0 orelse return error.MissingArgv);
+    try testing.expectEqualStrings(".", capture.cwd orelse return error.MissingCwd);
+    try testing.expectEqualStrings("hello", capture.stdin orelse return error.MissingStdin);
+    try testing.expectEqualStrings("bar", capture.env_value orelse return error.MissingEnv);
+    try testing.expectEqual(@as(?u64, 1234), capture.timeout_ms);
+    try runner.resumeAsync(1, .{ .system = .{ .completed = .{
+        .code = 7,
+        .stdout = try testing.allocator.dupe(u8, "out"),
+        .stderr = try testing.allocator.dupe(u8, "err"),
+    } } });
+    try testing.expectEqual(@as(usize, 0), runner.pending_async.count());
+
+    _ = c.lua_getglobal(state.L, "_system_result");
+    defer c.lua_pop(state.L, 1);
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(state.L, -1, &len) orelse return error.MissingSystemResult;
+    try testing.expectEqualStrings("completed:7:out:err", ptr[0..len]);
+}
+
 test "extension command resumes after ai completion result" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
@@ -1843,7 +1915,7 @@ test "extension command context publishes a host-owned panel" {
         \\    ctx.ui.show_panel({
         \\      id = "demo",
         \\      title = "Demo",
-        \\      lines = { { { text = "✓ ", fg = "success" }, { text = "published", fg = "accent", dim = true } } },
+        \\      body = "✓ published",
         \\      transient = true,
         \\    })
         \\  end,
@@ -1859,10 +1931,44 @@ test "extension command context publishes a host-owned panel" {
     try testing.expectEqualStrings("Demo", panel.title);
     try testing.expect(panel.transient);
     try testing.expectEqual(@as(usize, 1), panel.lines.len);
-    try testing.expectEqualStrings("✓ ", panel.lines[0][0].text);
-    try testing.expectEqualStrings("success", panel.lines[0][0].fg.?);
-    try testing.expectEqualStrings("published", panel.lines[0][1].text);
-    try testing.expect(panel.lines[0][1].dim);
+    try testing.expectEqual(@as(usize, 1), panel.lines[0].len);
+    try testing.expectEqualStrings("✓ published", panel.lines[0][0].text);
+}
+
+test "extension panel body is split into visible lines" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 12);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "panel-body",
+        \\  description = "panel-body",
+        \\  handler = function(_, ctx)
+        \\    ctx.ui.show_panel({ title = "Body", body = "one\ntwo\n" })
+        \\  end,
+        \\})
+    , "register_panel_body_command");
+
+    try runner.dispatchCommand("panel-body", "");
+
+    const panel = store.panel orelse return error.MissingPanel;
+    try testing.expectEqualStrings("Body", panel.title);
+    try testing.expectEqual(@as(usize, 2), panel.lines.len);
+    try testing.expectEqualStrings("one", panel.lines[0][0].text);
+    try testing.expectEqualStrings("two", panel.lines[1][0].text);
 }
 
 test "todo command publishes hydrated todos as a host-owned panel" {
@@ -1895,10 +2001,9 @@ test "todo command publishes hydrated todos as a host-owned panel" {
     try testing.expectEqualStrings("todos", panel.id);
     try testing.expectEqualStrings("Todos", panel.title);
     try testing.expect(panel.transient);
-    try testing.expectEqualStrings("1 todo(s):", panel.lines[0][0].text);
-    try testing.expectEqualStrings("○ ", panel.lines[1][0].text);
-    try testing.expectEqualStrings("#1 ", panel.lines[1][1].text);
-    try testing.expectEqualStrings("ship panel", panel.lines[1][2].text);
+    try testing.expectEqual(@as(usize, 1), panel.lines.len);
+    try testing.expectEqual(@as(usize, 1), panel.lines[0].len);
+    try testing.expectEqualStrings("[ ] #1: ship panel", panel.lines[0][0].text);
 }
 
 test "todo fixture rehydrates from session state across extension generations" {

@@ -56,7 +56,7 @@ return function(zi)
           ctx.ui.show_panel({
             id = "dynamic-tools-usage",
             title = "Dynamic tools",
-            lines = { { { text = "Usage: /add-echo-tool <lowercase_name>", fg = "warning" } } },
+            body = "Usage: /add-echo-tool <lowercase_name>",
             transient = true,
           })
         end
@@ -68,7 +68,7 @@ return function(zi)
         ctx.ui.show_panel({
           id = "dynamic-tools-result",
           title = "Dynamic tools",
-          lines = { { { text = created and "Registered tool: " or "Tool already registered: ", fg = created and "success" or "warning" }, { text = tool_name, fg = "accent" } } },
+          body = (created and "Registered tool: " or "Tool already registered: ") .. tool_name,
           transient = true,
         })
       end

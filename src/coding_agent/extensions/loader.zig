@@ -922,9 +922,8 @@ test "example commands extension dispatches through host-owned command ui" {
     try std.testing.expectEqualStrings("Hello command", panel.title);
     try std.testing.expect(panel.transient);
     try std.testing.expectEqual(@as(usize, 1), panel.lines.len);
-    try std.testing.expectEqualStrings("Hello, ", panel.lines[0][0].text);
-    try std.testing.expectEqualStrings("matrix", panel.lines[0][1].text);
-    try std.testing.expectEqualStrings("!", panel.lines[0][2].text);
+    try std.testing.expectEqual(@as(usize, 1), panel.lines[0].len);
+    try std.testing.expectEqualStrings("Hello, matrix!", panel.lines[0][0].text);
 }
 
 const CommandExampleStore = struct {

@@ -37,36 +37,44 @@ local function preview_entry(entry)
   return preview
 end
 
-zi.command("labels", function(ctx, args)
-  local target = tostring(args or "")
-  local opts = { limit = 20 }
-  if target ~= "" then
-    opts.target_entry_id = target
-  end
+zi.register_command({
+  name = "labels",
+  description = "List durable session labels.",
+  handler = function(args, ctx)
+    local target = tostring(args or "")
+    local opts = { limit = 20 }
+    if target ~= "" then
+      opts.target_entry_id = target
+    end
 
-  local labels = ctx.session.labels(opts)
-  if #labels == 0 then
-    ctx.ui.show_panel({ title = "Labels", body = "No labels found." })
-    return
-  end
+    local labels = ctx.session.labels(opts)
+    if #labels == 0 then
+      ctx.ui.show_panel({ title = "Labels", body = "No labels found." })
+      return
+    end
 
-  local lines = {}
-  for _, item in ipairs(labels) do
-    table.insert(lines, string.format("%s: %s", item.label or "<cleared>", preview_entry(ctx.session.entry(item.target_entry_id))))
-  end
-  ctx.ui.show_panel({ title = "Labels", body = table.concat(lines, "\n") })
-end)
+    local lines = {}
+    for _, item in ipairs(labels) do
+      table.insert(lines, string.format("%s: %s", item.label or "<cleared>", preview_entry(ctx.session.entry(item.target_entry_id))))
+    end
+    ctx.ui.show_panel({ title = "Labels", body = table.concat(lines, "\n") })
+  end,
+})
 
-zi.command("decisions", function(ctx)
-  local entries = ctx.session.entries({ label = "decision", limit = 20 })
-  if #entries == 0 then
-    ctx.ui.show_panel({ title = "Decisions", body = "No decisions found." })
-    return
-  end
+zi.register_command({
+  name = "decisions",
+  description = "List entries labelled as decisions.",
+  handler = function(_, ctx)
+    local entries = ctx.session.entries({ label = "decision", limit = 20 })
+    if #entries == 0 then
+      ctx.ui.show_panel({ title = "Decisions", body = "No decisions found." })
+      return
+    end
 
-  local lines = {}
-  for _, entry in ipairs(entries) do
-    table.insert(lines, "- " .. preview_entry(entry))
-  end
-  ctx.ui.show_panel({ title = "Decisions", body = table.concat(lines, "\n") })
-end)
+    local lines = {}
+    for _, entry in ipairs(entries) do
+      table.insert(lines, "- " .. preview_entry(entry))
+    end
+    ctx.ui.show_panel({ title = "Decisions", body = table.concat(lines, "\n") })
+  end,
+})

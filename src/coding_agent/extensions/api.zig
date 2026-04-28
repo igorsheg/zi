@@ -98,6 +98,10 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     state.pushCClosureWithUserdata(ziSpawn, runner);
     c.lua_setfield(L, -2, "spawn");
 
+    // zi.system
+    state.pushCClosureWithUserdata(ziSystem, runner);
+    c.lua_setfield(L, -2, "system");
+
     // Install as a global named "zi".
     c.lua_setglobal(L, "zi");
 }
@@ -563,11 +567,17 @@ fn ziRegisterCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
         });
     };
 
+    return registerCommandDef(L, runner, cmd, "register_command");
+}
+
+fn registerCommandDef(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, cmd_in: command_registry.CommandDef, api_name: [:0]const u8) c_int {
+    const cmd = cmd_in;
     runner.command_registry.register(cmd) catch {
         c.luaL_unref(L, c.LUA_REGISTRYINDEX, cmd.lua_ref);
         runner.allocator.free(cmd.name);
+        runner.allocator.free(cmd.visible_name);
         runner.allocator.free(cmd.description);
-        return luaError(L, "register_command: registry insert failed");
+        return luaErrorFmt(L, "{s}: registry insert failed", .{api_name});
     };
 
     c.lua_pushboolean(L, 1);
@@ -781,6 +791,198 @@ fn parseEventKind(name: []const u8) ?event_registry.EventKind {
         if (std.mem.eql(u8, p.name, name)) return p.kind;
     }
     return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// zi.system
+// ─────────────────────────────────────────────────────────────────────────
+
+fn ziSystem(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+    const request = parseSystemRequest(runner.allocator, L) catch |err| {
+        return luaErrorFmt(L, "zi.system: invalid request: {s}", .{@errorName(err)});
+    };
+    const id = runner.beginSystemAsync(request);
+    return c.lua_yieldk(L, 0, @intCast(id), ziSystemContinue);
+}
+
+fn ziSystemContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) callconv(.c) c_int {
+    _ = status;
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+    const id: runner_mod.AsyncOpId = @intCast(ctx);
+    var result = runner.takeCompletedAsync(id) orelse {
+        pushSystemError(L, "missing async result");
+        return 1;
+    };
+    defer result.deinit(runner.allocator);
+    switch (result) {
+        .system => |value| pushSystemResult(L, value),
+        else => pushSystemError(L, "unexpected async result"),
+    }
+    return 1;
+}
+
+const SystemParseError = error{ InvalidArgv, InvalidOptions, OutOfMemory };
+
+fn parseSystemRequest(allocator: std.mem.Allocator, L: *c.lua_State) SystemParseError!runner_mod.SystemRequest {
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return error.InvalidArgv;
+    const argv_len = c.lua_rawlen(L, 1);
+    if (argv_len == 0) return error.InvalidArgv;
+    const argv = allocator.alloc([]const u8, argv_len) catch return error.OutOfMemory;
+    var argv_built: usize = 0;
+    errdefer {
+        for (argv[0..argv_built]) |arg| allocator.free(arg);
+        allocator.free(argv);
+    }
+    var i: c.lua_Integer = 1;
+    while (@as(usize, @intCast(i)) <= argv_len) : (i += 1) {
+        _ = c.lua_rawgeti(L, 1, i);
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidArgv;
+        var len: usize = 0;
+        const ptr = c.lua_tolstring(L, -1, &len) orelse return error.InvalidArgv;
+        argv[argv_built] = allocator.dupe(u8, ptr[0..len]) catch return error.OutOfMemory;
+        argv_built += 1;
+    }
+
+    var request = runner_mod.SystemRequest{ .argv = argv };
+    errdefer request.deinit(allocator);
+
+    if (c.lua_type(L, 2) == c.LUA_TNONE or c.lua_type(L, 2) == c.LUA_TNIL) return request;
+    if (c.lua_type(L, 2) != c.LUA_TTABLE) return error.InvalidOptions;
+    const opts_idx = c.lua_absindex(L, 2);
+
+    request.cwd = try optionalSystemStringField(allocator, L, opts_idx, "cwd");
+    request.stdin = try optionalSystemStringField(allocator, L, opts_idx, "stdin");
+    request.timeout_ms = optionalSystemU64Field(L, opts_idx, "timeout_ms") catch return error.InvalidOptions;
+    request.max_stdout_bytes = optionalSystemUsizeField(L, opts_idx, "max_stdout_bytes", 1024 * 1024) catch return error.InvalidOptions;
+    request.max_stderr_bytes = optionalSystemUsizeField(L, opts_idx, "max_stderr_bytes", 1024 * 1024) catch return error.InvalidOptions;
+    request.clear_env = optionalSystemBoolField(L, opts_idx, "clear_env", false) catch return error.InvalidOptions;
+    request.text = optionalSystemBoolField(L, opts_idx, "text", true) catch return error.InvalidOptions;
+    request.env = try optionalSystemEnv(allocator, L, opts_idx);
+    return request;
+}
+
+fn optionalSystemStringField(allocator: std.mem.Allocator, L: *c.lua_State, table_idx: c_int, field: [:0]const u8) SystemParseError!?[]const u8 {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return null,
+        c.LUA_TSTRING => {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, -1, &len) orelse return error.InvalidOptions;
+            return allocator.dupe(u8, ptr[0..len]) catch error.OutOfMemory;
+        },
+        else => return error.InvalidOptions,
+    }
+}
+
+fn optionalSystemU64Field(L: *c.lua_State, table_idx: c_int, field: [:0]const u8) !?u64 {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) == c.LUA_TNIL) return null;
+    if (c.lua_type(L, -1) != c.LUA_TNUMBER) return error.InvalidOptions;
+    const raw = c.lua_tointegerx(L, -1, null);
+    if (raw <= 0) return error.InvalidOptions;
+    return @intCast(raw);
+}
+
+fn optionalSystemUsizeField(L: *c.lua_State, table_idx: c_int, field: [:0]const u8, default_value: usize) !usize {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) == c.LUA_TNIL) return default_value;
+    if (c.lua_type(L, -1) != c.LUA_TNUMBER) return error.InvalidOptions;
+    const raw = c.lua_tointegerx(L, -1, null);
+    if (raw <= 0) return error.InvalidOptions;
+    const capped = @min(@as(usize, @intCast(raw)), 16 * 1024 * 1024);
+    return capped;
+}
+
+fn optionalSystemBoolField(L: *c.lua_State, table_idx: c_int, field: [:0]const u8, default_value: bool) !bool {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) == c.LUA_TNIL) return default_value;
+    if (c.lua_type(L, -1) != c.LUA_TBOOLEAN) return error.InvalidOptions;
+    return c.lua_toboolean(L, -1) != 0;
+}
+
+fn optionalSystemEnv(allocator: std.mem.Allocator, L: *c.lua_State, table_idx: c_int) SystemParseError![]runner_mod.SystemEnvPair {
+    _ = c.lua_getfield(L, table_idx, "env");
+    defer c.lua_pop(L, 1);
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNIL => return &.{},
+        c.LUA_TTABLE => {},
+        else => return error.InvalidOptions,
+    }
+    const env_idx = c.lua_absindex(L, -1);
+    var pairs: std.ArrayListUnmanaged(runner_mod.SystemEnvPair) = .empty;
+    errdefer {
+        for (pairs.items) |pair| pair.deinit(allocator);
+        pairs.deinit(allocator);
+    }
+    c.lua_pushnil(L);
+    while (c.lua_next(L, env_idx) != 0) {
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -2) != c.LUA_TSTRING or c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOptions;
+        var key_len: usize = 0;
+        const key_ptr = c.lua_tolstring(L, -2, &key_len) orelse return error.InvalidOptions;
+        var value_len: usize = 0;
+        const value_ptr = c.lua_tolstring(L, -1, &value_len) orelse return error.InvalidOptions;
+        pairs.append(allocator, .{
+            .key = allocator.dupe(u8, key_ptr[0..key_len]) catch return error.OutOfMemory,
+            .value = allocator.dupe(u8, value_ptr[0..value_len]) catch return error.OutOfMemory,
+        }) catch return error.OutOfMemory;
+    }
+    return pairs.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
+fn pushSystemResult(L: *c.lua_State, result: runner_mod.SystemResult) void {
+    switch (result) {
+        .completed => |completed| {
+            c.lua_createtable(L, 0, 5);
+            pushLiteralField(L, "status", "completed");
+            if (completed.code) |code| c.lua_pushinteger(L, @intCast(code)) else c.lua_pushnil(L);
+            c.lua_setfield(L, -2, "code");
+            if (completed.signal) |signal| c.lua_pushinteger(L, @intCast(signal)) else c.lua_pushnil(L);
+            c.lua_setfield(L, -2, "signal");
+            pushStringField(L, "stdout", completed.stdout);
+            pushStringField(L, "stderr", completed.stderr);
+        },
+        .timeout => |timeout| {
+            c.lua_createtable(L, 0, 4);
+            pushLiteralField(L, "status", "timeout");
+            pushStringField(L, "error", timeout.message);
+            pushStringField(L, "stdout", timeout.stdout);
+            pushStringField(L, "stderr", timeout.stderr);
+        },
+        .err => |err| {
+            c.lua_createtable(L, 0, 4);
+            pushLiteralField(L, "status", "error");
+            pushStringField(L, "error", err.message);
+            pushStringField(L, "stdout", err.stdout);
+            pushStringField(L, "stderr", err.stderr);
+        },
+    }
+}
+
+fn pushSystemError(L: *c.lua_State, message: []const u8) void {
+    c.lua_createtable(L, 0, 4);
+    pushLiteralField(L, "status", "error");
+    pushStringField(L, "error", message);
+    pushLiteralField(L, "stdout", "");
+    pushLiteralField(L, "stderr", "");
+}
+
+fn pushLiteralField(L: *c.lua_State, field: [:0]const u8, value: [:0]const u8) void {
+    _ = c.lua_pushstring(L, value.ptr);
+    c.lua_setfield(L, -2, field.ptr);
+}
+
+fn pushStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void {
+    _ = c.lua_pushlstring(L, value.ptr, value.len);
+    c.lua_setfield(L, -2, field.ptr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1611,6 +1813,14 @@ fn optionalProviderModelCompat(
 /// `lua_error` does not return — the cast is to satisfy the type
 /// checker for the unreachable code path.
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
+    _ = c.lua_pushstring(L, msg.ptr);
+    _ = c.lua_error(L);
+    return 0;
+}
+
+fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
     _ = c.lua_pushstring(L, msg.ptr);
     _ = c.lua_error(L);
     return 0;

@@ -12,6 +12,7 @@ Use extensions for things like:
 - asking side-channel model questions
 - registering provider/model claims
 - storing per-session extension state
+- attaching semantic notes/labels to durable session entries
 - spawning delegated child zi tasks
 
 Extensions describe what should happen. zi decides how to schedule work, update the terminal UI, store session data, call providers, and render transcript output.
@@ -91,6 +92,7 @@ Important rules:
 - use tool bodies or command handlers for user-visible work
 - use events for lifecycle policy and reaction
 - session-local UI surfaces, prompts, jobs, and provider handles should be recreated after session changes
-- durable data that should survive session changes belongs in [context state api](context.html#context-state-api)
+- private extension state that should survive session changes belongs in [context state api](context.html#context-state-api)
+- shared semantic session artifacts belong in [context session api](context.html#context-session-api), such as notes, labels, and entry lookup
 
 Common lifecycle events are [session_start](api.html#events), [session_shutdown](api.html#events), [session_before_switch](api.html#events), and [session_before_fork](api.html#events).

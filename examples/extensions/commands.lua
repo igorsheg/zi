@@ -9,13 +9,7 @@ return function(zi)
       ctx.ui.show_panel({
         id = "hello-command",
         title = "Hello command",
-        lines = {
-          {
-            { text = "Hello, ", fg = "toolTitle", bold = true },
-            { text = tostring(target), fg = "accent" },
-            { text = "!", fg = "toolTitle", bold = true },
-          },
-        },
+        body = "Hello, " .. tostring(target) .. "!",
         transient = true,
       })
     end,

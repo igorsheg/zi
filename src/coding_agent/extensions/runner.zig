@@ -12,6 +12,7 @@ const oauth_mod = @import("../auth/oauth.zig");
 const auth_types = @import("../auth/types.zig");
 const request_mod = @import("../request.zig");
 const extension_ui = @import("ui.zig");
+const system_command = @import("../../runtime/system_command.zig");
 
 const log = std.log.scoped(.zi_runner);
 
@@ -30,6 +31,7 @@ pub const AsyncOpId = u64;
 pub const AsyncKind = enum {
     @"test",
     ai_complete,
+    system,
 };
 
 pub const AiCompleteRequest = struct {
@@ -46,6 +48,75 @@ pub const AiCompleteRequest = struct {
         self.* = undefined;
     }
 };
+
+pub const SystemEnvPair = struct {
+    key: []const u8,
+    value: []const u8,
+
+    pub fn deinit(self: SystemEnvPair, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.value);
+    }
+};
+
+pub const SystemRequest = struct {
+    argv: []const []const u8,
+    cwd: ?[]const u8 = null,
+    stdin: ?[]const u8 = null,
+    env: []const SystemEnvPair = &.{},
+    clear_env: bool = false,
+    timeout_ms: ?u64 = null,
+    max_stdout_bytes: usize = system_command.default_max_output_bytes,
+    max_stderr_bytes: usize = system_command.default_max_output_bytes,
+    text: bool = true,
+
+    pub fn clone(self: SystemRequest, allocator: std.mem.Allocator) !SystemRequest {
+        const argv = try allocator.alloc([]const u8, self.argv.len);
+        errdefer allocator.free(argv);
+        var argv_built: usize = 0;
+        errdefer for (argv[0..argv_built]) |arg| allocator.free(arg);
+        for (self.argv, 0..) |arg, i| {
+            argv[i] = try allocator.dupe(u8, arg);
+            argv_built += 1;
+        }
+
+        const env = try allocator.alloc(SystemEnvPair, self.env.len);
+        errdefer allocator.free(env);
+        var env_built: usize = 0;
+        errdefer for (env[0..env_built]) |pair| pair.deinit(allocator);
+        for (self.env, 0..) |pair, i| {
+            env[i] = .{
+                .key = try allocator.dupe(u8, pair.key),
+                .value = try allocator.dupe(u8, pair.value),
+            };
+            env_built += 1;
+        }
+
+        return .{
+            .argv = argv,
+            .cwd = if (self.cwd) |value| try allocator.dupe(u8, value) else null,
+            .stdin = if (self.stdin) |value| try allocator.dupe(u8, value) else null,
+            .env = env,
+            .clear_env = self.clear_env,
+            .timeout_ms = self.timeout_ms,
+            .max_stdout_bytes = self.max_stdout_bytes,
+            .max_stderr_bytes = self.max_stderr_bytes,
+            .text = self.text,
+        };
+    }
+
+    pub fn deinit(self: *SystemRequest, allocator: std.mem.Allocator) void {
+        for (self.argv) |arg| allocator.free(arg);
+        allocator.free(self.argv);
+        if (self.cwd) |value| allocator.free(value);
+        if (self.stdin) |value| allocator.free(value);
+        for (self.env) |pair| pair.deinit(allocator);
+        if (self.env.len > 0) allocator.free(self.env);
+        self.* = undefined;
+    }
+};
+
+pub const SystemResult = system_command.Result;
 
 pub const AiCompleteResult = union(enum) {
     completed: struct { text: []const u8 },
@@ -73,11 +144,13 @@ pub const AiCompleteResult = union(enum) {
 pub const AsyncRequest = union(AsyncKind) {
     @"test": void,
     ai_complete: AiCompleteRequest,
+    system: SystemRequest,
 
     pub fn deinit(self: *AsyncRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .@"test" => {},
             .ai_complete => |*request| request.deinit(allocator),
+            .system => |*request| request.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -105,11 +178,13 @@ pub const AsyncDispatcher = struct {
 pub const AsyncResult = union(AsyncKind) {
     @"test": []const u8,
     ai_complete: AiCompleteResult,
+    system: SystemResult,
 
     pub fn clone(self: AsyncResult, allocator: std.mem.Allocator) !AsyncResult {
         return switch (self) {
             .@"test" => |value| .{ .@"test" = try allocator.dupe(u8, value) },
             .ai_complete => |result| .{ .ai_complete = try result.clone(allocator) },
+            .system => |result| .{ .system = try result.clone(allocator) },
         };
     }
 
@@ -117,6 +192,7 @@ pub const AsyncResult = union(AsyncKind) {
         switch (self.*) {
             .@"test" => |value| allocator.free(value),
             .ai_complete => |*result| result.deinit(allocator),
+            .system => |*result| result.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -897,6 +973,13 @@ pub const ExtensionRunner = struct {
         const id = self.next_async_id;
         self.next_async_id += 1;
         self.current_async_start = .{ .id = id, .request = .{ .ai_complete = request } };
+        return id;
+    }
+
+    pub fn beginSystemAsync(self: *ExtensionRunner, request: SystemRequest) AsyncOpId {
+        const id = self.next_async_id;
+        self.next_async_id += 1;
+        self.current_async_start = .{ .id = id, .request = .{ .system = request } };
         return id;
     }
 

@@ -44,7 +44,7 @@ zi's v2 docs intentionally keep the architecture different:
 
 source: `src/coding_agent/extensions/api.zig:68-102`; `src/coding_agent/extensions/context.zig:91-153`.
 
-current event registry tags cover lifecycle, tool, session start/shutdown/switch/fork, and model select (`src/coding_agent/extensions/registries/event_registry.zig:30-55`). the v2 events doc defines a wider target including resource discovery, input/context/provider transforms, user bash, compaction, and tree hooks (`docs/extensions-events.md:128-142`).
+current event registry tags cover lifecycle, tool, semantic messages, session start/shutdown/switch/fork, and model select (`src/coding_agent/extensions/registries/event_registry.zig:30-55`). the v2 events doc defines a wider target including resource discovery, input/context/provider transforms, user bash, compaction, and tree hooks (`docs/extensions-events.md:128-142`).
 
 ## open bead anchors
 
@@ -114,7 +114,7 @@ current event registry tags cover lifecycle, tool, session start/shutdown/switch
 | `dynamic-resources/` | add skills/prompts/themes dynamically | blocked | `resources_discover` aggregate returns runtime root descriptors | `zi-xb8` + resource loader integration. |
 | `message-renderer.ts` | custom message rendering | blocked | message renderer registry / transcript attachment renderer refs | `zi-0j8`. |
 | `event-bus.ts` | inter-extension communication | blocked | generation-local event bus or extension namespace pub/sub | no current public api; design after generation model. |
-| `session-name.ts`, `bookmark.ts` | session metadata and labels | blocked | session metadata actions: set/get session name, label entries | session action api + persistence. |
+| `session-name.ts`, `bookmark.ts` | session metadata and labels | shipped | `ctx.session.name`, `ctx.session.rename`, durable semantic `message.entry_id`, `ctx.session.label`, `ctx.session.labels`, `ctx.session.entry`, and `ctx.session.entries({ label = ... })`; examples include `session_name.lua`, `session_notes.lua`, and `auto_label.lua` | closed by session context, durable message ids, notes, labels, entry lookup, and label-query slices. |
 | `custom-provider-anthropic/`, `custom-provider-gitlab-duo/`, `custom-provider-qwen-cli/` | custom providers, oauth, models | partial | `zi.register_provider`, `zi.unregister_provider`, provider claims, oauth callbacks, model projection | `zi-c7v`, generation model, provider lifecycle tests. |
 | `file-trigger.ts` | file watcher injects prompt/message | blocked | job/watch substrate + send/follow-up host action | job substrate + send user message action. |
 | `bash-spawn-hook.ts`, `interactive-shell.ts` | user bash hook / interactive process takeover | blocked | `user_bash` interceptor + host-owned terminal process handoff | `zi-xb8`; decide what interactive terminal ownership means. |

@@ -27,18 +27,6 @@ local function serialize_messages(messages)
   return table.concat(lines, "\n\n")
 end
 
-local function panel_lines(text)
-  local lines = {}
-  for line in tostring(text or ""):gmatch("([^\n]*)\n?") do
-    if line == "" then
-      lines[#lines + 1] = { { text = "", fg = "muted" } }
-    else
-      lines[#lines + 1] = { { text = line, fg = "text" } }
-    end
-  end
-  if #lines == 0 then lines[1] = { { text = "No summary", fg = "muted" } } end
-  return lines
-end
 
 zi.register_command({
   name = "summarize",
@@ -66,7 +54,7 @@ zi.register_command({
     ctx.ui.show_panel({
       id = "summary",
       title = "Session summary",
-      lines = panel_lines(result.text),
+      body = result.text ~= "" and result.text or "No summary",
       transient = true,
     })
   end,

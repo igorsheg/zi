@@ -638,16 +638,41 @@ fn parsePanel(
         .generation = generation,
         .id = try readStringField(arena, L, abs_idx, "id", "panel"),
         .title = try readStringField(arena, L, abs_idx, "title", ""),
-        .lines = try readPanelLines(arena, L, abs_idx),
+        .lines = try readPanelBody(arena, L, abs_idx),
         .transient = readBoolField(L, abs_idx, "transient"),
     };
 }
 
-fn readPanelLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
-    _ = c.lua_getfield(L, idx, "lines");
+fn readPanelBody(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
+    _ = c.lua_getfield(L, idx, "body");
     defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TTABLE) return &.{};
-    return try readPanelLinesAtStack(arena, L, -1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return &.{};
+    return try readPanelBodyLines(arena, L, -1);
+}
+
+fn readPanelBodyLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
+    const body = try dupeLuaString(arena, L, idx);
+    var line_count: usize = 1;
+    for (body) |byte| {
+        if (byte == '\n') line_count += 1;
+    }
+    if (body.len > 0 and body[body.len - 1] == '\n') line_count -= 1;
+    if (line_count == 0) line_count = 1;
+
+    const lines = try arena.alloc([]const extension_ui.TextSpan, line_count);
+    var line_index: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= body.len and line_index < line_count) : (i += 1) {
+        if (i == body.len or body[i] == '\n') {
+            const spans = try arena.alloc(extension_ui.TextSpan, 1);
+            spans[0] = .{ .text = body[start..i] };
+            lines[line_index] = spans;
+            line_index += 1;
+            start = i + 1;
+        }
+    }
+    return lines;
 }
 
 fn readPanelLinesAtStack(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {

@@ -6,6 +6,7 @@
 `zi.register_command(spec)`
 : Register an interactive slash command. See [commands](#commands).
 
+
 `zi.register_provider(name, config)`
 : Register or override a provider claim. See [providers](#providers).
 
@@ -17,6 +18,9 @@
 
 `zi.spawn(opts)`
 : Run delegated child zi work through batch JSON mode. See [spawn helper](context.html#spawn-helper).
+
+`zi.system(argv, opts?)`
+: Run an argv-style system command through the extension async scheduler. Captures bounded stdout/stderr and returns a structured result.
 
 ## tools
 
@@ -89,7 +93,7 @@ return function(zi)
       ctx.ui.show_panel({
         id = "hello-command",
         title = "hello",
-        lines = { "hello, " .. (args or "zi") },
+        body = "hello, " .. (args or "zi"),
         transient = true,
       })
     end,
@@ -175,7 +179,7 @@ Supported event names include:
 : Observe assistant turn boundaries.
 
 `message_start`, `message_update`, `message_end`, `message`
-: Observe semantic transcript messages. `message_update` is for streaming assistant deltas; `message` is a compatibility/simple semantic message event.
+: Observe transcript/message edges. `message_update` is for streaming assistant deltas. `message_end` is the raw lifecycle edge. `message` is the durable semantic observer, dispatched after session persistence with `event.message.entry_id` for use with `ctx.session.entry`, notes, and labels.
 
 `tool_execution_start`, `tool_execution_update`, `tool_execution_end`
 : Observe tool execution state.

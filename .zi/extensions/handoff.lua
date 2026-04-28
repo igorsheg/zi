@@ -24,25 +24,14 @@ end
 local function line_for(msg)
   local role = msg.role or "message"
   if role == "tool_call" then
-    return {
-      { text = "tool call ", fg = "muted" },
-      { text = msg.tool_name or "?", fg = "accent" },
-      { text = " #" .. tostring(msg.tool_call_id or ""), fg = "muted" },
-    }
+    return "tool call " .. tostring(msg.tool_name or "?") .. " #" .. tostring(msg.tool_call_id or "")
   end
   if role == "tool_result" then
     local text = ""
     if type(msg.content) == "table" and msg.content[1] then text = msg.content[1].text or "" end
-    return {
-      { text = "tool result ", fg = msg.is_error and "error" or "success" },
-      { text = msg.tool_name or "?", fg = "accent" },
-      { text = ": " .. shorten(text, 120), fg = "text" },
-    }
+    return "tool result " .. tostring(msg.tool_name or "?") .. ": " .. shorten(text, 120)
   end
-  return {
-    { text = role .. ": ", fg = role == "user" and "accent" or "success" },
-    { text = shorten(msg.text or "", 140), fg = "text" },
-  }
+  return role .. ": " .. shorten(msg.text or "", 140)
 end
 
 zi.register_command({
@@ -53,17 +42,14 @@ zi.register_command({
     local info = ctx.session.info()
     local messages = ctx.session.messages({ limit = limit, include_tools = true })
     local lines = {
-      {
-        { text = "Session", fg = "accent" },
-        { text = info.name and (": " .. info.name) or "", fg = "text" },
-      },
-      { { text = "cwd: " .. tostring(info.cwd or "?"), fg = "muted" } },
-      { { text = "recent messages: " .. tostring(#messages), fg = "muted" } },
-      { { text = "", fg = "muted" } },
+      "Session" .. (info.name and (": " .. info.name) or ""),
+      "cwd: " .. tostring(info.cwd or "?"),
+      "recent messages: " .. tostring(#messages),
+      "",
     }
 
     if #messages == 0 then
-      lines[#lines + 1] = { { text = "No messages yet", fg = "muted", dim = true } }
+      lines[#lines + 1] = "No messages yet"
     else
       for _, msg in ipairs(messages) do
         lines[#lines + 1] = line_for(msg)
@@ -73,7 +59,7 @@ zi.register_command({
     ctx.ui.show_panel({
       id = "handoff",
       title = "Session handoff",
-      lines = lines,
+      body = table.concat(lines, "\n"),
       transient = true,
     })
   end,

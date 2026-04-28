@@ -8,51 +8,59 @@
 -- "extension_note". They are durable session artifacts, but not raw transcript
 -- mutation and not injected into the LLM context.
 
-zi.command("note", function(ctx, args)
-  local body = tostring(args or "")
-  local source_entry_id = nil
-  local maybe_source, rest = string.match(body, "^@([%w%-_]+)%s+(.+)$")
-  if maybe_source then
-    source_entry_id = maybe_source
-    body = rest
-  end
-  if body == "" then
-    ctx.ui.set_footer("Usage: /note [@entry-id] <text>")
-    return
-  end
+zi.register_command({
+  name = "note",
+  description = "Append a durable session note.",
+  handler = function(args, ctx)
+    local body = tostring(args or "")
+    local source_entry_id = nil
+    local maybe_source, rest = string.match(body, "^@([%w%-_]+)%s+(.+)$")
+    if maybe_source then
+      source_entry_id = maybe_source
+      body = rest
+    end
+    if body == "" then
+      ctx.ui.set_footer("Usage: /note [@entry-id] <text>")
+      return
+    end
 
-  local ok = ctx.session.append_note({
-    kind = "manual",
-    title = "Manual note",
-    body = body,
-    source_entry_id = source_entry_id,
-  })
+    local ok = ctx.session.append_note({
+      kind = "manual",
+      title = "Manual note",
+      body = body,
+      source_entry_id = source_entry_id,
+    })
 
-  if ok then
-    ctx.ui.set_footer("Saved session note")
-  else
-    ctx.ui.set_footer("Failed to save session note")
-  end
-end)
+    if ok then
+      ctx.ui.set_footer("Saved session note")
+    else
+      ctx.ui.set_footer("Failed to save session note")
+    end
+  end,
+})
 
-zi.command("notes", function(ctx)
-  local notes = ctx.session.notes({ kind = "manual", limit = 10 })
-  if #notes == 0 then
-    ctx.ui.set_footer("No manual session notes")
-    return
-  end
+zi.register_command({
+  name = "notes",
+  description = "List durable session notes.",
+  handler = function(_, ctx)
+    local notes = ctx.session.notes({ kind = "manual", limit = 10 })
+    if #notes == 0 then
+      ctx.ui.set_footer("No manual session notes")
+      return
+    end
 
-  local lines = {}
-  for i, note in ipairs(notes) do
-    local title = note.title or note.kind or "note"
-    lines[#lines + 1] = tostring(i) .. ". " .. title
-    lines[#lines + 1] = note.body or ""
-    lines[#lines + 1] = ""
-  end
+    local lines = {}
+    for i, note in ipairs(notes) do
+      local title = note.title or note.kind or "note"
+      lines[#lines + 1] = tostring(i) .. ". " .. title
+      lines[#lines + 1] = note.body or ""
+      lines[#lines + 1] = ""
+    end
 
-  ctx.ui.show_panel({
-    id = "session-notes",
-    title = "Session notes",
-    body = table.concat(lines, "\n"),
-  })
-end)
+    ctx.ui.show_panel({
+      id = "session-notes",
+      title = "Session notes",
+      body = table.concat(lines, "\n"),
+    })
+  end,
+})

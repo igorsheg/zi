@@ -51,8 +51,8 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 
 The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
 
-`ctx.ui.show_panel({ id, title, lines, transient })`
-: Show a host-owned panel. `lines` may be strings or arrays of text spans. A span may include `text`, `fg`, and `dim`.
+`ctx.ui.show_panel({ id, title, body, transient })`
+: Show a host-owned panel. `body` is plain text; zi owns splitting and rendering.
 
 `ctx.ui.notify(text, kind)`
 : Publish a notification. `kind` is `info`, `warning`, or `error`; unknown kinds fall back to `info`.
@@ -137,19 +137,19 @@ State is scoped to the extension and active session. It may survive session chan
 : Set or clear the session name. Returns boolean success.
 
 `ctx.session.messages({ limit?, include_tools? })`
-: Return recent semantic messages. Default limit is 50; maximum is 500. `include_tools` defaults to true.
+: Return recent semantic messages from the current visible branch. Default limit is 50; maximum is 500. `include_tools` defaults to true. Returned messages include durable `entry_id` values.
 
 `ctx.session.tool_results(tool_name)`
 : Return recorded tool results for a tool.
 
 `ctx.session.append_note({ kind, title?, body, source_entry_id? })`
-: Append a semantic session note. `source_entry_id` links the note to a durable session entry. Returns boolean success.
+: Append a semantic session note. `source_entry_id` links the note to a durable session entry. `sourceEntryId` is accepted as an alias. Notes are durable custom session artifacts, not transcript mutation. Returns boolean success.
 
 `ctx.session.notes({ kind?, source_entry_id?, limit? })`
 : Return session notes. Default limit is 50; maximum is 500.
 
 `ctx.session.label(entry_id, label)`
-: Append a lightweight durable label for a session entry. Passing `nil` or an empty string clears the label. Returns boolean success.
+: Append a lightweight durable label for a session entry. Passing `nil` or an empty string clears the label. Labels have no built-in meanings, colors, or priorities. Returns boolean success.
 
 `ctx.session.labels({ target_entry_id?, limit? })`
 : Return label entries, optionally filtered to a target session entry. Default limit is 50; maximum is 500.
@@ -158,7 +158,31 @@ State is scoped to the extension and active session. It may survive session chan
 : Return one semantic session entry by durable id, or `nil` when not found. Message entries return role/text fields when they map to one semantic message; labels return `target_entry_id` and `label`; extension notes return note fields.
 
 `ctx.session.entries({ label?, limit? })`
-: Return semantic session entries by simple predicates. Currently supports `label`; latest label wins, and cleared labels are excluded. Default limit is 50; maximum is 500.
+: Return semantic target entries by simple predicates. Currently supports `label`; latest label wins per target entry, cleared labels are excluded, and returned rows are target entries rather than label entries. Default limit is 50; maximum is 500.
+
+Durable message ids compose with notes and labels:
+
+```lua
+zi.on("message", function(event, ctx)
+  local message = event.message or {}
+  if message.role == "user" and message.text and message.text:match("decision") then
+    ctx.session.label(message.entry_id, "decision")
+    ctx.session.append_note({
+      kind = "observation",
+      body = "decision candidate",
+      source_entry_id = message.entry_id,
+    })
+  end
+end)
+```
+
+Later, an extension can query and dereference:
+
+```lua
+for _, entry in ipairs(ctx.session.entries({ label = "decision", limit = 20 })) do
+  local notes = ctx.session.notes({ source_entry_id = entry.entry_id })
+end
+```
 
 ## context model and ai api
 
@@ -195,6 +219,56 @@ The result shape is:
 { status = "error", error = "..." }
 { status = "cancelled" }
 ```
+
+## system command helper
+
+`zi.system(argv, opts?)` runs an OS command directly from an argv array. It is yieldable and should be called from command/tool execution contexts, not extension load/register code.
+
+```lua
+local result = zi.system({ "git", "status", "--short" }, {
+  cwd = ctx.cwd,
+  timeout_ms = 5000,
+})
+```
+
+There is no implicit shell string form. Use an explicit shell when needed:
+
+```lua
+zi.system({ "/bin/sh", "-c", "echo $HOME" })
+```
+
+Options:
+
+`cwd`
+: Working directory.
+
+`stdin`
+: Optional stdin string.
+
+`env`
+: Optional string map overlaid on the inherited environment.
+
+`clear_env`
+: Boolean. When true, only `env` is used.
+
+`timeout_ms`
+: Optional timeout in milliseconds.
+
+`max_stdout_bytes`, `max_stderr_bytes`
+: Optional bounded capture limits.
+
+`text`
+: Boolean. Defaults true and normalizes CRLF to LF.
+
+Result shapes:
+
+```lua
+{ status = "completed", code = 0, signal = nil, stdout = "...", stderr = "..." }
+{ status = "error", error = "...", stdout = "", stderr = "" }
+{ status = "timeout", error = "timed out after ...ms", stdout = "...partial...", stderr = "...partial..." }
+```
+
+Non-zero exits are `status = "completed"`; inspect `code`.
 
 ## spawn helper
 
