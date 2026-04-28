@@ -24,20 +24,33 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const run_mdman_html = b.addRunArtifact(mdman);
-    run_mdman_html.addArgs(&.{ "--html-fragment", "--name", "zi", "--section", "1" });
-    run_mdman_html.addFileArg(b.path("docs/zi.1.md"));
-    const man_fragment = run_mdman_html.captureStdOut();
-
-    const man_page = b.addSystemCommand(&.{ "cat", "--" });
-    man_page.addFileArg(b.path("docs/web/man-header.html"));
-    man_page.addFileArg(man_fragment);
-    man_page.addFileArg(b.path("docs/web/man-footer.html"));
-    const install_man = b.addInstallFileWithDir(man_page.captureStdOut(), .prefix, "man/index.html");
+    const man_pages = .{
+        .{ "docs/man/00-intro.md", "man/index.html" },
+        .{ "docs/man/10-cli.md", "man/cli.html" },
+        .{ "docs/man/20-extension-model.md", "man/extensions.html" },
+        .{ "docs/man/30-extension-api.md", "man/api.html" },
+        .{ "docs/man/40-context-api.md", "man/context.html" },
+        .{ "docs/man/50-guidance.md", "man/guidance.html" },
+    };
 
     const web = b.step("web", "Build the compound static website");
     web.dependOn(&zine_site.step);
-    web.dependOn(&install_man.step);
+
+    inline for (man_pages) |entry| {
+        const md_file, const html_file = entry;
+
+        const run_mdman_html = b.addRunArtifact(mdman);
+        run_mdman_html.addArgs(&.{ "--html-fragment", "--name", "zi", "--section", "1" });
+        run_mdman_html.addFileArg(b.path(md_file));
+        const man_fragment = run_mdman_html.captureStdOut();
+
+        const man_page = b.addSystemCommand(&.{ "cat", "--" });
+        man_page.addFileArg(b.path("docs/web/man-header.html"));
+        man_page.addFileArg(man_fragment);
+        man_page.addFileArg(b.path("docs/web/man-footer.html"));
+        const install_man = b.addInstallFileWithDir(man_page.captureStdOut(), .prefix, html_file);
+        web.dependOn(&install_man.step);
+    }
 
     b.getInstallStep().dependOn(web);
 }

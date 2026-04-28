@@ -24,12 +24,18 @@
   body,
   h1,
   h2,
+  h3,
   p,
   ul,
   ol,
   dl,
+  dt,
   dd,
-  pre { margin: 0; }
+  pre,
+  blockquote { margin: 0; }
+
+  ul,
+  ol { padding: 0; }
 }
 
 @layer tokens {
@@ -62,6 +68,11 @@
     --measure-xs: 18ch;
     --measure-sm: 48ch;
     --measure-md: 56rem;
+    --measure-man: 72rem;
+
+    --prose-indent: var(--space-6);
+    --prose-gap: var(--space-4);
+    --prose-section-gap: var(--space-10);
 
     /* type scale: sizes and line heights resolve to the 4px grid */
     --text-0: 1rem;    /* 16px */
@@ -195,15 +206,21 @@
   }
 
   .manual {
-    padding-block: var(--space-8);
+    inline-size: min(100% - (2 * var(--page-pad)), var(--measure-man));
+    padding-block: var(--space-8) var(--space-16);
+    color: var(--color-muted);
   }
 
   .manual .site-nav {
     margin-block-end: var(--space-12);
+    font-size: var(--text-0);
+    line-height: var(--leading-0);
   }
 
   .manual h1,
-  .manual h2 {
+  .manual h2,
+  .manual h3 {
+    color: var(--color-fg);
     font-size: var(--text-0);
     font-weight: 600;
     line-height: var(--leading-0);
@@ -211,23 +228,78 @@
   }
 
   .manual h1 {
-    color: var(--color-fg);
+    margin-block-end: var(--space-8);
   }
 
   .manual h2 {
+    margin-block-start: var(--prose-section-gap);
+    color: var(--color-subtle);
+  }
+
+  .manual h3 {
     margin-block-start: var(--space-8);
     color: var(--color-subtle);
   }
 
   .manual p,
   .manual ul,
+  .manual ol,
   .manual dl,
-  .manual pre {
-    max-inline-size: var(--measure-sm);
-    margin-block-start: var(--space-4);
-    margin-inline-start: var(--space-8);
-    color: var(--color-muted);
+  .manual pre,
+  .manual blockquote {
+    margin-block-start: var(--prose-gap);
+  }
+
+  .manual p,
+  .manual li,
+  .manual dd {
+    text-wrap: pretty;
+  }
+
+  .manual ul,
+  .manual ol {
+    padding-inline-start: var(--prose-indent);
   }
 
   .manual li + li { margin-block-start: var(--space-2); }
+
+  .manual dl {
+    display: grid;
+    grid-template-columns: minmax(16ch, 24ch) minmax(0, 1fr);
+    column-gap: var(--space-6);
+    row-gap: var(--space-2);
+  }
+
+  .manual dt {
+    color: var(--color-fg);
+    font-weight: 600;
+  }
+
+  .manual dd {
+    min-inline-size: 0;
+  }
+
+  .manual pre {
+    border: 1px solid var(--color-border);
+  }
+
+  .manual blockquote {
+    padding-inline-start: var(--prose-indent);
+    border-inline-start: 1px solid var(--color-border);
+  }
+
+  .manual :not(pre) > code {
+    color: var(--color-subtle);
+  }
+
+  @media (max-width: 48rem) {
+    .manual dl {
+      grid-template-columns: 1fr;
+      row-gap: 0;
+    }
+
+    .manual dd + dt {
+      margin-block-start: var(--space-3);
+    }
+  }
 }
