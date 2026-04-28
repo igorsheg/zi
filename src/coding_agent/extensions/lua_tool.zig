@@ -914,6 +914,11 @@ test "todo fixture registers a tool, command, details, and renderer" {
     try testing.expectEqualStrings("write parity ledger", rendered.collapsed[1][2].text);
 }
 
+const TestLabelEntry = struct {
+    target_entry_id: []const u8,
+    label: ?[]const u8,
+};
+
 const TestStateStore = struct {
     allocator: std.mem.Allocator,
     value: ?std.json.Value = null,
@@ -928,6 +933,7 @@ const TestStateStore = struct {
     note_source_entry_id: ?[]const u8 = null,
     label_target_entry_id: ?[]const u8 = null,
     label_value: ?[]const u8 = null,
+    label_history: std.ArrayListUnmanaged(TestLabelEntry) = .empty,
     cancel_count: usize = 0,
     revoke_count: usize = 0,
 
@@ -947,6 +953,11 @@ const TestStateStore = struct {
         if (self.note_source_entry_id) |value| self.allocator.free(value);
         if (self.label_target_entry_id) |value| self.allocator.free(value);
         if (self.label_value) |value| self.allocator.free(value);
+        for (self.label_history.items) |label_item| {
+            self.allocator.free(label_item.target_entry_id);
+            if (label_item.label) |value| self.allocator.free(value);
+        }
+        self.label_history.deinit(self.allocator);
         self.note_kind = null;
         self.note_title = null;
         self.note_body = null;
@@ -1048,6 +1059,10 @@ const TestStateStore = struct {
         if (self.label_value) |value| self.allocator.free(value);
         self.label_target_entry_id = try self.allocator.dupe(u8, target_entry_id);
         self.label_value = if (label) |value| try self.allocator.dupe(u8, value) else null;
+        try self.label_history.append(self.allocator, .{
+            .target_entry_id = try self.allocator.dupe(u8, target_entry_id),
+            .label = if (label) |value| try self.allocator.dupe(u8, value) else null,
+        });
     }
 
     fn entry(session: *anyopaque, allocator: std.mem.Allocator, entry_id: []const u8) ?std.json.Value {
@@ -1080,6 +1095,38 @@ const TestStateStore = struct {
             return .{ .object = obj };
         }
         return null;
+    }
+
+    fn latestLabel(self: *TestStateStore, target_entry_id: []const u8) ?[]const u8 {
+        var i = self.label_history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const label_item = self.label_history.items[i];
+            if (std.mem.eql(u8, label_item.target_entry_id, target_entry_id)) return label_item.label;
+        }
+        return null;
+    }
+
+    fn appendLabeledTestEntry(allocator: std.mem.Allocator, arr: *std.json.Array, self: *TestStateStore, target_entry_id: []const u8, wanted_label: []const u8, text: []const u8) !void {
+        const current = self.latestLabel(target_entry_id) orelse return;
+        if (!std.mem.eql(u8, current, wanted_label)) return;
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, target_entry_id) });
+        try obj.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "message") });
+        try obj.put(try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "user") });
+        try obj.put(try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+        try arr.append(.{ .object = obj });
+    }
+
+    fn entries(session: *anyopaque, allocator: std.mem.Allocator, label: ?[]const u8, limit: usize) ?std.json.Value {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        _ = limit;
+        var arr = std.json.Array.init(allocator);
+        const wanted = label orelse return .{ .array = arr };
+        appendLabeledTestEntry(allocator, &arr, self, "entry-a", wanted, "first decision") catch return null;
+        appendLabeledTestEntry(allocator, &arr, self, "entry-b", wanted, "kept decision") catch return null;
+        appendLabeledTestEntry(allocator, &arr, self, "entry-2", wanted, "important entry") catch return null;
+        return .{ .array = arr };
     }
 
     fn labels(session: *anyopaque, allocator: std.mem.Allocator, target_entry_id: ?[]const u8, limit: usize) ?std.json.Value {
@@ -1227,6 +1274,7 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_label_set = &TestStateStore.setLabel,
         .session_labels_get = &TestStateStore.labels,
         .session_entry_get = &TestStateStore.entry,
+        .session_entries_get = &TestStateStore.entries,
         .show_panel = &TestStateStore.showPanel,
         .publish_prompt = &TestStateStore.publishPrompt,
         .cancel_prompts = &TestStateStore.cancelPrompts,
@@ -1313,6 +1361,14 @@ test "extension command context exposes read-only session surface" {
         \\    assert(label_entry.target_entry_id == "entry-2")
         \\    assert(label_entry.label == "important")
         \\    assert(ctx.session.entry("missing") == nil)
+        \\    assert(ctx.session.label("entry-a", "decision") == true)
+        \\    assert(ctx.session.label("entry-b", "decision") == true)
+        \\    assert(ctx.session.label("entry-a", "") == true)
+        \\    local decision_entries = ctx.session.entries({ label = "decision" })
+        \\    assert(#decision_entries == 1)
+        \\    assert(decision_entries[1].entry_id == "entry-b")
+        \\    assert(decision_entries[1].text == "kept decision")
+        \\    assert(#ctx.session.entries({ label = "missing" }) == 0)
         \\    assert(ctx.session.label("entry-2", "") == true)
         \\    labels = ctx.session.labels({ target_entry_id = "entry-2" })
         \\    assert(#labels == 1)

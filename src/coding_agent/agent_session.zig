@@ -709,6 +709,7 @@ pub const AgentSession = struct {
             .session_label_set = &runtimeSessionLabelSet,
             .session_labels_get = &runtimeSessionLabelsGet,
             .session_entry_get = &runtimeSessionEntryGet,
+            .session_entries_get = &runtimeSessionEntriesGet,
             .show_panel = &runtimeShowPanel,
             .publish_prompt = &runtimePublishPrompt,
             .resolve_prompt = &runtimeResolvePrompt,
@@ -1228,6 +1229,38 @@ pub const AgentSession = struct {
     fn runtimeSessionLabelSet(session_ptr: *anyopaque, target_entry_id: []const u8, label: ?[]const u8) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
         self.session_store.appendLabel(target_entry_id, label);
+    }
+
+    fn runtimeSessionEntriesGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, label: ?[]const u8, limit: usize) ?std.json.Value {
+        const wanted = label orelse return .{ .array = std.json.Array.init(allocator) };
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
+        defer allocator.free(branch);
+
+        var latest_labels: std.StringHashMapUnmanaged(?[]const u8) = .{};
+        defer latest_labels.deinit(allocator);
+        for (branch) |entry| {
+            const label_entry = switch (entry.entry) {
+                .label => |value| value,
+                else => continue,
+            };
+            latest_labels.put(allocator, label_entry.target_id, label_entry.label) catch return null;
+        }
+
+        var all = std.json.Array.init(allocator);
+        for (branch) |entry| {
+            const current = latest_labels.get(entry.id) orelse continue;
+            const current_label = current orelse continue;
+            if (!std.mem.eql(u8, current_label, wanted)) continue;
+            all.append(sessionEntryJson(allocator, entry) catch return null) catch return null;
+        }
+        if (all.items.len <= limit) return .{ .array = all };
+        const start = all.items.len - limit;
+        for (all.items[0..start]) |value| ai.json_util.freeJsonValue(allocator, value);
+        var out = std.json.Array.init(allocator);
+        for (all.items[start..]) |value| out.append(value) catch return null;
+        all.deinit();
+        return .{ .array = out };
     }
 
     fn sessionLabelJson(allocator: std.mem.Allocator, entry_id: []const u8, label_entry: session_proto.LabelEntry) !std.json.Value {

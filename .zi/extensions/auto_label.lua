@@ -25,6 +25,18 @@ zi.on("message", function(event, ctx)
   end
 end)
 
+local function preview_entry(entry)
+  if not entry then
+    return "<missing>"
+  end
+  local preview = entry.text or entry.entry_id or "<entry>"
+  preview = string.gsub(preview, "\n", " ")
+  if #preview > 72 then
+    preview = string.sub(preview, 1, 69) .. "..."
+  end
+  return preview
+end
+
 zi.command("labels", function(ctx, args)
   local target = tostring(args or "")
   local opts = { limit = 20 }
@@ -40,15 +52,21 @@ zi.command("labels", function(ctx, args)
 
   local lines = {}
   for _, item in ipairs(labels) do
-    local entry = ctx.session.entry(item.target_entry_id)
-    local preview = item.target_entry_id
-    if entry and entry.text then
-      preview = string.gsub(entry.text, "\n", " ")
-      if #preview > 72 then
-        preview = string.sub(preview, 1, 69) .. "..."
-      end
-    end
-    table.insert(lines, string.format("%s: %s", item.label or "<cleared>", preview))
+    table.insert(lines, string.format("%s: %s", item.label or "<cleared>", preview_entry(ctx.session.entry(item.target_entry_id))))
   end
   ctx.ui.show_panel({ title = "Labels", body = table.concat(lines, "\n") })
+end)
+
+zi.command("decisions", function(ctx)
+  local entries = ctx.session.entries({ label = "decision", limit = 20 })
+  if #entries == 0 then
+    ctx.ui.show_panel({ title = "Decisions", body = "No decisions found." })
+    return
+  end
+
+  local lines = {}
+  for _, entry in ipairs(entries) do
+    table.insert(lines, "- " .. preview_entry(entry))
+  end
+  ctx.ui.show_panel({ title = "Decisions", body = table.concat(lines, "\n") })
 end)

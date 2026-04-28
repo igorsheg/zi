@@ -860,7 +860,7 @@ fn pushModelsApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
 
 fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     const has_session = switch (runner.runtime) {
-        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null or bound.session_note_append != null or bound.session_notes_get != null or bound.session_label_set != null or bound.session_labels_get != null or bound.session_entry_get != null,
+        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null or bound.session_note_append != null or bound.session_notes_get != null or bound.session_label_set != null or bound.session_labels_get != null or bound.session_entry_get != null or bound.session_entries_get != null,
         .stub => false,
     };
     if (!has_session) {
@@ -868,7 +868,7 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
         return;
     }
 
-    c.lua_createtable(L, 0, 10);
+    c.lua_createtable(L, 0, 11);
     pushMethod(L, runner, &ctxSessionInfo);
     c.lua_setfield(L, -2, "info");
     pushMethod(L, runner, &ctxSessionName);
@@ -889,6 +889,8 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_setfield(L, -2, "labels");
     pushMethod(L, runner, &ctxSessionEntry);
     c.lua_setfield(L, -2, "entry");
+    pushMethod(L, runner, &ctxSessionEntries);
+    c.lua_setfield(L, -2, "entries");
 }
 
 fn ctxModelsCurrent(L_opt: ?*c.lua_State) callconv(.c) c_int {
@@ -1282,6 +1284,42 @@ fn ctxSessionEntry(L_opt: ?*c.lua_State) callconv(.c) c_int {
         },
         .stub => {
             c.lua_pushnil(L);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionEntries(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    var limit: usize = 50;
+    var label: ?[]const u8 = null;
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        const idx = c.lua_absindex(L, 1);
+        label = readBorrowedStringField(L, idx, "label");
+        _ = c.lua_getfield(L, idx, "limit");
+        if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+            const raw = c.lua_tointegerx(L, -1, null);
+            if (raw > 0) limit = @intCast(@min(raw, 500));
+        }
+        c.lua_pop(L, 1);
+    }
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_entries_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator, label, limit) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
             return 1;
         },
     }
