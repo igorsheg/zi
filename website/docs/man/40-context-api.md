@@ -52,13 +52,13 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
 
 `ctx.ui.message(text, opts?)`
-: Publish short feedback. The host chooses a visible, low-disruption placement.
+: Publish short feedback. `opts.id` is the dedupe/update key; `opts.kind` is `info`, `warning`, `error`, or `success`. The host chooses a visible, low-disruption placement.
 
 `ctx.ui.status({ id, text, value, lifetime? })`
 : Publish compact retained state by stable id. `text` or `value` is shown; nil clears the item.
 
-`ctx.ui.progress({ id, title, current?, total?, detail?, text?, lifetime? })`
-: Publish retained progress/working state. The host formats and places it.
+`ctx.ui.progress({ id, status?, title?, current?, total?, detail?, indeterminate?, text?, lifetime? })`
+: Publish retained progress lifecycle state. `status` is `running`, `done`, `error`, or `cancelled`. The host formats and places it.
 
 `ctx.ui.report({ id, title, body, transient? })`
 : Publish a readable document/report. `body` is plain text; zi owns splitting, scrolling, and rendering.

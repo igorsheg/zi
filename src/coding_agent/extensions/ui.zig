@@ -118,6 +118,13 @@ pub const UiPublicationKind = enum {
     progress,
 };
 
+pub const ProgressStatus = enum {
+    running,
+    done,
+    @"error",
+    cancelled,
+};
+
 pub const UiLifetime = enum {
     session,
     until_input,
@@ -129,6 +136,13 @@ pub const UiPublication = struct {
     kind: UiPublicationKind,
     id: []const u8,
     text: ?[]const u8 = null,
+    classification: ?[]const u8 = null,
+    progress_status: ?ProgressStatus = null,
+    title: ?[]const u8 = null,
+    detail: ?[]const u8 = null,
+    current: ?i64 = null,
+    total: ?i64 = null,
+    indeterminate: bool = false,
     lifetime: UiLifetime = .session,
 
     pub fn clone(allocator: std.mem.Allocator, update: UiPublication) !UiPublication {
@@ -137,12 +151,25 @@ pub const UiPublication = struct {
         const id = try allocator.dupe(u8, update.id);
         errdefer allocator.free(id);
         const text = if (update.text) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (text) |value| allocator.free(value);
+        const classification = if (update.classification) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (classification) |value| allocator.free(value);
+        const title = if (update.title) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (title) |value| allocator.free(value);
+        const detail = if (update.detail) |value| try allocator.dupe(u8, value) else null;
         return .{
             .state_owner_id = state_owner_id,
             .generation = update.generation,
             .kind = update.kind,
             .id = id,
             .text = text,
+            .classification = classification,
+            .progress_status = update.progress_status,
+            .title = title,
+            .detail = detail,
+            .current = update.current,
+            .total = update.total,
+            .indeterminate = update.indeterminate,
             .lifetime = update.lifetime,
         };
     }
@@ -151,6 +178,9 @@ pub const UiPublication = struct {
         allocator.free(self.state_owner_id);
         allocator.free(self.id);
         if (self.text) |value| allocator.free(value);
+        if (self.classification) |value| allocator.free(value);
+        if (self.title) |value| allocator.free(value);
+        if (self.detail) |value| allocator.free(value);
         self.* = undefined;
     }
 };

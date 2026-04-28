@@ -239,8 +239,9 @@ fn publishMessageFromArgs(L: *c.lua_State) !void {
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
         .kind = .message,
-        .id = try readMessageKind(aa, L, 2),
+        .id = try readMessageId(aa, L, 2),
         .text = try readOptionalArgString(aa, L, 1),
+        .classification = try readMessageKind(aa, L, 2),
         .lifetime = try readUiLifetime(L, 2),
     };
     try callback(bound.session, update);
@@ -286,16 +287,27 @@ fn publishProgressFromArgs(L: *c.lua_State) !void {
     const aa = arena.allocator();
     const spec_idx = c.lua_absindex(L, 1);
     const id = try readStringField(aa, L, spec_idx, "id", "progress");
-    const text = try formatProgressText(aa, L, spec_idx);
+    const explicit_text = try readOptionalStringField(aa, L, spec_idx, "text");
     const update = extension_ui.UiPublication{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
         .kind = .progress,
         .id = id,
-        .text = text,
+        .text = explicit_text,
+        .progress_status = try readProgressStatus(aa, L, spec_idx),
+        .title = try readOptionalStringField(aa, L, spec_idx, "title"),
+        .detail = try readOptionalStringField(aa, L, spec_idx, "detail"),
+        .current = readOptionalNumberField(L, spec_idx, "current"),
+        .total = readOptionalNumberField(L, spec_idx, "total"),
+        .indeterminate = readBoolField(L, spec_idx, "indeterminate"),
         .lifetime = try readUiLifetime(L, spec_idx),
     };
     try callback(bound.session, update);
+}
+
+fn readMessageId(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
+    if (c.lua_type(L, idx) != c.LUA_TTABLE) return try arena.dupe(u8, "default");
+    return try readStringField(arena, L, idx, "id", "default");
 }
 
 fn readMessageKind(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
@@ -309,28 +321,19 @@ fn readMessageKind(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]con
     return try arena.dupe(u8, "info");
 }
 
+fn readProgressStatus(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui.ProgressStatus {
+    const value = try readOptionalStringField(arena, L, idx, "status") orelse return .running;
+    if (std.mem.eql(u8, value, "running")) return .running;
+    if (std.mem.eql(u8, value, "done")) return .done;
+    if (std.mem.eql(u8, value, "error")) return .@"error";
+    if (std.mem.eql(u8, value, "cancelled")) return .cancelled;
+    return .running;
+}
+
 fn readStatusText(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
     if (try readOptionalStringField(arena, L, idx, "text")) |text| return text;
     if (try readOptionalStringField(arena, L, idx, "value")) |value| return value;
     return null;
-}
-
-fn formatProgressText(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
-    if (try readOptionalStringField(arena, L, idx, "text")) |text| return text;
-    const title = try readStringField(arena, L, idx, "title", "Progress");
-    const detail = try readOptionalStringField(arena, L, idx, "detail");
-    const current = readOptionalNumberField(L, idx, "current");
-    const total = readOptionalNumberField(L, idx, "total");
-    if (current) |cur| {
-        if (total) |tot| {
-            if (detail) |d| return try std.fmt.allocPrint(arena, "{s} {d}/{d} — {s}", .{ title, cur, tot, d });
-            return try std.fmt.allocPrint(arena, "{s} {d}/{d}", .{ title, cur, tot });
-        }
-        if (detail) |d| return try std.fmt.allocPrint(arena, "{s} {d} — {s}", .{ title, cur, d });
-        return try std.fmt.allocPrint(arena, "{s} {d}", .{ title, cur });
-    }
-    if (detail) |d| return try std.fmt.allocPrint(arena, "{s} — {s}", .{ title, d });
-    return title;
 }
 
 fn readOptionalNumberField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?i64 {

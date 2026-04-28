@@ -1471,7 +1471,7 @@ test "extension command context publishes semantic ui message status and progres
         \\  name = "ui_publications",
         \\  description = "ui_publications",
         \\  handler = function(_, ctx)
-        \\    ctx.ui.message("Ready for input", { kind = "warning", lifetime = "until_input" })
+        \\    ctx.ui.message("Ready for input", { id = "readiness", kind = "warning", lifetime = "until_input" })
         \\    ctx.ui.status({ id = "demo", text = "ready" })
         \\    ctx.ui.progress({ id = "index", title = "Indexing", current = 2, total = 4, detail = "src" })
         \\  end,
@@ -1482,14 +1482,20 @@ test "extension command context publishes semantic ui message status and progres
 
     try testing.expectEqual(@as(usize, 3), store.ui_publications.items.len);
     try testing.expectEqual(extension_ui.UiPublicationKind.message, store.ui_publications.items[0].kind);
-    try testing.expectEqualStrings("warning", store.ui_publications.items[0].id);
+    try testing.expectEqualStrings("readiness", store.ui_publications.items[0].id);
     try testing.expectEqualStrings("Ready for input", store.ui_publications.items[0].text.?);
+    try testing.expectEqualStrings("warning", store.ui_publications.items[0].classification.?);
     try testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[1].kind);
     try testing.expectEqualStrings("demo", store.ui_publications.items[1].id);
     try testing.expectEqualStrings("ready", store.ui_publications.items[1].text.?);
     try testing.expectEqual(extension_ui.UiPublicationKind.progress, store.ui_publications.items[2].kind);
     try testing.expectEqualStrings("index", store.ui_publications.items[2].id);
-    try testing.expectEqualStrings("Indexing 2/4 — src", store.ui_publications.items[2].text.?);
+    try testing.expect(store.ui_publications.items[2].text == null);
+    try testing.expectEqual(extension_ui.ProgressStatus.running, store.ui_publications.items[2].progress_status.?);
+    try testing.expectEqualStrings("Indexing", store.ui_publications.items[2].title.?);
+    try testing.expectEqual(@as(i64, 2), store.ui_publications.items[2].current.?);
+    try testing.expectEqual(@as(i64, 4), store.ui_publications.items[2].total.?);
+    try testing.expectEqualStrings("src", store.ui_publications.items[2].detail.?);
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 1), store.revoke_count);

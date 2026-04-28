@@ -120,7 +120,7 @@ avoid public `placement = "left"` / `placement = "right"` unless a real product 
 
 retained work lifecycle. separate from status because progress has terminal states.
 
-v1 can materialize compactly, but the semantic shape should support real progress later:
+v1 materializes compactly, but the host transport preserves progress semantics:
 
 ```lua
 ctx.ui.progress({
@@ -514,9 +514,9 @@ this table is the guardrail against the api becoming scattered.
 
 | primitive | endgame contract | current public api | current materialization | consistency gaps to close |
 | --- | --- | --- | --- | --- |
-| `message` | ephemeral short feedback with `{ kind, id?, lifetime? }`; host routes to composer-adjacent text/status/toast/log | exists as `ctx.ui.message(text, opts?)`; `kind` is accepted through opts | publishes `UiPublication.message` and materializes as TUI-owned short text | make `id` semantics explicit for dedupe/update; decide terminal-notification policy |
+| `message` | ephemeral short feedback with `{ kind, id?, lifetime? }`; host routes to composer-adjacent text/status/toast/log | exists as `ctx.ui.message(text, opts?)`; `id` and `kind` are distinct | publishes `UiPublication.message` and materializes as TUI-owned short text | decide terminal-notification policy |
 | `status` | compact retained state keyed by `id`; optional `label`, `kind`, `priority`, `lifetime`; no placement | exists as `ctx.ui.status({ id, text/value })` | publishes `UiPublication.status`, maps to `StatusData.extension_statuses` and `StatusLine` | internal storage is string-only and sorted by key; no severity/priority yet |
-| `progress` | retained work lifecycle keyed by `id` with `status = running/done/error/cancelled`, `title`, `detail`, counts | exists as `ctx.ui.progress(spec)` but is currently text-shaped | publishes `UiPublication.progress` and materializes compactly near reports/messages | needs real progress record type instead of formatted text |
+| `progress` | retained work lifecycle keyed by `id` with `status = running/done/error/cancelled`, `title`, `detail`, counts | exists as `ctx.ui.progress(spec)` with preserved semantic fields | publishes `UiPublication.progress` and materializes compactly near reports/messages | needs richer retained registry/materialization, not a new public shape |
 | `report` | durable readable document by `id`; plain text baseline; future host-owned markdown/actions/destination policy | exists as `ctx.ui.report({ id?, title?, body, transient? })` | travels through internal `Report` transport and `Text` materialization | preserve scroll by id; add explicit `format = "text"` before markdown |
 | `prompt` | modal request envelope with typed kind, declarative validation, timeout, semantic result | exists as `ctx.ui.prompt({ kind = confirm/select/input/editor, ... })` | uses `Overlay`, `ListPicker`, and `Editor` flows | add declarative validation; keep result shape aligned with `pick` |
 | `pick` | telescope-like chooser: entries/source/search/preview/actions/multi-select over time; no hot-path lua callbacks | exists as `ctx.ui.pick({ title, options })` | currently prompt/select-shaped over `ListPicker`/`SelectList` | add richer item fields, selected item in result, placeholder/empty text, static preview; keep callbacks host-owned |
@@ -542,7 +542,7 @@ all public `ctx.ui` primitives should obey the same grammar:
 
 these are implementation debts, not public api holes:
 
-- make `progress` an explicit retained record instead of formatted text.
+- add richer retained progress registry/materialization on top of the existing semantic progress record.
 - upgrade `PromptRequest.SelectOption` to carry `description` and future item metadata.
 - return selected `item` from `pick`, not just `value`.
 - define terminal notification policy as one possible host materialization of `message`, not a separate extension concept.

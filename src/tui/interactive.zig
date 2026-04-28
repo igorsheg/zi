@@ -3278,7 +3278,7 @@ pub const Interactive = struct {
             switch (update.kind) {
                 .message => self.applyUiPublicationText(&self.extension_message_text, update),
                 .status => self.status_data.setStatus(update.id, update.text),
-                .progress => self.applyUiPublicationText(&self.extension_report_text, update),
+                .progress => self.applyProgressPublication(update),
             }
         }
         self.tui.dirty = true;
@@ -3286,6 +3286,38 @@ pub const Interactive = struct {
 
     fn applyUiPublicationText(_: *Interactive, text_component: *text_mod.Text, update: @import("../coding_agent/extensions/ui.zig").UiPublication) void {
         text_component.setContent(update.text orelse "");
+    }
+
+    fn applyProgressPublication(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").UiPublication) void {
+        const text = self.formatProgressPublication(update) catch return;
+        defer self.allocator.free(text);
+        self.extension_report_text.setContent(text);
+    }
+
+    fn formatProgressPublication(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").UiPublication) ![]const u8 {
+        if (update.text) |text| return try self.allocator.dupe(u8, text);
+        const title = update.title orelse "Progress";
+        const detail = update.detail;
+        const status_suffix: []const u8 = switch (update.progress_status orelse .running) {
+            .running => "",
+            .done => " done",
+            .@"error" => " error",
+            .cancelled => " cancelled",
+        };
+        if (update.current) |cur| {
+            if (update.total) |tot| {
+                if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} {d}/{d} — {s}", .{ title, status_suffix, cur, tot, d });
+                return try std.fmt.allocPrint(self.allocator, "{s}{s} {d}/{d}", .{ title, status_suffix, cur, tot });
+            }
+            if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} {d} — {s}", .{ title, status_suffix, cur, d });
+            return try std.fmt.allocPrint(self.allocator, "{s}{s} {d}", .{ title, status_suffix, cur });
+        }
+        if (update.indeterminate) {
+            if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} … — {s}", .{ title, status_suffix, d });
+            return try std.fmt.allocPrint(self.allocator, "{s}{s} …", .{ title, status_suffix });
+        }
+        if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} — {s}", .{ title, status_suffix, d });
+        return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ title, status_suffix });
     }
 
     /// TUI-thread application of the latest extension command ui_publication.

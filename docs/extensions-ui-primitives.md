@@ -55,10 +55,14 @@ there are no compatibility aliases.
 short feedback.
 
 ```lua
-ctx.ui.message("Saved note", { kind = "success", lifetime = "until_input" })
+ctx.ui.message("Saved note", {
+  id = "save-status",
+  kind = "success",
+  lifetime = "until_input",
+})
 ```
 
-`kind` is a semantic hint. hosts may render messages in a footer, status line, toast, notification backend, or non-tui event stream.
+`id` is the family-scoped dedupe/update key. `kind` is a semantic hint (`info`, `warning`, `error`, `success`). hosts may render messages near the composer, in a status line, as a toast, notification backend, log entry, or non-tui event stream.
 
 ### status
 
@@ -74,11 +78,12 @@ status is not a widget slot. host owns ordering, truncation, style, and placemen
 
 ### progress
 
-retained working/progress state.
+retained progress lifecycle state.
 
 ```lua
 ctx.ui.progress({
   id = "index",
+  status = "running", -- running | done | error | cancelled
   title = "Indexing",
   current = 42,
   total = 120,
@@ -86,7 +91,7 @@ ctx.ui.progress({
 })
 ```
 
-v1 materialization is compact. future retained handles may add explicit terminal states and child progress without changing the semantic intent.
+zi preserves the semantic fields even when v1 materialization is compact. future hosts may add child progress, richer progress views, or non-tui progress events without changing the lua intent.
 
 ### report
 
