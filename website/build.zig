@@ -25,19 +25,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const man_pages = .{
-        .{ "docs/man/00-intro.md", "man/index.html" },
-        .{ "docs/man/10-cli.md", "man/cli.html" },
-        .{ "docs/man/20-extension-model.md", "man/extensions.html" },
-        .{ "docs/man/30-extension-api.md", "man/api.html" },
-        .{ "docs/man/40-context-api.md", "man/context.html" },
-        .{ "docs/man/50-guidance.md", "man/guidance.html" },
+        .{ "docs/man/00-intro.md", "man/index.html", "man/index.md" },
+        .{ "docs/man/10-cli.md", "man/cli.html", "man/cli.md" },
+        .{ "docs/man/20-extension-model.md", "man/extensions.html", "man/extensions.md" },
+        .{ "docs/man/30-extension-api.md", "man/api.html", "man/api.md" },
+        .{ "docs/man/40-context-api.md", "man/context.html", "man/context.md" },
+        .{ "docs/man/50-guidance.md", "man/guidance.html", "man/guidance.md" },
     };
 
     const web = b.step("web", "Build the compound static website");
     web.dependOn(&zine_site.step);
 
     inline for (man_pages) |entry| {
-        const md_file, const html_file = entry;
+        const md_file, const html_file, const markdown_file = entry;
 
         const run_mdman_html = b.addRunArtifact(mdman);
         run_mdman_html.addArgs(&.{ "--html-fragment", "--name", "zi", "--section", "1" });
@@ -50,6 +50,9 @@ pub fn build(b: *std.Build) void {
         man_page.addFileArg(b.path("docs/web/man-footer.html"));
         const install_man = b.addInstallFileWithDir(man_page.captureStdOut(), .prefix, html_file);
         web.dependOn(&install_man.step);
+
+        const install_markdown = b.addInstallFileWithDir(b.path(md_file), .prefix, markdown_file);
+        web.dependOn(&install_markdown.step);
     }
 
     b.getInstallStep().dependOn(web);

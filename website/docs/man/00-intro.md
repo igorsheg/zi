@@ -33,6 +33,8 @@ This manual is written for two readers:
 
 When generating an extension, prefer the API documented here and adapt the closest available example.
 
+Agents and other programmatic readers should prefer the Markdown version of each page. Replace the web page suffix with `.md`, for example `cli.html` becomes `cli.md`. When following links from Markdown manually, prefer the adjacent `.md` target when available.
+
 ## contents
 
 - [cli model](cli.html#cli-model) — run modes, prompt inputs, session selectors, and flags
