@@ -174,8 +174,8 @@ pub const RuntimeHost = struct {
         return extension_ui.Report.clone(allocator, report) catch null;
     }
 
-    pub fn takePendingExtensionRuntimeBundles(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.UiPublication {
-        return self.session.takePendingExtensionRuntimeBundles(allocator) catch allocator.alloc(extension_ui.UiPublication, 0) catch &.{};
+    pub fn takePendingExtensionUiPublications(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.UiPublication {
+        return self.session.takePendingExtensionUiPublications(allocator) catch allocator.alloc(extension_ui.UiPublication, 0) catch &.{};
     }
 
     pub fn takePendingExtensionEditorActions(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.EditorAction {

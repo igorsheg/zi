@@ -1970,7 +1970,7 @@ pub const Interactive = struct {
         }
 
         // Publish the queued snapshot so the transcript projection picks up
-        // the new row without waiting for the agent thread to ui_publication.
+        // the new row without waiting for the agent thread to publish.
         _ = self.publishQueuedSnapshot();
 
         self.active_editor.clear();
@@ -2279,7 +2279,7 @@ pub const Interactive = struct {
             .max_height_percent = 40,
             .margin_bottom = 0,
             .margin_top = header_h,
-            .ui_publication = .{ .fill = Color.default },
+            .surface = .{ .fill = Color.default },
         };
     }
 
@@ -2289,7 +2289,7 @@ pub const Interactive = struct {
         const header_h = self.header_container.measure(width).preferred_height;
         options.margin_top = header_h;
         options.margin_bottom = 1;
-        options.ui_publication = .{ .fill = self.theme.bg(.tool_pending_bg) };
+        options.surface = .{ .fill = self.theme.bg(.tool_pending_bg) };
         return options;
     }
 
@@ -3198,7 +3198,7 @@ pub const Interactive = struct {
         }
     }
 
-    /// Publish the current extension command ui_publication through the UI event
+    /// Publish the current extension command list through the UI event
     /// queue so the TUI thread can rebuild its own registry without reading
     /// or mutating agent-owned runner state directly.
     fn publishExtensionCommandsUpdate(self: *Interactive) void {
@@ -3320,7 +3320,7 @@ pub const Interactive = struct {
         return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ title, status_suffix });
     }
 
-    /// TUI-thread application of the latest extension command ui_publication.
+    /// TUI-thread application of the latest extension command list.
     fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {
         for (self.command_registry.dynamic.items) |*cmd| {
             self.allocator.free(cmd.name);

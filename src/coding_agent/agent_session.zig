@@ -548,7 +548,7 @@ pub const AgentSession = struct {
         self.destroyExtensionRuntime();
         self.clearPendingExtensionReport();
         self.clearPendingExtensionPrompts();
-        self.clearPendingExtensionRuntimeBundles();
+        self.clearPendingExtensionUiPublications();
         self.clearPendingExtensionEditorActions();
         self.allocator.destroy(self._stream_closure);
         self.allocator.destroy(self._extension_runner_ref);
@@ -1349,10 +1349,10 @@ pub const AgentSession = struct {
 
     fn runtimeRevokeUi(session_ptr: *anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.clearPendingExtensionRuntimeBundles();
+        self.clearPendingExtensionUiPublications();
     }
 
-    pub fn takePendingExtensionRuntimeBundles(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.UiPublication {
+    pub fn takePendingExtensionUiPublications(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.UiPublication {
         const out = try allocator.alloc(extension_ui.UiPublication, self.pending_extension_ui_publications.items.len);
         errdefer allocator.free(out);
         var initialized: usize = 0;
@@ -1363,11 +1363,11 @@ pub const AgentSession = struct {
             out[i] = try extension_ui.UiPublication.clone(allocator, update);
             initialized += 1;
         }
-        self.clearPendingExtensionRuntimeBundles();
+        self.clearPendingExtensionUiPublications();
         return out;
     }
 
-    fn clearPendingExtensionRuntimeBundles(self: *AgentSession) void {
+    fn clearPendingExtensionUiPublications(self: *AgentSession) void {
         for (self.pending_extension_ui_publications.items) |*update| update.deinit(self.allocator);
         self.pending_extension_ui_publications.deinit(self.allocator);
         self.pending_extension_ui_publications = .empty;
