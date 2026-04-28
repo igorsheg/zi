@@ -165,11 +165,12 @@ ctx.ui.report({
   id = "git-status",
   title = "Git status",
   body = "M src/foo.zig\n?? notes.md\n",
+  format = "text",
   transient = true,
 })
 ```
 
-current public payload is plain text. this is deliberate.
+current public payload is plain text. this is deliberate. `format = "text"` is accepted now and is the default.
 
 future-compatible fields:
 
@@ -195,9 +196,9 @@ non-goals:
 - no component constructors.
 - no direct overlay handle.
 
-substrate gaps that would make reports excellent:
+substrate notes and remaining gaps:
 
-- retained scroll position by report `id`.
+- retained scroll position by report `id` is implemented for the TUI text materialization.
 - selectable/copyable body text.
 - markdown as a host-owned `format`, not lua spans.
 - empty/error states.

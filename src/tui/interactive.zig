@@ -540,6 +540,8 @@ pub const Interactive = struct {
     status_line: StatusLine,
     pending_image_banner: text_mod.Text,
     extension_report_text: text_mod.Text,
+    extension_report_id: ?[]const u8 = null,
+    extension_report_scroll_offsets: std.StringHashMapUnmanaged(u32) = .{},
     extension_message_text: text_mod.Text,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
@@ -808,6 +810,7 @@ pub const Interactive = struct {
         self.conversation_projection.deinit();
         self.transcript.deinit();
         self.extension_message_text.deinit();
+        self.clearExtensionReportScrollState();
         self.extension_report_text.deinit();
         self.pending_image_banner.deinit();
         self.status_line.deinit();
@@ -3295,11 +3298,45 @@ pub const Interactive = struct {
         }
     }
 
-    fn applyExtensionReport(self: *Interactive, report: @import("../coding_agent/extensions/ui.zig").Report) void {
-        const text = report.flattenText(self.allocator) catch return;
+    fn applyExtensionReport(self: *Interactive, report: extension_ui.Report) void {
+        self.saveCurrentExtensionReportScrollOffset();
+        const text = switch (report.format) {
+            .text => report.flattenText(self.allocator),
+        } catch return;
         defer self.allocator.free(text);
         self.extension_report_text.setContent(text);
+        self.extension_report_text.scroll_offset = self.extension_report_scroll_offsets.get(report.id) orelse 0;
+        self.setCurrentExtensionReportId(report.id);
         self.tui.dirty = true;
+    }
+
+    fn saveCurrentExtensionReportScrollOffset(self: *Interactive) void {
+        const id = self.extension_report_id orelse return;
+        const owned_key = self.allocator.dupe(u8, id) catch return;
+        if (self.extension_report_scroll_offsets.fetchRemove(id)) |old| {
+            self.allocator.free(old.key);
+        }
+        self.extension_report_scroll_offsets.put(self.allocator, owned_key, self.extension_report_text.scroll_offset) catch {
+            self.allocator.free(owned_key);
+        };
+    }
+
+    fn setCurrentExtensionReportId(self: *Interactive, id: []const u8) void {
+        self.clearCurrentExtensionReportId();
+        self.extension_report_id = self.allocator.dupe(u8, id) catch null;
+    }
+
+    fn clearCurrentExtensionReportId(self: *Interactive) void {
+        if (self.extension_report_id) |old| self.allocator.free(old);
+        self.extension_report_id = null;
+    }
+
+    fn clearExtensionReportScrollState(self: *Interactive) void {
+        self.clearCurrentExtensionReportId();
+        var iter = self.extension_report_scroll_offsets.iterator();
+        while (iter.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.extension_report_scroll_offsets.deinit(self.allocator);
+        self.extension_report_scroll_offsets = .{};
     }
 
     fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
@@ -3330,9 +3367,12 @@ pub const Interactive = struct {
     }
 
     fn applyProgressPublication(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").UiPublication) void {
+        self.saveCurrentExtensionReportScrollOffset();
+        self.clearCurrentExtensionReportId();
         const text = self.formatProgressPublication(update) catch return;
         defer self.allocator.free(text);
         self.extension_report_text.setContent(text);
+        self.extension_report_text.scroll_offset = 0;
     }
 
     fn formatProgressPublication(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").UiPublication) ![]const u8 {

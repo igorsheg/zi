@@ -623,7 +623,19 @@ fn parseReport(
         .title = try readStringField(arena, L, abs_idx, "title", ""),
         .lines = try readReportBody(arena, L, abs_idx),
         .transient = readBoolField(L, abs_idx, "transient"),
+        .format = readReportFormat(L, abs_idx),
     };
+}
+
+fn readReportFormat(L: *c.lua_State, idx: c_int) extension_ui.ReportFormat {
+    _ = c.lua_getfield(L, idx, "format");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .text;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return .text;
+    const value = ptr[0..len];
+    if (std.mem.eql(u8, value, "text")) return .text;
+    return .text;
 }
 
 fn readReportBody(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {

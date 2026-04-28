@@ -1947,6 +1947,7 @@ test "extension command context publishes a host-owned report" {
         \\      title = "Demo",
         \\      body = "✓ published",
         \\      transient = true,
+        \\      format = "text",
         \\    })
         \\  end,
         \\})
@@ -1960,6 +1961,7 @@ test "extension command context publishes a host-owned report" {
     try testing.expectEqualStrings("demo", report.id);
     try testing.expectEqualStrings("Demo", report.title);
     try testing.expect(report.transient);
+    try testing.expectEqual(extension_ui.ReportFormat.text, report.format);
     try testing.expectEqual(@as(usize, 1), report.lines.len);
     try testing.expectEqual(@as(usize, 1), report.lines[0].len);
     try testing.expectEqualStrings("✓ published", report.lines[0][0].text);

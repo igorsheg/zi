@@ -196,6 +196,10 @@ pub const UiPublication = struct {
     }
 };
 
+pub const ReportFormat = enum {
+    text,
+};
+
 pub const Report = struct {
     state_owner_id: []const u8,
     generation: u64,
@@ -203,6 +207,7 @@ pub const Report = struct {
     title: []const u8,
     lines: []const []const TextSpan,
     transient: bool = false,
+    format: ReportFormat = .text,
 
     pub fn clone(allocator: std.mem.Allocator, report: Report) !Report {
         const state_owner_id = try allocator.dupe(u8, report.state_owner_id);
@@ -228,6 +233,7 @@ pub const Report = struct {
             .title = title,
             .lines = lines,
             .transient = report.transient,
+            .format = report.format,
         };
     }
 

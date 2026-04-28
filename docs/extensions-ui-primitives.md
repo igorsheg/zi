@@ -102,11 +102,12 @@ ctx.ui.report({
   id = "git-status",
   title = "Git status",
   body = "M src/foo.zig\n?? notes.md\n",
+  format = "text",
   transient = true,
 })
 ```
 
-`body` is plain text. zi owns splitting, wrapping, scrolling, markdown support, and final destination. a report is not a panel command.
+`format = "text"` is the explicit baseline and default. `body` is plain text. zi owns splitting, wrapping, scrolling, and final destination. when the same report `id` is republished, the host may preserve presentation state such as scroll position. markdown remains a future host-owned format, not lua spans. a report is not a panel command.
 
 ### prompt
 

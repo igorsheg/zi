@@ -74,7 +74,7 @@ rules:
 | short feedback | `message` | message publication | footer/status/toast/log/rpc event; host may coalesce or suppress |
 | compact state | `status` | keyed status publication | status line/title/rpc state; host owns order and truncation |
 | work lifecycle | `progress` | keyed progress publication | compact status/progress view; future nested progress registry |
-| readable document | `report` | report publication | text/markdown view, bottom sheet, modal, transcript artifact, or non-tui artifact |
+| readable document | `report` | report publication with `format = "text"` baseline | text view with retained scroll by report `id`, future markdown view, bottom sheet, modal, transcript artifact, or non-tui artifact |
 | modal request | `prompt` | prompt request | overlay/editor/list/remote prompt; semantic result envelope |
 | chooser/search | `pick` | picker request with serializable item metadata | list picker/select/search; semantic result envelope with `value` and selected `item` |
 | composer mutation | `editor_*` | editor action | host-owned composer buffer action |

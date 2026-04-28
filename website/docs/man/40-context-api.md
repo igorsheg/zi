@@ -60,8 +60,8 @@ The UI API publishes presentation intent. Extensions do not own terminal compone
 `ctx.ui.progress({ id, status?, title?, current?, total?, detail?, indeterminate?, text?, lifetime? })`
 : Publish retained progress lifecycle state. `status` is `running`, `done`, `error`, or `cancelled`. The host formats and places it.
 
-`ctx.ui.report({ id, title, body, transient? })`
-: Publish a readable document/report. `body` is plain text; zi owns splitting, scrolling, and rendering.
+`ctx.ui.report({ id, title, body, format?, transient? })`
+: Publish a readable document/report. `format = "text"` is the default and current supported format. `body` is plain text; zi owns splitting, scrolling, rendering, and preserving report presentation state by `id` where supported.
 
 `ctx.ui.pick({ title, placeholder?, empty_text?, options|items, timeout_ms? })`
 : Request selection from stable options. Items may carry `value`, `label`, `description`, `search`, and static `preview`. Returns `{ status, value, item? }` when submitted.
