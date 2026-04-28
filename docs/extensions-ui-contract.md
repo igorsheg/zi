@@ -76,7 +76,7 @@ rules:
 | work lifecycle | `progress` | keyed progress publication | compact status/progress view; future nested progress registry |
 | readable document | `report` | report publication | text/markdown view, bottom sheet, modal, transcript artifact, or non-tui artifact |
 | modal request | `prompt` | prompt request | overlay/editor/list/remote prompt; semantic result envelope |
-| chooser/search | `pick` | picker request | list picker/select/search; semantic result envelope |
+| chooser/search | `pick` | picker request with serializable item metadata | list picker/select/search; semantic result envelope with `value` and selected `item` |
 | composer mutation | `editor_*` | editor action | host-owned composer buffer action |
 | transcript semantics | notes/labels/attachments | transcript/session semantic records | host-rendered badges, folds, rows, or summaries |
 

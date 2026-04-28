@@ -134,14 +134,33 @@ selection intent, inspired by `vim.ui.select` but result-envelope shaped.
 ```lua
 local result = ctx.ui.pick({
   title = "Choose model",
+  placeholder = "model> ",
+  empty_text = "No models",
   options = {
-    { value = "anthropic/claude", label = "Claude" },
-    { value = "openai/gpt", label = "GPT" },
+    {
+      value = "anthropic/claude",
+      label = "Claude",
+      description = "fast, strong coding",
+      search = "claude anthropic sonnet coding",
+      preview = "Claude\nProvider: Anthropic\nGood for coding.",
+    },
+    { value = "openai/gpt", label = "GPT", description = "broad" },
   },
 })
+
+if result.status == "submitted" then
+  -- convenience value
+  print(result.value)
+
+  -- selected item metadata, when supplied by the option
+  print(result.item.label)
+  print(result.item.description)
+end
 ```
 
-`pick` is for choosing from options. broader browsable lists/search results should become a separate list/quickfix-like primitive.
+`options` may also be spelled `items`. each item is serializable host-owned data: `value`, `label`, `description`, `search`, and `preview`. `search` influences host-owned matching without calling lua from the input hot path. `preview` is static metadata for host materialization; dynamic preview callbacks are intentionally not part of this surface.
+
+`pick` is for choosing from bounded options. broader durable browsable lists/search results should become a separate list/quickfix-like primitive.
 
 ### editor actions
 

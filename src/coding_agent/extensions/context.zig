@@ -390,6 +390,10 @@ fn pushPromptEnvelope(L: *c.lua_State, result: request_mod.ExtensionPromptRespon
             c.lua_setfield(L, -2, "status");
             _ = c.lua_pushlstring(L, value.text.ptr, value.text.len);
             c.lua_setfield(L, -2, "value");
+            if (value.label != null or value.description != null or value.search != null or value.preview != null) {
+                pushPromptItem(L, value);
+                c.lua_setfield(L, -2, "item");
+            }
         } else {
             _ = c.lua_pushlstring(L, "cancelled", "cancelled".len);
             c.lua_setfield(L, -2, "status");
@@ -398,6 +402,28 @@ fn pushPromptEnvelope(L: *c.lua_State, result: request_mod.ExtensionPromptRespon
             _ = c.lua_pushlstring(L, "timeout", "timeout".len);
             c.lua_setfield(L, -2, "status");
         },
+    }
+}
+
+fn pushPromptItem(L: *c.lua_State, value: request_mod.ExtensionPromptResponse.OwnedValue) void {
+    c.lua_createtable(L, 0, 5);
+    _ = c.lua_pushlstring(L, value.text.ptr, value.text.len);
+    c.lua_setfield(L, -2, "value");
+    if (value.label) |label| {
+        _ = c.lua_pushlstring(L, label.ptr, label.len);
+        c.lua_setfield(L, -2, "label");
+    }
+    if (value.description) |description| {
+        _ = c.lua_pushlstring(L, description.ptr, description.len);
+        c.lua_setfield(L, -2, "description");
+    }
+    if (value.search) |search| {
+        _ = c.lua_pushlstring(L, search.ptr, search.len);
+        c.lua_setfield(L, -2, "search");
+    }
+    if (value.preview) |preview| {
+        _ = c.lua_pushlstring(L, preview.ptr, preview.len);
+        c.lua_setfield(L, -2, "preview");
     }
 }
 
@@ -451,6 +477,8 @@ fn parsePrompt(
             .id = id,
             .kind = kind,
             .title = title,
+            .placeholder = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "placeholder") else null,
+            .empty_text = if (is_table) try readOptionalStringField(arena, L, prompt_idx, "empty_text") else null,
             .options = if (is_table) try readSelectOptionsField(arena, L, prompt_idx) else try readSelectOptions(arena, L, 2),
             .timeout_ms = try readPromptTimeoutMs(L, if (is_table) prompt_idx else 3),
         },
@@ -511,6 +539,12 @@ fn readPromptKindArg(L: *c.lua_State, idx: c_int) ?extension_ui.PromptKind {
 
 fn readSelectOptionsField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const extension_ui.SelectOption {
     _ = c.lua_getfield(L, idx, "options");
+    if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+        defer c.lua_pop(L, 1);
+        return try readSelectOptions(arena, L, -1);
+    }
+    c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, "items");
     defer c.lua_pop(L, 1);
     return try readSelectOptions(arena, L, -1);
 }
@@ -538,7 +572,13 @@ fn readSelectOption(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !exte
     const abs_idx = c.lua_absindex(L, idx);
     const id = if (try readOptionalStringField(arena, L, abs_idx, "value")) |value| value else try readStringField(arena, L, abs_idx, "id", "");
     const label = try readStringField(arena, L, abs_idx, "label", id);
-    return .{ .id = id, .label = label };
+    return .{
+        .id = id,
+        .label = label,
+        .description = try readOptionalStringField(arena, L, abs_idx, "description"),
+        .search = try readOptionalStringField(arena, L, abs_idx, "search"),
+        .preview = try readOptionalStringField(arena, L, abs_idx, "preview"),
+    };
 }
 
 fn promptKindString(kind: extension_ui.PromptKind) []const u8 {

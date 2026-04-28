@@ -63,6 +63,18 @@ pub const ExtensionPromptResponse = struct {
     pub const OwnedValue = struct {
         text: []const u8,
         allocator: std.mem.Allocator,
+        label: ?[]const u8 = null,
+        description: ?[]const u8 = null,
+        search: ?[]const u8 = null,
+        preview: ?[]const u8 = null,
+
+        pub fn deinit(self: OwnedValue) void {
+            self.allocator.free(self.text);
+            if (self.label) |value| self.allocator.free(value);
+            if (self.description) |value| self.allocator.free(value);
+            if (self.search) |value| self.allocator.free(value);
+            if (self.preview) |value| self.allocator.free(value);
+        }
     };
 
     pub const Result = union(enum) {
@@ -72,7 +84,7 @@ pub const ExtensionPromptResponse = struct {
 
         pub fn deinit(self: *Result) void {
             switch (self.*) {
-                .value => |maybe| if (maybe) |value| value.allocator.free(value.text),
+                .value => |maybe| if (maybe) |value| value.deinit(),
                 .confirm, .timeout => {},
             }
             self.* = undefined;

@@ -63,8 +63,8 @@ The UI API publishes presentation intent. Extensions do not own terminal compone
 `ctx.ui.report({ id, title, body, transient? })`
 : Publish a readable document/report. `body` is plain text; zi owns splitting, scrolling, and rendering.
 
-`ctx.ui.pick({ title, options, timeout_ms? })`
-: Request selection from stable options. Returns the same envelope shape as `ctx.ui.prompt`.
+`ctx.ui.pick({ title, placeholder?, empty_text?, options|items, timeout_ms? })`
+: Request selection from stable options. Items may carry `value`, `label`, `description`, `search`, and static `preview`. Returns `{ status, value, item? }` when submitted.
 
 `ctx.ui.prompt({ kind = "confirm"|"select"|"input"|"editor", ... })`
 : Generic modal interaction request. Returns an envelope with `status` and, when submitted, `value`.

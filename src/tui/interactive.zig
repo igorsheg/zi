@@ -332,11 +332,29 @@ const ResumePickerFlow = struct {
     }
 };
 
+fn buildPromptSearchTexts(arena: std.mem.Allocator, options: []const extension_ui.SelectOption) ![]const []const u8 {
+    if (options.len == 0) return &.{};
+    var any_search = false;
+    for (options) |option| {
+        if (option.search != null) {
+            any_search = true;
+            break;
+        }
+    }
+    if (!any_search) return &.{};
+    const out = try arena.alloc([]const u8, options.len);
+    for (options, 0..) |option, i| {
+        out[i] = option.search orelse option.label;
+    }
+    return out;
+}
+
 const ExtensionPromptFlow = struct {
     arena: std.heap.ArenaAllocator,
     prompt: extension_ui.PromptRequest,
     response: *request_mod.ExtensionPromptResponse,
     items: []SelectItem = &.{},
+    search_texts: []const []const u8 = &.{},
     picker: ?ListPicker = null,
     editor: ?editor_mod.Editor = null,
     handle: ?tui_mod.OverlayHandle = null,
@@ -364,7 +382,7 @@ const ExtensionPromptFlow = struct {
                     .select => blk: {
                         const select_items = try a.alloc(SelectItem, owned_prompt.options.len);
                         for (owned_prompt.options, 0..) |option, i| {
-                            select_items[i] = .{ .value = option.id, .label = option.label };
+                            select_items[i] = .{ .value = option.id, .label = option.label, .description = option.description };
                         }
                         break :blk select_items;
                     },
@@ -373,8 +391,15 @@ const ExtensionPromptFlow = struct {
                 var picker = ListPicker.init(theme);
                 picker.title = owned_prompt.title;
                 picker.list.max_visible = 8;
-                picker.setItems(items);
-                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .items = items, .picker = picker, .deadline_ns = deadline_ns };
+                picker.setSearchPlaceholder(owned_prompt.placeholder);
+                if (owned_prompt.empty_text) |empty_text| picker.setEmptyText(empty_text);
+                const search_texts = try buildPromptSearchTexts(a, owned_prompt.options);
+                if (search_texts.len > 0) {
+                    picker.setSearchableItems(items, search_texts);
+                } else {
+                    picker.setItems(items);
+                }
+                return .{ .arena = arena, .prompt = owned_prompt, .response = response, .items = items, .search_texts = search_texts, .picker = picker, .deadline_ns = deadline_ns };
             },
             .input, .editor => {
                 var editor = editor_mod.Editor.init(a);
@@ -2513,8 +2538,24 @@ pub const Interactive = struct {
             switch (flow.prompt.kind) {
                 .confirm => flow.response.finish(.{ .confirm = std.mem.eql(u8, selection.item.value, "yes") }),
                 .select => {
+                    const selected = if (selection.source_index < flow.prompt.options.len) flow.prompt.options[selection.source_index] else null;
                     const value = self.msg_allocator.dupe(u8, selection.item.value) catch null;
-                    flow.response.finish(.{ .value = if (value) |text| .{ .text = text, .allocator = self.msg_allocator } else null });
+                    if (value) |text| {
+                        const label = if (selected) |option| if (option.label.len > 0) self.msg_allocator.dupe(u8, option.label) catch null else null else null;
+                        const description = if (selected) |option| if (option.description) |description| self.msg_allocator.dupe(u8, description) catch null else null else null;
+                        const search = if (selected) |option| if (option.search) |search| self.msg_allocator.dupe(u8, search) catch null else null else null;
+                        const preview = if (selected) |option| if (option.preview) |preview| self.msg_allocator.dupe(u8, preview) catch null else null else null;
+                        flow.response.finish(.{ .value = .{
+                            .text = text,
+                            .allocator = self.msg_allocator,
+                            .label = label,
+                            .description = description,
+                            .search = search,
+                            .preview = preview,
+                        } });
+                    } else {
+                        flow.response.finish(.{ .value = null });
+                    }
                 },
                 .input, .editor => flow.response.finish(request_mod.ExtensionPromptResponse.defaultFor(flow.prompt.kind)),
             }

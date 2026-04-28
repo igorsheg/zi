@@ -1206,9 +1206,21 @@ const TestStateStore = struct {
         switch (prompt.kind) {
             .confirm => response.finish(.{ .confirm = true }),
             .select => {
-                const selected = if (prompt.options.len > 0) prompt.options[0].id else "";
-                const text = self.allocator.dupe(u8, selected) catch return response.finish(.{ .value = null });
-                response.finish(.{ .value = .{ .text = text, .allocator = self.allocator } });
+                const selected = if (prompt.options.len > 0) prompt.options[0] else null;
+                const selected_id = if (selected) |option| option.id else "";
+                const text = self.allocator.dupe(u8, selected_id) catch return response.finish(.{ .value = null });
+                const label = if (selected) |option| self.allocator.dupe(u8, option.label) catch null else null;
+                const description = if (selected) |option| if (option.description) |value| self.allocator.dupe(u8, value) catch null else null else null;
+                const search = if (selected) |option| if (option.search) |value| self.allocator.dupe(u8, value) catch null else null else null;
+                const preview = if (selected) |option| if (option.preview) |value| self.allocator.dupe(u8, value) catch null else null else null;
+                response.finish(.{ .value = .{
+                    .text = text,
+                    .allocator = self.allocator,
+                    .label = label,
+                    .description = description,
+                    .search = search,
+                    .preview = preview,
+                } });
             },
             .input => {
                 const text = self.allocator.dupe(u8, "typed") catch return response.finish(.{ .value = null });
@@ -1535,10 +1547,26 @@ test "extension command prompts can resolve through host response" {
         \\    local selected = ctx.ui.prompt({
         \\      kind = "select",
         \\      title = "Pick object",
-        \\      options = { { label = "Lua", value = "lua" }, { label = "Zig", value = "zig" } },
+        \\      placeholder = "language> ",
+        \\      empty_text = "No languages",
+        \\      options = {
+        \\        {
+        \\          label = "Lua",
+        \\          value = "lua",
+        \\          description = "extension language",
+        \\          search = "lua extension scripting",
+        \\          preview = "Lua\nSmall embeddable language.",
+        \\        },
+        \\        { label = "Zig", value = "zig" },
+        \\      },
         \\    })
         \\    assert(selected.status == "submitted")
         \\    assert(selected.value == "lua")
+        \\    assert(selected.item.value == "lua")
+        \\    assert(selected.item.label == "Lua")
+        \\    assert(selected.item.description == "extension language")
+        \\    assert(selected.item.search == "lua extension scripting")
+        \\    assert(selected.item.preview == "Lua\nSmall embeddable language.")
         \\    local typed = ctx.ui.prompt({ kind = "input", title = "Name", placeholder = "my-app", default = "zi" })
         \\    assert(typed.status == "submitted")
         \\    assert(typed.value == "typed")

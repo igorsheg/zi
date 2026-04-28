@@ -16,6 +16,9 @@ pub const PromptKind = enum {
 pub const SelectOption = struct {
     id: []const u8,
     label: []const u8,
+    description: ?[]const u8 = null,
+    search: ?[]const u8 = null,
+    preview: ?[]const u8 = null,
 };
 
 pub const PromptRequest = struct {
@@ -26,6 +29,7 @@ pub const PromptRequest = struct {
     title: []const u8,
     message: ?[]const u8 = null,
     placeholder: ?[]const u8 = null,
+    empty_text: ?[]const u8 = null,
     prefill: ?[]const u8 = null,
     options: []const SelectOption = &.{},
     timeout_ms: ?u64 = null,
@@ -41,6 +45,8 @@ pub const PromptRequest = struct {
         errdefer if (message) |value| allocator.free(value);
         const placeholder = if (prompt.placeholder) |value| try allocator.dupe(u8, value) else null;
         errdefer if (placeholder) |value| allocator.free(value);
+        const empty_text = if (prompt.empty_text) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (empty_text) |value| allocator.free(value);
         const prefill = if (prompt.prefill) |value| try allocator.dupe(u8, value) else null;
         errdefer if (prefill) |value| allocator.free(value);
 
@@ -51,6 +57,9 @@ pub const PromptRequest = struct {
             options[i] = .{
                 .id = try allocator.dupe(u8, option.id),
                 .label = try allocator.dupe(u8, option.label),
+                .description = if (option.description) |value| try allocator.dupe(u8, value) else null,
+                .search = if (option.search) |value| try allocator.dupe(u8, value) else null,
+                .preview = if (option.preview) |value| try allocator.dupe(u8, value) else null,
             };
             initialized_options += 1;
         }
@@ -63,6 +72,7 @@ pub const PromptRequest = struct {
             .title = title,
             .message = message,
             .placeholder = placeholder,
+            .empty_text = empty_text,
             .prefill = prefill,
             .options = options,
             .timeout_ms = prompt.timeout_ms,
@@ -75,6 +85,7 @@ pub const PromptRequest = struct {
         allocator.free(self.title);
         if (self.message) |value| allocator.free(value);
         if (self.placeholder) |value| allocator.free(value);
+        if (self.empty_text) |value| allocator.free(value);
         if (self.prefill) |value| allocator.free(value);
         freeOptions(allocator, self.options, self.options.len);
         self.* = undefined;
@@ -260,6 +271,9 @@ fn freeOptions(allocator: std.mem.Allocator, options: []const SelectOption, coun
     for (options[0..count]) |option| {
         allocator.free(option.id);
         allocator.free(option.label);
+        if (option.description) |value| allocator.free(value);
+        if (option.search) |value| allocator.free(value);
+        if (option.preview) |value| allocator.free(value);
     }
     allocator.free(options);
 }

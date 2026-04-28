@@ -244,7 +244,7 @@ validate = {
 
 selection/search intent. this should be the telescope-inspired primitive.
 
-v1 static picker:
+current static picker:
 
 ```lua
 local result = ctx.ui.pick({
@@ -256,12 +256,13 @@ local result = ctx.ui.pick({
 })
 ```
 
-v2 richer entries without callbacks:
+richer entries are still static and callback-free:
 
 ```lua
-ctx.ui.pick({
+local result = ctx.ui.pick({
   title = "Find decision",
-  prompt = "decision> ",
+  placeholder = "decision> ",
+  empty_text = "No decisions",
   items = {
     {
       value = "entry-123",
@@ -272,9 +273,11 @@ ctx.ui.pick({
     },
   },
 })
+
+-- result.item carries the selected metadata.
 ```
 
-v3 host-owned sources, still no paint-time lua:
+future host-owned sources, still no paint-time lua:
 
 ```lua
 ctx.ui.pick({
@@ -295,7 +298,7 @@ ctx.ui.pick({
 
 future telescope-like concepts to design carefully:
 
-- entries: `value`, `label`, `description`, `search`, `ordinal`, `preview`.
+- entries: current `value`, `label`, `description`, `search`, `preview`; future `ordinal` if needed.
 - preview: static text first; host-owned source previews later.
 - actions: host-owned action ids, not arbitrary lua callbacks from keypresses.
 - multi-select: result value list.
@@ -418,11 +421,10 @@ zi-safe version:
 
 recommended growth path:
 
-1. `options = { { value, label, description } }`.
-2. add `items` alias with `search`, `ordinal`, `preview`.
-3. return selected item envelope, not only value.
-4. add multi-select.
-5. add host-owned source descriptors.
+1. `options`/`items` with `value`, `label`, `description`, `search`, and static `preview` is shipped.
+2. selected item envelope is shipped.
+3. add multi-select only when an extension needs it.
+4. add host-owned source descriptors.
 6. add action descriptors.
 
 ## report policy
@@ -543,8 +545,7 @@ all public `ctx.ui` primitives should obey the same grammar:
 these are implementation debts, not public api holes:
 
 - add richer retained progress registry/materialization on top of the existing semantic progress record.
-- upgrade `PromptRequest.SelectOption` to carry `description` and future item metadata.
-- return selected `item` from `pick`, not just `value`.
+- keep `PromptRequest.SelectOption` metadata serializable; `description`, `search`, and static `preview` are host-owned data, not callbacks.
 - define terminal notification policy as one possible host materialization of `message`, not a separate extension concept.
 
 ## research conclusions
