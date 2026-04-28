@@ -154,6 +154,9 @@ State is scoped to the extension and active session. It may survive session chan
 `ctx.session.labels({ target_entry_id?, limit? })`
 : Return label entries, optionally filtered to a target session entry. Default limit is 50; maximum is 500.
 
+`ctx.session.entry(entry_id)`
+: Return one semantic session entry by durable id, or `nil` when not found. Message entries return role/text fields when they map to one semantic message; labels return `target_entry_id` and `label`; extension notes return note fields.
+
 ## context model and ai api
 
 `ctx.models.list()`

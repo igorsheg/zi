@@ -40,7 +40,15 @@ zi.command("labels", function(ctx, args)
 
   local lines = {}
   for _, item in ipairs(labels) do
-    table.insert(lines, string.format("%s -> %s: %s", item.entry_id, item.target_entry_id, item.label or "<cleared>"))
+    local entry = ctx.session.entry(item.target_entry_id)
+    local preview = item.target_entry_id
+    if entry and entry.text then
+      preview = string.gsub(entry.text, "\n", " ")
+      if #preview > 72 then
+        preview = string.sub(preview, 1, 69) .. "..."
+      end
+    end
+    table.insert(lines, string.format("%s: %s", item.label or "<cleared>", preview))
   end
   ctx.ui.show_panel({ title = "Labels", body = table.concat(lines, "\n") })
 end)

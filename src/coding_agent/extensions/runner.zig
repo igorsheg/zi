@@ -191,6 +191,7 @@ pub const ExtensionRuntime = union(enum) {
         session_notes_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, source_entry_id: ?[]const u8, limit: usize) ?std.json.Value = null,
         session_label_set: ?*const fn (session: *anyopaque, target_entry_id: []const u8, label: ?[]const u8) anyerror!void = null,
         session_labels_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, target_entry_id: ?[]const u8, limit: usize) ?std.json.Value = null,
+        session_entry_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, entry_id: []const u8) ?std.json.Value = null,
         show_panel: ?*const fn (session: *anyopaque, panel: extension_ui.Panel) anyerror!void = null,
         publish_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest) anyerror!void = null,
         resolve_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void = null,

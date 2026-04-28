@@ -1050,6 +1050,38 @@ const TestStateStore = struct {
         self.label_value = if (label) |value| try self.allocator.dupe(u8, value) else null;
     }
 
+    fn entry(session: *anyopaque, allocator: std.mem.Allocator, entry_id: []const u8) ?std.json.Value {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (std.mem.eql(u8, entry_id, "message-1")) {
+            var obj = std.json.ObjectMap.init(allocator);
+            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "message-1") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "message") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "user") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hello") catch return null }) catch return null;
+            return .{ .object = obj };
+        }
+        if (std.mem.eql(u8, entry_id, "note-1")) {
+            const note_kind = self.note_kind orelse return null;
+            var obj = std.json.ObjectMap.init(allocator);
+            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "note-1") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "extension_note") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, note_kind) catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
+            if (self.note_source_entry_id) |source| obj.put(allocator.dupe(u8, "source_entry_id") catch return null, .{ .string = allocator.dupe(u8, source) catch return null }) catch return null;
+            return .{ .object = obj };
+        }
+        if (std.mem.eql(u8, entry_id, "label-1")) {
+            const target = self.label_target_entry_id orelse return null;
+            var obj = std.json.ObjectMap.init(allocator);
+            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "label-1") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "label") catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "target_entry_id") catch return null, .{ .string = allocator.dupe(u8, target) catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "label") catch return null, if (self.label_value) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
+            return .{ .object = obj };
+        }
+        return null;
+    }
+
     fn labels(session: *anyopaque, allocator: std.mem.Allocator, target_entry_id: ?[]const u8, limit: usize) ?std.json.Value {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         _ = limit;
@@ -1194,6 +1226,7 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_notes_get = &TestStateStore.notes,
         .session_label_set = &TestStateStore.setLabel,
         .session_labels_get = &TestStateStore.labels,
+        .session_entry_get = &TestStateStore.entry,
         .show_panel = &TestStateStore.showPanel,
         .publish_prompt = &TestStateStore.publishPrompt,
         .cancel_prompts = &TestStateStore.cancelPrompts,
@@ -1267,6 +1300,19 @@ test "extension command context exposes read-only session surface" {
         \\    assert(labels[1].target_entry_id == "entry-2")
         \\    assert(labels[1].label == "important")
         \\    assert(#ctx.session.labels({ target_entry_id = "missing" }) == 0)
+        \\    local message_entry = ctx.session.entry("message-1")
+        \\    assert(message_entry.type == "message")
+        \\    assert(message_entry.role == "user")
+        \\    assert(message_entry.text == "hello")
+        \\    local note_entry = ctx.session.entry("note-1")
+        \\    assert(note_entry.type == "extension_note")
+        \\    assert(note_entry.kind == "manual")
+        \\    assert(note_entry.source_entry_id == "entry-2")
+        \\    local label_entry = ctx.session.entry("label-1")
+        \\    assert(label_entry.type == "label")
+        \\    assert(label_entry.target_entry_id == "entry-2")
+        \\    assert(label_entry.label == "important")
+        \\    assert(ctx.session.entry("missing") == nil)
         \\    assert(ctx.session.label("entry-2", "") == true)
         \\    labels = ctx.session.labels({ target_entry_id = "entry-2" })
         \\    assert(#labels == 1)

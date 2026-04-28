@@ -30,6 +30,7 @@ pub const SessionStore = session_runtime.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 pub const ContextUsage = session_core.context_usage.ContextUsage;
+const session_proto = session_core.protocol;
 
 /// Composition root: wires Agent + SessionStore + tools + model resolution.
 ///
@@ -707,6 +708,7 @@ pub const AgentSession = struct {
             .session_notes_get = &runtimeSessionNotesGet,
             .session_label_set = &runtimeSessionLabelSet,
             .session_labels_get = &runtimeSessionLabelsGet,
+            .session_entry_get = &runtimeSessionEntryGet,
             .show_panel = &runtimeShowPanel,
             .publish_prompt = &runtimePublishPrompt,
             .resolve_prompt = &runtimeResolvePrompt,
@@ -1160,9 +1162,81 @@ pub const AgentSession = struct {
         return .{ .object = obj };
     }
 
+    fn runtimeSessionEntryGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, entry_id: []const u8) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
+        defer allocator.free(branch);
+        for (branch) |entry| {
+            if (!std.mem.eql(u8, entry.id, entry_id)) continue;
+            return sessionEntryJson(allocator, entry) catch return null;
+        }
+        return null;
+    }
+
+    fn sessionEntryJson(allocator: std.mem.Allocator, entry: session_proto.SessionEntry) !std.json.Value {
+        switch (entry.entry) {
+            .message => |message| return sessionMessageEntryJson(allocator, entry.id, message.message),
+            .custom => |custom| {
+                if (std.mem.eql(u8, custom.custom_type, "extension_note")) {
+                    const data = custom.data orelse return sessionCustomEntryJson(allocator, entry.id, custom);
+                    if (data == .object) {
+                        var note = try ai.json_util.cloneJsonValue(allocator, data);
+                        try note.object.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry.id) });
+                        try note.object.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "extension_note") });
+                        return note;
+                    }
+                }
+                return sessionCustomEntryJson(allocator, entry.id, custom);
+            },
+            .label => |label| return sessionLabelJson(allocator, entry.id, label),
+            else => return sessionTypedEntryJson(allocator, entry.id, @tagName(entry.entry)),
+        }
+    }
+
+    fn sessionMessageEntryJson(allocator: std.mem.Allocator, entry_id: []const u8, msg: protocol.AgentMessage) !std.json.Value {
+        var messages = std.json.Array.init(allocator);
+        try appendSessionMessageJson(allocator, &messages, entry_id, msg, true);
+        if (messages.items.len == 1) {
+            var value = messages.items[0];
+            messages.deinit();
+            try value.object.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "message") });
+            return value;
+        }
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry_id) });
+        try obj.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "message") });
+        try obj.put(try allocator.dupe(u8, "messages"), .{ .array = messages });
+        return .{ .object = obj };
+    }
+
+    fn sessionCustomEntryJson(allocator: std.mem.Allocator, entry_id: []const u8, custom: session_proto.CustomEntry) !std.json.Value {
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry_id) });
+        try obj.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "custom") });
+        try obj.put(try allocator.dupe(u8, "custom_type"), .{ .string = try allocator.dupe(u8, custom.custom_type) });
+        try obj.put(try allocator.dupe(u8, "data"), if (custom.data) |data| try ai.json_util.cloneJsonValue(allocator, data) else .null);
+        return .{ .object = obj };
+    }
+
+    fn sessionTypedEntryJson(allocator: std.mem.Allocator, entry_id: []const u8, entry_type: []const u8) !std.json.Value {
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry_id) });
+        try obj.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, entry_type) });
+        return .{ .object = obj };
+    }
+
     fn runtimeSessionLabelSet(session_ptr: *anyopaque, target_entry_id: []const u8, label: ?[]const u8) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
         self.session_store.appendLabel(target_entry_id, label);
+    }
+
+    fn sessionLabelJson(allocator: std.mem.Allocator, entry_id: []const u8, label_entry: session_proto.LabelEntry) !std.json.Value {
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, entry_id) });
+        try obj.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "label") });
+        try obj.put(try allocator.dupe(u8, "target_entry_id"), .{ .string = try allocator.dupe(u8, label_entry.target_id) });
+        try obj.put(try allocator.dupe(u8, "label"), if (label_entry.label) |value| .{ .string = try allocator.dupe(u8, value) } else .null);
+        return .{ .object = obj };
     }
 
     fn runtimeSessionLabelsGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, target_entry_id: ?[]const u8, limit: usize) ?std.json.Value {
@@ -1178,11 +1252,7 @@ pub const AgentSession = struct {
             if (target_entry_id) |wanted| {
                 if (!std.mem.eql(u8, label_entry.target_id, wanted)) continue;
             }
-            var obj = std.json.ObjectMap.init(allocator);
-            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, entry.id) catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "target_entry_id") catch return null, .{ .string = allocator.dupe(u8, label_entry.target_id) catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "label") catch return null, if (label_entry.label) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
-            all.append(.{ .object = obj }) catch return null;
+            all.append(sessionLabelJson(allocator, entry.id, label_entry) catch return null) catch return null;
         }
         if (all.items.len <= limit) return .{ .array = all };
         const start = all.items.len - limit;
