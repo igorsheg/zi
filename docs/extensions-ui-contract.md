@@ -1,186 +1,104 @@
-# extension ui: host-owned interaction and custom presentation
+# extension ui: host-owned semantic presentation
 
 ## status
 
-contract for `zi-fex.8`.
-it follows [extensions.md](./extensions.md), [runtime.md](./runtime.md), [extensions-lifecycle.md](./extensions-lifecycle.md), [extensions-retained-objects.md](./extensions-retained-objects.md), [extensions-events.md](./extensions-events.md), and the [v2 cutover adr](./adr/extensions-v2-cutover.md).
+contract for extension-visible ui.
+
+it follows [extensions.md](./extensions.md), [runtime.md](./runtime.md), [extensions-lifecycle.md](./extensions-lifecycle.md), [extensions-retained-objects.md](./extensions-retained-objects.md), [extensions-events.md](./extensions-events.md), [extensions-ui-primitives.md](./extensions-ui-primitives.md), [extensions-ui-substrate-map.md](./extensions-ui-substrate-map.md), and the [v2 cutover adr](./adr/extensions-v2-cutover.md).
 
 ## decision
 
-- extension ui is a family of **host-owned retained primitives**.
-- zi keeps common interaction capability, but not pi-mono's raw tui component reach-through.
-- extensions publish semantic intent, slot claims, payload, and optional renderer references.
-  they do not publish live components, overlay handles, focus objects, or editor implementations across the lua boundary.
-- render work is host-scheduled agent-thread work.
-  tui paint, layout, input, and overlay hot paths never call lua directly.
-- render hooks are side-effect free contractually.
-  the host may rerun, coalesce, defer, or drop stale render work.
-- cleanup is deterministic by `{ generation, namespace }` lease scope.
-  `session_shutdown` is the last session-visible mutation edge.
-  `unbind` revokes session-scoped ui leases.
-  `teardown` destroys generation-scoped renderer registrations and retained host caches that still exist for that namespace.
+extension ui is a closed family of **host-owned semantic primitives**.
 
-## model
+public lua publishes intent:
+
+```lua
+ctx.ui.message(text, opts?)
+ctx.ui.status(spec)
+ctx.ui.progress(spec)
+ctx.ui.report(spec)
+ctx.ui.prompt(spec)
+ctx.ui.pick(spec)
+ctx.ui.set_editor_text(text)
+ctx.ui.paste_to_editor(text)
+ctx.ui.clear_editor_text()
+ctx.ui.get_editor_text()
+```
+
+public lua does not publish TUI components, overlay handles, slot claims, focus objects, geometry, renderer spans for reports, or editor implementations.
+
+## owner model
 
 ```text
 extension code
    │
-   │  semantic intent
-   │  prompt requests
-   │  surface payloads
-   │  renderer refs
+   │ semantic ui intent
+   │ prompt/pick requests
+   │ report/message/status/progress publications
+   │ editor actions
    ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ agent-owned host ui store                                   │
+│ agent-owned extension runtime                               │
 │  generation g                                               │
 │  namespace n                                                │
 │                                                              │
-│  notifications           prompt requests                     │
-│  status / working        slot leases                         │
-│  title / header/footer   editor actions                      │
-│  transcript attachments  renderer registrations              │
-│  presentation caches     overlay / panel descriptors         │
+│  reports                  prompts / picks                    │
+│  messages                 editor actions                     │
+│  status records           renderer registrations             │
+│  progress records         transcript semantic attachments    │
 └───────────────┬──────────────────────────────────────────────┘
                 │
-                │ family-scoped semantic publication
+                │ owned semantic publication
                 │ revisioned, host-timed, owner-safe
                 ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ tui thread                                                   │
-│  slot materialization                                        │
-│  overlay stack + focus                                       │
+│  text/markdown/list/editor/overlay materialization           │
 │  transcript rows + renderer caches                           │
-│  editor component + local interaction state                  │
-│  layout, paint cadence, animation                            │
+│  layout, focus, paint cadence, animation                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-reading rule:
+rules:
 
-- if the extension wants to mutate ui, it mutates a host-owned primitive.
-- if the tui wants to render, it reads a published semantic view.
+- if extension code wants to mutate ui, it publishes a semantic primitive.
+- if the tui wants to render, it reads an already-published semantic view.
 - if a capability needs a real component, the tui builds it from host-owned state.
-
-## parity classes
-
-terms:
-
-- **direct equivalent** — zi keeps the user-visible capability with substantially the same semantic outcome.
-- **host-owned reinterpretation** — zi keeps the product capability, but the object crossing the boundary is a host-owned primitive rather than a raw tui object or callback graph.
-- **excluded** — zi does not expose that pi-mono seam across the lua boundary.
-
-| class | parity | host primitive | contract note |
-| --- | --- | --- | --- |
-| notify / toast | host-owned reinterpretation | `notification` record | extensions publish level, text, and optional lifetime hints. host may materialize as toast, banner, rpc event, or ignore by mode policy. |
-| confirm | direct equivalent | `prompt<bool>` | modal vs inline vs rpc request is host policy. the semantic result is boolean confirmation. |
-| text input | direct equivalent | `prompt<string?>` | single-line user input request. host owns focus, validation chrome, timeout display, and dismissal. |
-| select / picker | direct equivalent | `prompt<option_id?>` | extensions publish stable option ids plus labels/metadata. host owns list ui, search, focus, and keybindings. |
-| status items | direct equivalent | keyed `status_item` records | same product meaning as `setStatus(key, text)`, but authoritative state is host-owned and revisioned. |
-| working message | direct equivalent | singleton `working_surface` | same product meaning as a working/loading label. host chooses where it appears. |
-| hidden-thinking label | direct equivalent | singleton `thinking_label_surface` | same product meaning as the hidden-thinking label. host chooses exact placement and styling. |
-| widgets | host-owned reinterpretation | `surface_lease` in a widget slot | no component factory crosses lua. extensions provide payload or renderer ref for host-owned materialization. |
-| panels | host-owned reinterpretation | `surface_lease` in a panel slot | advanced panels stay possible, but only through named slots, semantic payload, and host-owned rendering. |
-| header / footer | host-owned reinterpretation | singleton `surface_lease` | extensions may claim those surfaces semantically. they do not hand the host a live component factory. |
-| title | direct equivalent | singleton `title_surface` | same product meaning as window/tab title intent. host resolves conflicts and applies per mode. |
-| editor text / get / set / paste | direct equivalent | `editor_buffer_action` against host-owned editor state | extensions can read or mutate text through host actions. they do not replace the editor object. |
-| editor modal | direct equivalent | `prompt<editor_text?>` | multi-line edit request with host-owned editor implementation. |
-| transcript attachments | host-owned reinterpretation | `transcript_attachment` record | attachment meaning, metadata, and lifecycle are semantic. transcript row construction stays host-owned. |
-| transcript custom presentation | host-owned reinterpretation | attachment / tool / message object with `renderer_ref` | custom transcript presentation is allowed through host-owned renderer hooks, not `TranscriptRenderable` reach-through. |
-| advanced overlays / modal panels | host-owned reinterpretation | `overlay_surface_lease` | host owns overlay stack, focus restore, dismissal, and geometry. extension supplies semantics and optional renderer ref only. |
-| raw custom component trees (`custom()`) | excluded | none | zi does not expose arbitrary tui component factories across the lua boundary. |
-| custom editor component replacement | excluded | none | zi does not expose `setEditorComponent()`-style editor replacement to extensions. |
-| raw terminal input listeners | excluded | none | terminal byte streams and focus routing stay host-private. |
+- tui paint, layout, input, and overlay hot paths never call lua directly.
+- cleanup is deterministic by `{ generation, namespace }` lease scope.
 
 ## primitive families
 
-### 1. notification family
+| family | public primitive | host-owned record | materialization policy |
+| --- | --- | --- | --- |
+| short feedback | `message` | message publication | footer/status/toast/log/rpc event; host may coalesce or suppress |
+| compact state | `status` | keyed status publication | status line/title/rpc state; host owns order and truncation |
+| work lifecycle | `progress` | keyed progress publication | compact status/progress view; future nested progress registry |
+| readable document | `report` | report publication | text/markdown view, bottom sheet, modal, transcript artifact, or non-tui artifact |
+| modal request | `prompt` | prompt request | overlay/editor/list/remote prompt; semantic result envelope |
+| chooser/search | `pick` | picker request | list picker/select/search; semantic result envelope |
+| composer mutation | `editor_*` | editor action | host-owned composer buffer action |
+| transcript semantics | notes/labels/attachments | transcript/session semantic records | host-rendered badges, folds, rows, or summaries |
 
-notifications are ephemeral retained records.
+## public consistency grammar
 
-they carry semantic fields such as:
+all public `ctx.ui` primitives follow one grammar:
 
-- level
-- message text
-- optional ttl / dismissal hint
-- provenance
+1. names describe intent, not destinations.
+   - `report`, not panel.
+   - `message`, not footer/notification.
+   - `pick`, not select-list.
+2. retained or complex operations take spec tables.
+3. stable `id` is family-scoped replacement/dedupe state.
+4. `kind` is semantic classification, not a component class or color token.
+5. `lifetime` is a host hint, not a cleanup handle.
+6. modal operations return result envelopes.
+7. non-modal publications do not return component handles.
+8. payloads crossing lua are serializable host data.
+9. layout and fallback are host policy.
+10. the same primitive should make sense in TUI, batch, and future RPC hosts.
 
-they are not promises, overlay handles, or direct paint commands.
-
-the host may:
-
-- coalesce duplicates
-- drop stale notifications on mode changes
-- map them to toast, banner, log, rpc event, or no-op by mode policy
-
-### 2. prompt family
-
-confirms, text input, select, and editor-modal flows are one family: retained prompt requests.
-
-each request has:
-
-- a stable request id
-- prompt kind
-- prompt payload
-- optional timeout / cancellation metadata
-- terminal resolution state
-
-resolution is host-owned.
-extensions observe only the semantic result.
-
-default unbind outcomes:
-
-- confirm resolves `false`
-- select resolves `null` / `undefined`
-- text input resolves `null` / `undefined`
-- editor-modal resolves `null` / `undefined`
-
-that keeps teardown deterministic without replaying old prompts into a new binding.
-
-### 3. status family
-
-status-like surfaces are small retained records, not direct footer mutations.
-
-members:
-
-- keyed status items
-- working message singleton
-- hidden-thinking label singleton
-- title singleton
-
-these publish through family-scoped snapshots.
-the tui is free to merge, order, truncate, or restyle them.
-
-### 4. surface-slot family
-
-widgets, panels, header, footer, and advanced overlays are all slot leases.
-
-a slot lease says:
-
-- which surface family the extension is claiming
-- which host-defined slot within that family
-- what semantic payload to render there
-- whether a renderer ref is attached
-- ordering / visibility hints
-- lifetime hints such as `session` or `until_input`
-
-it does **not** say:
-
-- which concrete component class to instantiate
-- what focus object to borrow
-- which overlay stack entry id to use
-- how often the tui must repaint
-
-### 5. editor family
-
-editor capabilities split in two:
-
-- **editor actions** — get text, set text, paste text, clear text, maybe open editor-modal
-- **editor presentation** — border, autocomplete, cursoring, ime, focus, history, collapse behavior
-
-extensions may use the first class.
-the host owns the second class.
-
-### publication boundary
+## publication boundary
 
 extension ui publication is not command-owned.
 
@@ -194,55 +112,30 @@ any extension execution boundary that can mutate host-owned ui must publish or s
 
 this publication is a boundary object, not store access:
 
-- the agent-side extension runtime owns retained ui records, namespace/generation cleanup, dirty-family tracking, and any pending action queues.
-- the tui consumes semantic publications (`surface`, `prompt`, `editor_action`, notification, panel, etc.) and materializes local components from them.
+- the agent-side extension runtime owns retained ui records, namespace/generation cleanup, dirty-family tracking, and pending action queues.
+- the tui consumes semantic publications and materializes local components from them.
 - the tui must not read an `ExtensionUiStore`, `ExtensionRunner`, lua registry, or mailbox internals to discover ui state.
-- lua extensions call semantic capability functions (`ctx.ui.message`, `ctx.ui.status`, `ctx.ui.progress`, `ctx.ui.report`, `ctx.ui.prompt`, `ctx.ui.pick`, etc.); they never observe the store or transport shape.
-
-surface lifetimes are semantic hints, not direct component commands:
-
-- `session` means the lease persists until replaced, cleared, revoked, or unbound.
-- `until_input` means the host may clear the surface when the composer receives user input. zi's built-in greeter/onboarding header uses this policy; extension headers default to `session` unless they opt in.
-
-closed primitive families are intentional. extensibility happens through host-defined slots, semantic payloads, renderer refs, presentation documents, and deliberately added versioned families — not through raw tui component reach-through.
-
-### 6. transcript family
-
-transcript-facing ui uses semantic attachment and presentation records.
-
-an extension may:
-
-- attach semantic objects to transcript entries or tool results
-- mark an object with a renderer ref
-- update or detach that object while its lease is valid
-
-an extension may not:
-
-- inject a live transcript row object
-- pass a `TranscriptRenderable`
-- retain a cleanup callback that the tui must call later
+- lua extensions call semantic capability functions; they never observe the store or transport shape.
 
 ## render-work contract
 
-renderer hooks are the only advanced custom-presentation seam.
+renderer hooks are the advanced custom-presentation seam.
 
-they are still host-owned.
+they remain host-owned and pure.
 
 ### registration
 
-renderer hooks are registered during load/register as namespace-scoped names.
-a ui object may later reference one by id.
+renderer hooks are registered during load/register as namespace-scoped names. a ui or transcript object may later reference one by id.
 
-a renderer registration is generation-scoped.
-it dies at teardown, even if no session was bound.
+a renderer registration is generation-scoped. it dies at teardown, even if no session was bound.
 
 ### inputs
 
-a renderer hook receives only host-approved inputs, such as:
+a renderer hook receives host-approved inputs, such as:
 
 - object family
 - semantic payload for that object
-- presentation context (`width`, `expanded`, host mode, theme roles, density class, maybe slot kind)
+- presentation context (`width`, `expanded`, host mode, theme roles, density class)
 - object revision metadata
 
 it does not receive:
@@ -258,12 +151,9 @@ it does not receive:
 
 a renderer hook returns a **presentation document**.
 
-a presentation document is host data, not a component instance.
-it may contain host-approved nodes such as text runs, stacks, lists, tables, badges, markdown/code blocks, and other future serializable presentation nodes the host defines.
+a presentation document is host data, not a component instance. it may contain host-approved nodes such as text runs, stacks, lists, tables, badges, markdown/code blocks, and future serializable presentation nodes.
 
-the host may copy, cache, diff, or discard that document.
-
-the tui materializes its own render objects from the document.
+the host may copy, cache, diff, or discard that document. the tui materializes its own render objects from it.
 
 ### scheduling
 
@@ -274,92 +164,68 @@ the host may run a renderer when:
 - an object is created
 - semantic payload changes
 - expansion state changes
-- a slot or transcript context changes
-- theme or width class invalidates the cached document
+- context changes
+- theme or width invalidates the cached document
 
-render work does **not** run from tui paint or input hot paths.
-
-the tui consumes the newest retained presentation document that already exists.
+render work does **not** run from tui paint or input hot paths. the tui consumes the newest retained presentation document that already exists.
 
 ### purity
 
-renderer hooks are side-effect free by contract.
+renderer hooks are side-effect free by contract:
 
-that means:
-
-- no mutation of other retained objects
+- no mutation of retained objects
 - no prompt creation
-- no spawn / job scheduling
+- no process/job scheduling
 - no reliance on paint-time callback ordering
 - no yielding or blocking
 
-if a renderer tries to act like a controller instead of a pure function, host behavior is undefined except for one guarantee: the host may reject the output and fall back to default presentation.
+if a renderer acts like a controller, the host may reject the output and fall back to default presentation.
 
 ### failure and fallback
 
-renderer failure is fail-open.
+renderer failure is fail-open:
 
-if a renderer is missing, invalid, stale, or rejected:
-
-- the host keeps the semantic object alive
-- the host drops the stale presentation cache
-- the host uses family-default presentation
+- the semantic object stays alive
+- stale presentation cache is dropped
+- family-default presentation is used
 
 ## transcript integration
 
-transcript integration stays semantic first.
+transcript-facing ui stays semantic first.
 
-```text
-extension tool / event / attachment
-   │
-   ├─ create transcript object record
-   ├─ optional renderer_ref
-   └─ semantic revision bumps
-            │
-            ▼
-      host transcript projection
-            │
-            ├─ build / refresh presentation document
-            ├─ publish transcript semantic snapshot
-            └─ invalidate tui-local retained rows as needed
-                     │
-                     ▼
-                tui transcript rows
-```
+extensions may attach semantic objects to transcript entries or tool results, or create session notes/labels tied to durable entry ids. renderer refs may influence presentation, but transcript ownership stays host-owned.
 
-rules:
+extensions may not:
 
-- transcript ids and semantic revisions are host-owned.
-- renderer refs may influence presentation, but not transcript ownership.
-- transcript rows remain rebuildable from semantic state plus host-owned render caches.
-- transcript attachments clean up on unbind if session-local, or when the owning transcript object dies if later contracts add longer-lived transcript storage.
+- inject live transcript rows
+- pass `TranscriptRenderable` objects
+- retain cleanup callbacks for the tui to call later
 
 ## cleanup and rebind
 
-this section applies the retained-object and lifecycle docs directly to ui.
+this section applies [extensions-retained-objects.md](./extensions-retained-objects.md) and [extensions-lifecycle.md](./extensions-lifecycle.md) directly to ui.
 
 ### `session_shutdown`
 
 `session_shutdown` is the last session-visible edge where a namespace may:
 
-- finalize visible status or working text
+- finalize visible status/progress/message state
 - publish terminal prompt outcomes if already resolved
 - withdraw or mark transcript attachments terminal
-- request surface teardown in an orderly way
 
-it must not create new long-lived session-scoped ui leases.
+it must not create new long-lived session-scoped ui records.
 
 ### unbind
 
 after unbind:
 
-- every pending prompt owned by that namespace is resolved or cancelled by host policy
-- notification records still pending display are dropped
-- status / working / hidden-thinking / title records for that namespace are withdrawn
-- widget / panel / header / footer / overlay leases are revoked
+- pending prompts/picks owned by that namespace are resolved or cancelled by host policy
+- message records still pending display are dropped
+- status/progress records for that namespace are withdrawn
+- reports owned by that namespace are revoked
 - editor actions from stale handles are rejected or ignored
 - transcript attachments owned by the old binding are detached
-- all renderer caches derived from revoked session-scoped objects are invalidated
+- renderer caches derived from revoked session-scoped objects are invalidated
 
 no stale ui handle silently reattaches to a later binding.
 
@@ -371,7 +237,7 @@ reload is same-session generation swap.
 old generation g
    │
    ├─ session_shutdown(reason=reload)
-   ├─ unbind ui leases for g
+   ├─ unbind ui records for g
    ├─ discover + load generation g+1
    ├─ bind g+1 to same session
    ├─ session_start(reason=reload)
@@ -380,9 +246,9 @@ old generation g
 
 rules:
 
-- no prompt, status item, surface lease, attachment, or renderer ref from `g` is valid in `g+1`
-- the new generation must create fresh ui objects explicitly
-- the host may rebuild identical-looking presentation, but only from fresh `g+1` state
+- no prompt, pick, report, status, progress, message, editor action, attachment, or renderer ref from `g` is valid in `g+1`.
+- the new generation must publish fresh ui state explicitly.
+- identical-looking presentation may be rebuilt only from fresh `g+1` state.
 
 ### session replacement
 
@@ -392,7 +258,7 @@ new-session, resume, and fork replace both the session binding and the generatio
 session a / generation g
    │
    ├─ session_shutdown(reason=new|resume|fork)
-   ├─ unbind ui leases for g
+   ├─ unbind ui records for g
    ├─ teardown g
    ├─ discover + load generation h for session b
    ├─ bind h to session b
@@ -401,54 +267,20 @@ session a / generation g
 
 rules:
 
-- no ui state crosses the session replacement boundary implicitly
-- transcript attachments from session `a` do not rebind into session `b`
-- if the same extension id appears again, it still gets fresh namespace ownership and fresh ui leases
-
-## what this replaces or tightens in current zi
-
-- `src/coding_agent/extensions/context.zig` and `src/coding_agent/agent_session.zig` currently model a nullable `ctx.ui` seam.
-  this contract replaces that placeholder with host-owned ui primitives.
-- `src/tui/status_data.zig` currently stores extension statuses inside tui-owned state.
-  this contract moves status authority to the agent-owned host store and treats tui state as published materialization.
-- `src/coding_agent/extensions/api.zig` and `src/coding_agent/extensions/lua_renderer.zig` currently expose `render_result` as an optional lua hook for tool results.
-  this contract keeps the useful part — host-scheduled pure render work returning owned data — and generalizes it into renderer hooks for ui families without exposing raw tui reach-through.
-- `src/tui/tool_display.zig`, `src/tui/transcript.zig`, and `src/tui/conversation_projection.zig` already separate semantic input from retained presentation caches.
-  this contract makes that split normative for extension ui surfaces and transcript attachments too.
-- `src/tui/interactive.zig`, `src/tui/overlay.zig`, `src/tui/tui.zig`, and `src/tui/editor_iface.zig` already own slot layout, overlay focus, and editor plumbing on the tui side.
-  this contract keeps those seams host-private rather than extension-visible.
+- no ui state crosses the session replacement boundary implicitly.
+- transcript attachments from session `a` do not rebind into session `b`.
+- if the same extension id appears again, it still gets fresh namespace ownership and fresh ui records.
 
 ## explicit exclusions
 
 zi does not expose these across the lua boundary:
 
-- arbitrary component factories for widgets, header, footer, overlays, or transcript rows
-- raw overlay handles
-- raw terminal input listeners
+- arbitrary component factories
+- raw overlay handles or geometry
+- slot claims such as header/footer/widget placement
 - custom editor object replacement
+- raw terminal input listeners
 - direct paint-time callbacks from tui into lua
+- compatibility aliases for removed ui api names
 
-if zi later wants richer extension ui, it should add richer **host-owned primitives** or richer **presentation-document nodes**.
-it should not punch a new component-shaped hole through the owner boundary.
-
-## relation to the existing docs
-
-this doc does not replace the retained-object or lifecycle docs.
-it specializes them for ui.
-
-- [extensions-retained-objects.md](./extensions-retained-objects.md) stays authoritative for lease domains, cleanup edges, and family-scoped publication.
-- [extensions-lifecycle.md](./extensions-lifecycle.md) stays authoritative for bind, `session_start`, `session_shutdown`, unbind, teardown, reload, and session replacement ordering.
-- [runtime.md](./runtime.md) stays authoritative for the owner split: agent owns extension execution; tui owns presentation.
-- [extensions-events.md](./extensions-events.md) stays authoritative for the rule that public contracts are semantic payloads, not internal mailbox or snapshot transport.
-
-## non-goals
-
-this contract still does not pin down:
-
-- exact lua api names and call signatures for each primitive
-- final snapshot wire format
-- final presentation-document node schema
-- exact host arbitration rules when multiple namespaces compete for one slot
-- exact transcript attachment schema per attachment kind
-
-those belong in follow-on api and schema docs.
+if zi later wants richer extension ui, it should add richer **host-owned primitives** or richer **presentation-document nodes**. it should not punch a component-shaped hole through the owner boundary.

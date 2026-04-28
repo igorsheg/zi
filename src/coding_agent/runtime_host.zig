@@ -168,14 +168,14 @@ pub const RuntimeHost = struct {
         try runner.resumeAsync(id, owned);
     }
 
-    pub fn takePendingExtensionPanel(self: *RuntimeHost, allocator: std.mem.Allocator) ?extension_ui.Panel {
-        var panel = self.session.takePendingExtensionPanel() orelse return null;
-        defer panel.deinit(self.session.allocator);
-        return extension_ui.Panel.clone(allocator, panel) catch null;
+    pub fn takePendingExtensionReport(self: *RuntimeHost, allocator: std.mem.Allocator) ?extension_ui.Report {
+        var report = self.session.takePendingExtensionReport() orelse return null;
+        defer report.deinit(self.session.allocator);
+        return extension_ui.Report.clone(allocator, report) catch null;
     }
 
-    pub fn takePendingExtensionSurfaces(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.SurfaceUpdate {
-        return self.session.takePendingExtensionSurfaces(allocator) catch allocator.alloc(extension_ui.SurfaceUpdate, 0) catch &.{};
+    pub fn takePendingExtensionRuntimeBundles(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.UiPublication {
+        return self.session.takePendingExtensionRuntimeBundles(allocator) catch allocator.alloc(extension_ui.UiPublication, 0) catch &.{};
     }
 
     pub fn takePendingExtensionEditorActions(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.EditorAction {
@@ -189,7 +189,7 @@ pub const RuntimeHost = struct {
         }
 
         try self.session.resource_loader.reload();
-        const next = try session_bootstrap.prepareExtensionSurface(self.session_allocator, .{
+        const next = try session_bootstrap.prepareExtensionRuntimeBundle(self.session_allocator, .{
             .resource_loader = self.session.resource_loader,
             .settings_manager = self.create_options.settings_manager,
             .tools = self.create_options.tools,
@@ -197,7 +197,7 @@ pub const RuntimeHost = struct {
             .session_id = self.session.session_store.sessionId(),
             .extension_generation = self.reserveExtensionGeneration(),
         });
-        try self.session.replaceExtensionSurfaceOnAgentThread(next);
+        try self.session.replaceExtensionRuntimeBundleOnAgentThread(next);
     }
 
     pub fn dispatchExtensionOAuthLogin(self: *RuntimeHost, provider_id: []const u8, callbacks: request_mod.ExtensionOAuthLoginCallbacks) !request_mod.ExtensionOAuthLoginResponse.Result {

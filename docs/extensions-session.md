@@ -173,7 +173,7 @@ later:
 ```lua
 for _, entry in ipairs(ctx.session.entries({ label = "decision" })) do
   local notes = ctx.session.notes({ source_entry_id = entry.entry_id })
-  -- compose the entry and notes into a handoff or panel.
+  -- compose the entry and notes into a handoff or report.
 end
 ```
 

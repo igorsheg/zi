@@ -269,12 +269,12 @@ pub const ExtensionRuntime = union(enum) {
         session_labels_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, target_entry_id: ?[]const u8, limit: usize) ?std.json.Value = null,
         session_entry_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, entry_id: []const u8) ?std.json.Value = null,
         session_entries_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, label: ?[]const u8, limit: usize) ?std.json.Value = null,
-        show_panel: ?*const fn (session: *anyopaque, panel: extension_ui.Panel) anyerror!void = null,
+        publish_report: ?*const fn (session: *anyopaque, report: extension_ui.Report) anyerror!void = null,
         publish_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest) anyerror!void = null,
         resolve_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void = null,
         cancel_prompts: ?*const fn (session: *anyopaque) void = null,
-        publish_surface: ?*const fn (session: *anyopaque, update: extension_ui.SurfaceUpdate) anyerror!void = null,
-        revoke_surfaces: ?*const fn (session: *anyopaque) void = null,
+        publish_ui: ?*const fn (session: *anyopaque, update: extension_ui.UiPublication) anyerror!void = null,
+        revoke_ui: ?*const fn (session: *anyopaque) void = null,
         publish_editor_action: ?*const fn (session: *anyopaque, action: extension_ui.EditorAction) anyerror!void = null,
         clear_editor_actions: ?*const fn (session: *anyopaque) void = null,
         provider_projection_changed: ?*const fn (session: *anyopaque) void = null,
@@ -439,7 +439,7 @@ pub const ExtensionRunner = struct {
     current_update_callback: ?agent_protocol.AgentToolUpdateCallback = null,
     current_update_ctx: ?*anyopaque = null,
 
-    /// Working directory of the parent agent. Surfaced to Lua tools
+    /// Working directory of the parent agent. Published to Lua tools
     /// via `ctx.cwd` so they can spawn child processes in the
     /// right directory and resolve relative paths. Set once at
     /// session bootstrap; static for the runner generation.
@@ -756,7 +756,7 @@ pub const ExtensionRunner = struct {
         if (self.runtime == .bound) {
             const bound = self.runtime.bound;
             if (bound.cancel_prompts) |cancel| cancel(bound.session);
-            if (bound.revoke_surfaces) |revoke| revoke(bound.session);
+            if (bound.revoke_ui) |revoke| revoke(bound.session);
             if (bound.clear_editor_actions) |clear| clear(bound.session);
             var projection_changed = false;
             if (self._provider_registry) |registry| {

@@ -1,4 +1,4 @@
-# retained objects: progress, ui surfaces, subagents, and runtime state
+# retained objects: progress, semantic ui, subagents, and runtime state
 
 ## status
 
@@ -9,7 +9,7 @@ more specific retained-family contracts live in [tools](./extensions-tools.md), 
 
 ## decision
 
-- progress, status, working-message state, ui surfaces, transcript attachments, subagent state, and extension-visible runtime/session/provider state are **host-owned retained objects**.
+- progress, status, messages, reports, transcript attachments, subagent state, and extension-visible runtime/session/provider state are **host-owned retained objects**.
 - each retained object lives inside one `{ generation, namespace }` lease domain.
 - extensions may supply semantic intent and metadata, but they do not own tui components, cross-thread lifetimes, mailbox payloads, or redraw cadence.
 - live ui updates publish **family-scoped semantic snapshots** from host-owned retained state.
@@ -39,8 +39,8 @@ extension code
 │  generation g                                               │
 │  namespace n                                                │
 │                                                              │
-│  progress handles        status / working state             │
-│  ui surface leases       transcript attachment records      │
+│  progress records        status / message / report records │
+│  semantic ui records     transcript attachment records      │
 │  subagent records        runtime/session/provider state     │
 └───────────────┬──────────────────────────────────────────────┘
                 │
@@ -52,7 +52,7 @@ extension code
 │  snapshot caches                                             │
 │  retained transcript rows                                    │
 │  retained renderer state                                     │
-│  widget/header/footer/editor materialization                 │
+│  text/list/overlay/editor materialization                    │
 │  layout, focus, paint cadence                                │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -67,11 +67,11 @@ corollary:
 
 | class | authoritative owner | extension supplies | published across owner boundary | cleanup edge |
 | --- | --- | --- | --- | --- |
-| progress handles | agent-owned host state | label, phase, totals, status, child relationships, terminal reason | progress semantic view only; never a live tui object | unbind for active handles, teardown for namespace-owned records |
-| status items | agent-owned host state | key + text or clear intent | status family snapshot | unbind |
-| working-message state | agent-owned host state | message text or restore-default intent | status family snapshot | unbind |
-| widget/panel handles | host-owned surface leases | slot, ordering hints, semantic payload, optional renderer/factory reference defined by the ui contract | surface family snapshot or invalidation | unbind |
-| header/footer/title/editor handles | host-owned singleton slot leases | semantic payload or factory reference defined by the ui contract | surface family snapshot or invalidation | unbind |
+| progress records | agent-owned host state | title, detail, totals, lifecycle status, child relationships, terminal reason | progress semantic view only; never a live tui object | unbind for active records, teardown for namespace-owned records |
+| status items | agent-owned host state | key + text or clear intent | status semantic view | unbind |
+| messages | agent-owned host state | text, kind, lifetime/dedupe hints | message semantic publication | unbind or host expiry |
+| reports | agent-owned host state | title, body, lifetime/dedupe hints, optional renderer ref later | report semantic publication | unbind |
+| editor actions | host-owned composer state | set/paste/clear/get action payload | editor action queue | request boundary / unbind |
 | transcript attachments | agent-owned transcript semantics | attachment metadata, labels, render hints, lifecycle intent | transcript semantic snapshot | unbind if session-local; otherwise teardown when the owning transcript object dies |
 | retained presentation objects derived from transcript or tool results | tui-owned presentation cache | at most metadata or precomputed host payload | do not cross as live objects; only ids, semantic revisions, or payload descriptors cross | tui drop or rebuild on semantic invalidation |
 | namespace-scoped runtime state / caches / services | agent-owned runtime state | implementation data only | none by default | teardown |
@@ -85,9 +85,9 @@ corollary:
 
 these objects are part of product semantics, even when the tui renders them:
 
-- progress handles
+- progress records
 - status items
-- working-message state
+- messages and reports
 - transcript attachments that affect transcript meaning
 - subagent state
 - namespace/runtime/session/provider state
@@ -105,22 +105,22 @@ the tui owns:
 - focus state
 - scroll state
 - retained renderer caches
-- editor/header/footer/widget materialization
+- text/list/overlay/editor materialization
 - any presentation object built from semantic publication
 
 a tui object may outlive one paint, but it does not become extension-owned just because an extension requested it.
 
-the extension contract is about slots, handles, semantic payloads, and invalidation.
-it is not about borrowing component pointers across threads.
+the extension contract is about semantic payloads, retained records, and invalidation.
+it is not about borrowing component pointers, slot handles, or geometry across threads.
 
 ### extension-provided metadata
 
 extensions may provide:
 
-- labels, status text, working text
-- progress totals and annotations
+- labels, status text, message text, report bodies
+- progress totals, lifecycle state, and annotations
 - transcript attachment metadata
-- ui payloads or host-approved renderer/factory references
+- ui payloads or host-approved renderer references
 - runtime/service configuration
 - provider configuration
 - subagent configuration and semantic annotations
@@ -136,7 +136,7 @@ that means:
 
 - status publishes status semantics
 - progress publishes progress semantics
-- surfaces publish surface semantics
+- messages/reports publish semantic ui publications
 - transcript publishes transcript semantics, including attachment descriptors
 - subagents publish subagent semantics
 
@@ -160,8 +160,8 @@ the host chooses the transport shape, but every family must preserve these rules
 - consumers may rebuild local presentation caches from the latest semantic view.
 - publication does not transfer ownership of the underlying object.
 
-for singleton families such as title or working message, the semantic view may be just the resolved visible state plus provenance.
-for collection families such as progress handles or widgets, the semantic view may be a changed-record set plus enough metadata to resolve adds, updates, and removals.
+for singleton or keyed families such as message/status/report/progress, the semantic view may be just the resolved visible record plus provenance.
+for collection families such as progress records or transcript attachments, the semantic view may be a changed-record set plus enough metadata to resolve adds, updates, and removals.
 
 ## coalescing and update rules
 
@@ -170,7 +170,7 @@ cheap frequent updates are host-coalesced.
 rules:
 
 - scalar field writes are last-write-wins within one object revision stream.
-- the host may collapse many progress ticks or working-message rewrites into one published update.
+- the host may collapse many progress ticks or message rewrites into one published update.
 - terminal transitions must flush: create, complete, fail, cancel, attach, detach, revoke, and destroy are hard boundaries.
 - redraw cadence is host policy.
 - extensions do not force one mailbox send per mutation.
@@ -180,8 +180,8 @@ practical reading:
 
 - progress counts can update fast.
   the host may publish only the newest visible value.
-- working-message churn can update fast.
-  the host may publish only the newest text.
+- message/progress churn can update fast.
+  the host may publish only the newest visible text/state.
 - transcript semantic changes may use existing conversation coalescing rules, but attachment add/remove and terminal tool/subagent edges are hard flush points.
 
 ```text
@@ -190,8 +190,8 @@ many extension writes
    ├─ set progress current=41
    ├─ set progress current=42
    ├─ set progress current=43
-   ├─ set working="indexing"
-   └─ set working="indexing src/"
+   ├─ message "indexing"
+   └─ message "indexing src/"
    ▼
 host coalescer
    │
@@ -243,7 +243,7 @@ examples:
 
 - runtime caches/services
 - provider registrations
-- namespace-owned metadata for surface handles
+- namespace-owned metadata for semantic ui records
 - detached semantic records that are not session-visible after unbind but still need orderly teardown
 
 these die at teardown.
@@ -255,9 +255,9 @@ session-scoped objects survive across callbacks only while one generation is bou
 examples:
 
 - visible status items
-- working-message state
-- active progress handles
-- visible widget/header/footer/title/editor occupancy
+- visible messages and reports
+- active progress records
+- queued editor actions
 - bound provider instances
 - active subagents
 - transcript attachments attached to the active session transcript
@@ -290,7 +290,7 @@ after unbind:
 
 - every session-scoped lease for that namespace is invalid
 - no more session-visible callbacks fire for that namespace
-- visible status, working-message state, progress, surface occupancy, transcript attachments, bound provider instances, and active subagent state are withdrawn or cancelled
+- visible status, messages, reports, progress records, transcript attachments, bound provider instances, and active subagent state are withdrawn or cancelled
 - stale handle mutations are ignored or rejected by host policy; they are never reattached to the new binding implicitly
 
 ### reload
@@ -347,13 +347,13 @@ this contract exists because current seams are truthful, but still split across 
 - `src/tui/interactive.zig` and `src/tui/ui_event.zig` already show the right publication doctrine: bounded snapshot traffic, lossy coalescing for cheap updates, and separate lifecycle delivery for terminal outcomes.
   this doc turns that runtime shape into the retained-object rule.
 - `src/tui/conversation_projection.zig`, `src/tui/transcript.zig`, and `src/tui/renderers/builtins.zig` already distinguish semantic input from retained presentation caches.
-  this doc makes that split normative for extension-visible attachments and surfaces too.
+  this doc makes that split normative for extension-visible attachments and semantic ui too.
 - `src/coding_agent/runtime_host.zig` and `src/coding_agent/agent_session.zig` already tear down extension state on session replacement.
   this doc makes the cleanup expectations explicit for every retained-object class.
 
 ## pi-mono capability parity, without pi-mono ownership leakage
 
-pi-mono proves the product surface is worth keeping: status, working message, widgets, footer/header/title/editor controls, and runtime/provider state exist there already.
+pi-mono proves the product capability is worth keeping: feedback, status, progress, readable reports, prompts, picker flows, editor actions, and runtime/provider state exist there already.
 
 zi keeps that capability, but with stricter ownership:
 
@@ -369,7 +369,7 @@ so parity is about capability, not about copying pi-mono's in-memory object grap
 the following are rejected as the normal architecture:
 
 - one giant full-state ui blob streamed from extension code to drive live ui
-- direct tui → extension reach-through for status, progress, widget, or subagent mutation
+- direct tui → extension reach-through for status, progress, report, message, or subagent mutation
 - extension-owned tui component instances crossing threads
 - stale handles from an old generation silently mutating the new generation
 - treating mailbox payloads as the public product contract
@@ -379,7 +379,7 @@ the following are rejected as the normal architecture:
 this contract does not yet define:
 
 - the concrete extension api names for every retained class
-- exact widget/layout precedence rules between competing namespaces
+- exact status/report/message arbitration rules between competing namespaces
 - transcript attachment payload schema
 - provider api schema
 - subagent event payload schema

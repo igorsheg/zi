@@ -5,7 +5,6 @@ const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");
 const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal.zig");
-const terminal_notify = @import("terminal_notify.zig");
 const keys_mod = @import("keys.zig");
 const component_mod = @import("component.zig");
 const div_mod = @import("components/div.zig");
@@ -515,13 +514,8 @@ pub const Interactive = struct {
     active_editor_bound: bool = false,
     status_line: StatusLine,
     pending_image_banner: text_mod.Text,
-    extension_panel_text: text_mod.Text,
-    extension_header_text: text_mod.Text,
-    extension_footer_text: text_mod.Text,
-    extension_widget_above_text: text_mod.Text,
-    extension_widget_below_text: text_mod.Text,
-    extension_header_active: bool = false,
-    extension_header_lifetime: @import("../coding_agent/extensions/ui.zig").SurfaceLifetime = .session,
+    extension_report_text: text_mod.Text,
+    extension_message_text: text_mod.Text,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
@@ -567,9 +561,9 @@ pub const Interactive = struct {
     header_container: container_mod.Container,
     pending_container: container_mod.Container,
     status_container: container_mod.Container,
-    widget_above_container: container_mod.Container,
+    composer_above_container: container_mod.Container,
     editor_container: container_mod.Container,
-    widget_below_container: container_mod.Container,
+    composer_below_container: container_mod.Container,
 
     // ── Slash commands ──────────────────────────────────────────
     command_registry: CommandRegistry,
@@ -633,7 +627,6 @@ pub const Interactive = struct {
     last_ctrl_c_ns: i128 = 0,
     tool_output_expanded: bool = false,
     hide_thinking_block: bool = false,
-    extension_hidden_thinking_label: ?[]u8 = null,
     greeter_dismissed: bool = false,
     /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
     input: input_buffer_mod.InputBuffer,
@@ -665,11 +658,8 @@ pub const Interactive = struct {
             .editor = editor_mod.Editor.init(state_allocator),
             .status_line = StatusLine.init(state_allocator),
             .pending_image_banner = text_mod.Text.init(state_allocator),
-            .extension_panel_text = text_mod.Text.init(state_allocator),
-            .extension_header_text = text_mod.Text.init(state_allocator),
-            .extension_footer_text = text_mod.Text.init(state_allocator),
-            .extension_widget_above_text = text_mod.Text.init(state_allocator),
-            .extension_widget_below_text = text_mod.Text.init(state_allocator),
+            .extension_report_text = text_mod.Text.init(state_allocator),
+            .extension_message_text = text_mod.Text.init(state_allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
@@ -682,9 +672,9 @@ pub const Interactive = struct {
             .header_container = container_mod.Container.init(state_allocator),
             .pending_container = container_mod.Container.init(state_allocator),
             .status_container = container_mod.Container.init(state_allocator),
-            .widget_above_container = container_mod.Container.init(state_allocator),
+            .composer_above_container = container_mod.Container.init(state_allocator),
             .editor_container = container_mod.Container.init(state_allocator),
-            .widget_below_container = container_mod.Container.init(state_allocator),
+            .composer_below_container = container_mod.Container.init(state_allocator),
             .command_registry = CommandRegistry.init(state_allocator),
             .input = input_buffer_mod.InputBuffer.init(state_allocator),
             .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
@@ -768,10 +758,6 @@ pub const Interactive = struct {
         coding_agent_mod.model_registry.deinitOwnedModels(self.msg_allocator, self.model_catalog);
         self.model_catalog = &.{};
         self.status_data.deinit();
-        if (self.extension_hidden_thinking_label) |label| {
-            self.allocator.free(label);
-            self.extension_hidden_thinking_label = null;
-        }
         self.input.deinit();
         logMailboxStats("snapshot", self.snapshot_event_queue.stats());
         logMailboxStats("lifecycle", self.lifecycle_event_queue.stats());
@@ -787,20 +773,17 @@ pub const Interactive = struct {
         // Any unexpectedly undrained requests are mailbox-owned here;
         // deinit cleans them with AgentRequest.deinit.
         self.request_queue.deinit();
-        self.widget_below_container.deinit();
+        self.composer_below_container.deinit();
         self.editor_container.deinit();
-        self.widget_above_container.deinit();
+        self.composer_above_container.deinit();
         self.status_container.deinit();
         self.pending_container.deinit();
         self.header_container.deinit();
         self.transcript_container.deinit();
         self.conversation_projection.deinit();
         self.transcript.deinit();
-        self.extension_widget_below_text.deinit();
-        self.extension_widget_above_text.deinit();
-        self.extension_footer_text.deinit();
-        self.extension_header_text.deinit();
-        self.extension_panel_text.deinit();
+        self.extension_message_text.deinit();
+        self.extension_report_text.deinit();
         self.pending_image_banner.deinit();
         self.status_line.deinit();
         self.editor.deinit();
@@ -877,12 +860,10 @@ pub const Interactive = struct {
         self.status_line.setStatusData(&self.status_data);
         self.status_line.setTheme(self.theme);
         self.status_container.addChild(self.status_line.component());
-        self.widget_above_container.addChild(self.extension_widget_above_text.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
-        self.widget_below_container.addChild(self.extension_widget_below_text.component());
-        self.widget_below_container.addChild(self.extension_panel_text.component());
-        self.widget_below_container.addChild(self.extension_footer_text.component());
+        self.composer_below_container.addChild(self.extension_report_text.component());
+        self.composer_below_container.addChild(self.extension_message_text.component());
 
         // Set initial focus via TUI (source of truth for input routing)
         self.tui.setFocus(self.active_editor.component());
@@ -891,24 +872,23 @@ pub const Interactive = struct {
         self.transcript_container.addChild(self.transcript_bottom_padding.component());
         self.transcript_container.flex_child_index = 0;
 
-        // Build root tree matching pi-mono slot structure, adapted for a
-        // full-screen TUI: transcript remains the flex region while the header
-        // is a composer/onboarding surface near the editor, not top chrome.
-        // chat(flex) → pending → status → header → widget_above → editor(focused) → widget_below
+        // Build root tree: transcript remains the flex region while semantic
+        // UI publications materialize near the composer according to host policy.
+        // chat(flex) → pending → status → header/greeter → above → editor(focused) → below
         self.tui.root.addChild(self.transcript_container.component()); // [0] chat (flex, with bottom padding)
         self.tui.root.addChild(self.pending_container.component()); // [1] pendingContainer
         self.tui.root.addChild(self.status_container.component()); // [2] statusContainer
         self.tui.root.addChild(self.header_container.component()); // [3] composer header/onboarding
-        self.tui.root.addChild(self.widget_above_container.component()); // [4] widgetAboveContainer
+        self.tui.root.addChild(self.composer_above_container.component()); // [4] composerAboveContainer
         self.tui.root.addChild(self.editor_container.component()); // [5] editorContainer
-        self.tui.root.addChild(self.widget_below_container.component()); // [6] widgetBelowContainer
+        self.tui.root.addChild(self.composer_below_container.component()); // [6] composerBelowContainer
         self.tui.root.flex_child_index = 0; // transcript is flex
         self.tui.root.focused_child_index = 5; // editorContainer for cursor y-offset
 
         // RuntimeHost emits extension `session_start` before the TUI tree exists.
-        // Drain the semantic UI publications once after slots are materialized so
-        // lifecycle-time retained surfaces (widgets/status/header/footer/etc.)
-        // are visible without waiting for an extension command.
+        // Drain semantic UI publications once after slots are materialized so
+        // lifecycle-time retained messages/status/progress are visible without
+        // waiting for an extension command.
         self.publishPendingExtensionUi();
 
         self.tui.dirty = true;
@@ -1504,11 +1484,11 @@ pub const Interactive = struct {
             .extension_commands_updated => |u| {
                 self.applyExtensionCommandsUpdate(u.commands);
             },
-            .extension_panel_shown => |u| {
-                self.applyExtensionPanel(u.panel);
+            .extension_report_shown => |u| {
+                self.applyExtensionReport(u.report);
             },
-            .extension_surfaces_updated => |u| {
-                self.applyExtensionSurfaces(u.updates);
+            .extension_ui_published => |u| {
+                self.applyExtensionUiPublications(u.updates);
             },
             .extension_editor_actions => |u| {
                 self.applyExtensionEditorActions(u.actions);
@@ -1624,8 +1604,8 @@ pub const Interactive = struct {
         }
     }
 
-    fn currentHiddenThinkingLabel(self: *const Interactive) []const u8 {
-        return self.extension_hidden_thinking_label orelse "Thinking...";
+    fn currentHiddenThinkingLabel(_: *const Interactive) []const u8 {
+        return "Thinking...";
     }
 
     const TranscriptMouseZone = struct {
@@ -1797,19 +1777,11 @@ pub const Interactive = struct {
     }
 
     fn refreshHeaderVisibility(self: *Interactive) void {
-        if (self.composerHasPendingInput()) {
-            if (self.extension_header_active and self.extension_header_lifetime == .until_input) {
-                self.extension_header_active = false;
-                self.extension_header_text.setContent("");
-            }
-            if (!self.extension_header_active and !self.greeter_dismissed) {
-                self.greeter_dismissed = true;
-            }
+        if (self.composerHasPendingInput() and !self.greeter_dismissed) {
+            self.greeter_dismissed = true;
         }
         self.header_container.clear();
-        if (self.extension_header_active) {
-            self.header_container.addChild(self.extension_header_text.component());
-        } else if (!self.greeter_dismissed) {
+        if (!self.greeter_dismissed) {
             self.header_container.addChild(self.greeter.component());
         }
     }
@@ -1998,7 +1970,7 @@ pub const Interactive = struct {
         }
 
         // Publish the queued snapshot so the transcript projection picks up
-        // the new row without waiting for the agent thread to surface.
+        // the new row without waiting for the agent thread to ui_publication.
         _ = self.publishQueuedSnapshot();
 
         self.active_editor.clear();
@@ -2298,7 +2270,7 @@ pub const Interactive = struct {
         self.status_line.setPrimary(msg, self.theme.fg(.success));
     }
 
-    fn bottomPanelOptions(self: *Interactive) overlay_mod.OverlayOptions {
+    fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
         const width = self.tui.width();
         const header_h = self.header_container.measure(width).preferred_height;
         return .{
@@ -2307,7 +2279,7 @@ pub const Interactive = struct {
             .max_height_percent = 40,
             .margin_bottom = 0,
             .margin_top = header_h,
-            .surface = .{ .fill = Color.default },
+            .ui_publication = .{ .fill = Color.default },
         };
     }
 
@@ -2317,7 +2289,7 @@ pub const Interactive = struct {
         const header_h = self.header_container.measure(width).preferred_height;
         options.margin_top = header_h;
         options.margin_bottom = 1;
-        options.surface = .{ .fill = self.theme.bg(.tool_pending_bg) };
+        options.ui_publication = .{ .fill = self.theme.bg(.tool_pending_bg) };
         return options;
     }
 
@@ -2351,7 +2323,7 @@ pub const Interactive = struct {
     ) void {
         self.cancelTranscriptSelection();
         self.hideSimplePickerOverlay(handle);
-        handle.* = self.tui.showOverlay(picker.component(), self.bottomPanelOptions());
+        handle.* = self.tui.showOverlay(picker.component(), self.bottomSheetOptions());
     }
 
     fn hideSimplePickerOverlay(self: *Interactive, handle: *?tui_mod.OverlayHandle) void {
@@ -2431,7 +2403,7 @@ pub const Interactive = struct {
         self.resume_picker_flow = flow;
         self.resume_picker_flow.?.handle = self.tui.showOverlay(
             self.resume_picker_flow.?.picker.component(),
-            self.bottomPanelOptions(),
+            self.bottomSheetOptions(),
         );
         self.tui.dirty = true;
 
@@ -2531,7 +2503,7 @@ pub const Interactive = struct {
         };
         self.extension_prompt_flow.?.handle = self.tui.showOverlay(
             component,
-            self.bottomPanelOptions(),
+            self.bottomSheetOptions(),
         );
     }
 
@@ -2603,7 +2575,7 @@ pub const Interactive = struct {
         self.model_picker_flow = flow;
         self.model_picker_flow.?.handle = self.tui.showOverlay(
             self.model_picker_flow.?.picker.component(),
-            self.bottomPanelOptions(),
+            self.bottomSheetOptions(),
         );
     }
 
@@ -3226,7 +3198,7 @@ pub const Interactive = struct {
         }
     }
 
-    /// Publish the current extension command surface through the UI event
+    /// Publish the current extension command ui_publication through the UI event
     /// queue so the TUI thread can rebuild its own registry without reading
     /// or mutating agent-owned runner state directly.
     fn publishExtensionCommandsUpdate(self: *Interactive) void {
@@ -3265,12 +3237,12 @@ pub const Interactive = struct {
     /// owner. Call this after any agent-thread extension execution boundary that
     /// may have mutated UI state (startup lifecycle, commands, future observers).
     fn publishPendingExtensionUi(self: *Interactive) void {
-        if (self.runtime_host.takePendingExtensionPanel(self.msg_allocator)) |panel| {
-            _ = self.publishLifecycleUiEvent(.{ .extension_panel_shown = .{ .panel = panel } });
+        if (self.runtime_host.takePendingExtensionReport(self.msg_allocator)) |report| {
+            _ = self.publishLifecycleUiEvent(.{ .extension_report_shown = .{ .report = report } });
         }
-        const updates = self.runtime_host.takePendingExtensionSurfaces(self.msg_allocator);
+        const updates = self.runtime_host.takePendingExtensionUiPublications(self.msg_allocator);
         if (updates.len > 0) {
-            _ = self.publishLifecycleUiEvent(.{ .extension_surfaces_updated = .{ .updates = updates } });
+            _ = self.publishLifecycleUiEvent(.{ .extension_ui_published = .{ .updates = updates } });
         } else {
             self.msg_allocator.free(updates);
         }
@@ -3282,10 +3254,10 @@ pub const Interactive = struct {
         }
     }
 
-    fn applyExtensionPanel(self: *Interactive, panel: @import("../coding_agent/extensions/ui.zig").Panel) void {
-        const text = panel.flattenText(self.allocator) catch return;
+    fn applyExtensionReport(self: *Interactive, report: @import("../coding_agent/extensions/ui.zig").Report) void {
+        const text = report.flattenText(self.allocator) catch return;
         defer self.allocator.free(text);
-        self.extension_panel_text.setContent(text);
+        self.extension_report_text.setContent(text);
         self.tui.dirty = true;
     }
 
@@ -3301,64 +3273,22 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn applyExtensionSurfaces(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
+    fn applyExtensionUiPublications(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiPublication) void {
         for (updates) |update| {
             switch (update.kind) {
-                .status => {
-                    self.status_data.setStatus(update.id, update.text);
-                },
-                .header => {
-                    self.applySurfaceText(&self.extension_header_text, update);
-                    self.extension_header_active = surfaceHasContent(update);
-                    self.extension_header_lifetime = update.lifetime;
-                    self.refreshHeaderVisibility();
-                },
-                .footer => self.applySurfaceText(&self.extension_footer_text, update),
-                .widget => if (update.placement != null and std.mem.eql(u8, update.placement.?, "belowEditor"))
-                    self.applySurfaceText(&self.extension_widget_below_text, update)
-                else
-                    self.applySurfaceText(&self.extension_widget_above_text, update),
-                .working, .overlay => self.applySurfaceText(&self.extension_panel_text, update),
-                .notification => self.applyNotificationSurface(update),
-                .title => if (update.text) |title| self.tui.terminal.setTitle(title),
-                .thinking_label => self.applyHiddenThinkingLabelSurface(update),
+                .message => self.applyUiPublicationText(&self.extension_message_text, update),
+                .status => self.status_data.setStatus(update.id, update.text),
+                .progress => self.applyUiPublicationText(&self.extension_report_text, update),
             }
         }
         self.tui.dirty = true;
     }
 
-    fn applySurfaceText(self: *Interactive, text_component: *text_mod.Text, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
-        const text = update.flattenText(self.allocator) catch return;
-        defer self.allocator.free(text);
-        text_component.setContent(text);
+    fn applyUiPublicationText(_: *Interactive, text_component: *text_mod.Text, update: @import("../coding_agent/extensions/ui.zig").UiPublication) void {
+        text_component.setContent(update.text orelse "");
     }
 
-    fn applyNotificationSurface(_: *Interactive, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
-        const message = update.text orelse return;
-        terminal_notify.notify("Zi", message);
-    }
-
-    fn applyHiddenThinkingLabelSurface(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
-        if (self.extension_hidden_thinking_label) |old| {
-            self.allocator.free(old);
-            self.extension_hidden_thinking_label = null;
-        }
-        if (update.text) |label| {
-            self.extension_hidden_thinking_label = self.allocator.dupe(u8, label) catch null;
-        }
-        for (self.transcript.items.items, 0..) |_, idx| {
-            const assistant = self.transcript.assistantMessageAt(idx) orelse continue;
-            assistant.setHiddenThinkingLabel(self.currentHiddenThinkingLabel()) catch continue;
-            self.transcript.itemMutatedAt(idx);
-        }
-    }
-
-    fn surfaceHasContent(update: @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) bool {
-        if (update.text) |text| if (text.len > 0) return true;
-        return update.lines.len > 0;
-    }
-
-    /// TUI-thread application of the latest extension command surface.
+    /// TUI-thread application of the latest extension command ui_publication.
     fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {
         for (self.command_registry.dynamic.items) |*cmd| {
             self.allocator.free(cmd.name);

@@ -908,7 +908,7 @@ test "example commands extension dispatches through host-owned command ui" {
         .get_context_usage = &commandExampleGetContextUsage,
         .get_system_prompt = &commandExampleGetSystemPrompt,
         .get_binding_info = &commandExampleGetBindingInfo,
-        .show_panel = &CommandExampleStore.showPanel,
+        .publish_report = &CommandExampleStore.publishReport,
     }, &provider_registry);
     api.installZiTable(&state, &runner);
 
@@ -917,31 +917,31 @@ test "example commands extension dispatches through host-owned command ui" {
     try std.testing.expect(runner.command_registry.getByVisibleName("hello") != null);
 
     try runner.dispatchCommand("hello", "matrix");
-    const panel = store.panel orelse return error.MissingCommandPanel;
-    try std.testing.expectEqualStrings("hello-command", panel.id);
-    try std.testing.expectEqualStrings("Hello command", panel.title);
-    try std.testing.expect(panel.transient);
-    try std.testing.expectEqual(@as(usize, 1), panel.lines.len);
-    try std.testing.expectEqual(@as(usize, 1), panel.lines[0].len);
-    try std.testing.expectEqualStrings("Hello, matrix!", panel.lines[0][0].text);
+    const report = store.report orelse return error.MissingCommandReport;
+    try std.testing.expectEqualStrings("hello-command", report.id);
+    try std.testing.expectEqualStrings("Hello command", report.title);
+    try std.testing.expect(report.transient);
+    try std.testing.expectEqual(@as(usize, 1), report.lines.len);
+    try std.testing.expectEqual(@as(usize, 1), report.lines[0].len);
+    try std.testing.expectEqualStrings("Hello, matrix!", report.lines[0][0].text);
 }
 
 const CommandExampleStore = struct {
     allocator: std.mem.Allocator = std.testing.allocator,
-    panel: ?extension_ui.Panel = null,
+    report: ?extension_ui.Report = null,
     editor_action: ?extension_ui.EditorAction = null,
-    surfaces: std.ArrayList(extension_ui.SurfaceUpdate) = .empty,
+    ui_publications: std.ArrayList(extension_ui.UiPublication) = .empty,
 
     fn deinit(self: *CommandExampleStore) void {
         if (self.editor_action) |*action| action.deinit(self.allocator);
         self.editor_action = null;
-        for (self.surfaces.items) |*surface| surface.deinit(self.allocator);
-        self.surfaces.deinit(self.allocator);
+        for (self.ui_publications.items) |*ui_publication| ui_publication.deinit(self.allocator);
+        self.ui_publications.deinit(self.allocator);
     }
 
-    fn showPanel(session: *anyopaque, panel: extension_ui.Panel) anyerror!void {
+    fn publishReport(session: *anyopaque, report: extension_ui.Report) anyerror!void {
         const self: *CommandExampleStore = @ptrCast(@alignCast(session));
-        self.panel = panel;
+        self.report = report;
     }
 
     fn publishEditorAction(session: *anyopaque, action: extension_ui.EditorAction) anyerror!void {
@@ -950,10 +950,10 @@ const CommandExampleStore = struct {
         self.editor_action = try extension_ui.EditorAction.clone(self.allocator, action);
     }
 
-    fn publishSurface(session: *anyopaque, update: extension_ui.SurfaceUpdate) anyerror!void {
+    fn publishUi(session: *anyopaque, update: extension_ui.UiPublication) anyerror!void {
         const self: *CommandExampleStore = @ptrCast(@alignCast(session));
-        const cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
-        try self.surfaces.append(self.allocator, cloned);
+        const cloned = try extension_ui.UiPublication.clone(self.allocator, update);
+        try self.ui_publications.append(self.allocator, cloned);
     }
 };
 
@@ -1057,7 +1057,7 @@ test "example status line extension updates status across session and turn event
         .get_context_usage = &commandExampleGetContextUsage,
         .get_system_prompt = &commandExampleGetSystemPrompt,
         .get_binding_info = &commandExampleGetBindingInfo,
-        .publish_surface = &CommandExampleStore.publishSurface,
+        .publish_ui = &CommandExampleStore.publishUi,
     }, &provider_registry);
     api.installZiTable(&state, &runner);
 
@@ -1070,22 +1070,22 @@ test "example status line extension updates status across session and turn event
         .session_id = "session-123",
         .session_file = "/workspace/.zi/sessions/session-123.jsonl",
     }, null, .startup, null);
-    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[0].kind);
-    try std.testing.expectEqualStrings("status-demo", store.surfaces.items[0].id);
-    try std.testing.expectEqualStrings("Ready", store.surfaces.items[0].text.?);
+    try std.testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[0].kind);
+    try std.testing.expectEqualStrings("status-demo", store.ui_publications.items[0].id);
+    try std.testing.expectEqualStrings("Ready", store.ui_publications.items[0].text.?);
 
     try event_bridge.handleAgentEvent(&runner, .{ .turn_start = {} });
-    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[1].kind);
-    try std.testing.expectEqualStrings("status-demo", store.surfaces.items[1].id);
-    try std.testing.expectEqualStrings("● Turn 1...", store.surfaces.items[1].text.?);
+    try std.testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[1].kind);
+    try std.testing.expectEqualStrings("status-demo", store.ui_publications.items[1].id);
+    try std.testing.expectEqualStrings("● Turn 1...", store.ui_publications.items[1].text.?);
 
     try event_bridge.handleAgentEvent(&runner, .{ .turn_end = .{
         .message = .{ .assistant = commandExampleAssistantMessage() },
         .tool_results = &.{},
     } });
-    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[2].kind);
-    try std.testing.expectEqualStrings("status-demo", store.surfaces.items[2].id);
-    try std.testing.expectEqualStrings("✓ Turn 1 complete", store.surfaces.items[2].text.?);
+    try std.testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[2].kind);
+    try std.testing.expectEqualStrings("status-demo", store.ui_publications.items[2].id);
+    try std.testing.expectEqualStrings("✓ Turn 1 complete", store.ui_publications.items[2].text.?);
 }
 
 test "example custom header extension publishes a semantic report" {
@@ -1128,7 +1128,7 @@ test "example custom header extension publishes a semantic report" {
         .get_context_usage = &commandExampleGetContextUsage,
         .get_system_prompt = &commandExampleGetSystemPrompt,
         .get_binding_info = &commandExampleGetBindingInfo,
-        .show_panel = &CommandExampleStore.showPanel,
+        .publish_report = &CommandExampleStore.publishReport,
     }, &provider_registry);
     api.installZiTable(&state, &runner);
 
@@ -1142,11 +1142,11 @@ test "example custom header extension publishes a semantic report" {
         .session_file = "/workspace/.zi/sessions/session-123.jsonl",
     }, null, .startup, null);
 
-    const panel = store.panel orelse return error.MissingPanel;
-    try std.testing.expectEqualStrings("welcome", panel.id);
-    try std.testing.expectEqualStrings("zi coding agent", panel.title);
-    try std.testing.expectEqualStrings("Welcome. Extension UI is semantic and host-owned.", panel.lines[0][0].text);
-    try std.testing.expect(panel.transient);
+    const report = store.report orelse return error.MissingReport;
+    try std.testing.expectEqualStrings("welcome", report.id);
+    try std.testing.expectEqualStrings("zi coding agent", report.title);
+    try std.testing.expectEqualStrings("Welcome. Extension UI is semantic and host-owned.", report.lines[0][0].text);
+    try std.testing.expect(report.transient);
 }
 
 test "example widget placement extension publishes semantic status" {
@@ -1189,7 +1189,7 @@ test "example widget placement extension publishes semantic status" {
         .get_context_usage = &commandExampleGetContextUsage,
         .get_system_prompt = &commandExampleGetSystemPrompt,
         .get_binding_info = &commandExampleGetBindingInfo,
-        .publish_surface = &CommandExampleStore.publishSurface,
+        .publish_ui = &CommandExampleStore.publishUi,
     }, &provider_registry);
     api.installZiTable(&state, &runner);
 
@@ -1203,10 +1203,10 @@ test "example widget placement extension publishes semantic status" {
         .session_file = "/workspace/.zi/sessions/session-123.jsonl",
     }, null, .startup, null);
 
-    try std.testing.expectEqual(@as(usize, 1), store.surfaces.items.len);
-    try std.testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[0].kind);
-    try std.testing.expectEqualStrings("widget-demo", store.surfaces.items[0].id);
-    try std.testing.expectEqualStrings("Extension UI ready", store.surfaces.items[0].text.?);
+    try std.testing.expectEqual(@as(usize, 1), store.ui_publications.items.len);
+    try std.testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[0].kind);
+    try std.testing.expectEqualStrings("widget-demo", store.ui_publications.items[0].id);
+    try std.testing.expectEqualStrings("Extension UI ready", store.ui_publications.items[0].text.?);
 }
 
 test "example qna extension writes a question prompt through editor actions" {

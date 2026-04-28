@@ -79,9 +79,9 @@ pub const AgentSession = struct {
     /// teardown order (unsubscribe → runner.deinit → state.deinit).
     /// Both fields are nil when Lua init fails; the agent still runs.
     _extension_lua_state: ?*lua_runtime.LuaState = null,
-    pending_extension_panel: ?extension_ui.Panel = null,
+    pending_extension_report: ?extension_ui.Report = null,
     pending_extension_prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
-    pending_extension_surfaces: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
+    pending_extension_ui_publications: std.ArrayListUnmanaged(extension_ui.UiPublication) = .empty,
     pending_extension_editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
     pending_tool_projection_refresh: bool = false,
 
@@ -156,7 +156,7 @@ pub const AgentSession = struct {
 
     pub const PreparedDeps = session_bootstrap.PreparedDeps;
     pub const StreamClosure = session_bootstrap.StreamClosure;
-    pub const ExtensionSurface = session_bootstrap.ExtensionSurface;
+    pub const ExtensionRuntimeBundle = session_bootstrap.ExtensionRuntimeBundle;
 
     pub const Options = struct {
         model: ai.protocol.Model,
@@ -546,9 +546,9 @@ pub const AgentSession = struct {
         // same path here on whatever thread owns lua.
         self.deactivateLifecycle();
         self.destroyExtensionRuntime();
-        self.clearPendingExtensionPanel();
+        self.clearPendingExtensionReport();
         self.clearPendingExtensionPrompts();
-        self.clearPendingExtensionSurfaces();
+        self.clearPendingExtensionRuntimeBundles();
         self.clearPendingExtensionEditorActions();
         self.allocator.destroy(self._stream_closure);
         self.allocator.destroy(self._extension_runner_ref);
@@ -710,12 +710,12 @@ pub const AgentSession = struct {
             .session_labels_get = &runtimeSessionLabelsGet,
             .session_entry_get = &runtimeSessionEntryGet,
             .session_entries_get = &runtimeSessionEntriesGet,
-            .show_panel = &runtimeShowPanel,
+            .publish_report = &runtimePublishReport,
             .publish_prompt = &runtimePublishPrompt,
             .resolve_prompt = &runtimeResolvePrompt,
             .cancel_prompts = &runtimeCancelPrompts,
-            .publish_surface = &runtimePublishSurface,
-            .revoke_surfaces = &runtimeRevokeSurfaces,
+            .publish_ui = &runtimePublishUi,
+            .revoke_ui = &runtimeRevokeUi,
             .publish_editor_action = &runtimePublishEditorAction,
             .clear_editor_actions = &runtimeClearEditorActions,
             .provider_projection_changed = &runtimeProviderProjectionChanged,
@@ -729,7 +729,7 @@ pub const AgentSession = struct {
         }
     }
 
-    pub fn replaceExtensionSurfaceOnAgentThread(self: *AgentSession, next: ExtensionSurface) !void {
+    pub fn replaceExtensionRuntimeBundleOnAgentThread(self: *AgentSession, next: ExtensionRuntimeBundle) !void {
         if (self.agent.isStreaming() or self.agent.hasQueuedMessages()) return error.SessionBusy;
         if (self._extension_runner) |runner| {
             if (!runner.isReloadIdle()) return error.SessionBusy;
@@ -739,7 +739,7 @@ pub const AgentSession = struct {
         errdefer replacement.deinit(self.allocator);
         if (replacement.extension_runner) |runner| self.bindExtensionRuntimeFor(runner);
 
-        var old: ExtensionSurface = .{
+        var old: ExtensionRuntimeBundle = .{
             .system_prompt = self._owned_system_prompt,
             .tools = self.tools,
             .builtin_ctx = self._builtin_ctx,
@@ -1296,21 +1296,21 @@ pub const AgentSession = struct {
         return .{ .array = out };
     }
 
-    fn runtimeShowPanel(session_ptr: *anyopaque, panel: extension_ui.Panel) !void {
+    fn runtimePublishReport(session_ptr: *anyopaque, report: extension_ui.Report) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.clearPendingExtensionPanel();
-        self.pending_extension_panel = try extension_ui.Panel.clone(self.allocator, panel);
+        self.clearPendingExtensionReport();
+        self.pending_extension_report = try extension_ui.Report.clone(self.allocator, report);
     }
 
-    pub fn takePendingExtensionPanel(self: *AgentSession) ?extension_ui.Panel {
-        const panel = self.pending_extension_panel;
-        self.pending_extension_panel = null;
-        return panel;
+    pub fn takePendingExtensionReport(self: *AgentSession) ?extension_ui.Report {
+        const report = self.pending_extension_report;
+        self.pending_extension_report = null;
+        return report;
     }
 
-    fn clearPendingExtensionPanel(self: *AgentSession) void {
-        if (self.pending_extension_panel) |*panel| panel.deinit(self.allocator);
-        self.pending_extension_panel = null;
+    fn clearPendingExtensionReport(self: *AgentSession) void {
+        if (self.pending_extension_report) |*report| report.deinit(self.allocator);
+        self.pending_extension_report = null;
     }
 
     fn runtimePublishPrompt(session_ptr: *anyopaque, prompt: extension_ui.PromptRequest) !void {
@@ -1340,37 +1340,37 @@ pub const AgentSession = struct {
         self.pending_extension_prompts = .empty;
     }
 
-    fn runtimePublishSurface(session_ptr: *anyopaque, update: extension_ui.SurfaceUpdate) !void {
+    fn runtimePublishUi(session_ptr: *anyopaque, update: extension_ui.UiPublication) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        var cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
+        var cloned = try extension_ui.UiPublication.clone(self.allocator, update);
         errdefer cloned.deinit(self.allocator);
-        try self.pending_extension_surfaces.append(self.allocator, cloned);
+        try self.pending_extension_ui_publications.append(self.allocator, cloned);
     }
 
-    fn runtimeRevokeSurfaces(session_ptr: *anyopaque) void {
+    fn runtimeRevokeUi(session_ptr: *anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.clearPendingExtensionSurfaces();
+        self.clearPendingExtensionRuntimeBundles();
     }
 
-    pub fn takePendingExtensionSurfaces(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.SurfaceUpdate {
-        const out = try allocator.alloc(extension_ui.SurfaceUpdate, self.pending_extension_surfaces.items.len);
+    pub fn takePendingExtensionRuntimeBundles(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.UiPublication {
+        const out = try allocator.alloc(extension_ui.UiPublication, self.pending_extension_ui_publications.items.len);
         errdefer allocator.free(out);
         var initialized: usize = 0;
         errdefer {
             for (out[0..initialized]) |*update| update.deinit(allocator);
         }
-        for (self.pending_extension_surfaces.items, 0..) |update, i| {
-            out[i] = try extension_ui.SurfaceUpdate.clone(allocator, update);
+        for (self.pending_extension_ui_publications.items, 0..) |update, i| {
+            out[i] = try extension_ui.UiPublication.clone(allocator, update);
             initialized += 1;
         }
-        self.clearPendingExtensionSurfaces();
+        self.clearPendingExtensionRuntimeBundles();
         return out;
     }
 
-    fn clearPendingExtensionSurfaces(self: *AgentSession) void {
-        for (self.pending_extension_surfaces.items) |*update| update.deinit(self.allocator);
-        self.pending_extension_surfaces.deinit(self.allocator);
-        self.pending_extension_surfaces = .empty;
+    fn clearPendingExtensionRuntimeBundles(self: *AgentSession) void {
+        for (self.pending_extension_ui_publications.items) |*update| update.deinit(self.allocator);
+        self.pending_extension_ui_publications.deinit(self.allocator);
+        self.pending_extension_ui_publications = .empty;
     }
 
     fn runtimePublishEditorAction(session_ptr: *anyopaque, action: extension_ui.EditorAction) !void {
@@ -2659,7 +2659,7 @@ test "AgentSession refreshes visible tools and prompt after runtime tool registr
     try testing.expect(found);
 }
 
-test "AgentSession: extension surface swap publishes the next runner generation" {
+test "AgentSession: extension ui_publication swap publishes the next runner generation" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2703,12 +2703,12 @@ test "AgentSession: extension surface swap publishes the next runner generation"
         "reload v2 result",
     );
     try ca.resource_loader.reload();
-    const next = try session_bootstrap.prepareExtensionSurface(allocator, .{
+    const next = try session_bootstrap.prepareExtensionRuntimeBundle(allocator, .{
         .resource_loader = ca.resource_loader,
         .session_id = ca.session_store.sessionId(),
         .extension_generation = 1,
     });
-    try ca.replaceExtensionSurfaceOnAgentThread(next);
+    try ca.replaceExtensionRuntimeBundleOnAgentThread(next);
 
     const swapped_runner = ca.extensionRunner() orelse return error.MissingExtensionRunner;
     try testing.expectEqual(@as(extension_runner_mod.Generation, 1), swapped_runner.generation);

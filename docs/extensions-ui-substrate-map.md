@@ -356,19 +356,18 @@ public api should describe the left column only through semantic primitives.
 
 ## current host-owned extension ui records
 
-current implementation still has internal transport names that predate the final public vocabulary. those names are not public lua api.
+current implementation now uses semantic transport names for extension ui. these names are still internal records, not public lua objects.
 
 | internal record/family | current use | semantic meaning |
 | --- | --- | --- |
-| `Panel` | report-like body flattened into `extension_panel_text` | `ctx.ui.report` transport |
-| `SurfaceUpdate.status` | keyed extension status in `StatusData` | `ctx.ui.status` |
-| `SurfaceUpdate.footer` | text component destination | `ctx.ui.message` materialization path |
-| `SurfaceUpdate.working` | text component destination | `ctx.ui.progress` materialization path |
-| `SurfaceUpdate.notification` | terminal notification | possible host side effect of `message` |
+| `Report` | report body flattened into TUI-owned text materialization | `ctx.ui.report` transport |
+| `UiPublication.message` | short feedback text | `ctx.ui.message` |
+| `UiPublication.status` | keyed extension status in `StatusData` | `ctx.ui.status` |
+| `UiPublication.progress` | compact progress text materialization | `ctx.ui.progress` |
 | `PromptRequest` | confirm/select/input/editor prompt | `ctx.ui.prompt` and `ctx.ui.pick` |
 | `EditorAction` | composer mutations | `ctx.ui.editor_*` |
 
-follow-on implementation should gradually rename/internalize these around semantic family names, but public behavior should already be the new vocabulary.
+follow-on implementation should add richer records only where the semantic primitive demands it. the current transport no longer exposes slot-shaped header/footer/widget/overlay variants.
 
 ## overlay policy
 
@@ -515,10 +514,10 @@ this table is the guardrail against the api becoming scattered.
 
 | primitive | endgame contract | current public api | current materialization | consistency gaps to close |
 | --- | --- | --- | --- | --- |
-| `message` | ephemeral short feedback with `{ kind, id?, lifetime? }`; host routes to footer/status/toast/log | exists as `ctx.ui.message(text, opts?)`; `kind` is accepted through opts | currently publishes a footer-like surface; terminal notification remains an internal surface family | decide whether message should also trigger terminal notification by policy; make `id` semantics explicit for dedupe/update |
-| `status` | compact retained state keyed by `id`; optional `label`, `kind`, `priority`, `lifetime`; no placement | exists as `ctx.ui.status({ id, text/value })` | maps to `StatusData.extension_statuses` and `StatusLine` | internal storage is string-only and sorted by key; no severity/priority yet |
-| `progress` | retained work lifecycle keyed by `id` with `status = running/done/error/cancelled`, `title`, `detail`, counts | exists as `ctx.ui.progress(spec)` but is currently text-shaped | maps to working/panel-like text path | needs real progress record type; avoid reusing one singleton working label semantics |
-| `report` | durable readable document by `id`; plain text baseline; future host-owned markdown/actions/destination policy | exists as `ctx.ui.report({ id?, title?, body, transient? })` | still travels through internal `Panel`/`show_panel` naming and `Text` materialization | rename internal transport to report; preserve scroll by id; add explicit `format = "text"` before markdown |
+| `message` | ephemeral short feedback with `{ kind, id?, lifetime? }`; host routes to composer-adjacent text/status/toast/log | exists as `ctx.ui.message(text, opts?)`; `kind` is accepted through opts | publishes `UiPublication.message` and materializes as TUI-owned short text | make `id` semantics explicit for dedupe/update; decide terminal-notification policy |
+| `status` | compact retained state keyed by `id`; optional `label`, `kind`, `priority`, `lifetime`; no placement | exists as `ctx.ui.status({ id, text/value })` | publishes `UiPublication.status`, maps to `StatusData.extension_statuses` and `StatusLine` | internal storage is string-only and sorted by key; no severity/priority yet |
+| `progress` | retained work lifecycle keyed by `id` with `status = running/done/error/cancelled`, `title`, `detail`, counts | exists as `ctx.ui.progress(spec)` but is currently text-shaped | publishes `UiPublication.progress` and materializes compactly near reports/messages | needs real progress record type instead of formatted text |
+| `report` | durable readable document by `id`; plain text baseline; future host-owned markdown/actions/destination policy | exists as `ctx.ui.report({ id?, title?, body, transient? })` | travels through internal `Report` transport and `Text` materialization | preserve scroll by id; add explicit `format = "text"` before markdown |
 | `prompt` | modal request envelope with typed kind, declarative validation, timeout, semantic result | exists as `ctx.ui.prompt({ kind = confirm/select/input/editor, ... })` | uses `Overlay`, `ListPicker`, and `Editor` flows | add declarative validation; keep result shape aligned with `pick` |
 | `pick` | telescope-like chooser: entries/source/search/preview/actions/multi-select over time; no hot-path lua callbacks | exists as `ctx.ui.pick({ title, options })` | currently prompt/select-shaped over `ListPicker`/`SelectList` | add richer item fields, selected item in result, placeholder/empty text, static preview; keep callbacks host-owned |
 | `editor_*` | explicit composer buffer actions only | exists as set/paste/clear/get editor text | maps through `EditorAction` to composer `Editor` | naming is intentionally action-shaped; do not add raw cursor/focus/key APIs without semantic editor jobs |
@@ -537,18 +536,16 @@ all public `ctx.ui` primitives should obey the same grammar:
 7. **modal primitives return envelopes**: `prompt` and `pick` return `{ status = ... }`; non-modal publications return nothing/use boolean success only if needed.
 8. **payloads crossing lua are serializable data**: no component instances, raw handles, focus objects, or paint/input callbacks.
 9. **host owns layout and fallback**: every primitive must make sense in TUI, batch, and future RPC hosts.
-10. **internal names may lag, public names may not**: `Panel`/`SurfaceUpdate` can be mechanically renamed later, but public lua must stay semantic now.
+10. **internal names must reinforce public intent**: internal extension-ui records should speak report/message/status/progress/prompt/pick/editor-action vocabulary, not slot vocabulary.
 
 ### current internal cleanup backlog
 
 these are implementation debts, not public api holes:
 
-- rename `Panel`, `show_panel`, and `extension_panel_shown` internals to report-shaped names.
-- split `SurfaceUpdate` into semantic families or make its old slot-like variants private adapters.
-- make `progress` an explicit retained record instead of mapping through working/overlay-ish text.
+- make `progress` an explicit retained record instead of formatted text.
 - upgrade `PromptRequest.SelectOption` to carry `description` and future item metadata.
 - return selected `item` from `pick`, not just `value`.
-- move terminal notification into host policy for `message` instead of a separate public concept.
+- define terminal notification policy as one possible host materialization of `message`, not a separate extension concept.
 
 ## research conclusions
 
@@ -564,38 +561,32 @@ these are implementation debts, not public api holes:
 
 ## recommended next implementation slices
 
-### slice 1: align names and docs
-
-- keep `ctx.ui.report` as the only public report output primitive.
-- stop using panel language in public docs except historical removed-api notes.
-- optionally rename internal `Panel`/`show_panel` transport to `Report` in a mechanical follow-up.
-
-### slice 2: make `message` richer but still tiny
+### slice 1: make `message` richer but still tiny
 
 - accept `{ kind, id, lifetime }`.
 - use `kind` for severity/dedupe routing.
 - keep destination host-owned.
 
-### slice 3: make `progress` semantic
+### slice 2: make `progress` semantic
 
 - accept `status = "running" | "done" | "error" | "cancelled"`.
 - keep compact materialization in status line for now.
 - allow multiple keyed progress records internally even if TUI collapses them.
 
-### slice 4: strengthen `pick` v1.5
+### slice 3: strengthen `pick` v1.5
 
 - support item `description` in public lua.
 - return selected item as well as value.
 - support `placeholder` / `prompt` and `empty_text`.
 - no lua callbacks during search.
 
-### slice 5: improve report substrate
+### slice 4: improve report substrate
 
 - preserve scroll by report `id`.
 - use `Markdown` only behind `format = "markdown"`.
 - add copy/insert actions once host actions are formalized.
 
-### slice 6: transcript annotations
+### slice 5: transcript annotations
 
 - render notes/labels near transcript entries through host policy.
 - avoid new lua UI until session semantics prove insufficient.

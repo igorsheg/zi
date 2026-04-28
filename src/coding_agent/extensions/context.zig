@@ -25,7 +25,7 @@ pub fn pushExtensionContext(
     c.lua_setfield(L, -2, "cwd");
 
     const has_ui = switch (runner.runtime) {
-        .bound => |bound| bound.ui != null or bound.show_panel != null or bound.publish_prompt != null or bound.publish_surface != null or bound.publish_editor_action != null,
+        .bound => |bound| bound.ui != null or bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_editor_action != null,
         .stub => false,
     };
     c.lua_pushboolean(L, if (has_ui) 1 else 0);
@@ -111,7 +111,7 @@ fn pushUiApi(
     };
 
     const has_methods = switch (runner.runtime) {
-        .bound => |bound| bound.show_panel != null or bound.publish_prompt != null or bound.publish_surface != null or bound.publish_editor_action != null,
+        .bound => |bound| bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_editor_action != null,
         .stub => false,
     };
     if (!has_methods) {
@@ -120,7 +120,7 @@ fn pushUiApi(
     }
 
     c.lua_createtable(L, 0, 16);
-    if (runner.runtime.bound.show_panel != null) {
+    if (runner.runtime.bound.publish_report != null) {
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiReport);
         c.lua_setfield(L, -2, "report");
     }
@@ -140,7 +140,7 @@ fn pushUiApi(
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiGetEditorText);
         c.lua_setfield(L, -2, "get_editor_text");
     }
-    if (runner.runtime.bound.publish_surface != null) {
+    if (runner.runtime.bound.publish_ui != null) {
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiMessage);
         c.lua_setfield(L, -2, "message");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiStatus);
@@ -230,18 +230,18 @@ fn publishMessageFromArgs(L: *c.lua_State) !void {
         .bound => |bound| bound,
         .stub => return,
     };
-    const callback = bound.publish_surface orelse return;
+    const callback = bound.publish_ui orelse return;
 
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
-    const update = extension_ui.SurfaceUpdate{
+    const update = extension_ui.UiPublication{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
-        .kind = .footer,
+        .kind = .message,
         .id = try readMessageKind(aa, L, 2),
         .text = try readOptionalArgString(aa, L, 1),
-        .lifetime = try readSurfaceLifetime(L, 2),
+        .lifetime = try readUiLifetime(L, 2),
     };
     try callback(bound.session, update);
 }
@@ -252,7 +252,7 @@ fn publishStatusFromArgs(L: *c.lua_State) !void {
         .bound => |bound| bound,
         .stub => return,
     };
-    const callback = bound.publish_surface orelse return;
+    const callback = bound.publish_ui orelse return;
     if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
 
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
@@ -261,13 +261,13 @@ fn publishStatusFromArgs(L: *c.lua_State) !void {
     const spec_idx = c.lua_absindex(L, 1);
     const id = try readStringField(aa, L, spec_idx, "id", "default");
     const text = try readStatusText(aa, L, spec_idx);
-    const update = extension_ui.SurfaceUpdate{
+    const update = extension_ui.UiPublication{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
         .kind = .status,
         .id = id,
         .text = text,
-        .lifetime = try readSurfaceLifetime(L, spec_idx),
+        .lifetime = try readUiLifetime(L, spec_idx),
     };
     try callback(bound.session, update);
 }
@@ -278,7 +278,7 @@ fn publishProgressFromArgs(L: *c.lua_State) !void {
         .bound => |bound| bound,
         .stub => return,
     };
-    const callback = bound.publish_surface orelse return;
+    const callback = bound.publish_ui orelse return;
     if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
 
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
@@ -287,13 +287,13 @@ fn publishProgressFromArgs(L: *c.lua_State) !void {
     const spec_idx = c.lua_absindex(L, 1);
     const id = try readStringField(aa, L, spec_idx, "id", "progress");
     const text = try formatProgressText(aa, L, spec_idx);
-    const update = extension_ui.SurfaceUpdate{
+    const update = extension_ui.UiPublication{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
-        .kind = .working,
+        .kind = .progress,
         .id = id,
         .text = text,
-        .lifetime = try readSurfaceLifetime(L, spec_idx),
+        .lifetime = try readUiLifetime(L, spec_idx),
     };
     try callback(bound.session, update);
 }
@@ -340,7 +340,7 @@ fn readOptionalNumberField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?i6
     return @intFromFloat(c.lua_tonumberx(L, -1, null));
 }
 
-fn readSurfaceLifetime(L: *c.lua_State, idx: c_int) !extension_ui.SurfaceLifetime {
+fn readUiLifetime(L: *c.lua_State, idx: c_int) !extension_ui.UiLifetime {
     if (c.lua_type(L, idx) != c.LUA_TTABLE) return .session;
     _ = c.lua_getfield(L, idx, "lifetime");
     defer c.lua_pop(L, 1);
@@ -554,43 +554,43 @@ fn ctxUiReport(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
     switch (runner.runtime) {
         .bound => |bound| {
-            const callback = bound.show_panel orelse return 0;
+            const callback = bound.publish_report orelse return 0;
             var arena = std.heap.ArenaAllocator.init(runner.allocator);
             defer arena.deinit();
-            const panel = parsePanel(arena.allocator(), L, 1, stateOwnerFromUpvalue(L), runner.generation) catch return 0;
-            callback(bound.session, panel) catch return 0;
+            const report = parseReport(arena.allocator(), L, 1, stateOwnerFromUpvalue(L), runner.generation) catch return 0;
+            callback(bound.session, report) catch return 0;
         },
         .stub => {},
     }
     return 0;
 }
 
-fn parsePanel(
+fn parseReport(
     arena: std.mem.Allocator,
     L: *c.lua_State,
     idx: c_int,
     state_owner_id: []const u8,
     generation: runner_mod.Generation,
-) !extension_ui.Panel {
+) !extension_ui.Report {
     const abs_idx = c.lua_absindex(L, idx);
     return .{
         .state_owner_id = try arena.dupe(u8, state_owner_id),
         .generation = generation,
-        .id = try readStringField(arena, L, abs_idx, "id", "panel"),
+        .id = try readStringField(arena, L, abs_idx, "id", "report"),
         .title = try readStringField(arena, L, abs_idx, "title", ""),
-        .lines = try readPanelBody(arena, L, abs_idx),
+        .lines = try readReportBody(arena, L, abs_idx),
         .transient = readBoolField(L, abs_idx, "transient"),
     };
 }
 
-fn readPanelBody(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
+fn readReportBody(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
     _ = c.lua_getfield(L, idx, "body");
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return &.{};
-    return try readPanelBodyLines(arena, L, -1);
+    return try readReportBodyLines(arena, L, -1);
 }
 
-fn readPanelBodyLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
+fn readReportBodyLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
     const body = try dupeLuaString(arena, L, idx);
     var line_count: usize = 1;
     for (body) |byte| {
@@ -615,7 +615,7 @@ fn readPanelBodyLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]
     return lines;
 }
 
-fn readPanelLinesAtStack(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
+fn readReportLinesAtStack(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
     const abs_idx = c.lua_absindex(L, idx);
     const n = c.lua_rawlen(L, abs_idx);
     if (n == 0) return &.{};
@@ -626,14 +626,14 @@ fn readPanelLinesAtStack(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) 
     var i: c.lua_Integer = 1;
     while (i <= @as(c.lua_Integer, @intCast(n))) : (i += 1) {
         _ = c.lua_rawgeti(L, abs_idx, i);
-        const line = try readPanelLine(arena, L, -1);
+        const line = try readReportLine(arena, L, -1);
         c.lua_pop(L, 1);
         try lines.append(arena, line);
     }
     return lines.items;
 }
 
-fn readPanelLine(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const extension_ui.TextSpan {
+fn readReportLine(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const extension_ui.TextSpan {
     if (c.lua_type(L, idx) == c.LUA_TSTRING) {
         const spans = try arena.alloc(extension_ui.TextSpan, 1);
         spans[0] = .{ .text = try dupeLuaString(arena, L, idx) };
@@ -649,7 +649,7 @@ fn readPanelLine(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const
     var i: c.lua_Integer = 1;
     while (i <= @as(c.lua_Integer, @intCast(n))) : (i += 1) {
         _ = c.lua_rawgeti(L, abs_idx, i);
-        const span = readPanelSpan(arena, L, -1) catch {
+        const span = readReportSpan(arena, L, -1) catch {
             c.lua_pop(L, 1);
             continue;
         };
@@ -659,7 +659,7 @@ fn readPanelLine(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const
     return spans.items;
 }
 
-fn readPanelSpan(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui.TextSpan {
+fn readReportSpan(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui.TextSpan {
     if (c.lua_type(L, idx) == c.LUA_TSTRING) return .{ .text = try dupeLuaString(arena, L, idx) };
     if (c.lua_type(L, idx) != c.LUA_TTABLE) return error.BadSpan;
 

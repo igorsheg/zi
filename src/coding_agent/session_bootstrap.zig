@@ -132,14 +132,14 @@ pub const PreparedDeps = struct {
     extension_lua_state: ?*lua_runtime.LuaState = null,
 };
 
-pub const ExtensionSurface = struct {
+pub const ExtensionRuntimeBundle = struct {
     system_prompt: []const u8,
     tools: []const agent_mod.protocol.AgentTool,
     builtin_ctx: ?*builtin_util.BuiltinCtx = null,
     extension_runner: ?*ExtensionRunner = null,
     extension_lua_state: ?*lua_runtime.LuaState = null,
 
-    pub fn deinit(self: *ExtensionSurface, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ExtensionRuntimeBundle, allocator: std.mem.Allocator) void {
         if (self.extension_runner) |runner| {
             runner.deinit();
             allocator.destroy(runner);
@@ -350,10 +350,10 @@ pub fn prepareSessionDeps(
     };
 }
 
-pub fn prepareExtensionSurface(
+pub fn prepareExtensionRuntimeBundle(
     allocator: std.mem.Allocator,
     options: ReloadExtensionOptions,
-) !ExtensionSurface {
+) !ExtensionRuntimeBundle {
     var builtins = try buildBuiltinDefinitions(allocator, .{
         .cwd = options.resource_loader.cwd,
         .settings_manager = options.settings_manager,

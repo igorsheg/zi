@@ -162,7 +162,7 @@ end)
 : Host-owned prompts.
 
 `custom_header.lua`, `widget_placement.lua`, `hidden_thinking_label.lua`, `titlebar.lua`
-: Host-owned UI surfaces.
+: Pi-mono parity examples rewritten onto host-owned semantic UI primitives.
 
 `input_transform.lua`, `permission_gate.lua`
 : Input and permission-style interception patterns.

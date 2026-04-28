@@ -106,11 +106,11 @@ pub const UiEvent = union(enum) {
     extension_commands_updated: struct {
         commands: []ExtensionCommandEntry,
     },
-    extension_panel_shown: struct {
-        panel: extension_ui.Panel,
+    extension_report_shown: struct {
+        report: extension_ui.Report,
     },
-    extension_surfaces_updated: struct {
-        updates: []extension_ui.SurfaceUpdate,
+    extension_ui_published: struct {
+        updates: []extension_ui.UiPublication,
     },
     extension_editor_actions: struct {
         actions: []extension_ui.EditorAction,
@@ -251,8 +251,8 @@ pub const UiEvent = union(enum) {
                 }
                 allocator.free(u.commands);
             },
-            .extension_panel_shown => |*u| u.panel.deinit(allocator),
-            .extension_surfaces_updated => |u| {
+            .extension_report_shown => |*u| u.report.deinit(allocator),
+            .extension_ui_published => |u| {
                 for (u.updates) |*update| update.deinit(allocator);
                 allocator.free(u.updates);
             },

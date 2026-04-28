@@ -283,7 +283,7 @@ this doc does not define:
 - the full event payload schemas; see [extensions-events](./extensions-events.md)
 - provider registration contracts
 - tool contracts; see [extensions-tools](./extensions-tools.md)
-- ui retained objects or widget surfaces
+- ui retained objects or semantic presentation records
 - persistence storage formats
 - exact cli parsing syntax for boolean vs string flags beyond the merged precedence rule above
 - the transport shape of the agent↔tui publication used to surface merged commands or shortcuts

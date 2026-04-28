@@ -320,7 +320,7 @@ fn parseReturn(
 
     // Anything else (number, bool, nil): treat as empty success.
     // Lua tools that return non-string non-table values are almost
-    // always tests or mistakes; we don't want to surface a tool
+    // always tests or mistakes; we don't want to ui_publication a tool
     // error for them.
     return emptyResult();
 }
@@ -397,7 +397,7 @@ fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
 
 /// `ctx.update(partial)` — Lua-callable that forwards a partial
 /// tool result back through the agent loop. Used by long-running
-/// tools (Task, Oracle, anything that wraps `zi.spawn`) to surface
+/// tools (Task, Oracle, anything that wraps `zi.spawn`) to ui_publication
 /// progressive state to the TUI without waiting for `execute` to
 /// return.
 ///
@@ -909,9 +909,9 @@ const TestLabelEntry = struct {
 const TestStateStore = struct {
     allocator: std.mem.Allocator,
     value: ?std.json.Value = null,
-    panel: ?extension_ui.Panel = null,
+    report: ?extension_ui.Report = null,
     prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
-    surfaces: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
+    ui_publications: std.ArrayListUnmanaged(extension_ui.UiPublication) = .empty,
     editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
     session_name: ?[]const u8 = null,
     note_kind: ?[]const u8 = null,
@@ -927,10 +927,10 @@ const TestStateStore = struct {
     fn deinit(self: *TestStateStore) void {
         if (self.value) |value| ai.json_util.freeJsonValue(self.allocator, value);
         self.value = null;
-        if (self.panel) |*panel| panel.deinit(self.allocator);
-        self.panel = null;
+        if (self.report) |*report| report.deinit(self.allocator);
+        self.report = null;
         self.clearPrompts();
-        self.clearSurfaces();
+        self.clearUiPublications();
         self.clearEditorActions();
         if (self.session_name) |name| self.allocator.free(name);
         self.session_name = null;
@@ -1149,10 +1149,10 @@ const TestStateStore = struct {
         return .{ .array = arr };
     }
 
-    fn showPanel(session: *anyopaque, panel: extension_ui.Panel) !void {
+    fn publishReport(session: *anyopaque, report: extension_ui.Report) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
-        if (self.panel) |*old| old.deinit(self.allocator);
-        self.panel = try extension_ui.Panel.clone(self.allocator, panel);
+        if (self.report) |*old| old.deinit(self.allocator);
+        self.report = try extension_ui.Report.clone(self.allocator, report);
     }
 
     fn publishPrompt(session: *anyopaque, prompt: extension_ui.PromptRequest) !void {
@@ -1174,23 +1174,23 @@ const TestStateStore = struct {
         self.prompts = .empty;
     }
 
-    fn publishSurface(session: *anyopaque, update: extension_ui.SurfaceUpdate) !void {
+    fn publishUi(session: *anyopaque, update: extension_ui.UiPublication) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
-        var cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
+        var cloned = try extension_ui.UiPublication.clone(self.allocator, update);
         errdefer cloned.deinit(self.allocator);
-        try self.surfaces.append(self.allocator, cloned);
+        try self.ui_publications.append(self.allocator, cloned);
     }
 
-    fn revokeSurfaces(session: *anyopaque) void {
+    fn revokeUi(session: *anyopaque) void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         self.revoke_count += 1;
-        self.clearSurfaces();
+        self.clearUiPublications();
     }
 
-    fn clearSurfaces(self: *TestStateStore) void {
-        for (self.surfaces.items) |*update| update.deinit(self.allocator);
-        self.surfaces.deinit(self.allocator);
-        self.surfaces = .empty;
+    fn clearUiPublications(self: *TestStateStore) void {
+        for (self.ui_publications.items) |*update| update.deinit(self.allocator);
+        self.ui_publications.deinit(self.allocator);
+        self.ui_publications = .empty;
     }
 
     fn publishEditorAction(session: *anyopaque, action: extension_ui.EditorAction) !void {
@@ -1262,11 +1262,11 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_labels_get = &TestStateStore.labels,
         .session_entry_get = &TestStateStore.entry,
         .session_entries_get = &TestStateStore.entries,
-        .show_panel = &TestStateStore.showPanel,
+        .publish_report = &TestStateStore.publishReport,
         .publish_prompt = &TestStateStore.publishPrompt,
         .cancel_prompts = &TestStateStore.cancelPrompts,
-        .publish_surface = &TestStateStore.publishSurface,
-        .revoke_surfaces = &TestStateStore.revokeSurfaces,
+        .publish_ui = &TestStateStore.publishUi,
+        .revoke_ui = &TestStateStore.revokeUi,
         .publish_editor_action = &TestStateStore.publishEditorAction,
         .clear_editor_actions = &TestStateStore.clearEditorActionsCallback,
     };
@@ -1282,7 +1282,7 @@ fn bindResolvingRuntime(runner: *runner_mod.ExtensionRunner, store: *TestStateSt
     try runner.bindRuntime(bound, provider_registry);
 }
 
-test "extension command context exposes read-only session surface" {
+test "extension command context exposes read-only session ui_publication" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1301,8 +1301,8 @@ test "extension command context exposes read-only session surface" {
     defer runner.endLoadContext();
     try state.doString(
         \\zi.register_command({
-        \\  name = "session-surface",
-        \\  description = "session-surface",
+        \\  name = "session-ui_publication",
+        \\  description = "session-ui_publication",
         \\  handler = function(_, ctx)
         \\    local info = ctx.session.info()
         \\    assert(info.id == "session-test")
@@ -1362,9 +1362,9 @@ test "extension command context exposes read-only session surface" {
         \\    assert(labels[1].label == nil)
         \\  end,
         \\})
-    , "register_session_surface_command");
+    , "register_session_ui_publication_command");
 
-    try runner.dispatchCommand("session-surface", "");
+    try runner.dispatchCommand("session-ui_publication", "");
 }
 
 test "extension command context exposes model catalog and lookup" {
@@ -1386,8 +1386,8 @@ test "extension command context exposes model catalog and lookup" {
     defer runner.endLoadContext();
     try state.doString(
         \\zi.register_command({
-        \\  name = "model-surface",
-        \\  description = "model-surface",
+        \\  name = "model-ui_publication",
+        \\  description = "model-ui_publication",
         \\  handler = function(_, ctx)
         \\    assert(ctx.model == nil)
         \\    assert(ctx.models.current().id == "test-model")
@@ -1400,9 +1400,9 @@ test "extension command context exposes model catalog and lookup" {
         \\    assert(ctx.models.get("missing") == nil)
         \\  end,
         \\})
-    , "register_model_surface_command");
+    , "register_model_ui_publication_command");
 
-    try runner.dispatchCommand("model-surface", "");
+    try runner.dispatchCommand("model-ui_publication", "");
 }
 
 test "extension command context publishes host-owned editor buffer actions" {
@@ -1468,32 +1468,32 @@ test "extension command context publishes semantic ui message status and progres
     defer runner.endLoadContext();
     try state.doString(
         \\zi.register_command({
-        \\  name = "surfaces",
-        \\  description = "surfaces",
+        \\  name = "ui_publications",
+        \\  description = "ui_publications",
         \\  handler = function(_, ctx)
         \\    ctx.ui.message("Ready for input", { kind = "warning", lifetime = "until_input" })
         \\    ctx.ui.status({ id = "demo", text = "ready" })
         \\    ctx.ui.progress({ id = "index", title = "Indexing", current = 2, total = 4, detail = "src" })
         \\  end,
         \\})
-    , "register_surface_command");
+    , "register_ui_publication_command");
 
-    try runner.dispatchCommand("surfaces", "");
+    try runner.dispatchCommand("ui_publications", "");
 
-    try testing.expectEqual(@as(usize, 3), store.surfaces.items.len);
-    try testing.expectEqual(extension_ui.SurfaceKind.footer, store.surfaces.items[0].kind);
-    try testing.expectEqualStrings("warning", store.surfaces.items[0].id);
-    try testing.expectEqualStrings("Ready for input", store.surfaces.items[0].text.?);
-    try testing.expectEqual(extension_ui.SurfaceKind.status, store.surfaces.items[1].kind);
-    try testing.expectEqualStrings("demo", store.surfaces.items[1].id);
-    try testing.expectEqualStrings("ready", store.surfaces.items[1].text.?);
-    try testing.expectEqual(extension_ui.SurfaceKind.working, store.surfaces.items[2].kind);
-    try testing.expectEqualStrings("index", store.surfaces.items[2].id);
-    try testing.expectEqualStrings("Indexing 2/4 — src", store.surfaces.items[2].text.?);
+    try testing.expectEqual(@as(usize, 3), store.ui_publications.items.len);
+    try testing.expectEqual(extension_ui.UiPublicationKind.message, store.ui_publications.items[0].kind);
+    try testing.expectEqualStrings("warning", store.ui_publications.items[0].id);
+    try testing.expectEqualStrings("Ready for input", store.ui_publications.items[0].text.?);
+    try testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[1].kind);
+    try testing.expectEqualStrings("demo", store.ui_publications.items[1].id);
+    try testing.expectEqualStrings("ready", store.ui_publications.items[1].text.?);
+    try testing.expectEqual(extension_ui.UiPublicationKind.progress, store.ui_publications.items[2].kind);
+    try testing.expectEqualStrings("index", store.ui_publications.items[2].id);
+    try testing.expectEqualStrings("Indexing 2/4 — src", store.ui_publications.items[2].text.?);
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 1), store.revoke_count);
-    try testing.expectEqual(@as(usize, 0), store.surfaces.items.len);
+    try testing.expectEqual(@as(usize, 0), store.ui_publications.items.len);
 }
 
 test "extension command prompts can resolve through host response" {
@@ -1885,7 +1885,7 @@ test "extension command rejects arbitrary coroutine yield" {
     try testing.expectError(error.UnexpectedYield, runner.dispatchCommand("bad-yield", ""));
 }
 
-test "extension command context publishes a host-owned panel" {
+test "extension command context publishes a host-owned report" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1904,8 +1904,8 @@ test "extension command context publishes a host-owned panel" {
     defer runner.endLoadContext();
     try state.doString(
         \\zi.register_command({
-        \\  name = "panel",
-        \\  description = "panel",
+        \\  name = "report",
+        \\  description = "report",
         \\  handler = function(_, ctx)
         \\    assert(ctx.has_ui == true)
         \\    ctx.ui.report({
@@ -1916,22 +1916,22 @@ test "extension command context publishes a host-owned panel" {
         \\    })
         \\  end,
         \\})
-    , "register_panel_command");
+    , "register_report_command");
 
-    try runner.dispatchCommand("panel", "");
+    try runner.dispatchCommand("report", "");
 
-    const panel = store.panel orelse return error.MissingPanel;
-    try testing.expectEqualStrings("state-123", panel.state_owner_id);
-    try testing.expectEqual(@as(u64, 11), panel.generation);
-    try testing.expectEqualStrings("demo", panel.id);
-    try testing.expectEqualStrings("Demo", panel.title);
-    try testing.expect(panel.transient);
-    try testing.expectEqual(@as(usize, 1), panel.lines.len);
-    try testing.expectEqual(@as(usize, 1), panel.lines[0].len);
-    try testing.expectEqualStrings("✓ published", panel.lines[0][0].text);
+    const report = store.report orelse return error.MissingReport;
+    try testing.expectEqualStrings("state-123", report.state_owner_id);
+    try testing.expectEqual(@as(u64, 11), report.generation);
+    try testing.expectEqualStrings("demo", report.id);
+    try testing.expectEqualStrings("Demo", report.title);
+    try testing.expect(report.transient);
+    try testing.expectEqual(@as(usize, 1), report.lines.len);
+    try testing.expectEqual(@as(usize, 1), report.lines[0].len);
+    try testing.expectEqualStrings("✓ published", report.lines[0][0].text);
 }
 
-test "extension panel body is split into visible lines" {
+test "extension report body is split into visible lines" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1950,24 +1950,24 @@ test "extension panel body is split into visible lines" {
     defer runner.endLoadContext();
     try state.doString(
         \\zi.register_command({
-        \\  name = "panel-body",
-        \\  description = "panel-body",
+        \\  name = "report-body",
+        \\  description = "report-body",
         \\  handler = function(_, ctx)
         \\    ctx.ui.report({ title = "Body", body = "one\ntwo\n" })
         \\  end,
         \\})
-    , "register_panel_body_command");
+    , "register_report_body_command");
 
-    try runner.dispatchCommand("panel-body", "");
+    try runner.dispatchCommand("report-body", "");
 
-    const panel = store.panel orelse return error.MissingPanel;
-    try testing.expectEqualStrings("Body", panel.title);
-    try testing.expectEqual(@as(usize, 2), panel.lines.len);
-    try testing.expectEqualStrings("one", panel.lines[0][0].text);
-    try testing.expectEqualStrings("two", panel.lines[1][0].text);
+    const report = store.report orelse return error.MissingReport;
+    try testing.expectEqualStrings("Body", report.title);
+    try testing.expectEqual(@as(usize, 2), report.lines.len);
+    try testing.expectEqualStrings("one", report.lines[0][0].text);
+    try testing.expectEqualStrings("two", report.lines[1][0].text);
 }
 
-test "todo command publishes hydrated todos as a host-owned panel" {
+test "todo command publishes hydrated todos as a host-owned report" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1987,19 +1987,19 @@ test "todo command publishes hydrated todos as a host-owned panel" {
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const add_args = try todoArgs(arena.allocator(), "add", "ship panel", null);
+    const add_args = try todoArgs(arena.allocator(), "add", "ship report", null);
     const add_result = tool.execute(tool.ctx, arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
     try testing.expect(!add_result.is_error);
 
     try runner.dispatchCommand("todos", "");
 
-    const panel = store.panel orelse return error.MissingPanel;
-    try testing.expectEqualStrings("todos", panel.id);
-    try testing.expectEqualStrings("Todos", panel.title);
-    try testing.expect(panel.transient);
-    try testing.expectEqual(@as(usize, 1), panel.lines.len);
-    try testing.expectEqual(@as(usize, 1), panel.lines[0].len);
-    try testing.expectEqualStrings("[ ] #1: ship panel", panel.lines[0][0].text);
+    const report = store.report orelse return error.MissingReport;
+    try testing.expectEqualStrings("todos", report.id);
+    try testing.expectEqualStrings("Todos", report.title);
+    try testing.expect(report.transient);
+    try testing.expectEqual(@as(usize, 1), report.lines.len);
+    try testing.expectEqual(@as(usize, 1), report.lines[0].len);
+    try testing.expectEqualStrings("[ ] #1: ship report", report.lines[0][0].text);
 }
 
 test "todo fixture rehydrates from session state across extension generations" {
@@ -2097,7 +2097,7 @@ test "lua tool returning a string produces a single text content block" {
     try testing.expectEqualStrings("hello zi", result.content[0].text.text);
 }
 
-test "lua tool returning content array with is_error=true surfaces both" {
+test "lua tool returning content array with is_error=true ui_publications both" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 

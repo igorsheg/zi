@@ -112,79 +112,50 @@ pub const EditorAction = struct {
     }
 };
 
-pub const SurfaceKind = enum {
+pub const UiPublicationKind = enum {
+    message,
     status,
-    title,
-    working,
-    thinking_label,
-    widget,
-    header,
-    footer,
-    overlay,
-    notification,
+    progress,
 };
 
-pub const SurfaceLifetime = enum {
+pub const UiLifetime = enum {
     session,
     until_input,
 };
 
-pub const SurfaceUpdate = struct {
+pub const UiPublication = struct {
     state_owner_id: []const u8,
     generation: u64,
-    kind: SurfaceKind,
+    kind: UiPublicationKind,
     id: []const u8,
     text: ?[]const u8 = null,
-    lines: []const []const TextSpan = &.{},
-    placement: ?[]const u8 = null,
-    lifetime: SurfaceLifetime = .session,
+    lifetime: UiLifetime = .session,
 
-    pub fn clone(allocator: std.mem.Allocator, update: SurfaceUpdate) !SurfaceUpdate {
+    pub fn clone(allocator: std.mem.Allocator, update: UiPublication) !UiPublication {
         const state_owner_id = try allocator.dupe(u8, update.state_owner_id);
         errdefer allocator.free(state_owner_id);
         const id = try allocator.dupe(u8, update.id);
         errdefer allocator.free(id);
         const text = if (update.text) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (text) |value| allocator.free(value);
-        const placement = if (update.placement) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (placement) |value| allocator.free(value);
-
-        const lines = try allocator.alloc([]const TextSpan, update.lines.len);
-        var initialized_lines: usize = 0;
-        errdefer freeLines(allocator, lines, initialized_lines);
-        for (update.lines, 0..) |line, i| {
-            lines[i] = try cloneLine(allocator, line);
-            initialized_lines += 1;
-        }
-
         return .{
             .state_owner_id = state_owner_id,
             .generation = update.generation,
             .kind = update.kind,
             .id = id,
             .text = text,
-            .lines = lines,
-            .placement = placement,
             .lifetime = update.lifetime,
         };
     }
 
-    pub fn deinit(self: *SurfaceUpdate, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *UiPublication, allocator: std.mem.Allocator) void {
         allocator.free(self.state_owner_id);
         allocator.free(self.id);
         if (self.text) |value| allocator.free(value);
-        if (self.placement) |value| allocator.free(value);
-        freeLines(allocator, self.lines, self.lines.len);
         self.* = undefined;
-    }
-
-    pub fn flattenText(self: SurfaceUpdate, allocator: std.mem.Allocator) ![]u8 {
-        if (self.text) |value| return try allocator.dupe(u8, value);
-        return flattenLines(allocator, self.lines);
     }
 };
 
-pub const Panel = struct {
+pub const Report = struct {
     state_owner_id: []const u8,
     generation: u64,
     id: []const u8,
@@ -192,34 +163,34 @@ pub const Panel = struct {
     lines: []const []const TextSpan,
     transient: bool = false,
 
-    pub fn clone(allocator: std.mem.Allocator, panel: Panel) !Panel {
-        const state_owner_id = try allocator.dupe(u8, panel.state_owner_id);
+    pub fn clone(allocator: std.mem.Allocator, report: Report) !Report {
+        const state_owner_id = try allocator.dupe(u8, report.state_owner_id);
         errdefer allocator.free(state_owner_id);
-        const id = try allocator.dupe(u8, panel.id);
+        const id = try allocator.dupe(u8, report.id);
         errdefer allocator.free(id);
-        const title = try allocator.dupe(u8, panel.title);
+        const title = try allocator.dupe(u8, report.title);
         errdefer allocator.free(title);
 
-        const lines = try allocator.alloc([]const TextSpan, panel.lines.len);
+        const lines = try allocator.alloc([]const TextSpan, report.lines.len);
         var initialized_lines: usize = 0;
         errdefer freeLines(allocator, lines, initialized_lines);
 
-        for (panel.lines, 0..) |line, i| {
+        for (report.lines, 0..) |line, i| {
             lines[i] = try cloneLine(allocator, line);
             initialized_lines += 1;
         }
 
         return .{
             .state_owner_id = state_owner_id,
-            .generation = panel.generation,
+            .generation = report.generation,
             .id = id,
             .title = title,
             .lines = lines,
-            .transient = panel.transient,
+            .transient = report.transient,
         };
     }
 
-    pub fn deinit(self: *Panel, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         allocator.free(self.state_owner_id);
         allocator.free(self.id);
         allocator.free(self.title);
@@ -227,7 +198,7 @@ pub const Panel = struct {
         self.* = undefined;
     }
 
-    pub fn flattenText(self: Panel, allocator: std.mem.Allocator) ![]u8 {
+    pub fn flattenText(self: Report, allocator: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
 
