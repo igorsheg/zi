@@ -1249,6 +1249,8 @@ fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner
     c.lua_pop(L, 1);
     errdefer if (model) |value| allocator.free(value);
 
+    const reasoning = try readAiCompleteReasoning(L, idx);
+
     var max_tokens: ?u64 = null;
     _ = c.lua_getfield(L, idx, "max_tokens");
     if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
@@ -1257,7 +1259,29 @@ fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner
     }
     c.lua_pop(L, 1);
 
-    return .{ .prompt = prompt, .system_prompt = system_prompt, .max_tokens = max_tokens, .model = model };
+    return .{ .prompt = prompt, .system_prompt = system_prompt, .max_tokens = max_tokens, .model = model, .reasoning = reasoning };
+}
+
+fn readAiCompleteReasoning(L: *c.lua_State, table_idx: c_int) !?agent_protocol.ThinkingLevel {
+    _ = c.lua_getfield(L, table_idx, "reasoning");
+    defer c.lua_pop(L, 1);
+    switch (c.lua_type(L, -1)) {
+        c.LUA_TNONE, c.LUA_TNIL => return null,
+        c.LUA_TBOOLEAN => return if (c.lua_toboolean(L, -1) != 0) .high else .off,
+        c.LUA_TSTRING => {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, -1, &len) orelse return error.InvalidReasoning;
+            const value = ptr[0..len];
+            if (std.mem.eql(u8, value, "off")) return .off;
+            if (std.mem.eql(u8, value, "minimal")) return .minimal;
+            if (std.mem.eql(u8, value, "low")) return .low;
+            if (std.mem.eql(u8, value, "medium")) return .medium;
+            if (std.mem.eql(u8, value, "high")) return .high;
+            if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+            return error.InvalidReasoning;
+        },
+        else => return error.InvalidReasoning,
+    }
 }
 
 fn pushAiCompleteResult(L: *c.lua_State, result: runner_mod.AiCompleteResult) void {

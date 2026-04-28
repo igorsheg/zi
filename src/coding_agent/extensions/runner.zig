@@ -37,6 +37,7 @@ pub const AiCompleteRequest = struct {
     system_prompt: ?[]const u8 = null,
     max_tokens: ?u64 = null,
     model: ?[]const u8 = null,
+    reasoning: ?agent_protocol.ThinkingLevel = null,
 
     pub fn deinit(self: *AiCompleteRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);

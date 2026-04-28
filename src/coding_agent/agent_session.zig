@@ -1365,13 +1365,26 @@ pub const AgentSession = struct {
             .api_key = null,
             .headers = null,
             .max_tokens = request.max_tokens,
-            .reasoning = if (current_model.reasoning) .high else null,
+            .reasoning = resolveAiCompleteReasoning(current_model, request.reasoning),
         };
         errdefer built.deinit(allocator);
         if (request.system_prompt) |value| built.system_prompt = try allocator.dupe(u8, value);
         if (api_key.len > 0) built.api_key = try allocator.dupe(u8, api_key);
         built.headers = try self._stream_closure.mergeClaimHeaders(current_model, allocator, null);
         return built;
+    }
+
+    fn resolveAiCompleteReasoning(model: ai.protocol.Model, override: ?protocol.ThinkingLevel) ?ai.protocol.ThinkingLevel {
+        if (!model.reasoning) return null;
+        const level = override orelse return .high;
+        return switch (level) {
+            .off => null,
+            .minimal => .minimal,
+            .low => .low,
+            .medium => .medium,
+            .high => .high,
+            .xhigh => .xhigh,
+        };
     }
 
     fn resolveExtensionAiModel(self: *AgentSession, model_ref: ?[]const u8) ?ai.protocol.Model {

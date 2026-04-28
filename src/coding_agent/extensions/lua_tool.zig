@@ -1541,6 +1541,7 @@ test "extension command resumes after ai completion result" {
     try bindTestRuntime(&runner, &store, &provider_registry);
     const Capture = struct {
         model: ?[]u8 = null,
+        reasoning: ?agent_protocol.ThinkingLevel = null,
 
         fn submit(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, start: runner_mod.AsyncStart) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1549,6 +1550,7 @@ test "extension command resumes after ai completion result" {
             switch (owned.request) {
                 .ai_complete => |request| {
                     if (request.model) |model| self.model = try testing.allocator.dupe(u8, model);
+                    self.reasoning = request.reasoning;
                 },
                 else => {},
             }
@@ -1566,7 +1568,7 @@ test "extension command resumes after ai completion result" {
         \\  name = "ai-complete-test",
         \\  description = "ai-complete-test",
         \\  handler = function(_, ctx)
-        \\    local result = ctx.ai.complete({ model = ctx.models.current(), prompt = "hello", system_prompt = "system", max_tokens = 12 })
+        \\    local result = ctx.ai.complete({ model = ctx.models.current(), reasoning = "low", prompt = "hello", system_prompt = "system", max_tokens = 12 })
         \\    _ai_complete_result = result.status .. ":" .. result.text
         \\  end,
         \\})
@@ -1577,6 +1579,7 @@ test "extension command resumes after ai completion result" {
     const pending = runner.pending_async.get(1) orelse return error.MissingAsyncRequest;
     try testing.expectEqual(runner_mod.AsyncKind.ai_complete, pending.kind);
     try testing.expectEqualStrings("test-provider/test-model", capture.model orelse return error.MissingModelOverride);
+    try testing.expectEqual(agent_protocol.ThinkingLevel.low, capture.reasoning orelse return error.MissingReasoningOverride);
     try runner.resumeAsync(1, .{ .ai_complete = .{ .completed = .{ .text = try testing.allocator.dupe(u8, "world") } } });
     try testing.expectEqual(@as(usize, 0), runner.pending_async.count());
 

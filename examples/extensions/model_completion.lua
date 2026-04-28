@@ -65,6 +65,7 @@ zi.command("ask-model", function(ctx, args)
     model = model_ref,
     prompt = prompt,
     max_tokens = 800,
+    reasoning = "low",
   })
 
   if result.status == "completed" then
