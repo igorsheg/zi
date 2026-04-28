@@ -705,6 +705,8 @@ pub const AgentSession = struct {
             .session_messages_get = &runtimeSessionMessagesGet,
             .session_note_append = &runtimeSessionNoteAppend,
             .session_notes_get = &runtimeSessionNotesGet,
+            .session_label_set = &runtimeSessionLabelSet,
+            .session_labels_get = &runtimeSessionLabelsGet,
             .show_panel = &runtimeShowPanel,
             .publish_prompt = &runtimePublishPrompt,
             .resolve_prompt = &runtimeResolvePrompt,
@@ -1015,7 +1017,7 @@ pub const AgentSession = struct {
         self.session_store.appendCustomEntry("extension_note", .{ .object = obj });
     }
 
-    fn runtimeSessionNotesGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, limit: usize) ?std.json.Value {
+    fn runtimeSessionNotesGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, source_entry_id: ?[]const u8, limit: usize) ?std.json.Value {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
         const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
         defer allocator.free(branch);
@@ -1027,9 +1029,13 @@ pub const AgentSession = struct {
             };
             if (!std.mem.eql(u8, custom.custom_type, "extension_note")) continue;
             const data = custom.data orelse continue;
+            if (data != .object) continue;
             if (kind) |wanted| {
-                if (data != .object) continue;
                 const value = data.object.get("kind") orelse continue;
+                if (value != .string or !std.mem.eql(u8, value.string, wanted)) continue;
+            }
+            if (source_entry_id) |wanted| {
+                const value = data.object.get("source_entry_id") orelse continue;
                 if (value != .string or !std.mem.eql(u8, value.string, wanted)) continue;
             }
             var note = ai.json_util.cloneJsonValue(allocator, data) catch return null;
@@ -1152,6 +1158,39 @@ pub const AgentSession = struct {
         }
         try obj.put(try allocator.dupe(u8, "content"), .{ .array = content });
         return .{ .object = obj };
+    }
+
+    fn runtimeSessionLabelSet(session_ptr: *anyopaque, target_entry_id: []const u8, label: ?[]const u8) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        self.session_store.appendLabel(target_entry_id, label);
+    }
+
+    fn runtimeSessionLabelsGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, target_entry_id: ?[]const u8, limit: usize) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
+        defer allocator.free(branch);
+        var all = std.json.Array.init(allocator);
+        for (branch) |entry| {
+            const label_entry = switch (entry.entry) {
+                .label => |label| label,
+                else => continue,
+            };
+            if (target_entry_id) |wanted| {
+                if (!std.mem.eql(u8, label_entry.target_id, wanted)) continue;
+            }
+            var obj = std.json.ObjectMap.init(allocator);
+            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, entry.id) catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "target_entry_id") catch return null, .{ .string = allocator.dupe(u8, label_entry.target_id) catch return null }) catch return null;
+            obj.put(allocator.dupe(u8, "label") catch return null, if (label_entry.label) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
+            all.append(.{ .object = obj }) catch return null;
+        }
+        if (all.items.len <= limit) return .{ .array = all };
+        const start = all.items.len - limit;
+        for (all.items[0..start]) |value| ai.json_util.freeJsonValue(allocator, value);
+        var out = std.json.Array.init(allocator);
+        for (all.items[start..]) |value| out.append(value) catch return null;
+        all.deinit();
+        return .{ .array = out };
     }
 
     fn runtimeShowPanel(session_ptr: *anyopaque, panel: extension_ui.Panel) !void {

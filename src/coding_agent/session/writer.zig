@@ -223,7 +223,10 @@ pub const SessionWriter = struct {
 
     /// Append a label entry (bookmark on another entry).
     pub fn appendLabel(self: *SessionWriter, target_id: []const u8, label: ?[]const u8) void {
-        self.appendEntry(.{ .label = .{ .target_id = target_id, .label = label } });
+        const owned_target_id = self.allocator.dupe(u8, target_id) catch return;
+        errdefer self.allocator.free(owned_target_id);
+        const owned_label = if (label) |value| self.allocator.dupe(u8, value) catch return else null;
+        self.appendEntry(.{ .label = .{ .target_id = owned_target_id, .label = owned_label } });
     }
 
     /// Append a session info entry (display name, etc).
@@ -300,6 +303,13 @@ pub const SessionWriter = struct {
         if (!self.persist) return;
         defer self.allocator.free(entry.timestamp);
         defer if (entry.parent_id) |parent_id| self.allocator.free(parent_id);
+        defer switch (entry.entry) {
+            .label => |label| {
+                self.allocator.free(label.target_id);
+                if (label.label) |value| self.allocator.free(value);
+            },
+            else => {},
+        };
         const file = try std.fs.openFileAbsolute(self.session_file, .{ .mode = .read_write });
         defer file.close();
         try file.seekFromEnd(0);
@@ -343,6 +353,10 @@ fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, s
             if (session_entry.parent_id) |parent_id| allocator.free(parent_id);
             switch (session_entry.entry) {
                 .session_info => |info| if (info.name) |name| allocator.free(name),
+                .label => |label| {
+                    allocator.free(label.target_id);
+                    if (label.label) |value| allocator.free(value);
+                },
                 else => {},
             }
         },

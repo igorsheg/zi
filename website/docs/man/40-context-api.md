@@ -142,11 +142,17 @@ State is scoped to the extension and active session. It may survive session chan
 `ctx.session.tool_results(tool_name)`
 : Return recorded tool results for a tool.
 
-`ctx.session.append_note({ kind, title?, body })`
-: Append a semantic session note. Returns boolean success.
+`ctx.session.append_note({ kind, title?, body, source_entry_id? })`
+: Append a semantic session note. `source_entry_id` links the note to a durable session entry. Returns boolean success.
 
-`ctx.session.notes({ kind?, limit? })`
+`ctx.session.notes({ kind?, source_entry_id?, limit? })`
 : Return session notes. Default limit is 50; maximum is 500.
+
+`ctx.session.label(entry_id, label)`
+: Append a lightweight durable label for a session entry. Passing `nil` or an empty string clears the label. Returns boolean success.
+
+`ctx.session.labels({ target_entry_id?, limit? })`
+: Return label entries, optionally filtered to a target session entry. Default limit is 50; maximum is 500.
 
 ## context model and ai api
 
