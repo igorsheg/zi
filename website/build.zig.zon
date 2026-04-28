@@ -1,0 +1,22 @@
+.{
+    .name = .withzi_website,
+    .version = "0.0.1",
+    .dependencies = .{
+        .zine = .{
+            .url = "git+https://github.com/kristoff-it/zine?ref=v0.11.2#5a01fa5c9bad6a0c3055c523ee0ef848bb11c743",
+            .hash = "zine-0.11.2-ou6nINh3FgANNoH-3RUaEWOc3ax5zfWiL8a4lt4hDhpG",
+        },
+    },
+    .fingerprint = 0x5d8a3c5f575035af,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "zine.ziggy",
+        "content",
+        "layouts",
+        "assets",
+        "docs",
+        "mdman",
+    },
+}
