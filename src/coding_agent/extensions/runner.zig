@@ -36,10 +36,12 @@ pub const AiCompleteRequest = struct {
     prompt: []const u8,
     system_prompt: ?[]const u8 = null,
     max_tokens: ?u64 = null,
+    model: ?[]const u8 = null,
 
     pub fn deinit(self: *AiCompleteRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
         if (self.system_prompt) |value| allocator.free(value);
+        if (self.model) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -167,6 +169,8 @@ pub const ExtensionRuntime = union(enum) {
         /// through them without importing `coding_agent.zig` and creating
         /// a cycle.
         get_model: *const fn (session: *anyopaque) agent_protocol.Model,
+        models_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value = null,
+        models_get_one: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, model_ref: []const u8) ?std.json.Value = null,
         is_idle: *const fn (session: *anyopaque) bool,
         abort: *const fn (session: *anyopaque) void,
         has_pending_messages: *const fn (session: *anyopaque) bool,
@@ -182,6 +186,8 @@ pub const ExtensionRuntime = union(enum) {
         session_name_set: ?*const fn (session: *anyopaque, name: ?[]const u8) anyerror!void = null,
         session_tool_results_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8) ?std.json.Value = null,
         session_messages_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, limit: usize, include_tools: bool) ?std.json.Value = null,
+        session_note_append: ?*const fn (session: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8) anyerror!void = null,
+        session_notes_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, limit: usize) ?std.json.Value = null,
         show_panel: ?*const fn (session: *anyopaque, panel: extension_ui.Panel) anyerror!void = null,
         publish_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest) anyerror!void = null,
         resolve_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void = null,

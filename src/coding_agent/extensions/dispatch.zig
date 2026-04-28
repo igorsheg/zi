@@ -481,7 +481,7 @@ test "dispatchObserver passes extension context helpers" {
         \\  local usage = ctx.get_context_usage()
         \\  assert(usage.tokens == 321)
         \\  assert(usage.context_window == 1024)
-        \\  assert(ctx.model.id == "test-model")
+        \\  assert(ctx.models.current().id == "test-model")
         \\  assert(ctx.is_idle() == true)
         \\  assert(ctx.get_system_prompt() == "system")
         \\  assert(ctx.binding == nil)

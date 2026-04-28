@@ -7,6 +7,7 @@ const agent_protocol = @import("../../agent3/types.zig");
 const session_core = @import("../../session/root.zig");
 const extension_ui = @import("ui.zig");
 const request_mod = @import("../request.zig");
+const ai_provider = @import("../../ai/provider.zig");
 
 const c = lua_runtime.c;
 
@@ -55,8 +56,8 @@ pub fn pushExtensionContext(
 
     switch (runner.runtime) {
         .bound => |bound| {
-            pushModel(L, bound.get_model(bound.session));
-            c.lua_setfield(L, -2, "model");
+            pushModelsApi(L, runner);
+            c.lua_setfield(L, -2, "models");
 
             pushMethod(L, runner, &ctxIsIdle);
             c.lua_setfield(L, -2, "is_idle");
@@ -82,7 +83,7 @@ pub fn pushExtensionContext(
         },
         .stub => {
             c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "model");
+            c.lua_setfield(L, -2, "models");
             c.lua_pushnil(L);
             c.lua_setfield(L, -2, "is_idle");
             c.lua_pushnil(L);
@@ -847,9 +848,19 @@ fn pushAiApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_setfield(L, -2, "complete");
 }
 
+fn pushModelsApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
+    c.lua_createtable(L, 0, 3);
+    pushMethod(L, runner, &ctxModelsList);
+    c.lua_setfield(L, -2, "list");
+    pushMethod(L, runner, &ctxModelsCurrent);
+    c.lua_setfield(L, -2, "current");
+    pushMethod(L, runner, &ctxModelsGet);
+    c.lua_setfield(L, -2, "get");
+}
+
 fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     const has_session = switch (runner.runtime) {
-        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null,
+        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null or bound.session_note_append != null or bound.session_notes_get != null,
         .stub => false,
     };
     if (!has_session) {
@@ -857,7 +868,7 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
         return;
     }
 
-    c.lua_createtable(L, 0, 5);
+    c.lua_createtable(L, 0, 7);
     pushMethod(L, runner, &ctxSessionInfo);
     c.lua_setfield(L, -2, "info");
     pushMethod(L, runner, &ctxSessionName);
@@ -868,6 +879,77 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_setfield(L, -2, "tool_results");
     pushMethod(L, runner, &ctxSessionMessages);
     c.lua_setfield(L, -2, "messages");
+    pushMethod(L, runner, &ctxSessionAppendNote);
+    c.lua_setfield(L, -2, "append_note");
+    pushMethod(L, runner, &ctxSessionNotes);
+    c.lua_setfield(L, -2, "notes");
+}
+
+fn ctxModelsCurrent(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    switch (runner.runtime) {
+        .bound => |bound| {
+            pushModel(L, bound.get_model(bound.session));
+            return 1;
+        },
+        .stub => {
+            c.lua_pushnil(L);
+            return 1;
+        },
+    }
+}
+
+fn ctxModelsGet(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const model_ref = readModelRefArg(L) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.models_get_one orelse {
+                c.lua_pushnil(L);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator, model_ref) orelse {
+                c.lua_pushnil(L);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_pushnil(L);
+            return 1;
+        },
+        .stub => {
+            c.lua_pushnil(L);
+            return 1;
+        },
+    }
+}
+
+fn ctxModelsList(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.models_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
 }
 
 fn ctxSessionInfo(L_opt: ?*c.lua_State) callconv(.c) c_int {
@@ -1011,6 +1093,85 @@ fn ctxSessionMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
     }
 }
 
+fn ctxSessionAppendNote(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    }
+    const idx = c.lua_absindex(L, 1);
+    const kind = readBorrowedStringField(L, idx, "kind") orelse "note";
+    const body = readBorrowedStringField(L, idx, "body") orelse {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    };
+    const title = readBorrowedStringField(L, idx, "title");
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const append = bound.session_note_append orelse {
+                c.lua_pushboolean(L, 0);
+                return 1;
+            };
+            append(bound.session, kind, title, body) catch {
+                c.lua_pushboolean(L, 0);
+                return 1;
+            };
+            c.lua_pushboolean(L, 1);
+            return 1;
+        },
+        .stub => {
+            c.lua_pushboolean(L, 0);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionNotes(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    var limit: usize = 50;
+    var kind: ?[]const u8 = null;
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        const idx = c.lua_absindex(L, 1);
+        kind = readBorrowedStringField(L, idx, "kind");
+        _ = c.lua_getfield(L, idx, "limit");
+        if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+            const raw = c.lua_tointegerx(L, -1, null);
+            if (raw > 0) limit = @intCast(@min(raw, 500));
+        }
+        c.lua_pop(L, 1);
+    }
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_notes_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator, kind, limit) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
+}
+
+fn readBorrowedStringField(L: *c.lua_State, table_idx: c_int, field: [:0]const u8) ?[]const u8 {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return null;
+    return ptr[0..len];
+}
+
 fn ctxAiComplete(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
@@ -1039,6 +1200,19 @@ fn ctxAiCompleteContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContex
     return 1;
 }
 
+fn readModelRefArg(L: *c.lua_State) ?[]const u8 {
+    if (c.lua_type(L, 1) == c.LUA_TSTRING) {
+        var len: usize = 0;
+        const ptr = c.lua_tolstring(L, 1, &len) orelse return null;
+        return ptr[0..len];
+    }
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        const idx = c.lua_absindex(L, 1);
+        return readBorrowedStringField(L, idx, "id");
+    }
+    return null;
+}
+
 fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.AiCompleteRequest {
     if (c.lua_type(L, 1) == c.LUA_TSTRING) {
         const prompt = try dupeLuaString(allocator, L, 1);
@@ -1058,6 +1232,23 @@ fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner
     c.lua_pop(L, 1);
     errdefer if (system_prompt) |value| allocator.free(value);
 
+    var model: ?[]const u8 = null;
+    _ = c.lua_getfield(L, idx, "model");
+    if (c.lua_type(L, -1) == c.LUA_TSTRING) {
+        model = try dupeLuaString(allocator, L, -1);
+    } else if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+        const model_idx = c.lua_absindex(L, -1);
+        if (readBorrowedStringField(L, model_idx, "id")) |id| {
+            if (readBorrowedStringField(L, model_idx, "provider")) |provider| {
+                model = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider, id });
+            } else {
+                model = try allocator.dupe(u8, id);
+            }
+        }
+    }
+    c.lua_pop(L, 1);
+    errdefer if (model) |value| allocator.free(value);
+
     var max_tokens: ?u64 = null;
     _ = c.lua_getfield(L, idx, "max_tokens");
     if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
@@ -1066,7 +1257,7 @@ fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner
     }
     c.lua_pop(L, 1);
 
-    return .{ .prompt = prompt, .system_prompt = system_prompt, .max_tokens = max_tokens };
+    return .{ .prompt = prompt, .system_prompt = system_prompt, .max_tokens = max_tokens, .model = model };
 }
 
 fn pushAiCompleteResult(L: *c.lua_State, result: runner_mod.AiCompleteResult) void {
@@ -1200,7 +1391,7 @@ fn pushMethod(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, func: *const
 }
 
 pub fn pushModel(L: *c.lua_State, model: agent_protocol.Model) void {
-    c.lua_createtable(L, 0, 6);
+    c.lua_createtable(L, 0, 8);
     _ = c.lua_pushlstring(L, model.id.ptr, model.id.len);
     c.lua_setfield(L, -2, "id");
     _ = c.lua_pushlstring(L, model.name.ptr, model.name.len);
@@ -1208,8 +1399,13 @@ pub fn pushModel(L: *c.lua_State, model: agent_protocol.Model) void {
     const provider = json_util.providerToString(model.provider);
     _ = c.lua_pushlstring(L, provider.ptr, provider.len);
     c.lua_setfield(L, -2, "provider");
+    const api = ai_provider.apiToString(model.api);
+    _ = c.lua_pushlstring(L, api.ptr, api.len);
+    c.lua_setfield(L, -2, "api");
     c.lua_pushinteger(L, @intCast(model.context_window));
     c.lua_setfield(L, -2, "context_window");
+    c.lua_pushinteger(L, @intCast(model.max_tokens));
+    c.lua_setfield(L, -2, "max_tokens");
     c.lua_pushboolean(L, if (model.reasoning) 1 else 0);
     c.lua_setfield(L, -2, "reasoning");
 }

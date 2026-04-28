@@ -21,6 +21,7 @@ pub const Request = struct {
     api_key: ?[]u8 = null,
     headers: ?[]const ai.protocol.Header = null,
     max_tokens: ?u64 = null,
+    reasoning: ?ai.protocol.ThinkingLevel = null,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
@@ -65,6 +66,7 @@ const Handler = struct {
             .api_key = request.api_key,
             .headers = request.headers,
             .max_tokens = request.max_tokens,
+            .reasoning = request.reasoning,
         });
         return switch (result) {
             .completed => |completed| .{ .completed = .{ .text = completed.text } },

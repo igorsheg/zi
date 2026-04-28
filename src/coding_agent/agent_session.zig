@@ -21,6 +21,7 @@ const event_bridge = @import("extensions/event_bridge.zig");
 const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
 const request_mod = @import("request.zig");
+const resolve_mod = @import("resolve.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -685,6 +686,8 @@ pub const AgentSession = struct {
             .ui = null,
             .command_actions = null,
             .get_model = &runtimeGetModel,
+            .models_get = &runtimeModelsGet,
+            .models_get_one = &runtimeModelsGetOne,
             .is_idle = &runtimeIsIdle,
             .abort = &runtimeAbort,
             .has_pending_messages = &runtimeHasPendingMessages,
@@ -700,6 +703,8 @@ pub const AgentSession = struct {
             .session_name_set = &runtimeSessionNameSet,
             .session_tool_results_get = &runtimeSessionToolResultsGet,
             .session_messages_get = &runtimeSessionMessagesGet,
+            .session_note_append = &runtimeSessionNoteAppend,
+            .session_notes_get = &runtimeSessionNotesGet,
             .show_panel = &runtimeShowPanel,
             .publish_prompt = &runtimePublishPrompt,
             .resolve_prompt = &runtimeResolvePrompt,
@@ -793,6 +798,40 @@ pub const AgentSession = struct {
     fn runtimeGetModel(session_ptr: *anyopaque) protocol.Model {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
         return self.agent.modelValue();
+    }
+
+    fn runtimeModelsGet(session_ptr: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const registry = self.model_registry orelse return null;
+        var arr = std.json.Array.init(allocator);
+        for (registry.getAll()) |model| arr.append(modelJson(allocator, model) catch return null) catch return null;
+        return .{ .array = arr };
+    }
+
+    fn runtimeModelsGetOne(session_ptr: *anyopaque, allocator: std.mem.Allocator, model_ref: []const u8) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const model = self.resolveModelRef(model_ref) orelse return null;
+        return modelJson(allocator, model) catch null;
+    }
+
+    fn resolveModelRef(self: *AgentSession, model_ref: []const u8) ?ai.protocol.Model {
+        const registry = self.model_registry orelse return null;
+        const parsed = resolve_mod.parseModelPattern(self.allocator, model_ref, registry.getAll(), .{});
+        return parsed.model orelse registry.findByProviderName(ai.json_util.providerToString(self.agent.modelValue().provider), model_ref);
+    }
+
+    fn modelJson(allocator: std.mem.Allocator, model: protocol.Model) !std.json.Value {
+        var obj = std.json.ObjectMap.init(allocator);
+        try obj.put(try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, model.id) });
+        try obj.put(try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, model.name) });
+        const provider = ai.json_util.providerToString(model.provider);
+        try obj.put(try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, provider) });
+        const api = ai.provider.apiToString(model.api);
+        try obj.put(try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, api) });
+        try obj.put(try allocator.dupe(u8, "context_window"), .{ .integer = @intCast(model.context_window) });
+        try obj.put(try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(model.max_tokens) });
+        try obj.put(try allocator.dupe(u8, "reasoning"), .{ .bool = model.reasoning });
+        return .{ .object = obj };
     }
 
     fn runtimeIsIdle(session_ptr: *anyopaque) bool {
@@ -962,6 +1001,49 @@ pub const AgentSession = struct {
             arr.append(sessionToolResultJson(allocator, entry.id, tr) catch return null) catch return null;
         }
         return .{ .array = arr };
+    }
+
+    fn runtimeSessionNoteAppend(session_ptr: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8) !void {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const allocator = self.session_store.writer.allocator;
+        var obj = std.json.ObjectMap.init(allocator);
+        errdefer ai.json_util.freeJsonValue(allocator, .{ .object = obj });
+        try obj.put(try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, kind) });
+        if (title) |value| try obj.put(try allocator.dupe(u8, "title"), .{ .string = try allocator.dupe(u8, value) });
+        try obj.put(try allocator.dupe(u8, "body"), .{ .string = try allocator.dupe(u8, body) });
+        self.session_store.appendCustomEntry("extension_note", .{ .object = obj });
+    }
+
+    fn runtimeSessionNotesGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, limit: usize) ?std.json.Value {
+        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
+        const branch = self.session_store.buildCurrentVisibleBranchAlloc(allocator) catch return null;
+        defer allocator.free(branch);
+        var all = std.json.Array.init(allocator);
+        for (branch) |entry| {
+            const custom = switch (entry.entry) {
+                .custom => |c| c,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, custom.custom_type, "extension_note")) continue;
+            const data = custom.data orelse continue;
+            if (kind) |wanted| {
+                if (data != .object) continue;
+                const value = data.object.get("kind") orelse continue;
+                if (value != .string or !std.mem.eql(u8, value.string, wanted)) continue;
+            }
+            var note = ai.json_util.cloneJsonValue(allocator, data) catch return null;
+            if (note == .object) {
+                note.object.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, entry.id) catch return null }) catch return null;
+            }
+            all.append(note) catch return null;
+        }
+        if (all.items.len <= limit) return .{ .array = all };
+        const start = all.items.len - limit;
+        for (all.items[0..start]) |value| ai.json_util.freeJsonValue(allocator, value);
+        var out = std.json.Array.init(allocator);
+        for (all.items[start..]) |value| out.append(value) catch return null;
+        all.deinit();
+        return .{ .array = out };
     }
 
     fn runtimeSessionMessagesGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, include_tools: bool) ?std.json.Value {
@@ -1266,7 +1348,7 @@ pub const AgentSession = struct {
         id: extension_runner_mod.AsyncOpId,
         request: extension_runner_mod.AiCompleteRequest,
     ) !ai_complete_worker_mod.Request {
-        const current_model = self.agent.modelValue();
+        const current_model = self.resolveExtensionAiModel(request.model) orelse return error.ModelUnavailable;
         const provider = self._stream_closure.registry.getForModel(
             ai.provider.apiToString(current_model.api),
             ai.json_util.providerToString(current_model.provider),
@@ -1283,12 +1365,18 @@ pub const AgentSession = struct {
             .api_key = null,
             .headers = null,
             .max_tokens = request.max_tokens,
+            .reasoning = if (current_model.reasoning) .high else null,
         };
         errdefer built.deinit(allocator);
         if (request.system_prompt) |value| built.system_prompt = try allocator.dupe(u8, value);
         if (api_key.len > 0) built.api_key = try allocator.dupe(u8, api_key);
         built.headers = try self._stream_closure.mergeClaimHeaders(current_model, allocator, null);
         return built;
+    }
+
+    fn resolveExtensionAiModel(self: *AgentSession, model_ref: ?[]const u8) ?ai.protocol.Model {
+        const value = model_ref orelse return self.agent.modelValue();
+        return self.resolveModelRef(value);
     }
 
     pub fn completeUserText(

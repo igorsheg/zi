@@ -483,6 +483,29 @@ fn testGetModel(_: *anyopaque) agent_protocol.Model {
     };
 }
 
+fn testModelJson(allocator: std.mem.Allocator, model: agent_protocol.Model) !std.json.Value {
+    var obj = std.json.ObjectMap.init(allocator);
+    try obj.put(try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, model.id) });
+    try obj.put(try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, model.name) });
+    try obj.put(try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, ai.json_util.providerToString(model.provider)) });
+    try obj.put(try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, ai.provider.apiToString(model.api)) });
+    try obj.put(try allocator.dupe(u8, "context_window"), .{ .integer = @intCast(model.context_window) });
+    try obj.put(try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(model.max_tokens) });
+    try obj.put(try allocator.dupe(u8, "reasoning"), .{ .bool = model.reasoning });
+    return .{ .object = obj };
+}
+
+fn testModelsGet(_: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
+    var arr = std.json.Array.init(allocator);
+    arr.append(testModelJson(allocator, testGetModel(undefined)) catch return null) catch return null;
+    return .{ .array = arr };
+}
+
+fn testModelsGetOne(_: *anyopaque, allocator: std.mem.Allocator, model_ref: []const u8) ?std.json.Value {
+    if (!std.mem.eql(u8, model_ref, "test-model") and !std.mem.eql(u8, model_ref, "test-provider/test-model")) return null;
+    return testModelJson(allocator, testGetModel(undefined)) catch null;
+}
+
 fn testIsIdle(_: *anyopaque) bool {
     return true;
 }
@@ -543,6 +566,8 @@ test "lua tool ctx exposes binding from tool provenance" {
         .ui = null,
         .command_actions = null,
         .get_model = &testGetModel,
+        .models_get = &testModelsGet,
+        .models_get_one = &testModelsGetOne,
         .is_idle = &testIsIdle,
         .abort = &testAbort,
         .has_pending_messages = &testHasPendingMessages,
@@ -897,6 +922,9 @@ const TestStateStore = struct {
     surfaces: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
     editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
     session_name: ?[]const u8 = null,
+    note_kind: ?[]const u8 = null,
+    note_title: ?[]const u8 = null,
+    note_body: ?[]const u8 = null,
     cancel_count: usize = 0,
     revoke_count: usize = 0,
 
@@ -910,6 +938,12 @@ const TestStateStore = struct {
         self.clearEditorActions();
         if (self.session_name) |name| self.allocator.free(name);
         self.session_name = null;
+        if (self.note_kind) |value| self.allocator.free(value);
+        if (self.note_title) |value| self.allocator.free(value);
+        if (self.note_body) |value| self.allocator.free(value);
+        self.note_kind = null;
+        self.note_title = null;
+        self.note_body = null;
     }
 
     fn get(session: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) ?std.json.Value {
@@ -965,6 +999,30 @@ const TestStateStore = struct {
             obj.put(allocator.dupe(u8, "is_error") catch return null, .{ .bool = false }) catch return null;
             arr.append(.{ .object = obj }) catch return null;
         }
+        return .{ .array = arr };
+    }
+
+    fn appendNote(session: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (self.note_kind) |value| self.allocator.free(value);
+        if (self.note_title) |value| self.allocator.free(value);
+        if (self.note_body) |value| self.allocator.free(value);
+        self.note_kind = try self.allocator.dupe(u8, kind);
+        self.note_title = if (title) |value| try self.allocator.dupe(u8, value) else null;
+        self.note_body = try self.allocator.dupe(u8, body);
+    }
+
+    fn notes(session: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, limit: usize) ?std.json.Value {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        _ = limit;
+        var arr = std.json.Array.init(allocator);
+        const note_kind = self.note_kind orelse return .{ .array = arr };
+        if (kind) |wanted| if (!std.mem.eql(u8, wanted, note_kind)) return .{ .array = arr };
+        var obj = std.json.ObjectMap.init(allocator);
+        obj.put(allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, note_kind) catch return null }) catch return null;
+        if (self.note_title) |title| obj.put(allocator.dupe(u8, "title") catch return null, .{ .string = allocator.dupe(u8, title) catch return null }) catch return null;
+        obj.put(allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
+        arr.append(.{ .object = obj }) catch return null;
         return .{ .array = arr };
     }
 
@@ -1077,6 +1135,8 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .ui = null,
         .command_actions = null,
         .get_model = &testGetModel,
+        .models_get = &testModelsGet,
+        .models_get_one = &testModelsGetOne,
         .is_idle = &testIsIdle,
         .abort = &testAbort,
         .has_pending_messages = &testHasPendingMessages,
@@ -1092,6 +1152,8 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_name_set = &TestStateStore.setSessionName,
         .session_tool_results_get = &TestStateStore.sessionToolResults,
         .session_messages_get = &TestStateStore.sessionMessages,
+        .session_note_append = &TestStateStore.appendNote,
+        .session_notes_get = &TestStateStore.notes,
         .show_panel = &TestStateStore.showPanel,
         .publish_prompt = &TestStateStore.publishPrompt,
         .cancel_prompts = &TestStateStore.cancelPrompts,
@@ -1151,11 +1213,54 @@ test "extension command context exposes read-only session surface" {
         \\    assert(#messages == 1)
         \\    assert(messages[1].role == "assistant")
         \\    assert(messages[1].text == "hi")
+        \\    assert(ctx.session.append_note({ kind = "manual", title = "Note", body = "remember" }) == true)
+        \\    local notes = ctx.session.notes({ kind = "manual" })
+        \\    assert(#notes == 1)
+        \\    assert(notes[1].title == "Note")
+        \\    assert(notes[1].body == "remember")
         \\  end,
         \\})
     , "register_session_surface_command");
 
     try runner.dispatchCommand("session-surface", "");
+}
+
+test "extension command context exposes model catalog and lookup" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 21);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "model-surface",
+        \\  description = "model-surface",
+        \\  handler = function(_, ctx)
+        \\    assert(ctx.model == nil)
+        \\    assert(ctx.models.current().id == "test-model")
+        \\    assert(ctx.models.current().max_tokens == 1024)
+        \\    local models = ctx.models.list()
+        \\    assert(#models == 1)
+        \\    assert(models[1].provider == "test-provider")
+        \\    assert(ctx.models.get("test-model").id == "test-model")
+        \\    assert(ctx.models.get("test-provider/test-model").api == "test-api")
+        \\    assert(ctx.models.get("missing") == nil)
+        \\  end,
+        \\})
+    , "register_model_surface_command");
+
+    try runner.dispatchCommand("model-surface", "");
 }
 
 test "extension command context publishes host-owned editor buffer actions" {
@@ -1434,6 +1539,24 @@ test "extension command resumes after ai completion result" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
+    const Capture = struct {
+        model: ?[]u8 = null,
+
+        fn submit(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, start: runner_mod.AsyncStart) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var owned = start;
+            defer owned.deinit(testing.allocator);
+            switch (owned.request) {
+                .ai_complete => |request| {
+                    if (request.model) |model| self.model = try testing.allocator.dupe(u8, model);
+                },
+                else => {},
+            }
+        }
+    };
+    var capture = Capture{};
+    defer if (capture.model) |model| testing.allocator.free(model);
+    runner.async_dispatcher = .{ .ptr = @ptrCast(&capture), .submit = &Capture.submit };
     api.installZiTable(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
@@ -1443,7 +1566,7 @@ test "extension command resumes after ai completion result" {
         \\  name = "ai-complete-test",
         \\  description = "ai-complete-test",
         \\  handler = function(_, ctx)
-        \\    local result = ctx.ai.complete({ prompt = "hello", system_prompt = "system", max_tokens = 12 })
+        \\    local result = ctx.ai.complete({ model = ctx.models.current(), prompt = "hello", system_prompt = "system", max_tokens = 12 })
         \\    _ai_complete_result = result.status .. ":" .. result.text
         \\  end,
         \\})
@@ -1453,6 +1576,7 @@ test "extension command resumes after ai completion result" {
     try testing.expectEqual(@as(usize, 1), runner.pending_async.count());
     const pending = runner.pending_async.get(1) orelse return error.MissingAsyncRequest;
     try testing.expectEqual(runner_mod.AsyncKind.ai_complete, pending.kind);
+    try testing.expectEqualStrings("test-provider/test-model", capture.model orelse return error.MissingModelOverride);
     try runner.resumeAsync(1, .{ .ai_complete = .{ .completed = .{ .text = try testing.allocator.dupe(u8, "world") } } });
     try testing.expectEqual(@as(usize, 0), runner.pending_async.count());
 

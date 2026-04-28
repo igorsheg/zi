@@ -901,7 +901,7 @@ fn makeLifecycleLoggerSource(
         "    extension_name,\n" ++
         "    value(event.type),\n" ++
         "    value(event.reason),\n" ++
-        "    ctx.model and \"1\" or \"0\",\n" ++
+        "    ctx.models and ctx.models.current() and \"1\" or \"0\",\n" ++
         "    value(binding.runtime_root_id),\n" ++
         "    value(binding.state_owner_id),\n" ++
         "    value(binding.workspace_id),\n" ++
