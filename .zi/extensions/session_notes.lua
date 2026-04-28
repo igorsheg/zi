@@ -1,6 +1,7 @@
 -- Semantic session notes example.
 --
 -- /note remember to update docs
+-- /note @entry-id remember to update docs
 -- /notes
 --
 -- Notes are stored as host-owned session custom entries with customType
@@ -9,8 +10,14 @@
 
 zi.command("note", function(ctx, args)
   local body = tostring(args or "")
+  local source_entry_id = nil
+  local maybe_source, rest = string.match(body, "^@([%w%-_]+)%s+(.+)$")
+  if maybe_source then
+    source_entry_id = maybe_source
+    body = rest
+  end
   if body == "" then
-    ctx.ui.set_footer("Usage: /note <text>")
+    ctx.ui.set_footer("Usage: /note [@entry-id] <text>")
     return
   end
 
@@ -18,6 +25,7 @@ zi.command("note", function(ctx, args)
     kind = "manual",
     title = "Manual note",
     body = body,
+    source_entry_id = source_entry_id,
   })
 
   if ok then

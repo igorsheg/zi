@@ -98,10 +98,7 @@ pub fn handleAgentEvent(
         .turn_end => |e| try observeWith(state, runner, .turn_end, e, pushTurnEnd),
         .message_start => |e| try observeWith(state, runner, .message_start, e, pushMessageStart),
         .message_update => |e| try observeWith(state, runner, .message_update, e, pushMessageUpdate),
-        .message_end => |e| {
-            try observeWith(state, runner, .message_end, e, pushMessageEnd);
-            try dispatchSemanticMessage(state, runner, e.message);
-        },
+        .message_end => |e| try observeWith(state, runner, .message_end, e, pushMessageEnd),
         .tool_execution_start => |e| try observeWith(state, runner, .tool_execution_start, e, pushToolExecStart),
         .tool_execution_update => |e| try observeWith(state, runner, .tool_execution_update, e, pushToolExecUpdate),
         .tool_execution_end => |e| try observeWith(state, runner, .tool_execution_end, e, pushToolExecEnd),
@@ -147,15 +144,26 @@ fn observeWith(
     try dispatch.dispatchObserver(state, runner, kind, -1);
 }
 
-fn dispatchSemanticMessage(
+pub fn dispatchSemanticMessage(
+    runner: *runner_mod.ExtensionRunner,
+    message: agent_protocol.AgentMessage,
+    entry_id: []const u8,
+) !void {
+    const state = runner.lua_state orelse return error.NoState;
+    runner.assertOnLuaThread();
+    try dispatchSemanticMessageForState(state, runner, message, entry_id);
+}
+
+fn dispatchSemanticMessageForState(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
     message: agent_protocol.AgentMessage,
+    entry_id: []const u8,
 ) !void {
     if (runner.event_registry.handlers(.message).len == 0) return;
     switch (message) {
         .user => |user| {
-            try pushSemanticMessagePayload(state.L, "user", null);
+            try pushSemanticMessagePayload(state.L, "user", entry_id, null);
             defer c.lua_pop(state.L, 1);
             const msg_idx = c.lua_absindex(state.L, -1);
             try pushUserTextField(state.L, msg_idx, user);
@@ -170,7 +178,7 @@ fn dispatchSemanticMessage(
                     try text.appendSlice(state.allocator, t.text);
                 },
                 .tool_call => |call| {
-                    try pushSemanticMessagePayload(state.L, "tool_call", null);
+                    try pushSemanticMessagePayload(state.L, "tool_call", entry_id, null);
                     defer c.lua_pop(state.L, 1);
                     const msg_idx = semanticMessageTableIndex(state.L, -1);
                     _ = c.lua_pushlstring(state.L, call.id.ptr, call.id.len);
@@ -185,13 +193,13 @@ fn dispatchSemanticMessage(
                 .thinking => {},
             };
             if (text.items.len > 0) {
-                try pushSemanticMessagePayload(state.L, "assistant", text.items);
+                try pushSemanticMessagePayload(state.L, "assistant", entry_id, text.items);
                 defer c.lua_pop(state.L, 1);
                 try dispatch.dispatchObserver(state, runner, .message, -1);
             }
         },
         .tool_result => |tr| {
-            try pushSemanticMessagePayload(state.L, "tool_result", null);
+            try pushSemanticMessagePayload(state.L, "tool_result", entry_id, null);
             defer c.lua_pop(state.L, 1);
             const msg_idx = semanticMessageTableIndex(state.L, -1);
             _ = c.lua_pushlstring(state.L, tr.tool_call_id.ptr, tr.tool_call_id.len);
@@ -212,13 +220,15 @@ fn dispatchSemanticMessage(
     }
 }
 
-fn pushSemanticMessagePayload(L: *c.lua_State, role: []const u8, text: ?[]const u8) !void {
+fn pushSemanticMessagePayload(L: *c.lua_State, role: []const u8, entry_id: []const u8, text: ?[]const u8) !void {
     c.lua_createtable(L, 0, 2);
     _ = c.lua_pushlstring(L, "message".ptr, "message".len);
     c.lua_setfield(L, -2, "type");
-    c.lua_createtable(L, 0, 6);
+    c.lua_createtable(L, 0, 7);
     _ = c.lua_pushlstring(L, role.ptr, role.len);
     c.lua_setfield(L, -2, "role");
+    _ = c.lua_pushlstring(L, entry_id.ptr, entry_id.len);
+    c.lua_setfield(L, -2, "entry_id");
     if (text) |value| {
         _ = c.lua_pushlstring(L, value.ptr, value.len);
         c.lua_setfield(L, -2, "text");
@@ -1259,7 +1269,7 @@ test "semantic message event exposes assistant text and tool calls" {
     try state.doString(
         \\_semantic = {}
         \\zi.on("message", function(event, ctx)
-        \\  table.insert(_semantic, event.message.role .. ":" .. (event.message.text or event.message.tool_name or ""))
+        \\  table.insert(_semantic, event.message.entry_id .. ":" .. event.message.role .. ":" .. (event.message.text or event.message.tool_name or ""))
         \\end)
     , "subscribe_semantic_message");
 
@@ -1279,12 +1289,12 @@ test "semantic message event exposes assistant text and tool calls" {
         .timestamp = 0,
     } };
 
-    try handleAgentEvent(&runner, .{ .message_end = .{ .message = fake_assistant } });
+    try dispatchSemanticMessage(&runner, fake_assistant, "entry-1");
 
     try state.doString(
         \\assert(#_semantic == 2, "expected 2 semantic messages, got " .. #_semantic)
-        \\assert(_semantic[1] == "tool_call:todo", _semantic[1])
-        \\assert(_semantic[2] == "assistant:hello", _semantic[2])
+        \\assert(_semantic[1] == "entry-1:tool_call:todo", _semantic[1])
+        \\assert(_semantic[2] == "entry-1:assistant:hello", _semantic[2])
     , "verify_semantic_message");
 }
 

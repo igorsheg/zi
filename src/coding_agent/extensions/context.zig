@@ -1107,13 +1107,14 @@ fn ctxSessionAppendNote(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return 1;
     };
     const title = readBorrowedStringField(L, idx, "title");
+    const source_entry_id = readBorrowedStringField(L, idx, "source_entry_id") orelse readBorrowedStringField(L, idx, "sourceEntryId");
     switch (runner.runtime) {
         .bound => |bound| {
             const append = bound.session_note_append orelse {
                 c.lua_pushboolean(L, 0);
                 return 1;
             };
-            append(bound.session, kind, title, body) catch {
+            append(bound.session, kind, title, body, source_entry_id) catch {
                 c.lua_pushboolean(L, 0);
                 return 1;
             };

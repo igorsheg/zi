@@ -925,6 +925,7 @@ const TestStateStore = struct {
     note_kind: ?[]const u8 = null,
     note_title: ?[]const u8 = null,
     note_body: ?[]const u8 = null,
+    note_source_entry_id: ?[]const u8 = null,
     cancel_count: usize = 0,
     revoke_count: usize = 0,
 
@@ -941,9 +942,11 @@ const TestStateStore = struct {
         if (self.note_kind) |value| self.allocator.free(value);
         if (self.note_title) |value| self.allocator.free(value);
         if (self.note_body) |value| self.allocator.free(value);
+        if (self.note_source_entry_id) |value| self.allocator.free(value);
         self.note_kind = null;
         self.note_title = null;
         self.note_body = null;
+        self.note_source_entry_id = null;
     }
 
     fn get(session: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) ?std.json.Value {
@@ -1002,14 +1005,16 @@ const TestStateStore = struct {
         return .{ .array = arr };
     }
 
-    fn appendNote(session: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8) !void {
+    fn appendNote(session: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8, source_entry_id: ?[]const u8) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         if (self.note_kind) |value| self.allocator.free(value);
         if (self.note_title) |value| self.allocator.free(value);
         if (self.note_body) |value| self.allocator.free(value);
+        if (self.note_source_entry_id) |value| self.allocator.free(value);
         self.note_kind = try self.allocator.dupe(u8, kind);
         self.note_title = if (title) |value| try self.allocator.dupe(u8, value) else null;
         self.note_body = try self.allocator.dupe(u8, body);
+        self.note_source_entry_id = if (source_entry_id) |value| try self.allocator.dupe(u8, value) else null;
     }
 
     fn notes(session: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, limit: usize) ?std.json.Value {
@@ -1021,6 +1026,7 @@ const TestStateStore = struct {
         var obj = std.json.ObjectMap.init(allocator);
         obj.put(allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, note_kind) catch return null }) catch return null;
         if (self.note_title) |title| obj.put(allocator.dupe(u8, "title") catch return null, .{ .string = allocator.dupe(u8, title) catch return null }) catch return null;
+        if (self.note_source_entry_id) |source| obj.put(allocator.dupe(u8, "source_entry_id") catch return null, .{ .string = allocator.dupe(u8, source) catch return null }) catch return null;
         obj.put(allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
         arr.append(.{ .object = obj }) catch return null;
         return .{ .array = arr };
@@ -1213,11 +1219,12 @@ test "extension command context exposes read-only session surface" {
         \\    assert(#messages == 1)
         \\    assert(messages[1].role == "assistant")
         \\    assert(messages[1].text == "hi")
-        \\    assert(ctx.session.append_note({ kind = "manual", title = "Note", body = "remember" }) == true)
+        \\    assert(ctx.session.append_note({ kind = "manual", title = "Note", body = "remember", source_entry_id = "entry-2" }) == true)
         \\    local notes = ctx.session.notes({ kind = "manual" })
         \\    assert(#notes == 1)
         \\    assert(notes[1].title == "Note")
         \\    assert(notes[1].body == "remember")
+        \\    assert(notes[1].source_entry_id == "entry-2")
         \\  end,
         \\})
     , "register_session_surface_command");

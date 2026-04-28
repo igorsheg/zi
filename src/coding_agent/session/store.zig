@@ -177,9 +177,9 @@ pub const SessionStore = struct {
 
     // ── Append methods (delegate to writer) ──────────────────────
 
-    pub fn appendMessage(self: *SessionStore, msg: agent_mod.protocol.AgentMessage) void {
+    pub fn appendMessage(self: *SessionStore, msg: agent_mod.protocol.AgentMessage) ?[]const u8 {
         self.invalidateCache();
-        self.writer.appendMessage(msg);
+        return self.writer.appendMessage(msg);
     }
 
     pub fn appendThinkingLevelChange(self: *SessionStore, level: []const u8) void {
@@ -819,8 +819,8 @@ test "applyCompaction preserves artifact fields and rebuilds current context" {
     var store = SessionStore.createEphemeral(allocator);
     defer store.deinit();
 
-    store.appendMessage(testUserMessage("first", 1));
-    store.appendMessage(testUserMessage("second", 2));
+    _ = store.appendMessage(testUserMessage("first", 1));
+    _ = store.appendMessage(testUserMessage("second", 2));
 
     var details_obj: std.json.ObjectMap = .init(allocator);
     try details_obj.put("artifact", .{ .string = "file-index" });
@@ -841,7 +841,7 @@ test "applyCompaction preserves artifact fields and rebuilds current context" {
     try std.testing.expect(rebuilt.messages[1] == .user);
     try std.testing.expectEqualStrings("second", rebuilt.messages[1].user.content.text);
 
-    store.appendMessage(testUserMessage("third", 3));
+    _ = store.appendMessage(testUserMessage("third", 3));
     const rebuilt_with_later = try store.buildCurrentContext();
     try std.testing.expectEqual(@as(usize, 3), rebuilt_with_later.messages.len);
     try std.testing.expectEqualStrings("third", rebuilt_with_later.messages[2].user.content.text);
@@ -855,17 +855,17 @@ test "contextUsageUnknownAfterCompaction tracks post-compaction assistant usage"
     var store = SessionStore.createEphemeral(allocator);
     defer store.deinit();
 
-    store.appendMessage(testUserMessage("first", 1));
-    store.appendMessage(try testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
-    store.appendMessage(testUserMessage("second", 3));
+    _ = store.appendMessage(testUserMessage("first", 1));
+    _ = store.appendMessage(try testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
+    _ = store.appendMessage(testUserMessage("second", 3));
     const kept_user_id = store.currentEntryId().?;
-    store.appendMessage(try testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
+    _ = store.appendMessage(try testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
     store.appendCompaction("summary", kept_user_id, 195_000, null, null);
-    store.appendMessage(testUserMessage("third", 5));
+    _ = store.appendMessage(testUserMessage("third", 5));
 
     try std.testing.expect(store.contextUsageUnknownAfterCompaction(allocator));
 
-    store.appendMessage(try testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
+    _ = store.appendMessage(try testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
     try std.testing.expect(!store.contextUsageUnknownAfterCompaction(allocator));
 }
 

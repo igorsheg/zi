@@ -135,8 +135,9 @@ pub const SessionWriter = struct {
     /// Append a message entry. Matches pi-mono's message_end persistence:
     /// - Buffers until first assistant message appears
     /// - Then flushes all buffered entries + appends incrementally
-    pub fn appendMessage(self: *SessionWriter, msg: agent.protocol.AgentMessage) void {
-        const entry = self.createEntry(.{ .message = .{ .message = msg } }) orelse return;
+    pub fn appendMessage(self: *SessionWriter, msg: agent.protocol.AgentMessage) ?[]const u8 {
+        const entry = self.createEntry(.{ .message = .{ .message = msg } }) orelse return null;
+        const entry_id = entry.id;
 
         // Track if we've seen an assistant message
         switch (msg) {
@@ -145,26 +146,27 @@ pub const SessionWriter = struct {
         }
 
         if (!self.persist) {
-            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch {};
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return null;
             if (self.has_assistant) self.flushed = true;
-            return;
+            return entry_id;
         }
 
         if (!self.has_assistant) {
             // Buffer until first assistant arrives
-            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch {};
-            return;
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return null;
+            return entry_id;
         }
 
         if (!self.flushed) {
             // First assistant seen — flush everything buffered + this entry
-            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch {};
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return null;
             self.flushAll();
-            return;
+            return entry_id;
         }
 
         // Already flushed — append incrementally
-        self.appendToFile(entry) catch {};
+        self.appendToFile(entry) catch return null;
+        return entry_id;
     }
 
     /// Append a thinking level change entry.

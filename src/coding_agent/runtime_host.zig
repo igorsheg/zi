@@ -822,7 +822,7 @@ fn fauxErrorAssistantMessage(
 }
 
 fn persistSessionFixture(_: std.mem.Allocator, store: *agent_session_mod.SessionStore) void {
-    store.appendMessage(.{ .user = .{
+    _ = store.appendMessage(.{ .user = .{
         .content = .{ .text = "persist me" },
         .timestamp = 1,
     } });
@@ -830,7 +830,7 @@ fn persistSessionFixture(_: std.mem.Allocator, store: *agent_session_mod.Session
     const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("persisted")};
     var assistant = faux.fauxAssistantMessage(std.heap.page_allocator, &content, .stop);
     assistant.timestamp = 2;
-    store.appendMessage(.{ .assistant = assistant });
+    _ = store.appendMessage(.{ .assistant = assistant });
 }
 
 fn createTestCreateOptions(registry: ?*ai.provider.Registry) sdk.CreateOptions {

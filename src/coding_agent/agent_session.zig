@@ -1003,13 +1003,14 @@ pub const AgentSession = struct {
         return .{ .array = arr };
     }
 
-    fn runtimeSessionNoteAppend(session_ptr: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8) !void {
+    fn runtimeSessionNoteAppend(session_ptr: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8, source_entry_id: ?[]const u8) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
         const allocator = self.session_store.writer.allocator;
         var obj = std.json.ObjectMap.init(allocator);
         errdefer ai.json_util.freeJsonValue(allocator, .{ .object = obj });
         try obj.put(try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, kind) });
         if (title) |value| try obj.put(try allocator.dupe(u8, "title"), .{ .string = try allocator.dupe(u8, value) });
+        if (source_entry_id) |value| try obj.put(try allocator.dupe(u8, "source_entry_id"), .{ .string = try allocator.dupe(u8, value) });
         try obj.put(try allocator.dupe(u8, "body"), .{ .string = try allocator.dupe(u8, body) });
         self.session_store.appendCustomEntry("extension_note", .{ .object = obj });
     }
@@ -1460,7 +1461,12 @@ pub const AgentSession = struct {
         // Session persistence on message_end
         switch (event) {
             .message_end => |me| {
-                self.session_store.appendMessage(me.message);
+                const entry_id = self.session_store.appendMessage(me.message) orelse return;
+                if (self._extension_runner_ref.current) |runner| {
+                    event_bridge.dispatchSemanticMessage(runner, me.message, entry_id) catch |err| {
+                        std.log.scoped(.zi_bridge).warn("semantic message dispatch failed: {s}", .{@errorName(err)});
+                    };
+                }
             },
             else => {},
         }
@@ -2156,8 +2162,8 @@ test "AgentSession: getContextUsage reports current context from assistant usage
     defer registry.deinit();
     defer fp.deinit();
 
-    session.session_store.appendMessage(testUserMessage("hello", 1));
-    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "hi", 200, 2));
+    _ = session.session_store.appendMessage(testUserMessage("hello", 1));
+    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "hi", 200, 2));
     try syncMessagesFromStore(&session);
 
     const usage = session.getContextUsage().?;
@@ -2218,13 +2224,13 @@ test "AgentSession: getContextUsage is unknown immediately after compaction" {
     defer registry.deinit();
     defer fp.deinit();
 
-    session.session_store.appendMessage(testUserMessage("first", 1));
-    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
-    session.session_store.appendMessage(testUserMessage("second", 3));
+    _ = session.session_store.appendMessage(testUserMessage("first", 1));
+    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
+    _ = session.session_store.appendMessage(testUserMessage("second", 3));
     const kept_user_id = session.session_store.currentEntryId().?;
-    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
+    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
     session.session_store.appendCompaction("summary", kept_user_id, 195_000, null, null);
-    session.session_store.appendMessage(testUserMessage("third", 5));
+    _ = session.session_store.appendMessage(testUserMessage("third", 5));
     try syncMessagesFromStore(&session);
 
     const usage = session.getContextUsage().?;
@@ -2297,14 +2303,14 @@ test "AgentSession: getContextUsage prefers post-compaction assistant usage" {
     defer registry.deinit();
     defer fp.deinit();
 
-    session.session_store.appendMessage(testUserMessage("first", 1));
-    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
-    session.session_store.appendMessage(testUserMessage("second", 3));
+    _ = session.session_store.appendMessage(testUserMessage("first", 1));
+    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
+    _ = session.session_store.appendMessage(testUserMessage("second", 3));
     const kept_user_id = session.session_store.currentEntryId().?;
-    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
+    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
     session.session_store.appendCompaction("summary", kept_user_id, 195_000, null, null);
-    session.session_store.appendMessage(testUserMessage("third", 5));
-    session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
+    _ = session.session_store.appendMessage(testUserMessage("third", 5));
+    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
     try syncMessagesFromStore(&session);
 
     const usage = session.getContextUsage().?;
