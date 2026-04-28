@@ -44,6 +44,7 @@ pub const EventKind = enum {
     message_start,
     message_update,
     message_end,
+    message,
 
     // Tool and host command execution
     tool_execution_start,
@@ -201,7 +202,7 @@ test "EventRegistry subscribes in order and dispatches correct chain" {
 }
 
 test "EventKind reserves the full v2 event surface" {
-    try testing.expectEqual(@as(usize, 28), @typeInfo(EventKind).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 29), @typeInfo(EventKind).@"enum".fields.len);
 }
 
 test "EventKind.semantics matches spec" {

@@ -757,6 +757,7 @@ fn parseEventKind(name: []const u8) ?event_registry.EventKind {
         .{ .name = "message_start", .kind = .message_start },
         .{ .name = "message_update", .kind = .message_update },
         .{ .name = "message_end", .kind = .message_end },
+        .{ .name = "message", .kind = .message },
         // tool and host command execution
         .{ .name = "tool_execution_start", .kind = .tool_execution_start },
         .{ .name = "tool_execution_update", .kind = .tool_execution_update },
@@ -2664,6 +2665,7 @@ test "zi.on accepts every reserved v2 event" {
         "message_start",
         "message_update",
         "message_end",
+        "message",
         "tool_execution_start",
         "tool_execution_update",
         "tool_execution_end",
@@ -2684,13 +2686,13 @@ test "zi.on accepts every reserved v2 event" {
     inline for (events) |event_name| {
         try testing.expect(parseEventKind(event_name) != null);
     }
-    try testing.expectEqual(@as(usize, 28), events.len);
+    try testing.expectEqual(@as(usize, 29), events.len);
 
     try state.doString(
         \\local events = {
         \\  "session_directory", "resources_discover",
         \\  "agent_start", "agent_end", "before_agent_start", "input", "context", "before_provider_request",
-        \\  "turn_start", "turn_end", "message_start", "message_update", "message_end",
+        \\  "turn_start", "turn_end", "message_start", "message_update", "message_end", "message",
         \\  "tool_execution_start", "tool_execution_update", "tool_execution_end", "tool_call", "tool_result", "user_bash",
         \\  "session_start", "session_shutdown", "session_before_switch", "session_before_fork",
         \\  "session_before_compact", "session_compact", "session_before_tree", "session_tree",
@@ -2701,7 +2703,7 @@ test "zi.on accepts every reserved v2 event" {
         \\end
     , "test_all_reserved_events");
 
-    try testing.expectEqual(@as(usize, 28), runner.event_registry.count());
+    try testing.expectEqual(@as(usize, 29), runner.event_registry.count());
 }
 
 test "zi.register_command registers a command end-to-end" {

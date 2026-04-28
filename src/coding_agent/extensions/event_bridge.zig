@@ -98,7 +98,10 @@ pub fn handleAgentEvent(
         .turn_end => |e| try observeWith(state, runner, .turn_end, e, pushTurnEnd),
         .message_start => |e| try observeWith(state, runner, .message_start, e, pushMessageStart),
         .message_update => |e| try observeWith(state, runner, .message_update, e, pushMessageUpdate),
-        .message_end => |e| try observeWith(state, runner, .message_end, e, pushMessageEnd),
+        .message_end => |e| {
+            try observeWith(state, runner, .message_end, e, pushMessageEnd);
+            try dispatchSemanticMessage(state, runner, e.message);
+        },
         .tool_execution_start => |e| try observeWith(state, runner, .tool_execution_start, e, pushToolExecStart),
         .tool_execution_update => |e| try observeWith(state, runner, .tool_execution_update, e, pushToolExecUpdate),
         .tool_execution_end => |e| try observeWith(state, runner, .tool_execution_end, e, pushToolExecEnd),
@@ -142,6 +145,126 @@ fn observeWith(
     try builder(state.L, payload);
     defer c.lua_pop(state.L, 1);
     try dispatch.dispatchObserver(state, runner, kind, -1);
+}
+
+fn dispatchSemanticMessage(
+    state: *lua_runtime.LuaState,
+    runner: *runner_mod.ExtensionRunner,
+    message: agent_protocol.AgentMessage,
+) !void {
+    if (runner.event_registry.handlers(.message).len == 0) return;
+    switch (message) {
+        .user => |user| {
+            try pushSemanticMessagePayload(state.L, "user", null);
+            defer c.lua_pop(state.L, 1);
+            const msg_idx = c.lua_absindex(state.L, -1);
+            try pushUserTextField(state.L, msg_idx, user);
+            try dispatch.dispatchObserver(state, runner, .message, -1);
+        },
+        .assistant => |assistant| {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(state.allocator);
+            for (assistant.content) |block| switch (block) {
+                .text => |t| {
+                    if (text.items.len > 0) try text.append(state.allocator, '\n');
+                    try text.appendSlice(state.allocator, t.text);
+                },
+                .tool_call => |call| {
+                    try pushSemanticMessagePayload(state.L, "tool_call", null);
+                    defer c.lua_pop(state.L, 1);
+                    const msg_idx = semanticMessageTableIndex(state.L, -1);
+                    _ = c.lua_pushlstring(state.L, call.id.ptr, call.id.len);
+                    c.lua_setfield(state.L, msg_idx, "tool_call_id");
+                    _ = c.lua_pushlstring(state.L, call.name.ptr, call.name.len);
+                    c.lua_setfield(state.L, msg_idx, "tool_name");
+                    try lua_runtime.pushJsonValue(state.L, call.arguments);
+                    c.lua_setfield(state.L, msg_idx, "args");
+                    c.lua_pop(state.L, 1);
+                    try dispatch.dispatchObserver(state, runner, .message, -1);
+                },
+                .thinking => {},
+            };
+            if (text.items.len > 0) {
+                try pushSemanticMessagePayload(state.L, "assistant", text.items);
+                defer c.lua_pop(state.L, 1);
+                try dispatch.dispatchObserver(state, runner, .message, -1);
+            }
+        },
+        .tool_result => |tr| {
+            try pushSemanticMessagePayload(state.L, "tool_result", null);
+            defer c.lua_pop(state.L, 1);
+            const msg_idx = semanticMessageTableIndex(state.L, -1);
+            _ = c.lua_pushlstring(state.L, tr.tool_call_id.ptr, tr.tool_call_id.len);
+            c.lua_setfield(state.L, msg_idx, "tool_call_id");
+            _ = c.lua_pushlstring(state.L, tr.tool_name.ptr, tr.tool_name.len);
+            c.lua_setfield(state.L, msg_idx, "tool_name");
+            c.lua_pushboolean(state.L, if (tr.is_error) 1 else 0);
+            c.lua_setfield(state.L, msg_idx, "is_error");
+            try pushToolResultTextField(state, msg_idx, tr);
+            if (tr.details) |details| {
+                try lua_runtime.pushJsonValue(state.L, details);
+                c.lua_setfield(state.L, msg_idx, "details");
+            }
+            c.lua_pop(state.L, 1);
+            try dispatch.dispatchObserver(state, runner, .message, -1);
+        },
+        .compaction_summary, .branch_summary, .custom => {},
+    }
+}
+
+fn pushSemanticMessagePayload(L: *c.lua_State, role: []const u8, text: ?[]const u8) !void {
+    c.lua_createtable(L, 0, 2);
+    _ = c.lua_pushlstring(L, "message".ptr, "message".len);
+    c.lua_setfield(L, -2, "type");
+    c.lua_createtable(L, 0, 6);
+    _ = c.lua_pushlstring(L, role.ptr, role.len);
+    c.lua_setfield(L, -2, "role");
+    if (text) |value| {
+        _ = c.lua_pushlstring(L, value.ptr, value.len);
+        c.lua_setfield(L, -2, "text");
+    }
+    c.lua_setfield(L, -2, "message");
+}
+
+fn semanticMessageTableIndex(L: *c.lua_State, payload_idx: c_int) c_int {
+    _ = c.lua_getfield(L, payload_idx, "message");
+    return c.lua_absindex(L, -1);
+}
+
+fn pushUserTextField(L: *c.lua_State, payload_idx: c_int, user: ai_protocol.UserMessage) !void {
+    const msg_idx = semanticMessageTableIndex(L, payload_idx);
+    defer c.lua_pop(L, 1);
+    switch (user.content) {
+        .text => |text| {
+            _ = c.lua_pushlstring(L, text.ptr, text.len);
+            c.lua_setfield(L, msg_idx, "text");
+        },
+        .blocks => |blocks| {
+            for (blocks) |block| switch (block) {
+                .text => |text| {
+                    _ = c.lua_pushlstring(L, text.text.ptr, text.text.len);
+                    c.lua_setfield(L, msg_idx, "text");
+                    return;
+                },
+                .image => {},
+            };
+        },
+    }
+}
+
+fn pushToolResultTextField(state: *lua_runtime.LuaState, msg_idx: c_int, tr: ai_protocol.ToolResultMessage) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(state.allocator);
+    for (tr.content) |block| switch (block) {
+        .text => |t| {
+            if (text.items.len > 0) try text.append(state.allocator, '\n');
+            try text.appendSlice(state.allocator, t.text);
+        },
+        .image => {},
+    };
+    if (text.items.len == 0) return;
+    _ = c.lua_pushlstring(state.L, text.items.ptr, text.items.len);
+    c.lua_setfield(state.L, msg_idx, "text");
 }
 
 pub const SessionLifecycleReason = enum { startup, new, @"resume", exit, fork };
@@ -1122,6 +1245,47 @@ test "event_bridge dispatches AgentEvent.message_end through to a Lua handler" {
     try state.doString(
         \\assert(_received_role == "assistant", "expected 'assistant', got " .. tostring(_received_role))
     , "verify");
+}
+
+test "semantic message event exposes assistant text and tool calls" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api.installZiTable(&state, &runner);
+
+    try state.doString(
+        \\_semantic = {}
+        \\zi.on("message", function(event, ctx)
+        \\  table.insert(_semantic, event.message.role .. ":" .. (event.message.text or event.message.tool_name or ""))
+        \\end)
+    , "subscribe_semantic_message");
+
+    var args = std.json.ObjectMap.init(testing.allocator);
+    defer args.deinit();
+    const content = [_]ai_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "hello" } },
+        .{ .tool_call = .{ .id = "call-1", .name = "todo", .arguments = .{ .object = args } } },
+    };
+    const fake_assistant = agent_protocol.AgentMessage{ .assistant = .{
+        .content = &content,
+        .api = .{ .anthropic_messages = {} },
+        .provider = .{ .anthropic = {} },
+        .model = "test",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .stop,
+        .timestamp = 0,
+    } };
+
+    try handleAgentEvent(&runner, .{ .message_end = .{ .message = fake_assistant } });
+
+    try state.doString(
+        \\assert(#_semantic == 2, "expected 2 semantic messages, got " .. #_semantic)
+        \\assert(_semantic[1] == "tool_call:todo", _semantic[1])
+        \\assert(_semantic[2] == "assistant:hello", _semantic[2])
+    , "verify_semantic_message");
 }
 
 test "event_bridge skips dispatch when no handler is subscribed" {
