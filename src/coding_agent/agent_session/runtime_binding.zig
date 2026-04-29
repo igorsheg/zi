@@ -7,10 +7,16 @@ const runtime_state = @import("runtime_state.zig");
 const runtime_session = @import("runtime_session.zig");
 const runtime_ui = @import("runtime_ui.zig");
 const projection_runtime = @import("projection_runtime.zig");
+const event_bridge = @import("../extensions/event_bridge.zig");
 const AgentSession = @import("../agent_session.zig").AgentSession;
 
 const ContextUsage = @import("../../session/root.zig").context_usage.ContextUsage;
 const ExtensionRunner = extension_runner_mod.ExtensionRunner;
+const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
+
+pub const agentEventSink = agentEventSinkFromRunnerRef;
+pub const beforeToolCall = beforeToolCallFromRunnerRef;
+pub const afterToolCall = afterToolCallFromRunnerRef;
 
 pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
     if (runner.isBound()) return;
@@ -54,6 +60,32 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .provider_projection_changed = &projection_runtime.providerProjectionChanged,
         .tool_projection_changed = &projection_runtime.toolProjectionChanged,
     }, self._stream_closure.registry) catch {};
+}
+
+fn agentEventSinkFromRunnerRef(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
+    const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
+    const runner = ref.current orelse return;
+    event_bridge.agentEventSink(event, @ptrCast(runner));
+}
+
+fn beforeToolCallFromRunnerRef(
+    ctx_arg: protocol.BeforeToolCallContext,
+    signal: @import("../../abort_signal.zig").AbortSignal,
+    ctx: ?*anyopaque,
+) ?protocol.BeforeToolCallResult {
+    const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
+    const runner = ref.current orelse return null;
+    return event_bridge.beforeToolCall(ctx_arg, signal, @ptrCast(runner));
+}
+
+fn afterToolCallFromRunnerRef(
+    ctx_arg: protocol.AfterToolCallContext,
+    signal: @import("../../abort_signal.zig").AbortSignal,
+    ctx: ?*anyopaque,
+) ?protocol.AfterToolCallResult {
+    const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
+    const runner = ref.current orelse return null;
+    return event_bridge.afterToolCall(ctx_arg, signal, @ptrCast(runner));
 }
 
 fn runtimeGetModel(session_ptr: *anyopaque) protocol.Model {

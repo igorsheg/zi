@@ -160,11 +160,11 @@ pub const AgentSession = struct {
         };
 
         const before_tool_hook: ?protocol.BeforeToolCallHook = .{
-            .func = &beforeToolCallFromRunnerRef,
+            .func = &runtime_binding.beforeToolCall,
             .ctx = @ptrCast(prepared.extension_runner_ref),
         };
         const after_tool_hook: ?protocol.AfterToolCallHook = .{
-            .func = &afterToolCallFromRunnerRef,
+            .func = &runtime_binding.afterToolCall,
             .ctx = @ptrCast(prepared.extension_runner_ref),
         };
 
@@ -529,7 +529,7 @@ pub const AgentSession = struct {
         if (self._extension_subscription_token == null) {
             if (self._extension_runner != null) {
                 self._extension_subscription_token = self.agent.subscribe(
-                    &agentEventSinkFromRunnerRef,
+                    &runtime_binding.agentEventSink,
                     @ptrCast(self._extension_runner_ref),
                 );
             }
@@ -615,32 +615,6 @@ pub const AgentSession = struct {
             self.allocator.destroy(state);
             self._extension_lua_state = null;
         }
-    }
-
-    fn agentEventSinkFromRunnerRef(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
-        const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
-        const runner = ref.current orelse return;
-        event_bridge.agentEventSink(event, @ptrCast(runner));
-    }
-
-    fn beforeToolCallFromRunnerRef(
-        ctx_arg: protocol.BeforeToolCallContext,
-        signal: @import("../abort_signal.zig").AbortSignal,
-        ctx: ?*anyopaque,
-    ) ?protocol.BeforeToolCallResult {
-        const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
-        const runner = ref.current orelse return null;
-        return event_bridge.beforeToolCall(ctx_arg, signal, @ptrCast(runner));
-    }
-
-    fn afterToolCallFromRunnerRef(
-        ctx_arg: protocol.AfterToolCallContext,
-        signal: @import("../abort_signal.zig").AbortSignal,
-        ctx: ?*anyopaque,
-    ) ?protocol.AfterToolCallResult {
-        const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
-        const runner = ref.current orelse return null;
-        return event_bridge.afterToolCall(ctx_arg, signal, @ptrCast(runner));
     }
 
     pub fn takePendingExtensionReport(self: *AgentSession) ?extension_ui.Report {
