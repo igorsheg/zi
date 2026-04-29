@@ -13,6 +13,7 @@ const settings_manager_mod = @import("settings/manager.zig");
 const settings_types_mod = @import("settings/types.zig");
 const model_registry_mod = @import("model_registry.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
+const message_conversion = @import("agent_session/message_conversion.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const ai_completion = @import("ai_completion.zig");
@@ -190,7 +191,7 @@ pub const AgentSession = struct {
             .tools = prepared.tools,
             .messages = options.initial_messages,
             .thinking_level = options.thinking_level orelse .off,
-            .convert_to_llm = .{ .func = &convertToLlm, .ctx = null },
+            .convert_to_llm = .{ .func = &message_conversion.convertToLlm, .ctx = null },
             .stream_fn = stream_hook,
             .session_id = prepared.session_store.sessionId(),
             .get_api_key = null,
@@ -1564,76 +1565,7 @@ pub const AgentSession = struct {
 
 };
 
-// ── convertToLlm ──────────────────────────────────────────────────────────
-//
-// pi-mono source: packages/coding-agent/src/core/messages.ts:148-195
-// The base agent's defaultConvertToLlm silently drops compaction_summary,
-// branch_summary, and custom. The coding agent's version converts them to
-// user messages with the proper prefix/suffix wrapping.
-
-const COMPACTION_SUMMARY_PREFIX =
-    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
-const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
-
-const BRANCH_SUMMARY_PREFIX =
-    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
-const BRANCH_SUMMARY_SUFFIX = "</summary>";
-
-pub fn convertToLlm(
-    allocator: std.mem.Allocator,
-    messages: []const protocol.AgentMessage,
-    _: ?*anyopaque,
-) []const ai.protocol.Message {
-    var result: std.ArrayList(ai.protocol.Message) = .empty;
-    for (messages) |msg| {
-        switch (msg) {
-            .user => |u| result.append(allocator, .{ .user = u }) catch continue,
-            .assistant => |a| result.append(allocator, .{ .assistant = a }) catch continue,
-            .tool_result => |t| result.append(allocator, .{ .tool_result = t }) catch continue,
-            .compaction_summary => |cs| {
-                const text = std.fmt.allocPrint(
-                    allocator,
-                    "{s}{s}{s}",
-                    .{ COMPACTION_SUMMARY_PREFIX, cs.summary, COMPACTION_SUMMARY_SUFFIX },
-                ) catch continue;
-                const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
-                blocks[0] = .{ .text = .{ .text = text } };
-                result.append(allocator, .{ .user = .{
-                    .content = .{ .blocks = blocks },
-                    .timestamp = cs.timestamp,
-                } }) catch continue;
-            },
-            .branch_summary => |bs| {
-                const text = std.fmt.allocPrint(
-                    allocator,
-                    "{s}{s}{s}",
-                    .{ BRANCH_SUMMARY_PREFIX, bs.summary, BRANCH_SUMMARY_SUFFIX },
-                ) catch continue;
-                const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
-                blocks[0] = .{ .text = .{ .text = text } };
-                result.append(allocator, .{ .user = .{
-                    .content = .{ .blocks = blocks },
-                    .timestamp = bs.timestamp,
-                } }) catch continue;
-            },
-            .custom => |c| {
-                const user_content: ai.protocol.UserMessage.UserMessageContent = switch (c.content) {
-                    .text => |t| blk: {
-                        const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
-                        blocks[0] = .{ .text = .{ .text = t } };
-                        break :blk .{ .blocks = blocks };
-                    },
-                    .blocks => |b| .{ .blocks = b },
-                };
-                result.append(allocator, .{ .user = .{
-                    .content = user_content,
-                    .timestamp = c.timestamp,
-                } }) catch continue;
-            },
-        }
-    }
-    return result.items;
-}
+pub const convertToLlm = message_conversion.convertToLlm;
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
@@ -1910,141 +1842,6 @@ test "trySetModel rejects unauthed model without mutating state or session" {
     try testing.expect(result == .no_auth);
     try testing.expectEqualStrings(initial.id, ca.agent.modelValue().id);
     try testing.expectEqual(@as(usize, 0), ca.session_store.writer.buffered_entries.items.len);
-}
-
-test "convertToLlm passes through user/assistant/tool_result" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const content = alloc.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1) catch unreachable;
-    content[0] = .{ .text = .{ .text = "hi" } };
-
-    const messages = &[_]protocol.AgentMessage{
-        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } },
-        .{ .assistant = .{
-            .content = content,
-            .api = .anthropic_messages,
-            .provider = .anthropic,
-            .model = "test",
-            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
-            .stop_reason = .stop,
-            .timestamp = 2,
-        } },
-    };
-
-    const result = convertToLlm(alloc, messages, null);
-    try testing.expectEqual(@as(usize, 2), result.len);
-    try testing.expect(result[0] == .user);
-    try testing.expect(result[1] == .assistant);
-}
-
-test "convertToLlm wraps compaction_summary as user message" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const messages = &[_]protocol.AgentMessage{
-        .{ .compaction_summary = .{ .summary = "Previous work summarized", .tokens_before = 5000, .timestamp = 1 } },
-    };
-
-    const result = convertToLlm(alloc, messages, null);
-    try testing.expectEqual(@as(usize, 1), result.len);
-    try testing.expect(result[0] == .user);
-
-    // Verify the text contains prefix + summary + suffix
-    const user = result[0].user;
-    switch (user.content) {
-        .blocks => |blocks| {
-            try testing.expectEqual(@as(usize, 1), blocks.len);
-            const text = blocks[0].text.text;
-            try testing.expect(std.mem.indexOf(u8, text, "compacted into the following summary") != null);
-            try testing.expect(std.mem.indexOf(u8, text, "Previous work summarized") != null);
-            try testing.expect(std.mem.indexOf(u8, text, "<summary>") != null);
-            try testing.expect(std.mem.indexOf(u8, text, "</summary>") != null);
-        },
-        .text => return error.ExpectedBlocks,
-    }
-}
-
-test "convertToLlm wraps branch_summary as user message" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const messages = &[_]protocol.AgentMessage{
-        .{ .branch_summary = .{ .summary = "Tried approach X", .from_id = "abc", .timestamp = 1 } },
-    };
-
-    const result = convertToLlm(alloc, messages, null);
-    try testing.expectEqual(@as(usize, 1), result.len);
-    try testing.expect(result[0] == .user);
-
-    const user = result[0].user;
-    switch (user.content) {
-        .blocks => |blocks| {
-            const text = blocks[0].text.text;
-            try testing.expect(std.mem.indexOf(u8, text, "summary of a branch") != null);
-            try testing.expect(std.mem.indexOf(u8, text, "Tried approach X") != null);
-        },
-        .text => return error.ExpectedBlocks,
-    }
-}
-
-test "convertToLlm converts custom to user message" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const messages = &[_]protocol.AgentMessage{
-        .{ .custom = .{ .custom_type = "skill", .content = .{ .text = "Do X" }, .display = true, .timestamp = 1 } },
-    };
-
-    const result = convertToLlm(alloc, messages, null);
-    try testing.expectEqual(@as(usize, 1), result.len);
-    try testing.expect(result[0] == .user);
-
-    const user = result[0].user;
-    switch (user.content) {
-        .blocks => |blocks| {
-            try testing.expectEqualStrings("Do X", blocks[0].text.text);
-        },
-        .text => return error.ExpectedBlocks,
-    }
-}
-
-test "convertToLlm handles mixed message types in order" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const content = alloc.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1) catch unreachable;
-    content[0] = .{ .text = .{ .text = "response" } };
-
-    const messages = &[_]protocol.AgentMessage{
-        .{ .compaction_summary = .{ .summary = "Summary", .tokens_before = 1000, .timestamp = 0 } },
-        .{ .user = .{ .content = .{ .text = "question" }, .timestamp = 1 } },
-        .{ .assistant = .{
-            .content = content,
-            .api = .anthropic_messages,
-            .provider = .anthropic,
-            .model = "test",
-            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
-            .stop_reason = .stop,
-            .timestamp = 2,
-        } },
-        .{ .branch_summary = .{ .summary = "Branch work", .from_id = "x", .timestamp = 3 } },
-        .{ .custom = .{ .custom_type = "ext", .content = .{ .text = "Custom content" }, .timestamp = 4 } },
-    };
-
-    const result = convertToLlm(alloc, messages, null);
-    try testing.expectEqual(@as(usize, 5), result.len);
-    // All 5 should be present: compaction→user, user, assistant, branch→user, custom→user
-    try testing.expect(result[0] == .user); // compaction
-    try testing.expect(result[1] == .user); // original user
-    try testing.expect(result[2] == .assistant);
-    try testing.expect(result[3] == .user); // branch
-    try testing.expect(result[4] == .user); // custom
 }
 
 // ── AgentSession e2e tests (ported from pi-mono test-harness.test.ts) ───
