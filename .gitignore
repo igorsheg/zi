@@ -2,6 +2,8 @@
 zig-out/
 .references/
 .forks/
+.tmp/
+.wrangler/
 node_modules/
 website/.zig-cache/
 website/zig-out/
