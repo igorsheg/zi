@@ -39,6 +39,7 @@ const model_requests_mod = @import("interactive/model_requests.zig");
 const session_events_mod = @import("interactive/session_events.zig");
 const key_flow_mod = @import("interactive/key_flow.zig");
 const transcript_mouse = @import("interactive/transcript_mouse.zig");
+const login_flow = @import("interactive/login_flow.zig");
 const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
@@ -1819,219 +1820,15 @@ pub const Interactive = struct {
     // ── Login picker (/login) ───────────────────────────────────
 
     fn clearLoginPickerEntries(self: *Interactive) void {
-        var i: usize = 0;
-        while (i < self.login_picker_count) : (i += 1) {
-            self.login_picker_entries[i].deinit(self.msg_allocator);
-        }
-        self.login_picker_count = 0;
+        login_flow.clearEntries(self);
     }
 
     fn showLoginPicker(self: *Interactive) void {
-        self.clearLoginPickerEntries();
-
-        const providers = oauth_mod.listProviders(self.msg_allocator) catch {
-            self.status_line.setPrimary("failed to load OAuth providers", self.theme.fg(.@"error"));
-            return;
-        };
-        defer self.msg_allocator.free(providers);
-
-        var count: usize = 0;
-        for (providers) |provider| {
-            if (count >= self.login_picker_items.len) {
-                var dropped = provider;
-                dropped.deinit(self.msg_allocator);
-                continue;
-            }
-            self.login_picker_entries[count] = provider;
-            self.login_picker_items[count] = .{
-                .value = provider.id,
-                .label = provider.name,
-                .description = null,
-            };
-            count += 1;
-        }
-        self.login_picker_count = count;
-
-        if (count == 0) {
-            self.status_line.setPrimary("no OAuth providers available", self.theme.fg(.muted));
-            return;
-        }
-
-        self.configureSimplePicker(
-            &self.login_picker,
-            "Login",
-            8,
-            self.login_picker_items[0..count],
-            &onLoginProviderSelected,
-            &onLoginPickerCancel,
-        );
-        self.showSimplePickerOverlay(&self.login_picker_handle, &self.login_picker);
-    }
-
-    fn onLoginProviderSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.hideSimplePickerOverlay(&self.login_picker_handle);
-        self.startLogin(selection.item.value);
-    }
-
-    fn onLoginPickerCancel(ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.hideSimplePickerOverlay(&self.login_picker_handle);
+        login_flow.showPicker(self);
     }
 
     fn startLogin(self: *Interactive, provider_id: []const u8) void {
-        if (self.login_thread != null) {
-            self.status_line.setPrimary("login already in progress", self.theme.fg(.warning));
-            return;
-        }
-
-        const provider = oauth_mod.findProvider(provider_id) orelse {
-            self.status_line.setPrimary("unknown OAuth provider", self.theme.fg(.@"error"));
-            return;
-        };
-
-        self.login_cancelled.store(false, .release);
-
-        self.status_line.setPrimary("starting login...", self.theme.fg(.muted));
-        self.tui.dirty = true;
-
-        const login_ctx = self.msg_allocator.create(LoginContext) catch {
-            self.status_line.setPrimary("failed to start login", self.theme.fg(.@"error"));
-            return;
-        };
-        login_ctx.* = .{
-            .interactive = self,
-            .provider = provider,
-        };
-
-        self.login_thread = std.Thread.spawn(.{}, loginThreadFn, .{login_ctx}) catch {
-            self.msg_allocator.destroy(login_ctx);
-            self.status_line.setPrimary("failed to spawn login thread", self.theme.fg(.@"error"));
-            return;
-        };
-    }
-
-    const LoginContext = struct {
-        interactive: *Interactive,
-        provider: oauth_mod.OAuthProvider,
-    };
-
-    fn loginThreadFn(ctx: *LoginContext) void {
-        logging.setThreadLabel(.login);
-
-        const self = ctx.interactive;
-        const provider = ctx.provider;
-        self.msg_allocator.destroy(ctx);
-
-        const result: oauth_mod.LoginResult = if (!provider.kind.usesExtensionLogin())
-            oauth_mod.login(
-                self.msg_allocator,
-                provider,
-                .{
-                    .on_auth = &onLoginAuth,
-                    .on_progress = &onLoginProgress,
-                    .ctx = @ptrCast(self),
-                },
-                &self.login_cancelled,
-            )
-        else blk: {
-            var response: request_mod.ExtensionOAuthLoginResponse = .{};
-            const provider_copy = self.msg_allocator.dupe(u8, provider.id) catch break :blk .{ .err = "out of memory" };
-            switch (self.request_queue.trySend(.{ .extension_oauth_login = .{
-                .provider_id = provider_copy,
-                .callbacks = .{
-                    .on_auth = &onLoginAuth,
-                    .on_progress = &onLoginProgress,
-                    .ctx = @ptrCast(self),
-                },
-                .response = &response,
-            } })) {
-                .ok => {},
-                .full => |rejected| {
-                    var req = rejected;
-                    req.deinit(self.msg_allocator);
-                    break :blk .{ .err = "login request queue is full" };
-                },
-                .closed => |rejected| {
-                    var req = rejected;
-                    req.deinit(self.msg_allocator);
-                    break :blk .{ .err = "login request queue is closed" };
-                },
-                .oom => break :blk .{ .err = "out of memory" },
-                .dropped => unreachable,
-            }
-            const result_from_agent: oauth_mod.LoginResult = switch (response.wait()) {
-                .success => |cred| .{ .success = cred },
-                .cancelled => .cancelled,
-                .err => |msg| .{ .err = msg },
-                .unsupported => .{ .err = "extension OAuth login is unsupported for this provider" },
-            };
-            break :blk result_from_agent;
-        };
-
-        const provider_id = self.msg_allocator.dupe(u8, provider.id) catch return;
-        switch (result) {
-            .success => |cred| {
-                self.auth_storage.set(provider.id, .{ .oauth = cred });
-                // auth_storage.set() dupes the credential; free the originals
-                self.msg_allocator.free(cred.refresh);
-                self.msg_allocator.free(cred.access);
-                var extras = cred.extras;
-                var eit = extras.iterator();
-                while (eit.next()) |e| {
-                    self.msg_allocator.free(e.key_ptr.*);
-                    json_util.freeJsonValue(self.msg_allocator, e.value_ptr.*);
-                }
-                extras.deinit();
-                _ = self.publishLifecycleUiEvent(.{ .login_complete = .{
-                    .provider_id = provider_id,
-                    .success = true,
-                    .message = self.msg_allocator.dupe(u8, "logged in") catch return,
-                } });
-            },
-            .cancelled => {
-                _ = self.publishLifecycleUiEvent(.{ .login_complete = .{
-                    .provider_id = provider_id,
-                    .success = false,
-                    .message = self.msg_allocator.dupe(u8, "login cancelled") catch return,
-                } });
-            },
-            .err => |msg| {
-                _ = self.publishLifecycleUiEvent(.{ .login_complete = .{
-                    .provider_id = provider_id,
-                    .success = false,
-                    .message = self.msg_allocator.dupe(u8, msg) catch return,
-                } });
-            },
-        }
-    }
-
-    // zi-wub.17: login-thread callbacks. These run on the login
-    // thread, so they MUST NOT touch TUI-owned state (status_line,
-    // tui.dirty, etc). Instead they publish a `login_progress` event
-    // on the snapshot queue with an msg_allocator-owned payload; the TUI
-    // thread consumes it from the normal drain loop. Single-owner
-    // invariant for status_line is restored — only the TUI thread
-    // writes it.
-    fn onLoginAuth(url: []const u8, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-
-        _ = std.process.Child.run(.{
-            .allocator = self.msg_allocator,
-            .argv = if (@import("builtin").os.tag == .macos)
-                &.{ "open", url }
-            else
-                &.{ "xdg-open", url },
-        }) catch {};
-
-        const msg = self.msg_allocator.dupe(u8, "login: check your browser") catch return;
-        _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = msg, .kind = .auth_url } });
-    }
-
-    fn onLoginProgress(msg: []const u8, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        const owned = self.msg_allocator.dupe(u8, msg) catch return;
-        _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = owned, .kind = .info } });
+        login_flow.start(self, provider_id);
     }
 
     fn dispatchExtensionOAuthRefreshViaRequestQueue(
