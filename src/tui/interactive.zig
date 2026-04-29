@@ -48,6 +48,7 @@ const composer_flow = @import("interactive/composer_flow.zig");
 const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const status_flow = @import("interactive/status_flow.zig");
+const overlay_flow = @import("interactive/overlay_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -1155,31 +1156,15 @@ pub const Interactive = struct {
     }
 
     pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
-        const width = self.tui.width();
-        const header_h = self.header_container.measure(width).preferred_height;
-        return .{
-            .anchor = .bottom_left,
-            .width_percent = 100,
-            .max_height_percent = 40,
-            .margin_bottom = 0,
-            .margin_top = header_h,
-            .surface = .{ .fill = Color.default },
-        };
+        return overlay_flow.bottomSheetOptions(self);
     }
 
     fn centerDialogOptions(self: *Interactive) overlay_mod.OverlayOptions {
-        var options = overlay_mod.OverlayPresets.centerDialog();
-        const width = self.tui.width();
-        const header_h = self.header_container.measure(width).preferred_height;
-        options.margin_top = header_h;
-        options.margin_bottom = 1;
-        options.surface = .{ .fill = self.theme.bg(.tool_pending_bg) };
-        return options;
+        return overlay_flow.centerDialogOptions(self);
     }
 
     fn showHotkeysOverlay(self: *Interactive) void {
-        self.cancelTranscriptSelection();
-        _ = self.tui.showOverlay(self.hotkeys_overlay.component(), self.centerDialogOptions());
+        overlay_flow.showHotkeys(self);
     }
 
     pub fn configureSimplePicker(
@@ -1191,13 +1176,7 @@ pub const Interactive = struct {
         on_select: ?*const fn (selection: PickerSelection, ctx: ?*anyopaque) void,
         on_cancel: ?*const fn (ctx: ?*anyopaque) void,
     ) void {
-        picker.* = ListPicker.init(self.theme);
-        picker.title = title;
-        picker.list.max_visible = max_visible;
-        picker.setItems(items);
-        picker.on_select = on_select;
-        picker.on_cancel = on_cancel;
-        picker.callback_ctx = @ptrCast(self);
+        overlay_flow.configureSimplePicker(self, picker, title, max_visible, items, on_select, on_cancel);
     }
 
     pub fn showSimplePickerOverlay(
@@ -1205,17 +1184,12 @@ pub const Interactive = struct {
         handle: *?tui_mod.OverlayHandle,
         picker: *ListPicker,
     ) void {
-        self.cancelTranscriptSelection();
-        self.hideSimplePickerOverlay(handle);
-        handle.* = self.tui.showOverlay(picker.component(), self.bottomSheetOptions());
+        overlay_flow.showSimplePickerOverlay(self, handle, picker);
     }
 
     pub fn hideSimplePickerOverlay(self: *Interactive, handle: *?tui_mod.OverlayHandle) void {
         _ = self;
-        if (handle.*) |h| {
-            handle.* = null;
-            h.hide();
-        }
+        overlay_flow.hideSimplePickerOverlay(handle);
     }
 
     pub fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
