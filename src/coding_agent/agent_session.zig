@@ -18,6 +18,7 @@ const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const ai_completion = @import("ai_completion.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
+const pending_extension_ui_mod = @import("agent_session/pending_extension_ui.zig");
 const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
 const request_mod = @import("request.zig");
@@ -30,6 +31,7 @@ pub const SessionStore = session_runtime.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 pub const ContextUsage = session_core.context_usage.ContextUsage;
+const PendingExtensionUi = pending_extension_ui_mod.PendingExtensionUi;
 const session_proto = session_core.protocol;
 
 /// Composition root: wires Agent + SessionStore + tools + model resolution.
@@ -79,10 +81,7 @@ pub const AgentSession = struct {
     /// teardown order (unsubscribe → runner.deinit → state.deinit).
     /// Both fields are nil when Lua init fails; the agent still runs.
     _extension_lua_state: ?*lua_runtime.LuaState = null,
-    pending_extension_report: ?extension_ui.Report = null,
-    pending_extension_prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
-    pending_extension_ui_publications: std.ArrayListUnmanaged(extension_ui.UiPublication) = .empty,
-    pending_extension_editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
+    pending_extension_ui: PendingExtensionUi,
     pending_tool_projection_refresh: bool = false,
 
     /// Subscription token for the extension event bridge. Separate
@@ -221,6 +220,7 @@ pub const AgentSession = struct {
             ._extension_runner = prepared.extension_runner,
             ._extension_runner_ref = prepared.extension_runner_ref,
             ._extension_lua_state = prepared.extension_lua_state,
+            .pending_extension_ui = PendingExtensionUi.init(allocator),
         };
     }
 
@@ -546,10 +546,7 @@ pub const AgentSession = struct {
         // same path here on whatever thread owns lua.
         self.deactivateLifecycle();
         self.destroyExtensionRuntime();
-        self.clearPendingExtensionReport();
-        self.clearPendingExtensionPrompts();
-        self.clearPendingExtensionUiPublications();
-        self.clearPendingExtensionEditorActions();
+        self.pending_extension_ui.deinit();
         self.allocator.destroy(self._stream_closure);
         self.allocator.destroy(self._extension_runner_ref);
         self.agent_event_listeners.deinit(self.allocator);
@@ -1298,26 +1295,16 @@ pub const AgentSession = struct {
 
     fn runtimePublishReport(session_ptr: *anyopaque, report: extension_ui.Report) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.clearPendingExtensionReport();
-        self.pending_extension_report = try extension_ui.Report.clone(self.allocator, report);
+        try self.pending_extension_ui.publishReport(report);
     }
 
     pub fn takePendingExtensionReport(self: *AgentSession) ?extension_ui.Report {
-        const report = self.pending_extension_report;
-        self.pending_extension_report = null;
-        return report;
-    }
-
-    fn clearPendingExtensionReport(self: *AgentSession) void {
-        if (self.pending_extension_report) |*report| report.deinit(self.allocator);
-        self.pending_extension_report = null;
+        return self.pending_extension_ui.takeReport();
     }
 
     fn runtimePublishPrompt(session_ptr: *anyopaque, prompt: extension_ui.PromptRequest) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        var cloned = try extension_ui.PromptRequest.clone(self.allocator, prompt);
-        errdefer cloned.deinit(self.allocator);
-        try self.pending_extension_prompts.append(self.allocator, cloned);
+        try self.pending_extension_ui.publishPrompt(prompt);
     }
 
     fn runtimeResolvePrompt(session_ptr: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
@@ -1327,83 +1314,39 @@ pub const AgentSession = struct {
 
     fn runtimeCancelPrompts(session_ptr: *anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.clearPendingExtensionPrompts();
+        self.pending_extension_ui.clearPrompts();
     }
 
     pub fn pendingExtensionPromptCount(self: *const AgentSession) usize {
-        return self.pending_extension_prompts.items.len;
-    }
-
-    fn clearPendingExtensionPrompts(self: *AgentSession) void {
-        for (self.pending_extension_prompts.items) |*prompt| prompt.deinit(self.allocator);
-        self.pending_extension_prompts.deinit(self.allocator);
-        self.pending_extension_prompts = .empty;
+        return self.pending_extension_ui.promptCount();
     }
 
     fn runtimePublishUi(session_ptr: *anyopaque, update: extension_ui.UiPublication) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        var cloned = try extension_ui.UiPublication.clone(self.allocator, update);
-        errdefer cloned.deinit(self.allocator);
-        try self.pending_extension_ui_publications.append(self.allocator, cloned);
+        try self.pending_extension_ui.publishUi(update);
     }
 
     fn runtimeRevokeUi(session_ptr: *anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.clearPendingExtensionUiPublications();
+        self.pending_extension_ui.clearUiPublications();
     }
 
     pub fn takePendingExtensionUiPublications(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.UiPublication {
-        const out = try allocator.alloc(extension_ui.UiPublication, self.pending_extension_ui_publications.items.len);
-        errdefer allocator.free(out);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |*update| update.deinit(allocator);
-        }
-        for (self.pending_extension_ui_publications.items, 0..) |update, i| {
-            out[i] = try extension_ui.UiPublication.clone(allocator, update);
-            initialized += 1;
-        }
-        self.clearPendingExtensionUiPublications();
-        return out;
-    }
-
-    fn clearPendingExtensionUiPublications(self: *AgentSession) void {
-        for (self.pending_extension_ui_publications.items) |*update| update.deinit(self.allocator);
-        self.pending_extension_ui_publications.deinit(self.allocator);
-        self.pending_extension_ui_publications = .empty;
+        return self.pending_extension_ui.takeUiPublications(allocator);
     }
 
     fn runtimePublishEditorAction(session_ptr: *anyopaque, action: extension_ui.EditorAction) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        var cloned = try extension_ui.EditorAction.clone(self.allocator, action);
-        errdefer cloned.deinit(self.allocator);
-        try self.pending_extension_editor_actions.append(self.allocator, cloned);
+        try self.pending_extension_ui.publishEditorAction(action);
     }
 
     fn runtimeClearEditorActions(session_ptr: *anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.clearPendingExtensionEditorActions();
+        self.pending_extension_ui.clearEditorActions();
     }
 
     pub fn takePendingExtensionEditorActions(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.EditorAction {
-        const out = try allocator.alloc(extension_ui.EditorAction, self.pending_extension_editor_actions.items.len);
-        errdefer allocator.free(out);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |*action| action.deinit(allocator);
-        }
-        for (self.pending_extension_editor_actions.items, 0..) |action, i| {
-            out[i] = try extension_ui.EditorAction.clone(allocator, action);
-            initialized += 1;
-        }
-        self.clearPendingExtensionEditorActions();
-        return out;
-    }
-
-    fn clearPendingExtensionEditorActions(self: *AgentSession) void {
-        for (self.pending_extension_editor_actions.items) |*action| action.deinit(self.allocator);
-        self.pending_extension_editor_actions.deinit(self.allocator);
-        self.pending_extension_editor_actions = .empty;
+        return self.pending_extension_ui.takeEditorActions(allocator);
     }
 
     fn runtimeProviderProjectionChanged(session_ptr: *anyopaque) void {
