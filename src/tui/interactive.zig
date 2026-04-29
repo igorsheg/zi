@@ -30,6 +30,7 @@ const queues_mod = @import("interactive/queues.zig");
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
+const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
@@ -52,6 +53,7 @@ const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
 const UiSnapshotQueue = queues_mod.UiSnapshotQueue;
 const UiLifecycleQueue = queues_mod.UiLifecycleQueue;
+const PublishedStatusSnapshot = status_snapshot_mod.PublishedStatusSnapshot;
 const convertAgentUiEvent = agent_ui_event_mod.convertAgentUiEvent;
 const userFacingFailureMessage = agent_ui_event_mod.userFacingFailureMessage;
 const PendingImageAttachment = clipboard_images_mod.PendingImageAttachment;
@@ -124,44 +126,6 @@ const StatusLine = status_line_mod.StatusLine;
 const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
 const StatusData = status_data_mod.StatusData;
-
-const PublishedStatusSnapshot = struct {
-    model_provider: []u8,
-    model_id: []u8,
-    thinking_level: agent_protocol.ThinkingLevel,
-    context_tokens: ?u64,
-    context_window: u64,
-
-    fn init(
-        allocator: std.mem.Allocator,
-        snapshot: AgentSession.StatusSnapshot,
-    ) !PublishedStatusSnapshot {
-        const model_provider = try allocator.dupe(u8, snapshot.model_provider);
-        errdefer allocator.free(model_provider);
-        const model_id = try allocator.dupe(u8, snapshot.model_id);
-        return .{
-            .model_provider = model_provider,
-            .model_id = model_id,
-            .thinking_level = snapshot.thinking_level,
-            .context_tokens = snapshot.context_tokens,
-            .context_window = snapshot.context_window,
-        };
-    }
-
-    fn deinit(self: *PublishedStatusSnapshot, allocator: std.mem.Allocator) void {
-        allocator.free(self.model_provider);
-        allocator.free(self.model_id);
-        self.* = undefined;
-    }
-
-    fn eql(self: PublishedStatusSnapshot, snapshot: AgentSession.StatusSnapshot) bool {
-        return std.mem.eql(u8, self.model_provider, snapshot.model_provider) and
-            std.mem.eql(u8, self.model_id, snapshot.model_id) and
-            self.thinking_level == snapshot.thinking_level and
-            self.context_tokens == snapshot.context_tokens and
-            self.context_window == snapshot.context_window;
-    }
-};
 
 const QueuedInputKind = enum {
     steering,
@@ -3320,19 +3284,8 @@ pub const Interactive = struct {
     }
 
     fn publishStatusSnapshotForAgentEvent(self: *Interactive, event: AgentEvent) void {
-        if (!shouldPublishStatusSnapshotForAgentEvent(event)) return;
+        if (!status_snapshot_mod.shouldPublishStatusSnapshotForAgentEvent(event)) return;
         self.publishStatusSnapshot();
-    }
-
-    fn shouldPublishStatusSnapshotForAgentEvent(event: AgentEvent) bool {
-        return switch (event) {
-            .message_end => true,
-            .turn_end => |payload| switch (payload.message) {
-                .assistant => true,
-                else => false,
-            },
-            else => false,
-        };
     }
 
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
@@ -3506,41 +3459,4 @@ fn thinkingDescription(level: agent_protocol.ThinkingLevel) []const u8 {
         .high => "Deep reasoning (~16k tokens)",
         .xhigh => "Maximum reasoning (~32k tokens)",
     };
-}
-
-const testing = std.testing;
-
-test "status snapshot publication follows message-end source mutations" {
-    const user = agent_protocol.AgentMessage{ .user = .{
-        .content = .{ .text = "hello" },
-        .timestamp = 1,
-    } };
-    const assistant = agent_protocol.AgentMessage{ .assistant = .{
-        .content = &.{},
-        .api = .openai_responses,
-        .provider = .openai,
-        .model = "gpt-test",
-        .usage = .{
-            .input = 0,
-            .output = 0,
-            .cache_read = 0,
-            .cache_write = 0,
-            .total_tokens = 0,
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-        },
-        .stop_reason = .stop,
-        .timestamp = 2,
-    } };
-    const tool_result = agent_protocol.AgentMessage{ .tool_result = .{
-        .tool_call_id = "tool-1",
-        .tool_name = "read",
-        .content = &.{},
-        .is_error = false,
-        .timestamp = 3,
-    } };
-
-    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = user } }));
-    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = assistant } }));
-    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .message_end = .{ .message = tool_result } }));
-    try testing.expect(Interactive.shouldPublishStatusSnapshotForAgentEvent(.{ .turn_end = .{ .message = assistant, .tool_results = &.{} } }));
 }
