@@ -50,6 +50,7 @@ const status_flow = @import("interactive/status_flow.zig");
 const overlay_flow = @import("interactive/overlay_flow.zig");
 const idle_request = @import("interactive/idle_request.zig");
 const runtime_loop = @import("interactive/runtime_loop.zig");
+const theme_flow = @import("interactive/theme_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -1405,24 +1406,11 @@ pub const Interactive = struct {
     }
 
     pub fn publishThemeSnapshot(self: *Interactive) void {
-        _ = self.publishSnapshotUiEvent(.{ .theme_changed = self.runtime_host.selectedTheme() });
+        theme_flow.publishSnapshot(self);
     }
 
     pub fn applyTheme(self: *Interactive, theme: theme_mod.Theme) void {
-        self.theme_storage = theme;
-        self.theme = &self.theme_storage;
-        self.greeter.theme = self.theme;
-        self.footer.theme = self.theme;
-        self.hotkeys_overlay.theme = self.theme;
-        if (self.active_editor_bound) {
-            self.active_editor.setTheme(self.theme);
-        } else {
-            self.editor.setTheme(self.theme);
-        }
-        self.transcript.theme = self.theme;
-        self.status_line.setTheme(self.theme);
-        self.pending_image_banner.fg = self.theme.fg(.accent);
-        self.pending_image_banner.bg = self.theme.bg(.tool_pending_bg);
+        theme_flow.apply(self, theme);
     }
 
     pub fn publishVisibleModelsSnapshot(self: *Interactive) void {
