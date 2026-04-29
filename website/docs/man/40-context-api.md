@@ -2,6 +2,8 @@
 
 Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.html#events) receive `ctx`.
 
+`ctx` is the extension's view of the current run. It gives you what you need without handing over private host internals: current directory, UI intent, session helpers, state, model helpers, cancellation, and a few session controls.
+
 `ctx.cwd`
 : Current working directory.
 
@@ -49,7 +51,7 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 
 ## context ui api
 
-The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
+The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Say what you want the user to see; let the host decide where it fits. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
 
 `ctx.ui.message(text, opts?)`
 : Publish short feedback. `opts.id` is the dedupe/update key; `opts.kind` is `info`, `warning`, `error`, or `success`. The host chooses a visible, low-disruption placement.
@@ -85,7 +87,7 @@ Surface option tables may include `placement` and `lifetime`. `lifetime` is `ses
 
 ## context state api
 
-`ctx.state` is a per-extension session-persisted map:
+`ctx.state` is a per-extension session-persisted map. Use it for small choices and facts your extension owns.
 
 `ctx.state.get(key)`
 : Return a JSON-compatible value or `nil`.
@@ -133,7 +135,7 @@ State is scoped to the extension and active session. It may survive session chan
 `ctx.session.entries({ label?, limit? })`
 : Return semantic target entries by simple predicates. Currently supports `label`; latest label wins per target entry, cleared labels are excluded, and returned rows are target entries rather than label entries. Default limit is 50; maximum is 500.
 
-Durable message ids compose with notes and labels:
+Durable message ids compose with notes and labels. This is useful for memory that should be inspectable later, not hidden inside an extension:
 
 ```lua
 zi.on("message", function(event, ctx)
@@ -169,7 +171,7 @@ end
 : Resolve a model by id, provider/id string, or model-like table.
 
 `ctx.ai.complete(request)`
-: Run a sessionless model completion. It does not mutate the transcript and does not run tools. For provider/model registration, see [providers](api.html#providers).
+: Run a sessionless model completion. It does not mutate the transcript and does not run tools. Use it for side questions, summaries, or classification that should not become part of the main conversation. For provider/model registration, see [providers](api.html#providers).
 
 `ctx.ai.complete` accepts either a prompt string or a table:
 
@@ -195,7 +197,7 @@ The result shape is:
 
 ## system command helper
 
-`zi.system(argv, opts?)` runs an OS command directly from an argv array. It is yieldable and should be called from command/tool execution contexts, not extension load/register code.
+`zi.system(argv, opts?)` runs an OS command directly from an argv array. It is yieldable and should be called from command/tool execution contexts, not extension load/register code. Prefer bounded, explicit commands over shell strings.
 
 ```lua
 local result = zi.system({ "git", "status", "--short" }, {
@@ -245,7 +247,7 @@ Non-zero exits are `status = "completed"`; inspect `code`.
 
 ## spawn helper
 
-`zi.spawn(opts)` runs delegated child zi work through batch JSON mode and returns a table shaped like a tool result. Prefer normal [tools](api.html#tools), [commands](api.html#commands), and [context model and ai api](#context-model-and-ai-api) when a child agent is not required.
+`zi.spawn(opts)` runs delegated child zi work through batch JSON mode and returns a table shaped like a tool result. This is for real delegation, not ordinary helper logic. Prefer normal [tools](api.html#tools), [commands](api.html#commands), and [context model and ai api](#context-model-and-ai-api) when a child agent is not required.
 
 ```lua
 local result = zi.spawn({

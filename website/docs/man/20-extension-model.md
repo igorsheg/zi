@@ -1,6 +1,12 @@
 ## extension purpose
 
-Extensions are Lua programs loaded by zi. They let users shape the agent without rebuilding the Zig core. The concrete host functions are listed in [extension api: zi table](api.html#extension-api-zi-table), and handler context is documented in [context object](context.html#context-object).
+An extension is just a Lua file that teaches zi one new habit.
+
+It can register a command, expose a model-visible tool, customize prompts, store small bits of state, react to lifecycle events, or publish simple UI. You do not need a framework, build step, package registry, or permission from the core project. Start with the smallest useful thing.
+
+Good extensions feel boring in the best way: clear names, clear inputs, visible effects, and no surprise ownership of the user's workflow.
+
+The concrete host functions are listed in [extension api: zi table](api.html#extension-api-zi-table), and handler context is documented in [context object](context.html#context-object).
 
 Use extensions for things like:
 
@@ -76,7 +82,7 @@ return function(zi)
 end
 ```
 
-Load/register is non-suspending. Do not perform long work while the extension loads. Register capabilities, initialize cheap local state, and defer work to [commands](api.html#commands), [tools](api.html#tools), [events](api.html#events), jobs, or [host-owned prompts](context.html#context-ui-api).
+Load/register is non-suspending. Keep it cheap and deterministic: register capabilities, initialize small local state, and defer real work to [commands](api.html#commands), [tools](api.html#tools), [events](api.html#events), jobs, or [host-owned prompts](context.html#context-ui-api).
 
 ## extension lifecycle
 
@@ -91,8 +97,8 @@ Important rules:
 - do not perform long-running work while the extension loads
 - use tool bodies or command handlers for user-visible work
 - use events for lifecycle policy and reaction
-- session-local UI surfaces, prompts, jobs, and provider handles should be recreated after session changes
-- private extension state that should survive session changes belongs in [context state api](context.html#context-state-api)
-- shared semantic session artifacts belong in [context session api](context.html#context-session-api), such as notes, labels, and entry lookup
+- recreate session-local UI surfaces, prompts, jobs, and provider handles after session changes
+- store private extension state that should survive session changes in [context state api](context.html#context-state-api)
+- store shared semantic session artifacts in [context session api](context.html#context-session-api), such as notes, labels, and entry lookup
 
 Common lifecycle events are [session_start](api.html#events), [session_shutdown](api.html#events), [session_before_switch](api.html#events), and [session_before_fork](api.html#events).

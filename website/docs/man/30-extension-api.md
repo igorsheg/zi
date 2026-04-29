@@ -1,5 +1,11 @@
 ## extension api: zi table
 
+The extension API is deliberately plain.
+
+Most of it is ordinary Lua functions and tables. The shape is simple so an extension can be read, copied, changed, or removed by one person.
+
+Prefer small tools. Prefer explicit names. Prefer behavior that will still make sense when it appears in a session transcript later.
+
 `zi.register_tool(spec)`
 : Register a model-visible tool. See [tools](#tools).
 
@@ -24,7 +30,7 @@
 
 ## tools
 
-Tools are definition-first. A tool definition is the unit zi exposes to the model. Tool handlers receive the shared [context object](context.html#context-object).
+Tools are definition-first. A tool definition is the unit zi exposes to the model. Keep each tool narrow: one clear name, one clear parameter shape, one readable result. Tool handlers receive the shared [context object](context.html#context-object).
 
 `zi.register_tool(spec)` accepts:
 
@@ -67,9 +73,11 @@ A terminal tool result has this shape:
 }
 ```
 
-Tool names are unique. If a later extension registers a tool with an already-claimed name, the later registration is ignored and `zi.register_tool` returns `false`.
+Tool names are unique. If a later extension registers a tool with an already-claimed name, the later registration is ignored and `zi.register_tool` returns `false`. This keeps ownership explicit.
 
 ## commands
+
+Commands are direct user actions. Use them for things a person asks zi to do now: open a report, save a note, start a workflow, or change local state.
 
 `zi.register_command(spec)` accepts:
 
@@ -113,7 +121,7 @@ Built-ins stay TUI-local when they need immediate UI/session behavior. Extension
 
 ## providers
 
-Providers let extensions add or override visible model/provider choices.
+Providers let extensions add or override visible model/provider choices. Use them to describe what models exist; use events to rewrite requests.
 
 `zi.register_provider(name, config)` supports:
 
@@ -147,6 +155,8 @@ Provider registration changes the host-owned provider/model views. Extensions ow
 ## events
 
 `zi.on(name, handler)` registers an observer or interceptor. Handlers receive `(event, ctx)`, where `ctx` is described in [context object](context.html#context-object).
+
+Events are where extensions react to the life of a session. They are powerful, so keep them visible and kind: avoid surprising network calls, hidden policy, or changes the user cannot explain later.
 
 Observer events are additive and post-commit. Return values are ignored.
 

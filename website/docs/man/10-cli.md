@@ -1,10 +1,10 @@
 ## cli model
 
-zi chooses a run plan from explicit arguments. For extension authoring, see [extension purpose](extensions.html#extension-purpose); for API details, see [extension api: zi table](api.html#extension-api-zi-table).
+zi chooses its run mode from the arguments you give it. No hidden ceremony is required: run `zi` for an interactive session, or choose batch mode when you want a scriptable result.
 
-Interactive mode is the default when no batch selector is present. Batch mode is explicit: use `-p`, `--print`, or `--mode`. Piped stdin alone does not force batch mode.
+Interactive mode is the default when no batch selector is present. Batch mode is explicit: use `-p`, `--print`, or `--mode`. Piped stdin alone does not force batch mode, so an accidental pipe does not quietly change how zi behaves.
 
-Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. They cannot be combined with startup prompt inputs such as positional prompt text or `@file` arguments. Extension lifecycle/rebinding behavior is described in [extension lifecycle](extensions.html#extension-lifecycle).
+Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. They cannot be combined with startup prompt inputs such as positional prompt text or `@file` arguments. For extension authoring, see [extension purpose](extensions.html#extension-purpose); for lifecycle details, see [extension lifecycle](extensions.html#extension-lifecycle).
 
 ## cli examples
 
@@ -39,7 +39,7 @@ Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. 
 : Resume a specific session file.
 
 `zi --list-models claude`
-: List available models, optionally fuzzy-filtered by search text.
+: List available models, optionally filtered by search text.
 
 ## cli options
 
@@ -62,10 +62,10 @@ Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. 
 : Select a model by ID or pattern.
 
 `--api-key <key>`
-: Override provider API key for the run.
+: Override the provider API key for this run.
 
 `--no-session`
-: Disable session persistence for the startup session. In interactive mode, later `/resume` may enter a persisted session and `/new` starts a normal persisted session.
+: Disable persistence for the startup session. In interactive mode, later `/resume` may enter a persisted session and `/new` starts a normal persisted session.
 
 `--tools <filter>`
 : Restrict the allowed tool set with a comma-separated filter.
@@ -74,7 +74,7 @@ Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. 
 : Append literal text or file contents to the system prompt.
 
 `--list-models [search]`
-: List available models. The optional positional value fuzzy-filters the model list.
+: List available models. The optional positional value filters the model list.
 
 `-h`, `--help`
 : Show CLI help.
@@ -98,4 +98,4 @@ stdin + @file text + positional prompt
 
 `@file` arguments are supported for interactive startup and explicit batch mode. Text files are inserted into the prompt. Image files are detected from file bytes; supported inline images attach to the model request and also contribute text references.
 
-Empty or whitespace-only stdin is ignored. Empty `@file` inputs are skipped. Extensions that rewrite submitted input should use the [`input`](api.html#events) event; extensions that alter provider context should use [`context`](api.html#events) or [`before_provider_request`](api.html#events).
+Empty or whitespace-only stdin is ignored. Empty `@file` inputs are skipped. Extensions that rewrite submitted input should use the [`input`](api.html#events) event. Extensions that alter provider context should use [`context`](api.html#events) or [`before_provider_request`](api.html#events).

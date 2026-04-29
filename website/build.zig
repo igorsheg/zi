@@ -25,22 +25,27 @@ pub fn build(b: *std.Build) void {
     });
 
     const man_pages = .{
-        .{ "docs/man/00-intro.md", "man/index.html", "man/index.md" },
-        .{ "docs/man/10-cli.md", "man/cli.html", "man/cli.md" },
-        .{ "docs/man/20-extension-model.md", "man/extensions.html", "man/extensions.md" },
-        .{ "docs/man/30-extension-api.md", "man/api.html", "man/api.md" },
-        .{ "docs/man/40-context-api.md", "man/context.html", "man/context.md" },
-        .{ "docs/man/50-guidance.md", "man/guidance.html", "man/guidance.md" },
+        .{ "docs/man/00-intro.md", "man/index.html", "man/index.md", "zi(1)", "", "", "cli", "cli.html" },
+        .{ "docs/man/10-cli.md", "man/cli.html", "man/cli.md", "cli", "intro", "index.html", "extensions", "extensions.html" },
+        .{ "docs/man/20-extension-model.md", "man/extensions.html", "man/extensions.md", "extensions", "cli", "cli.html", "api", "api.html" },
+        .{ "docs/man/30-extension-api.md", "man/api.html", "man/api.md", "api", "extensions", "extensions.html", "context", "context.html" },
+        .{ "docs/man/40-context-api.md", "man/context.html", "man/context.md", "context", "api", "api.html", "guidance", "guidance.html" },
+        .{ "docs/man/50-guidance.md", "man/guidance.html", "man/guidance.md", "guidance", "context", "context.html", "", "" },
     };
 
     const web = b.step("web", "Build the compound static website");
     web.dependOn(&zine_site.step);
 
     inline for (man_pages) |entry| {
-        const md_file, const html_file, const markdown_file = entry;
+        const md_file, const html_file, const markdown_file, const page_title, const prev_label, const prev_url, const next_label, const next_url = entry;
 
         const run_mdman_html = b.addRunArtifact(mdman);
-        run_mdman_html.addArgs(&.{ "--html-fragment", "--name", "zi", "--section", "1" });
+        const markdown_url = markdown_file[4..];
+        run_mdman_html.addArgs(&.{ "--html-fragment", "--name", "zi", "--section", "1", "--page-label", "ZI(1)", "--page-title", page_title, "--markdown-url", markdown_url });
+        if (prev_label.len > 0) run_mdman_html.addArgs(&.{ "--prev-label", prev_label });
+        if (prev_url.len > 0) run_mdman_html.addArgs(&.{ "--prev-url", prev_url });
+        if (next_label.len > 0) run_mdman_html.addArgs(&.{ "--next-label", next_label });
+        if (next_url.len > 0) run_mdman_html.addArgs(&.{ "--next-url", next_url });
         run_mdman_html.addFileArg(b.path(md_file));
         const man_fragment = run_mdman_html.captureStdOut();
 

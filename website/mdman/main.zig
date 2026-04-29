@@ -25,6 +25,13 @@ pub fn main() !void {
     var name: []const u8 = "prise";
     var section: []const u8 = "1";
     var html_fragment: bool = false;
+    var page_label: []const u8 = "ZI(1)";
+    var page_title: []const u8 = "zi manual";
+    var prev_label: ?[]const u8 = null;
+    var prev_url: ?[]const u8 = null;
+    var next_label: ?[]const u8 = null;
+    var next_url: ?[]const u8 = null;
+    var markdown_url: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -53,6 +60,34 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             section = args[i];
+        } else if (std.mem.eql(u8, arg, "--page-label")) {
+            i += 1;
+            if (i >= args.len) fatalMissing("--page-label");
+            page_label = args[i];
+        } else if (std.mem.eql(u8, arg, "--page-title")) {
+            i += 1;
+            if (i >= args.len) fatalMissing("--page-title");
+            page_title = args[i];
+        } else if (std.mem.eql(u8, arg, "--prev-label")) {
+            i += 1;
+            if (i >= args.len) fatalMissing("--prev-label");
+            prev_label = args[i];
+        } else if (std.mem.eql(u8, arg, "--prev-url")) {
+            i += 1;
+            if (i >= args.len) fatalMissing("--prev-url");
+            prev_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--next-label")) {
+            i += 1;
+            if (i >= args.len) fatalMissing("--next-label");
+            next_label = args[i];
+        } else if (std.mem.eql(u8, arg, "--next-url")) {
+            i += 1;
+            if (i >= args.len) fatalMissing("--next-url");
+            next_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--markdown-url")) {
+            i += 1;
+            if (i >= args.len) fatalMissing("--markdown-url");
+            markdown_url = args[i];
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             input_file = arg;
         } else {
@@ -71,13 +106,27 @@ pub fn main() !void {
 
     const output = switch (output_format) {
         .roff => try roff.render(allocator, doc, name, section),
-        .html => try html.render(allocator, doc, name, .{ .fragment = html_fragment }),
+        .html => try html.render(allocator, doc, name, .{
+            .fragment = html_fragment,
+            .page_label = page_label,
+            .page_title = page_title,
+            .prev_label = prev_label,
+            .prev_url = prev_url,
+            .next_label = next_label,
+            .next_url = next_url,
+            .markdown_url = markdown_url,
+        }),
     };
 
     var buf: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
     defer stdout.interface.flush() catch {};
     try stdout.interface.writeAll(output);
+}
+
+fn fatalMissing(option: []const u8) noreturn {
+    std.debug.print("error: {s} requires an argument\n", .{option});
+    std.process.exit(1);
 }
 
 fn printUsage() !void {

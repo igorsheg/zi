@@ -34,7 +34,8 @@
   dt,
   dd,
   pre,
-  blockquote {
+  blockquote,
+  figure {
     margin: 0;
   }
 
@@ -52,7 +53,9 @@
     --black: #000;
     --white: #f4f4f4;
     --gray-300: #c9c9c9;
+    --gray-400: #b7b7b7;
     --gray-500: #8a8a8a;
+    --gray-600: #5f5f5f;
     --gray-800: #242424;
     --gray-900: #111;
 
@@ -98,7 +101,9 @@
     /* semantic tokens */
     --color-bg: var(--black);
     --color-fg: var(--white);
+    --color-prose: var(--gray-400);
     --color-muted: var(--gray-500);
+    --color-dim: var(--gray-600);
     --color-subtle: var(--gray-300);
     --color-border: var(--gray-800);
     --color-code-bg: var(--gray-900);
@@ -222,15 +227,53 @@
   .manual {
     inline-size: min(100% - (2 * var(--page-pad)), var(--measure-man));
     padding-block: var(--space-8) var(--space-16);
-    color: var(--color-muted);
+    color: var(--color-prose);
     font-size: var(--text--1);
     line-height: var(--leading--1);
   }
 
   .manual .site-nav {
-    margin-block-end: var(--space-12);
+    margin-block-end: var(--space-8);
     font-size: var(--text--1);
     line-height: var(--leading--1);
+  }
+
+  .manual-mast {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: var(--space-4);
+    margin-block-end: var(--space-12);
+    color: var(--color-dim);
+  }
+
+  .manual-mast > span:last-child {
+    text-align: end;
+  }
+
+  .manual-view {
+    display: flex;
+    justify-content: end;
+    gap: var(--space-4);
+  }
+
+  .manual-view a {
+    color: var(--color-muted);
+    text-decoration: none;
+  }
+
+  .manual-view a:hover {
+    color: var(--color-fg);
+  }
+
+  .manual-layout {
+    display: grid;
+    grid-template-columns: minmax(0, var(--measure-prose)) 24ch;
+    gap: var(--space-12);
+    align-items: start;
+  }
+
+  .manual-prose {
+    min-inline-size: 0;
   }
 
   .manual h1,
@@ -241,6 +284,28 @@
     font-weight: 600;
     line-height: var(--leading--1);
     text-transform: lowercase;
+    scroll-margin-block-start: var(--space-8);
+  }
+
+  .manual-anchor {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .manual-anchor span {
+    margin-inline-start: var(--space-2);
+    color: var(--color-dim);
+    opacity: 0;
+  }
+
+  .manual-anchor:hover span,
+  .manual-anchor:focus-visible span {
+    opacity: 1;
+  }
+
+  .manual h2::before {
+    content: ":: ";
+    color: var(--color-dim);
   }
 
   .manual h1 {
@@ -262,7 +327,8 @@
   .manual ol,
   .manual dl,
   .manual pre,
-  .manual blockquote {
+  .manual blockquote,
+  .manual-code {
     margin-block-start: var(--prose-gap);
   }
 
@@ -279,6 +345,11 @@
     max-inline-size: var(--measure-prose);
   }
 
+  .manual strong {
+    color: var(--color-fg);
+    font-weight: 400;
+  }
+
   .manual ul,
   .manual ol {
     padding-inline-start: var(--prose-indent);
@@ -292,35 +363,204 @@
     display: grid;
     grid-template-columns: minmax(16ch, 24ch) minmax(0, 1fr);
     column-gap: var(--space-6);
-    row-gap: var(--space-2);
+    row-gap: var(--space-3);
+    max-inline-size: var(--measure-prose);
   }
 
   .manual dt {
     color: var(--color-fg);
-    font-weight: 600;
+    font-weight: 400;
   }
 
   .manual dd {
     min-inline-size: 0;
   }
 
+  .manual p:has(> code:only-child) {
+    margin-block-start: var(--space-2);
+    color: var(--color-subtle);
+  }
+
+  .manual h2 + p:has(> code:only-child) {
+    margin-block-start: var(--space-4);
+  }
+
+  .manual-code {
+    max-inline-size: 88ch;
+  }
+
+  .manual-code figcaption {
+    margin-block-end: var(--space-1);
+    color: var(--color-dim);
+  }
+
   .manual pre {
-    border: 1px solid var(--color-border);
+    background: transparent;
+    border-inline-start: 1px solid var(--color-border);
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4) 0;
   }
 
   .manual blockquote {
     padding-inline-start: var(--prose-indent);
     border-inline-start: 1px solid var(--color-border);
+    color: var(--color-muted);
+  }
+
+  .manual dt code {
+    padding: 0;
+    background: transparent;
+    color: var(--color-fg);
+  }
+
+  .manual dt {
+    overflow-wrap: anywhere;
   }
 
   .manual :not(pre) > code {
     color: var(--color-subtle);
   }
 
+  .manual-toc {
+    position: sticky;
+    inset-block-start: var(--space-8);
+    color: var(--color-muted);
+  }
+
+  .manual-toc p {
+    margin-block-start: 0;
+    color: var(--color-dim);
+  }
+
+  .manual-toc ol {
+    margin-block-start: var(--space-2);
+    padding: 0;
+    list-style: none;
+  }
+
+  .manual-toc li + li {
+    margin-block-start: var(--space-1);
+  }
+
+  .manual-toc a {
+    display: inline-grid;
+    grid-template-columns: 1ch 1fr;
+    gap: var(--space-2);
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .manual-toc a::before {
+    content: ">";
+    color: var(--color-dim);
+    opacity: 0;
+  }
+
+  .manual-toc a:hover {
+    color: var(--color-fg);
+  }
+
+  .manual-toc a:hover::before {
+    opacity: 1;
+  }
+
+  .manual h2:target .manual-anchor span {
+    opacity: 1;
+  }
+
+  .manual-pager {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
+    margin-block-start: var(--space-16);
+    padding-block-start: var(--space-4);
+    border-block-start: 1px solid var(--color-border);
+  }
+
+  .manual-pager a {
+    display: grid;
+    color: var(--color-fg);
+    text-decoration: none;
+  }
+
+  .manual-pager span {
+    color: var(--color-dim);
+  }
+
+  .manual-pager-next {
+    grid-column: 2;
+    text-align: end;
+  }
+
+  @media print {
+    :root {
+      color-scheme: light;
+    }
+
+    body {
+      background: white;
+      color: black;
+    }
+
+    .site-nav,
+    .manual-toc,
+    .manual-pager,
+    .manual-view a {
+      display: none;
+    }
+
+    .manual {
+      inline-size: auto;
+      padding: 0;
+      color: black;
+      font-size: 10pt;
+      line-height: 14pt;
+    }
+
+    .manual-layout {
+      display: block;
+    }
+
+    .manual h1,
+    .manual h2,
+    .manual h3,
+    .manual dt,
+    .manual strong,
+    .manual :not(pre) > code {
+      color: black;
+    }
+
+    .manual pre,
+    .manual blockquote {
+      border-color: #999;
+    }
+  }
+
   @media (max-width: 48rem) {
+    .manual-mast {
+      grid-template-columns: 1fr;
+      gap: 0;
+      margin-block-end: var(--space-8);
+    }
+
+    .manual-mast > span:nth-child(2),
+    .manual-mast .manual-view > span,
+    .manual-toc {
+      display: none;
+    }
+
+    .manual-layout {
+      display: block;
+    }
+
     .manual dl {
       grid-template-columns: 1fr;
       row-gap: 0;
+    }
+
+    .manual dd {
+      padding-block-end: var(--space-3);
+      border-block-end: 1px solid var(--color-border);
     }
 
     .manual dd + dt {

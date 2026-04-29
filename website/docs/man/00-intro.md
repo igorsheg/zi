@@ -22,16 +22,32 @@ zi - yours-first coding agent
 
 ## description
 
-There are many coding agents. This one is yours: ask zi to extend itself to best suit your workflow.
+There are many coding agents. This one is yours.
 
-zi is a local-first coding agent harness with a terminal UI, durable sessions, explicit batch modes, model selection, and Lua extensions. The consumer surface is deliberately small: the CLI starts, resumes, or batches agent work; extensions add workflow-specific tools, commands, UI, model/provider behavior, prompt rules, and session policy.
+zi is a local-first coding agent harness for people who want agent help without giving up ownership of their tools. It keeps sessions durable, configuration local, extensions small, and behavior explicit enough to inspect.
+
+You can use zi as-is. You can also teach it your habits one piece at a time: a command, a tool, a prompt rule, a model preference, a bit of UI.
+
+The goal is not to make agent work magical. The goal is to make it dependable.
+
+## philosophy
+
+zi is small on purpose.
+
+A good agent harness should be understandable by one person. It should compose with the tools you already use. It should keep useful history. It should make automation visible enough that you can trust it, change it, or remove it.
+
+Extensions are not a marketplace feature. They are how the tool becomes yours.
+
+Start small. Add one thing. Keep what helps. Delete what does not.
+
+## readers
 
 This manual is written for two readers:
 
 - humans who want to use zi or write extensions
 - zi itself, when the user asks: "build me an extension"
 
-When generating an extension, prefer the API documented here and adapt the closest available example.
+When generating an extension, prefer the API documented here and adapt the closest available example. Favor small, explicit behavior over clever machinery.
 
 Agents and other programmatic readers should prefer the Markdown version of each page. Replace the web page suffix with `.md`, for example `cli.html` becomes `cli.md`. When following links from Markdown manually, prefer the adjacent `.md` target when available.
 

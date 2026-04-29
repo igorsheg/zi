@@ -8,6 +8,13 @@ const Document = parser.Document;
 
 pub const Options = struct {
     fragment: bool = false,
+    page_label: []const u8 = "ZI(1)",
+    page_title: []const u8 = "zi manual",
+    prev_label: ?[]const u8 = null,
+    prev_url: ?[]const u8 = null,
+    next_label: ?[]const u8 = null,
+    next_url: ?[]const u8 = null,
+    markdown_url: ?[]const u8 = null,
 };
 
 /// Render a Document to HTML format.
@@ -36,9 +43,28 @@ pub fn render(allocator: std.mem.Allocator, doc: Document, title: []const u8, op
         , .{title});
     }
 
+    try writer.writeAll("<div class=\"manual-mast\"><span aria-hidden=\"true\">");
+    try escapeAndWrite(writer, options.page_label);
+    try writer.writeAll("</span><span aria-hidden=\"true\">");
+    try escapeAndWrite(writer, options.page_title);
+    try writer.writeAll("</span><span class=\"manual-view\"><span aria-hidden=\"true\">");
+    try escapeAndWrite(writer, options.page_label);
+    try writer.writeAll("</span>");
+    if (options.markdown_url) |url| {
+        try writer.writeAll("<a href=\"");
+        try escapeAndWrite(writer, url);
+        try writer.writeAll("\">md</a>");
+    }
+    try writer.writeAll("</span></div>\n");
+
+    try writer.writeAll("<div class=\"manual-layout\">\n<article class=\"manual-prose\">\n");
     for (doc.nodes) |node| {
         try renderNode(writer, node);
     }
+    try renderPager(writer, options);
+    try writer.writeAll("</article>\n");
+    try renderToc(writer, doc);
+    try writer.writeAll("</div>\n");
 
     if (!options.fragment) {
         try writer.writeAll("</body>\n</html>\n");
@@ -52,9 +78,9 @@ fn renderNode(writer: anytype, node: Node) !void {
         .heading => |h| {
             const tag = if (h.level == 1) "h1" else "h2";
             const id = slugify(h.text);
-            try writer.print("<{s} id=\"{s}\"><a href=\"#{s}\">", .{ tag, id, id });
+            try writer.print("<{s} id=\"{s}\"><a class=\"manual-anchor\" href=\"#{s}\">", .{ tag, id, id });
             try escapeAndWrite(writer, h.text);
-            try writer.print("</a></{s}>\n", .{tag});
+            try writer.print("<span aria-hidden=\"true\">#</span></a></{s}>\n", .{tag});
         },
         .paragraph => |spans| {
             try writer.writeAll("<p>");
@@ -63,12 +89,14 @@ fn renderNode(writer: anytype, node: Node) !void {
         },
         .code_block => |cb| {
             if (cb.language) |lang| {
-                try writer.print("<pre><code class=\"language-{s}\">", .{lang});
+                try writer.writeAll("<figure class=\"manual-code\"><figcaption>");
+                try escapeAndWrite(writer, lang);
+                try writer.print("</figcaption><pre><code class=\"language-{s}\">", .{lang});
             } else {
-                try writer.writeAll("<pre><code>");
+                try writer.writeAll("<figure class=\"manual-code\"><pre><code>");
             }
             try escapeAndWrite(writer, cb.content);
-            try writer.writeAll("</code></pre>\n");
+            try writer.writeAll("</code></pre></figure>\n");
         },
         .bullet_list => |items| {
             try writer.writeAll("<ul>\n");
@@ -87,6 +115,44 @@ fn renderNode(writer: anytype, node: Node) !void {
             try writer.writeAll("</dd>\n</dl>\n");
         },
     }
+}
+
+fn renderToc(writer: anytype, doc: Document) !void {
+    try writer.writeAll("<aside class=\"manual-toc\" aria-label=\"page contents\"><p>on this page</p><ol>\n");
+    for (doc.nodes) |node| {
+        if (node == .heading and node.heading.level > 1) {
+            const id = slugify(node.heading.text);
+            try writer.print("<li><a href=\"#{s}\">", .{id});
+            try escapeAndWrite(writer, node.heading.text);
+            try writer.writeAll("</a></li>\n");
+        }
+    }
+    try writer.writeAll("</ol></aside>\n");
+}
+
+fn renderPager(writer: anytype, options: Options) !void {
+    if (options.prev_label == null and options.next_label == null) return;
+
+    try writer.writeAll("<nav class=\"manual-pager\" aria-label=\"manual pages\">\n");
+    if (options.prev_label) |label| {
+        if (options.prev_url) |url| {
+            try writer.writeAll("<a class=\"manual-pager-prev\" href=\"");
+            try escapeAndWrite(writer, url);
+            try writer.writeAll("\"><span>previous</span>");
+            try escapeAndWrite(writer, label);
+            try writer.writeAll("</a>\n");
+        }
+    }
+    if (options.next_label) |label| {
+        if (options.next_url) |url| {
+            try writer.writeAll("<a class=\"manual-pager-next\" href=\"");
+            try escapeAndWrite(writer, url);
+            try writer.writeAll("\"><span>next</span>");
+            try escapeAndWrite(writer, label);
+            try writer.writeAll("</a>\n");
+        }
+    }
+    try writer.writeAll("</nav>\n");
 }
 
 fn renderSpans(writer: anytype, spans: []const Span) !void {

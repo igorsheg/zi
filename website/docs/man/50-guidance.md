@@ -1,10 +1,16 @@
 ## extension design rules
 
-Prefer documented host APIs over host details.
+Good zi extensions are small, inspectable, and kind to the user.
 
-Do not depend on TUI components, terminal input streams, mailbox payloads, provider runtime handles, transcript row objects, or render caches.
+They do one useful thing, say what they are doing, and leave the user in control. They avoid hidden policy, surprising network calls, and clever abstractions that only the author can debug.
 
-Keep load/register cheap and deterministic.
+This page is guidance for humans and for zi when generating extensions.
+
+Prefer documented host APIs over host details. Do not depend on TUI components, terminal input streams, mailbox payloads, provider runtime handles, transcript row objects, or render caches.
+
+Keep load/register cheap and deterministic. Register capabilities at load time; do real work later, when a tool, command, or event is running with a live context.
+
+## choose the smallest surface
 
 Use [tools](api.html#tools) for model-visible capabilities.
 
@@ -63,7 +69,7 @@ Need: delegate work to a child zi run
 
 ## canonical patterns
 
-A model-visible tool has one job: accept structured parameters, perform the action, and return content.
+A model-visible tool has one job: accept structured parameters, perform the action, and return content. If the behavior cannot be described in one sentence, split it.
 
 ```lua
 return function(zi)
@@ -78,7 +84,7 @@ return function(zi)
 end
 ```
 
-A slash command is for direct user intent.
+A slash command is for direct user intent. It should be safe to run because a person asked for it.
 
 ```lua
 return function(zi)
@@ -93,7 +99,7 @@ return function(zi)
 end
 ```
 
-A semantic message observer can attach durable session metadata without touching raw jsonl or UI rows.
+A semantic message observer can attach durable session metadata without touching raw jsonl or UI rows. Prefer this kind of visible memory over private state when the information belongs to the session.
 
 ```lua
 zi.on("message", function(event, ctx)
@@ -109,7 +115,7 @@ zi.on("message", function(event, ctx)
 end)
 ```
 
-An event is for policy or reaction.
+An event is for policy or reaction. Keep event behavior easy to explain when someone reads the session later.
 
 ```lua
 zi.on("message", function(event, ctx)
@@ -119,6 +125,22 @@ zi.on("message", function(event, ctx)
   end
 end)
 ```
+
+## kindness rules
+
+Ask before destructive actions.
+
+Show paths before changing files outside the current project.
+
+Name models and providers when an extension changes them.
+
+Prefer local files, local state, and project-relative paths when possible.
+
+Do not hide network calls inside unrelated commands.
+
+Return readable errors. A person should know what failed and what they can try next.
+
+Keep generated extensions short enough to review.
 
 ## extension examples
 
