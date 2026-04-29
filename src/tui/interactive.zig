@@ -53,6 +53,7 @@ const runtime_loop = @import("interactive/runtime_loop.zig");
 const theme_flow = @import("interactive/theme_flow.zig");
 const terminal_input_flow = @import("interactive/terminal_input.zig");
 const event_flow = @import("interactive/event_flow.zig");
+const run_setup = @import("interactive/run_setup.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -470,29 +471,9 @@ pub const Interactive = struct {
 
     /// Main loop — runs on the main thread.
     pub fn run(self: *Interactive) !void {
-        try self.tui.terminal.enterRawMode();
-        self.tui.terminal.installSignalHandlers();
-        self.tui.terminal.hideCursor();
-        self.tui.terminal.enableBracketedPaste();
-        self.tui.terminal.queryKittyProtocol();
-        self.tui.terminal.enableMouseTracking();
-        self.kitty_deadline_ns = std.time.nanoTimestamp() + 150_000_000; // 150ms
-
-        self.active_editor = EditorInterface.init(editor_mod.Editor, &self.editor);
-        self.active_editor_bound = true;
-        self.active_editor.setOnSubmit(&composer_flow.onEditorSubmit, @ptrCast(self));
-        self.active_editor.setOnChange(&onEditorChange, @ptrCast(self));
-        self.active_editor.setTheme(self.theme);
-        self.active_editor.setCwd(self.cwd);
-        self.active_editor.setPaddingX(@intCast(self.settings_manager.getEditorPaddingX()));
-        self.active_editor.setAutocompleteMaxVisible(@intCast(self.settings_manager.getAutocompleteMaxVisible()));
-        self.active_editor.setStatusData(&self.status_data);
-        self.agent_event_token = self.runtime_host.subscribeAgentEvents(&agentEventCallback, @ptrCast(self));
-        self.session_event_token = self.runtime_host.subscribeEvents(&sessionEventCallback, @ptrCast(self));
-        self.runtime_host.setExtensionOAuthRefreshDispatcher(.{
-            .func = &runtime_loop.dispatchExtensionOAuthRefresh,
-            .ctx = @ptrCast(self),
-        });
+        try run_setup.prepareTerminal(self);
+        run_setup.bindEditor(self);
+        run_setup.bindRuntimeEvents(self);
 
         self.detectGitBranch();
         try self.startAgentThread();
@@ -511,41 +492,8 @@ pub const Interactive = struct {
         // thread even during startup.
         self.bootstrapStatusSnapshot();
 
-        // Wire autocomplete: combined slash + file path completion.
-        self.autocomplete_provider = CombinedAutocompleteProvider.init(self.allocator, &self.command_registry, self.cwd);
-        self.autocomplete_provider_bound = true;
-        self.active_editor.setAutocompleteProvider(self.autocomplete_provider.provider());
-
-        // Populate container slots with their initial children.
-        self.refreshHeaderVisibility();
-        self.refreshPendingImageBanner();
-        self.status_line.setStatusData(&self.status_data);
-        self.status_line.setTheme(self.theme);
-        self.status_container.addChild(self.status_line.component());
-        self.editor_container.addChild(self.active_editor.component());
-        self.editor_container.focused_child_index = 0; // for cursor y-offset translation
-        self.composer_below_container.addChild(self.extension_ui_state.reportComponent());
-        self.composer_below_container.addChild(self.extension_ui_state.messageComponent());
-
-        // Set initial focus via TUI (source of truth for input routing)
-        self.tui.setFocus(self.active_editor.component());
-
-        self.transcript_container.addChild(self.transcript.component());
-        self.transcript_container.addChild(self.transcript_bottom_padding.component());
-        self.transcript_container.flex_child_index = 0;
-
-        // Build root tree: transcript remains the flex region while semantic
-        // UI publications materialize near the composer according to host policy.
-        // chat(flex) → pending → status → header/greeter → above → editor(focused) → below
-        self.tui.root.addChild(self.transcript_container.component()); // [0] chat (flex, with bottom padding)
-        self.tui.root.addChild(self.pending_container.component()); // [1] pendingContainer
-        self.tui.root.addChild(self.status_container.component()); // [2] statusContainer
-        self.tui.root.addChild(self.header_container.component()); // [3] composer header/onboarding
-        self.tui.root.addChild(self.composer_above_container.component()); // [4] composerAboveContainer
-        self.tui.root.addChild(self.editor_container.component()); // [5] editorContainer
-        self.tui.root.addChild(self.composer_below_container.component()); // [6] composerBelowContainer
-        self.tui.root.flex_child_index = 0; // transcript is flex
-        self.tui.root.focused_child_index = 5; // editorContainer for cursor y-offset
+        run_setup.bindAutocomplete(self);
+        run_setup.mountInitialTree(self);
 
         // RuntimeHost emits extension `session_start` before the TUI tree exists.
         // Drain semantic UI publications once after slots are materialized so
@@ -734,7 +682,7 @@ pub const Interactive = struct {
         composer_flow.clearPendingImages(self);
     }
 
-    fn refreshPendingImageBanner(self: *Interactive) void {
+    pub fn refreshPendingImageBanner(self: *Interactive) void {
         composer_flow.refreshPendingImageBanner(self);
     }
 
@@ -894,12 +842,6 @@ pub const Interactive = struct {
     }
 
     // --- Editor callbacks ---
-
-    fn onEditorChange(_: []const u8, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.refreshHeaderVisibility();
-        self.tui.dirty = true;
-    }
 
     pub fn restoreQueuedInputsToEditor(self: *Interactive) void {
         composer_flow.restoreQueuedInputsToEditor(self);
@@ -1354,7 +1296,7 @@ pub const Interactive = struct {
     }
 
     /// Raw agent event callback — runs on the AGENT THREAD.
-    fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
+    pub fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         self.publishConversationStateForAgentEvent(event);
         if (convertAgentUiEvent(event, self.msg_allocator)) |ui_event| {
@@ -1365,7 +1307,7 @@ pub const Interactive = struct {
     }
 
     /// Session event callback — runs on the AGENT THREAD.
-    fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
+    pub fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         session_events_mod.handle(self, event);
     }
