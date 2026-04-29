@@ -48,6 +48,7 @@ const composer_flow = @import("interactive/composer_flow.zig");
 const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
+const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
 const agent_ui_event_mod = @import("interactive/agent_ui_event.zig");
@@ -1535,81 +1536,24 @@ pub const Interactive = struct {
         _ = self.publishLifecycleUiEvent(.{ .extension_commands_updated = .{ .commands = commands } });
     }
 
-    /// Publish agent-owned extension UI publications across the TUI boundary.
-    ///
-    /// This is intentionally a semantic publication drain, not TUI access to an
-    /// extension UI store. The TUI consumes owned publication records and
-    /// materializes them locally; the agent/runtime remains the retained-object
-    /// owner. Call this after any agent-thread extension execution boundary that
-    /// may have mutated UI state (startup lifecycle, commands, future observers).
     pub fn publishPendingExtensionUi(self: *Interactive) void {
-        if (self.runtime_host.takePendingExtensionReport(self.msg_allocator)) |report| {
-            _ = self.publishLifecycleUiEvent(.{ .extension_report_shown = .{ .report = report } });
-        }
-        const updates = self.runtime_host.takePendingExtensionUiPublications(self.msg_allocator);
-        if (updates.len > 0) {
-            _ = self.publishLifecycleUiEvent(.{ .extension_ui_published = .{ .updates = updates } });
-        } else {
-            self.msg_allocator.free(updates);
-        }
-        const actions = self.runtime_host.takePendingExtensionEditorActions(self.msg_allocator);
-        if (actions.len > 0) {
-            _ = self.publishLifecycleUiEvent(.{ .extension_editor_actions = .{ .actions = actions } });
-        } else {
-            self.msg_allocator.free(actions);
-        }
+        extension_ui_flow.publishPending(self);
     }
 
     pub fn applyExtensionReport(self: *Interactive, report: extension_ui.Report) void {
-        self.extension_ui_state.applyReport(report);
-        self.tui.dirty = true;
+        extension_ui_flow.applyReport(self, report);
     }
 
     pub fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
-        for (actions) |action| {
-            switch (action.kind) {
-                .set_text => if (action.text) |text| self.active_editor.setText(text),
-                .paste_text => if (action.text) |text| self.active_editor.handlePaste(text),
-                .clear_text => self.active_editor.clear(),
-                .get_text => {},
-            }
-        }
-        self.tui.dirty = true;
+        extension_ui_flow.applyEditorActions(self, actions);
     }
 
     pub fn applyExtensionUiPublications(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiPublication) void {
-        for (updates) |update| {
-            switch (update.kind) {
-                .message => self.extension_ui_state.applyMessage(update),
-                .status => self.status_data.setStatus(update.id, update.text),
-                .progress => self.extension_ui_state.applyProgress(update),
-            }
-        }
-        self.tui.dirty = true;
+        extension_ui_flow.applyPublications(self, updates);
     }
 
-    /// TUI-thread application of the latest extension command list.
     pub fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {
-        for (self.command_registry.dynamic.items) |*cmd| {
-            self.allocator.free(cmd.name);
-            if (cmd.description) |d| self.allocator.free(d);
-        }
-        self.command_registry.dynamic.clearRetainingCapacity();
-
-        for (commands) |entry| {
-            const name = self.allocator.dupe(u8, entry.name) catch continue;
-            const desc = self.allocator.dupe(u8, entry.description) catch {
-                self.allocator.free(name);
-                continue;
-            };
-            self.command_registry.register(.{
-                .name = name,
-                .description = desc,
-                .source = .extension,
-                .action = .extension,
-            });
-        }
-        self.tui.dirty = true;
+        extension_ui_flow.applyCommandsUpdate(self, commands);
     }
 
     /// Agent-thread handler for `AgentRequest.compact`. The runner emits
