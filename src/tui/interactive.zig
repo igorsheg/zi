@@ -32,6 +32,7 @@ const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
 const thinking_mod = @import("interactive/thinking.zig");
 const slash_command_mod = @import("interactive/slash_command.zig");
+const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -968,251 +969,11 @@ pub const Interactive = struct {
         }
     }
 
-    fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
-        if (ev.takeConversationSnapshot()) |snapshot| {
-            var owned = snapshot;
-            const was_following_bottom = self.transcript.isFollowingBottom();
-            self.conversation_projection.replaceViewSnapshot(
-                &self.transcript,
-                self.active_editor,
-                self.resolver,
-                &owned,
-                .{
-                    .theme = self.theme,
-                    .retry_attempt = self.retry_attempt,
-                    .hidden_thinking_label = self.currentHiddenThinkingLabel(),
-                },
-            );
-            if (was_following_bottom) {
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-            }
-            self.tui.dirty = true;
-            return;
-        }
-
-        if (ev.takeQueuedSnapshot()) |snapshot| {
-            var owned = snapshot;
-            const was_following_bottom = self.transcript.isFollowingBottom();
-            self.conversation_projection.replaceQueuedSnapshot(
-                &self.transcript,
-                self.active_editor,
-                self.resolver,
-                &owned,
-                .{
-                    .theme = self.theme,
-                    .retry_attempt = self.retry_attempt,
-                    .hidden_thinking_label = self.currentHiddenThinkingLabel(),
-                },
-            );
-            if (was_following_bottom) {
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-            }
-            self.tui.dirty = true;
-            return;
-        }
-
-        if (ev.takeVisibleModelsSnapshot()) |models| {
-            self.applyVisibleModelsSnapshot(models);
-            self.tui.dirty = true;
-            return;
-        }
-
-        switch (ev.*) {
-            .consumed => {},
-            .conversation_snapshot => unreachable,
-            .queued_snapshot => unreachable,
-            .visible_models_snapshot => unreachable,
-            .error_message => |e| {
-                self.status_line.setPrimary(e.message, self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-            },
-            .theme_changed => |theme| {
-                self.applyTheme(theme);
-                self.tui.dirty = true;
-            },
-            .assistant_run_finished => |m| {
-                self.tui.dirty = true;
-                if (m.is_aborted) {
-                    self.status_line.setPrimary(m.error_message orelse "aborted", self.theme.fg(.@"error"));
-                } else if (m.error_message) |msg| {
-                    self.status_line.setPrimary(userFacingFailureMessage(m.failure_kind, msg), self.theme.fg(.@"error"));
-                }
-            },
-            .tool_running => |t| {
-                self.status_line.setPrimary(t.tool_name, self.theme.fg(.accent));
-                self.tui.dirty = true;
-            },
-            .login_progress => |l| {
-                self.status_line.setPrimary(l.message, switch (l.kind) {
-                    .auth_url => self.theme.fg(.accent),
-                    .info => self.theme.fg(.muted),
-                });
-                self.tui.dirty = true;
-            },
-            .login_complete => |l| {
-                if (self.login_thread) |t| t.join();
-                self.login_thread = null;
-
-                if (l.success) {
-                    self.status_line.setPrimary(l.message, self.theme.fg(.success));
-                } else {
-                    self.status_line.setPrimary(l.message, self.theme.fg(.@"error"));
-                }
-                self.tui.dirty = true;
-            },
-            .retry_start => |r| {
-                self.retry_active = true;
-                self.retry_waiting = true;
-                self.retry_attempt = r.attempt;
-                self.retry_max_attempts = r.max_attempts;
-                self.retry_delay_ms = r.delay_ms;
-                self.refreshBuiltInStatus();
-            },
-            .retry_wait_finished => {
-                self.retry_waiting = false;
-                self.retry_delay_ms = 0;
-                self.refreshBuiltInStatus();
-            },
-            .retry_end => |r| {
-                self.retry_active = false;
-                self.retry_waiting = false;
-                self.retry_attempt = 0;
-                self.retry_max_attempts = 0;
-                self.retry_delay_ms = 0;
-                self.refreshBuiltInStatus();
-                if (!r.success) {
-                    var buf: [160]u8 = undefined;
-                    const final_error = r.final_error orelse "unknown error";
-                    const msg = std.fmt.bufPrint(
-                        &buf,
-                        "retry failed after {d} attempt{s}: {s}",
-                        .{ r.attempt, if (r.attempt == 1) "" else "s", userFacingFailureMessage(r.failure_kind, final_error) },
-                    ) catch userFacingFailureMessage(r.failure_kind, final_error);
-                    self.status_line.setPrimary(msg, self.theme.fg(.@"error"));
-                }
-                self.tui.dirty = true;
-            },
-            .compaction_start => |c| {
-                self.showCompactionLoader(c.reason);
-            },
-            .compaction_end => {
-                self.finishCompactionLoader();
-            },
-            .prompt_worker_finished => |p| {
-                self.is_streaming = false;
-                self.hideLoader();
-                self.tui.setFocus(self.active_editor.component());
-                switch (p.outcome) {
-                    .success => self.status_line.clearPrimary(),
-                    .assistant_error, .aborted => {},
-                }
-                if (p.internal_error) |msg| {
-                    self.status_line.setPrimary(msg, self.theme.fg(.@"error"));
-                }
-                self.tui.dirty = true;
-            },
-            .request_worker_finished => {
-                // Long-lived agent owner loop finished an idle request drain.
-                // Hide the loader only when the TUI actually has a pending
-                // request banner to unwind; individual success/failure events
-                // still own primary status and focus.
-                if (self.request_in_flight) {
-                    self.request_in_flight = false;
-                    self.hideLoader();
-                }
-                self.tui.dirty = true;
-            },
-            .session_resumed => |r| {
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                // Prefer the restore warning over the generic
-                // "session resumed" banner when a fallback happened
-                // — users need to see why their saved model isn't
-                // the one they're about to talk to. Otherwise default
-                // to the success banner.
-                if (r.restore_warning) |w| {
-                    self.status_line.setPrimary(w, self.theme.fg(.warning));
-                } else {
-                    self.status_line.setPrimary("session resumed", self.theme.fg(.success));
-                }
-                self.tui.dirty = true;
-            },
-            .session_resume_failed => |f| {
-                self.status_line.setPrimary(f.message, self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-            },
-            .resume_sessions_loaded => |r| {
-                self.applyResumeSessionsLoaded(r.generation, r.sessions);
-            },
-            .resume_sessions_failed => |f| {
-                self.applyResumeSessionsFailed(f.generation, f.message);
-            },
-            .extension_commands_updated => |u| {
-                self.applyExtensionCommandsUpdate(u.commands);
-            },
-            .extension_report_shown => |u| {
-                self.applyExtensionReport(u.report);
-            },
-            .extension_ui_published => |u| {
-                self.applyExtensionUiPublications(u.updates);
-            },
-            .extension_editor_actions => |u| {
-                self.applyExtensionEditorActions(u.actions);
-            },
-            .extension_prompt_requested => |u| {
-                self.showExtensionPrompt(u.prompt, u.response);
-            },
-            .session_new_started => {
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                self.status_line.setPrimary("new session started", self.theme.fg(.success));
-                self.tui.dirty = true;
-            },
-            .session_fork_started => {
-                self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
-                self.status_line.setPrimary("session forked", self.theme.fg(.success));
-                self.tui.dirty = true;
-            },
-            .session_new_failed => |f| {
-                self.status_line.setPrimary(f.message, self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-            },
-            .session_compacted => {
-                self.status_line.setPrimary("session compacted; ctx updates after next response", self.theme.fg(.success));
-                self.tui.dirty = true;
-            },
-            .session_compaction_failed => |f| {
-                self.status_line.setPrimary(f.message, self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-            },
-            .status_snapshot => |s| {
-                self.applyStatusSnapshot(s);
-                self.tui.dirty = true;
-            },
-            .model_switch_failed => |m| {
-                self.status_line.setPrimary(m.message, self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-            },
-            .model_switched => |m| {
-                var buf: [80]u8 = undefined;
-                const label = if (m.model_id.len > 0) m.model_id else "model switched";
-                const msg = std.fmt.bufPrint(&buf, "Model: {s}", .{label}) catch "model switched";
-                self.status_line.setPrimary(msg, self.theme.fg(.success));
-                self.tui.dirty = true;
-            },
-            .thinking_level_changed => |t| {
-                var buf: [96]u8 = undefined;
-                const level = if (t.level.len > 0) t.level else "off";
-                const msg = std.fmt.bufPrint(&buf, "Thinking: {s}", .{level}) catch "thinking level updated";
-                self.status_line.setPrimary(msg, self.theme.fg(.success));
-                self.tui.dirty = true;
-            },
-            .thinking_level_change_failed => |t| {
-                self.status_line.setPrimary(t.message, self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-            },
-        }
+    pub fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
+        ui_event_handler_mod.handle(self, ev);
     }
 
-    fn applyStatusSnapshot(self: *Interactive, snapshot: @FieldType(UiEvent, "status_snapshot")) void {
+    pub fn applyStatusSnapshot(self: *Interactive, snapshot: @FieldType(UiEvent, "status_snapshot")) void {
         self.status_data.setModelProvider(snapshot.model_provider);
         self.status_data.setModelId(snapshot.model_id);
         self.status_data.setThinkingLevel(snapshot.thinking_level);
@@ -1220,13 +981,13 @@ pub const Interactive = struct {
         self.status_data.context_window = snapshot.context_window;
     }
 
-    fn applyVisibleModelsSnapshot(self: *Interactive, models: []ai_protocol.Model) void {
+    pub fn applyVisibleModelsSnapshot(self: *Interactive, models: []ai_protocol.Model) void {
         self.closeModelPickerFlow();
         coding_agent_mod.model_registry.deinitOwnedModels(self.msg_allocator, self.model_catalog);
         self.model_catalog = models;
     }
 
-    fn applyResumeSessionsLoaded(self: *Interactive, generation: u64, sessions: []const session_store_mod.SessionInfo) void {
+    pub fn applyResumeSessionsLoaded(self: *Interactive, generation: u64, sessions: []const session_store_mod.SessionInfo) void {
         if (generation != self.resume_picker_generation) return;
         const flow = if (self.resume_picker_flow) |*flow| flow else return;
         if (flow.generation != generation) return;
@@ -1248,7 +1009,7 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn applyResumeSessionsFailed(self: *Interactive, generation: u64, message: []const u8) void {
+    pub fn applyResumeSessionsFailed(self: *Interactive, generation: u64, message: []const u8) void {
         if (generation != self.resume_picker_generation) return;
         if (self.resume_picker_flow) |*flow| {
             if (flow.generation != generation) return;
@@ -1269,7 +1030,7 @@ pub const Interactive = struct {
         }
     }
 
-    fn currentHiddenThinkingLabel(_: *const Interactive) []const u8 {
+    pub fn currentHiddenThinkingLabel(_: *const Interactive) []const u8 {
         return "Thinking...";
     }
 
@@ -1425,7 +1186,7 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn outputHeight(self: *Interactive) u32 {
+    pub fn outputHeight(self: *Interactive) u32 {
         const h = self.tui.height();
         const w = self.tui.width();
         const max_h = @max(3, h * 30 / 100);
@@ -1456,25 +1217,25 @@ pub const Interactive = struct {
         self.refreshBuiltInStatus();
     }
 
-    fn showCompactionLoader(self: *Interactive, reason: coding_agent_mod.session_event.CompactionReason) void {
+    pub fn showCompactionLoader(self: *Interactive, reason: coding_agent_mod.session_event.CompactionReason) void {
         self.compaction_loader_active = true;
         self.compaction_loader_reason = reason;
         self.refreshBuiltInStatus();
     }
 
-    fn finishCompactionLoader(self: *Interactive) void {
+    pub fn finishCompactionLoader(self: *Interactive) void {
         if (!self.compaction_loader_active) return;
         self.compaction_loader_active = false;
         self.refreshBuiltInStatus();
     }
 
-    fn hideLoader(self: *Interactive) void {
+    pub fn hideLoader(self: *Interactive) void {
         self.refreshBuiltInStatus();
         // Don't blank primary status — preserve any error/abort message
         // that was set while working was active.
     }
 
-    fn refreshBuiltInStatus(self: *Interactive) void {
+    pub fn refreshBuiltInStatus(self: *Interactive) void {
         if (self.compaction_loader_active) {
             const message = switch (self.compaction_loader_reason) {
                 .manual => "Compacting session…",
@@ -2116,7 +1877,7 @@ pub const Interactive = struct {
         }
     }
 
-    fn showExtensionPrompt(self: *Interactive, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
+    pub fn showExtensionPrompt(self: *Interactive, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
         self.closeExtensionPromptFlow(true);
         var flow = ExtensionPromptFlow.init(self.allocator, self.theme, prompt, response) catch {
             response.finish(request_mod.ExtensionPromptResponse.defaultFor(prompt.kind));
@@ -2906,12 +2667,12 @@ pub const Interactive = struct {
         }
     }
 
-    fn applyExtensionReport(self: *Interactive, report: extension_ui.Report) void {
+    pub fn applyExtensionReport(self: *Interactive, report: extension_ui.Report) void {
         self.extension_ui_state.applyReport(report);
         self.tui.dirty = true;
     }
 
-    fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
+    pub fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
         for (actions) |action| {
             switch (action.kind) {
                 .set_text => if (action.text) |text| self.active_editor.setText(text),
@@ -2923,7 +2684,7 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn applyExtensionUiPublications(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiPublication) void {
+    pub fn applyExtensionUiPublications(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiPublication) void {
         for (updates) |update| {
             switch (update.kind) {
                 .message => self.extension_ui_state.applyMessage(update),
@@ -2935,7 +2696,7 @@ pub const Interactive = struct {
     }
 
     /// TUI-thread application of the latest extension command list.
-    fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {
+    pub fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {
         for (self.command_registry.dynamic.items) |*cmd| {
             self.allocator.free(cmd.name);
             if (cmd.description) |d| self.allocator.free(d);
