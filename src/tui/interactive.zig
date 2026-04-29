@@ -33,6 +33,7 @@ const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig
 const thinking_mod = @import("interactive/thinking.zig");
 const slash_command_mod = @import("interactive/slash_command.zig");
 const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
+const agent_requests_mod = @import("interactive/agent_requests.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -714,7 +715,7 @@ pub const Interactive = struct {
         }
     }
 
-    fn publishLifecycleUiEvent(self: *Interactive, event: UiEvent) bool {
+    pub fn publishLifecycleUiEvent(self: *Interactive, event: UiEvent) bool {
         switch (self.lifecycle_event_queue.trySend(event)) {
             .ok => return true,
             .dropped => unreachable,
@@ -2474,11 +2475,11 @@ pub const Interactive = struct {
         }
     }
 
-    fn discardAgentRequests(self: *Interactive, requests: []AgentRequest) void {
+    pub fn discardAgentRequests(self: *Interactive, requests: []AgentRequest) void {
         for (requests) |*req| req.deinit(self.msg_allocator);
     }
 
-    fn discardQueuedAgentRequests(self: *Interactive) void {
+    pub fn discardQueuedAgentRequests(self: *Interactive) void {
         var buf: [16]AgentRequest = undefined;
         while (true) {
             const n = self.request_queue.drainInto(&buf);
@@ -2491,124 +2492,7 @@ pub const Interactive = struct {
     /// long-lived agent owner thread. Returns `false` when an in-band
     /// shutdown request terminates the owner loop after all earlier work.
     fn processAgentRequests(self: *Interactive) bool {
-        var buf: [16]AgentRequest = undefined;
-        while (true) {
-            const n = self.request_queue.drainInto(&buf);
-            if (n == 0) return true;
-
-            var idle_processed = false;
-            var prompt_processed = false;
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                var req = &buf[i];
-                switch (req.*) {
-                    .prompt => |p| {
-                        prompt_processed = true;
-                        const outcome = self.runtime_host.runUserContent(p.content) catch |err| {
-                            const err_msg = self.msg_allocator.dupe(u8, @errorName(err)) catch null;
-                            _ = self.publishLifecycleUiEvent(.{ .prompt_worker_finished = .{
-                                .outcome = .assistant_error,
-                                .internal_error = err_msg,
-                            } });
-                            req.deinit(self.msg_allocator);
-                            continue;
-                        };
-                        self.publishPendingExtensionUi();
-                        _ = self.publishLifecycleUiEvent(.{ .prompt_worker_finished = .{ .outcome = outcome } });
-                    },
-                    .resume_session => |r| {
-                        idle_processed = true;
-                        self.handleResumeSession(r.path, r.restore_session_model);
-                    },
-                    .fork_session => |f| {
-                        idle_processed = true;
-                        self.handleForkSession(f.entry_id);
-                    },
-                    .new_session => {
-                        idle_processed = true;
-                        self.handleNewSession();
-                    },
-                    .set_model => |s| {
-                        idle_processed = true;
-                        self.handleSetModel(s.model);
-                    },
-                    .set_model_by_pattern => |s| {
-                        idle_processed = true;
-                        self.handleSetModelPattern(s.pattern);
-                    },
-                    .set_thinking_level => |s| {
-                        idle_processed = true;
-                        self.handleSetThinkingLevel(s.level);
-                    },
-                    .refresh_status_snapshot => {
-                        idle_processed = true;
-                        self.publishStatusSnapshot();
-                    },
-                    .compact => |c| {
-                        idle_processed = true;
-                        self.handleManualCompactRequest(c.custom_instructions);
-                    },
-                    .extension_command => |ec| {
-                        idle_processed = true;
-                        if (self.runtime_host.currentSession().extensionRunner()) |runner| {
-                            runner.async_dispatcher = .{ .ptr = @ptrCast(self), .submit = &submitExtensionAsyncFromRunner };
-                        }
-                        self.runtime_host.dispatchExtensionCommand(ec.name, ec.args) catch |err| {
-                            const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch {
-                                // OOM: skip publishing error message, keep draining.
-                                continue;
-                            };
-                            _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
-                        };
-                        self.publishPendingExtensionUi();
-                    },
-                    .extension_oauth_login => |oauth| {
-                        idle_processed = true;
-                        const result: request_mod.ExtensionOAuthLoginResponse.Result = self.runtime_host.dispatchExtensionOAuthLogin(oauth.provider_id, oauth.callbacks) catch |err| blk: {
-                            const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch break :blk .unsupported;
-                            break :blk .{ .err = msg };
-                        };
-                        oauth.response.finish(result);
-                    },
-                    .extension_oauth_refresh => |oauth| {
-                        idle_processed = true;
-                        const exchange: oauth_mod.ExchangeResult = self.runtime_host.dispatchExtensionOAuthRefresh(oauth.provider_id, oauth.credential, oauth.result_allocator) catch |err| .{ .err = @errorName(err) };
-                        const result: request_mod.ExtensionOAuthRefreshResponse.Result = switch (exchange) {
-                            .success => |cred| .{ .success = cred },
-                            .err => |msg| .{ .err = msg },
-                        };
-                        oauth.response.finish(result);
-                    },
-                    .extension_async_result => |async_result| {
-                        idle_processed = true;
-                        self.runtime_host.deliverExtensionAsyncResult(async_result.id, async_result.result) catch |err| {
-                            const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
-                            _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
-                        };
-                        req.* = .{ .refresh_status_snapshot = {} };
-                        self.publishPendingExtensionUi();
-                    },
-                    .shutdown => {
-                        req.deinit(self.msg_allocator);
-                        self.discardAgentRequests(buf[i + 1 .. n]);
-                        self.discardQueuedAgentRequests();
-                        return false;
-                    },
-                }
-                req.deinit(self.msg_allocator);
-            }
-
-            if (idle_processed) {
-                // Session replacement, model events, oauth callbacks, and future
-                // observer paths may run extension code outside command dispatch.
-                // Publish any semantic UI records those callbacks produced before
-                // telling the TUI thread the idle batch is finished.
-                self.publishPendingExtensionUi();
-            }
-            if (idle_processed and !prompt_processed) {
-                _ = self.publishLifecycleUiEvent(.{ .request_worker_finished = {} });
-            }
-        }
+        return agent_requests_mod.processWithBuffer(self, AgentRequest, &submitExtensionAsyncFromRunner);
     }
 
     /// Publish the current extension command list through the UI event
@@ -2649,7 +2533,7 @@ pub const Interactive = struct {
     /// materializes them locally; the agent/runtime remains the retained-object
     /// owner. Call this after any agent-thread extension execution boundary that
     /// may have mutated UI state (startup lifecycle, commands, future observers).
-    fn publishPendingExtensionUi(self: *Interactive) void {
+    pub fn publishPendingExtensionUi(self: *Interactive) void {
         if (self.runtime_host.takePendingExtensionReport(self.msg_allocator)) |report| {
             _ = self.publishLifecycleUiEvent(.{ .extension_report_shown = .{ .report = report } });
         }
@@ -2723,7 +2607,7 @@ pub const Interactive = struct {
     /// `compaction_start`/`compaction_end` events which the TUI consumes
     /// via `sessionEventCallback`; no direct mutation of agent-owned state
     /// happens here. Failures still flow through `compaction_end`.
-    fn handleManualCompactRequest(self: *Interactive, custom_instructions: ?[]const u8) void {
+    pub fn handleManualCompactRequest(self: *Interactive, custom_instructions: ?[]const u8) void {
         _ = self.runtime_host.runCompaction(.manual, false, .{
             .custom_instructions = custom_instructions,
         }) catch {
@@ -2736,7 +2620,7 @@ pub const Interactive = struct {
         }
     }
 
-    fn handleNewSession(self: *Interactive) void {
+    pub fn handleNewSession(self: *Interactive) void {
         self.runtime_host.newSession() catch |err| {
             const msg = switch (err) {
                 error.SessionBeforeSwitchBlocked => self.msg_allocator.dupe(u8, "session switch blocked by extension") catch return,
@@ -2756,7 +2640,7 @@ pub const Interactive = struct {
         _ = self.publishLifecycleUiEvent(.{ .session_new_started = {} });
     }
 
-    fn handleForkSession(self: *Interactive, entry_id: []const u8) void {
+    pub fn handleForkSession(self: *Interactive, entry_id: []const u8) void {
         self.runtime_host.forkSession(entry_id) catch |err| {
             const msg = switch (err) {
                 error.SessionBeforeForkBlocked => self.msg_allocator.dupe(u8, "session fork blocked by extension") catch return,
@@ -2783,7 +2667,7 @@ pub const Interactive = struct {
     ///
     /// Transcript rebuild stays on the TUI thread — this handler
     /// does NOT touch `self.transcript`. That's .15's whole point.
-    fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
+    pub fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
         const result = self.runtime_host.resumeSession(path, restore_session_model) catch |err| {
             const message = switch (err) {
                 error.SessionAlreadyActive => "session is already active",
@@ -2896,7 +2780,7 @@ pub const Interactive = struct {
     /// Delegates the canonical validation + mutation path to
     /// `AgentSession.trySetModel`, then translates the typed outcome
     /// into a TUI-owned event payload.
-    fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
+    pub fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
         switch (self.runtime_host.currentSession().trySetModel(m)) {
             .success => |_| {
                 self.publishStatusSnapshot();
@@ -2919,7 +2803,7 @@ pub const Interactive = struct {
         }
     }
 
-    fn handleSetModelPattern(self: *Interactive, pattern: []const u8) void {
+    pub fn handleSetModelPattern(self: *Interactive, pattern: []const u8) void {
         const registry = self.runtime_host.currentSession().model_registry orelse {
             const msg = self.msg_allocator.dupe(u8, "model registry unavailable") catch return;
             _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
@@ -2976,7 +2860,7 @@ pub const Interactive = struct {
         _ = self.publishLifecycleUiEvent(.{ .visible_models_snapshot = .{ .models = models } });
     }
 
-    fn publishStatusSnapshot(self: *Interactive) void {
+    pub fn publishStatusSnapshot(self: *Interactive) void {
         const snapshot = self.runtime_host.currentSession().statusSnapshot();
         if (self.shouldSkipStatusSnapshotPublish(snapshot)) return;
 
@@ -3022,7 +2906,7 @@ pub const Interactive = struct {
         self.publishStatusSnapshot();
     }
 
-    fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
+    pub fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         _ = self.runtime_host.currentSession().trySetThinkingLevel(level);
         self.publishStatusSnapshot();
         const level_label = self.msg_allocator.dupe(u8, thinking_mod.label(level)) catch return;
