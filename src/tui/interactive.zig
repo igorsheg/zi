@@ -49,6 +49,7 @@ const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const status_flow = @import("interactive/status_flow.zig");
 const overlay_flow = @import("interactive/overlay_flow.zig");
+const idle_request = @import("interactive/idle_request.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -107,11 +108,7 @@ const SettingsAction = enum {
     toggle_hide_thinking,
 };
 
-const IdleRequestDispatch = struct {
-    busy_message: []const u8,
-    loader_message: []const u8,
-    spawn_failed_message: []const u8,
-};
+const IdleRequestDispatch = idle_request.Options;
 const auth_storage_mod = @import("../coding_agent/auth/storage.zig");
 const auth_types = @import("../coding_agent/auth/types.zig");
 const oauth_mod = @import("../coding_agent/auth/oauth.zig");
@@ -1193,35 +1190,7 @@ pub const Interactive = struct {
     }
 
     pub fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
-        if (self.is_streaming or self.request_in_flight) {
-            var rejected = req;
-            rejected.deinit(self.msg_allocator);
-            self.status_line.setPrimary(options.busy_message, self.theme.fg(.@"error"));
-            self.tui.dirty = true;
-            return false;
-        }
-
-        switch (self.request_queue.trySend(req)) {
-            .ok => {},
-            .dropped => unreachable,
-            .full => |rejected| {
-                var failed_req = rejected;
-                failed_req.deinit(self.msg_allocator);
-                self.showAgentRequestQueueFull();
-                return false;
-            },
-            .closed, .oom => |rejected| {
-                var failed_req = rejected;
-                failed_req.deinit(self.msg_allocator);
-                self.status_line.setPrimary(options.spawn_failed_message, self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-                return false;
-            },
-        }
-        self.request_in_flight = true;
-        self.showLoader(options.loader_message);
-        self.tui.dirty = true;
-        return true;
+        return idle_request.dispatch(self, req, options);
     }
 
     // ── Session picker (/resume) ────────────────────────────────
