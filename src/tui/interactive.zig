@@ -28,6 +28,7 @@ const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
 const queues_mod = @import("interactive/queues.zig");
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
+const model_flow = @import("interactive/model_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
 const thinking_mod = @import("interactive/thinking.zig");
@@ -96,7 +97,6 @@ const AgentSession = coding_agent_mod.AgentSession;
 const SessionEvent = coding_agent_mod.session_event.SessionEvent;
 const RuntimeHost = coding_agent_mod.RuntimeHost;
 const ConversationSnapshotPublisher = coding_agent_mod.ConversationSnapshotPublisher;
-const json_util = @import("../ai/json_util.zig");
 const SettingsAction = enum {
     open_thinking,
     toggle_hide_thinking,
@@ -844,7 +844,7 @@ pub const Interactive = struct {
         return "Thinking...";
     }
 
-    fn cancelTranscriptSelection(self: *Interactive) void {
+    pub fn cancelTranscriptSelection(self: *Interactive) void {
         transcript_mouse.cancelSelection(self);
     }
 
@@ -1207,7 +1207,7 @@ pub const Interactive = struct {
         self.status_line.setPrimary(msg, self.theme.fg(.success));
     }
 
-    fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
+    pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
         const width = self.tui.width();
         const header_h = self.header_container.measure(width).preferred_height;
         return .{
@@ -1271,7 +1271,7 @@ pub const Interactive = struct {
         }
     }
 
-    fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
+    pub fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
         if (self.is_streaming or self.request_in_flight) {
             var rejected = req;
             rejected.deinit(self.msg_allocator);
@@ -1391,7 +1391,7 @@ pub const Interactive = struct {
     // ── Model picker (/model) ───────────────────────────────────
 
     fn switchModelDirect(self: *Interactive, pattern: []const u8) void {
-        self.queueModelPatternSwitch(pattern);
+        model_flow.switchDirect(self, pattern);
     }
 
     pub fn closeExtensionPromptFlow(self: *Interactive, resolve_default: bool) void {
@@ -1490,87 +1490,11 @@ pub const Interactive = struct {
     }
 
     fn closeModelPickerFlow(self: *Interactive) void {
-        if (self.model_picker_flow) |*flow| {
-            if (flow.handle) |h| {
-                flow.handle = null;
-                h.hide();
-            }
-            flow.deinit();
-        }
-        self.model_picker_flow = null;
+        model_flow.close(self);
     }
 
     fn showModelPicker(self: *Interactive) void {
-        self.closeModelPickerFlow();
-        var flow = ModelPickerFlow.init(self.allocator, self.theme, self.model_catalog, self.auth_storage) catch {
-            self.status_line.setPrimary("failed to build model picker", self.theme.fg(.@"error"));
-            return;
-        };
-        errdefer flow.deinit();
-
-        if (flow.rows.len == 0) {
-            self.status_line.setPrimary("no models available", self.theme.fg(.muted));
-            return;
-        }
-
-        flow.picker.on_select = &onModelSelected;
-        flow.picker.on_cancel = &onModelPickerCancel;
-        flow.picker.callback_ctx = @ptrCast(self);
-        for (flow.rows, 0..) |row, i| {
-            if (std.mem.eql(u8, json_util.providerToString(row.model.provider), self.status_data.model_provider) and
-                std.mem.eql(u8, row.model.id, self.status_data.model_id))
-            {
-                flow.picker.setInitialSelectionIndex(i);
-                break;
-            }
-        }
-        self.cancelTranscriptSelection();
-        self.model_picker_flow = flow;
-        self.model_picker_flow.?.handle = self.tui.showOverlay(
-            self.model_picker_flow.?.picker.component(),
-            self.bottomSheetOptions(),
-        );
-    }
-
-    fn onModelSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        const selected_model = if (self.model_picker_flow) |*flow|
-            if (selection.source_index < flow.rows.len) flow.rows[selection.source_index].model else null
-        else
-            null;
-
-        self.closeModelPickerFlow();
-
-        const m = selected_model orelse {
-            self.status_line.setPrimary("model not found", self.theme.fg(.@"error"));
-            return;
-        };
-
-        const reference = std.fmt.allocPrint(self.msg_allocator, "{s}/{s}", .{ json_util.providerToString(m.provider), m.id }) catch {
-            self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
-            self.tui.dirty = true;
-            return;
-        };
-        defer self.msg_allocator.free(reference);
-        self.queueModelPatternSwitch(reference);
-    }
-
-    fn onModelPickerCancel(ctx: ?*anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.closeModelPickerFlow();
-    }
-
-    fn queueModelPatternSwitch(self: *Interactive, pattern: []const u8) void {
-        const pattern_copy = self.msg_allocator.dupe(u8, pattern) catch {
-            self.status_line.setPrimary("out of memory", self.theme.fg(.@"error"));
-            self.tui.dirty = true;
-            return;
-        };
-        _ = self.dispatchIdleRequest(.{ .set_model_by_pattern = .{ .pattern = pattern_copy } }, .{
-            .busy_message = "cannot switch model while agent is running",
-            .loader_message = "Switching model...",
-            .spawn_failed_message = "failed to queue model switch",
-        });
+        model_flow.show(self);
     }
 
     // ── Settings picker (/settings) ─────────────────────────────
