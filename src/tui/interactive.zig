@@ -31,6 +31,7 @@ const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
 const thinking_mod = @import("interactive/thinking.zig");
+const slash_command_mod = @import("interactive/slash_command.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -1771,13 +1772,9 @@ pub const Interactive = struct {
 
     /// Dispatch a slash command. Returns true if handled (caller should not send to agent).
     fn dispatchSlashCommand(self: *Interactive, text: []const u8) bool {
-        // Parse "/command args" → name="command", args="args"
-        const after_slash = text[1..];
-        const space_idx = std.mem.indexOfScalar(u8, after_slash, ' ');
-        const name = if (space_idx) |si| after_slash[0..si] else after_slash;
-        const args = if (space_idx) |si| std.mem.trimLeft(u8, after_slash[si + 1 ..], " ") else "";
-
-        if (name.len == 0) return false;
+        const parsed = slash_command_mod.parse(text) orelse return false;
+        const name = parsed.name;
+        const args = parsed.args;
 
         const cmd = self.command_registry.findCommand(name) orelse return false;
 
@@ -1787,87 +1784,7 @@ pub const Interactive = struct {
 
         // Built-in commands with Interactive access
         if (cmd.source == .builtin) {
-            if (std.mem.eql(u8, name, "quit")) {
-                self.running = false;
-                return true;
-            }
-            if (std.mem.eql(u8, name, "clear")) {
-                self.transcript.clearAll();
-                // Drop the projection snapshot/cache too — otherwise the
-                // next replaceViewSnapshot with the same committed ptr
-                // would take the cache-hit path and hand reconcile
-                // metadata-only items against a wiped transcript.
-                self.conversation_projection.clear();
-                self.status_line.clearPrimary();
-                self.tui.dirty = true;
-                return true;
-            }
-            if (std.mem.eql(u8, name, "new")) {
-                _ = self.dispatchIdleRequest(.{ .new_session = {} }, .{
-                    .busy_message = "cannot start a new session while agent is running",
-                    .loader_message = "Starting new session...",
-                    .spawn_failed_message = "failed to queue new session",
-                });
-                return true;
-            }
-            if (std.mem.eql(u8, name, "compact")) {
-                const instructions: ?[]const u8 = if (args.len > 0)
-                    self.msg_allocator.dupe(u8, args) catch null
-                else
-                    null;
-                _ = self.dispatchIdleRequest(.{ .compact = .{ .custom_instructions = instructions } }, .{
-                    .busy_message = "cannot compact while agent is running",
-                    .loader_message = "Compacting session...",
-                    .spawn_failed_message = "failed to queue compaction",
-                });
-                return true;
-            }
-            if (std.mem.eql(u8, name, "resume")) {
-                self.showSessionPicker(true);
-                return true;
-            }
-            if (std.mem.eql(u8, name, "fork")) {
-                if (args.len == 0) {
-                    self.status_line.setPrimary("usage: /fork <entry-id>", self.theme.fg(.@"error"));
-                    self.tui.dirty = true;
-                    return true;
-                }
-                const entry_id = self.msg_allocator.dupe(u8, args) catch return true;
-                _ = self.dispatchIdleRequest(.{ .fork_session = .{ .entry_id = entry_id } }, .{
-                    .busy_message = "cannot fork while agent is running",
-                    .loader_message = "Forking session...",
-                    .spawn_failed_message = "failed to queue fork",
-                });
-                return true;
-            }
-            if (std.mem.eql(u8, name, "model")) {
-                if (args.len > 0) {
-                    self.switchModelDirect(args);
-                } else {
-                    self.showModelPicker();
-                }
-                return true;
-            }
-            if (std.mem.eql(u8, name, "login")) {
-                if (args.len > 0) {
-                    self.startLogin(args);
-                } else {
-                    self.showLoginPicker();
-                }
-                return true;
-            }
-            if (std.mem.eql(u8, name, "settings")) {
-                self.showSettingsPicker();
-                return true;
-            }
-            if (std.mem.eql(u8, name, "hotkeys")) {
-                self.showHotkeysOverlay();
-                return true;
-            }
-            if (std.mem.eql(u8, name, "mem")) {
-                self.writeMemoryDiagnostic();
-                return true;
-            }
+            if (self.dispatchInteractiveBuiltinCommand(name, args)) return true;
         }
 
         switch (cmd.action) {
@@ -1900,6 +1817,61 @@ pub const Interactive = struct {
             },
         }
 
+        return true;
+    }
+
+    fn dispatchInteractiveBuiltinCommand(self: *Interactive, name: []const u8, args: []const u8) bool {
+        const builtin = slash_command_mod.builtinInteractiveCommand(name) orelse return false;
+        switch (builtin) {
+            .quit => {
+                self.running = false;
+            },
+            .clear => {
+                self.transcript.clearAll();
+                // Drop the projection snapshot/cache too — otherwise the
+                // next replaceViewSnapshot with the same committed ptr
+                // would take the cache-hit path and hand reconcile
+                // metadata-only items against a wiped transcript.
+                self.conversation_projection.clear();
+                self.status_line.clearPrimary();
+                self.tui.dirty = true;
+            },
+            .new => _ = self.dispatchIdleRequest(.{ .new_session = {} }, .{
+                .busy_message = "cannot start a new session while agent is running",
+                .loader_message = "Starting new session...",
+                .spawn_failed_message = "failed to queue new session",
+            }),
+            .compact => {
+                const instructions: ?[]const u8 = if (args.len > 0)
+                    self.msg_allocator.dupe(u8, args) catch null
+                else
+                    null;
+                _ = self.dispatchIdleRequest(.{ .compact = .{ .custom_instructions = instructions } }, .{
+                    .busy_message = "cannot compact while agent is running",
+                    .loader_message = "Compacting session...",
+                    .spawn_failed_message = "failed to queue compaction",
+                });
+            },
+            .@"resume" => self.showSessionPicker(true),
+            .fork => {
+                if (args.len == 0) {
+                    self.status_line.setPrimary("usage: /fork <entry-id>", self.theme.fg(.@"error"));
+                    self.tui.dirty = true;
+                    return true;
+                }
+                const entry_id = self.msg_allocator.dupe(u8, args) catch return true;
+                _ = self.dispatchIdleRequest(.{ .fork_session = .{ .entry_id = entry_id } }, .{
+                    .busy_message = "cannot fork while agent is running",
+                    .loader_message = "Forking session...",
+                    .spawn_failed_message = "failed to queue fork",
+                });
+            },
+            .model => if (args.len > 0) self.switchModelDirect(args) else self.showModelPicker(),
+            .login => if (args.len > 0) self.startLogin(args) else self.showLoginPicker(),
+            .settings => self.showSettingsPicker(),
+            .hotkeys => self.showHotkeysOverlay(),
+            .mem => self.writeMemoryDiagnostic(),
+        }
         return true;
     }
 
