@@ -48,6 +48,7 @@ const system_api = @import("system_api.zig");
 const spawn_api = @import("spawn_api.zig");
 const provider_api = @import("provider_api.zig");
 const command_api = @import("command_api.zig");
+const event_api = @import("event_api.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
 const command_registry = @import("registries/command_registry.zig");
@@ -95,7 +96,7 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     c.lua_setfield(L, -2, "__register_builtin_tools");
 
     // zi.on
-    state.pushCClosureWithUserdata(ziOn, runner);
+    state.pushCClosureWithUserdata(event_api.ziOn, runner);
     c.lua_setfield(L, -2, "on");
 
     // zi.spawn
@@ -340,112 +341,6 @@ fn ziRegisterBuiltinTools(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// zi.on
-// ─────────────────────────────────────────────────────────────────────────
-
-fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    const runner = runnerFromUpvalue(L);
-
-    // arg 1: event name (string)
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
-        return luaError(L, "zi.on: expected event name as first argument");
-    }
-    var name_len: usize = 0;
-    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return luaError(L, "zi.on: invalid event name");
-    const event_name = name_ptr[0..name_len];
-
-    const kind = parseEventKind(event_name) orelse {
-        // Build the error message on the Lua stack so the runner's
-        // allocator stays out of the error path. lua_pushfstring is
-        // the canonical way and Lua-internal-allocator-friendly.
-        _ = c.lua_pushfstring(L, "zi.on: unknown event '%s'", name_ptr);
-        _ = c.lua_error(L);
-        return 0;
-    };
-
-    // arg 2: handler (function)
-    if (c.lua_type(L, 2) != c.LUA_TFUNCTION) {
-        return luaError(L, "zi.on: expected handler function as second argument");
-    }
-
-    // Capture the handler via luaL_ref. We need it on top of the
-    // stack first, so duplicate arg 2 with lua_pushvalue. luaL_ref
-    // pops what's on top.
-    c.lua_pushvalue(L, 2);
-    const handler_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
-    if (handler_ref == c.LUA_REFNIL or handler_ref == c.LUA_NOREF) {
-        return luaError(L, "zi.on: failed to capture handler reference");
-    }
-
-    runner.event_registry.subscribe(kind, .{
-        .lua_ref = handler_ref,
-        .source_id = currentEventSourceId(runner),
-        .provenance = currentEventProvenance(runner),
-    }) catch {
-        // OOM during subscribe: release the handler ref so the Lua
-        // GC can reclaim it, then surface as a Lua error.
-        c.luaL_unref(L, c.LUA_REGISTRYINDEX, handler_ref);
-        return luaError(L, "zi.on: subscribe failed");
-    };
-
-    return 0;
-}
-
-/// Map a Lua-side event name (the same string the spec uses in
-/// `zi.on("name", ...)` examples) to an `EventKind` enum value.
-/// Returns null on unknown names — the caller raises a Lua error
-/// with the offending string in the message.
-///
-/// Event names are documented in `docs/extensions.md`.
-/// We support the current implemented subset; new events get added here as
-/// their dispatch points come online (D4 grows the table when it
-/// hooks new event sources).
-fn parseEventKind(name: []const u8) ?event_registry.EventKind {
-    const Pair = struct { name: []const u8, kind: event_registry.EventKind };
-    const table = [_]Pair{
-        // startup/resource interceptors
-        .{ .name = "session_directory", .kind = .session_directory },
-        .{ .name = "resources_discover", .kind = .resources_discover },
-        // agent lifecycle and prompt/provider interceptors
-        .{ .name = "agent_start", .kind = .agent_start },
-        .{ .name = "agent_end", .kind = .agent_end },
-        .{ .name = "before_agent_start", .kind = .before_agent_start },
-        .{ .name = "input", .kind = .input },
-        .{ .name = "context", .kind = .context },
-        .{ .name = "before_provider_request", .kind = .before_provider_request },
-        .{ .name = "turn_start", .kind = .turn_start },
-        .{ .name = "turn_end", .kind = .turn_end },
-        .{ .name = "message_start", .kind = .message_start },
-        .{ .name = "message_update", .kind = .message_update },
-        .{ .name = "message_end", .kind = .message_end },
-        .{ .name = "message", .kind = .message },
-        // tool and host command execution
-        .{ .name = "tool_execution_start", .kind = .tool_execution_start },
-        .{ .name = "tool_execution_update", .kind = .tool_execution_update },
-        .{ .name = "tool_execution_end", .kind = .tool_execution_end },
-        .{ .name = "tool_call", .kind = .tool_call },
-        .{ .name = "tool_result", .kind = .tool_result },
-        .{ .name = "user_bash", .kind = .user_bash },
-        // session
-        .{ .name = "session_start", .kind = .session_start },
-        .{ .name = "session_shutdown", .kind = .session_shutdown },
-        .{ .name = "session_before_switch", .kind = .session_before_switch },
-        .{ .name = "session_before_fork", .kind = .session_before_fork },
-        .{ .name = "session_before_compact", .kind = .session_before_compact },
-        .{ .name = "session_compact", .kind = .session_compact },
-        .{ .name = "session_before_tree", .kind = .session_before_tree },
-        .{ .name = "session_tree", .kind = .session_tree },
-        // meta
-        .{ .name = "model_select", .kind = .model_select },
-    };
-    for (table) |p| {
-        if (std.mem.eql(u8, p.name, name)) return p.kind;
-    }
-    return null;
-}
-
 fn pushLiteralField(L: *c.lua_State, field: [:0]const u8, value: [:0]const u8) void {
     _ = c.lua_pushstring(L, value.ptr);
     c.lua_setfield(L, -2, field.ptr);
@@ -512,6 +407,7 @@ pub const TrampolineCtx = spawn_api.TrampolineCtx;
 pub const eventTrampoline = spawn_api.eventTrampoline;
 pub const pushToolResultAsSpawnResult = spawn_api.pushToolResultAsSpawnResult;
 const pushSpawnResult = spawn_api.pushSpawnResult;
+const parseEventKind = event_api.parseEventKind;
 
 fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
     var len: usize = 0;
