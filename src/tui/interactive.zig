@@ -51,6 +51,7 @@ const overlay_flow = @import("interactive/overlay_flow.zig");
 const idle_request = @import("interactive/idle_request.zig");
 const runtime_loop = @import("interactive/runtime_loop.zig");
 const theme_flow = @import("interactive/theme_flow.zig");
+const terminal_input_flow = @import("interactive/terminal_input.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -572,7 +573,7 @@ pub const Interactive = struct {
 
             if (input_ready and self.processTerminalInput()) continue;
 
-            self.input.checkTimeout(&onInputSequence, @ptrCast(self));
+            self.input.checkTimeout(&terminal_input_flow.onSequence, @ptrCast(self));
             self.finishKittyNegotiationIfDue();
             self.finishExtensionPromptIfTimedOut();
 
@@ -653,35 +654,11 @@ pub const Interactive = struct {
     }
 
     fn processTerminalInput(self: *Interactive) bool {
-        var input_raw: [4096]u8 = undefined;
-        const n = self.tui.terminal.readInput(&input_raw) catch 0;
-        if (n == 0) return false;
-
-        if (self.kitty_deadline_ns != null) {
-            self.input.buf.appendSlice(self.allocator, input_raw[0..n]) catch {};
-            if (self.input.consumeKittyResponse()) {
-                self.tui.terminal.enableKittyProtocol();
-                self.kitty_deadline_ns = null;
-                self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
-                return false;
-            }
-            return true;
-        }
-
-        self.input.feed(input_raw[0..n], &onInputSequence, &onInputPaste, @ptrCast(self));
-        return false;
+        return terminal_input_flow.process(self);
     }
 
     fn finishKittyNegotiationIfDue(self: *Interactive) void {
-        if (self.kitty_deadline_ns) |deadline| {
-            if (std.time.nanoTimestamp() >= deadline) {
-                self.tui.terminal.enableModifyOtherKeys();
-                self.kitty_deadline_ns = null;
-                if (self.input.buf.items.len > 0) {
-                    self.input.drain(&onInputSequence, &onInputPaste, @ptrCast(self));
-                }
-            }
-        }
+        terminal_input_flow.finishKittyNegotiationIfDue(self);
     }
 
     pub fn showAgentRequestQueueFull(self: *Interactive) void {
@@ -737,36 +714,7 @@ pub const Interactive = struct {
         );
     }
 
-    // ── InputBuffer callbacks ───────────────────────────────────────
-
-    /// Called by InputBuffer for each complete input sequence.
-    fn onInputSequence(seq: []const u8, raw_ctx: *anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(raw_ctx));
-
-        // Bare \n = newline insertion (some terminals send this for shift+enter)
-        if (seq.len == 1 and seq[0] == '\n') {
-            self.active_editor.insertText("\n");
-            self.refreshHeaderVisibility();
-            self.tui.dirty = true;
-            return;
-        }
-
-        const result = keys_mod.parseInput(seq, self.tui.terminal.kitty_active) orelse return;
-        switch (result) {
-            .key => |k| self.handleKey(k.key),
-            .mouse => |m| self.handleMouse(m.event),
-        }
-    }
-
-    /// Called by InputBuffer when paste content is complete.
-    fn onInputPaste(content: []const u8, raw_ctx: *anyopaque) void {
-        const self: *Interactive = @ptrCast(@alignCast(raw_ctx));
-        self.active_editor.handlePaste(content);
-        self.refreshHeaderVisibility();
-        self.tui.dirty = true;
-    }
-
-    fn handleKey(self: *Interactive, key: Key) void {
+    pub fn handleKey(self: *Interactive, key: Key) void {
         key_flow_mod.handle(self, key);
     }
 
@@ -774,7 +722,7 @@ pub const Interactive = struct {
         return key_flow_mod.handleScroll(self, key);
     }
 
-    fn handleMouse(self: *Interactive, event: keys_mod.MouseEvent) void {
+    pub fn handleMouse(self: *Interactive, event: keys_mod.MouseEvent) void {
         transcript_mouse.handle(self, event);
     }
 
