@@ -52,6 +52,7 @@ const idle_request = @import("interactive/idle_request.zig");
 const runtime_loop = @import("interactive/runtime_loop.zig");
 const theme_flow = @import("interactive/theme_flow.zig");
 const terminal_input_flow = @import("interactive/terminal_input.zig");
+const event_flow = @import("interactive/event_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -421,10 +422,10 @@ pub const Interactive = struct {
         self.model_catalog = &.{};
         self.status_data.deinit();
         self.input.deinit();
-        logMailboxStats("snapshot", self.snapshot_event_queue.stats());
-        logMailboxStats("lifecycle", self.lifecycle_event_queue.stats());
-        logMailboxStats("request", self.request_queue.stats());
-        logMailboxStats("session_index", self.session_index_worker.stats());
+        event_flow.logStats("snapshot", self.snapshot_event_queue.stats());
+        event_flow.logStats("lifecycle", self.lifecycle_event_queue.stats());
+        event_flow.logStats("request", self.request_queue.stats());
+        event_flow.logStats("session_index", self.session_index_worker.stats());
         self.session_index_worker.deinit();
         if (self.ai_complete_worker) |*worker| worker.deinit();
         self.ai_complete_worker = null;
@@ -637,20 +638,7 @@ pub const Interactive = struct {
     }
 
     fn drainUiEvents(self: *Interactive) void {
-        self.drainUiEventQueue(&self.snapshot_event_queue);
-        self.drainUiEventQueue(&self.lifecycle_event_queue);
-    }
-
-    fn drainUiEventQueue(self: *Interactive, queue: anytype) void {
-        var event_buf: [64]UiEvent = undefined;
-        while (true) {
-            const count = queue.drainInto(&event_buf);
-            if (count == 0) break;
-            for (event_buf[0..count]) |*ev| {
-                self.handleUiEvent(ev);
-                ev.deinit(self.msg_allocator);
-            }
-        }
+        event_flow.drain(self);
     }
 
     fn processTerminalInput(self: *Interactive) bool {
@@ -667,51 +655,15 @@ pub const Interactive = struct {
     }
 
     fn publishUiEvent(self: *Interactive, event: UiEvent) bool {
-        return if (event.isSnapshotEvent())
-            self.publishSnapshotUiEvent(event)
-        else
-            self.publishLifecycleUiEvent(event);
+        return event_flow.publish(self, event);
     }
 
     pub fn publishSnapshotUiEvent(self: *Interactive, event: UiEvent) bool {
-        switch (self.snapshot_event_queue.trySend(event)) {
-            .ok => return true,
-            .dropped => return false,
-            .closed, .full, .oom => |rejected| {
-                var failed = rejected;
-                failed.deinit(self.msg_allocator);
-                return false;
-            },
-        }
+        return event_flow.publishSnapshot(self, event);
     }
 
     pub fn publishLifecycleUiEvent(self: *Interactive, event: UiEvent) bool {
-        switch (self.lifecycle_event_queue.trySend(event)) {
-            .ok => return true,
-            .dropped => unreachable,
-            .closed, .full, .oom => |rejected| {
-                var failed = rejected;
-                defer failed.deinit(self.msg_allocator);
-                log.warn("lifecycle queue rejected ui event", .{});
-                return false;
-            },
-        }
-    }
-
-    fn logMailboxStats(comptime label: []const u8, stats: anytype) void {
-        log.info(
-            "{s} queue stats pending={d} high_water={d} sends={d} wakes={d} rejected={d} dropped={d} state={s}",
-            .{
-                label,
-                stats.pending_depth,
-                stats.high_water_depth,
-                stats.send_count,
-                stats.wake_count,
-                stats.rejected_count,
-                stats.dropped_count,
-                @tagName(stats.state),
-            },
-        );
+        return event_flow.publishLifecycle(self, event);
     }
 
     pub fn handleKey(self: *Interactive, key: Key) void {
