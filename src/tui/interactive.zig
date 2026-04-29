@@ -39,6 +39,7 @@ const agent_requests_mod = @import("interactive/agent_requests.zig");
 const session_requests_mod = @import("interactive/session_requests.zig");
 const model_requests_mod = @import("interactive/model_requests.zig");
 const session_events_mod = @import("interactive/session_events.zig");
+const conversation_publish = @import("interactive/conversation_publish.zig");
 const key_flow_mod = @import("interactive/key_flow.zig");
 const transcript_mouse = @import("interactive/transcript_mouse.zig");
 const login_flow = @import("interactive/login_flow.zig");
@@ -97,7 +98,6 @@ const MouseCapture = transcript_mouse.MouseCapture;
 const AgentSession = coding_agent_mod.AgentSession;
 const SessionEvent = coding_agent_mod.session_event.SessionEvent;
 const RuntimeHost = coding_agent_mod.RuntimeHost;
-const ConversationSnapshotPublisher = coding_agent_mod.ConversationSnapshotPublisher;
 const SettingsAction = enum {
     open_thinking,
     toggle_hide_thinking,
@@ -1748,85 +1748,15 @@ pub const Interactive = struct {
     }
 
     pub fn publishConversationState(self: *Interactive) bool {
-        return self.runtime_host.publishConversationState(self.conversationSnapshotPublisher());
+        return conversation_publish.publishConversationState(self);
     }
 
     pub fn publishQueuedSnapshot(self: *Interactive) bool {
-        return self.runtime_host.publishQueuedSnapshot(self.queuedSnapshotPublisher());
+        return conversation_publish.publishQueuedSnapshot(self);
     }
 
-    /// Agent-thread entry point for queued-snapshot publication. Skips
-    /// the publish when the run-control version hasn't moved since we
-    /// last pushed. This is how pending rows disappear after the agent
-    /// loop drains steering/follow-up during a run — the drain bumps
-    /// the version, and this call picks that up on the next event flush.
     pub fn publishQueuedSnapshotIfChanged(self: *Interactive) void {
-        const current_version = self.runtime_host.currentQueuedVersion();
-        if (current_version == self.last_published_queued_version) return;
-        if (self.publishQueuedSnapshot()) {
-            self.last_published_queued_version = current_version;
-        }
-    }
-
-    /// Soft conversation-publish cadence (ns between forced publishes
-    /// while streaming). 30 Hz feels "live" in a terminal and lets us
-    /// collapse token-rate event floods (1000+/turn) down to ~30/sec.
-    const soft_conversation_publish_cadence_ns: u64 = 33 * std.time.ns_per_ms;
-
-    fn monotonicNowNs() u64 {
-        return @intCast(std.time.nanoTimestamp());
-    }
-
-    /// Flush the latest conversation snapshot unconditionally.
-    fn flushPendingConversationPublish(self: *Interactive, event: AgentEvent) void {
-        _ = event;
-        const published = self.publishConversationState();
-        self.publishQueuedSnapshotIfChanged();
-        if (published) {
-            self.last_conversation_publish_ns = monotonicNowNs();
-            self.conversation_publish_dirty = false;
-        }
-    }
-
-    /// Soft path: mark dirty and publish only if cadence has elapsed
-    /// since the last publish. Otherwise drop — the next event will
-    /// re-check, or a hard boundary will flush. Accepted edge: a mid-
-    /// stream pause longer than the cadence leaves one pending snapshot
-    /// deferred until the next event; acceptable for P1.
-    fn maybePublishSoftConversation(self: *Interactive, event: AgentEvent) void {
-        _ = event;
-        self.conversation_publish_dirty = true;
-        const now = monotonicNowNs();
-        const elapsed = now -% self.last_conversation_publish_ns;
-        if (elapsed < soft_conversation_publish_cadence_ns) return;
-        const published = self.publishConversationState();
-        if (!published) return;
-        self.last_conversation_publish_ns = now;
-        self.conversation_publish_dirty = false;
-    }
-
-    fn conversationSnapshotPublisher(self: *Interactive) ConversationSnapshotPublisher {
-        return .{
-            .func = &publishConversationSnapshotToUi,
-            .ctx = @ptrCast(self),
-        };
-    }
-
-    fn queuedSnapshotPublisher(self: *Interactive) coding_agent_mod.runtime_host.QueuedSnapshotPublisher {
-        return .{
-            .func = &publishQueuedSnapshotToUi,
-            .ctx = @ptrCast(self),
-        };
-    }
-
-    fn publishConversationSnapshotToUi(envelope: agent_mod.conversation_state.ConversationSnapshotEnvelope, ctx: ?*anyopaque) bool {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        return self.publishSnapshotUiEvent(.{ .conversation_snapshot = envelope });
-    }
-
-    fn publishQueuedSnapshotToUi(snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot, ctx: ?*anyopaque) bool {
-        const self: *Interactive = @ptrCast(@alignCast(ctx));
-        return self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot });
+        conversation_publish.publishQueuedSnapshotIfChanged(self);
     }
 
     /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
@@ -1899,26 +1829,7 @@ pub const Interactive = struct {
     }
 
     fn publishConversationStateForAgentEvent(self: *Interactive, event: AgentEvent) void {
-        switch (event) {
-            .message_start => |payload| switch (payload.message) {
-                .assistant => self.flushPendingConversationPublish(event),
-                else => {},
-            },
-            // Soft deltas: coalesce at the configured cadence.
-            .message_update, .tool_execution_update => {
-                self.maybePublishSoftConversation(event);
-            },
-            // Hard semantic boundaries: flush now so the UI never stalls
-            // behind a dropped soft event.
-            .message_end, .tool_execution_start, .tool_execution_end, .agent_end => {
-                self.flushPendingConversationPublish(event);
-            },
-            .turn_end => |payload| {
-                if (payload.message != .assistant) return;
-                self.flushPendingConversationPublish(event);
-            },
-            .agent_start, .turn_start => {},
-        }
+        conversation_publish.publishForAgentEvent(self, event);
     }
 
     /// Raw agent event callback — runs on the AGENT THREAD.
