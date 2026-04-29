@@ -1,6 +1,5 @@
 const std = @import("std");
 const posix = std.posix;
-const mailbox_mod = @import("../runtime/mailbox.zig");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");
 const renderer_mod = @import("renderer.zig");
@@ -27,6 +26,7 @@ const app_meta = @import("../app_meta.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
+const queues_mod = @import("interactive/queues.zig");
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
@@ -50,6 +50,8 @@ const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
+const UiSnapshotQueue = queues_mod.UiSnapshotQueue;
+const UiLifecycleQueue = queues_mod.UiLifecycleQueue;
 const convertAgentUiEvent = agent_ui_event_mod.convertAgentUiEvent;
 const userFacingFailureMessage = agent_ui_event_mod.userFacingFailureMessage;
 const PendingImageAttachment = clipboard_images_mod.PendingImageAttachment;
@@ -161,86 +163,12 @@ const PublishedStatusSnapshot = struct {
     }
 };
 
-const ui_snapshot_queue_capacity: usize = 64;
-const ui_lifecycle_queue_capacity: usize = 64;
-
-/// Mailbox-backed agent/helper → TUI snapshot channel.
-///
-/// Snapshot/progress traffic is bounded and lossy: the latest semantic
-/// state will be republished, so intermediate snapshots may be dropped.
-const UiSnapshotQueue = mailbox_mod.Mailbox(UiEvent, .{
-    .cleanup = .deinit,
-    .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_newest } },
-    .wakeup = .pipe,
-});
-
-/// Mailbox-backed agent/helper → TUI lifecycle channel.
-///
-/// Terminal lifecycle outcomes must not disappear silently, so this
-/// channel rejects on overload instead of dropping.
-const UiLifecycleQueue = mailbox_mod.Mailbox(UiEvent, .{
-    .cleanup = .deinit,
-    .policy = .{ .bounded = .{ .capacity = ui_lifecycle_queue_capacity, .on_full = .reject } },
-    .wakeup = .pipe,
-});
-
 const QueuedInputKind = enum {
     steering,
     follow_up,
 };
 
 const ClipboardImageReader = *const fn (allocator: std.mem.Allocator) ?[]u8;
-
-test "UiSnapshotQueue drops newest snapshot traffic when bounded" {
-    const themes_builtin = @import("../themes/builtin.zig");
-    var q = try UiSnapshotQueue.init(std.testing.allocator);
-    defer q.deinit();
-
-    var sent: usize = 0;
-    while (sent < ui_snapshot_queue_capacity) : (sent += 1) {
-        try std.testing.expectEqual(.ok, q.trySend(.{ .theme_changed = themes_builtin.dark().* }));
-    }
-    try std.testing.expectEqual(.dropped, q.trySend(.{ .theme_changed = themes_builtin.light().* }));
-
-    const stats = q.stats();
-    try std.testing.expectEqual(@as(usize, ui_snapshot_queue_capacity), stats.pending_depth);
-    try std.testing.expectEqual(@as(usize, 1), stats.dropped_count);
-    try std.testing.expectEqual(@as(usize, ui_snapshot_queue_capacity), stats.send_count);
-}
-
-test "UiLifecycleQueue rejects overload and keeps wake semantics" {
-    var q = try UiLifecycleQueue.init(std.testing.allocator);
-    defer q.deinit();
-
-    var sent: usize = 0;
-    while (sent < ui_lifecycle_queue_capacity) : (sent += 1) {
-        try std.testing.expectEqual(.ok, q.trySend(.{ .request_worker_finished = {} }));
-    }
-    switch (q.trySend(.{ .request_worker_finished = {} })) {
-        .full => |rejected| {
-            var failed = rejected;
-            failed.deinit(std.testing.allocator);
-        },
-        else => return error.UnexpectedResult,
-    }
-
-    var pfd = [1]posix.pollfd{.{
-        .fd = q.wakeReadFd().?,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try posix.poll(&pfd, 0);
-    try std.testing.expectEqual(@as(usize, 1), ready);
-
-    var out: [ui_lifecycle_queue_capacity]UiEvent = undefined;
-    const count = q.drainInto(&out);
-    try std.testing.expectEqual(ui_lifecycle_queue_capacity, count);
-    for (out[0..count]) |*ev| ev.deinit(std.testing.allocator);
-
-    const stats = q.stats();
-    try std.testing.expectEqual(@as(usize, 1), stats.rejected_count);
-    try std.testing.expectEqual(ui_lifecycle_queue_capacity, stats.high_water_depth);
-}
 
 const StartupAction = union(enum) {
     none,
