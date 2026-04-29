@@ -1,10 +1,10 @@
-# zi(1)
+# Zi(1)
 
-## name
+## Name
 
 zi - yours-first coding agent
 
-## synopsis
+## Synopsis
 
 `zi [run-options] [@file ...] [prompt]`
 
@@ -20,7 +20,7 @@ zi - yours-first coding agent
 
 `zi --list-models [search]`
 
-## description
+## Description
 
 There are many coding agents. This one is yours.
 
@@ -30,7 +30,7 @@ You can use zi as-is. You can also teach it your habits one piece at a time: a c
 
 The goal is not to make agent work magical. The goal is to make it dependable.
 
-## philosophy
+## Philosophy
 
 zi is small on purpose.
 
@@ -40,7 +40,7 @@ Extensions are not a marketplace feature. They are how the tool becomes yours.
 
 Start small. Add one thing. Keep what helps. Delete what does not.
 
-## readers
+## Readers
 
 This manual is written for two readers:
 
@@ -51,7 +51,7 @@ When generating an extension, prefer the API documented here and adapt the close
 
 Agents and other programmatic readers should prefer the Markdown version of each page. Replace the web page suffix with `.md`, for example `cli.html` becomes `cli.md`. When following links from Markdown manually, prefer the adjacent `.md` target when available.
 
-## contents
+## Contents
 
 - [cli model](cli.html#cli-model) — run modes, prompt inputs, session selectors, and flags
 - [extension purpose](extensions.html#extension-purpose) — what extensions are for and how zi discovers them

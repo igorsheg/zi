@@ -6,9 +6,10 @@
         font-size="72"
         font-weight="400"
         fill="#dbdce1"
-        letter-spacing="0">
-    <tspan x="256" dy="0">░▀▀█░▀█▀</tspan>
-    <tspan x="256" dy="80">░▄▀░░░█░</tspan>
-    <tspan x="256" dy="80">░▀▀▀░▀▀▀</tspan>
+        letter-spacing="0"
+        xml:space="preserve">
+    <tspan x="256" dy="0"> ▀▀█ ▀█▀ </tspan>
+    <tspan x="256" dy="80"> ▄▀   █  </tspan>
+    <tspan x="256" dy="80"> ▀▀▀ ▀▀▀ </tspan>
   </text>
 </svg>

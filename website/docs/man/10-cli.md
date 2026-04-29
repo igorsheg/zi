@@ -1,4 +1,4 @@
-## cli model
+## Cli model
 
 zi chooses its run mode from the arguments you give it. No hidden ceremony is required: run `zi` for an interactive session, or choose batch mode when you want a scriptable result.
 
@@ -6,7 +6,7 @@ Interactive mode is the default when no batch selector is present. Batch mode is
 
 Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. They cannot be combined with startup prompt inputs such as positional prompt text or `@file` arguments. For extension authoring, see [extension purpose](extensions.html#extension-purpose); for lifecycle details, see [extension lifecycle](extensions.html#extension-lifecycle).
 
-## cli examples
+## Cli examples
 
 `zi`
 : Start interactive mode in the current project.
@@ -41,7 +41,7 @@ Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. 
 `zi --list-models claude`
 : List available models, optionally filtered by search text.
 
-## cli options
+## Cli options
 
 `-p`, `--print`
 : Select batch text mode. Prints the final assistant text only after completion.
@@ -82,7 +82,7 @@ Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. 
 `-v`, `--version`
 : Show the zi version.
 
-## prompt inputs
+## Prompt inputs
 
 Prompt input may come from:
 

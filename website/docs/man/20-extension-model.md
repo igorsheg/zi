@@ -1,4 +1,4 @@
-## extension purpose
+## Extension purpose
 
 An extension is just a Lua file that teaches zi one new habit.
 
@@ -23,7 +23,7 @@ Use extensions for things like:
 
 Extensions describe what should happen. zi decides how to schedule work, update the terminal UI, store session data, call providers, and render transcript output.
 
-## extension discovery
+## Extension discovery
 
 An extension root is a directory-like container. zi discovers extensions from the `extensions/` folder:
 
@@ -57,7 +57,7 @@ explicit > user > project > builtin
 
 Within a root, discovery is lexical and deterministic. Most duplicate registrations use first claimant wins. Commands are different: duplicate command names stay callable through resolved invocation names in [commands](api.html#commands).
 
-## extension loading
+## Extension loading
 
 The host installs a global `zi` table into the extension Lua state. Extensions may either register directly at top level or return a function that receives `zi`:
 
@@ -84,7 +84,7 @@ end
 
 Load/register is non-suspending. Keep it cheap and deterministic: register capabilities, initialize small local state, and defer real work to [commands](api.html#commands), [tools](api.html#tools), [events](api.html#events), jobs, or [host-owned prompts](context.html#context-ui-api).
 
-## extension lifecycle
+## Extension lifecycle
 
 An extension has two kinds of work:
 

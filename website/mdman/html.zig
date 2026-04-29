@@ -91,11 +91,11 @@ fn renderNode(writer: anytype, node: Node) !void {
             if (cb.language) |lang| {
                 try writer.writeAll("<figure class=\"manual-code\"><figcaption>");
                 try escapeAndWrite(writer, lang);
-                try writer.print("</figcaption><pre><code class=\"language-{s}\">", .{lang});
+                try writer.print("</figcaption><pre tabindex=\"0\"><code class=\"language-{s}\">", .{lang});
             } else {
-                try writer.writeAll("<figure class=\"manual-code\"><pre><code>");
+                try writer.writeAll("<figure class=\"manual-code\"><pre tabindex=\"0\"><code>");
             }
-            try escapeAndWrite(writer, cb.content);
+            try renderCode(writer, cb.language, cb.content);
             try writer.writeAll("</code></pre></figure>\n");
         },
         .bullet_list => |items| {
@@ -183,6 +183,110 @@ fn renderSpans(writer: anytype, spans: []const Span) !void {
             },
         }
     }
+}
+
+fn renderCode(writer: anytype, language: ?[]const u8, code: []const u8) !void {
+    if (language) |lang| {
+        if (std.ascii.eqlIgnoreCase(lang, "lua")) {
+            return renderLuaCode(writer, code);
+        }
+    }
+
+    try escapeAndWrite(writer, code);
+}
+
+fn renderLuaCode(writer: anytype, code: []const u8) !void {
+    var i: usize = 0;
+    while (i < code.len) {
+        if (std.mem.startsWith(u8, code[i..], "--[[")) {
+            const end = std.mem.indexOf(u8, code[i + 4 ..], "]]" ) orelse code.len - i - 4;
+            const token = code[i .. i + 4 + end + @as(usize, if (i + 4 + end < code.len) 2 else 0)];
+            try renderToken(writer, "tok-comment", token);
+            i += token.len;
+        } else if (std.mem.startsWith(u8, code[i..], "--")) {
+            const end = std.mem.indexOfScalar(u8, code[i..], '\n') orelse code.len - i;
+            try renderToken(writer, "tok-comment", code[i .. i + end]);
+            i += end;
+        } else if (std.mem.startsWith(u8, code[i..], "[[")) {
+            const end = std.mem.indexOf(u8, code[i + 2 ..], "]]" ) orelse code.len - i - 2;
+            const token = code[i .. i + 2 + end + @as(usize, if (i + 2 + end < code.len) 2 else 0)];
+            try renderToken(writer, "tok-string", token);
+            i += token.len;
+        } else if (code[i] == '"' or code[i] == '\'') {
+            const quote = code[i];
+            var end = i + 1;
+            while (end < code.len) : (end += 1) {
+                if (code[end] == '\\' and end + 1 < code.len) {
+                    end += 1;
+                    continue;
+                }
+                if (code[end] == quote) {
+                    end += 1;
+                    break;
+                }
+            }
+            try renderToken(writer, "tok-string", code[i..end]);
+            i = end;
+        } else if (isDigit(code[i])) {
+            var end = i + 1;
+            while (end < code.len and (isIdentContinue(code[end]) or code[end] == '.')) : (end += 1) {}
+            try renderToken(writer, "tok-number", code[i..end]);
+            i = end;
+        } else if (isIdentStart(code[i])) {
+            var end = i + 1;
+            while (end < code.len and isIdentContinue(code[end])) : (end += 1) {}
+            const word = code[i..end];
+            if (isLuaKeyword(word)) {
+                try renderToken(writer, "tok-keyword", word);
+            } else if (isLuaLiteral(word)) {
+                try renderToken(writer, "tok-literal", word);
+            } else {
+                try escapeAndWrite(writer, word);
+            }
+            i = end;
+        } else {
+            try escapeAndWrite(writer, code[i .. i + 1]);
+            i += 1;
+        }
+    }
+}
+
+fn renderToken(writer: anytype, class: []const u8, text: []const u8) !void {
+    try writer.print("<span class=\"{s}\">", .{class});
+    try escapeAndWrite(writer, text);
+    try writer.writeAll("</span>");
+}
+
+fn isLuaKeyword(word: []const u8) bool {
+    const keywords = [_][]const u8{
+        "and", "break", "do", "else", "elseif", "end", "for", "function",
+        "goto", "if", "in", "local", "not", "or", "repeat", "return",
+        "then", "until", "while",
+    };
+    for (keywords) |keyword| {
+        if (std.mem.eql(u8, word, keyword)) return true;
+    }
+    return false;
+}
+
+fn isLuaLiteral(word: []const u8) bool {
+    return std.mem.eql(u8, word, "nil") or
+        std.mem.eql(u8, word, "true") or
+        std.mem.eql(u8, word, "false");
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        c == '_';
+}
+
+fn isIdentContinue(c: u8) bool {
+    return isIdentStart(c) or isDigit(c);
+}
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
 }
 
 fn escapeAndWrite(writer: anytype, text: []const u8) !void {

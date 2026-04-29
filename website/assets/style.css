@@ -49,15 +49,35 @@
   :root {
     color-scheme: dark;
 
-    /* raw tokens */
-    --black: #000;
-    --white: #f4f4f4;
-    --gray-300: #c9c9c9;
-    --gray-400: #b7b7b7;
-    --gray-500: #8a8a8a;
-    --gray-600: #5f5f5f;
-    --gray-800: #242424;
-    --gray-900: #111;
+    /*
+      Color contract:
+      - the site is monochrome-first: ink, paper, line, annotation
+      - accent is reserved for affordance: focus, hover, selection, syntax
+      - long-form manual text uses --color-prose on --color-bg
+      - metadata uses --color-muted or --color-dim
+    */
+    --hue-ink: 255;
+    --hue-accent: 190;
+    --hue-green: 150;
+    --hue-violet: 285;
+
+    /* cool ink ramp: ordered by perceived lightness */
+    --ink-bg: oklch(7.5% 0.012 var(--hue-ink));
+    --ink-panel: oklch(10.5% 0.012 var(--hue-ink));
+    --ink-code: oklch(14% 0.014 var(--hue-ink));
+    --ink-line: oklch(22% 0.014 var(--hue-ink));
+    --ink-dim: oklch(42% 0.014 var(--hue-ink));
+    --ink-muted: oklch(58% 0.014 var(--hue-ink));
+    --ink-prose: oklch(76% 0.014 var(--hue-ink));
+    --ink-subtle: oklch(86% 0.01 var(--hue-ink));
+    --ink-fg: oklch(94% 0.008 var(--hue-ink));
+
+    /* low-chroma color: visible, but not decorative */
+    --accent-fg: oklch(78% 0.055 var(--hue-accent));
+    --accent-muted: oklch(62% 0.035 var(--hue-accent));
+    --accent-dim: oklch(42% 0.028 var(--hue-accent));
+    --syntax-green: oklch(74% 0.045 var(--hue-green));
+    --syntax-violet: oklch(70% 0.04 var(--hue-violet));
 
     --font-mono:
       "Fragment Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -85,38 +105,149 @@
     --prose-gap: var(--space-4);
     --prose-section-gap: var(--space-10);
 
-    /* type scale: sizes and line heights resolve to the 4px grid */
-    --text--1: 0.875rem; /* 14px */
-    --text-0: 1rem; /* 16px */
-    --text-1: 1.25rem; /* 20px */
-    --text-2: clamp(1.75rem, 4vw, 4rem); /* 28px -> 64px */
-    --text-logo: clamp(4rem, 18vw, 10rem); /* 64px -> 160px */
+    /* type scale */
+    --step--1: 0.875rem; /* 14px */
+    --step-0: 1rem; /* 16px */
+    --step-1: 1.25rem; /* 20px */
+    --step-title: clamp(1.75rem, 4vw, 4rem); /* 28px -> 64px */
+    --step-logo: 1rem; /* stepped for crisper block-art rendering */
 
-    --leading--1: 1.25rem; /* 20px */
-    --leading-0: 1.5rem; /* 24px */
-    --leading-1: 1.75rem; /* 28px */
-    --leading-2: 4rem; /* 64px */
-    --leading-logo: 8rem; /* 128px */
+    /* line heights: body text stays on the 4px grid; display uses ratios */
+    --line--1: 1.25rem; /* 20px */
+    --line-0: 1.5rem; /* 24px */
+    --line-1: 1.75rem; /* 28px */
+    --line-tight: 0.95;
+    --line-logo: 1;
+
+    /* semantic type roles */
+    --text-man: var(--step--1);
+    --line-man: var(--line--1);
+    --text-body: var(--step-0);
+    --line-body: var(--line-0);
+    --text-lede: var(--step-0);
+    --line-lede: var(--line-0);
+    --text-title: var(--step-title);
+    --line-title: var(--line-tight);
+    --text-logo: var(--step-logo);
+    --line-logo-display: var(--line-logo);
+    --tracking-title: -0.08em;
+    --tracking-logo: 0;
 
     /* semantic tokens */
-    --color-bg: var(--black);
-    --color-fg: var(--white);
-    --color-prose: var(--gray-400);
-    --color-muted: var(--gray-500);
-    --color-dim: var(--gray-600);
-    --color-subtle: var(--gray-300);
-    --color-border: var(--gray-800);
-    --color-code-bg: var(--gray-900);
+    --color-bg: var(--ink-bg);
+    --color-panel: var(--ink-panel);
+    --color-code-bg: var(--ink-code);
+    --color-fg: var(--ink-fg);
+    --color-subtle: var(--ink-subtle);
+    --color-prose: var(--ink-prose);
+    --color-muted: var(--ink-muted);
+    --color-dim: var(--ink-dim);
+    --color-line: var(--ink-line);
+    --color-border: var(--color-line);
+    --color-rule: color-mix(in oklch, var(--color-line), var(--color-fg) 8%);
+    --color-accent: var(--accent-fg);
+    --color-accent-muted: var(--accent-muted);
+    --color-accent-dim: var(--accent-dim);
+    --color-link-underline: color-mix(in oklch, var(--color-muted), var(--color-accent) 20%);
+    --color-selection: color-mix(in oklch, var(--color-accent) 35%, var(--color-fg));
+    --color-selection-fg: var(--color-bg);
+    --syntax-keyword: var(--color-fg);
+    --syntax-literal: var(--color-accent);
+    --syntax-string: var(--syntax-green);
+    --syntax-number: var(--syntax-violet);
+    --syntax-comment: var(--color-dim);
 
+    --line-width: 1px;
+    --target-min: 2.75rem;
     --page-pad: clamp(var(--space-4), 4vw, var(--space-8));
-    --focus-ring: 2px solid var(--color-fg);
+    --focus-width: 2px;
+    --focus-ring: var(--focus-width) solid var(--color-accent);
+    --link-thickness: var(--line-width);
+  }
+
+  @supports not (color: oklch(50% 0 0)) {
+    :root {
+      --ink-bg: #050507;
+      --ink-panel: #0c0c11;
+      --ink-code: #121218;
+      --ink-line: #292933;
+      --ink-dim: #62626f;
+      --ink-muted: #8e8e9a;
+      --ink-prose: #bdbdc6;
+      --ink-subtle: #d8d8de;
+      --ink-fg: #f1f1f4;
+      --accent-fg: #83d5dc;
+      --accent-muted: #6aaeb5;
+      --accent-dim: #3e757b;
+      --syntax-green: #9bcba8;
+      --syntax-violet: #b8a2d2;
+      --color-rule: var(--color-border);
+      --color-link-underline: var(--color-muted);
+      --color-selection: var(--color-fg);
+    }
+  }
+
+  @media (prefers-contrast: more) {
+    :root {
+      --ink-line: oklch(34% 0.014 var(--hue-ink));
+      --ink-dim: oklch(56% 0.014 var(--hue-ink));
+      --ink-muted: oklch(70% 0.014 var(--hue-ink));
+      --ink-prose: oklch(88% 0.01 var(--hue-ink));
+      --ink-subtle: oklch(94% 0.008 var(--hue-ink));
+      --accent-fg: oklch(88% 0.065 var(--hue-accent));
+      --color-link-underline: var(--color-accent);
+      --color-selection: var(--color-accent);
+      --focus-width: 3px;
+      --link-thickness: 2px;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      transition-delay: 0s !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }
+
+  @media (forced-colors: active) {
+    :root {
+      color-scheme: light dark;
+      --color-bg: Canvas;
+      --color-panel: Canvas;
+      --color-code-bg: Canvas;
+      --color-fg: CanvasText;
+      --color-subtle: CanvasText;
+      --color-prose: CanvasText;
+      --color-muted: CanvasText;
+      --color-dim: GrayText;
+      --color-line: CanvasText;
+      --color-border: CanvasText;
+      --color-rule: CanvasText;
+      --color-accent: LinkText;
+      --color-accent-muted: LinkText;
+      --color-accent-dim: LinkText;
+      --color-link-underline: LinkText;
+      --color-selection: Highlight;
+      --color-selection-fg: HighlightText;
+      --syntax-keyword: CanvasText;
+      --syntax-literal: CanvasText;
+      --syntax-string: CanvasText;
+      --syntax-number: CanvasText;
+      --syntax-comment: GrayText;
+    }
   }
 }
 
 @layer base {
   html {
     block-size: 100%;
-    text-size-adjust: none;
+    scroll-padding-block-start: var(--space-8);
+    text-size-adjust: 100%;
   }
 
   body {
@@ -124,20 +255,22 @@
     background: var(--color-bg);
     color: var(--color-fg);
     font-family: var(--font-mono);
-    font-size: var(--text-0);
-    line-height: var(--leading-0);
+    font-size: var(--text-body);
+    line-height: var(--line-body);
     text-rendering: optimizeLegibility;
   }
 
   a {
-    color: var(--color-fg);
-    text-decoration-color: var(--color-muted);
-    text-decoration-thickness: 1px;
+    color: inherit;
+    text-decoration-color: var(--color-link-underline);
+    text-decoration-thickness: var(--link-thickness);
     text-underline-offset: 0.25em;
+    touch-action: manipulation;
   }
 
   a:hover {
-    text-decoration-color: var(--color-fg);
+    color: var(--color-fg);
+    text-decoration-color: var(--color-accent);
   }
 
   :focus-visible {
@@ -145,9 +278,25 @@
     outline-offset: var(--space-1);
   }
 
+  .skip-link {
+    position: fixed;
+    inset-block-start: var(--space-2);
+    inset-inline-start: var(--space-2);
+    z-index: 1;
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-bg);
+    color: var(--color-fg);
+    border: var(--line-width) solid var(--color-rule);
+    transform: translateY(calc(-100% - var(--space-4)));
+  }
+
+  .skip-link:focus-visible {
+    transform: translateY(0);
+  }
+
   ::selection {
-    background: var(--color-fg);
-    color: var(--color-bg);
+    background: var(--color-selection);
+    color: var(--color-selection-fg);
   }
 
   code {
@@ -160,6 +309,10 @@
     overflow-x: auto;
     padding: var(--space-4);
     background: var(--color-code-bg);
+  }
+
+  pre:focus-visible {
+    outline-offset: var(--space-1);
   }
 
   pre code {
@@ -189,23 +342,50 @@
 
 @layer components {
   .logo {
+    display: inline-block;
+    inline-size: max-content;
+    overflow: visible;
+    overflow-wrap: normal;
+    padding: 0;
+    background: transparent;
+    color: var(--color-subtle);
     font-size: var(--text-logo);
-    font-weight: 600;
-    line-height: var(--leading-logo);
-    letter-spacing: -0.12em;
+    font-weight: 400;
+    font-synthesis: none;
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "calt" 0;
+    line-height: var(--line-logo-display);
+    letter-spacing: var(--tracking-logo);
+    tab-size: 2;
+    text-rendering: geometricPrecision;
+    white-space: pre;
   }
 
   .title {
     max-inline-size: var(--measure-xs);
-    font-size: var(--text-2);
+    font-size: var(--text-title);
     font-weight: 600;
-    line-height: var(--leading-2);
-    letter-spacing: -0.08em;
+    line-height: var(--line-title);
+    letter-spacing: var(--tracking-title);
+  }
+
+  @media (min-width: 40rem) {
+    :root {
+      --step-logo: 1.5rem;
+    }
+  }
+
+  @media (min-width: 64rem) {
+    :root {
+      --step-logo: 2rem;
+    }
   }
 
   .lede {
     max-inline-size: var(--measure-sm);
     color: var(--color-muted);
+    font-size: var(--text-lede);
+    line-height: var(--line-lede);
   }
 
   .site-nav {
@@ -214,6 +394,20 @@
 
   .site-nav a {
     color: inherit;
+  }
+
+  .site-nav a[aria-current] {
+    color: var(--color-fg);
+  }
+
+  @media (pointer: coarse) {
+    .cluster a,
+    .manual-view a,
+    .manual-pager a {
+      min-block-size: var(--target-min);
+      display: inline-flex;
+      align-items: center;
+    }
   }
 }
 
@@ -228,14 +422,14 @@
     inline-size: min(100% - (2 * var(--page-pad)), var(--measure-man));
     padding-block: var(--space-8) var(--space-16);
     color: var(--color-prose);
-    font-size: var(--text--1);
-    line-height: var(--leading--1);
+    font-size: var(--text-man);
+    line-height: var(--line-man);
   }
 
   .manual .site-nav {
     margin-block-end: var(--space-8);
-    font-size: var(--text--1);
-    line-height: var(--leading--1);
+    font-size: var(--text-man);
+    line-height: var(--line-man);
   }
 
   .manual-mast {
@@ -280,10 +474,9 @@
   .manual h2,
   .manual h3 {
     color: var(--color-fg);
-    font-size: var(--text--1);
+    font-size: var(--text-man);
     font-weight: 600;
-    line-height: var(--leading--1);
-    text-transform: lowercase;
+    line-height: var(--line-man);
     scroll-margin-block-start: var(--space-8);
   }
 
@@ -396,14 +589,39 @@
 
   .manual pre {
     background: transparent;
-    border-inline-start: 1px solid var(--color-border);
+    border-inline-start: var(--line-width) solid var(--color-rule);
     padding-block: var(--space-3);
     padding-inline: var(--space-4) 0;
   }
 
+  .manual pre code {
+    color: var(--color-muted);
+  }
+
+  .manual .tok-keyword {
+    color: var(--syntax-keyword);
+    font-weight: 600;
+  }
+
+  .manual .tok-literal {
+    color: var(--syntax-literal);
+  }
+
+  .manual .tok-number {
+    color: var(--syntax-number);
+  }
+
+  .manual .tok-string {
+    color: var(--syntax-string);
+  }
+
+  .manual .tok-comment {
+    color: var(--syntax-comment);
+  }
+
   .manual blockquote {
     padding-inline-start: var(--prose-indent);
-    border-inline-start: 1px solid var(--color-border);
+    border-inline-start: var(--line-width) solid var(--color-rule);
     color: var(--color-muted);
   }
 
@@ -446,6 +664,7 @@
     display: inline-grid;
     grid-template-columns: 1ch 1fr;
     gap: var(--space-2);
+    padding-block: var(--space-1);
     color: inherit;
     text-decoration: none;
   }
@@ -474,7 +693,7 @@
     gap: var(--space-4);
     margin-block-start: var(--space-16);
     padding-block-start: var(--space-4);
-    border-block-start: 1px solid var(--color-border);
+    border-block-start: var(--line-width) solid var(--color-rule);
   }
 
   .manual-pager a {
@@ -495,13 +714,35 @@
   @media print {
     :root {
       color-scheme: light;
+      --color-bg: white;
+      --color-panel: oklch(98% 0 0);
+      --color-code-bg: oklch(96% 0 0);
+      --color-fg: black;
+      --color-subtle: oklch(24% 0 0);
+      --color-prose: oklch(28% 0 0);
+      --color-muted: oklch(42% 0 0);
+      --color-dim: oklch(52% 0 0);
+      --color-border: oklch(78% 0 0);
+      --color-line: var(--color-border);
+      --color-rule: var(--color-border);
+      --color-accent: black;
+      --color-accent-muted: oklch(42% 0 0);
+      --color-accent-dim: oklch(52% 0 0);
+      --color-link-underline: oklch(65% 0 0);
+      --color-selection: oklch(88% 0 0);
+      --syntax-keyword: black;
+      --syntax-literal: black;
+      --syntax-string: oklch(28% 0 0);
+      --syntax-number: oklch(28% 0 0);
+      --syntax-comment: oklch(52% 0 0);
     }
 
     body {
-      background: white;
-      color: black;
+      background: var(--color-bg);
+      color: var(--color-fg);
     }
 
+    .skip-link,
     .site-nav,
     .manual-toc,
     .manual-pager,
@@ -512,7 +753,7 @@
     .manual {
       inline-size: auto;
       padding: 0;
-      color: black;
+      color: var(--color-prose);
       font-size: 10pt;
       line-height: 14pt;
     }
@@ -527,12 +768,12 @@
     .manual dt,
     .manual strong,
     .manual :not(pre) > code {
-      color: black;
+      color: var(--color-fg);
     }
 
     .manual pre,
     .manual blockquote {
-      border-color: #999;
+      border-color: var(--color-border);
     }
   }
 
@@ -560,7 +801,7 @@
 
     .manual dd {
       padding-block-end: var(--space-3);
-      border-block-end: 1px solid var(--color-border);
+      border-block-end: var(--line-width) solid var(--color-rule);
     }
 
     .manual dd + dt {

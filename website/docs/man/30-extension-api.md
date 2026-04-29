@@ -1,4 +1,4 @@
-## extension api: zi table
+## Extension api: zi table
 
 The extension API is deliberately plain.
 
@@ -28,7 +28,7 @@ Prefer small tools. Prefer explicit names. Prefer behavior that will still make 
 `zi.system(argv, opts?)`
 : Run an argv-style system command through the extension async scheduler. Captures bounded stdout/stderr and returns a structured result.
 
-## tools
+## Tools
 
 Tools are definition-first. A tool definition is the unit zi exposes to the model. Keep each tool narrow: one clear name, one clear parameter shape, one readable result. Tool handlers receive the shared [context object](context.html#context-object).
 
@@ -75,7 +75,7 @@ A terminal tool result has this shape:
 
 Tool names are unique. If a later extension registers a tool with an already-claimed name, the later registration is ignored and `zi.register_tool` returns `false`. This keeps ownership explicit.
 
-## commands
+## Commands
 
 Commands are direct user actions. Use them for things a person asks zi to do now: open a report, save a note, start a workflow, or change local state.
 
@@ -119,7 +119,7 @@ Slash command ordering is:
 
 Built-ins stay TUI-local when they need immediate UI/session behavior. Extension commands enqueue semantic command work to the agent thread. Command handlers receive the same [context object](context.html#context-object) as tools and events.
 
-## providers
+## Providers
 
 Providers let extensions add or override visible model/provider choices. Use them to describe what models exist; use events to rewrite requests.
 
@@ -152,7 +152,7 @@ Built-in visible provider names with override support today are:
 
 Provider registration changes the host-owned provider/model views. Extensions own claims, not provider runtime pointers or credential persistence. Use [before_provider_request](#events) for request rewriting, and [context model and ai api](context.html#context-model-and-ai-api) for model inspection/completions.
 
-## events
+## Events
 
 `zi.on(name, handler)` registers an observer or interceptor. Handlers receive `(event, ctx)`, where `ctx` is described in [context object](context.html#context-object).
 

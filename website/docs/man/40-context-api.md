@@ -1,4 +1,4 @@
-## context object
+## Context object
 
 Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.html#events) receive `ctx`.
 
@@ -49,7 +49,7 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 `ctx.get_system_prompt()`
 : Return the active system prompt when bound.
 
-## context ui api
+## Context ui api
 
 The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Say what you want the user to see; let the host decide where it fits. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
 
@@ -85,7 +85,7 @@ The UI API publishes presentation intent. Extensions do not own terminal compone
 
 Surface option tables may include `placement` and `lifetime`. `lifetime` is `session` or `until_input`.
 
-## context state api
+## Context state api
 
 `ctx.state` is a per-extension session-persisted map. Use it for small choices and facts your extension owns.
 
@@ -100,7 +100,7 @@ Surface option tables may include `placement` and `lifetime`. `lifetime` is `ses
 
 State is scoped to the extension and active session. It may survive session changes according to the lifecycle rules in [extension lifecycle](extensions.html#extension-lifecycle). UI handles, prompts, jobs, and provider handles are live objects and should be recreated when needed.
 
-## context session api
+## Context session api
 
 `ctx.session.info()`
 : Return semantic session information.
@@ -159,7 +159,7 @@ for _, entry in ipairs(ctx.session.entries({ label = "decision", limit = 20 })) 
 end
 ```
 
-## context model and ai api
+## Context model and ai api
 
 `ctx.models.list()`
 : Return visible model catalog entries.
@@ -195,7 +195,7 @@ The result shape is:
 { status = "cancelled" }
 ```
 
-## system command helper
+## System command helper
 
 `zi.system(argv, opts?)` runs an OS command directly from an argv array. It is yieldable and should be called from command/tool execution contexts, not extension load/register code. Prefer bounded, explicit commands over shell strings.
 
@@ -245,7 +245,7 @@ Result shapes:
 
 Non-zero exits are `status = "completed"`; inspect `code`.
 
-## spawn helper
+## Spawn helper
 
 `zi.spawn(opts)` runs delegated child zi work through batch JSON mode and returns a table shaped like a tool result. This is for real delegation, not ordinary helper logic. Prefer normal [tools](api.html#tools), [commands](api.html#commands), and [context model and ai api](#context-model-and-ai-api) when a child agent is not required.
 

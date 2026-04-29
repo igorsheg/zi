@@ -1,4 +1,4 @@
-## extension design rules
+## Extension design rules
 
 Good zi extensions are small, inspectable, and kind to the user.
 
@@ -10,7 +10,7 @@ Prefer documented host APIs over host details. Do not depend on TUI components, 
 
 Keep load/register cheap and deterministic. Register capabilities at load time; do real work later, when a tool, command, or event is running with a live context.
 
-## choose the smallest surface
+## Choose the smallest surface
 
 Use [tools](api.html#tools) for model-visible capabilities.
 
@@ -26,7 +26,7 @@ Use [`ctx.ai.complete`](context.html#context-model-and-ai-api) for side-channel 
 
 Use [`zi.register_provider`](api.html#providers) for provider/model visibility, not for request rewriting. Use [`before_provider_request`](api.html#events) for request rewriting.
 
-## capability guide
+## Capability guide
 
 Need: add an action the model can call
 : Use [tools](api.html#tools).
@@ -67,7 +67,7 @@ Need: run a bounded OS command from extension code
 Need: delegate work to a child zi run
 : Use [spawn helper](context.html#spawn-helper).
 
-## canonical patterns
+## Canonical patterns
 
 A model-visible tool has one job: accept structured parameters, perform the action, and return content. If the behavior cannot be described in one sentence, split it.
 
@@ -126,7 +126,7 @@ zi.on("message", function(event, ctx)
 end)
 ```
 
-## kindness rules
+## Kindness rules
 
 Ask before destructive actions.
 
@@ -142,7 +142,7 @@ Return readable errors. A person should know what failed and what they can try n
 
 Keep generated extensions short enough to review.
 
-## extension examples
+## Extension examples
 
 `hello.lua`
 : Minimal tool registration.
