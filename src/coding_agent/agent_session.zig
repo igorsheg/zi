@@ -18,6 +18,7 @@ const model_control = @import("agent_session/model_control.zig");
 const runtime_state = @import("agent_session/runtime_state.zig");
 const runtime_session = @import("agent_session/runtime_session.zig");
 const ai_completion_runtime = @import("agent_session/ai_completion_runtime.zig");
+const runtime_models = @import("agent_session/runtime_models.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
@@ -700,36 +701,16 @@ pub const AgentSession = struct {
 
     fn runtimeModelsGet(session_ptr: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        const registry = self.model_registry orelse return null;
-        var arr = std.json.Array.init(allocator);
-        for (registry.getAll()) |model| arr.append(modelJson(allocator, model) catch return null) catch return null;
-        return .{ .array = arr };
+        return runtime_models.modelsGet(self, allocator);
     }
 
     fn runtimeModelsGetOne(session_ptr: *anyopaque, allocator: std.mem.Allocator, model_ref: []const u8) ?std.json.Value {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        const model = self.resolveModelRef(model_ref) orelse return null;
-        return modelJson(allocator, model) catch null;
+        return runtime_models.modelGet(self, allocator, model_ref);
     }
 
     pub fn resolveModelRef(self: *AgentSession, model_ref: []const u8) ?ai.protocol.Model {
-        const registry = self.model_registry orelse return null;
-        const parsed = resolve_mod.parseModelPattern(self.allocator, model_ref, registry.getAll(), .{});
-        return parsed.model orelse registry.findByProviderName(ai.json_util.providerToString(self.agent.modelValue().provider), model_ref);
-    }
-
-    fn modelJson(allocator: std.mem.Allocator, model: protocol.Model) !std.json.Value {
-        var obj = std.json.ObjectMap.init(allocator);
-        try obj.put(try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, model.id) });
-        try obj.put(try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, model.name) });
-        const provider = ai.json_util.providerToString(model.provider);
-        try obj.put(try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, provider) });
-        const api = ai.provider.apiToString(model.api);
-        try obj.put(try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, api) });
-        try obj.put(try allocator.dupe(u8, "context_window"), .{ .integer = @intCast(model.context_window) });
-        try obj.put(try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(model.max_tokens) });
-        try obj.put(try allocator.dupe(u8, "reasoning"), .{ .bool = model.reasoning });
-        return .{ .object = obj };
+        return runtime_models.resolveModelRef(self, model_ref);
     }
 
     fn runtimeIsIdle(session_ptr: *anyopaque) bool {
