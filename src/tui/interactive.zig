@@ -38,6 +38,7 @@ const session_requests_mod = @import("interactive/session_requests.zig");
 const model_requests_mod = @import("interactive/model_requests.zig");
 const session_events_mod = @import("interactive/session_events.zig");
 const key_flow_mod = @import("interactive/key_flow.zig");
+const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -1568,7 +1569,7 @@ pub const Interactive = struct {
         _ = self.tui.showOverlay(self.hotkeys_overlay.component(), self.centerDialogOptions());
     }
 
-    fn configureSimplePicker(
+    pub fn configureSimplePicker(
         self: *Interactive,
         picker: *ListPicker,
         title: []const u8,
@@ -1586,7 +1587,7 @@ pub const Interactive = struct {
         picker.callback_ctx = @ptrCast(self);
     }
 
-    fn showSimplePickerOverlay(
+    pub fn showSimplePickerOverlay(
         self: *Interactive,
         handle: *?tui_mod.OverlayHandle,
         picker: *ListPicker,
@@ -1596,7 +1597,7 @@ pub const Interactive = struct {
         handle.* = self.tui.showOverlay(picker.component(), self.bottomSheetOptions());
     }
 
-    fn hideSimplePickerOverlay(self: *Interactive, handle: *?tui_mod.OverlayHandle) void {
+    pub fn hideSimplePickerOverlay(self: *Interactive, handle: *?tui_mod.OverlayHandle) void {
         _ = self;
         if (handle.*) |h| {
             handle.* = null;
@@ -1909,51 +1910,12 @@ pub const Interactive = struct {
     // ── Settings picker (/settings) ─────────────────────────────
 
     fn showSettingsPicker(self: *Interactive) void {
-        var count: usize = 0;
-
-        self.settings_picker_items[count] = .{
-            .value = "thinking",
-            .label = "Thinking level",
-            .description = currentThinkingSettingsDescription(self),
-        };
-        self.settings_picker_actions[count] = .open_thinking;
-        count += 1;
-
-        self.settings_picker_items[count] = .{
-            .value = "hide-thinking",
-            .label = "Hide thinking",
-            .description = if (self.hide_thinking_block) "On" else "Off",
-        };
-        self.settings_picker_actions[count] = .toggle_hide_thinking;
-        count += 1;
-
-        self.settings_picker_count = count;
-        self.configureSimplePicker(
-            &self.settings_picker,
-            "Settings",
-            10,
-            self.settings_picker_items[0..count],
-            &onSettingsSelected,
-            &onSettingsPickerCancel,
-        );
-        self.showSimplePickerOverlay(&self.settings_picker_handle, &self.settings_picker);
+        settings_flow_mod.showSettings(self, &onSettingsSelected, &onSettingsPickerCancel);
     }
 
     fn onSettingsSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.hideSimplePickerOverlay(&self.settings_picker_handle);
-        if (selection.source_index >= self.settings_picker_count) return;
-
-        switch (self.settings_picker_actions[selection.source_index]) {
-            .open_thinking => self.showThinkingLevelPicker(),
-            .toggle_hide_thinking => {
-                self.hide_thinking_block = !self.hide_thinking_block;
-                self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
-                self.applyTranscriptHideThinkingBlock();
-                self.status_line.setPrimary(if (self.hide_thinking_block) "thinking hidden" else "thinking shown", self.theme.fg(.success));
-                self.tui.dirty = true;
-            },
-        }
+        settings_flow_mod.settingsSelected(self, selection, &onThinkingLevelSelected, &onThinkingLevelPickerCancel);
     }
 
     fn onSettingsPickerCancel(ctx: ?*anyopaque) void {
@@ -1962,42 +1924,12 @@ pub const Interactive = struct {
     }
 
     fn showThinkingLevelPicker(self: *Interactive) void {
-        const model = currentStatusModel(self) orelse {
-            self.status_line.setPrimary("current model unavailable", self.theme.fg(.@"error"));
-            self.tui.dirty = true;
-            return;
-        };
-        const available = coding_agent_mod.AgentSession.getAvailableThinkingLevelsForModel(model);
-        const count = @min(available.len, self.thinking_picker_items.len);
-        for (0..count) |i| {
-            const level = available[i];
-            self.thinking_picker_levels[i] = level;
-            self.thinking_picker_items[i] = .{
-                .value = thinking_mod.value(level),
-                .label = thinking_mod.value(level),
-                .description = thinking_mod.description(level),
-            };
-        }
-        self.thinking_picker_count = count;
-        self.configureSimplePicker(
-            &self.thinking_picker,
-            "Thinking level",
-            8,
-            self.thinking_picker_items[0..count],
-            &onThinkingLevelSelected,
-            &onThinkingLevelPickerCancel,
-        );
-        self.thinking_picker.setInitialSelectionByValue(if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off");
-        self.showSimplePickerOverlay(&self.thinking_picker_handle, &self.thinking_picker);
+        settings_flow_mod.showThinkingLevel(self, &onThinkingLevelSelected, &onThinkingLevelPickerCancel);
     }
 
     fn onThinkingLevelSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.hideSimplePickerOverlay(&self.thinking_picker_handle);
-
-        if (selection.source_index < self.thinking_picker_count) {
-            self.applyThinkingLevelChange(self.thinking_picker_levels[selection.source_index]);
-        }
+        settings_flow_mod.thinkingLevelSelected(self, selection);
     }
 
     fn onThinkingLevelPickerCancel(ctx: ?*anyopaque) void {
@@ -2005,7 +1937,7 @@ pub const Interactive = struct {
         self.hideSimplePickerOverlay(&self.thinking_picker_handle);
     }
 
-    fn applyThinkingLevelChange(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
+    pub fn applyThinkingLevelChange(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         _ = self.dispatchIdleRequest(.{ .set_thinking_level = .{ .level = level } }, .{
             .busy_message = "cannot change thinking level while agent is running",
             .loader_message = "Updating thinking level...",
@@ -2702,20 +2634,3 @@ pub const Interactive = struct {
         session_events_mod.handle(self, event);
     }
 };
-
-fn currentThinkingSettingsDescription(self: *const Interactive) []const u8 {
-    const model = currentStatusModel(self) orelse return "Current model unavailable";
-    if (!model.reasoning) return "Current model does not support thinking";
-    return if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off";
-}
-
-fn currentStatusModel(self: *const Interactive) ?ai_protocol.Model {
-    for (self.model_catalog) |model| {
-        if (std.mem.eql(u8, json_util.providerToString(model.provider), self.status_data.model_provider) and
-            std.mem.eql(u8, model.id, self.status_data.model_id))
-        {
-            return model;
-        }
-    }
-    return null;
-}
