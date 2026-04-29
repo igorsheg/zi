@@ -19,6 +19,7 @@ const runtime_state = @import("agent_session/runtime_state.zig");
 const runtime_session = @import("agent_session/runtime_session.zig");
 const ai_completion_runtime = @import("agent_session/ai_completion_runtime.zig");
 const runtime_models = @import("agent_session/runtime_models.zig");
+const runtime_ui = @import("agent_session/runtime_ui.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
@@ -26,8 +27,6 @@ const event_bridge = @import("extensions/event_bridge.zig");
 const pending_extension_ui_mod = @import("agent_session/pending_extension_ui.zig");
 const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
-const request_mod = @import("request.zig");
-const resolve_mod = @import("resolve.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -604,14 +603,14 @@ pub const AgentSession = struct {
             .session_labels_get = &runtimeSessionLabelsGet,
             .session_entry_get = &runtimeSessionEntryGet,
             .session_entries_get = &runtimeSessionEntriesGet,
-            .publish_report = &runtimePublishReport,
-            .publish_prompt = &runtimePublishPrompt,
-            .resolve_prompt = &runtimeResolvePrompt,
-            .cancel_prompts = &runtimeCancelPrompts,
-            .publish_ui = &runtimePublishUi,
-            .revoke_ui = &runtimeRevokeUi,
-            .publish_editor_action = &runtimePublishEditorAction,
-            .clear_editor_actions = &runtimeClearEditorActions,
+            .publish_report = &runtime_ui.publishReport,
+            .publish_prompt = &runtime_ui.publishPrompt,
+            .resolve_prompt = &runtime_ui.resolvePrompt,
+            .cancel_prompts = &runtime_ui.cancelPrompts,
+            .publish_ui = &runtime_ui.publishUi,
+            .revoke_ui = &runtime_ui.revokeUi,
+            .publish_editor_action = &runtime_ui.publishEditorAction,
+            .clear_editor_actions = &runtime_ui.clearEditorActions,
             .provider_projection_changed = &runtimeProviderProjectionChanged,
             .tool_projection_changed = &runtimeToolProjectionChanged,
         }, self._stream_closure.registry) catch {};
@@ -832,56 +831,16 @@ pub const AgentSession = struct {
         return runtime_session.labelsGet(self, allocator, target_entry_id, limit);
     }
 
-    fn runtimePublishReport(session_ptr: *anyopaque, report: extension_ui.Report) !void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        try self.pending_extension_ui.publishReport(report);
-    }
-
     pub fn takePendingExtensionReport(self: *AgentSession) ?extension_ui.Report {
         return self.pending_extension_ui.takeReport();
-    }
-
-    fn runtimePublishPrompt(session_ptr: *anyopaque, prompt: extension_ui.PromptRequest) !void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        try self.pending_extension_ui.publishPrompt(prompt);
-    }
-
-    fn runtimeResolvePrompt(session_ptr: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.emitSessionEvent(.{ .extension_prompt_request = .{ .prompt = prompt, .response = response } });
-    }
-
-    fn runtimeCancelPrompts(session_ptr: *anyopaque) void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.pending_extension_ui.clearPrompts();
     }
 
     pub fn pendingExtensionPromptCount(self: *const AgentSession) usize {
         return self.pending_extension_ui.promptCount();
     }
 
-    fn runtimePublishUi(session_ptr: *anyopaque, update: extension_ui.UiPublication) !void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        try self.pending_extension_ui.publishUi(update);
-    }
-
-    fn runtimeRevokeUi(session_ptr: *anyopaque) void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.pending_extension_ui.clearUiPublications();
-    }
-
     pub fn takePendingExtensionUiPublications(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.UiPublication {
         return self.pending_extension_ui.takeUiPublications(allocator);
-    }
-
-    fn runtimePublishEditorAction(session_ptr: *anyopaque, action: extension_ui.EditorAction) !void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        try self.pending_extension_ui.publishEditorAction(action);
-    }
-
-    fn runtimeClearEditorActions(session_ptr: *anyopaque) void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.pending_extension_ui.clearEditorActions();
     }
 
     pub fn takePendingExtensionEditorActions(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.EditorAction {
