@@ -14,6 +14,7 @@ const settings_types_mod = @import("settings/types.zig");
 const model_registry_mod = @import("model_registry.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
 const message_conversion = @import("agent_session/message_conversion.zig");
+const model_control = @import("agent_session/model_control.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const ai_completion = @import("ai_completion.zig");
@@ -131,28 +132,9 @@ pub const AgentSession = struct {
         index: usize,
     };
 
-    pub const ModelSwitchResult = union(enum) {
-        success: struct {
-            model: ai.protocol.Model,
-            thinking_level: protocol.ThinkingLevel,
-            thinking_level_changed: bool,
-        },
-        no_auth: ai.protocol.Model,
-        registry_unavailable: void,
-    };
-
-    pub const ThinkingLevelChangeResult = struct {
-        level: protocol.ThinkingLevel,
-        changed: bool,
-    };
-
-    pub const StatusSnapshot = struct {
-        model_provider: []const u8,
-        model_id: []const u8,
-        thinking_level: protocol.ThinkingLevel,
-        context_tokens: ?u64,
-        context_window: u64,
-    };
+    pub const ModelSwitchResult = model_control.ModelSwitchResult;
+    pub const ThinkingLevelChangeResult = model_control.ThinkingLevelChangeResult;
+    pub const StatusSnapshot = model_control.StatusSnapshot;
 
     pub const PreparedDeps = session_bootstrap.PreparedDeps;
     pub const StreamClosure = session_bootstrap.StreamClosure;
@@ -301,105 +283,16 @@ pub const AgentSession = struct {
         self.destroyExtensionRuntime();
     }
 
-    /// Canonical session-owned model switch. Owns validation,
-    /// in-memory state mutation, session persistence, and thinking-
-    /// level reclamp for the new model's capabilities.
     pub fn trySetModel(self: *AgentSession, model: ai.protocol.Model) ModelSwitchResult {
-        const registry = self.model_registry orelse return .registry_unavailable;
-        if (!registry.hasConfiguredAuth(model)) {
-            return .{ .no_auth = model };
-        }
-
-        const previous_model = self.agent.modelValue();
-        const previous_thinking = self.agent.thinkingLevel();
-        const next_thinking = clampThinkingLevelForModel(previous_thinking, model);
-        const thinking_changed = next_thinking != previous_thinking;
-
-        self.agent.setModel(model);
-        self.agent.setThinkingLevel(next_thinking);
-        const provider_str = ai.json_util.providerToString(model.provider);
-        self.session_store.appendModelChange(provider_str, model.id);
-        if (self.settings_manager) |settings| {
-            settings.setDefaultModelAndProvider(provider_str, model.id);
-            persistDefaultThinkingLevel(settings, model, next_thinking);
-        }
-        if (thinking_changed) {
-            self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(next_thinking));
-        }
-
-        if (self._extension_runner) |runner| {
-            if (!ai.models.modelsAreEqual(previous_model, model)) {
-                event_bridge.dispatchModelSelect(runner, model, previous_model, "set");
-            }
-        }
-
-        return .{ .success = .{
-            .model = model,
-            .thinking_level = next_thinking,
-            .thinking_level_changed = thinking_changed,
-        } };
+        return model_control.trySetModel(self, model);
     }
 
     pub fn trySetThinkingLevel(self: *AgentSession, level: protocol.ThinkingLevel) ThinkingLevelChangeResult {
-        const effective = clampThinkingLevelForModel(level, self.agent.modelValue());
-        const changed = effective != self.agent.thinkingLevel();
-        self.agent.setThinkingLevel(effective);
-        if (changed) {
-            self.session_store.appendThinkingLevelChange(agentThinkingLevelToString(effective));
-            if (self.settings_manager) |settings| {
-                persistDefaultThinkingLevel(settings, self.agent.modelValue(), effective);
-            }
-        }
-        return .{ .level = effective, .changed = changed };
+        return model_control.trySetThinkingLevel(self, level);
     }
 
     pub fn getAvailableThinkingLevelsForModel(model: ai.protocol.Model) []const protocol.ThinkingLevel {
-        return if (!model.reasoning)
-            &.{.off}
-        else if (ai.models.supportsXhigh(model))
-            &.{ .off, .minimal, .low, .medium, .high, .xhigh }
-        else
-            &.{ .off, .minimal, .low, .medium, .high };
-    }
-
-    fn clampThinkingLevelForModel(level: protocol.ThinkingLevel, model: ai.protocol.Model) protocol.ThinkingLevel {
-        if (!model.reasoning) return .off;
-        return switch (level) {
-            .xhigh => if (ai.models.supportsXhigh(model)) .xhigh else .high,
-            else => level,
-        };
-    }
-
-    fn agentThinkingLevelToString(level: protocol.ThinkingLevel) []const u8 {
-        return switch (level) {
-            .off => "off",
-            .minimal => "minimal",
-            .low => "low",
-            .medium => "medium",
-            .high => "high",
-            .xhigh => "xhigh",
-        };
-    }
-
-    fn agentThinkingLevelToDefault(level: protocol.ThinkingLevel) settings_types_mod.DefaultThinkingLevel {
-        return switch (level) {
-            .off => .off,
-            .minimal => .minimal,
-            .low => .low,
-            .medium => .medium,
-            .high => .high,
-            .xhigh => .xhigh,
-        };
-    }
-
-    fn persistDefaultThinkingLevel(
-        settings: *settings_manager_mod.SettingsManager,
-        model: ai.protocol.Model,
-        level: protocol.ThinkingLevel,
-    ) void {
-        if (model.reasoning or level != .off) {
-            settings.setDefaultThinkingLevel(agentThinkingLevelToDefault(level));
-        }
+        return model_control.availableThinkingLevelsForModel(model);
     }
 
     pub fn replaceSessionStore(self: *AgentSession, new_store: SessionStore) !void {
@@ -436,7 +329,7 @@ pub const AgentSession = struct {
         self.session_store.appendRuntimeDefaults(
             ai.json_util.providerToString(current_model.provider),
             current_model.id,
-            agentThinkingLevelToString(self.agent.thinkingLevel()),
+            model_control.agentThinkingLevelToString(self.agent.thinkingLevel()),
         );
     }
 
@@ -493,7 +386,7 @@ pub const AgentSession = struct {
         try registry.rebuildFromActiveProviderClaims(self._stream_closure.registry);
         if (registry.findByProviderName(provider_name, model_id)) |refreshed| {
             self.agent.setModel(refreshed);
-            self.agent.setThinkingLevel(clampThinkingLevelForModel(thinking_level, refreshed));
+            self.agent.setThinkingLevel(model_control.clampThinkingLevelForModel(thinking_level, refreshed));
         }
         self.emitSessionEvent(.{ .visible_models_changed = {} });
     }
