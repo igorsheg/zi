@@ -47,6 +47,7 @@ const runner_mod = @import("runner.zig");
 const system_api = @import("system_api.zig");
 const spawn_api = @import("spawn_api.zig");
 const provider_api = @import("provider_api.zig");
+const command_api = @import("command_api.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
 const command_registry = @import("registries/command_registry.zig");
@@ -77,7 +78,7 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     c.lua_setfield(L, -2, "register_tool");
 
     // zi.register_command
-    state.pushCClosureWithUserdata(ziRegisterCommand, runner);
+    state.pushCClosureWithUserdata(command_api.ziRegisterCommand, runner);
     c.lua_setfield(L, -2, "register_command");
 
     // zi.register_provider
@@ -309,120 +310,6 @@ fn buildExtensionTool(
 /// `ToolRegistry.freeEntry` minus the registry-managed bookkeeping.
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
     tool_def.freeOwned(allocator, tool);
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// zi.register_command
-// ─────────────────────────────────────────────────────────────────────────
-
-fn ziRegisterCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    const runner = runnerFromUpvalue(L);
-
-    if (c.lua_type(L, 1) != c.LUA_TTABLE) {
-        return luaError(L, "register_command: expected a table argument");
-    }
-
-    const cmd = buildCommandDef(L, runner) catch |err| {
-        return luaError(L, switch (err) {
-            error.MissingName => "register_command: missing required field \"name\" (string)",
-            error.InvalidDescription => "register_command: \"description\" must be a string",
-            error.MissingHandler => "register_command: missing required field \"handler\" (function)",
-            error.InvalidHandler => "register_command: \"handler\" must be a function",
-            error.OutOfMemory => "register_command: out of memory",
-        });
-    };
-
-    return registerCommandDef(L, runner, cmd, "register_command");
-}
-
-fn registerCommandDef(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, cmd_in: command_registry.CommandDef, api_name: [:0]const u8) c_int {
-    const cmd = cmd_in;
-    runner.command_registry.register(cmd) catch {
-        c.luaL_unref(L, c.LUA_REGISTRYINDEX, cmd.lua_ref);
-        runner.allocator.free(cmd.name);
-        runner.allocator.free(cmd.visible_name);
-        runner.allocator.free(cmd.description);
-        return luaErrorFmt(L, "{s}: registry insert failed", .{api_name});
-    };
-
-    c.lua_pushboolean(L, 1);
-    return 1;
-}
-
-const RegisterCommandError = error{
-    OutOfMemory,
-    MissingName,
-    InvalidDescription,
-    MissingHandler,
-    InvalidHandler,
-};
-
-fn buildCommandDef(
-    L: *c.lua_State,
-    runner: *runner_mod.ExtensionRunner,
-) RegisterCommandError!command_registry.CommandDef {
-    const a = runner.allocator;
-
-    var name: ?[]const u8 = null;
-    var description: ?[]const u8 = null;
-    defer {
-        if (name) |n| a.free(n);
-        if (description) |d| a.free(d);
-    }
-
-    _ = c.lua_getfield(L, 1, "name");
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) {
-        c.lua_pop(L, 1);
-        return error.MissingName;
-    }
-    var name_len: usize = 0;
-    const name_ptr = c.lua_tolstring(L, -1, &name_len).?;
-    name = a.dupe(u8, name_ptr[0..name_len]) catch return error.OutOfMemory;
-    c.lua_pop(L, 1);
-
-    _ = c.lua_getfield(L, 1, "description");
-    if (c.lua_type(L, -1) == c.LUA_TSTRING) {
-        var desc_len: usize = 0;
-        const desc_ptr = c.lua_tolstring(L, -1, &desc_len).?;
-        description = a.dupe(u8, desc_ptr[0..desc_len]) catch {
-            c.lua_pop(L, 1);
-            return error.OutOfMemory;
-        };
-        c.lua_pop(L, 1);
-    } else if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 1);
-        description = a.dupe(u8, "") catch return error.OutOfMemory;
-    } else {
-        c.lua_pop(L, 1);
-        return error.InvalidDescription;
-    }
-
-    _ = c.lua_getfield(L, 1, "handler");
-    if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 1);
-        return error.MissingHandler;
-    }
-    if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
-        c.lua_pop(L, 1);
-        return error.InvalidHandler;
-    }
-    const handler_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
-
-    const owned_name = name.?;
-    const result = command_registry.CommandDef{
-        .name = owned_name,
-        .visible_name = a.dupe(u8, owned_name) catch {
-            c.luaL_unref(L, c.LUA_REGISTRYINDEX, handler_ref);
-            return error.OutOfMemory;
-        },
-        .description = description.?,
-        .lua_ref = handler_ref,
-        .source = currentRegistrationSource(runner),
-    };
-    name = null;
-    description = null;
-    return result;
 }
 
 fn ziRegisterBuiltinTools(L_opt: ?*c.lua_State) callconv(.c) c_int {
