@@ -27,6 +27,7 @@ const app_meta = @import("../app_meta.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
+const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -34,7 +35,6 @@ const clipboard_mod = @import("clipboard.zig");
 const image_mod = @import("../image/root.zig");
 const profile_mod = @import("../debug/profile.zig");
 const string_util = @import("../lib/string_util.zig");
-const time_util = @import("../lib/time_util.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
@@ -49,6 +49,7 @@ const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
+const ResumePickerFlow = resume_picker_flow_mod.ResumePickerFlow;
 const ExtensionPromptFlow = extension_prompt_flow_mod.ExtensionPromptFlow;
 const ExtensionUiState = extension_ui_state_mod.ExtensionUiState;
 const session_store_mod = @import("../coding_agent/session/store.zig");
@@ -266,75 +267,6 @@ test "UiLifecycleQueue rejects overload and keeps wake semantics" {
     try std.testing.expectEqual(@as(usize, 1), stats.rejected_count);
     try std.testing.expectEqual(ui_lifecycle_queue_capacity, stats.high_water_depth);
 }
-
-/// Owns all transient heap-backed data for one `/resume` overlay.
-/// The picker borrows from this flow; teardown is one arena drop.
-const ResumePickerFlow = struct {
-    arena: std.heap.ArenaAllocator,
-    rows: []Row = &.{},
-    items: []SelectItem = &.{},
-    picker: ListPicker,
-    handle: ?tui_mod.OverlayHandle = null,
-    restore_session_model: bool = true,
-    generation: u64 = 0,
-
-    const Row = struct {
-        item: SelectItem,
-        path: []const u8,
-    };
-
-    fn initLoading(
-        gpa: std.mem.Allocator,
-        theme: *const theme_mod.Theme,
-        restore_session_model: bool,
-        generation: u64,
-    ) !ResumePickerFlow {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
-
-        var picker = ListPicker.init(theme);
-        picker.title = "Resume session";
-        picker.list.max_visible = 10;
-        picker.setSearchPlaceholder("Filter sessions");
-        picker.setEmptyText("Loading sessions...");
-        picker.setSearchableItems(&.{}, null);
-
-        return .{
-            .arena = arena,
-            .picker = picker,
-            .restore_session_model = restore_session_model,
-            .generation = generation,
-        };
-    }
-
-    fn populate(self: *ResumePickerFlow, summaries: []const session_store_mod.SessionInfo) !void {
-        const a = self.arena.allocator();
-        const rows = try a.alloc(Row, summaries.len);
-        const items = try a.alloc(SelectItem, summaries.len);
-
-        for (summaries, 0..) |session, i| {
-            const item: SelectItem = .{
-                .value = try a.dupe(u8, session.session_id),
-                .label = try a.dupe(u8, session.first_message),
-                .description = try std.fmt.allocPrint(a, "{d} msgs \xC2\xB7 {s}", .{
-                    session.message_count,
-                    time_util.relativeTimeLabel(session.timestamp),
-                }),
-            };
-            rows[i] = .{ .item = item, .path = try a.dupe(u8, session.path) };
-            items[i] = item;
-        }
-
-        self.rows = rows;
-        self.items = items;
-        self.picker.setEmptyText("No matching sessions");
-        self.picker.setSearchableItems(items, null);
-    }
-
-    fn deinit(self: *ResumePickerFlow) void {
-        self.arena.deinit();
-    }
-};
 
 /// Owns all transient heap-backed data for one `/model` overlay.
 /// Catalog models are borrowed from Interactive's TUI-owned snapshot;
