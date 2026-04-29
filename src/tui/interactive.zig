@@ -34,6 +34,7 @@ const thinking_mod = @import("interactive/thinking.zig");
 const slash_command_mod = @import("interactive/slash_command.zig");
 const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
 const agent_requests_mod = @import("interactive/agent_requests.zig");
+const session_requests_mod = @import("interactive/session_requests.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -2498,7 +2499,7 @@ pub const Interactive = struct {
     /// Publish the current extension command list through the UI event
     /// queue so the TUI thread can rebuild its own registry without reading
     /// or mutating agent-owned runner state directly.
-    fn publishExtensionCommandsUpdate(self: *Interactive) void {
+    pub fn publishExtensionCommandsUpdate(self: *Interactive) void {
         const commands = blk: {
             const runner = self.runtime_host.currentSession().extensionRunner() orelse break :blk self.msg_allocator.alloc(ui_event_mod.ExtensionCommandEntry, 0) catch return;
             const items = runner.command_registry.items();
@@ -2621,43 +2622,11 @@ pub const Interactive = struct {
     }
 
     pub fn handleNewSession(self: *Interactive) void {
-        self.runtime_host.newSession() catch |err| {
-            const msg = switch (err) {
-                error.SessionBeforeSwitchBlocked => self.msg_allocator.dupe(u8, "session switch blocked by extension") catch return,
-                else => std.fmt.allocPrint(self.msg_allocator, "failed to start new session: {s}", .{@errorName(err)}) catch return,
-            };
-            _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
-            return;
-        };
-        self.publishExtensionCommandsUpdate();
-        self.publishThemeSnapshot();
-        self.publishVisibleModelsSnapshot();
-        self.publishStatusSnapshot();
-        if (!self.publishConversationState()) {
-            log.warn("snapshot queue dropped new-session conversation state", .{});
-        }
-        self.publishQueuedSnapshotIfChanged();
-        _ = self.publishLifecycleUiEvent(.{ .session_new_started = {} });
+        session_requests_mod.handleNewSession(self);
     }
 
     pub fn handleForkSession(self: *Interactive, entry_id: []const u8) void {
-        self.runtime_host.forkSession(entry_id) catch |err| {
-            const msg = switch (err) {
-                error.SessionBeforeForkBlocked => self.msg_allocator.dupe(u8, "session fork blocked by extension") catch return,
-                else => std.fmt.allocPrint(self.msg_allocator, "failed to fork session: {s}", .{@errorName(err)}) catch return,
-            };
-            _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
-            return;
-        };
-        self.publishExtensionCommandsUpdate();
-        self.publishThemeSnapshot();
-        self.publishVisibleModelsSnapshot();
-        self.publishStatusSnapshot();
-        if (!self.publishConversationState()) {
-            log.warn("snapshot queue dropped forked conversation state", .{});
-        }
-        self.publishQueuedSnapshotIfChanged();
-        _ = self.publishLifecycleUiEvent(.{ .session_fork_started = {} });
+        session_requests_mod.handleForkSession(self, entry_id);
     }
 
     /// Agent-thread handler for `AgentRequest.resume_session`.
@@ -2668,33 +2637,10 @@ pub const Interactive = struct {
     /// Transcript rebuild stays on the TUI thread — this handler
     /// does NOT touch `self.transcript`. That's .15's whole point.
     pub fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
-        const result = self.runtime_host.resumeSession(path, restore_session_model) catch |err| {
-            const message = switch (err) {
-                error.SessionAlreadyActive => "session is already active",
-                error.SessionBeforeSwitchBlocked => "session switch blocked by extension",
-                else => "failed to load session",
-            };
-            const msg = self.msg_allocator.dupe(u8, message) catch return;
-            _ = self.publishLifecycleUiEvent(.{ .session_resume_failed = .{ .message = msg } });
-            return;
-        };
-
-        const restore_warning = result.restore_warning;
-
-        self.publishExtensionCommandsUpdate();
-        self.publishThemeSnapshot();
-        self.publishVisibleModelsSnapshot();
-        self.publishStatusSnapshot();
-        if (!self.publishConversationState()) {
-            log.warn("snapshot queue dropped resumed conversation state", .{});
-        }
-        self.publishQueuedSnapshotIfChanged();
-        _ = self.publishLifecycleUiEvent(.{ .session_resumed = .{
-            .restore_warning = restore_warning,
-        } });
+        session_requests_mod.handleResumeSession(self, path, restore_session_model);
     }
 
-    fn publishConversationState(self: *Interactive) bool {
+    pub fn publishConversationState(self: *Interactive) bool {
         return self.runtime_host.publishConversationState(self.conversationSnapshotPublisher());
     }
 
@@ -2707,7 +2653,7 @@ pub const Interactive = struct {
     /// last pushed. This is how pending rows disappear after the agent
     /// loop drains steering/follow-up during a run — the drain bumps
     /// the version, and this call picks that up on the next event flush.
-    fn publishQueuedSnapshotIfChanged(self: *Interactive) void {
+    pub fn publishQueuedSnapshotIfChanged(self: *Interactive) void {
         const current_version = self.runtime_host.currentQueuedVersion();
         if (current_version == self.last_published_queued_version) return;
         if (self.publishQueuedSnapshot()) {
@@ -2830,7 +2776,7 @@ pub const Interactive = struct {
         self.handleSetModel(model);
     }
 
-    fn publishThemeSnapshot(self: *Interactive) void {
+    pub fn publishThemeSnapshot(self: *Interactive) void {
         _ = self.publishSnapshotUiEvent(.{ .theme_changed = self.runtime_host.selectedTheme() });
     }
 
@@ -2851,7 +2797,7 @@ pub const Interactive = struct {
         self.pending_image_banner.bg = self.theme.bg(.tool_pending_bg);
     }
 
-    fn publishVisibleModelsSnapshot(self: *Interactive) void {
+    pub fn publishVisibleModelsSnapshot(self: *Interactive) void {
         const registry = self.runtime_host.currentSession().model_registry orelse {
             _ = self.publishLifecycleUiEvent(.{ .visible_models_snapshot = .{ .models = &.{} } });
             return;
