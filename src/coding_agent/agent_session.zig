@@ -20,6 +20,7 @@ const runtime_session = @import("agent_session/runtime_session.zig");
 const ai_completion_runtime = @import("agent_session/ai_completion_runtime.zig");
 const runtime_models = @import("agent_session/runtime_models.zig");
 const runtime_ui = @import("agent_session/runtime_ui.zig");
+const projection_runtime = @import("agent_session/projection_runtime.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
@@ -376,21 +377,8 @@ pub const AgentSession = struct {
         };
     }
 
-    fn rebuildVisibleModelCatalogFromActiveProviders(self: *AgentSession) !void {
-        const registry = self.model_registry orelse return;
-        const current = self.agent.modelValue();
-        const provider_name = try self.allocator.dupe(u8, ai.json_util.providerToString(current.provider));
-        defer self.allocator.free(provider_name);
-        const model_id = try self.allocator.dupe(u8, current.id);
-        defer self.allocator.free(model_id);
-        const thinking_level = self.agent.thinkingLevel();
-
-        try registry.rebuildFromActiveProviderClaims(self._stream_closure.registry);
-        if (registry.findByProviderName(provider_name, model_id)) |refreshed| {
-            self.agent.setModel(refreshed);
-            self.agent.setThinkingLevel(model_control.clampThinkingLevelForModel(thinking_level, refreshed));
-        }
-        self.emitSessionEvent(.{ .visible_models_changed = {} });
+    pub fn rebuildVisibleModelCatalogFromActiveProviders(self: *AgentSession) !void {
+        try projection_runtime.rebuildVisibleModelCatalogFromActiveProviders(self);
     }
 
     pub fn noteCompactionApplied(self: *AgentSession) void {
@@ -611,8 +599,8 @@ pub const AgentSession = struct {
             .revoke_ui = &runtime_ui.revokeUi,
             .publish_editor_action = &runtime_ui.publishEditorAction,
             .clear_editor_actions = &runtime_ui.clearEditorActions,
-            .provider_projection_changed = &runtimeProviderProjectionChanged,
-            .tool_projection_changed = &runtimeToolProjectionChanged,
+            .provider_projection_changed = &projection_runtime.providerProjectionChanged,
+            .tool_projection_changed = &projection_runtime.toolProjectionChanged,
         }, self._stream_closure.registry) catch {};
     }
 
@@ -847,50 +835,8 @@ pub const AgentSession = struct {
         return self.pending_extension_ui.takeEditorActions(allocator);
     }
 
-    fn runtimeProviderProjectionChanged(session_ptr: *anyopaque) void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        self.rebuildVisibleModelCatalogFromActiveProviders() catch |err| {
-            std.log.scoped(.coding_agent).warn("failed to rebuild visible model catalog: {s}", .{@errorName(err)});
-        };
-    }
-
-    fn runtimeToolProjectionChanged(session_ptr: *anyopaque) void {
-        const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        if (self.agent.isStreaming() or self.agent.hasQueuedMessages()) {
-            self.pending_tool_projection_refresh = true;
-            return;
-        }
-        self.rebuildVisibleToolsAndPromptFromRunner() catch |err| {
-            self.pending_tool_projection_refresh = true;
-            std.log.scoped(.coding_agent).warn("failed to rebuild visible tool projection: {s}", .{@errorName(err)});
-        };
-    }
-
     fn flushPendingToolProjectionRefresh(self: *AgentSession) void {
-        if (!self.pending_tool_projection_refresh) return;
-        if (self.agent.isStreaming() or self.agent.hasQueuedMessages()) return;
-        self.rebuildVisibleToolsAndPromptFromRunner() catch |err| {
-            std.log.scoped(.coding_agent).warn("failed to refresh visible tool projection: {s}", .{@errorName(err)});
-            return;
-        };
-        self.pending_tool_projection_refresh = false;
-    }
-
-    fn rebuildVisibleToolsAndPromptFromRunner(self: *AgentSession) !void {
-        const runner = self._extension_runner orelse return;
-        const definitions = runner.tool_registry.items();
-        const tools = try session_bootstrap.buildAgentTools(self.allocator, definitions, runner);
-        errdefer self.allocator.free(tools);
-        const system_prompt = try session_bootstrap.buildSystemPrompt(self.allocator, self.resource_loader, definitions);
-        errdefer self.allocator.free(system_prompt);
-
-        const old_tools = self.tools;
-        const old_system_prompt = self._owned_system_prompt;
-        self.tools = tools;
-        self._owned_system_prompt = system_prompt;
-        self.agent.replaceRuntimeInputs(system_prompt, tools);
-        if (old_tools.len > 0) self.allocator.free(old_tools);
-        if (old_system_prompt.len > 0) self.allocator.free(old_system_prompt);
+        projection_runtime.flushPendingToolProjectionRefresh(self);
     }
 
     /// Run a new text prompt. Wires session persistence, then delegates to Agent.prompt.
