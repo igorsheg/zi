@@ -35,7 +35,6 @@ const extension_prompt = @import("interactive/extension_prompt.zig");
 const thinking_mod = @import("interactive/thinking.zig");
 const slash_command_mod = @import("interactive/slash_command.zig");
 const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
-const agent_requests_mod = @import("interactive/agent_requests.zig");
 const session_requests_mod = @import("interactive/session_requests.zig");
 const model_requests_mod = @import("interactive/model_requests.zig");
 const session_events_mod = @import("interactive/session_events.zig");
@@ -50,6 +49,7 @@ const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const status_flow = @import("interactive/status_flow.zig");
 const overlay_flow = @import("interactive/overlay_flow.zig");
 const idle_request = @import("interactive/idle_request.zig");
+const runtime_loop = @import("interactive/runtime_loop.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -62,7 +62,6 @@ const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const request_mod = @import("../coding_agent/request.zig");
-const extension_runner_mod = @import("../coding_agent/extensions/runner.zig");
 const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
@@ -85,14 +84,12 @@ const session_store_mod = @import("../coding_agent/session/store.zig");
 const session_index_worker_mod = @import("session_index_worker.zig");
 const SessionStore = session_store_mod.SessionStore;
 const storage = @import("../storage.zig");
-const logging = @import("../logging.zig");
 
 const agent_mod = @import("../agent3/root.zig");
 const coding_agent_mod = @import("../coding_agent/root.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentRequest = coding_agent_mod.AgentRequest;
 const RequestQueue = coding_agent_mod.RequestQueue;
-const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 const agent_protocol = agent_mod.protocol;
 const RetryPolicy = coding_agent_mod.runtime_host.RetryPolicy;
 const CompactionPolicy = coding_agent_mod.runtime_host.CompactionPolicy;
@@ -110,7 +107,6 @@ const SettingsAction = enum {
 
 const IdleRequestDispatch = idle_request.Options;
 const auth_storage_mod = @import("../coding_agent/auth/storage.zig");
-const auth_types = @import("../coding_agent/auth/types.zig");
 const oauth_mod = @import("../coding_agent/auth/oauth.zig");
 const settings_manager_mod = @import("../coding_agent/settings/manager.zig");
 const ai_protocol = @import("../ai/protocol.zig");
@@ -455,7 +451,7 @@ pub const Interactive = struct {
 
     fn startAgentThread(self: *Interactive) !void {
         if (self.agent_thread != null) return;
-        self.agent_thread = try std.Thread.spawn(.{}, agentThreadFn, .{self});
+        self.agent_thread = try std.Thread.spawn(.{}, runtime_loop.agentThread, .{self});
     }
 
     fn startSessionIndexWorker(self: *Interactive) !void {
@@ -491,7 +487,7 @@ pub const Interactive = struct {
         self.agent_event_token = self.runtime_host.subscribeAgentEvents(&agentEventCallback, @ptrCast(self));
         self.session_event_token = self.runtime_host.subscribeEvents(&sessionEventCallback, @ptrCast(self));
         self.runtime_host.setExtensionOAuthRefreshDispatcher(.{
-            .func = &dispatchExtensionOAuthRefreshViaRequestQueue,
+            .func = &runtime_loop.dispatchExtensionOAuthRefresh,
             .ctx = @ptrCast(self),
         });
 
@@ -499,11 +495,11 @@ pub const Interactive = struct {
         try self.startAgentThread();
         try self.startSessionIndexWorker();
         if (self.ai_complete_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &submitExtensionAsyncResult });
+            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &runtime_loop.submitExtensionAsyncResult });
             try worker.start();
         }
         if (self.system_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &submitExtensionAsyncResult });
+            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &runtime_loop.submitExtensionAsyncResult });
             try worker.start();
         }
 
@@ -1281,140 +1277,20 @@ pub const Interactive = struct {
         login_flow.start(self, provider_id);
     }
 
-    fn dispatchExtensionOAuthRefreshViaRequestQueue(
-        provider_id: []const u8,
-        credential: auth_types.OAuthCredential,
-        result_allocator: std.mem.Allocator,
-        ctx: ?*anyopaque,
-    ) oauth_mod.ExchangeResult {
-        const self: *Interactive = @ptrCast(@alignCast(ctx.?));
-        var response: request_mod.ExtensionOAuthRefreshResponse = .{};
-        const provider_copy = self.msg_allocator.dupe(u8, provider_id) catch return .{ .err = "out of memory" };
-        const credential_copy = auth_types.cloneOAuthCredential(self.msg_allocator, credential) catch {
-            self.msg_allocator.free(provider_copy);
-            return .{ .err = "out of memory" };
-        };
-        switch (self.request_queue.trySend(.{ .extension_oauth_refresh = .{
-            .provider_id = provider_copy,
-            .credential = credential_copy,
-            .result_allocator = result_allocator,
-            .response = &response,
-        } })) {
-            .ok => {},
-            .full => |rejected| {
-                var req = rejected;
-                req.deinit(self.msg_allocator);
-                return .{ .err = "refresh request queue is full" };
-            },
-            .closed => |rejected| {
-                var req = rejected;
-                req.deinit(self.msg_allocator);
-                return .{ .err = "refresh request queue is closed" };
-            },
-            .oom => return .{ .err = "out of memory" },
-            .dropped => unreachable,
-        }
-        return switch (response.wait()) {
-            .success => |cred| .{ .success = cred },
-            .err => |msg| .{ .err = msg },
-            .unsupported => .{ .err = "extension OAuth refresh is unsupported for this provider" },
-        };
-    }
-
-    /// Long-lived agent owner thread entry point. This is the only
-    /// path that runs agent-owned mutations: it binds lua ownership,
-    /// blocks on the request inbox wake fd, drains queued work, and
-    /// tears down extensions on exit after an ordered shutdown request
-    /// or after the inbox has been transport-closed and fully drained.
-    ///
-    /// Completion events stay semantic rather than thread-shaped:
-    ///   - prompt requests publish `.prompt_worker_finished`
-    ///   - non-prompt request drains publish `.request_worker_finished`
-    fn agentThreadFn(self: *Interactive) void {
-        logging.setThreadLabel(.agent);
-
-        if (self.runtime_host.currentSession().extensionRunner()) |runner| {
-            runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-            self.publishExtensionCommandsUpdate();
-        }
-        self.publishVisibleModelsSnapshot();
-        _ = self.publishConversationState();
-        self.publishQueuedSnapshotIfChanged();
-
-        while (true) {
-            _ = self.request_queue.waitReadable(-1) catch break;
-            if (self.request_queue.isDrained()) break;
-            if (!self.processAgentRequests()) break;
-            if (self.request_queue.isDrained()) break;
-        }
-
-        self.runtime_host.shutdownCurrentSessionOnAgentThread();
-    }
-
-    fn submitExtensionAsyncResult(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) bool {
-        const self: *Interactive = @ptrCast(@alignCast(ptr));
-        switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = id, .result = result } })) {
-            .ok, .dropped => return true,
-            .full, .closed, .oom => |rejected| {
-                var failed = rejected;
-                failed.deinit(self.msg_allocator);
-                return false;
-            },
-        }
-    }
-
-    fn submitExtensionAsyncFromRunner(ptr: *anyopaque, runner: *ExtensionRunner, start: extension_runner_mod.AsyncStart) anyerror!void {
-        const self: *Interactive = @ptrCast(@alignCast(ptr));
-        var owned_start = start;
-        defer owned_start.deinit(runner.allocator);
-        switch (owned_start.request) {
-            .ai_complete => |request| {
-                const worker_request = try self.runtime_host.currentSession().buildAiCompleteWorkerRequest(self.msg_allocator, owned_start.id, request);
-                errdefer {
-                    var failed = worker_request;
-                    failed.deinit(self.msg_allocator);
-                }
-                const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
-                try worker.submit(worker_request);
-            },
-            .system => |request| {
-                const cloned = try request.clone(self.msg_allocator);
-                errdefer {
-                    var failed = cloned;
-                    failed.deinit(self.msg_allocator);
-                }
-                const worker = if (self.system_worker) |*worker| worker else return error.SystemWorkerUnavailable;
-                try worker.submit(.{ .id = owned_start.id, .system = cloned });
-            },
-            else => {},
-        }
-    }
-
     fn enqueueAgentShutdown(self: *Interactive) void {
-        switch (self.request_queue.trySend(.{ .shutdown = {} })) {
-            .ok, .dropped => {},
-            .closed, .full, .oom => {},
-        }
+        runtime_loop.enqueueShutdown(self);
     }
 
     pub fn discardAgentRequests(self: *Interactive, requests: []AgentRequest) void {
-        for (requests) |*req| req.deinit(self.msg_allocator);
+        runtime_loop.discardRequests(self, requests);
     }
 
     pub fn discardQueuedAgentRequests(self: *Interactive) void {
-        var buf: [16]AgentRequest = undefined;
-        while (true) {
-            const n = self.request_queue.drainInto(&buf);
-            if (n == 0) return;
-            self.discardAgentRequests(buf[0..n]);
-        }
+        runtime_loop.discardQueuedRequests(self);
     }
 
-    /// Drain the AgentRequest inbox and dispatch each request on the
-    /// long-lived agent owner thread. Returns `false` when an in-band
-    /// shutdown request terminates the owner loop after all earlier work.
     fn processAgentRequests(self: *Interactive) bool {
-        return agent_requests_mod.processWithBuffer(self, AgentRequest, &submitExtensionAsyncFromRunner);
+        return runtime_loop.processRequests(self);
     }
 
     /// Publish the current extension command list through the UI event
