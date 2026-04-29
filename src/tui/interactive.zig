@@ -37,6 +37,7 @@ const agent_requests_mod = @import("interactive/agent_requests.zig");
 const session_requests_mod = @import("interactive/session_requests.zig");
 const model_requests_mod = @import("interactive/model_requests.zig");
 const session_events_mod = @import("interactive/session_events.zig");
+const key_flow_mod = @import("interactive/key_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -777,143 +778,11 @@ pub const Interactive = struct {
     }
 
     fn handleKey(self: *Interactive, key: Key) void {
-        // When an overlay has focus, route input there FIRST.
-        // Overlays own Esc/Ctrl+C for dismiss — app-level handlers are fallbacks.
-        if (self.tui.hasOverlay()) {
-            if (self.tui.handleInput(key)) {
-                if (self.extension_prompt_close_after_submit) {
-                    self.extension_prompt_close_after_submit = false;
-                    self.closeExtensionPromptFlow(false);
-                }
-                self.tui.dirty = true;
-                return;
-            }
-            if (keybindings.matches(.select_cancel, key)) {
-                if (self.extension_prompt_flow != null) {
-                    self.closeExtensionPromptFlow(true);
-                } else {
-                    self.tui.hideOverlay();
-                }
-                return;
-            }
-            return;
-        }
-
-        // App-level keybindings — no overlay active
-        if (keybindings.matches(.app_interrupt, key)) {
-            if (self.retry_waiting) {
-                self.runtime_host.abortRetry();
-                return;
-            }
-            if (self.is_streaming) {
-                self.runtime_host.abortCurrentRun();
-                self.status_line.setPrimary("aborted", self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-            }
-            return;
-        }
-
-        // Ctrl+C: double-tap guard (pi-mono parity)
-        // First press: clear editor. Second press within 500ms: exit.
-        if (keybindings.matches(.app_clear, key)) {
-            if (self.login_thread != null) {
-                self.login_cancelled.store(true, .release);
-                return;
-            }
-            if (self.retry_waiting) {
-                self.runtime_host.abortRetry();
-                return;
-            }
-            if (self.is_streaming) {
-                self.runtime_host.abortCurrentRun();
-                self.status_line.setPrimary("aborted", self.theme.fg(.@"error"));
-                self.tui.dirty = true;
-                return;
-            }
-            const now = std.time.nanoTimestamp();
-            const double_tap_ns: i128 = 500 * std.time.ns_per_ms;
-            if (!self.composerHasPendingInput() and now - self.last_ctrl_c_ns < double_tap_ns) {
-                self.running = false;
-                return;
-            }
-            self.clearComposerDraft();
-            self.last_ctrl_c_ns = now;
-            self.tui.dirty = true;
-            return;
-        }
-
-        // Ctrl+D: exit only when the composer is empty (pi-mono parity)
-        if (keybindings.matches(.app_exit, key)) {
-            if (!self.composerHasPendingInput()) {
-                self.running = false;
-                return;
-            }
-        }
-
-        if (keybindings.matches(.app_toggle_tools, key)) {
-            self.tool_output_expanded = !self.tool_output_expanded;
-            self.transcript.setToolOutputExpanded(self.tool_output_expanded);
-            self.tui.dirty = true;
-            return;
-        }
-
-        if (keybindings.matches(.app_toggle_thinking, key)) {
-            self.hide_thinking_block = !self.hide_thinking_block;
-            self.settings_manager.setHideThinkingBlock(self.hide_thinking_block);
-            self.applyTranscriptHideThinkingBlock();
-            self.tui.dirty = true;
-            return;
-        }
-
-        if (keybindings.matches(.app_queue_follow_up, key)) {
-            self.handleFollowUpShortcut();
-            return;
-        }
-
-        if (keybindings.matches(.app_restore_queued, key)) {
-            self.restoreQueuedInputsToEditor();
-            return;
-        }
-
-        if (keybindings.matches(.app_paste_image, key)) {
-            self.handlePasteImageShortcut();
-            return;
-        }
-
-        // scroll: page up/down, shift+up/down
-        if (self.handleScroll(key)) return;
-
-        // Route to focused component via TUI
-        if (self.tui.handleInput(key)) {
-            self.refreshHeaderVisibility();
-            self.tui.dirty = true;
-        }
+        key_flow_mod.handle(self, key);
     }
 
     fn handleScroll(self: *Interactive, key: Key) bool {
-        const output_h = self.outputHeight();
-        if (output_h == 0) return false;
-
-        const page_size = @max(1, output_h -| 2);
-
-        const delta: ?i64 = if (keybindings.matches(.app_scroll_page_up, key))
-            -@as(i64, @intCast(page_size))
-        else if (keybindings.matches(.app_scroll_page_down, key))
-            @as(i64, @intCast(page_size))
-        else if (keybindings.matches(.app_scroll_line_up, key))
-            -3
-        else if (keybindings.matches(.app_scroll_line_down, key))
-            3
-        else
-            null;
-
-        if (delta) |d| {
-            const w = self.tui.width();
-            self.transcript.scrollBy(w, output_h, d);
-            self.tui.dirty = true;
-            return true;
-        }
-        return false;
+        return key_flow_mod.handleScroll(self, key);
     }
 
     fn handleMouse(self: *Interactive, event: keys_mod.MouseEvent) void {
@@ -1024,7 +893,7 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn applyTranscriptHideThinkingBlock(self: *Interactive) void {
+    pub fn applyTranscriptHideThinkingBlock(self: *Interactive) void {
         self.transcript.hide_thinking_block = self.hide_thinking_block;
         for (self.transcript.items.items, 0..) |_, idx| {
             const assistant = self.transcript.assistantMessageAt(idx) orelse continue;
@@ -1114,11 +983,11 @@ pub const Interactive = struct {
         self.status_line.setPrimary("copied selection", self.theme.fg(.success));
     }
 
-    fn composerHasPendingInput(self: *Interactive) bool {
+    pub fn composerHasPendingInput(self: *Interactive) bool {
         return self.active_editor.getText().len > 0 or self.pending_images.items.len > 0;
     }
 
-    fn clearComposerDraft(self: *Interactive) void {
+    pub fn clearComposerDraft(self: *Interactive) void {
         self.active_editor.clear();
         self.clearPendingImages();
         self.refreshHeaderVisibility();
@@ -1140,7 +1009,7 @@ pub const Interactive = struct {
         self.pending_container.addChild(self.pending_image_banner.component());
     }
 
-    fn handlePasteImageShortcut(self: *Interactive) void {
+    pub fn handlePasteImageShortcut(self: *Interactive) void {
         if (self.is_streaming or self.request_in_flight) {
             self.status_line.setPrimary("cannot paste image while agent is running", self.theme.fg(.@"error"));
             self.tui.dirty = true;
@@ -1206,7 +1075,7 @@ pub const Interactive = struct {
         return if (h > fixed_total) h - fixed_total else 0;
     }
 
-    fn refreshHeaderVisibility(self: *Interactive) void {
+    pub fn refreshHeaderVisibility(self: *Interactive) void {
         if (self.composerHasPendingInput() and !self.greeter_dismissed) {
             self.greeter_dismissed = true;
         }
@@ -1408,7 +1277,7 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
-    fn restoreQueuedInputsToEditor(self: *Interactive) void {
+    pub fn restoreQueuedInputsToEditor(self: *Interactive) void {
         // Atomic take-and-clear on the TUI thread (safe — run-control's
         // mailbox serializes it against the agent thread's drain).
         var snapshot = self.runtime_host.takeQueuedMessagesAndClear(self.msg_allocator) catch {
@@ -1517,7 +1386,7 @@ pub const Interactive = struct {
         _ = self.submitUserContent(built.content);
     }
 
-    fn handleFollowUpShortcut(self: *Interactive) void {
+    pub fn handleFollowUpShortcut(self: *Interactive) void {
         const expanded = self.active_editor.getExpandedText();
         const text = std.mem.trim(u8, expanded, " \t\r\n");
         if (text.len == 0 and self.pending_images.items.len == 0) return;
@@ -1858,7 +1727,7 @@ pub const Interactive = struct {
         self.queueModelPatternSwitch(pattern);
     }
 
-    fn closeExtensionPromptFlow(self: *Interactive, resolve_default: bool) void {
+    pub fn closeExtensionPromptFlow(self: *Interactive, resolve_default: bool) void {
         if (self.extension_prompt_flow) |*flow| {
             if (resolve_default) flow.response.finish(request_mod.ExtensionPromptResponse.defaultFor(flow.prompt.kind));
             if (flow.handle) |h| {
