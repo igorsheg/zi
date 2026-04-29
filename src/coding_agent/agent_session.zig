@@ -17,9 +17,9 @@ const message_conversion = @import("agent_session/message_conversion.zig");
 const model_control = @import("agent_session/model_control.zig");
 const runtime_state = @import("agent_session/runtime_state.zig");
 const runtime_session = @import("agent_session/runtime_session.zig");
+const ai_completion_runtime = @import("agent_session/ai_completion_runtime.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
-const ai_completion = @import("ai_completion.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const pending_extension_ui_mod = @import("agent_session/pending_extension_ui.zig");
@@ -712,7 +712,7 @@ pub const AgentSession = struct {
         return modelJson(allocator, model) catch null;
     }
 
-    fn resolveModelRef(self: *AgentSession, model_ref: []const u8) ?ai.protocol.Model {
+    pub fn resolveModelRef(self: *AgentSession, model_ref: []const u8) ?ai.protocol.Model {
         const registry = self.model_registry orelse return null;
         const parsed = resolve_mod.parseModelPattern(self.allocator, model_ref, registry.getAll(), .{});
         return parsed.model orelse registry.findByProviderName(ai.json_util.providerToString(self.agent.modelValue().provider), model_ref);
@@ -992,48 +992,7 @@ pub const AgentSession = struct {
         id: extension_runner_mod.AsyncOpId,
         request: extension_runner_mod.AiCompleteRequest,
     ) !ai_complete_worker_mod.Request {
-        const current_model = self.resolveExtensionAiModel(request.model) orelse return error.ModelUnavailable;
-        const provider = self._stream_closure.registry.getForModel(
-            ai.provider.apiToString(current_model.api),
-            ai.json_util.providerToString(current_model.provider),
-        ) orelse return error.ProviderUnavailable;
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const api_key = self._stream_closure.resolveApiKey(arena.allocator(), current_model);
-        var built = ai_complete_worker_mod.Request{
-            .id = id,
-            .provider = provider,
-            .model = current_model,
-            .prompt = try allocator.dupe(u8, request.prompt),
-            .system_prompt = null,
-            .api_key = null,
-            .headers = null,
-            .max_tokens = request.max_tokens,
-            .reasoning = resolveAiCompleteReasoning(current_model, request.reasoning),
-        };
-        errdefer built.deinit(allocator);
-        if (request.system_prompt) |value| built.system_prompt = try allocator.dupe(u8, value);
-        if (api_key.len > 0) built.api_key = try allocator.dupe(u8, api_key);
-        built.headers = try self._stream_closure.mergeClaimHeaders(current_model, allocator, null);
-        return built;
-    }
-
-    fn resolveAiCompleteReasoning(model: ai.protocol.Model, override: ?protocol.ThinkingLevel) ?ai.protocol.ThinkingLevel {
-        if (!model.reasoning) return null;
-        const level = override orelse return .high;
-        return switch (level) {
-            .off => null,
-            .minimal => .minimal,
-            .low => .low,
-            .medium => .medium,
-            .high => .high,
-            .xhigh => .xhigh,
-        };
-    }
-
-    fn resolveExtensionAiModel(self: *AgentSession, model_ref: ?[]const u8) ?ai.protocol.Model {
-        const value = model_ref orelse return self.agent.modelValue();
-        return self.resolveModelRef(value);
+        return ai_completion_runtime.buildWorkerRequest(self, allocator, id, request);
     }
 
     pub fn completeUserText(
@@ -1043,31 +1002,7 @@ pub const AgentSession = struct {
         prompt_text: []const u8,
         max_tokens: u64,
     ) ![]u8 {
-        const current_model = self.agent.modelValue();
-        const provider = self._stream_closure.registry.getForModel(
-            ai.provider.apiToString(current_model.api),
-            ai.json_util.providerToString(current_model.provider),
-        ) orelse return error.ProviderUnavailable;
-
-        const api_key = self._stream_closure.resolveApiKey(allocator, current_model);
-        const result = ai_completion.runPreparedTextCompletion(allocator, .{
-            .provider = provider,
-            .model = current_model,
-            .prompt = prompt_text,
-            .system_prompt = system_prompt,
-            .api_key = if (api_key.len > 0) api_key else null,
-            .max_tokens = max_tokens,
-            .reasoning = if (current_model.reasoning) .high else null,
-        });
-        return switch (result) {
-            .completed => |completed| completed.text,
-            .err => |msg| {
-                defer allocator.free(msg);
-                std.log.scoped(.coding_agent).warn("completion failed: {s}", .{msg});
-                return error.ProviderCompletionFailed;
-            },
-            .cancelled => error.MissingCompletionText,
-        };
+        return ai_completion_runtime.completeUserText(self, allocator, system_prompt, prompt_text, max_tokens);
     }
 
     /// Get session file path (valid after first flush).
