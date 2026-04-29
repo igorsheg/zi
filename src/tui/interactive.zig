@@ -47,6 +47,7 @@ const login_flow = @import("interactive/login_flow.zig");
 const composer_flow = @import("interactive/composer_flow.zig");
 const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
+const status_flow = @import("interactive/status_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
 const status_data_mod = @import("status_data.zig");
@@ -873,55 +874,23 @@ pub const Interactive = struct {
     }
 
     pub fn showLoader(self: *Interactive, message: []const u8) void {
-        self.built_in_working_message = message;
-        self.refreshBuiltInStatus();
+        status_flow.showLoader(self, message);
     }
 
     pub fn showCompactionLoader(self: *Interactive, reason: coding_agent_mod.session_event.CompactionReason) void {
-        self.compaction_loader_active = true;
-        self.compaction_loader_reason = reason;
-        self.refreshBuiltInStatus();
+        status_flow.showCompactionLoader(self, reason);
     }
 
     pub fn finishCompactionLoader(self: *Interactive) void {
-        if (!self.compaction_loader_active) return;
-        self.compaction_loader_active = false;
-        self.refreshBuiltInStatus();
+        status_flow.finishCompactionLoader(self);
     }
 
     pub fn hideLoader(self: *Interactive) void {
-        self.refreshBuiltInStatus();
-        // Don't blank primary status — preserve any error/abort message
-        // that was set while working was active.
+        status_flow.hideLoader(self);
     }
 
     pub fn refreshBuiltInStatus(self: *Interactive) void {
-        if (self.compaction_loader_active) {
-            const message = switch (self.compaction_loader_reason) {
-                .manual => "Compacting session…",
-                .threshold => "Auto-compacting…",
-                .overflow => "Context overflow detected, auto-compacting…",
-            };
-            self.status_line.setWorking(message);
-            self.loader_active = true;
-        } else if (self.retry_waiting) {
-            var buf: [128]u8 = undefined;
-            const delay_seconds = @divTrunc(self.retry_delay_ms + 500, 1000);
-            const message = std.fmt.bufPrint(
-                &buf,
-                "Retrying ({d}/{d}) in {d}s… (Esc to cancel)",
-                .{ self.retry_attempt, self.retry_max_attempts, delay_seconds },
-            ) catch "Retrying…";
-            self.status_line.setWorking(message);
-            self.loader_active = true;
-        } else if (self.is_streaming or self.request_in_flight) {
-            self.status_line.setWorking(self.built_in_working_message);
-            self.loader_active = true;
-        } else if (self.loader_active) {
-            self.status_line.clearWorking();
-            self.loader_active = false;
-        }
-        self.tui.dirty = true;
+        status_flow.refreshBuiltInStatus(self);
     }
 
     fn detectGitBranch(self: *Interactive) void {
