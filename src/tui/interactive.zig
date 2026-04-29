@@ -27,6 +27,7 @@ const app_meta = @import("../app_meta.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
+const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
 const image_mod = @import("../image/root.zig");
@@ -47,6 +48,7 @@ const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
+const ExtensionUiState = extension_ui_state_mod.ExtensionUiState;
 const session_store_mod = @import("../coding_agent/session/store.zig");
 const session_index_worker_mod = @import("session_index_worker.zig");
 const SessionStore = session_store_mod.SessionStore;
@@ -539,10 +541,7 @@ pub const Interactive = struct {
     active_editor_bound: bool = false,
     status_line: StatusLine,
     pending_image_banner: text_mod.Text,
-    extension_report_text: text_mod.Text,
-    extension_report_id: ?[]const u8 = null,
-    extension_report_scroll_offsets: std.StringHashMapUnmanaged(u32) = .{},
-    extension_message_text: text_mod.Text,
+    extension_ui_state: ExtensionUiState,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
@@ -685,8 +684,7 @@ pub const Interactive = struct {
             .editor = editor_mod.Editor.init(state_allocator),
             .status_line = StatusLine.init(state_allocator),
             .pending_image_banner = text_mod.Text.init(state_allocator),
-            .extension_report_text = text_mod.Text.init(state_allocator),
-            .extension_message_text = text_mod.Text.init(state_allocator),
+            .extension_ui_state = ExtensionUiState.init(state_allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
@@ -809,9 +807,7 @@ pub const Interactive = struct {
         self.transcript_container.deinit();
         self.conversation_projection.deinit();
         self.transcript.deinit();
-        self.extension_message_text.deinit();
-        self.clearExtensionReportScrollState();
-        self.extension_report_text.deinit();
+        self.extension_ui_state.deinit();
         self.pending_image_banner.deinit();
         self.status_line.deinit();
         self.editor.deinit();
@@ -890,8 +886,8 @@ pub const Interactive = struct {
         self.status_container.addChild(self.status_line.component());
         self.editor_container.addChild(self.active_editor.component());
         self.editor_container.focused_child_index = 0; // for cursor y-offset translation
-        self.composer_below_container.addChild(self.extension_report_text.component());
-        self.composer_below_container.addChild(self.extension_message_text.component());
+        self.composer_below_container.addChild(self.extension_ui_state.reportComponent());
+        self.composer_below_container.addChild(self.extension_ui_state.messageComponent());
 
         // Set initial focus via TUI (source of truth for input routing)
         self.tui.setFocus(self.active_editor.component());
@@ -3299,44 +3295,8 @@ pub const Interactive = struct {
     }
 
     fn applyExtensionReport(self: *Interactive, report: extension_ui.Report) void {
-        self.saveCurrentExtensionReportScrollOffset();
-        const text = switch (report.format) {
-            .text => report.flattenText(self.allocator),
-        } catch return;
-        defer self.allocator.free(text);
-        self.extension_report_text.setContent(text);
-        self.extension_report_text.scroll_offset = self.extension_report_scroll_offsets.get(report.id) orelse 0;
-        self.setCurrentExtensionReportId(report.id);
+        self.extension_ui_state.applyReport(report);
         self.tui.dirty = true;
-    }
-
-    fn saveCurrentExtensionReportScrollOffset(self: *Interactive) void {
-        const id = self.extension_report_id orelse return;
-        const owned_key = self.allocator.dupe(u8, id) catch return;
-        if (self.extension_report_scroll_offsets.fetchRemove(id)) |old| {
-            self.allocator.free(old.key);
-        }
-        self.extension_report_scroll_offsets.put(self.allocator, owned_key, self.extension_report_text.scroll_offset) catch {
-            self.allocator.free(owned_key);
-        };
-    }
-
-    fn setCurrentExtensionReportId(self: *Interactive, id: []const u8) void {
-        self.clearCurrentExtensionReportId();
-        self.extension_report_id = self.allocator.dupe(u8, id) catch null;
-    }
-
-    fn clearCurrentExtensionReportId(self: *Interactive) void {
-        if (self.extension_report_id) |old| self.allocator.free(old);
-        self.extension_report_id = null;
-    }
-
-    fn clearExtensionReportScrollState(self: *Interactive) void {
-        self.clearCurrentExtensionReportId();
-        var iter = self.extension_report_scroll_offsets.iterator();
-        while (iter.next()) |entry| self.allocator.free(entry.key_ptr.*);
-        self.extension_report_scroll_offsets.deinit(self.allocator);
-        self.extension_report_scroll_offsets = .{};
     }
 
     fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
@@ -3354,51 +3314,12 @@ pub const Interactive = struct {
     fn applyExtensionUiPublications(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiPublication) void {
         for (updates) |update| {
             switch (update.kind) {
-                .message => self.applyUiPublicationText(&self.extension_message_text, update),
+                .message => self.extension_ui_state.applyMessage(update),
                 .status => self.status_data.setStatus(update.id, update.text),
-                .progress => self.applyProgressPublication(update),
+                .progress => self.extension_ui_state.applyProgress(update),
             }
         }
         self.tui.dirty = true;
-    }
-
-    fn applyUiPublicationText(_: *Interactive, text_component: *text_mod.Text, update: @import("../coding_agent/extensions/ui.zig").UiPublication) void {
-        text_component.setContent(update.text orelse "");
-    }
-
-    fn applyProgressPublication(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").UiPublication) void {
-        self.saveCurrentExtensionReportScrollOffset();
-        self.clearCurrentExtensionReportId();
-        const text = self.formatProgressPublication(update) catch return;
-        defer self.allocator.free(text);
-        self.extension_report_text.setContent(text);
-        self.extension_report_text.scroll_offset = 0;
-    }
-
-    fn formatProgressPublication(self: *Interactive, update: @import("../coding_agent/extensions/ui.zig").UiPublication) ![]const u8 {
-        if (update.text) |text| return try self.allocator.dupe(u8, text);
-        const title = update.title orelse "Progress";
-        const detail = update.detail;
-        const status_suffix: []const u8 = switch (update.progress_status orelse .running) {
-            .running => "",
-            .done => " done",
-            .@"error" => " error",
-            .cancelled => " cancelled",
-        };
-        if (update.current) |cur| {
-            if (update.total) |tot| {
-                if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} {d}/{d} — {s}", .{ title, status_suffix, cur, tot, d });
-                return try std.fmt.allocPrint(self.allocator, "{s}{s} {d}/{d}", .{ title, status_suffix, cur, tot });
-            }
-            if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} {d} — {s}", .{ title, status_suffix, cur, d });
-            return try std.fmt.allocPrint(self.allocator, "{s}{s} {d}", .{ title, status_suffix, cur });
-        }
-        if (update.indeterminate) {
-            if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} … — {s}", .{ title, status_suffix, d });
-            return try std.fmt.allocPrint(self.allocator, "{s}{s} …", .{ title, status_suffix });
-        }
-        if (detail) |d| return try std.fmt.allocPrint(self.allocator, "{s}{s} — {s}", .{ title, status_suffix, d });
-        return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ title, status_suffix });
     }
 
     /// TUI-thread application of the latest extension command list.
