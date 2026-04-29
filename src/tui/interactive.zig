@@ -35,6 +35,7 @@ const slash_command_mod = @import("interactive/slash_command.zig");
 const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
 const agent_requests_mod = @import("interactive/agent_requests.zig");
 const session_requests_mod = @import("interactive/session_requests.zig");
+const model_requests_mod = @import("interactive/model_requests.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -704,7 +705,7 @@ pub const Interactive = struct {
             self.publishLifecycleUiEvent(event);
     }
 
-    fn publishSnapshotUiEvent(self: *Interactive, event: UiEvent) bool {
+    pub fn publishSnapshotUiEvent(self: *Interactive, event: UiEvent) bool {
         switch (self.snapshot_event_queue.trySend(event)) {
             .ok => return true,
             .dropped => return false,
@@ -2727,53 +2728,11 @@ pub const Interactive = struct {
     /// `AgentSession.trySetModel`, then translates the typed outcome
     /// into a TUI-owned event payload.
     pub fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
-        switch (self.runtime_host.currentSession().trySetModel(m)) {
-            .success => |_| {
-                self.publishStatusSnapshot();
-                const model_id = self.msg_allocator.dupe(u8, m.id) catch return;
-                _ = self.publishLifecycleUiEvent(.{ .model_switched = .{ .model_id = model_id } });
-            },
-            .no_auth => |blocked| {
-                const provider_str = json_util.providerToString(blocked.provider);
-                const msg = std.fmt.allocPrint(
-                    self.msg_allocator,
-                    "No API key for {s}/{s}",
-                    .{ provider_str, blocked.id },
-                ) catch return;
-                _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
-            },
-            .registry_unavailable => {
-                const msg = self.msg_allocator.dupe(u8, "model registry unavailable") catch return;
-                _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
-            },
-        }
+        model_requests_mod.handleSetModel(self, m);
     }
 
     pub fn handleSetModelPattern(self: *Interactive, pattern: []const u8) void {
-        const registry = self.runtime_host.currentSession().model_registry orelse {
-            const msg = self.msg_allocator.dupe(u8, "model registry unavailable") catch return;
-            _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
-            return;
-        };
-
-        var scratch = std.heap.ArenaAllocator.init(self.msg_allocator);
-        defer scratch.deinit();
-        const result = ai_resolve.resolveCliModel(.{
-            .cli_model = pattern,
-            .registry = registry,
-            .allocator = scratch.allocator(),
-        });
-        if (result.err) |err_msg| {
-            const msg = self.msg_allocator.dupe(u8, err_msg) catch return;
-            _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
-            return;
-        }
-        const model = result.model orelse {
-            const msg = self.msg_allocator.dupe(u8, "model not found") catch return;
-            _ = self.publishLifecycleUiEvent(.{ .model_switch_failed = .{ .message = msg } });
-            return;
-        };
-        self.handleSetModel(model);
+        model_requests_mod.handleSetModelPattern(self, pattern);
     }
 
     pub fn publishThemeSnapshot(self: *Interactive) void {
@@ -2798,37 +2757,14 @@ pub const Interactive = struct {
     }
 
     pub fn publishVisibleModelsSnapshot(self: *Interactive) void {
-        const registry = self.runtime_host.currentSession().model_registry orelse {
-            _ = self.publishLifecycleUiEvent(.{ .visible_models_snapshot = .{ .models = &.{} } });
-            return;
-        };
-        const models = coding_agent_mod.model_registry.cloneOwnedModels(self.msg_allocator, registry.getAll()) catch return;
-        _ = self.publishLifecycleUiEvent(.{ .visible_models_snapshot = .{ .models = models } });
+        model_requests_mod.publishVisibleModelsSnapshot(self);
     }
 
     pub fn publishStatusSnapshot(self: *Interactive) void {
-        const snapshot = self.runtime_host.currentSession().statusSnapshot();
-        if (self.shouldSkipStatusSnapshotPublish(snapshot)) return;
-
-        const provider_copy = self.msg_allocator.dupe(u8, snapshot.model_provider) catch return;
-        errdefer self.msg_allocator.free(provider_copy);
-        const model_id_copy = self.msg_allocator.dupe(u8, snapshot.model_id) catch return;
-        errdefer self.msg_allocator.free(model_id_copy);
-        const thinking_copy = self.msg_allocator.dupe(u8, thinking_mod.label(snapshot.thinking_level)) catch return;
-        errdefer self.msg_allocator.free(thinking_copy);
-
-        if (self.publishSnapshotUiEvent(.{ .status_snapshot = .{
-            .model_provider = provider_copy,
-            .model_id = model_id_copy,
-            .thinking_level = thinking_copy,
-            .context_tokens = snapshot.context_tokens,
-            .context_window = snapshot.context_window,
-        } })) {
-            self.rememberPublishedStatusSnapshot(snapshot);
-        }
+        model_requests_mod.publishStatusSnapshot(self);
     }
 
-    fn shouldSkipStatusSnapshotPublish(
+    pub fn shouldSkipStatusSnapshotPublish(
         self: *const Interactive,
         snapshot: AgentSession.StatusSnapshot,
     ) bool {
@@ -2836,7 +2772,7 @@ pub const Interactive = struct {
         return last.eql(snapshot);
     }
 
-    fn rememberPublishedStatusSnapshot(
+    pub fn rememberPublishedStatusSnapshot(
         self: *Interactive,
         snapshot: AgentSession.StatusSnapshot,
     ) void {
@@ -2853,10 +2789,7 @@ pub const Interactive = struct {
     }
 
     pub fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
-        _ = self.runtime_host.currentSession().trySetThinkingLevel(level);
-        self.publishStatusSnapshot();
-        const level_label = self.msg_allocator.dupe(u8, thinking_mod.label(level)) catch return;
-        _ = self.publishLifecycleUiEvent(.{ .thinking_level_changed = .{ .level = level_label } });
+        model_requests_mod.handleSetThinkingLevel(self, level);
     }
 
     fn publishConversationStateForAgentEvent(self: *Interactive, event: AgentEvent) void {
