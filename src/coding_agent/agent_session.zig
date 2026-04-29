@@ -15,6 +15,7 @@ const model_registry_mod = @import("model_registry.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
 const message_conversion = @import("agent_session/message_conversion.zig");
 const model_control = @import("agent_session/model_control.zig");
+const runtime_state = @import("agent_session/runtime_state.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const ai_completion = @import("ai_completion.zig");
@@ -765,8 +766,6 @@ pub const AgentSession = struct {
         };
     }
 
-    const extension_state_entry_type = "extension_state";
-
     fn runtimeSessionStateGet(
         session_ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -774,34 +773,7 @@ pub const AgentSession = struct {
         key: []const u8,
     ) ?std.json.Value {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-
-        const branch = self.session_store.buildCurrentVisibleBranchAlloc(arena.allocator()) catch return null;
-        var latest: ?std.json.Value = null;
-        var deleted = false;
-
-        for (branch) |entry| {
-            const custom = switch (entry.entry) {
-                .custom => |custom| custom,
-                else => continue,
-            };
-            if (!std.mem.eql(u8, custom.custom_type, extension_state_entry_type)) continue;
-            const data = custom.data orelse continue;
-            if (data != .object) continue;
-            const owner_value = data.object.get("state_owner_id") orelse continue;
-            const key_value = data.object.get("key") orelse continue;
-            if (owner_value != .string or key_value != .string) continue;
-            if (!std.mem.eql(u8, owner_value.string, state_owner_id)) continue;
-            if (!std.mem.eql(u8, key_value.string, key)) continue;
-
-            deleted = if (data.object.get("deleted")) |value| value == .bool and value.bool else false;
-            latest = data.object.get("value");
-        }
-
-        if (deleted) return null;
-        const value = latest orelse return null;
-        return ai.json_util.cloneJsonValue(allocator, value) catch null;
+        return runtime_state.get(self, allocator, state_owner_id, key);
     }
 
     fn runtimeSessionStateSet(
@@ -811,17 +783,7 @@ pub const AgentSession = struct {
         value: std.json.Value,
     ) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        var data = std.json.ObjectMap.init(self.allocator);
-        errdefer {
-            const wrapped: std.json.Value = .{ .object = data };
-            ai.json_util.freeJsonValue(self.allocator, wrapped);
-        }
-
-        try data.put(try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
-        try data.put(try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
-        try data.put(try self.allocator.dupe(u8, "value"), try ai.json_util.cloneJsonValue(self.allocator, value));
-
-        self.session_store.appendCustomEntry(extension_state_entry_type, .{ .object = data });
+        try runtime_state.set(self, state_owner_id, key, value);
     }
 
     fn runtimeSessionStateDelete(
@@ -830,17 +792,7 @@ pub const AgentSession = struct {
         key: []const u8,
     ) !void {
         const self: *AgentSession = @ptrCast(@alignCast(session_ptr));
-        var data = std.json.ObjectMap.init(self.allocator);
-        errdefer {
-            const wrapped: std.json.Value = .{ .object = data };
-            ai.json_util.freeJsonValue(self.allocator, wrapped);
-        }
-
-        try data.put(try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
-        try data.put(try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
-        try data.put(try self.allocator.dupe(u8, "deleted"), .{ .bool = true });
-
-        self.session_store.appendCustomEntry(extension_state_entry_type, .{ .object = data });
+        try runtime_state.delete(self, state_owner_id, key);
     }
 
     fn runtimeSessionInfoGet(session_ptr: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
