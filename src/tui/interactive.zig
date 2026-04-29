@@ -30,6 +30,7 @@ const queues_mod = @import("interactive/queues.zig");
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
+const thinking_mod = @import("interactive/thinking.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
@@ -2366,9 +2367,9 @@ pub const Interactive = struct {
             const level = available[i];
             self.thinking_picker_levels[i] = level;
             self.thinking_picker_items[i] = .{
-                .value = agentThinkingValue(level),
-                .label = agentThinkingValue(level),
-                .description = thinkingDescription(level),
+                .value = thinking_mod.value(level),
+                .label = thinking_mod.value(level),
+                .description = thinking_mod.description(level),
             };
         }
         self.thinking_picker_count = count;
@@ -3250,7 +3251,7 @@ pub const Interactive = struct {
         errdefer self.msg_allocator.free(provider_copy);
         const model_id_copy = self.msg_allocator.dupe(u8, snapshot.model_id) catch return;
         errdefer self.msg_allocator.free(model_id_copy);
-        const thinking_copy = self.msg_allocator.dupe(u8, agentThinkingLabel(snapshot.thinking_level)) catch return;
+        const thinking_copy = self.msg_allocator.dupe(u8, thinking_mod.label(snapshot.thinking_level)) catch return;
         errdefer self.msg_allocator.free(thinking_copy);
 
         if (self.publishSnapshotUiEvent(.{ .status_snapshot = .{
@@ -3291,7 +3292,7 @@ pub const Interactive = struct {
     fn handleSetThinkingLevel(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
         _ = self.runtime_host.currentSession().trySetThinkingLevel(level);
         self.publishStatusSnapshot();
-        const level_label = self.msg_allocator.dupe(u8, agentThinkingLabel(level)) catch return;
+        const level_label = self.msg_allocator.dupe(u8, thinking_mod.label(level)) catch return;
         _ = self.publishLifecycleUiEvent(.{ .thinking_level_changed = .{ .level = level_label } });
     }
 
@@ -3402,37 +3403,6 @@ pub const Interactive = struct {
     }
 };
 
-fn agentThinkingLabel(level: agent_protocol.ThinkingLevel) []const u8 {
-    return switch (level) {
-        .off => "",
-        .minimal => "minimal",
-        .low => "low",
-        .medium => "medium",
-        .high => "high",
-        .xhigh => "xhigh",
-    };
-}
-
-fn agentThinkingValue(level: agent_protocol.ThinkingLevel) []const u8 {
-    return switch (level) {
-        .off => "off",
-        .minimal => "minimal",
-        .low => "low",
-        .medium => "medium",
-        .high => "high",
-        .xhigh => "xhigh",
-    };
-}
-
-fn parseAgentThinkingLevel(value: []const u8) agent_protocol.ThinkingLevel {
-    if (std.mem.eql(u8, value, "minimal")) return .minimal;
-    if (std.mem.eql(u8, value, "low")) return .low;
-    if (std.mem.eql(u8, value, "medium")) return .medium;
-    if (std.mem.eql(u8, value, "high")) return .high;
-    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
-    return .off;
-}
-
 fn currentThinkingSettingsDescription(self: *const Interactive) []const u8 {
     const model = currentStatusModel(self) orelse return "Current model unavailable";
     if (!model.reasoning) return "Current model does not support thinking";
@@ -3448,15 +3418,4 @@ fn currentStatusModel(self: *const Interactive) ?ai_protocol.Model {
         }
     }
     return null;
-}
-
-fn thinkingDescription(level: agent_protocol.ThinkingLevel) []const u8 {
-    return switch (level) {
-        .off => "No reasoning",
-        .minimal => "Very brief reasoning (~1k tokens)",
-        .low => "Light reasoning (~2k tokens)",
-        .medium => "Moderate reasoning (~8k tokens)",
-        .high => "Deep reasoning (~16k tokens)",
-        .xhigh => "Maximum reasoning (~32k tokens)",
-    };
 }
