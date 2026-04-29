@@ -33,9 +33,9 @@ const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
+const agent_ui_event_mod = @import("interactive/agent_ui_event.zig");
 const clipboard_images_mod = @import("interactive/clipboard_images.zig");
 const profile_mod = @import("../debug/profile.zig");
-const string_util = @import("../lib/string_util.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
@@ -50,6 +50,8 @@ const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
+const convertAgentUiEvent = agent_ui_event_mod.convertAgentUiEvent;
+const userFacingFailureMessage = agent_ui_event_mod.userFacingFailureMessage;
 const PendingImageAttachment = clipboard_images_mod.PendingImageAttachment;
 const buildSubmittedUserContent = clipboard_images_mod.buildSubmittedUserContent;
 const pendingImageBannerText = clipboard_images_mod.pendingImageBannerText;
@@ -3518,62 +3520,6 @@ pub const Interactive = struct {
         _ = self.publishLifecycleUiEvent(.{ .session_compaction_failed = .{ .message = msg } });
     }
 };
-
-fn userFacingFailureMessage(
-    failure_kind: ?ai_protocol.NormalizedFailure.Kind,
-    raw_message: []const u8,
-) []const u8 {
-    return switch (failure_kind orelse return raw_message) {
-        .auth => "authentication failed. run /login or refresh your credentials.",
-        .context_overflow => "context window exceeded. compact the session or switch to a larger-context model.",
-        .rate_limited => "provider rate limit reached. wait and try again, or switch providers.",
-        .transient => "provider or network failure. try again shortly.",
-        .invalid_request => if (string_util.containsCI(raw_message, "content_filter"))
-            "request blocked by the provider safety filter. try rephrasing and try again."
-        else
-            raw_message,
-        else => raw_message,
-    };
-}
-
-/// Convert an AgentEvent to a small TUI side-effect event.
-/// Conversation semantics cross separately as `conversation_state`.
-fn convertAgentUiEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
-    switch (event) {
-        .message_update => |mu| switch (mu.assistant_message_event) {
-            .@"error" => |e| {
-                const assistant = e.@"error";
-                if (assistant.error_message) |msg| {
-                    const display = userFacingFailureMessage(if (assistant.failure) |failure| failure.kind else null, msg);
-                    const owned = allocator.dupe(u8, display) catch return null;
-                    return .{ .error_message = .{ .message = owned } };
-                }
-                return null;
-            },
-            else => return null,
-        },
-        .tool_execution_start => |te| {
-            const tool_name = allocator.dupe(u8, te.tool_name) catch return null;
-            return .{ .tool_running = .{ .tool_name = tool_name } };
-        },
-        .message_end => |me| switch (me.message) {
-            .assistant => |assistant| {
-                if (assistant.stop_reason != .aborted and assistant.stop_reason != .@"error") return null;
-                const err_msg = if (assistant.error_message) |msg|
-                    (allocator.dupe(u8, msg) catch null)
-                else
-                    null;
-                return .{ .assistant_run_finished = .{
-                    .is_aborted = assistant.stop_reason == .aborted,
-                    .error_message = err_msg,
-                    .failure_kind = if (assistant.failure) |failure| failure.kind else null,
-                } };
-            },
-            else => return null,
-        },
-        .agent_start, .agent_end, .turn_start, .turn_end, .message_start, .tool_execution_update, .tool_execution_end => return null,
-    }
-}
 
 fn agentThinkingLabel(level: agent_protocol.ThinkingLevel) []const u8 {
     return switch (level) {
