@@ -27,6 +27,7 @@ const app_meta = @import("../app_meta.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("input_buffer.zig");
+const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
 const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
@@ -49,6 +50,7 @@ const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
+const ModelPickerFlow = model_picker_flow_mod.ModelPickerFlow;
 const ResumePickerFlow = resume_picker_flow_mod.ResumePickerFlow;
 const ExtensionPromptFlow = extension_prompt_flow_mod.ExtensionPromptFlow;
 const ExtensionUiState = extension_ui_state_mod.ExtensionUiState;
@@ -267,80 +269,6 @@ test "UiLifecycleQueue rejects overload and keeps wake semantics" {
     try std.testing.expectEqual(@as(usize, 1), stats.rejected_count);
     try std.testing.expectEqual(ui_lifecycle_queue_capacity, stats.high_water_depth);
 }
-
-/// Owns all transient heap-backed data for one `/model` overlay.
-/// Catalog models are borrowed from Interactive's TUI-owned snapshot;
-/// derived search rows live here.
-const ModelPickerFlow = struct {
-    arena: std.heap.ArenaAllocator,
-    rows: []Row = &.{},
-    items: []SelectItem = &.{},
-    search_texts: []const []const u8 = &.{},
-    picker: ListPicker,
-    handle: ?tui_mod.OverlayHandle = null,
-
-    const Row = struct {
-        item: SelectItem,
-        model: ai_protocol.Model,
-        search_text: []const u8,
-    };
-
-    fn init(
-        gpa: std.mem.Allocator,
-        theme: *const theme_mod.Theme,
-        model_catalog: []const ai_protocol.Model,
-        auth_storage: *auth_storage_mod.AuthStorage,
-    ) !ModelPickerFlow {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-
-        var count: usize = 0;
-        for (model_catalog) |model| {
-            if (auth_storage.hasAuth(json_util.providerToString(model.provider))) count += 1;
-        }
-
-        const rows = try a.alloc(Row, count);
-        const items = try a.alloc(SelectItem, count);
-        const search_texts = try a.alloc([]const u8, count);
-
-        var i: usize = 0;
-        for (model_catalog) |model| {
-            const provider_str = json_util.providerToString(model.provider);
-            if (!auth_storage.hasAuth(provider_str)) continue;
-
-            const item: SelectItem = .{
-                .value = model.id,
-                .label = model.id,
-                .description = provider_str,
-            };
-            const search_text = try std.fmt.allocPrint(a, "{s} {s}", .{ provider_str, model.id });
-            rows[i] = .{ .item = item, .model = model, .search_text = search_text };
-            items[i] = item;
-            search_texts[i] = search_text;
-            i += 1;
-        }
-
-        var picker = ListPicker.init(theme);
-        picker.title = "Select model";
-        picker.list.max_visible = 12;
-        picker.setSearchPlaceholder("Search models");
-        picker.setEmptyText("No matching models");
-        picker.setSearchableItems(items, search_texts);
-
-        return .{
-            .arena = arena,
-            .rows = rows,
-            .items = items,
-            .search_texts = search_texts,
-            .picker = picker,
-        };
-    }
-
-    fn deinit(self: *ModelPickerFlow) void {
-        self.arena.deinit();
-    }
-};
 
 const StartupAction = union(enum) {
     none,
