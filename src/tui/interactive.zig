@@ -38,6 +38,7 @@ const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
 const session_requests_mod = @import("interactive/session_requests.zig");
 const model_requests_mod = @import("interactive/model_requests.zig");
 const session_events_mod = @import("interactive/session_events.zig");
+const runtime_process = @import("../runtime/process.zig");
 const session_flow = @import("interactive/session_flow.zig");
 const conversation_publish = @import("interactive/conversation_publish.zig");
 const key_flow_mod = @import("interactive/key_flow.zig");
@@ -699,23 +700,24 @@ pub const Interactive = struct {
     }
 
     fn detectGitBranch(self: *Interactive) void {
-        var child = std.process.spawn(self.io, .{
+        var result = runtime_process.run(self.allocator, self.io, .{
             .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-            .stdout = .pipe,
-            .stderr = .ignore,
-        }) catch return;
-        var stdout_buf: [256]u8 = undefined;
-        var stdout_reader = child.stdout.?.reader(self.io, &stdout_buf);
-        const stdout = stdout_reader.interface.allocRemaining(self.allocator, .limited(256)) catch return;
-        defer self.allocator.free(stdout);
-        const term = child.wait(self.io) catch return;
+            .max_stdout_bytes = 256,
+            .capture_stderr = false,
+        });
+        defer result.deinit(self.allocator);
 
-        if (term == .exited and term.exited == 0) {
-            const branch = std.mem.trimEnd(u8, stdout, " \t\n\r");
-            if (branch.len > 0) {
-                self.active_editor.setGitBranch(branch);
-            }
+        const completed = switch (result) {
+            .completed => |completed| completed,
+            .timeout, .err => return,
+        };
+        switch (completed.term) {
+            .exited => |code| if (code != 0) return,
+            else => return,
         }
+
+        const branch = std.mem.trimEnd(u8, completed.stdout, " \t\n\r");
+        if (branch.len > 0) self.active_editor.setGitBranch(branch);
     }
 
     fn nextLoopDeadlineNs(self: *Interactive, now_ns: i128) ?i128 {
@@ -923,7 +925,6 @@ pub const Interactive = struct {
     // ── App-level overlay presets ──────────────────────────────
     // These know about the Interactive layout (footer height, etc).
     // Generic presets live in overlay.zig (OverlayPresets).
-
 
     pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
         return overlay_flow.bottomSheetOptions(self);

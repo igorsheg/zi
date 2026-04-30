@@ -5,13 +5,12 @@ const json_util = @import("../../ai/json_util.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("../../lib/output_buffer.zig");
-const AbortGuard = @import("../../abort_guard.zig").AbortGuard;
+const runtime_process = @import("../../runtime/process.zig");
 const lock_registry = @import("lock_registry.zig");
 
 const HEAD_LINES: usize = 50;
 const TAIL_LINES: usize = 50;
 const TRUNCATED_FMT = "... [{d} lines truncated] ...";
-const STREAM_UPDATE_POLL_MS: u64 = 50;
 const STREAM_UPDATE_MIN_INTERVAL_MS: u64 = 100;
 
 const bash_schema =
@@ -140,32 +139,41 @@ fn runCommand(
     else |_|
         &.{ "/bin/sh", "-c", command };
 
-    var child = std.process.spawn(io, .{
-        .argv = shell_argv,
-        .cwd = .{ .path = cwd },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
-    }) catch |err| {
-        return util.errorf(allocator, "command error: {s}", .{@errorName(err)});
+    var capture = StreamingCapture.init(io_allocator);
+    defer capture.deinit();
+    var callback_ctx = BashChunkCtx{
+        .allocator = allocator,
+        .capture = &capture,
+        .command = command,
+        .cb = on_update,
+        .update_ctx = update_ctx,
     };
-    const child_id = child.id.?;
 
-    var abort_guard = AbortGuard.start(signal, .{ .interrupt_process_group = child_id });
-    defer abort_guard.stop();
+    var proc_result = runtime_process.run(allocator, io, .{
+        .argv = shell_argv,
+        .cwd = cwd,
+        .timeout_ms = if (timeout_secs) |secs| secs * std.time.ms_per_s else null,
+        .signal = signal,
+        .capture_stdout = false,
+        .capture_stderr = false,
+        .on_chunk = .{ .ctx = @ptrCast(&callback_ctx), .func = &BashChunkCtx.onChunk },
+    });
+    defer proc_result.deinit(allocator);
+    callback_ctx.emitFinal();
 
-    var timeout_guard = TimeoutGuard.start(timeout_secs, child_id);
-    defer timeout_guard.stop();
+    if (proc_result == .err) {
+        return util.errorf(allocator, "command error: {s}", .{proc_result.err.message});
+    }
 
-    const completed = if (on_update) |cb|
-        runStreamingCapture(allocator, io_allocator, &child, command, cb, update_ctx)
-    else
-        runBufferedCapture(allocator, io_allocator, &child);
+    const completed = CompletedOutput{ .output_text = capture.finishText(allocator) catch allocator.dupe(u8, "") catch &.{} };
     defer if (completed.output_text.len > 0) allocator.free(completed.output_text);
 
-    const term = child.wait(io) catch null;
-    timeout_guard.markExited();
+    const did_timeout = proc_result == .timeout;
+    const term: ?std.process.Child.Term = switch (proc_result) {
+        .completed => |completed_result| completed_result.term,
+        .timeout => null,
+        .err => null,
+    };
 
     const result_text = formatCommandTranscript(allocator, command, completed.output_text) catch
         return util.errorResult(allocator, "bash tool: alloc failed");
@@ -177,7 +185,7 @@ fn runCommand(
         return .{ .content = oneText(allocator, aborted), .is_error = true };
     }
 
-    if (timeout_guard.did_timeout.load(.acquire)) {
+    if (did_timeout) {
         if (timeout_secs) |secs| {
             const tail = std.fmt.allocPrint(allocator, "\n\ncommand timed out after {d} seconds", .{secs}) catch "";
             defer if (tail.len > 0) allocator.free(tail);
@@ -206,68 +214,54 @@ fn runCommand(
     return .{ .content = oneText(allocator, result_text) };
 }
 
-const TimeoutGuard = struct {
-    done: *std.Io.Event,
-    did_timeout: *std.atomic.Value(bool),
-    thread: ?std.Thread,
-
-    fn start(timeout_secs: ?u64, process_group_id: std.process.Child.Id) TimeoutGuard {
-        const secs = timeout_secs orelse return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        const done = std.heap.page_allocator.create(std.Io.Event) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        errdefer std.heap.page_allocator.destroy(done);
-        const did_timeout = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        done.* = .unset;
-        did_timeout.* = std.atomic.Value(bool).init(false);
-        const thread = std.Thread.spawn(.{}, watchdog, .{ secs, process_group_id, done, did_timeout }) catch null;
-        return .{ .done = done, .did_timeout = did_timeout, .thread = thread };
-    }
-
-    fn markExited(self: *TimeoutGuard) void {
-        self.done.set(std.Options.debug_io);
-    }
-
-    fn stop(self: *TimeoutGuard) void {
-        self.done.set(std.Options.debug_io);
-        if (self.thread) |t| t.join();
-        if (self.done != &noop_done) std.heap.page_allocator.destroy(self.done);
-        if (self.did_timeout != &noop_timeout) std.heap.page_allocator.destroy(self.did_timeout);
-        self.thread = null;
-    }
-
-    var noop_done: std.Io.Event = .unset;
-    var noop_timeout = std.atomic.Value(bool).init(false);
-
-    fn watchdog(timeout_secs: u64, process_group_id: std.process.Child.Id, done: *std.Io.Event, did_timeout: *std.atomic.Value(bool)) void {
-        done.waitTimeout(std.Options.debug_io, .{ .duration = .{ .raw = .fromSeconds(@intCast(timeout_secs)), .clock = .boot } }) catch |err| switch (err) {
-            error.Timeout => {
-                did_timeout.store(true, .release);
-                killProcessGroup(process_group_id, std.posix.SIG.KILL);
-            },
-            error.Canceled => {},
-        };
-    }
-};
-
-fn killProcessGroup(process_group_id: std.process.Child.Id, sig: std.posix.SIG) void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        std.posix.kill(process_group_id, sig) catch {};
-        return;
-    }
-    const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(process_group_id));
-    std.posix.kill(group_pid, sig) catch {};
-}
-
 const CompletedOutput = struct {
     output_text: []u8 = &.{},
 };
 
-const StreamKind = enum { stdout, stderr };
+const BashChunkCtx = struct {
+    allocator: std.mem.Allocator,
+    capture: *StreamingCapture,
+    command: []const u8,
+    cb: ?protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
+    mutex: std.Io.Mutex = .init,
+    last_emit_ns: i128 = 0,
+    last_emitted_hash: ?u64 = null,
+
+    fn onChunk(raw_ctx: ?*anyopaque, _: runtime_process.StreamKind, bytes: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+
+        self.capture.append(bytes);
+        const cb = self.cb orelse return;
+        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        if (self.last_emit_ns != 0 and now_ns - self.last_emit_ns < STREAM_UPDATE_MIN_INTERVAL_MS * std.time.ns_per_ms) return;
+        if (self.capture.takeDirtySnapshot(self.allocator)) |snapshot| {
+            defer if (snapshot.len > 0) self.allocator.free(snapshot);
+            if (emitPartialTranscriptUpdate(self.allocator, self.command, snapshot, cb, self.update_ctx, self.last_emitted_hash)) |new_hash| {
+                self.last_emitted_hash = new_hash;
+                self.last_emit_ns = now_ns;
+            }
+        }
+    }
+
+    fn emitFinal(self: *@This()) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        const cb = self.cb orelse return;
+        if (self.capture.takeDirtySnapshot(self.allocator)) |snapshot| {
+            defer if (snapshot.len > 0) self.allocator.free(snapshot);
+            if (emitPartialTranscriptUpdate(self.allocator, self.command, snapshot, cb, self.update_ctx, self.last_emitted_hash)) |new_hash| {
+                self.last_emitted_hash = new_hash;
+            }
+        }
+    }
+};
 
 const StreamingCapture = struct {
     mutex: std.Io.Mutex = .init,
     output: output_buffer.LineOutputBuffer,
-    stdout_done: bool = false,
-    stderr_done: bool = false,
     dirty: bool = false,
 
     fn init(allocator: std.mem.Allocator) StreamingCapture {
@@ -287,21 +281,6 @@ const StreamingCapture = struct {
         self.dirty = true;
     }
 
-    fn markDone(self: *StreamingCapture, kind: StreamKind) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-        switch (kind) {
-            .stdout => self.stdout_done = true,
-            .stderr => self.stderr_done = true,
-        }
-    }
-
-    fn isComplete(self: *StreamingCapture) bool {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-        return self.stdout_done and self.stderr_done;
-    }
-
     fn takeDirtySnapshot(self: *StreamingCapture, allocator: std.mem.Allocator) ?[]u8 {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
@@ -318,128 +297,6 @@ const StreamingCapture = struct {
         return final.text;
     }
 };
-
-fn runBufferedCapture(
-    allocator: std.mem.Allocator,
-    io_allocator: std.mem.Allocator,
-    child: *std.process.Child,
-) CompletedOutput {
-    var capture = StreamingCapture.init(io_allocator);
-    defer capture.deinit();
-
-    var stderr_thread: ?std.Thread = null;
-    if (child.stderr) |stderr_file| {
-        stderr_thread = std.Thread.spawn(.{}, readStream, .{ stderr_file, &capture, StreamKind.stderr }) catch blk: {
-            capture.markDone(.stderr);
-            break :blk null;
-        };
-    } else capture.markDone(.stderr);
-
-    if (child.stdout) |stdout_file| {
-        readStream(stdout_file, &capture, StreamKind.stdout);
-    } else capture.markDone(.stdout);
-
-    if (stderr_thread) |t| t.join();
-
-    return .{ .output_text = capture.finishText(allocator) catch allocator.dupe(u8, "") catch &.{} };
-}
-
-fn runStreamingCapture(
-    allocator: std.mem.Allocator,
-    io_allocator: std.mem.Allocator,
-    child: *std.process.Child,
-    command: []const u8,
-    cb: protocol.AgentToolUpdateCallback,
-    update_ctx: ?*anyopaque,
-) CompletedOutput {
-    var capture = StreamingCapture.init(io_allocator);
-    defer capture.deinit();
-
-    var stdout_thread: ?std.Thread = null;
-    var stderr_thread: ?std.Thread = null;
-
-    if (child.stdout) |stdout_file| {
-        stdout_thread = std.Thread.spawn(.{}, readStream, .{ stdout_file, &capture, StreamKind.stdout }) catch blk: {
-            capture.markDone(.stdout);
-            break :blk null;
-        };
-    } else capture.markDone(.stdout);
-
-    if (child.stderr) |stderr_file| {
-        stderr_thread = std.Thread.spawn(.{}, readStream, .{ stderr_file, &capture, StreamKind.stderr }) catch blk: {
-            capture.markDone(.stderr);
-            break :blk null;
-        };
-    } else capture.markDone(.stderr);
-
-    var last_emit_ns: i128 = 0;
-    var last_emitted_hash: ?u64 = null;
-
-    while (!capture.isComplete()) {
-        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
-        if (last_emit_ns == 0 or now_ns - last_emit_ns >= STREAM_UPDATE_MIN_INTERVAL_MS * std.time.ns_per_ms) {
-            if (capture.takeDirtySnapshot(allocator)) |snapshot| {
-                defer if (snapshot.len > 0) allocator.free(snapshot);
-                if (emitPartialTranscriptUpdate(allocator, command, snapshot, cb, update_ctx, last_emitted_hash)) |new_hash| {
-                    last_emitted_hash = new_hash;
-                    last_emit_ns = now_ns;
-                }
-            }
-        }
-        std.Options.debug_io.sleep(.fromMilliseconds(STREAM_UPDATE_POLL_MS), .awake) catch {};
-    }
-
-    if (capture.takeDirtySnapshot(allocator)) |snapshot| {
-        defer if (snapshot.len > 0) allocator.free(snapshot);
-        if (emitPartialTranscriptUpdate(allocator, command, snapshot, cb, update_ctx, last_emitted_hash)) |new_hash| {
-            last_emitted_hash = new_hash;
-        }
-    }
-
-    if (stdout_thread) |t| t.join();
-    if (stderr_thread) |t| t.join();
-
-    return .{ .output_text = capture.finishText(allocator) catch allocator.dupe(u8, "") catch &.{} };
-}
-
-fn readStream(file: std.Io.File, capture: *StreamingCapture, kind: StreamKind) void {
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = std.posix.read(file.handle, &buf) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Options.debug_io.sleep(.fromMilliseconds(1), .awake) catch {};
-                continue;
-            },
-            else => break,
-        };
-        if (n == 0) break;
-        capture.append(buf[0..n]);
-    }
-    capture.markDone(kind);
-}
-
-test "TimeoutGuard.stop does not wait for the full timeout after process exit" {
-    const testing = std.testing;
-
-    var child = try std.process.spawn(std.Options.debug_io, .{
-        .argv = &.{ "/bin/sh", "-c", "exit 0" },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-
-    var guard = TimeoutGuard.start(2, child.id.?);
-
-    _ = try child.wait(std.Options.debug_io);
-    try testing.expect(!guard.did_timeout.load(.acquire));
-    guard.markExited();
-
-    const start_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
-    guard.stop();
-    const elapsed_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) - start_ns;
-
-    try testing.expect(elapsed_ns < 500 * std.time.ns_per_ms);
-}
 
 test "oneText sanitizes invalid utf-8" {
     const allocator = std.testing.allocator;

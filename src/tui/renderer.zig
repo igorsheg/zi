@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime_fd = @import("../runtime/fd.zig");
 const ansi = @import("ansi.zig");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");
@@ -213,9 +214,7 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
 }
 
 fn testPipe() ![2]std.posix.fd_t {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.Unexpected;
-    return fds;
+    return runtime_fd.pipe();
 }
 
 test "Renderer init and deinit" {
@@ -240,8 +239,8 @@ test "Renderer begin returns cleared buffer region" {
 
 test "Renderer diff produces output for changed cells" {
     const pipe = try testPipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer runtime_fd.close(pipe[0]);
+    defer runtime_fd.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 5, 1);
     defer r.deinit();
@@ -261,8 +260,8 @@ test "Renderer diff produces output for changed cells" {
 
 test "Renderer emits one cursor move for a contiguous changed run" {
     const pipe = try testPipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer runtime_fd.close(pipe[0]);
+    defer runtime_fd.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
     defer r.deinit();
@@ -282,8 +281,8 @@ test "Renderer emits one cursor move for a contiguous changed run" {
 
 test "Renderer emits separate cursor moves for separated changed runs" {
     const pipe = try testPipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer runtime_fd.close(pipe[0]);
+    defer runtime_fd.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
     defer r.deinit();
@@ -311,8 +310,8 @@ test "Renderer emits separate cursor moves for separated changed runs" {
 
 test "Renderer skips unchanged cells" {
     const pipe = try testPipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer runtime_fd.close(pipe[0]);
+    defer runtime_fd.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 5, 1);
     defer r.deinit();
@@ -338,8 +337,8 @@ test "Renderer skips unchanged cells" {
 
 test "multi-frame render emits clearing output for deleted characters" {
     const pipe = try testPipe();
-    defer _ = std.c.close(pipe[0]);
-    defer _ = std.c.close(pipe[1]);
+    defer runtime_fd.close(pipe[0]);
+    defer runtime_fd.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 10, 1);
     defer r.deinit();

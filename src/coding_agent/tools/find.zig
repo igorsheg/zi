@@ -10,6 +10,7 @@ const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("../../lib/output_buffer.zig");
+const runtime_process = @import("../../runtime/process.zig");
 
 const DEFAULT_LIMIT: usize = 500;
 
@@ -71,23 +72,24 @@ fn execute(
         ctx.cwd,
     };
 
-    var child = std.process.spawn(ctx.io, .{
+    var proc_result = runtime_process.run(allocator, ctx.io, .{
         .argv = &argv,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    }) catch |err|
-        return util.errorf(allocator, "find error: {s}", .{@errorName(err)});
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_reader = child.stdout.?.reader(ctx.io, &stdout_buf);
-    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024)) catch |err|
-        return util.errorf(allocator, "find read error: {s}", .{@errorName(err)});
-    defer allocator.free(stdout);
-    const term = child.wait(ctx.io) catch return util.errorResult(allocator, "find wait failed");
+        .max_stdout_bytes = 8 * 1024 * 1024,
+        .max_stderr_bytes = 0,
+        .process_group = false,
+    });
+    defer proc_result.deinit(allocator);
 
-    const code: u8 = switch (term) {
+    const completed = switch (proc_result) {
+        .completed => |completed| completed,
+        .timeout => return util.errorResult(allocator, "find timed out"),
+        .err => |err| return util.errorf(allocator, "find error: {s}", .{err.message}),
+    };
+    const code: u8 = switch (completed.term) {
         .exited => |c| c,
         else => 2,
     };
+    const stdout = completed.stdout;
 
     var paths: std.ArrayList([]const u8) = .empty;
     defer {

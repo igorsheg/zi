@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const wake_mod = @import("wake.zig");
 
 pub const Wakeup = enum {
     none,
@@ -70,8 +71,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         high_water_depth: usize = 0,
         send_count: usize = 0,
         wake_count: usize = 0,
-        wake_read_fd: ?posix.fd_t = null,
-        wake_write_fd: ?posix.fd_t = null,
+        wake_pipe: ?wake_mod.Pipe = null,
         wake_signaled: bool = false,
 
         const Self = @This();
@@ -160,16 +160,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             var self = Self{ .allocator = allocator };
             switch (config.wakeup) {
                 .none => {},
-                .pipe => {
-                    var pipe: [2]posix.fd_t = undefined;
-                    if (std.c.pipe(&pipe) != 0) return error.Unexpected;
-                    _ = std.c.fcntl(pipe[0], std.c.F.SETFL, @as(c_uint, @bitCast(std.c.O{ .NONBLOCK = true })));
-                    _ = std.c.fcntl(pipe[1], std.c.F.SETFL, @as(c_uint, @bitCast(std.c.O{ .NONBLOCK = true })));
-                    _ = std.c.fcntl(pipe[0], std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
-                    _ = std.c.fcntl(pipe[1], std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
-                    self.wake_read_fd = pipe[0];
-                    self.wake_write_fd = pipe[1];
-                },
+                .pipe => self.wake_pipe = try wake_mod.Pipe.init(),
             }
             return self;
         }
@@ -180,8 +171,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
                 Self.cleanupItem(item, self.allocator);
             }
             self.queue.deinit(self.allocator);
-            if (self.wake_read_fd) |fd| _ = std.c.close(fd);
-            if (self.wake_write_fd) |fd| _ = std.c.close(fd);
+            if (self.wake_pipe) |*pipe| pipe.deinit();
             self.* = undefined;
         }
 
@@ -349,7 +339,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             };
 
             var pfd = [1]posix.pollfd{.{
-                .fd = self.wake_read_fd.?,
+                .fd = self.wake_pipe.?.readFd(),
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
@@ -361,7 +351,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         }
 
         pub fn wakeReadFd(self: *const Self) ?posix.fd_t {
-            return self.wake_read_fd;
+            return if (self.wake_pipe) |pipe| pipe.readFd() else null;
         }
 
         pub fn hasWakeFd(_: *const Self) bool {
@@ -428,12 +418,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
                 .none => {},
                 .pipe => {
                     if (self.wake_signaled) return;
-                    const byte = [1]u8{1};
-                    const file: std.Io.File = .{ .handle = self.wake_write_fd.?, .flags = .{ .nonblocking = true } };
-                    var write_buf: [1]u8 = undefined;
-                    var writer = file.writer(std.Options.debug_io, &write_buf);
-                    writer.interface.writeAll(&byte) catch return;
-                    writer.interface.flush() catch return;
+                    if (!self.wake_pipe.?.signal(std.Options.debug_io)) return;
                     self.wake_signaled = true;
                     self.wake_count += 1;
                 },
@@ -446,11 +431,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
                 .pipe => {
                     if (!self.wake_signaled) return;
                     self.wake_signaled = false;
-                    var buf: [64]u8 = undefined;
-                    while (true) {
-                        const n = std.posix.read(self.wake_read_fd.?, &buf) catch return;
-                        if (n < buf.len) return;
-                    }
+                    self.wake_pipe.?.drain();
                 },
             }
         }

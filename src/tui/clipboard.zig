@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const runtime_process = @import("../runtime/process.zig");
 
 const supported_image_mime_types = [_][]const u8{
     "image/png",
@@ -132,24 +133,23 @@ fn readImageViaCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?
 }
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
-    var child = std.process.spawn(std.Options.debug_io, .{
+    var result = runtime_process.run(allocator, std.Options.debug_io, .{
         .argv = argv,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    }) catch return null;
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_reader = child.stdout.?.reader(std.Options.debug_io, &stdout_buf);
-    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(max_clipboard_image_bytes)) catch return null;
-    const term = child.wait(std.Options.debug_io) catch {
-        allocator.free(stdout);
-        return null;
-    };
+        .max_stdout_bytes = max_clipboard_image_bytes,
+        .capture_stderr = false,
+    });
+    defer result.deinit(allocator);
 
-    if (term != .exited or term.exited != 0 or stdout.len == 0) {
-        allocator.free(stdout);
-        return null;
+    const completed = switch (result) {
+        .completed => |completed| completed,
+        .timeout, .err => return null,
+    };
+    switch (completed.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
     }
-    return stdout;
+    if (completed.stdout.len == 0) return null;
+    return allocator.dupe(u8, completed.stdout) catch null;
 }
 
 fn decodeBase64Owned(allocator: std.mem.Allocator, encoded: []const u8) ?[]u8 {
@@ -168,31 +168,22 @@ fn decodeBase64Owned(allocator: std.mem.Allocator, encoded: []const u8) ?[]u8 {
 }
 
 fn copyViaCommand(argv: []const []const u8, text: []const u8) bool {
-    var child = std.process.spawn(std.Options.debug_io, .{
+    var result = runtime_process.run(std.heap.page_allocator, std.Options.debug_io, .{
         .argv = argv,
-        .stdin = .pipe,
-        .stdout = .ignore,
-        .stderr = .ignore,
-        .expand_arg0 = .expand,
-    }) catch return false;
+        .stdin = text,
+        .capture_stdout = false,
+        .capture_stderr = false,
+    });
+    defer result.deinit(std.heap.page_allocator);
 
-    if (child.stdin) |stdin_file| {
-        var write_buf: [4096]u8 = undefined;
-        var stdin_writer = stdin_file.writer(std.Options.debug_io, &write_buf);
-        stdin_writer.interface.writeAll(text) catch {
-            _ = child.wait(std.Options.debug_io) catch {};
-            return false;
-        };
-        stdin_writer.interface.flush() catch {
-            _ = child.wait(std.Options.debug_io) catch {};
-            return false;
-        };
-        stdin_file.close(std.Options.debug_io);
-        child.stdin = null;
-    }
-
-    const term = child.wait(std.Options.debug_io) catch return false;
-    return term == .exited and term.exited == 0;
+    const completed = switch (result) {
+        .completed => |completed| completed,
+        .timeout, .err => return false,
+    };
+    return switch (completed.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 const testing = std.testing;

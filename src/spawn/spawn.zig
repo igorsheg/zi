@@ -5,9 +5,9 @@
 /// Reads stdout line-by-line, parses each as a JSON agent event.
 /// On "message_end" with role=="assistant": extracts text, accumulates usage.
 /// stderr is collected after stdout EOF.
-const builtin = @import("builtin");
 const std = @import("std");
 const types = @import("types.zig");
+const runtime_process = @import("../runtime/process.zig");
 
 const log = std.log.scoped(.zi_spawn);
 
@@ -73,75 +73,57 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
         built.argv.append(allocator, task_arg) catch {};
     }
 
-    // -- spawn --
-    var child = std.process.spawn(config.io, .{
-        .argv = built.argv.items,
-        .cwd = .{ .path = config.cwd },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
-    }) catch {
-        result.exit_code = 1;
-        result.error_message = allocator.dupe(u8, "failed to spawn zi process") catch null;
-        if (trace_file) |f| traceWrite(config.io, f, "--- spawn FAILED to launch\n", .{});
-        return result;
-    };
-
     if (trace_file) |f| {
-        traceWrite(config.io, f, "--- spawn START pid={d} task=\"{s}\"\n", .{ child.id.?, config.task });
+        traceWrite(config.io, f, "--- spawn START task=\"{s}\"\n", .{config.task});
         traceWrite(config.io, f, "    argv:", .{});
         for (built.argv.items) |a| traceWrite(config.io, f, " {s}", .{a});
         traceWrite(config.io, f, "\n", .{});
     }
 
-    // -- read stdout line by line, parse events --
-    //
-    // A watchdog thread (spawned only when there is a signal to watch
-    // and a stdout pipe to shut down) blocks on the abort signal. On
-    // abort it `shutdown()`s the stdout fd, which unblocks the
-    // parent's blocking `read()` mid-call, and interrupts the child
-    // process group for good measure. The main thread sees the abort flag on
-    // its next iteration and breaks the loop. Without this, a quiet
-    // child (long LLM call, sleep) would never observe the abort
-    // until it next wrote to stdout.
-    var watchdog_done = std.atomic.Value(bool).init(false);
-    var watchdog_thread: ?std.Thread = null;
-    if (config.signal) |sig| {
-        if (child.stdout) |stdout_file| {
-            const ctx = WatchdogCtx{
-                .signal = sig,
-                .stdout_fd = stdout_file.handle,
-                .child = &child,
-                .done = &watchdog_done,
+    var line_ctx = JsonlCtx{
+        .allocator = allocator,
+        .config = config,
+        .result = &result,
+        .trace_file = trace_file,
+    };
+
+    var proc_result = runtime_process.run(allocator, config.io, .{
+        .argv = built.argv.items,
+        .cwd = config.cwd,
+        .signal = config.signal,
+        .max_stdout_bytes = 0,
+        .capture_stdout = false,
+        .max_stderr_bytes = 1024 * 1024,
+        .on_chunk = .{ .ctx = @ptrCast(&line_ctx), .func = &JsonlCtx.onChunk },
+    });
+    defer proc_result.deinit(allocator);
+    line_ctx.flushTail();
+
+    switch (proc_result) {
+        .completed => |completed| {
+            result.exit_code = switch (completed.term) {
+                .exited => |code| code,
+                else => 1,
             };
-            watchdog_thread = std.Thread.spawn(.{}, abortWatchdog, .{ctx}) catch null;
-        }
-    }
-    defer {
-        // Tell the watchdog to exit BEFORE we touch child.wait() or
-        // close pipes; then join so we know the watchdog is no
-        // longer poking the fd or the child handle.
-        watchdog_done.store(true, .release);
-        if (config.signal) |sig| sig.notifyWaiters();
-        if (watchdog_thread) |t| t.join();
+            result.stderr_output.appendSlice(allocator, completed.stderr) catch {};
+        },
+        .timeout => |timeout| {
+            result.exit_code = 1;
+            result.stderr_output.appendSlice(allocator, timeout.stderr) catch {};
+            result.error_message = allocator.dupe(u8, timeout.message) catch null;
+        },
+        .err => |err| {
+            result.exit_code = 1;
+            result.error_message = allocator.dupe(u8, err.message) catch null;
+            if (trace_file) |f| traceWrite(config.io, f, "--- spawn FAILED to launch: {s}\n", .{err.message});
+            return result;
+        },
     }
 
-    readAndProcess(&child, &result, config, trace_file);
-
-    // -- collect stderr (small, buffered by OS pipe) --
-    // NOTE: sequential drain after stdout EOF. safe as long as stderr < 64KB
-    // (OS pipe buffer). zi sub-agents produce small stderr. if this assumption
-    // breaks, switch to two threads or std.Io.poll.
-    if (child.stderr) |stderr_file| {
-        var stderr_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(stderr_file.handle, &stderr_buf) catch break;
-            if (n == 0) break;
-            const chunk = stderr_buf[0..n];
-            result.stderr_output.appendSlice(allocator, chunk) catch break;
-        }
+    if (config.signal) |sig| {
+        if (sig.isAborted()) result.cancelled = true;
     }
+
     if (trace_file) |f| {
         if (result.stderr_output.items.len > 0) {
             traceWrite(config.io, f, "--- stderr ({d} bytes):\n", .{result.stderr_output.items.len});
@@ -152,16 +134,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
             traceWrite(config.io, f, "\n", .{});
         }
     }
-
-    // -- wait for exit --
-    const term = child.wait(config.io) catch {
-        result.exit_code = 1;
-        return result;
-    };
-    result.exit_code = switch (term) {
-        .exited => |code| code,
-        else => 1,
-    };
 
     // normalize: processes killed after end_turn are intentional
     if (result.exit_code != 0) {
@@ -186,75 +158,55 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
 
 // -- stdout processing --
 
-fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config: types.SpawnConfig, trace_file: ?std.Io.File) void {
-    const allocator = config.allocator;
-    const stdout_file = child.stdout orelse return;
+const JsonlCtx = struct {
+    allocator: std.mem.Allocator,
+    config: types.SpawnConfig,
+    result: *types.SpawnResult,
+    trace_file: ?std.Io.File,
+    line_buf: std.ArrayList(u8) = .empty,
+    mutex: std.Io.Mutex = .init,
 
-    var line_buf: std.ArrayList(u8) = .empty;
-    defer line_buf.deinit(allocator);
+    fn onChunk(raw_ctx: ?*anyopaque, kind: runtime_process.StreamKind, bytes: []const u8) void {
+        if (kind != .stdout) return;
+        const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+        self.mutex.lockUncancelable(self.config.io);
+        defer self.mutex.unlock(self.config.io);
+        self.feed(bytes);
+    }
 
-    var read_buf: [8192]u8 = undefined;
-
-    while (true) {
-        // The watchdog (started by ziSpawn when there's a signal)
-        // is the only one allowed to send SIGKILL — it does so via
-        // raw posix.kill so it doesn't reap the child. We must not
-        // call std.process.Child.kill here because that internally
-        // waitpids and would race the main wait() at the end.
-        if (config.signal) |sig| {
-            if (sig.isAborted()) {
-                result.cancelled = true;
-                break;
-            }
-        }
-
-        const n = std.posix.read(stdout_file.handle, &read_buf) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Options.debug_io.sleep(.fromMilliseconds(1), .awake) catch {};
-                continue;
-            },
-            else => {
-                if (config.signal) |sig| {
-                    if (sig.isAborted()) result.cancelled = true;
-                }
-                break;
-            },
-        };
-        if (n == 0) break;
-        const chunk = read_buf[0..n];
-
+    fn feed(self: *@This(), chunk: []const u8) void {
         var start: usize = 0;
         for (0..chunk.len) |i| {
             if (chunk[i] == '\n') {
                 const segment = chunk[start..i];
-                if (line_buf.items.len > 0) {
-                    line_buf.appendSlice(allocator, segment) catch {};
-                    if (trace_file) |f| traceLine(config.io, f, line_buf.items);
-                    processLine(line_buf.items, result, config);
-                    line_buf.clearRetainingCapacity();
+                if (self.line_buf.items.len > 0) {
+                    self.line_buf.appendSlice(self.allocator, segment) catch {};
+                    self.emitLine(self.line_buf.items);
+                    self.line_buf.clearRetainingCapacity();
                 } else {
-                    if (trace_file) |f| traceLine(config.io, f, segment);
-                    processLine(segment, result, config);
+                    self.emitLine(segment);
                 }
                 start = i + 1;
             }
         }
+        if (start < chunk.len) self.line_buf.appendSlice(self.allocator, chunk[start..]) catch {};
+    }
 
-        if (start < chunk.len) {
-            line_buf.appendSlice(allocator, chunk[start..]) catch {};
+    fn flushTail(self: *@This()) void {
+        self.mutex.lockUncancelable(self.config.io);
+        defer self.mutex.unlock(self.config.io);
+        defer self.line_buf.deinit(self.allocator);
+        if (self.line_buf.items.len > 0) {
+            self.emitLine(self.line_buf.items);
+            self.line_buf.clearRetainingCapacity();
         }
     }
 
-    if (config.signal) |sig| {
-        if (sig.isAborted()) result.cancelled = true;
+    fn emitLine(self: *@This(), line: []const u8) void {
+        if (self.trace_file) |f| traceLine(self.config.io, f, line);
+        processLine(line, self.result, self.config);
     }
-
-    // flush any trailing data without a final newline
-    if (line_buf.items.len > 0) {
-        if (trace_file) |f| traceLine(config.io, f, line_buf.items);
-        processLine(line_buf.items, result, config);
-    }
-}
+};
 
 fn processLine(line: []const u8, result: *types.SpawnResult, config: types.SpawnConfig) void {
     if (line.len == 0) return;
@@ -413,10 +365,6 @@ fn jsonToF64(val: ?std.json.Value) f64 {
     };
 }
 
-fn killChild(child: *std.process.Child) void {
-    _ = child.kill() catch {};
-}
-
 // -- trace file --
 
 /// Open the file referenced by `ZI_SPAWN_TRACE` for append. Returns
@@ -452,67 +400,6 @@ fn traceLine(io: std.Io, f: std.Io.File, line: []const u8) void {
     writer.interface.flush() catch {};
 }
 
-const WatchdogCtx = struct {
-    signal: @import("../abort_signal.zig").AbortSignal,
-    stdout_fd: std.posix.fd_t,
-    child: *std.process.Child,
-    /// Set true by the main thread when readAndProcess returns,
-    /// telling the watchdog to exit BEFORE we move on to wait()
-    /// and pipe cleanup. Acquire fence ensures the watchdog sees
-    /// the main thread's write.
-    done: *std.atomic.Value(bool),
-};
-
-/// Blocks on `signal`. On abort: shuts down the child's stdout fd
-/// (unblocks the parent's blocking read) and interrupts the child
-/// process group (in case it was sleeping or hung). Idempotent — the
-/// main thread also observes the abort and stop paths tolerate
-/// repeated signals.
-///
-/// Why shutdown(SHUT_RDWR) instead of close: req.deinit / pipe
-/// cleanup on the main thread will close the fd later, and double
-/// closing a fd is a use-after-free hazard. shutdown leaves the fd
-/// valid but causes pending and future reads to return.
-fn abortWatchdog(ctx: WatchdogCtx) void {
-    switch (ctx.signal.waitUntil(null, &watchdogDone, @ptrCast(ctx.done))) {
-        .aborted => {},
-        .predicate, .timeout, .none => return,
-    }
-    if (ctx.done.load(.acquire)) return;
-
-    const SHUT_RDWR = 2;
-    _ = std.posix.system.shutdown(ctx.stdout_fd, SHUT_RDWR);
-    // Use raw posix.kill, NOT std.process.Child.kill — the latter
-    // reaps via waitpid internally, which would race the main
-    // thread's `child.wait()` and crash with ECHILD. Sending the
-    // signal directly leaves reaping to the main thread.
-    if (ctx.child.id) |id| interruptProcessGroup(id);
-}
-
-fn watchdogDone(ctx: ?*anyopaque) bool {
-    const done: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
-    return done.load(.acquire);
-}
-
-fn interruptProcessGroup(pgid: std.process.Child.Id) void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        std.posix.kill(pgid, std.posix.SIG.KILL) catch {};
-        return;
-    }
-    signalProcessGroup(pgid, std.posix.SIG.INT);
-    std.Options.debug_io.sleep(.fromMilliseconds(150), .awake) catch {};
-    signalProcessGroup(pgid, std.posix.SIG.KILL);
-}
-
-fn signalProcessGroup(pgid: std.process.Child.Id, sig: std.posix.SIG) void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        std.posix.kill(pgid, sig) catch {};
-        return;
-    }
-    const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pgid));
-    std.posix.kill(group_pid, sig) catch {};
-}
-
 // -- argv construction --
 //
 // Pulled out so tests can verify the production argv shape without
@@ -546,7 +433,7 @@ fn buildChildArgv(allocator: std.mem.Allocator, config: types.SpawnConfig) !Buil
     }
 
     var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_exe_len = try std.process.executablePath(std.Options.debug_io, &self_exe_buf);
+    const self_exe_len = try std.process.executablePath(config.io, &self_exe_buf);
     const self_exe = self_exe_buf[0..self_exe_len];
     const self_exe_owned = try allocator.dupe(u8, self_exe);
     try built.owned_strings.append(allocator, self_exe_owned);
@@ -565,7 +452,7 @@ const TempFile = struct { dir: []const u8, path: []const u8 };
 
 fn writeTempPrompt(io: std.Io, allocator: std.mem.Allocator, content: []const u8) !TempFile {
     var rand_buf: [8]u8 = undefined;
-    std.Options.debug_io.randomSecure(&rand_buf) catch std.Options.debug_io.random(&rand_buf);
+    io.randomSecure(&rand_buf) catch io.random(&rand_buf);
     const hex = std.fmt.bytesToHex(rand_buf, .lower);
     const dir_name = try std.fmt.allocPrint(allocator, "/tmp/zi-spawn-{s}", .{&hex});
     try std.Io.Dir.cwd().createDirPath(io, dir_name);

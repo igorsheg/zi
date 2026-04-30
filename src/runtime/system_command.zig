@@ -1,13 +1,8 @@
-const builtin = @import("builtin");
 const std = @import("std");
+const process = @import("process.zig");
 
-pub const default_max_output_bytes: usize = 1024 * 1024;
-const poll_interval_ms: u64 = 25;
-
-pub const EnvPair = struct {
-    key: []const u8,
-    value: []const u8,
-};
+pub const default_max_output_bytes: usize = process.default_max_output_bytes;
+pub const EnvPair = process.EnvPair;
 
 pub const Request = struct {
     argv: []const []const u8,
@@ -88,105 +83,40 @@ pub const Result = union(enum) {
 };
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
-    if (request.argv.len == 0) return errorResult(allocator, "empty argv");
-
-    var env_map_storage: ?std.process.Environ.Map = null;
-    defer if (env_map_storage) |*env_map| env_map.deinit();
-    if (request.env.len > 0 or request.clear_env) {
-        env_map_storage = if (request.clear_env)
-            std.process.Environ.Map.init(allocator)
-        else
-            std.process.Environ.Map.init(allocator);
-        for (request.env) |pair| {
-            env_map_storage.?.put(pair.key, pair.value) catch return errorResult(allocator, "failed to build environment");
-        }
-    }
-
-    var child = std.process.spawn(io, .{
+    var proc_result = process.run(allocator, io, .{
         .argv = request.argv,
-        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
-        .environ_map = if (env_map_storage) |*env_map| env_map else null,
-        .stdin = if (request.stdin != null) .pipe else .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
-    }) catch |err| {
-        return errorFmt(allocator, "spawn failed: {s}", .{@errorName(err)});
+        .cwd = request.cwd,
+        .stdin = request.stdin,
+        .env = request.env,
+        .clear_env = request.clear_env,
+        .timeout_ms = request.timeout_ms,
+        .max_stdout_bytes = request.max_stdout_bytes,
+        .max_stderr_bytes = request.max_stderr_bytes,
+        .process_group = true,
+    });
+    defer proc_result.deinit(allocator);
+
+    return switch (proc_result) {
+        .completed => |completed| completedResult(allocator, completed, request.text),
+        .timeout => |timeout| timeoutResult(allocator, timeout, request.text),
+        .err => |err| .{ .err = .{
+            .message = allocator.dupe(u8, err.message) catch &.{},
+            .stdout = if (err.stdout.len > 0) allocator.dupe(u8, err.stdout) catch &.{} else &.{},
+            .stderr = if (err.stderr.len > 0) allocator.dupe(u8, err.stderr) catch &.{} else &.{},
+        } },
     };
-    const child_id = child.id.?;
+}
 
-    var timeout_guard = TimeoutGuard.start(request.timeout_ms, child_id);
-    defer timeout_guard.stop();
-
-    const io_allocator = std.heap.smp_allocator;
-
-    var stdout_capture = Capture.init(io_allocator, request.max_stdout_bytes);
-    defer stdout_capture.deinit();
-    var stderr_capture = Capture.init(io_allocator, request.max_stderr_bytes);
-    defer stderr_capture.deinit();
-
-    var stdout_thread: ?std.Thread = null;
-    var stderr_thread: ?std.Thread = null;
-    if (child.stdout) |stdout_file| {
-        stdout_thread = std.Thread.spawn(.{}, Capture.readAll, .{ &stdout_capture, stdout_file }) catch null;
-    }
-    if (child.stderr) |stderr_file| {
-        stderr_thread = std.Thread.spawn(.{}, Capture.readAll, .{ &stderr_capture, stderr_file }) catch null;
-    }
-
-    if (request.stdin) |stdin_bytes| {
-        if (child.stdin) |stdin_file| {
-            var write_buf: [4096]u8 = undefined;
-            var stdin_writer = stdin_file.writer(io, &write_buf);
-            stdin_writer.interface.writeAll(stdin_bytes) catch {};
-            stdin_writer.interface.flush() catch {};
-            stdin_file.close(io);
-            child.stdin = null;
-        }
-    }
-
-    const term = child.wait(io) catch |err| {
-        timeout_guard.markExited();
-        if (stdout_thread) |thread| thread.join();
-        if (stderr_thread) |thread| thread.join();
-        return errorFmt(allocator, "wait failed: {s}", .{@errorName(err)});
-    };
-    timeout_guard.markExited();
-
-    if (stdout_thread) |thread| thread.join();
-    if (stderr_thread) |thread| thread.join();
-
-    if (stdout_capture.err) |err| return errorFmt(allocator, "stdout read failed: {s}", .{@errorName(err)});
-    if (stderr_capture.err) |err| return errorFmt(allocator, "stderr read failed: {s}", .{@errorName(err)});
-
-    var stdout = stdout_capture.toOwnedParent(allocator) catch return errorResult(allocator, "failed to allocate stdout");
+fn completedResult(allocator: std.mem.Allocator, completed: process.Completed, text: bool) Result {
+    const stdout = cloneOutput(allocator, completed.stdout, text) catch return errorResult(allocator, "failed to allocate stdout");
     errdefer allocator.free(stdout);
-    var stderr = stderr_capture.toOwnedParent(allocator) catch return errorResult(allocator, "failed to allocate stderr");
-    errdefer allocator.free(stderr);
-
-    if (request.text) {
-        const normalized_stdout = normalizeText(allocator, stdout) catch return errorResult(allocator, "failed to normalize stdout");
-        allocator.free(stdout);
-        stdout = normalized_stdout;
-        const normalized_stderr = normalizeText(allocator, stderr) catch return errorResult(allocator, "failed to normalize stderr");
-        allocator.free(stderr);
-        stderr = normalized_stderr;
-    }
-
-    if (timeout_guard.did_timeout.load(.acquire)) {
-        return .{ .timeout = .{
-            .stdout = stdout,
-            .stderr = stderr,
-            .message = std.fmt.allocPrint(allocator, "timed out after {d}ms", .{request.timeout_ms orelse 0}) catch return errorResult(allocator, "timed out"),
-        } };
-    }
-
+    const stderr = cloneOutput(allocator, completed.stderr, text) catch return errorResult(allocator, "failed to allocate stderr");
     return .{ .completed = .{
-        .code = switch (term) {
+        .code = switch (completed.term) {
             .exited => |code| code,
             else => null,
         },
-        .signal = switch (term) {
+        .signal = switch (completed.term) {
             .signal => |sig| @intFromEnum(sig),
             .stopped => |sig| @intFromEnum(sig),
             .unknown => |sig| sig,
@@ -197,96 +127,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
     } };
 }
 
-const CaptureError = error{ OutputTooLarge, ReadFailed };
+fn timeoutResult(allocator: std.mem.Allocator, timeout: process.TimedOut, text: bool) Result {
+    const stdout = cloneOutput(allocator, timeout.stdout, text) catch return errorResult(allocator, "failed to allocate stdout");
+    errdefer allocator.free(stdout);
+    const stderr = cloneOutput(allocator, timeout.stderr, text) catch return errorResult(allocator, "failed to allocate stderr");
+    errdefer allocator.free(stderr);
+    const message = allocator.dupe(u8, timeout.message) catch return errorResult(allocator, "timed out");
+    return .{ .timeout = .{ .stdout = stdout, .stderr = stderr, .message = message } };
+}
 
-const Capture = struct {
-    allocator: std.mem.Allocator,
-    max_bytes: usize,
-    buf: std.ArrayListUnmanaged(u8) = .empty,
-    err: ?CaptureError = null,
-
-    fn init(allocator: std.mem.Allocator, max_bytes: usize) Capture {
-        return .{ .allocator = allocator, .max_bytes = max_bytes };
-    }
-
-    fn deinit(self: *Capture) void {
-        self.buf.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    fn readAll(self: *Capture, file: std.Io.File) void {
-        var local_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(file.handle, &local_buf) catch {
-                self.err = error.ReadFailed;
-                return;
-            };
-            if (n == 0) return;
-            if (self.buf.items.len + n > self.max_bytes) {
-                self.err = error.OutputTooLarge;
-                return;
-            }
-            self.buf.appendSlice(self.allocator, local_buf[0..n]) catch {
-                self.err = error.ReadFailed;
-                return;
-            };
-        }
-    }
-
-    fn toOwnedParent(self: *Capture, allocator: std.mem.Allocator) ![]u8 {
-        return allocator.dupe(u8, self.buf.items);
-    }
-};
-
-const TimeoutGuard = struct {
-    done: *std.Io.Event,
-    did_timeout: *std.atomic.Value(bool),
-    thread: ?std.Thread,
-
-    fn start(timeout_ms: ?u64, process_group_id: std.process.Child.Id) TimeoutGuard {
-        const ms = timeout_ms orelse return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        const done = std.heap.page_allocator.create(std.Io.Event) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        errdefer std.heap.page_allocator.destroy(done);
-        const did_timeout = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        done.* = .unset;
-        did_timeout.* = std.atomic.Value(bool).init(false);
-        const thread = std.Thread.spawn(.{}, watchdog, .{ ms, process_group_id, done, did_timeout }) catch null;
-        return .{ .done = done, .did_timeout = did_timeout, .thread = thread };
-    }
-
-    fn markExited(self: *TimeoutGuard) void {
-        self.done.set(std.Options.debug_io);
-    }
-
-    fn stop(self: *TimeoutGuard) void {
-        self.done.set(std.Options.debug_io);
-        if (self.thread) |thread| thread.join();
-        if (self.done != &noop_done) std.heap.page_allocator.destroy(self.done);
-        if (self.did_timeout != &noop_timeout) std.heap.page_allocator.destroy(self.did_timeout);
-        self.thread = null;
-    }
-
-    fn watchdog(timeout_ms: u64, process_group_id: std.process.Child.Id, done: *std.Io.Event, did_timeout: *std.atomic.Value(bool)) void {
-        done.waitTimeout(std.Options.debug_io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .boot } }) catch |err| switch (err) {
-            error.Timeout => {
-                did_timeout.store(true, .release);
-                killProcessGroup(process_group_id, std.posix.SIG.KILL);
-            },
-            error.Canceled => {},
-        };
-    }
-
-    var noop_done: std.Io.Event = .unset;
-    var noop_timeout = std.atomic.Value(bool).init(false);
-};
-
-fn killProcessGroup(process_group_id: std.process.Child.Id, sig: std.posix.SIG) void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        std.posix.kill(process_group_id, sig) catch {};
-        return;
-    }
-    const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(process_group_id));
-    std.posix.kill(group_pid, sig) catch {};
+fn cloneOutput(allocator: std.mem.Allocator, bytes: []const u8, text: bool) ![]u8 {
+    if (!text) return allocator.dupe(u8, bytes);
+    return normalizeText(allocator, bytes);
 }
 
 fn normalizeText(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -306,10 +158,6 @@ fn normalizeText(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 
 fn errorResult(allocator: std.mem.Allocator, msg: []const u8) Result {
     return .{ .err = .{ .message = allocator.dupe(u8, msg) catch &.{} } };
-}
-
-fn errorFmt(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Result {
-    return .{ .err = .{ .message = std.fmt.allocPrint(allocator, fmt, args) catch allocator.dupe(u8, "system command failed") catch &.{} } };
 }
 
 test "system command runs argv and captures stdout" {

@@ -26,6 +26,7 @@ pub const AbortGuard = struct {
     thread: ?std.Thread,
     allocator: std.mem.Allocator,
     signal: AbortSignal,
+    io: std.Io,
 
     pub const Actions = struct {
         shutdown_fd: ?std.posix.fd_t = null,
@@ -48,6 +49,10 @@ pub const AbortGuard = struct {
     /// Spawn the watchdog. No-ops (no thread) when the signal is inert
     /// or all actions are null.
     pub fn start(signal: AbortSignal, actions: Actions) AbortGuard {
+        return startWithIo(std.Options.debug_io, signal, actions);
+    }
+
+    pub fn startWithIo(io: std.Io, signal: AbortSignal, actions: Actions) AbortGuard {
         if (signal.isNone() or
             (actions.shutdown_fd == null and actions.kill_pid == null and actions.interrupt_process_group == null))
         {
@@ -56,6 +61,7 @@ pub const AbortGuard = struct {
                 .thread = null,
                 .allocator = std.heap.page_allocator,
                 .signal = AbortSignal.none,
+                .io = io,
             };
         }
         const done = std.heap.page_allocator.create(std.atomic.Value(bool)) catch {
@@ -64,6 +70,7 @@ pub const AbortGuard = struct {
                 .thread = null,
                 .allocator = std.heap.page_allocator,
                 .signal = AbortSignal.none,
+                .io = io,
             };
         };
         done.* = std.atomic.Value(bool).init(false);
@@ -73,6 +80,7 @@ pub const AbortGuard = struct {
             .shutdown_fd = actions.shutdown_fd,
             .kill_pid = actions.kill_pid,
             .interrupt_process_group = actions.interrupt_process_group,
+            .io = io,
         };
         const thread = std.Thread.spawn(.{}, watchdog, .{ctx}) catch null;
         return .{
@@ -80,6 +88,7 @@ pub const AbortGuard = struct {
             .thread = thread,
             .allocator = std.heap.page_allocator,
             .signal = signal,
+            .io = io,
         };
     }
 
@@ -103,6 +112,7 @@ pub const AbortGuard = struct {
         shutdown_fd: ?std.posix.fd_t,
         kill_pid: ?std.process.Child.Id,
         interrupt_process_group: ?std.process.Child.Id,
+        io: std.Io,
     };
 
     fn watchdog(ctx: WatchdogCtx) void {
@@ -118,7 +128,7 @@ pub const AbortGuard = struct {
             _ = std.posix.system.shutdown(fd, SHUT_RDWR);
         }
         if (ctx.interrupt_process_group) |pgid| {
-            interruptProcessGroup(pgid);
+            interruptProcessGroup(ctx.io, pgid);
         }
         if (ctx.kill_pid) |pid| {
             std.posix.kill(pid, std.posix.SIG.KILL) catch {};
@@ -130,13 +140,13 @@ pub const AbortGuard = struct {
         return done.load(.acquire);
     }
 
-    fn interruptProcessGroup(pgid: std.process.Child.Id) void {
+    fn interruptProcessGroup(io: std.Io, pgid: std.process.Child.Id) void {
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
             std.posix.kill(pgid, std.posix.SIG.KILL) catch {};
             return;
         }
         signalProcessGroup(pgid, std.posix.SIG.INT);
-        std.Options.debug_io.sleep(.fromNanoseconds(150 * std.time.ns_per_ms), .awake) catch {};
+        io.sleep(.fromNanoseconds(150 * std.time.ns_per_ms), .awake) catch {};
         signalProcessGroup(pgid, std.posix.SIG.KILL);
     }
 

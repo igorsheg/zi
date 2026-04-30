@@ -1,5 +1,6 @@
 const std = @import("std");
 const string_util = @import("../../lib/string_util.zig");
+const runtime_process = @import("../../runtime/process.zig");
 
 // Process-global cache/store backing. Entries own both key and value storage;
 // `clearCache()` frees those allocations in tests.
@@ -97,23 +98,23 @@ fn executeCommandUncached(config: []const u8) ?[]const u8 {
     const command = config[1..]; // strip "!"
     if (command.len == 0) return null;
 
-    var child = std.process.spawn(std.Options.debug_io, .{
+    var result = runtime_process.run(allocator, std.Options.debug_io, .{
         .argv = &.{ "/bin/sh", "-c", command },
-        .stdout = .pipe,
-        .stderr = .ignore,
-    }) catch return null;
+        .max_stdout_bytes = 50 * 1024,
+        .capture_stderr = false,
+    });
+    defer result.deinit(allocator);
 
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_reader = child.stdout.?.reader(std.Options.debug_io, &stdout_buf);
-    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(50 * 1024)) catch return null;
-    defer allocator.free(stdout);
-
-    const term = child.wait(std.Options.debug_io) catch return null;
-    if (term != .exited or term.exited != 0) {
-        return null;
+    const completed = switch (result) {
+        .completed => |completed| completed,
+        .timeout, .err => return null,
+    };
+    switch (completed.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
     }
 
-    const trimmed = string_util.dupeTrimmed(allocator, stdout, &std.ascii.whitespace) catch return null;
+    const trimmed = string_util.dupeTrimmed(allocator, completed.stdout, &std.ascii.whitespace) catch return null;
     errdefer allocator.free(trimmed);
     if (trimmed.len == 0) {
         return null;

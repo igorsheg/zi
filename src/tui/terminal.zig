@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime_fd = @import("../runtime/fd.zig");
 const posix = std.posix;
 const ansi = @import("ansi.zig");
 
@@ -269,14 +270,11 @@ test "Terminal deinit is idempotent on fresh instance" {
 }
 
 fn testPipe() ![2]std.posix.fd_t {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.Unexpected;
-    return fds;
+    return runtime_fd.pipe();
 }
-
 test "Terminal deinit does not write control sequences to non-tty output" {
     const pipe = try testPipe();
-    defer _ = std.c.close(pipe[0]);
+    defer runtime_fd.close(pipe[0]);
 
     var t = Terminal.init();
     t.fd_out = pipe[1];
@@ -287,7 +285,7 @@ test "Terminal deinit does not write control sequences to non-tty output" {
     t.enableModifyOtherKeys();
 
     t.deinit();
-    _ = std.c.close(pipe[1]);
+    runtime_fd.close(pipe[1]);
 
     var read_buf: [256]u8 = undefined;
     const n = try std.posix.read(pipe[0], &read_buf);

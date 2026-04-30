@@ -7,6 +7,7 @@ const component_mod = @import("../component.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const buffer_mod = @import("buffer.zig");
 const keybindings = @import("../keybindings.zig");
+const runtime_process = @import("../../runtime/process.zig");
 
 const Key = keys_mod.Key;
 const Theme = theme_mod.Theme;
@@ -255,16 +256,7 @@ fn hasAsyncSearchBackend() bool {
 }
 
 fn commandExists(command: []const u8) bool {
-    var child = std.process.spawn(std.Options.debug_io, .{
-        .argv = &.{ command, "--version" },
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch return false;
-    const term = child.wait(std.Options.debug_io) catch return false;
-    return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
+    return runtime_process.commandExists(std.heap.page_allocator, std.Options.debug_io, command);
 }
 
 fn driveAsyncTick(session: *AutocompleteSession, buffer: *PromptBuffer) TickOutcome {

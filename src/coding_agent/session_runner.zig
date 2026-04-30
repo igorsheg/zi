@@ -264,6 +264,14 @@ pub const SessionRunner = struct {
                     self.overflow_recovery_attempted = true;
                     pruneTransientAssistantError(session);
                     _ = self.runCompaction(session, emitter, .overflow, true, .{}) catch return outcome;
+                    // pi-mono's _runAutoCompaction(willRetry=true) prunes the
+                    // retained overflow assistant after rebuilding context from
+                    // the session file (agent-session.ts:1977-1982). The first
+                    // prune above only affects in-memory agent state; the
+                    // persisted error can be kept by compaction and reappear via
+                    // setMessages(), which makes continueTurn() report
+                    // NeedsPrompt instead of retrying.
+                    pruneTransientAssistantError(session);
                     mode = .continue_turn;
                 },
                 else => return outcome,

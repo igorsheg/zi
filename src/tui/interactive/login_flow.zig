@@ -5,6 +5,7 @@ const json_util = @import("../../ai/json_util.zig");
 const request_mod = @import("../../coding_agent/request.zig");
 const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
 const list_picker_mod = @import("../components/list_picker.zig");
+const runtime_process = @import("../../runtime/process.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 const PickerSelection = list_picker_mod.Selection;
@@ -201,15 +202,16 @@ fn threadFn(ctx: *Context) void {
 fn onAuth(url: []const u8, ctx: ?*anyopaque) void {
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
 
-    var child = std.process.spawn(std.Options.debug_io, .{
+    var result = runtime_process.run(std.heap.page_allocator, std.Options.debug_io, .{
         .argv = if (builtin.os.tag == .macos)
             &.{ "open", url }
         else
             &.{ "xdg-open", url },
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch return;
-    _ = child.wait(std.Options.debug_io) catch {};
+        .capture_stdout = false,
+        .capture_stderr = false,
+        .timeout_ms = 5000,
+    });
+    defer result.deinit(std.heap.page_allocator);
 
     const msg = self.msg_allocator.dupe(u8, "login: check your browser") catch return;
     _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = msg, .kind = .auth_url } });

@@ -2,6 +2,8 @@ const std = @import("std");
 const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
+const runtime_process = @import("../runtime/process.zig");
+const runtime_fd = @import("../runtime/fd.zig");
 
 const SelectItem = select_list_mod.SelectItem;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
@@ -725,7 +727,7 @@ pub const CombinedAutocompleteProvider = struct {
         }) catch return false;
 
         if (child.stdout) |stdout_file| {
-            setNonblocking(stdout_file.handle) catch {
+            runtime_fd.setNonblocking(stdout_file.handle) catch {
                 child.kill(std.Options.debug_io);
                 return false;
             };
@@ -734,7 +736,7 @@ pub const CombinedAutocompleteProvider = struct {
             self.async_search.stdout_closed = true;
         }
         if (child.stderr) |stderr_file| {
-            setNonblocking(stderr_file.handle) catch {
+            runtime_fd.setNonblocking(stderr_file.handle) catch {
                 child.kill(std.Options.debug_io);
                 return false;
             };
@@ -1276,29 +1278,12 @@ fn appendEscapedRegex(builder: *std.ArrayList(u8), allocator: std.mem.Allocator,
     }
 }
 
-fn setNonblocking(fd: std.posix.fd_t) !void {
-    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
-    if (flags < 0) return error.Unexpected;
-    var new_flags: std.c.O = @bitCast(@as(c_uint, @intCast(flags)));
-    new_flags.NONBLOCK = true;
-    if (std.c.fcntl(fd, std.c.F.SETFL, @as(c_uint, @bitCast(new_flags))) < 0) return error.Unexpected;
-}
-
 fn hasAsyncSearchBackend() bool {
     return commandExists("/opt/homebrew/bin/fd") or commandExists("/usr/local/bin/fd") or commandExists("fd") or commandExists("fdfind");
 }
 
 fn commandExists(command: []const u8) bool {
-    var child = std.process.spawn(std.Options.debug_io, .{
-        .argv = &.{ command, "--version" },
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch return false;
-    const term = child.wait(std.Options.debug_io) catch return false;
-    return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
+    return runtime_process.commandExists(std.heap.page_allocator, std.Options.debug_io, command);
 }
 
 // --- Tests ---
