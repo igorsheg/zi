@@ -2,6 +2,7 @@ const std = @import("std");
 const terminal_mod = @import("tui/terminal.zig");
 const logging = @import("logging.zig");
 const cli = @import("coding_agent/cli/root.zig");
+const runtime_app = @import("runtime/app.zig");
 const env = @import("env");
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
@@ -16,8 +17,10 @@ pub fn main(init: std.process.Init) !void {
     env.setProcessEnvironment(init.environ_map);
     logging.setThreadLabel(.main);
 
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
+    var main_heap: runtime_app.MainHeap = .{};
+    defer main_heap.deinit();
+
+    const heap_allocator = main_heap.allocator();
 
     // zi-wub.12: dedicated arena owned by the agent thread. Single
     // owner during steady state — TUI thread only touches it during
@@ -27,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     // TUI keeps local state on its own tracked allocator/backing
     // tracker (zi-wub.11), so the ThreadSafeAllocator band-aid (.13)
     // is no longer needed.
-    var agent_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    var agent_arena = std.heap.ArenaAllocator.init(heap_allocator);
     defer agent_arena.deinit();
     const allocator = agent_arena.allocator();
 
