@@ -22,21 +22,19 @@ zi - yours-first coding agent
 
 ## Description
 
-There are many coding agents. This one is yours.
+zi is a local-first coding agent harness. It keeps sessions durable, configuration local, extensions small, and behavior explicit enough to inspect.
 
-zi is a local-first coding agent harness for people who want agent help without giving up ownership of their tools. It keeps sessions durable, configuration local, extensions small, and behavior explicit enough to inspect.
+Use it as-is, or teach it one habit at a time: a command, a tool, a prompt rule, a model preference, or a bit of UI.
 
-You can use zi as-is. You can also teach it your habits one piece at a time: a command, a tool, a prompt rule, a model preference, a bit of UI.
-
-The goal is not to make agent work magical. The goal is to make it dependable.
+The goal is dependable agent work you can understand and change.
 
 ## Philosophy
 
 zi is small on purpose.
 
-A good agent harness should be understandable by one person. It should compose with the tools you already use. It should keep useful history. It should make automation visible enough that you can trust it, change it, or remove it.
+A good agent harness should be understandable by one person. It should compose with the tools you already use, keep useful history, and make automation visible enough to trust, change, or remove.
 
-Extensions are not a marketplace feature. They are how the tool becomes yours.
+Extensions are how zi becomes yours.
 
 Start small. Add one thing. Keep what helps. Delete what does not.
 

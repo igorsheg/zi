@@ -1,10 +1,8 @@
 ## Extension api: zi table
 
-The extension API is deliberately plain.
+The extension API is plain Lua functions and tables, so an extension can be read, copied, changed, or removed by one person.
 
-Most of it is ordinary Lua functions and tables. The shape is simple so an extension can be read, copied, changed, or removed by one person.
-
-Prefer small tools. Prefer explicit names. Prefer behavior that will still make sense when it appears in a session transcript later.
+Prefer small tools, explicit names, and behavior that will still make sense in a session transcript later.
 
 `zi.register_tool(spec)`
 : Register a model-visible tool. See [tools](#tools).
@@ -156,7 +154,7 @@ Provider registration changes the host-owned provider/model views. Extensions ow
 
 `zi.on(name, handler)` registers an observer or interceptor. Handlers receive `(event, ctx)`, where `ctx` is described in [context object](context.html#context-object).
 
-Events are where extensions react to the life of a session. They are powerful, so keep them visible and kind: avoid surprising network calls, hidden policy, or changes the user cannot explain later.
+Events let extensions react to session life. Keep them visible: avoid surprising network calls, hidden policy, or changes the user cannot explain later.
 
 Observer events are additive and post-commit. Return values are ignored.
 

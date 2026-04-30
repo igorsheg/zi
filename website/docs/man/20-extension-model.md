@@ -1,10 +1,10 @@
 ## Extension purpose
 
-An extension is just a Lua file that teaches zi one new habit.
+An extension is a Lua file that teaches zi one habit.
 
-It can register a command, expose a model-visible tool, customize prompts, store small bits of state, react to lifecycle events, or publish simple UI. You do not need a framework, build step, package registry, or permission from the core project. Start with the smallest useful thing.
+It can register a command, expose a model-visible tool, customize prompts, store small bits of state, react to lifecycle events, or publish simple UI. You do not need a framework, build step, or package registry. Start with the smallest useful thing.
 
-Good extensions feel boring in the best way: clear names, clear inputs, visible effects, and no surprise ownership of the user's workflow.
+Good extensions have clear names, clear inputs, visible effects, and no surprise ownership of the user's workflow.
 
 The concrete host functions are listed in [extension api: zi table](api.html#extension-api-zi-table), and handler context is documented in [context object](context.html#context-object).
 

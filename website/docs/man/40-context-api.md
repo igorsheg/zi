@@ -2,7 +2,7 @@
 
 Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.html#events) receive `ctx`.
 
-`ctx` is the extension's view of the current run. It gives you what you need without handing over private host internals: current directory, UI intent, session helpers, state, model helpers, cancellation, and a few session controls.
+`ctx` is the extension's view of the current run: current directory, UI intent, session helpers, state, model helpers, cancellation, and a few session controls.
 
 `ctx.cwd`
 : Current working directory.
@@ -51,7 +51,7 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 
 ## Context ui api
 
-The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Say what you want the user to see; let the host decide where it fits. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
+The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Say what the user should see; the host decides where it fits. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
 
 `ctx.ui.message(text, opts?)`
 : Publish short feedback. `opts.id` is the dedupe/update key; `opts.kind` is `info`, `warning`, `error`, or `success`. The host chooses a visible, low-disruption placement.
@@ -135,7 +135,7 @@ State is scoped to the extension and active session. It may survive session chan
 `ctx.session.entries({ label?, limit? })`
 : Return semantic target entries by simple predicates. Currently supports `label`; latest label wins per target entry, cleared labels are excluded, and returned rows are target entries rather than label entries. Default limit is 50; maximum is 500.
 
-Durable message ids compose with notes and labels. This is useful for memory that should be inspectable later, not hidden inside an extension:
+Durable message ids compose with notes and labels. Use them for memory that should be inspectable later, not hidden inside an extension:
 
 ```lua
 zi.on("message", function(event, ctx)

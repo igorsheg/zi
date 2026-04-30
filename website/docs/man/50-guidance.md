@@ -2,7 +2,7 @@
 
 Good zi extensions are small, inspectable, and kind to the user.
 
-They do one useful thing, say what they are doing, and leave the user in control. They avoid hidden policy, surprising network calls, and clever abstractions that only the author can debug.
+They do one useful thing, say what they are doing, and leave the user in control. Avoid hidden policy, surprising network calls, and abstractions only the author can debug.
 
 This page is guidance for humans and for zi when generating extensions.
 
@@ -84,7 +84,7 @@ return function(zi)
 end
 ```
 
-A slash command is for direct user intent. It should be safe to run because a person asked for it.
+A slash command is for direct user intent. It should be safe to run when a person asks for it.
 
 ```lua
 return function(zi)
@@ -99,7 +99,7 @@ return function(zi)
 end
 ```
 
-A semantic message observer can attach durable session metadata without touching raw jsonl or UI rows. Prefer this kind of visible memory over private state when the information belongs to the session.
+A semantic message observer can attach durable session metadata without touching raw jsonl or UI rows. Use visible memory when the information belongs to the session.
 
 ```lua
 zi.on("message", function(event, ctx)
@@ -115,7 +115,7 @@ zi.on("message", function(event, ctx)
 end)
 ```
 
-An event is for policy or reaction. Keep event behavior easy to explain when someone reads the session later.
+An event is for policy or reaction. Keep event behavior easy to explain later.
 
 ```lua
 zi.on("message", function(event, ctx)
