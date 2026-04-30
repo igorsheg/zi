@@ -1,5 +1,5 @@
 const std = @import("std");
-const app_meta = @import("../../app_meta.zig");
+const app_meta = @import("../../runtime/app.zig");
 const spec = @import("spec.zig");
 
 pub fn writeGeneralHelp(writer: anytype) !void {
