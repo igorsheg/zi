@@ -174,7 +174,7 @@ pub fn streamCore(
         return;
     };
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = std.Options.debug_io };
+    var client: std.http.Client = .{ .allocator = allocator, .io = options.io };
     defer client.deinit();
 
     var extra_headers_buf: [16]std.http.Header = undefined;
@@ -210,7 +210,7 @@ pub fn streamCore(
     };
     defer req.deinit();
 
-    var abort_guard = AbortGuard.start(options.signal, .{
+    var abort_guard = AbortGuard.start(options.io, options.signal, .{
         .shutdown_fd = AbortGuard.httpRequestShutdownFd(&req),
     });
     defer abort_guard.stop();

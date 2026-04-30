@@ -174,6 +174,7 @@ pub const AgentSession = struct {
             .tools = prepared.tools,
             .messages = options.initial_messages,
             .thinking_level = options.thinking_level orelse .off,
+            .io = prepared.stream_closure.io,
             .convert_to_llm = .{ .func = &message_conversion.convertToLlm, .ctx = null },
             .stream_fn = stream_hook,
             .session_id = prepared.session_store.sessionId(),

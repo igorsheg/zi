@@ -1,6 +1,7 @@
 const std = @import("std");
 const component_mod = @import("../component.zig");
 const buffer_mod = @import("../buffer.zig");
+const cell_mod = @import("../cell.zig");
 const markdown_mod = @import("markdown.zig");
 const text_mod = @import("text.zig");
 const theme_mod = @import("../theme.zig");
@@ -11,15 +12,16 @@ const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
 const Theme = theme_mod.Theme;
+const Color = cell_mod.Color;
 
-pub const Footer = union(enum) {
+pub const MetaLine = union(enum) {
     none,
     queued_steering,
     queued_follow_up,
     edited,
     custom: []u8,
 
-    pub fn clone(self: Footer, allocator: std.mem.Allocator) !Footer {
+    pub fn clone(self: MetaLine, allocator: std.mem.Allocator) !MetaLine {
         return switch (self) {
             .none => .none,
             .queued_steering => .queued_steering,
@@ -29,7 +31,7 @@ pub const Footer = union(enum) {
         };
     }
 
-    fn deinit(self: *Footer, allocator: std.mem.Allocator) void {
+    fn deinit(self: *MetaLine, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .custom => |text| allocator.free(text),
             else => {},
@@ -37,7 +39,7 @@ pub const Footer = union(enum) {
         self.* = .none;
     }
 
-    fn label(self: Footer) []const u8 {
+    fn label(self: MetaLine) []const u8 {
         return switch (self) {
             .none => "",
             .queued_steering => "Queued · Steering",
@@ -55,20 +57,20 @@ pub const Status = enum {
 
 pub const UserRowModel = struct {
     text: ?[]u8 = null,
-    footer: Footer = .none,
+    meta: MetaLine = .none,
     status: Status = .in_chat,
 
     pub fn clone(self: UserRowModel, allocator: std.mem.Allocator) !UserRowModel {
         return .{
             .text = if (self.text) |text| try allocator.dupe(u8, text) else null,
-            .footer = try self.footer.clone(allocator),
+            .meta = try self.meta.clone(allocator),
             .status = self.status,
         };
     }
 
     pub fn deinit(self: *UserRowModel, allocator: std.mem.Allocator) void {
         if (self.text) |text| allocator.free(text);
-        self.footer.deinit(allocator);
+        self.meta.deinit(allocator);
         self.* = .{};
     }
 };
@@ -77,8 +79,8 @@ pub const UserMessage = struct {
     allocator: std.mem.Allocator,
     theme: *const Theme = undefined,
     body: markdown_mod.Markdown,
-    footer: text_mod.Text,
-    footer_visible: bool = false,
+    meta: text_mod.Text,
+    meta_visible: bool = false,
     model: UserRowModel = .{},
 
     pub fn init(allocator: std.mem.Allocator) UserMessage {
@@ -86,7 +88,7 @@ pub const UserMessage = struct {
             .allocator = allocator,
             .theme = themes_builtin.dark(),
             .body = markdown_mod.Markdown.init(allocator),
-            .footer = text_mod.Text.init(allocator),
+            .meta = text_mod.Text.init(allocator),
         };
         self.setTheme(self.theme);
         return self;
@@ -94,7 +96,7 @@ pub const UserMessage = struct {
 
     pub fn deinit(self: *UserMessage) void {
         self.body.deinit();
-        self.footer.deinit();
+        self.meta.deinit();
         self.model.deinit(self.allocator);
     }
 
@@ -109,9 +111,9 @@ pub const UserMessage = struct {
         self.body.padding_y = 1;
         self.body.fg = theme.fg(.user_message_text);
 
-        self.footer.padding_x = 1;
-        self.footer.padding_y = 0;
-        self.footer.fg = theme.fg(.muted);
+        self.meta.padding_x = 1;
+        self.meta.padding_y = 0;
+        self.meta.fg = theme.fg(.muted);
 
         self.applyModel();
     }
@@ -127,27 +129,29 @@ pub const UserMessage = struct {
         self.applyStatusStyles();
         self.body.setContent(self.model.text orelse "");
 
-        var footer_buf: [128]u8 = undefined;
-        const footer_text = footerLabel(self.model.footer, self.model.status, &footer_buf);
-        self.footer_visible = footer_text.len > 0;
-        self.footer.setContent(footer_text);
+        var meta_buf: [128]u8 = undefined;
+        const meta_text = metaLineText(self.model.meta, self.model.status, &meta_buf);
+        self.meta_visible = meta_text.len > 0;
+        self.meta.setContent(meta_text);
     }
 
     fn applyStatusStyles(self: *UserMessage) void {
-        const bg = switch (self.model.status) {
+        const queued = isQueuedMeta(self.model.meta);
+        const bg = if (queued) Color.default else switch (self.model.status) {
             .in_chat, .pending => self.theme.bg(.user_message_bg),
         };
 
         self.body.bg = bg;
-        self.footer.bg = bg;
+        self.meta.bg = Color.default;
     }
 
     pub fn measure(self: *UserMessage, width: u32) Measurement {
         const body = self.body.measure(width);
-        const footer_h: u32 = if (self.footer_visible) self.footer.measure(width).preferred_height else 0;
+        const meta_h: u32 = if (self.meta_visible) self.meta.measure(width).preferred_height else 0;
+        const body_h = self.bodyVisibleHeight(body.preferred_height);
         return .{
-            .min_height = body.min_height + footer_h,
-            .preferred_height = body.preferred_height + footer_h,
+            .min_height = @min(body.min_height, body_h) + meta_h,
+            .preferred_height = body_h + meta_h,
         };
     }
 
@@ -160,8 +164,8 @@ pub const UserMessage = struct {
         const height = region.height;
         if (width == 0 or height == 0) return;
 
-        const body_h = self.body.measure(width).preferred_height;
-        const footer_h: u32 = if (self.footer_visible) self.footer.measure(width).preferred_height else 0;
+        const body_h = self.bodyVisibleHeight(self.body.measure(width).preferred_height);
+        const meta_h: u32 = if (self.meta_visible) self.meta.measure(width).preferred_height else 0;
 
         var screen_y: u32 = 0;
         if (first_row < body_h) {
@@ -170,21 +174,29 @@ pub const UserMessage = struct {
             self.body.renderSlice(region.sub(0, screen_y, width, visible_h), skipped);
             screen_y += visible_h;
         }
-        if (!self.footer_visible or screen_y >= height) return;
+        if (!self.meta_visible or screen_y >= height) return;
 
-        if (first_row < body_h + footer_h) {
-            const footer_skip = first_row -| body_h;
-            const visible_h = @min(footer_h - footer_skip, height - screen_y);
-            self.footer.renderSlice(region.sub(0, screen_y, width, visible_h), footer_skip);
+        if (first_row < body_h + meta_h) {
+            const meta_skip = first_row -| body_h;
+            const visible_h = @min(meta_h - meta_skip, height - screen_y);
+            self.meta.renderSlice(region.sub(0, screen_y, width, visible_h), meta_skip);
         }
+    }
+
+    fn bodyVisibleHeight(self: *const UserMessage, measured_height: u32) u32 {
+        if (!isQueuedMeta(self.model.meta)) return measured_height;
+        return measured_height -| self.body.padding_y;
     }
 };
 
-fn footerLabel(footer: Footer, status: Status, out: []u8) []const u8 {
+fn metaLineText(meta: MetaLine, status: Status, out: []u8) []const u8 {
     var pos: usize = 0;
-    const base = footer.label();
+    const base = meta.label();
 
-    append(out, &pos, base);
+    if (base.len > 0) {
+        append(out, &pos, "↩ ");
+        append(out, &pos, base);
+    }
 
     if (status == .pending and base.len > 0) {
         append(out, &pos, " · ");
@@ -196,6 +208,13 @@ fn footerLabel(footer: Footer, status: Status, out: []u8) []const u8 {
     }
 
     return out[0..pos];
+}
+
+fn isQueuedMeta(meta: MetaLine) bool {
+    return switch (meta) {
+        .queued_steering, .queued_follow_up => true,
+        else => false,
+    };
 }
 
 fn append(dst: []u8, pos: *usize, text: []const u8) void {
@@ -212,10 +231,10 @@ fn setTestModel(msg: *UserMessage, model: *UserRowModel) void {
     msg.setOwnedModel(model);
 }
 
-fn makeTestModel(text: []const u8, footer: Footer, status: Status) !UserRowModel {
+fn makeTestModel(text: []const u8, meta: MetaLine, status: Status) !UserRowModel {
     return .{
         .text = try testing.allocator.dupe(u8, text),
-        .footer = try footer.clone(testing.allocator),
+        .meta = try meta.clone(testing.allocator),
         .status = status,
     };
 }
@@ -239,7 +258,7 @@ fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-test "user message renders body and queued footer from owned model" {
+test "user message renders body and queued meta line from owned model" {
     var msg = UserMessage.init(testing.allocator);
     defer msg.deinit();
 
@@ -254,10 +273,11 @@ test "user message renders body and queued footer from owned model" {
     const text = try bufferText(&buf, testing.allocator);
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "hello") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Queued · Follow-up") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "↩ Queued · Follow-up") != null);
+    try testing.expect(buf.get(0, 0).bg.eql(Color.default));
 }
 
-test "queued user message footer mentions queued amend shortcut" {
+test "queued user message meta line is transparent and mentions queued amend shortcut" {
     var msg = UserMessage.init(testing.allocator);
     defer msg.deinit();
 
@@ -275,24 +295,27 @@ test "queued user message footer mentions queued amend shortcut" {
 
     const text = try bufferText(&buf, testing.allocator);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "Queued · Follow-up") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "↩ Queued · Follow-up") != null);
     try testing.expect(std.mem.indexOf(u8, text, "to edit") != null);
+    try testing.expect(buf.get(0, 0).bg.eql(Color.default));
+    try testing.expectEqual(@as(u21, '↩'), buf.get(1, 2).grapheme.codepoint);
+    try testing.expectEqual(@as(u32, 3), msg.measure(80).preferred_height);
     try testing.expect(std.mem.indexOf(u8, text, binding) != null);
 }
 
-test "user message model replacement updates body and footer visibility" {
+test "user message model replacement updates body and meta visibility" {
     var msg = UserMessage.init(testing.allocator);
     defer msg.deinit();
 
     var first = try makeTestModel("hello", .queued_follow_up, .pending);
     defer first.deinit(testing.allocator);
     setTestModel(&msg, &first);
-    try testing.expect(msg.footer_visible);
+    try testing.expect(msg.meta_visible);
 
     var second = try makeTestModel("updated", .none, .in_chat);
     defer second.deinit(testing.allocator);
     setTestModel(&msg, &second);
 
-    try testing.expect(!msg.footer_visible);
+    try testing.expect(!msg.meta_visible);
     try testing.expectEqual(@as(u32, 3), msg.measure(20).preferred_height);
 }

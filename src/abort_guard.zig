@@ -14,7 +14,7 @@ const AbortSignal = @import("abort_signal.zig").AbortSignal;
 ///     bash/spawn so Ctrl+C semantics reach grandchildren too.
 ///
 /// Usage:
-///   var guard = AbortGuard.start(signal, .{ .shutdown_fd = fd });
+///   var guard = AbortGuard.start(io, signal, .{ .shutdown_fd = fd });
 ///   defer guard.stop();
 ///   // ... blocking I/O ...
 pub const AbortGuard = struct {
@@ -48,11 +48,7 @@ pub const AbortGuard = struct {
 
     /// Spawn the watchdog. No-ops (no thread) when the signal is inert
     /// or all actions are null.
-    pub fn start(signal: AbortSignal, actions: Actions) AbortGuard {
-        return startWithIo(std.Options.debug_io, signal, actions);
-    }
-
-    pub fn startWithIo(io: std.Io, signal: AbortSignal, actions: Actions) AbortGuard {
+    pub fn start(io: std.Io, signal: AbortSignal, actions: Actions) AbortGuard {
         if (signal.isNone() or
             (actions.shutdown_fd == null and actions.kill_pid == null and actions.interrupt_process_group == null))
         {

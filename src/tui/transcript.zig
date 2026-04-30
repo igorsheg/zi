@@ -1758,12 +1758,12 @@ fn appendTestToolExecutionRow(
 fn buildTestUserModel(
     allocator: std.mem.Allocator,
     text: []const u8,
-    footer: user_message_mod.Footer,
+    meta: user_message_mod.MetaLine,
     status: user_message_mod.Status,
 ) !user_message_mod.UserRowModel {
     return .{
         .text = try allocator.dupe(u8, text),
-        .footer = try footer.clone(allocator),
+        .meta = try meta.clone(allocator),
         .status = status,
     };
 }
@@ -1771,7 +1771,7 @@ fn buildTestUserModel(
 fn appendTestUserRow(
     transcript: *Transcript,
     text: []const u8,
-    footer: user_message_mod.Footer,
+    meta: user_message_mod.MetaLine,
     kind: ItemKind,
 ) !usize {
     const msg = try transcript.allocator.create(user_message_mod.UserMessage);
@@ -1783,7 +1783,7 @@ fn appendTestUserRow(
     var model = try buildTestUserModel(
         transcript.allocator,
         text,
-        footer,
+        meta,
         if (kind == .queued_user_message) .pending else .in_chat,
     );
     defer model.deinit(transcript.allocator);

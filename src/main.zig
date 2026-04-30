@@ -74,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var log_session = try logging.init(allocator, .{
+        .io = init.io,
         .sink_mode = sinkModeForPlan(execution_plan),
     });
     defer log_session.deinit();

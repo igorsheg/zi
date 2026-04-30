@@ -87,6 +87,7 @@ pub const Transport = enum {
 
 /// Base options all providers share
 pub const StreamOptions = struct {
+    io: std.Io = std.Options.debug_io,
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
     signal: abort_signal_mod.AbortSignal = abort_signal_mod.AbortSignal.none,

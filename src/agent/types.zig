@@ -396,6 +396,7 @@ pub const AgentLoopConfig = struct {
     on_payload: ?OnPayloadHook = null,
 
     // StreamOptions fields inlined from SimpleStreamOptions
+    io: std.Io = std.Options.debug_io,
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
     api_key: ?[]const u8 = null,
@@ -410,6 +411,7 @@ pub const AgentLoopConfig = struct {
     pub fn buildStreamOptions(self: *const AgentLoopConfig) ai.protocol.SimpleStreamOptions {
         return .{
             .base = .{
+                .io = self.io,
                 .temperature = self.temperature,
                 .max_tokens = self.max_tokens,
                 .api_key = self.api_key,

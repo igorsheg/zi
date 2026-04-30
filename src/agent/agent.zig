@@ -43,6 +43,7 @@ pub const Agent = struct {
     model: protocol.Model,
     tools: []const protocol.AgentTool,
     thinking_level: protocol.ThinkingLevel,
+    io: std.Io,
 
     convert_to_llm: protocol.ConvertToLlmHook,
     transform_context: ?protocol.TransformContextHook,
@@ -75,6 +76,7 @@ pub const Agent = struct {
         tools: []const protocol.AgentTool = &.{},
         messages: []const protocol.AgentMessage = &.{},
         thinking_level: protocol.ThinkingLevel = .off,
+        io: std.Io = std.Options.debug_io,
         convert_to_llm: ?protocol.ConvertToLlmHook = null,
         transform_context: ?protocol.TransformContextHook = null,
         stream_fn: ?protocol.StreamHook = null,
@@ -127,7 +129,7 @@ pub const Agent = struct {
             default_stream_bundle = bundle;
 
             const closure = try allocator.create(DefaultStreamClosure);
-            closure.* = .{ .registry = bundle.registry };
+            closure.* = .{ .registry = bundle.registry, .io = options.io };
             default_stream_closure = closure;
 
             break :blk protocol.StreamHook{
@@ -149,6 +151,7 @@ pub const Agent = struct {
             .model = options.model,
             .tools = options.tools,
             .thinking_level = options.thinking_level,
+            .io = options.io,
             .convert_to_llm = options.convert_to_llm orelse defaultConvertToLlmHook(),
             .transform_context = options.transform_context,
             .stream_fn = stream_fn,
@@ -399,7 +402,6 @@ pub const Agent = struct {
     }
 
     pub fn cloneConversationView(self: *const Agent, allocator: std.mem.Allocator) !conversation_state.ConversationView {
-
         const in_flight = try self.in_flight.freeze(allocator);
         errdefer if (in_flight) |*frozen| {
             var mut = frozen.*;
@@ -555,6 +557,7 @@ pub const Agent = struct {
     fn createLoopConfig(self: *Agent, skip_initial_steering_poll: bool) protocol.AgentLoopConfig {
         return .{
             .model = self.model,
+            .io = self.io,
             .stream = self.stream_fn,
             .convert_to_llm = self.convert_to_llm,
             .transform_context = self.transform_context,
@@ -664,6 +667,7 @@ pub fn defaultConvertToLlmHook() protocol.ConvertToLlmHook {
 
 const DefaultStreamClosure = struct {
     registry: *ai.provider.Registry,
+    io: std.Io,
 
     fn streamFn(
         ctx: ?*anyopaque,
@@ -681,7 +685,9 @@ const DefaultStreamClosure = struct {
             emitMissingProviderError(allocator, model, api_str, callback, callback_ctx);
             return;
         };
-        prov.streamSimple(allocator, model, context, options, callback, callback_ctx);
+        var opts = options;
+        opts.base.io = self.io;
+        prov.streamSimple(allocator, model, context, opts, callback, callback_ctx);
     }
 };
 

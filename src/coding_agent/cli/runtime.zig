@@ -30,7 +30,7 @@ pub const Runtime = struct {
 
         const auth_storage = try allocator.create(auth.storage.AuthStorage);
         errdefer allocator.destroy(auth_storage);
-        auth_storage.* = auth.storage.AuthStorage.create(allocator, null) catch |err| switch (err) {
+        auth_storage.* = auth.storage.AuthStorage.createWithIo(allocator, io, null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .err = .auth_storage_init_failed },
         };
@@ -38,7 +38,7 @@ pub const Runtime = struct {
 
         const settings_manager = try allocator.create(settings_mod.manager.SettingsManager);
         errdefer allocator.destroy(settings_manager);
-        settings_manager.* = settings_mod.manager.SettingsManager.create(allocator, cwd, null) catch |err| switch (err) {
+        settings_manager.* = settings_mod.manager.SettingsManager.createWithIo(allocator, io, cwd, null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .err = .settings_init_failed },
         };

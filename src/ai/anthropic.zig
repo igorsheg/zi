@@ -105,7 +105,7 @@ pub const AnthropicProvider = struct {
         };
 
         // Setup HTTP client
-        var client: std.http.Client = .{ .allocator = allocator, .io = std.Options.debug_io };
+        var client: std.http.Client = .{ .allocator = allocator, .io = options.io };
         defer client.deinit();
 
         // Build extra headers
@@ -171,7 +171,7 @@ pub const AnthropicProvider = struct {
         };
         defer req.deinit();
 
-        var abort_guard = AbortGuard.start(options.signal, .{
+        var abort_guard = AbortGuard.start(options.io, options.signal, .{
             .shutdown_fd = AbortGuard.httpRequestShutdownFd(&req),
         });
         defer abort_guard.stop();
@@ -1150,7 +1150,7 @@ test "Anthropic SSE usage keeps cache tokens in total_tokens" {
         fn callback(_: protocol.AssistantMessageEvent, _: ?*anyopaque) void {}
     };
 
-    handleSseEvent(.{ .data = 
+    handleSseEvent(.{ .data =
         \\{"type":"message_start","message":{"usage":{"input_tokens":1200,"output_tokens":10,"cache_read_input_tokens":800,"cache_creation_input_tokens":400}}}
     }, &state, &Noop.callback, null);
     try testing.expectEqual(@as(u64, 1200), state.partial.usage.input);
@@ -1159,7 +1159,7 @@ test "Anthropic SSE usage keeps cache tokens in total_tokens" {
     try testing.expectEqual(@as(u64, 400), state.partial.usage.cache_write);
     try testing.expectEqual(@as(u64, 2410), state.partial.usage.total_tokens);
 
-    handleSseEvent(.{ .data = 
+    handleSseEvent(.{ .data =
         \\{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":25,"cache_read_input_tokens":900}} 
     }, &state, &Noop.callback, null);
     try testing.expectEqual(@as(u64, 1200), state.partial.usage.input);

@@ -34,8 +34,12 @@ pub const SettingsManager = struct {
     /// File-backed settings manager.
     /// pi-mono: settings-manager.ts:232-240
     pub fn create(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) !SettingsManager {
+        return createWithIo(allocator, std.Options.debug_io, cwd, agent_dir_override);
+    }
+
+    pub fn createWithIo(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, agent_dir_override: ?[]const u8) !SettingsManager {
         var fs = try allocator.create(file_storage.FileSettingsStorage);
-        fs.* = try file_storage.FileSettingsStorage.init(allocator, cwd, agent_dir_override);
+        fs.* = try file_storage.FileSettingsStorage.initWithIo(allocator, io, cwd, agent_dir_override);
         return fromStorageInternal(allocator, fs.asStorage(), true);
     }
 

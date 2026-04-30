@@ -212,7 +212,6 @@ pub const ProjectionState = struct {
         options: RebuildOptions,
         use_committed_cache: bool,
     ) void {
-
         const allocator = transcript.allocator;
 
         if (use_committed_cache) {
@@ -350,7 +349,6 @@ pub fn reconcileFromSnapshots(
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
 ) void {
-
     var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, view, queued, options, transcript.hide_thinking_block) catch return;
     defer {
         for (desired_items.items) |*item| item.deinit(transcript.allocator);
@@ -459,7 +457,6 @@ fn buildDesiredItemsFull(
     hide_thinking_block: bool,
     cache_out: ?*std.ArrayList(CachedCommittedItem),
 ) !std.ArrayList(DesiredItem) {
-
     var desired_items: std.ArrayList(DesiredItem) = .empty;
     errdefer {
         for (desired_items.items) |*item| item.deinit(allocator);
@@ -514,7 +511,6 @@ fn buildDesiredItemsFromCommittedCache(
     hide_thinking_block: bool,
     cache_items: []const CachedCommittedItem,
 ) !std.ArrayList(DesiredItem) {
-
     var desired_items: std.ArrayList(DesiredItem) = .empty;
     errdefer {
         for (desired_items.items) |*item| item.deinit(allocator);
@@ -1016,12 +1012,12 @@ fn createAssistantMessageRow(
 pub fn buildUserRowModel(
     allocator: std.mem.Allocator,
     text: []const u8,
-    footer: user_message_component_mod.Footer,
+    meta: user_message_component_mod.MetaLine,
     status: user_message_component_mod.Status,
 ) !user_message_component_mod.UserRowModel {
     return .{
         .text = try allocator.dupe(u8, text),
-        .footer = try footer.clone(allocator),
+        .meta = try meta.clone(allocator),
         .status = status,
     };
 }

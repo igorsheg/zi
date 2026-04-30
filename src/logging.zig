@@ -30,6 +30,7 @@ pub const Session = struct {
 };
 
 pub const InitOptions = struct {
+    io: std.Io = std.Options.debug_io,
     sink_mode: SinkMode,
     agent_dir_override: ?[]const u8 = null,
 };
@@ -46,21 +47,21 @@ pub fn init(allocator: std.mem.Allocator, options: InitOptions) !Session {
     if (wantsFile(options.sink_mode)) {
         const dir = try storage.getLogDiagnosticsDir(allocator, options.agent_dir_override);
         defer allocator.free(dir);
-        try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir);
+        try std.Io.Dir.cwd().createDirPath(options.io, dir);
 
-        const file_name = try std.fmt.allocPrint(allocator, "zi-{d}.log", .{std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds()});
+        const file_name = try std.fmt.allocPrint(allocator, "zi-{d}.log", .{std.Io.Timestamp.now(options.io, .real).toMilliseconds()});
         defer allocator.free(file_name);
 
         const path = try std.fs.path.join(allocator, &.{ dir, file_name });
         errdefer allocator.free(path);
 
-        const file = try createFile(path);
-        errdefer file.close(std.Options.debug_io);
+        const file = try createFile(options.io, path);
+        errdefer file.close(options.io);
 
         session.log_path = path;
-        runtime.configure(options.sink_mode, file);
+        runtime.configure(options.io, options.sink_mode, file);
     } else {
-        runtime.configure(options.sink_mode, null);
+        runtime.configure(options.io, options.sink_mode, null);
     }
 
     runtime.emitBootLine(session.log_path);
@@ -68,21 +69,25 @@ pub fn init(allocator: std.mem.Allocator, options: InitOptions) !Session {
 }
 
 pub fn writeSnapshotFile(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
+    return writeSnapshotFileWithIo(std.Options.debug_io, allocator, agent_dir_override);
+}
+
+pub fn writeSnapshotFileWithIo(io: std.Io, allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
     const dir = try storage.getLogDiagnosticsDir(allocator, agent_dir_override);
     defer allocator.free(dir);
-    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir);
+    try std.Io.Dir.cwd().createDirPath(io, dir);
 
-    const file_name = try std.fmt.allocPrint(allocator, "recent-{d}.log", .{std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds()});
+    const file_name = try std.fmt.allocPrint(allocator, "recent-{d}.log", .{std.Io.Timestamp.now(io, .real).toMilliseconds()});
     defer allocator.free(file_name);
 
     const path = try std.fs.path.join(allocator, &.{ dir, file_name });
     errdefer allocator.free(path);
 
-    const file = try createFile(path);
-    defer file.close(std.Options.debug_io);
+    const file = try createFile(io, path);
+    defer file.close(io);
 
     var buf: [4096]u8 = undefined;
-    var writer = file.writer(std.Options.debug_io, &buf);
+    var writer = file.writer(io, &buf);
     try runtime.writeSnapshot(&writer.interface);
     try writer.end();
     return path;
@@ -108,7 +113,7 @@ pub fn logFn(
 
     var line_buf: [max_line_bytes]u8 = undefined;
     const line = formatLineText(&line_buf, .{
-        .timestamp_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        .timestamp_ms = std.Io.Timestamp.now(runtime.io, .real).toMilliseconds(),
         .level = level.asText(),
         .scope_name = @tagName(scope),
         .thread_label = @tagName(current_thread_label),
@@ -131,10 +136,12 @@ const Runtime = struct {
     stderr_enabled: bool = false,
     file: ?std.Io.File = null,
     recent: RingBuffer = .{},
+    io: std.Io = std.Options.debug_io,
 
-    fn configure(self: *Runtime, sink_mode: SinkMode, file: ?std.Io.File) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+    fn configure(self: *Runtime, io: std.Io, sink_mode: SinkMode, file: ?std.Io.File) void {
+        self.io = io;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         self.configured = true;
         self.stderr_enabled = wantsStderr(sink_mode);
@@ -143,10 +150,10 @@ const Runtime = struct {
     }
 
     fn shutdown(self: *Runtime) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        if (self.file) |file| file.close(std.Options.debug_io);
+        if (self.file) |file| file.close(self.io);
         self.file = null;
         self.stderr_enabled = false;
         self.configured = false;
@@ -154,8 +161,8 @@ const Runtime = struct {
     }
 
     fn isConfigured(self: *Runtime) bool {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.configured;
     }
 
@@ -170,7 +177,7 @@ const Runtime = struct {
 
         var line_buf: [max_line_bytes]u8 = undefined;
         const line = formatLineText(&line_buf, .{
-            .timestamp_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+            .timestamp_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
             .level = "info",
             .scope_name = "logging",
             .thread_label = @tagName(current_thread_label),
@@ -180,8 +187,8 @@ const Runtime = struct {
     }
 
     fn emitLine(self: *Runtime, line: []const u8) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.emitLineLocked(line);
     }
 
@@ -190,7 +197,7 @@ const Runtime = struct {
 
         if (self.file) |file| {
             var buf: [1024]u8 = undefined;
-            var writer = file.writer(std.Options.debug_io, &buf);
+            var writer = file.writer(self.io, &buf);
             writer.interface.writeAll(line) catch {};
             writer.interface.writeAll("\n") catch {};
             writer.end() catch {};
@@ -199,11 +206,11 @@ const Runtime = struct {
     }
 
     fn writeSnapshot(self: *Runtime, writer: *std.Io.Writer) !void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         try writer.writeAll("zi recent logs\n");
-        try writer.print("generated_at_unix_ms: {d}\n\n", .{std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds()});
+        try writer.print("generated_at_unix_ms: {d}\n\n", .{std.Io.Timestamp.now(self.io, .real).toMilliseconds()});
         try self.recent.writeAll(writer);
     }
 };
@@ -298,9 +305,9 @@ fn writeStderrLine(line: []const u8) void {
     stderr.file_writer.interface.print("{s}\n", .{line}) catch {};
 }
 
-fn createFile(path: []const u8) !std.Io.File {
-    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.createFileAbsolute(std.Options.debug_io, path, .{});
-    return std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{});
+fn createFile(io: std.Io, path: []const u8) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.createFileAbsolute(io, path, .{});
+    return std.Io.Dir.cwd().createFile(io, path, .{});
 }
 
 test "formatLineText includes metadata" {

@@ -20,12 +20,17 @@ pub const LockedFile = struct {
     path: []const u8,
     lock_path: []const u8,
     allocator: std.mem.Allocator,
+    io: std.Io,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !LockedFile {
+        return initWithIo(allocator, std.Options.debug_io, path);
+    }
+
+    pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !LockedFile {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
         const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{owned_path});
-        return .{ .path = owned_path, .lock_path = lock_path, .allocator = allocator };
+        return .{ .path = owned_path, .lock_path = lock_path, .allocator = allocator, .io = io };
     }
 
     pub fn deinit(self: *LockedFile) void {
@@ -35,7 +40,7 @@ pub const LockedFile = struct {
 
     /// Read file content. Returns null if file doesn't exist.
     pub fn readContent(self: *const LockedFile, allocator: std.mem.Allocator) ?[]const u8 {
-        return runtime_fs.readFileAlloc(std.Options.debug_io, allocator, self.path, .limited(max_file_size)) catch |err| switch (err) {
+        return runtime_fs.readFileAlloc(self.io, allocator, self.path, .limited(max_file_size)) catch |err| switch (err) {
             error.FileNotFound => null,
             else => {
                 log.warn("failed to read {s}: {}", .{ self.path, err });
@@ -46,20 +51,20 @@ pub const LockedFile = struct {
 
     /// Write content to file. Creates parent dirs (0o700) and file (0o600).
     pub fn writeContent(self: *const LockedFile, content: []const u8) !void {
-        try runtime_fs.writeFileTruncate(std.Options.debug_io, self.path, content);
+        try runtime_fs.writeFileTruncate(self.io, self.path, content);
     }
 
     /// Acquire the lockdir. Returns true on success, false after max retries.
     pub fn acquireLock(self: *const LockedFile) bool {
         var attempt: u32 = 0;
         while (attempt < max_retries) : (attempt += 1) {
-            std.Io.Dir.cwd().createDir(std.Options.debug_io, self.lock_path, .default_dir) catch |err| switch (err) {
+            std.Io.Dir.cwd().createDir(self.io, self.lock_path, .default_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     if (self.isLockStale()) {
                         self.breakLock();
                         continue;
                     }
-                    std.Options.debug_io.sleep(.fromNanoseconds(@intCast(retry_delay_ns)), .awake) catch {};
+                    self.io.sleep(.fromNanoseconds(@intCast(retry_delay_ns)), .awake) catch {};
                     continue;
                 },
                 else => {
@@ -75,20 +80,20 @@ pub const LockedFile = struct {
 
     /// Release the lockdir.
     pub fn releaseLock(self: *const LockedFile) void {
-        std.Io.Dir.cwd().deleteDir(std.Options.debug_io, self.lock_path) catch {};
+        std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch {};
     }
 
     fn isLockStale(self: *const LockedFile) bool {
-        var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, self.lock_path, .{}) catch return false;
-        defer dir.close(std.Options.debug_io);
-        const stat = dir.stat(std.Options.debug_io) catch return false;
-        const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        var dir = std.Io.Dir.cwd().openDir(self.io, self.lock_path, .{}) catch return false;
+        defer dir.close(self.io);
+        const stat = dir.stat(self.io) catch return false;
+        const now = @as(i128, @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds()));
         const age_ns = now - @as(i128, @intCast(stat.mtime.toNanoseconds()));
         return age_ns > stale_threshold_ns;
     }
 
     fn breakLock(self: *const LockedFile) void {
-        std.Io.Dir.cwd().deleteDir(std.Options.debug_io, self.lock_path) catch {};
+        std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch {};
     }
 };
 

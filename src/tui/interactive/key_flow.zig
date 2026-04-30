@@ -39,6 +39,15 @@ pub fn handle(self: anytype, key: Key) void {
     }
 
     if (keybindings.matches(.app_clear, key)) {
+        const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+
+        if (self.composerHasPendingInput()) {
+            self.clearComposerDraft();
+            self.last_ctrl_c_ns = now;
+            self.tui.dirty = true;
+            return;
+        }
+
         if (self.login_thread != null) {
             self.login_cancelled.store(true, .release);
             return;
@@ -53,9 +62,9 @@ pub fn handle(self: anytype, key: Key) void {
             self.tui.dirty = true;
             return;
         }
-        const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+
         const double_tap_ns: i128 = 500 * std.time.ns_per_ms;
-        if (!self.composerHasPendingInput() and now - self.last_ctrl_c_ns < double_tap_ns) {
+        if (now - self.last_ctrl_c_ns < double_tap_ns) {
             self.running = false;
             return;
         }

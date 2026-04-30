@@ -21,6 +21,15 @@ pub const FileSettingsStorage = struct {
         cwd: []const u8,
         agent_dir_override: ?[]const u8,
     ) !FileSettingsStorage {
+        return initWithIo(allocator, std.Options.debug_io, cwd, agent_dir_override);
+    }
+
+    pub fn initWithIo(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        agent_dir_override: ?[]const u8,
+    ) !FileSettingsStorage {
         const agent_dir = try shared.getAgentDir(allocator, agent_dir_override);
         defer allocator.free(agent_dir);
 
@@ -31,9 +40,9 @@ pub const FileSettingsStorage = struct {
         const project_path = try std.fs.path.join(allocator, &.{ project_dir, "settings.json" });
         defer allocator.free(project_path);
 
-        var global = try shared.LockedFile.init(allocator, global_path);
+        var global = try shared.LockedFile.initWithIo(allocator, io, global_path);
         errdefer global.deinit();
-        const project = try shared.LockedFile.init(allocator, project_path);
+        const project = try shared.LockedFile.initWithIo(allocator, io, project_path);
 
         return .{
             .allocator = allocator,

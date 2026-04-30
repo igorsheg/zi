@@ -139,10 +139,11 @@ fn runCommand(
     else |_|
         &.{ "/bin/sh", "-c", command };
 
-    var capture = StreamingCapture.init(io_allocator);
+    var capture = StreamingCapture.init(io_allocator, io);
     defer capture.deinit();
     var callback_ctx = BashChunkCtx{
         .allocator = allocator,
+        .io = io,
         .capture = &capture,
         .command = command,
         .cb = on_update,
@@ -220,6 +221,7 @@ const CompletedOutput = struct {
 
 const BashChunkCtx = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     capture: *StreamingCapture,
     command: []const u8,
     cb: ?protocol.AgentToolUpdateCallback,
@@ -230,12 +232,12 @@ const BashChunkCtx = struct {
 
     fn onChunk(raw_ctx: ?*anyopaque, _: runtime_process.StreamKind, bytes: []const u8) void {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         self.capture.append(bytes);
         const cb = self.cb orelse return;
-        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds()));
         if (self.last_emit_ns != 0 and now_ns - self.last_emit_ns < STREAM_UPDATE_MIN_INTERVAL_MS * std.time.ns_per_ms) return;
         if (self.capture.takeDirtySnapshot(self.allocator)) |snapshot| {
             defer if (snapshot.len > 0) self.allocator.free(snapshot);
@@ -247,8 +249,8 @@ const BashChunkCtx = struct {
     }
 
     fn emitFinal(self: *@This()) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const cb = self.cb orelse return;
         if (self.capture.takeDirtySnapshot(self.allocator)) |snapshot| {
             defer if (snapshot.len > 0) self.allocator.free(snapshot);
@@ -261,11 +263,13 @@ const BashChunkCtx = struct {
 
 const StreamingCapture = struct {
     mutex: std.Io.Mutex = .init,
+    io: std.Io,
     output: output_buffer.LineOutputBuffer,
     dirty: bool = false,
 
-    fn init(allocator: std.mem.Allocator) StreamingCapture {
+    fn init(allocator: std.mem.Allocator, io: std.Io) StreamingCapture {
         return .{
+            .io = io,
             .output = output_buffer.LineOutputBuffer.init(allocator, HEAD_LINES, TAIL_LINES),
         };
     }
@@ -275,15 +279,15 @@ const StreamingCapture = struct {
     }
 
     fn append(self: *StreamingCapture, bytes: []const u8) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.output.addChunk(bytes) catch return;
         self.dirty = true;
     }
 
     fn takeDirtySnapshot(self: *StreamingCapture, allocator: std.mem.Allocator) ?[]u8 {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (!self.dirty) return null;
         self.dirty = false;
         const snapshot = self.output.snapshotAlloc(allocator, TRUNCATED_FMT) catch return null;
@@ -291,8 +295,8 @@ const StreamingCapture = struct {
     }
 
     fn finishText(self: *StreamingCapture, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const final = try self.output.finishAlloc(allocator, TRUNCATED_FMT);
         return final.text;
     }

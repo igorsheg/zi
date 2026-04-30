@@ -128,9 +128,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
     const child_id = child.id.?;
 
     var abort_guard = if (request.signal) |signal|
-        AbortGuard.startWithIo(io, signal, .{ .interrupt_process_group = if (request.process_group) child_id else null, .kill_pid = if (request.process_group) null else child_id })
+        AbortGuard.start(io, signal, .{ .interrupt_process_group = if (request.process_group) child_id else null, .kill_pid = if (request.process_group) null else child_id })
     else
-        AbortGuard.startWithIo(io, AbortSignal.none, .{});
+        AbortGuard.start(io, AbortSignal.none, .{});
     defer abort_guard.stop();
 
     var timeout_guard = TimeoutGuard.start(io, request.timeout_ms, child_id, request.process_group);

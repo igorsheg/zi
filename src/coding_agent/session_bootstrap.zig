@@ -30,6 +30,7 @@ pub const StreamClosure = struct {
     extension_runner_ref: *ExtensionRunnerRef,
     api_key: []const u8,
     max_tokens: ?u64,
+    io: std.Io,
 
     pub fn streamFn(
         ctx: ?*anyopaque,
@@ -48,6 +49,7 @@ pub const StreamClosure = struct {
         defer arena.deinit();
 
         var opts = options;
+        opts.base.io = self.io;
         if (opts.base.api_key == null or opts.base.api_key.?.len == 0) {
             opts.base.api_key = self.resolveApiKey(arena.allocator(), model);
         }
@@ -305,6 +307,7 @@ pub fn prepareSessionDeps(
         .extension_runner_ref = extension_runner_ref,
         .api_key = options.api_key,
         .max_tokens = options.max_tokens,
+        .io = options.io,
     };
 
     var extension_runtime = try buildExtensionRuntime(
@@ -987,6 +990,7 @@ test "stream closure derives request api key from oauth.getApiKey when the activ
         .extension_runner_ref = &runner_ref,
         .api_key = "session-fallback",
         .max_tokens = null,
+        .io = std.Options.debug_io,
     };
 
     const model: ai.protocol.Model = .{
@@ -1067,6 +1071,7 @@ test "stream closure resolves claim api_key and layers provider headers before r
         .extension_runner_ref = &runner_ref,
         .api_key = "session-fallback",
         .max_tokens = null,
+        .io = std.Options.debug_io,
     };
 
     const request_headers = [_]ai.protocol.Header{
