@@ -6,9 +6,9 @@
 //! may use for richer host-owned presentation.
 
 const std = @import("std");
-const diff = @import("diff.zig");
-const diff_json = @import("diff_json.zig");
-const json_util = @import("../ai/json_util.zig");
+const diff = @import("../../diff/document.zig");
+const diff_json = @import("../../diff/json.zig");
+const json_util = @import("../../ai/json_util.zig");
 
 pub const DIFF_KIND = "diff";
 pub const DIFF_VERSION: i64 = 2;

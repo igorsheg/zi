@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_fs = @import("../../runtime/fs.zig");
+const zio_fs = @import("../../zio/fs.zig");
 const agent = @import("../../agent/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
@@ -315,7 +315,7 @@ pub const SessionWriter = struct {
         var fw = std.Io.Writer.fixed(&buf);
         try json.writeEntry(&fw, entry);
         try fw.writeAll("\n");
-        runtime_fs.appendFile(std.Options.debug_io, self.session_file, fw.buffered()) catch {};
+        zio_fs.appendFile(std.Options.debug_io, self.session_file, fw.buffered()) catch {};
     }
 
     /// Generate a unique 8-char hex ID, collision-checked.

@@ -1,5 +1,5 @@
 const std = @import("std");
-const diff = @import("diff.zig");
+const diff = @import("document.zig");
 const json_util = @import("../ai/json_util.zig");
 
 pub fn toJsonValue(allocator: std.mem.Allocator, document: diff.DiffDocument) !std.json.Value {

@@ -4,7 +4,7 @@ const protocol = @import("../../agent/types.zig");
 const json_util = @import("../../ai/json_util.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
-const output_buffer = @import("../../lib/output_buffer.zig");
+const output_buffer = @import("output_buffer.zig");
 const runtime_process = @import("../../zio/root.zig").process;
 const lock_registry = @import("lock_registry.zig");
 

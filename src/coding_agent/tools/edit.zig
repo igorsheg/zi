@@ -27,9 +27,9 @@ const builtin = @import("builtin");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
-const diff_mod = @import("../../lib/diff.zig");
-const diff_unified = @import("../../lib/diff_unified.zig");
-const tool_result_details = @import("../../lib/tool_result_details.zig");
+const diff_mod = @import("../../diff/document.zig");
+const diff_unified = @import("../../diff/unified.zig");
+const tool_result_details = @import("result_details.zig");
 const lock_registry = @import("lock_registry.zig");
 const json_value = @import("../../json/value.zig");
 

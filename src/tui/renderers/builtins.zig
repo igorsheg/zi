@@ -12,8 +12,8 @@ const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const json_util = @import("../../ai/json_util.zig");
-const diff_view = @import("../../lib/diff_view.zig");
-const tool_result_details = @import("../../lib/tool_result_details.zig");
+const diff_view = @import("../../diff/view.zig");
+const tool_result_details = @import("../../coding_agent/tools/result_details.zig");
 const agent_protocol = @import("../../agent/root.zig").protocol;
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
@@ -739,7 +739,7 @@ test "edit renderer renders unified diff text without structured diff details" {
 }
 
 test "edit renderer uses structured diff details when available" {
-    const diff_mod = @import("../../lib/diff.zig");
+    const diff_mod = @import("../../diff/document.zig");
 
     var doc = try diff_mod.buildDocument(testing.allocator, &[_]diff_mod.Input{.{
         .old_path = "a.txt",

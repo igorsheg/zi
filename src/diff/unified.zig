@@ -1,5 +1,5 @@
 const std = @import("std");
-const diff = @import("diff.zig");
+const diff = @import("document.zig");
 
 pub fn toUnified(allocator: std.mem.Allocator, document: diff.DiffDocument) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);

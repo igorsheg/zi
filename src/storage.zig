@@ -5,7 +5,7 @@
 /// Lock protocol uses proper-lockfile compatible mkdir-based locking (30s stale).
 const std = @import("std");
 
-const runtime_fs = @import("runtime/fs.zig");
+const zio_fs = @import("zio/fs.zig");
 
 const log = std.log.scoped(.storage);
 
@@ -40,7 +40,7 @@ pub const LockedFile = struct {
 
     /// Read file content. Returns null if file doesn't exist.
     pub fn readContent(self: *const LockedFile, allocator: std.mem.Allocator) ?[]const u8 {
-        return runtime_fs.readFileAlloc(self.io, allocator, self.path, .limited(max_file_size)) catch |err| switch (err) {
+        return zio_fs.readFileAlloc(self.io, allocator, self.path, .limited(max_file_size)) catch |err| switch (err) {
             error.FileNotFound => null,
             else => {
                 log.warn("failed to read {s}: {}", .{ self.path, err });
@@ -51,7 +51,7 @@ pub const LockedFile = struct {
 
     /// Write content to file. Creates parent dirs (0o700) and file (0o600).
     pub fn writeContent(self: *const LockedFile, content: []const u8) !void {
-        try runtime_fs.writeFileTruncate(self.io, self.path, content);
+        try zio_fs.writeFileTruncate(self.io, self.path, content);
     }
 
     /// Acquire the lockdir. Returns true on success, false after max retries.

@@ -1,5 +1,5 @@
 const std = @import("std");
-const diff = @import("diff.zig");
+const diff = @import("document.zig");
 
 const Allocator = std.mem.Allocator;
 

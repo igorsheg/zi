@@ -6,7 +6,7 @@ const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
-const output_buffer = @import("../../lib/output_buffer.zig");
+const output_buffer = @import("output_buffer.zig");
 
 const MAX_DIR_ENTRIES: usize = 1000;
 
