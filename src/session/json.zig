@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent = @import("../agent3/root.zig");
+const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const json_util = ai.json_util;
 const json_write = @import("../json/write.zig");
@@ -9,7 +9,7 @@ const Stringify = std.json.Stringify;
 
 // ─── Serialization ──────────────────────────────────────────────────
 
-pub fn writeHeader(writer: *std.io.Writer, header: proto.SessionHeader) !void {
+pub fn writeHeader(writer: *std.Io.Writer, header: proto.SessionHeader) !void {
     var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();
@@ -30,7 +30,7 @@ pub fn writeHeader(writer: *std.io.Writer, header: proto.SessionHeader) !void {
     try jw.endObject();
 }
 
-pub fn writeEntry(writer: *std.io.Writer, entry: proto.SessionEntry) !void {
+pub fn writeEntry(writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
     var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();

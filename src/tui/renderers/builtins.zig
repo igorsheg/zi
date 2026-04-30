@@ -14,7 +14,7 @@ const themes_builtin = @import("../../themes/builtin.zig");
 const json_util = @import("../../ai/json_util.zig");
 const diff_view = @import("../../lib/diff_view.zig");
 const tool_result_details = @import("../../lib/tool_result_details.zig");
-const agent_protocol = @import("../../agent3/root.zig").protocol;
+const agent_protocol = @import("../../agent/root.zig").protocol;
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
 const ToolStateContext = tool_display_mod.ToolStateContext;
@@ -322,7 +322,7 @@ fn renderTitle(
 }
 
 fn shortPath(buf: []u8, path: []const u8) []const u8 {
-    const home = std.posix.getenv("HOME") orelse return path;
+    const home = @import("env").get("HOME") orelse return path;
     if (std.mem.startsWith(u8, path, home)) {
         if (path.len - home.len + 1 > buf.len) return path;
         buf[0] = '~';
@@ -561,23 +561,23 @@ fn rowAscii(buf: *const buffer_mod.Buffer, y: u32, out: []u8) []const u8 {
         out[len] = if (cp <= 0x7f) @intCast(cp) else '?';
         len += 1;
     }
-    return std.mem.trimRight(u8, out[0..len], " ");
+    return std.mem.trimEnd(u8, out[0..len], " ");
 }
 
 fn makeBashArgsForTest(allocator: Allocator, key: []const u8, command: []const u8, timeout: ?std.json.Value) !std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
-    errdefer obj.deinit();
+    var obj: std.json.ObjectMap = .{};
+    errdefer obj.deinit(allocator);
 
     const owned_key = try allocator.dupe(u8, key);
     errdefer allocator.free(owned_key);
     const owned_command = try allocator.dupe(u8, command);
     errdefer allocator.free(owned_command);
-    try obj.put(owned_key, .{ .string = owned_command });
+    try obj.put(allocator, owned_key, .{ .string = owned_command });
 
     if (timeout) |value| {
         const timeout_key = try allocator.dupe(u8, "timeout");
         errdefer allocator.free(timeout_key);
-        try obj.put(timeout_key, value);
+        try obj.put(allocator, timeout_key, value);
     }
 
     return .{ .object = obj };

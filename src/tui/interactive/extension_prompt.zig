@@ -24,7 +24,7 @@ pub fn close(self: *Interactive, resolve_default: bool) void {
 pub fn finishIfTimedOut(self: *Interactive) void {
     if (self.extension_prompt_flow) |*flow| {
         const deadline = flow.deadline_ns orelse return;
-        if (std.time.nanoTimestamp() < deadline) return;
+        if (@as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) < deadline) return;
         flow.response.finish(.timeout);
         close(self, false);
         self.tui.dirty = true;

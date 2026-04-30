@@ -53,7 +53,7 @@ pub fn handle(self: anytype, key: Key) void {
             self.tui.dirty = true;
             return;
         }
-        const now = std.time.nanoTimestamp();
+        const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
         const double_tap_ns: i128 = 500 * std.time.ns_per_ms;
         if (!self.composerHasPendingInput() and now - self.last_ctrl_c_ns < double_tap_ns) {
             self.running = false;

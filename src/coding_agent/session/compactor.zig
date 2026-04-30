@@ -11,7 +11,7 @@
 //! Keep it thin — pi-mono's `compact()` in compaction.ts is the reference.
 
 const std = @import("std");
-const agent = @import("../../agent3/root.zig");
+const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../root.zig");
 const context_mod = @import("../../session/context.zig");
@@ -239,8 +239,8 @@ fn buildDetailsJson(
     allocator: std.mem.Allocator,
     file_lists: prep.ComputedFileLists,
 ) !std.json.Value {
-    var obj: std.json.ObjectMap = .init(allocator);
-    errdefer obj.deinit();
+    var obj: std.json.ObjectMap = .{};
+    errdefer obj.deinit(allocator);
 
     var read_arr: std.json.Array = .init(allocator);
     errdefer read_arr.deinit();
@@ -254,8 +254,8 @@ fn buildDetailsJson(
         try mod_arr.append(.{ .string = try allocator.dupe(u8, f) });
     }
 
-    try obj.put("readFiles", .{ .array = read_arr });
-    try obj.put("modifiedFiles", .{ .array = mod_arr });
+    try obj.put(allocator, try allocator.dupe(u8, "readFiles"), .{ .array = read_arr });
+    try obj.put(allocator, try allocator.dupe(u8, "modifiedFiles"), .{ .array = mod_arr });
     return .{ .object = obj };
 }
 

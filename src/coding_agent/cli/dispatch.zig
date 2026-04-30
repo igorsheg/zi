@@ -8,7 +8,7 @@ const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const plan = @import("plan.zig");
 
-const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+const stdout: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
 
 pub const Context = context_mod.Context;
 pub const ExecutionResult = result.ExecutionResult;
@@ -17,14 +17,14 @@ pub fn run(ctx: Context, cli_runtime: ?*runtime_mod.Runtime, execution_plan: pla
     switch (execution_plan) {
         .version => {
             var out_buf: [64]u8 = undefined;
-            var out_writer = stdout.writer(&out_buf);
+            var out_writer = stdout.writer(std.Options.debug_io, &out_buf);
             try help.writeVersion(&out_writer.interface);
             try out_writer.end();
             return .ok;
         },
         .help => {
             var out_buf: [2048]u8 = undefined;
-            var out_writer = stdout.writer(&out_buf);
+            var out_writer = stdout.writer(std.Options.debug_io, &out_buf);
             try help.writeGeneralHelp(&out_writer.interface);
             try out_writer.end();
             return .ok;

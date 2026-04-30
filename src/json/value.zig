@@ -35,12 +35,12 @@ pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.
             return .{ .array = new_arr };
         },
         .object => |obj| {
-            var new_obj = std.json.ObjectMap.init(allocator);
+            var new_obj: std.json.ObjectMap = .{};
             var it = obj.iterator();
             while (it.next()) |entry| {
                 const key = try allocator.dupe(u8, entry.key_ptr.*);
                 const val = try cloneJsonValue(allocator, entry.value_ptr.*);
-                try new_obj.put(key, val);
+                try new_obj.put(allocator, key, val);
             }
             return .{ .object = new_obj };
         },
@@ -68,7 +68,7 @@ pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
                 allocator.free(entry.key_ptr.*);
                 freeJsonValue(allocator, entry.value_ptr.*);
             }
-            mutable.deinit();
+            mutable.deinit(allocator);
         },
         else => {},
     }

@@ -2,10 +2,10 @@ const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const model_resolve = @import("../resolve.zig");
 const logging = @import("../../logging.zig");
-const agent = @import("../../agent3/root.zig");
+const agent = @import("../../agent/root.zig");
 const coding_agent = @import("../root.zig");
 const sdk = @import("../sdk.zig");
-const agent_json = @import("../../agent3/json.zig");
+const agent_json = @import("../../agent/json.zig");
 const batch_contract = @import("batch_contract.zig");
 const initial_message = @import("initial_message.zig");
 const plan = @import("plan.zig");
@@ -13,7 +13,7 @@ const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const common = @import("common.zig");
 
-const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+const stdout: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
 
 pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.ExecutionResult {
     logging.setThreadLabel(.batch);
@@ -72,6 +72,7 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
         .model = model,
         .api_key = key,
         .cwd = runtime.cwd,
+        .io = runtime.io,
         .max_tokens = 4096,
         .auth_storage = runtime.auth_storage,
         .settings_manager = runtime.settings_manager,
@@ -86,7 +87,7 @@ pub fn run(runtime: *runtime_mod.Runtime, options: plan.BatchPlan) !result.Execu
 
     if (options.output == .json) {
         var out_buf: [4096]u8 = undefined;
-        var out_writer = stdout.writerStreaming(&out_buf);
+        var out_writer = stdout.writerStreaming(runtime.io, &out_buf);
         try batch_contract.writeJsonSessionPreamble(&out_writer.interface, ca.session_store.header());
         try out_writer.end();
     }
@@ -105,7 +106,7 @@ fn finishTextMode(allocator: std.mem.Allocator, messages: []const agent.protocol
         .failure => |message| return .{ .err = .{ .batch_assistant_failed = message } },
         .success => |assistant| {
             var out_buf: [4096]u8 = undefined;
-            var out_writer = stdout.writer(&out_buf);
+            var out_writer = stdout.writer(std.Options.debug_io, &out_buf);
             try batch_contract.writeAssistantText(&out_writer.interface, assistant);
             try out_writer.end();
             return .ok;
@@ -116,7 +117,7 @@ fn finishTextMode(allocator: std.mem.Allocator, messages: []const agent.protocol
 const JsonHandler = struct {
     fn callback(event: agent.protocol.AgentEvent, _: ?*anyopaque) void {
         var buf: [4096]u8 = undefined;
-        var writer = stdout.writerStreaming(&buf);
+        var writer = stdout.writerStreaming(std.Options.debug_io, &buf);
         agent_json.writeAgentEvent(&writer.interface, event) catch return;
         writer.interface.writeAll("\n") catch {};
         writer.end() catch {};

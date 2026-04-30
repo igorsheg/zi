@@ -105,7 +105,7 @@ test "request transform applies provider decorators to canonical json" {
             _: *const protocol.Model,
             _: ?*anyopaque,
         ) !bool {
-            try payload.object.put("metadata", .{ .object = std.json.ObjectMap.init(allocator) });
+            try payload.object.put(allocator, "metadata", .{ .object = .{} });
             return true;
         }
     };

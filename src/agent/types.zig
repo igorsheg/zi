@@ -488,11 +488,11 @@ test "AgentToolResult clone+free with json details" {
     const allocator = std.testing.allocator;
 
     // Build a json object for details
-    var obj = std.json.ObjectMap.init(allocator);
-    try obj.put("key", .{ .string = "value" });
+    var obj: std.json.ObjectMap = .{};
+    try obj.put(allocator, "key", .{ .string = "value" });
     defer {
         var m = obj;
-        m.deinit();
+        m.deinit(allocator);
     }
 
     const original = AgentToolResult{

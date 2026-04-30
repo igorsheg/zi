@@ -14,10 +14,11 @@
 //!   passes in; ownership flows out of `execute` to the caller.
 
 const std = @import("std");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 
 pub const BuiltinCtx = struct {
     cwd: []const u8,
+    io: std.Io = std.Options.debug_io,
     session_id: []const u8 = "",
     image_auto_resize: bool = true,
 };
@@ -138,14 +139,13 @@ pub fn getIntPair(args: std.json.Value, key: []const u8) ?[2]i64 {
 pub fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const stripped = if (path.len > 0 and path[0] == '@') path[1..] else path;
     if (std.mem.eql(u8, stripped, "~")) {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch
+        const home = @import("env").get("HOME") orelse
             return allocator.dupe(u8, stripped);
-        return home;
+        return allocator.dupe(u8, home);
     }
     if (stripped.len >= 2 and stripped[0] == '~' and stripped[1] == '/') {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch
+        const home = @import("env").get("HOME") orelse
             return allocator.dupe(u8, stripped);
-        defer allocator.free(home);
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, stripped[1..] });
     }
     return allocator.dupe(u8, stripped);

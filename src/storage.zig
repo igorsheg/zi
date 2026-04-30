@@ -4,7 +4,8 @@
 /// All zi data lives under ~/.zi/ (or ZI_CODING_AGENT_DIR override).
 /// Lock protocol uses proper-lockfile compatible mkdir-based locking (30s stale).
 const std = @import("std");
-const posix = std.posix;
+
+const runtime_fs = @import("runtime/fs.zig");
 
 const log = std.log.scoped(.storage);
 
@@ -34,7 +35,7 @@ pub const LockedFile = struct {
 
     /// Read file content. Returns null if file doesn't exist.
     pub fn readContent(self: *const LockedFile, allocator: std.mem.Allocator) ?[]const u8 {
-        return std.fs.cwd().readFileAlloc(allocator, self.path, max_file_size) catch |err| switch (err) {
+        return runtime_fs.readFileAlloc(std.Options.debug_io, allocator, self.path, .limited(max_file_size)) catch |err| switch (err) {
             error.FileNotFound => null,
             else => {
                 log.warn("failed to read {s}: {}", .{ self.path, err });
@@ -45,28 +46,20 @@ pub const LockedFile = struct {
 
     /// Write content to file. Creates parent dirs (0o700) and file (0o600).
     pub fn writeContent(self: *const LockedFile, content: []const u8) !void {
-        if (std.fs.path.dirname(self.path)) |parent| {
-            try std.fs.cwd().makePath(parent);
-            var dir = try std.fs.cwd().openDir(parent, .{});
-            defer dir.close();
-            posix.fchmod(dir.fd, 0o700) catch {};
-        }
-        const file = try std.fs.cwd().createFile(self.path, .{ .mode = 0o600 });
-        defer file.close();
-        try file.writeAll(content);
+        try runtime_fs.writeFileTruncate(std.Options.debug_io, self.path, content);
     }
 
     /// Acquire the lockdir. Returns true on success, false after max retries.
     pub fn acquireLock(self: *const LockedFile) bool {
         var attempt: u32 = 0;
         while (attempt < max_retries) : (attempt += 1) {
-            std.fs.cwd().makeDir(self.lock_path) catch |err| switch (err) {
+            std.Io.Dir.cwd().createDir(std.Options.debug_io, self.lock_path, .default_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     if (self.isLockStale()) {
                         self.breakLock();
                         continue;
                     }
-                    std.Thread.sleep(retry_delay_ns);
+                    std.Options.debug_io.sleep(.fromNanoseconds(@intCast(retry_delay_ns)), .awake) catch {};
                     continue;
                 },
                 else => {
@@ -82,20 +75,20 @@ pub const LockedFile = struct {
 
     /// Release the lockdir.
     pub fn releaseLock(self: *const LockedFile) void {
-        std.fs.cwd().deleteDir(self.lock_path) catch {};
+        std.Io.Dir.cwd().deleteDir(std.Options.debug_io, self.lock_path) catch {};
     }
 
     fn isLockStale(self: *const LockedFile) bool {
-        var dir = std.fs.cwd().openDir(self.lock_path, .{}) catch return false;
-        defer dir.close();
-        const stat = dir.stat() catch return false;
-        const now = std.time.nanoTimestamp();
-        const age_ns = now - stat.mtime;
+        var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, self.lock_path, .{}) catch return false;
+        defer dir.close(std.Options.debug_io);
+        const stat = dir.stat(std.Options.debug_io) catch return false;
+        const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        const age_ns = now - @as(i128, @intCast(stat.mtime.toNanoseconds()));
         return age_ns > stale_threshold_ns;
     }
 
     fn breakLock(self: *const LockedFile) void {
-        std.fs.cwd().deleteDir(self.lock_path) catch {};
+        std.Io.Dir.cwd().deleteDir(std.Options.debug_io, self.lock_path) catch {};
     }
 };
 
@@ -149,11 +142,11 @@ pub const MemoryFile = struct {
 pub fn getAgentDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]const u8 {
     if (override) |dir| return allocator.dupe(u8, dir);
 
-    if (posix.getenv("ZI_CODING_AGENT_DIR")) |dir| {
+    if (@import("env").get("ZI_CODING_AGENT_DIR")) |dir| {
         return expandTilde(allocator, dir);
     }
 
-    const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+    const home = @import("env").get("HOME") orelse return error.NoHomeDir;
     return std.fs.path.join(allocator, &.{ home, ".zi", "agent" });
 }
 
@@ -221,11 +214,11 @@ pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
 /// Expand ~ prefix in a path.
 fn expandTilde(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
     if (std.mem.eql(u8, dir, "~")) {
-        const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+        const home = @import("env").get("HOME") orelse return error.NoHomeDir;
         return allocator.dupe(u8, home);
     }
     if (dir.len > 1 and dir[0] == '~' and dir[1] == '/') {
-        const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+        const home = @import("env").get("HOME") orelse return error.NoHomeDir;
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, dir[1..] });
     }
     return allocator.dupe(u8, dir);
@@ -251,7 +244,7 @@ test "locked file acquire and release" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
     const file_path = try std.fs.path.join(allocator, &.{ tmp_path, "test.json" });
     defer allocator.free(file_path);
@@ -260,11 +253,11 @@ test "locked file acquire and release" {
     defer lf.deinit();
 
     try std.testing.expect(lf.acquireLock());
-    tmp.dir.access("test.json.lock", .{}) catch |err| {
+    tmp.dir.access(std.Options.debug_io, "test.json.lock", .{}) catch |err| {
         return if (err == error.FileNotFound) error.TestUnexpectedResult else err;
     };
     lf.releaseLock();
-    tmp.dir.access("test.json.lock", .{}) catch |err| switch (err) {
+    tmp.dir.access(std.Options.debug_io, "test.json.lock", .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };

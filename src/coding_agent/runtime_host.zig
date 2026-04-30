@@ -1,6 +1,6 @@
 const std = @import("std");
-const agent_mod = @import("../agent3/root.zig");
-const control_mod = @import("../agent3/control.zig");
+const agent_mod = @import("../agent/root.zig");
+const control_mod = @import("../agent/control.zig");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const agent_session_mod = @import("agent_session.zig");
@@ -9,7 +9,7 @@ const extension_ui = @import("extensions/ui.zig");
 const sdk = @import("sdk.zig");
 const resolve_mod = @import("resolve.zig");
 const session_runner = @import("session_runner.zig");
-const conversation_state = @import("../agent3/conversation_state.zig");
+const conversation_state = @import("../agent/conversation_state.zig");
 const auth_types = @import("auth/types.zig");
 const oauth_mod = @import("auth/oauth.zig");
 const theme_mod = @import("../tui/theme.zig");
@@ -19,7 +19,6 @@ const extension_runner_mod = @import("extensions/runner.zig");
 const request_mod = @import("request.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
-const profile = @import("../debug/profile.zig");
 
 pub const QueueKind = control_mod.QueueKind;
 pub const EnqueueResult = control_mod.EnqueueResult;
@@ -191,6 +190,7 @@ pub const RuntimeHost = struct {
         try self.session.resource_loader.reload();
         const next = try session_bootstrap.prepareExtensionRuntimeBundle(self.session_allocator, .{
             .resource_loader = self.session.resource_loader,
+            .io = self.create_options.io,
             .settings_manager = self.create_options.settings_manager,
             .tools = self.create_options.tools,
             .tool_allowlist = self.create_options.tool_allowlist,
@@ -297,7 +297,7 @@ pub const RuntimeHost = struct {
     ) control_mod.EnqueueResult {
         const message: agent_mod.protocol.AgentMessage = .{ .user = .{
             .content = .{ .text = text },
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
         } };
         return switch (kind) {
             .steering => self.session.agent.steer(message),
@@ -468,8 +468,6 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         publisher: ConversationSnapshotPublisher,
     ) bool {
-        var publish_timer = profile.ScopedTimer.begin(.publish_conversation_state);
-        defer publish_timer.end();
 
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
@@ -925,7 +923,7 @@ fn makeLifecycleLoggerSource(
 test "runtime host rejects self-resume and only replaces with a different persisted session" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const workspace = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const workspace = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
     defer testing.allocator.free(workspace);
 
     const create_options = createTestCreateOptionsForCwd(workspace, &.{}, false);
@@ -974,22 +972,22 @@ test "runtime host emits truthful session lifecycle events across startup new re
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("shared/extensions");
-    try tmp.dir.makePath("workspace-a/.zi/extensions");
-    try tmp.dir.makePath("workspace-b/.zi/extensions");
-    try tmp.dir.writeFile(.{ .sub_path = "lifecycle.log", .data = "" });
+    try tmp.dir.createDirPath(std.Options.debug_io, "shared/extensions");
+    try tmp.dir.createDirPath(std.Options.debug_io, "workspace-a/.zi/extensions");
+    try tmp.dir.createDirPath(std.Options.debug_io, "workspace-b/.zi/extensions");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lifecycle.log", .data = "" });
 
-    const shared_root = try tmp.dir.realpathAlloc(allocator, "shared");
+    const shared_root = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "shared", allocator);
     defer allocator.free(shared_root);
-    const workspace_a = try tmp.dir.realpathAlloc(allocator, "workspace-a");
+    const workspace_a = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "workspace-a", allocator);
     defer allocator.free(workspace_a);
-    const workspace_b = try tmp.dir.realpathAlloc(allocator, "workspace-b");
+    const workspace_b = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "workspace-b", allocator);
     defer allocator.free(workspace_b);
     const project_root_a = try std.fs.path.join(allocator, &.{ workspace_a, ".zi" });
     defer allocator.free(project_root_a);
     const project_root_b = try std.fs.path.join(allocator, &.{ workspace_b, ".zi" });
     defer allocator.free(project_root_b);
-    const log_path = try tmp.dir.realpathAlloc(allocator, "lifecycle.log");
+    const log_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "lifecycle.log", allocator);
     defer allocator.free(log_path);
 
     const explicit_src = try makeLifecycleLoggerSource(allocator, log_path, "explicit");
@@ -997,9 +995,9 @@ test "runtime host emits truthful session lifecycle events across startup new re
     const project_src = try makeLifecycleLoggerSource(allocator, log_path, "project");
     defer allocator.free(project_src);
 
-    try tmp.dir.writeFile(.{ .sub_path = "shared/extensions/explicit.lua", .data = explicit_src });
-    try tmp.dir.writeFile(.{ .sub_path = "workspace-a/.zi/extensions/project.lua", .data = project_src });
-    try tmp.dir.writeFile(.{ .sub_path = "workspace-b/.zi/extensions/project.lua", .data = project_src });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "shared/extensions/explicit.lua", .data = explicit_src });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "workspace-a/.zi/extensions/project.lua", .data = project_src });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "workspace-b/.zi/extensions/project.lua", .data = project_src });
 
     const extension_paths = [_][]const u8{shared_root};
     const create_options = createTestCreateOptionsForCwd(workspace_a, &extension_paths, false);
@@ -1010,9 +1008,11 @@ test "runtime host emits truthful session lifecycle events across startup new re
 
     const readLines = struct {
         fn run(alloc: std.mem.Allocator, path_: []const u8) !std.ArrayListUnmanaged([]u8) {
-            const file = try std.fs.openFileAbsolute(path_, .{});
-            defer file.close();
-            const raw = try file.readToEndAlloc(alloc, 1024 * 1024);
+            const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, path_, .{});
+            defer file.close(std.Options.debug_io);
+            var read_buf: [4096]u8 = undefined;
+            var reader = file.reader(std.Options.debug_io, &read_buf);
+            const raw = try reader.interface.allocRemaining(alloc, .limited(1024 * 1024));
             defer alloc.free(raw);
 
             var lines: std.ArrayListUnmanaged([]u8) = .empty;
@@ -1331,7 +1331,7 @@ test "runtime host runs threshold compaction after successful turn when context 
             .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
         },
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
     fp.setResponses(&.{heavy_msg});
 
@@ -1441,8 +1441,8 @@ test "runtime host aborts replacement when session_before_switch is blocked" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".zi/extensions");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = ".zi/extensions/block.lua",
         .data =
         \\return function(zi)
@@ -1453,7 +1453,7 @@ test "runtime host aborts replacement when session_before_switch is blocked" {
         ,
     });
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
@@ -1476,8 +1476,8 @@ test "runtime host aborts replacement when session_before_fork is blocked" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".zi/extensions");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = ".zi/extensions/block.lua",
         .data =
         \\return function(zi)
@@ -1488,7 +1488,7 @@ test "runtime host aborts replacement when session_before_fork is blocked" {
         ,
     });
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
@@ -1511,8 +1511,8 @@ test "runtime host forkSession replaces session and skips session_before_switch"
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".zi/extensions");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = ".zi/extensions/block.lua",
         .data =
         \\return function(zi)
@@ -1523,7 +1523,7 @@ test "runtime host forkSession replaces session and skips session_before_switch"
         ,
     });
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
@@ -1546,7 +1546,7 @@ test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads"
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
     const log_path = try std.fs.path.join(allocator, &.{ cwd, "forklog.txt" });
     defer allocator.free(log_path);
@@ -1571,8 +1571,8 @@ test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads"
     , .{ log_path, log_path });
     defer allocator.free(lua_src);
 
-    try tmp.dir.makePath(".zi/extensions");
-    try tmp.dir.writeFile(.{ .sub_path = ".zi/extensions/fork-log.lua", .data = lua_src });
+    try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".zi/extensions/fork-log.lua", .data = lua_src });
 
     const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
     const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
@@ -1581,9 +1581,11 @@ test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads"
 
     try host.forkSession("entry-42");
 
-    const file = try std.fs.openFileAbsolute(log_path, .{});
-    defer file.close();
-    const raw = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, log_path, .{});
+    defer file.close(std.Options.debug_io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(std.Options.debug_io, &read_buf);
+    const raw = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     defer allocator.free(raw);
 
     var lines_out: std.ArrayListUnmanaged([]const u8) = .empty;

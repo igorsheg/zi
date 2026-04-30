@@ -14,23 +14,23 @@ pub fn notify(title: ?[]const u8, body: []const u8) void {
     const tmux = inTmux();
     const message = formatNotification(&buf, mode, tmux, title, body) catch return;
 
-    const tty = std.fs.openFileAbsolute("/dev/tty", .{ .mode = .write_only }) catch return;
-    defer tty.close();
+    const tty = std.Io.Dir.openFileAbsolute(std.Options.debug_io, "/dev/tty", .{ .mode = .write_only }) catch return;
+    defer tty.close(std.Options.debug_io);
     tty.writeAll(message) catch {};
 }
 
 fn detectMode() NotifyMode {
-    if (std.posix.getenv("KITTY_WINDOW_ID") != null) return .osc99;
-    if (std.posix.getenv("GHOSTTY_RESOURCES_DIR") != null) return .osc777;
-    if (std.posix.getenv("GHOSTTY_BIN_DIR") != null) return .osc777;
+    if (@import("env").get("KITTY_WINDOW_ID") != null) return .osc99;
+    if (@import("env").get("GHOSTTY_RESOURCES_DIR") != null) return .osc777;
+    if (@import("env").get("GHOSTTY_BIN_DIR") != null) return .osc777;
 
-    if (std.posix.getenv("TERM_PROGRAM")) |term_program| {
+    if (@import("env").get("TERM_PROGRAM")) |term_program| {
         if (std.mem.eql(u8, term_program, "ghostty")) return .osc777;
         if (std.mem.eql(u8, term_program, "WezTerm")) return .osc777;
         if (std.mem.eql(u8, term_program, "iTerm.app")) return .osc777;
     }
 
-    if (std.posix.getenv("TERM")) |term| {
+    if (@import("env").get("TERM")) |term| {
         if (std.mem.startsWith(u8, term, "foot")) return .osc777;
         if (std.mem.startsWith(u8, term, "rxvt-unicode")) return .osc777;
     }
@@ -39,7 +39,7 @@ fn detectMode() NotifyMode {
 }
 
 fn inTmux() bool {
-    return std.posix.getenv("TMUX") != null;
+    return @import("env").get("TMUX") != null;
 }
 
 fn formatNotification(

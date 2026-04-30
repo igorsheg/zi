@@ -61,7 +61,6 @@ const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("clipboard.zig");
 const agent_ui_event_mod = @import("interactive/agent_ui_event.zig");
 const clipboard_images_mod = @import("interactive/clipboard_images.zig");
-const profile_mod = @import("../debug/profile.zig");
 
 const autocomplete_mod = @import("autocomplete.zig");
 const keybindings = @import("keybindings.zig");
@@ -88,9 +87,8 @@ const ExtensionUiState = extension_ui_state_mod.ExtensionUiState;
 const session_store_mod = @import("../coding_agent/session/store.zig");
 const session_index_worker_mod = @import("session_index_worker.zig");
 const SessionStore = session_store_mod.SessionStore;
-const storage = @import("../storage.zig");
 
-const agent_mod = @import("../agent3/root.zig");
+const agent_mod = @import("../agent/root.zig");
 const coding_agent_mod = @import("../coding_agent/root.zig");
 const AgentEvent = agent_mod.protocol.AgentEvent;
 const AgentRequest = coding_agent_mod.AgentRequest;
@@ -116,7 +114,6 @@ const oauth_mod = @import("../coding_agent/auth/oauth.zig");
 const settings_manager_mod = @import("../coding_agent/settings/manager.zig");
 const ai_protocol = @import("../ai/protocol.zig");
 const ai_resolve = @import("../coding_agent/resolve.zig");
-const memory_debug = @import("../debug/tracked_allocator.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -167,6 +164,7 @@ pub const Interactive = struct {
     /// allocator-correct.
     /// See `docs/runtime.md` doctrine R3.
     msg_allocator: std.mem.Allocator,
+    io: std.Io,
     tui: TUI,
     theme_storage: theme_mod.Theme,
     theme: *const theme_mod.Theme = undefined,
@@ -282,7 +280,6 @@ pub const Interactive = struct {
     /// values; the long-lived agent thread wakes, drains, and dispatches
     /// them on the owner thread.
     request_queue: RequestQueue,
-    memory_diagnostics: *const memory_debug.Diagnostics,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
     session_event_token: ?RuntimeHost.EventSubscriptionToken = null,
     agent_thread: ?std.Thread = null,
@@ -305,18 +302,18 @@ pub const Interactive = struct {
         allocator: std.mem.Allocator,
         msg_allocator: std.mem.Allocator,
         runtime_host: RuntimeHost,
-        memory_diagnostics: *const memory_debug.Diagnostics,
         resolver: ToolRendererResolver,
         cwd: []const u8,
+        io: std.Io,
         auth_storage: *auth_storage_mod.AuthStorage,
         settings_manager: *settings_manager_mod.SettingsManager,
     ) !Interactive {
-        _ = allocator;
-        const state_allocator = memory_diagnostics.tui.allocator();
+        const state_allocator = allocator;
 
         var self: Interactive = .{
             .allocator = state_allocator,
             .msg_allocator = msg_allocator,
+            .io = io,
             .tui = try TUI.init(state_allocator),
             .theme_storage = undefined,
             .theme = undefined,
@@ -346,13 +343,12 @@ pub const Interactive = struct {
             .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
             .session_index_worker = try session_index_worker_mod.SessionIndexWorker.init(msg_allocator),
-            .memory_diagnostics = memory_diagnostics,
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
             .model_catalog = &.{},
         };
         self.ai_complete_worker = try ai_complete_worker_mod.AiCompleteWorker.init(msg_allocator);
-        self.system_worker = try system_worker_mod.SystemWorker.init(msg_allocator);
+        self.system_worker = try system_worker_mod.SystemWorker.init(msg_allocator, io);
         self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
@@ -531,7 +527,7 @@ pub const Interactive = struct {
                 self.cancelTranscriptSelection();
             }
 
-            const now_ns = std.time.nanoTimestamp();
+            const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
             if (self.tui.tickAnimations(now_ns)) {
                 self.tui.dirty = true;
             }
@@ -703,16 +699,19 @@ pub const Interactive = struct {
     }
 
     fn detectGitBranch(self: *Interactive) void {
-        const result = std.process.Child.run(.{
-            .allocator = self.allocator,
+        var child = std.process.spawn(self.io, .{
             .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-            .max_output_bytes = 256,
+            .stdout = .pipe,
+            .stderr = .ignore,
         }) catch return;
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
+        var stdout_buf: [256]u8 = undefined;
+        var stdout_reader = child.stdout.?.reader(self.io, &stdout_buf);
+        const stdout = stdout_reader.interface.allocRemaining(self.allocator, .limited(256)) catch return;
+        defer self.allocator.free(stdout);
+        const term = child.wait(self.io) catch return;
 
-        if (result.term.Exited == 0) {
-            const branch = std.mem.trimRight(u8, result.stdout, " \t\n\r");
+        if (term == .exited and term.exited == 0) {
+            const branch = std.mem.trimEnd(u8, stdout, " \t\n\r");
             if (branch.len > 0) {
                 self.active_editor.setGitBranch(branch);
             }
@@ -746,7 +745,7 @@ pub const Interactive = struct {
 
     fn waitForLoopReadiness(self: *Interactive) LoopReadiness {
         const idle_wait_timeout_ms: i32 = 50;
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
         const timeout_ms: i32 = if (self.nextLoopDeadlineNs(now_ns)) |deadline|
             if (deadline <= now_ns) 0 else @intCast(@divFloor(deadline - now_ns + 999_999, 1_000_000))
         else
@@ -780,10 +779,6 @@ pub const Interactive = struct {
     }
 
     fn renderFrame(self: *Interactive) void {
-        var frame_timer = profile_mod.ScopedTimer.begin(.tui_render_frame);
-        defer frame_timer.end();
-        defer profile_mod.maybeEmitPeriodic(120);
-
         const w = self.tui.width();
         const h = self.tui.height();
 
@@ -921,7 +916,6 @@ pub const Interactive = struct {
             .login => if (args.len > 0) self.startLogin(args) else self.showLoginPicker(),
             .settings => self.showSettingsPicker(),
             .hotkeys => self.showHotkeysOverlay(),
-            .mem => self.writeMemoryDiagnostic(),
         }
         return true;
     }
@@ -930,32 +924,6 @@ pub const Interactive = struct {
     // These know about the Interactive layout (footer height, etc).
     // Generic presets live in overlay.zig (OverlayPresets).
 
-    fn writeMemoryDiagnostic(self: *Interactive) void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const scratch = arena.allocator();
-
-        const path = self.memory_diagnostics.writeSnapshotFile(scratch, self.cwd, null) catch {
-            self.status_line.setPrimary("failed to write memory diagnostics", self.theme.fg(.@"error"));
-            return;
-        };
-
-        const agent_dir = storage.getAgentDir(scratch, null) catch null;
-        const relative_path = if (agent_dir) |dir|
-            if (std.mem.startsWith(u8, path, dir) and path.len > dir.len)
-                std.mem.trimLeft(u8, path[dir.len..], std.fs.path.sep_str)
-            else
-                null
-        else
-            null;
-
-        var status_buf: [256]u8 = undefined;
-        const msg = if (relative_path) |rel|
-            std.fmt.bufPrint(&status_buf, "wrote memory diagnostics: ~/.zi/agent/{s}", .{rel}) catch path
-        else
-            std.fmt.bufPrint(&status_buf, "wrote memory diagnostics: {s}", .{path}) catch path;
-        self.status_line.setPrimary(msg, self.theme.fg(.success));
-    }
 
     pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
         return overlay_flow.bottomSheetOptions(self);

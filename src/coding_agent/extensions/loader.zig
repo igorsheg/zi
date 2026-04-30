@@ -5,7 +5,7 @@ const lua_tool = @import("lua_tool.zig");
 const runner_mod = @import("runner.zig");
 const tool_def = @import("../tools/definition.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const ai = @import("../../ai/root.zig");
 const extension_ui = @import("ui.zig");
 const session_core = @import("../../session/root.zig");
@@ -127,7 +127,7 @@ fn loadSyntheticExtension(
     results: *std.ArrayListUnmanaged(LoadedExtension),
     seen: *SeenIds,
 ) !void {
-    std.fs.accessAbsolute(root.path, .{}) catch |err| {
+    std.Io.Dir.accessAbsolute(std.Options.debug_io, root.path, .{}) catch |err| {
         log.warn("synthetic extension path not found: {s} ({s})", .{ root.path, @errorName(err) });
         return err;
     };
@@ -159,12 +159,18 @@ fn loadSyntheticExtension(
 }
 
 fn syntheticExtensionFilePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, path, ".lua")) return std.fs.realpathAlloc(allocator, path);
+    if (std.mem.endsWith(u8, path, ".lua")) return realPathAbsoluteDupe(allocator, path);
 
     const init_path = try std.fs.path.join(allocator, &.{ path, "init.lua" });
     defer allocator.free(init_path);
-    std.fs.accessAbsolute(init_path, .{}) catch return std.fs.realpathAlloc(allocator, path);
-    return std.fs.realpathAlloc(allocator, init_path);
+    std.Io.Dir.accessAbsolute(std.Options.debug_io, init_path, .{}) catch return realPathAbsoluteDupe(allocator, path);
+    return realPathAbsoluteDupe(allocator, init_path);
+}
+
+fn realPathAbsoluteDupe(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const resolved_z = try std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, path, allocator);
+    defer allocator.free(resolved_z);
+    return allocator.dupe(u8, resolved_z);
 }
 
 fn extensionIdFromSyntheticPath(path: []const u8) []const u8 {
@@ -185,17 +191,17 @@ fn scanDirectory(
     results: *std.ArrayListUnmanaged(LoadedExtension),
     seen: *SeenIds,
 ) !void {
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return, // graceful: missing dir = no extensions
         else => {
             log.warn("failed to open extension dir {s}: {s}", .{ dir_path, @errorName(err) });
             return;
         },
     };
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.name[0] == '.') continue; // skip dotfiles
 
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
@@ -216,7 +222,7 @@ fn scanDirectory(
                 const init_path = try std.fs.path.join(allocator, &.{ full_path, "init.lua" });
                 defer allocator.free(init_path);
 
-                std.fs.accessAbsolute(init_path, .{}) catch continue; // no init.lua, skip
+                std.Io.Dir.accessAbsolute(std.Options.debug_io, init_path, .{}) catch continue; // no init.lua, skip
 
                 if (seen.contains(entry.name)) {
                     log.debug("skipping duplicate extension id in {s}: {s}", .{ @tagName(root.source), entry.name });
@@ -371,9 +377,11 @@ fn loadOne(
     runner: *runner_mod.ExtensionRunner,
     ext: LoadedExtension,
 ) !void {
-    const file = try std.fs.openFileAbsolute(ext.path, .{});
-    defer file.close();
-    const src = try file.readToEndAlloc(allocator, MAX_EXTENSION_SIZE);
+    const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, ext.path, .{});
+    defer file.close(std.Options.debug_io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    const src = try file_reader.interface.allocRemaining(allocator, .limited(MAX_EXTENSION_SIZE));
     defer allocator.free(src);
 
     const chunk_name_buf = try std.fmt.allocPrint(allocator, "@{s}", .{ext.path});
@@ -445,19 +453,19 @@ test "discover finds foo.lua and bar/init.lua in a temp dir" {
     defer tmp.cleanup();
 
     // Create extensions directory structure
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
 
     // foo.lua (single-file extension)
-    try ext_dir.writeFile(.{ .sub_path = "foo.lua", .data = "-- foo extension" });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "foo.lua", .data = "-- foo extension" });
 
     // bar/init.lua (directory extension)
-    try ext_dir.makeDir("bar");
-    var bar_dir = try ext_dir.openDir("bar", .{});
-    try bar_dir.writeFile(.{ .sub_path = "init.lua", .data = "-- bar extension" });
+    try ext_dir.createDir(std.Options.debug_io, "bar", .default_dir);
+    var bar_dir = try ext_dir.openDir(std.Options.debug_io, "bar", .{});
+    try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = "-- bar extension" });
 
     // Get absolute path to the extensions dir
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -501,7 +509,7 @@ test "discover returns empty when directories missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -528,14 +536,14 @@ test "explicit paths come first in result order" {
     defer tmp.cleanup();
 
     // Create user extensions dir with one extension
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.writeFile(.{ .sub_path = "user_ext.lua", .data = "-- user" });
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "user_ext.lua", .data = "-- user" });
 
     // Create explicit extension file
-    try tmp.dir.writeFile(.{ .sub_path = "explicit_ext.lua", .data = "-- explicit" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "explicit_ext.lua", .data = "-- explicit" });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const explicit_path = try std.fs.path.join(allocator, &.{ tmp_path, "explicit_ext.lua" });
@@ -566,12 +574,12 @@ test "discover derives synthetic bundled extension id from parent dir" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("bundle_ext");
-    var bundle_dir = try tmp.dir.openDir("bundle_ext", .{});
-    defer bundle_dir.close();
-    try bundle_dir.writeFile(.{ .sub_path = "init.lua", .data = "-- bundled" });
+    try tmp.dir.createDir(std.Options.debug_io, "bundle_ext", .default_dir);
+    var bundle_dir = try tmp.dir.openDir(std.Options.debug_io, "bundle_ext", .{});
+    defer bundle_dir.close(std.Options.debug_io);
+    try bundle_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = "-- bundled" });
 
-    const init_path = try tmp.dir.realpathAlloc(allocator, "bundle_ext/init.lua");
+    const init_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "bundle_ext/init.lua", allocator);
     defer allocator.free(init_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -595,12 +603,12 @@ test "discover loads synthetic bundled extension from directory path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("bundle_ext");
-    var bundle_dir = try tmp.dir.openDir("bundle_ext", .{});
-    defer bundle_dir.close();
-    try bundle_dir.writeFile(.{ .sub_path = "init.lua", .data = "-- bundled" });
+    try tmp.dir.createDir(std.Options.debug_io, "bundle_ext", .default_dir);
+    var bundle_dir = try tmp.dir.openDir(std.Options.debug_io, "bundle_ext", .{});
+    defer bundle_dir.close(std.Options.debug_io);
+    try bundle_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = "-- bundled" });
 
-    const bundle_path = try tmp.dir.realpathAlloc(allocator, "bundle_ext");
+    const bundle_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "bundle_ext", allocator);
     defer allocator.free(bundle_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -624,16 +632,16 @@ test "loadAll executes discovered .lua files and registrations land" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const hello_src =
         "return function(zi)\n" ++
         "  _loaded = true\n" ++
         "  zi.on(\"message_end\", function(e, ctx) end)\n" ++
         "end\n";
-    try ext_dir.writeFile(.{ .sub_path = "hello.lua", .data = hello_src });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "hello.lua", .data = hello_src });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -671,12 +679,12 @@ test "loadAll continues after a broken extension" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.writeFile(.{ .sub_path = "broken.lua", .data = "this is not valid lua !!!" });
-    try ext_dir.writeFile(.{ .sub_path = "good.lua", .data = "return function(zi) _good = 42 end" });
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "broken.lua", .data = "this is not valid lua !!!" });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "good.lua", .data = "return function(zi) _good = 42 end" });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -712,17 +720,17 @@ test "loadAll continues after a factory-time failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.writeFile(.{
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
+    try ext_dir.writeFile(std.Options.debug_io, .{
         .sub_path = "broken.lua",
         .data = "return function(zi)\n" ++
             "  error(\"factory blew up\")\n" ++
             "end\n",
     });
-    try ext_dir.writeFile(.{ .sub_path = "good.lua", .data = "return function(zi) _good = 42 end" });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "good.lua", .data = "return function(zi) _good = 42 end" });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -757,8 +765,8 @@ test "loadAll calls factory with zi and stamps source provenance" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const prov_src =
         "return function(zi)\n" ++
         "  zi.register_tool({\n" ++
@@ -771,9 +779,9 @@ test "loadAll calls factory with zi and stamps source provenance" {
         "  })\n" ++
         "  zi.on(\"message_end\", function() end)\n" ++
         "end\n";
-    try ext_dir.writeFile(.{ .sub_path = "provenance.lua", .data = prov_src });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "provenance.lua", .data = prov_src });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -824,7 +832,7 @@ test "loadAll calls factory with zi and stamps source provenance" {
 
 test "example hello extension loads and greets through the tool boundary" {
     const allocator = std.testing.allocator;
-    const hello_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/hello.lua");
+    const hello_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/hello.lua", allocator);
     defer allocator.free(hello_path);
 
     var state_owner_buf: [256]u8 = undefined;
@@ -856,9 +864,9 @@ test "example hello extension loads and greets through the tool boundary" {
     const ext_tool = runner.tool_registry.get("greet") orelse return error.MissingHelloTool;
     const tool = try lua_tool.buildAgentTool(allocator, &runner, ext_tool.*);
 
-    var args_obj = std.json.ObjectMap.init(allocator);
-    defer args_obj.deinit();
-    try args_obj.put("name", .{ .string = "zi" });
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(allocator);
+    try args_obj.put(allocator, "name", .{ .string = "zi" });
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -871,7 +879,7 @@ test "example hello extension loads and greets through the tool boundary" {
 
 test "example commands extension dispatches through host-owned command ui" {
     const allocator = std.testing.allocator;
-    const commands_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/commands.lua");
+    const commands_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/commands.lua", allocator);
     defer allocator.free(commands_path);
 
     var state_owner_buf: [256]u8 = undefined;
@@ -1019,7 +1027,7 @@ fn commandExampleAssistantMessage() ai.protocol.AssistantMessage {
 
 test "example status line extension updates status across session and turn events" {
     const allocator = std.testing.allocator;
-    const status_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/status_line.lua");
+    const status_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/status_line.lua", allocator);
     defer allocator.free(status_path);
 
     var state_owner_buf: [256]u8 = undefined;
@@ -1090,7 +1098,7 @@ test "example status line extension updates status across session and turn event
 
 test "example custom header extension publishes a semantic report" {
     const allocator = std.testing.allocator;
-    const header_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/custom_header.lua");
+    const header_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/custom_header.lua", allocator);
     defer allocator.free(header_path);
 
     var state_owner_buf: [256]u8 = undefined;
@@ -1151,7 +1159,7 @@ test "example custom header extension publishes a semantic report" {
 
 test "example widget placement extension publishes semantic status" {
     const allocator = std.testing.allocator;
-    const widget_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/widget_placement.lua");
+    const widget_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/widget_placement.lua", allocator);
     defer allocator.free(widget_path);
 
     var state_owner_buf: [256]u8 = undefined;
@@ -1211,7 +1219,7 @@ test "example widget placement extension publishes semantic status" {
 
 test "example qna extension writes a question prompt through editor actions" {
     const allocator = std.testing.allocator;
-    const qna_path = try std.fs.cwd().realpathAlloc(allocator, "examples/extensions/qna.lua");
+    const qna_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/qna.lua", allocator);
     defer allocator.free(qna_path);
 
     var state_owner_buf: [256]u8 = undefined;
@@ -1269,15 +1277,15 @@ test "loadAll stamps provenance on top-level registrations outside factory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const top_level_src =
         "zi.on(\"message_end\", function() end)\n" ++
         "return function(zi)\n" ++
         "end\n";
-    try ext_dir.writeFile(.{ .sub_path = "toplevel.lua", .data = top_level_src });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "toplevel.lua", .data = top_level_src });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -1317,17 +1325,17 @@ test "flat extension requires private helper resolved from synthetic module root
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.makeDir("foo");
-    var foo_dir = try ext_dir.openDir("foo", .{});
-    try foo_dir.writeFile(.{ .sub_path = "helper.lua", .data = "_helper_loaded = true\n" });
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
+    try ext_dir.createDir(std.Options.debug_io, "foo", .default_dir);
+    var foo_dir = try ext_dir.openDir(std.Options.debug_io, "foo", .{});
+    try foo_dir.writeFile(std.Options.debug_io, .{ .sub_path = "helper.lua", .data = "_helper_loaded = true\n" });
     const ext_src =
         "require(\"helper\")\n" ++
         "return function(zi) end\n";
-    try ext_dir.writeFile(.{ .sub_path = "foo.lua", .data = ext_src });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "foo.lua", .data = ext_src });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -1360,17 +1368,17 @@ test "bundled extension requires private helper resolved from directory module r
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.makeDir("bar");
-    var bar_dir = try ext_dir.openDir("bar", .{});
-    try bar_dir.writeFile(.{ .sub_path = "helper.lua", .data = "_bar_helper_loaded = true\n" });
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
+    try ext_dir.createDir(std.Options.debug_io, "bar", .default_dir);
+    var bar_dir = try ext_dir.openDir(std.Options.debug_io, "bar", .{});
+    try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "helper.lua", .data = "_bar_helper_loaded = true\n" });
     const ext_src =
         "require(\"helper\")\n" ++
         "return function(zi) end\n";
-    try bar_dir.writeFile(.{ .sub_path = "init.lua", .data = ext_src });
+    try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = ext_src });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -1403,19 +1411,19 @@ test "shared lua root resolves before later root in canonical order" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const ext_src =
         "local s = require(\"shared_helper\")\n" ++
         "_shared_value = s\n" ++
         "return function(zi) end\n";
-    try ext_dir.writeFile(.{ .sub_path = "ext.lua", .data = ext_src });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "ext.lua", .data = ext_src });
 
-    try tmp.dir.makeDir("lua");
-    var lua_dir = try tmp.dir.openDir("lua", .{});
-    try lua_dir.writeFile(.{ .sub_path = "shared_helper.lua", .data = "return 'first'\n" });
+    try tmp.dir.createDir(std.Options.debug_io, "lua", .default_dir);
+    var lua_dir = try tmp.dir.openDir(std.Options.debug_io, "lua", .{});
+    try lua_dir.writeFile(std.Options.debug_io, .{ .sub_path = "shared_helper.lua", .data = "return 'first'\n" });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -1440,7 +1448,7 @@ test "shared lua root resolves before later root in canonical order" {
     defer allocator.free(shared_path);
     var shared_buf: std.ArrayList(u8) = .empty;
     defer shared_buf.deinit(allocator);
-    try shared_buf.writer(allocator).print("{s}/?.lua;{s}/?/init.lua", .{ shared_path, shared_path });
+    try shared_buf.print(allocator, "{s}/?.lua;{s}/?/init.lua", .{ shared_path, shared_path });
     runner.shared_lua_paths = try allocator.dupe(u8, shared_buf.items);
 
     api.installZiTable(&state, &runner);
@@ -1457,19 +1465,19 @@ test "event handler dispatch inherits extension module context for require" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
-    try ext_dir.makeDir("evt");
-    var evt_dir = try ext_dir.openDir("evt", .{});
-    try evt_dir.writeFile(.{ .sub_path = "helper.lua", .data = "_evt_helper_loaded = true\n" });
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
+    try ext_dir.createDir(std.Options.debug_io, "evt", .default_dir);
+    var evt_dir = try ext_dir.openDir(std.Options.debug_io, "evt", .{});
+    try evt_dir.writeFile(std.Options.debug_io, .{ .sub_path = "helper.lua", .data = "_evt_helper_loaded = true\n" });
     const ext_src =
         "zi.on(\"message_end\", function(event, ctx)\n" ++
         "  require(\"helper\")\n" ++
         "end)\n" ++
         "return function(zi) end\n";
-    try evt_dir.writeFile(.{ .sub_path = "init.lua", .data = ext_src });
+    try evt_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = ext_src });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -1508,14 +1516,14 @@ test "event handler dispatch inherits extension module context for require" {
 test "builtin tools register with builtin source through extension loader" {
     const allocator = std.testing.allocator;
 
-    const params = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    const params = std.json.Value{ .object = .{} };
     const builtin_defs = try allocator.alloc(tool_def.ToolDefinition, 1);
     defer {
         allocator.free(builtin_defs[0].name);
         allocator.free(builtin_defs[0].label);
         allocator.free(builtin_defs[0].description);
         var p = builtin_defs[0].parameters.object;
-        p.deinit();
+        p.deinit(allocator);
         allocator.free(builtin_defs);
     }
     builtin_defs[0] = .{
@@ -1570,8 +1578,8 @@ test "user extension wins precedence over builtin with same name" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("extensions");
-    var ext_dir = try tmp.dir.openDir("extensions", .{});
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const user_src =
         "return function(zi)\n" ++
         "  zi.register_tool({\n" ++
@@ -1583,9 +1591,9 @@ test "user extension wins precedence over builtin with same name" {
         "    end,\n" ++
         "  })\n" ++
         "end\n";
-    try ext_dir.writeFile(.{ .sub_path = "bash.lua", .data = user_src });
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "bash.lua", .data = user_src });
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     const roots = [_]StaticExtensionRoot{.{
@@ -1598,14 +1606,14 @@ test "user extension wins precedence over builtin with same name" {
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
-    const params = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    const params = std.json.Value{ .object = .{} };
     const builtin_defs = try allocator.alloc(tool_def.ToolDefinition, 1);
     defer {
         allocator.free(builtin_defs[0].name);
         allocator.free(builtin_defs[0].label);
         allocator.free(builtin_defs[0].description);
         var p = builtin_defs[0].parameters.object;
-        p.deinit();
+        p.deinit(allocator);
         allocator.free(builtin_defs);
     }
     builtin_defs[0] = .{

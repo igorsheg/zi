@@ -57,7 +57,7 @@ pub const InputBuffer = struct {
         ctx: *anyopaque,
     ) void {
         if (self.flush_deadline_ns) |deadline| {
-            if (std.time.nanoTimestamp() >= deadline) {
+            if (@as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) >= deadline) {
                 self.flush_deadline_ns = null;
                 if (self.buf.items.len > 0) {
                     self.flushRaw(on_seq, ctx);
@@ -115,7 +115,7 @@ pub const InputBuffer = struct {
             // Partial paste start — could be split. Hold for more data.
             if (self.buf.items[0] == 0x1b and self.buf.items.len < 6) {
                 if (std.mem.startsWith(u8, "\x1b[200~", self.buf.items)) {
-                    self.flush_deadline_ns = std.time.nanoTimestamp() + self.timeout_ns;
+                    self.flush_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + self.timeout_ns;
                     return;
                 }
             }
@@ -130,7 +130,7 @@ pub const InputBuffer = struct {
                     },
                     .incomplete => {
                         // Wait for more data or timeout
-                        self.flush_deadline_ns = std.time.nanoTimestamp() + self.timeout_ns;
+                        self.flush_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + self.timeout_ns;
                         return;
                     },
                 }

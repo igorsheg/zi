@@ -2,12 +2,12 @@ const std = @import("std");
 const ai_resolve = @import("../../coding_agent/resolve.zig");
 const json_util = @import("../../ai/json_util.zig");
 const coding_agent_mod = @import("../../coding_agent/root.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const thinking_mod = @import("thinking.zig");
 
 pub fn handleSetModel(self: anytype, m: anytype) void {
     switch (self.runtime_host.currentSession().trySetModel(m)) {
-        .success => |_| {
+        .success => {
             self.publishStatusSnapshot();
             const model_id = self.msg_allocator.dupe(u8, m.id) catch return;
             _ = self.publishLifecycleUiEvent(.{ .model_switched = .{ .model_id = model_id } });

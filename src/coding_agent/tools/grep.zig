@@ -9,7 +9,7 @@
 //! - `literal: true` for fixed-string mode; otherwise rust-flavored regex
 
 const std = @import("std");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 
@@ -106,31 +106,29 @@ fn execute(
     argv.append(allocator, pattern) catch return util.errorResult(allocator, "alloc failed");
     argv.append(allocator, search_path) catch return util.errorResult(allocator, "alloc failed");
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    var child = std.process.spawn(ctx.io, .{
         .argv = argv.items,
-        .max_output_bytes = 8 * 1024 * 1024,
+        .stdout = .pipe,
+        .stderr = .ignore,
     }) catch |err|
         return util.errorf(allocator, "grep error: {s}", .{@errorName(err)});
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(ctx.io, &stdout_buf);
+    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024)) catch |err|
+        return util.errorf(allocator, "grep read error: {s}", .{@errorName(err)});
+    defer allocator.free(stdout);
+    const term = child.wait(ctx.io) catch return util.errorResult(allocator, "grep wait failed");
 
-    const exited_code: u8 = switch (result.term) {
-        .Exited => |c| c,
+    const exited_code: u8 = switch (term) {
+        .exited => |c| c,
         else => 2,
     };
     // rg exits 1 on no matches, 0 on matches, 2+ on error.
     if (exited_code != 0 and exited_code != 1) {
-        const stderr_trimmed = std.mem.trim(u8, result.stderr, " \t\n\r");
-        if (stderr_trimmed.len > 0) {
-            const msg = allocator.dupe(u8, stderr_trimmed) catch
-                return util.errorResult(allocator, "grep failed");
-            return util.errorResult(allocator, msg);
-        }
         return util.errorf(allocator, "ripgrep exited with code {d}", .{exited_code});
     }
 
-    return parseRgJson(allocator, result.stdout, search_path);
+    return parseRgJson(allocator, stdout, search_path);
 }
 
 const RgEvent = struct {
@@ -196,7 +194,7 @@ fn parseRgJson(
             .string => |s| s,
             else => continue,
         };
-        const text_trimmed = std.mem.trimRight(u8, text_str, "\r\n");
+        const text_trimmed = std.mem.trimEnd(u8, text_str, "\r\n");
 
         events.append(allocator, .{
             .kind = kind,
@@ -245,7 +243,7 @@ fn parseRgJson(
                 allocator.free(buf);
                 current_display_owned = null;
             }
-            const rel = std.fs.path.relative(allocator, base_path, ev.file_path) catch null;
+            const rel = std.fs.path.relative(allocator, base_path, null, base_path, ev.file_path) catch null;
             if (rel) |r| {
                 if (r.len > 0 and !std.mem.startsWith(u8, r, "..")) {
                     current_display = r;

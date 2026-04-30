@@ -166,7 +166,7 @@ fn buildCodexRequestJson(
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
 ) anyerror!void {
-    var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
@@ -477,8 +477,8 @@ test "buildCodexRequestJson writes codex tool strict null and temperature" {
         .context_window = 128000,
         .max_tokens = 4096,
     };
-    var params = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer params.object.deinit();
+    var params = std.json.Value{ .object = .{} };
+    defer params.object.deinit(alloc);
     const tool = protocol.Tool{
         .name = "bash",
         .description = "run shell",

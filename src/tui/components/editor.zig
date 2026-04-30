@@ -819,7 +819,7 @@ pub const Editor = struct {
         var pos: usize = 0;
 
         if (self.cwd.len > 0) {
-            const home = std.posix.getenv("HOME") orelse "";
+            const home = @import("env").get("HOME") orelse "";
             if (home.len > 0 and std.mem.startsWith(u8, self.cwd, home)) {
                 if (pos + 1 < buf.len) {
                     buf[pos] = '~';

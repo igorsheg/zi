@@ -195,13 +195,11 @@ fn appendGrapheme(self: *Renderer, grapheme: cell_mod.Grapheme, pool: *const buf
 }
 
 fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
-    var written: usize = 0;
-    while (written < data.len) {
-        written += std.posix.write(fd, data[written..]) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return,
-        };
-    }
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(std.Options.debug_io, &buf);
+    writer.interface.writeAll(data) catch return;
+    writer.interface.flush() catch {};
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -212,6 +210,12 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
         start = idx + needle.len;
     }
     return count;
+}
+
+fn testPipe() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.Unexpected;
+    return fds;
 }
 
 test "Renderer init and deinit" {
@@ -235,9 +239,9 @@ test "Renderer begin returns cleared buffer region" {
 }
 
 test "Renderer diff produces output for changed cells" {
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    const pipe = try testPipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 5, 1);
     defer r.deinit();
@@ -256,9 +260,9 @@ test "Renderer diff produces output for changed cells" {
 }
 
 test "Renderer emits one cursor move for a contiguous changed run" {
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    const pipe = try testPipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
     defer r.deinit();
@@ -277,9 +281,9 @@ test "Renderer emits one cursor move for a contiguous changed run" {
 }
 
 test "Renderer emits separate cursor moves for separated changed runs" {
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    const pipe = try testPipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
     defer r.deinit();
@@ -306,9 +310,9 @@ test "Renderer emits separate cursor moves for separated changed runs" {
 }
 
 test "Renderer skips unchanged cells" {
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    const pipe = try testPipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 5, 1);
     defer r.deinit();
@@ -333,9 +337,9 @@ test "Renderer skips unchanged cells" {
 }
 
 test "multi-frame render emits clearing output for deleted characters" {
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    const pipe = try testPipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
 
     var r = try Renderer.init(std.testing.allocator, pipe[1], 10, 1);
     defer r.deinit();

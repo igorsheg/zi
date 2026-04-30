@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const extension_runner_mod = @import("../extensions/runner.zig");
 const runtime_models = @import("runtime_models.zig");
 const runtime_state = @import("runtime_state.zig");

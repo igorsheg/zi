@@ -52,7 +52,7 @@ pub fn fauxAssistantMessage(
         .model = FAUX_MODEL_ID,
         .usage = DEFAULT_USAGE,
         .stop_reason = stop_reason,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
 }
 
@@ -122,7 +122,7 @@ pub const FauxProvider = struct {
                 .usage = DEFAULT_USAGE,
                 .stop_reason = .@"error",
                 .error_message = "No more faux responses queued",
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             };
             callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
             return;
@@ -131,7 +131,7 @@ pub const FauxProvider = struct {
         const message = self.responses.orderedRemove(0);
 
         // Build a growing content slice for the partial message.
-        var partial_content = std.ArrayListUnmanaged(protocol.AssistantMessage.AssistantContentBlock){};
+        var partial_content = std.ArrayListUnmanaged(protocol.AssistantMessage.AssistantContentBlock).empty;
         defer partial_content.deinit(allocator);
 
         var partial: protocol.AssistantMessage = .{

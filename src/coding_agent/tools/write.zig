@@ -6,7 +6,7 @@
 //! - file-tracker change record for undo_edit (undo tool not yet ported)
 
 const std = @import("std");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const lock_registry = @import("lock_registry.zig");
@@ -65,20 +65,24 @@ fn execute(
 
     // Detect new vs overwrite for the result message.
     var is_new = false;
-    std.fs.cwd().access(resolved, .{}) catch {
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved, .{}) catch {
         is_new = true;
     };
 
     // mkdir -p on the parent directory.
     if (std.fs.path.dirname(resolved)) |parent| {
-        std.fs.cwd().makePath(parent) catch |err|
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, parent) catch |err|
             return util.errorf(allocator, "write tool: failed to create parent dir: {s}", .{@errorName(err)});
     }
 
-    const file = std.fs.cwd().createFile(resolved, .{ .truncate = true }) catch |err|
+    const file = std.Io.Dir.cwd().createFile(std.Options.debug_io, resolved, .{ .truncate = true }) catch |err|
         return util.errorf(allocator, "write tool: failed to create file: {s}", .{@errorName(err)});
-    defer file.close();
-    file.writeAll(content) catch |err|
+    defer file.close(std.Options.debug_io);
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(std.Options.debug_io, &write_buf);
+    file_writer.interface.writeAll(content) catch |err|
+        return util.errorf(allocator, "write tool: failed to write: {s}", .{@errorName(err)});
+    file_writer.interface.flush() catch |err|
         return util.errorf(allocator, "write tool: failed to write: {s}", .{@errorName(err)});
 
     var line_count: usize = 1;

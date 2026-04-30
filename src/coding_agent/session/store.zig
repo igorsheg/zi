@@ -5,7 +5,7 @@ const reader_mod = @import("reader.zig");
 const context_mod = @import("../../session/context.zig");
 const context_usage = @import("../../session/context_usage.zig");
 const storage = @import("../../storage.zig");
-const agent_mod = @import("../../agent3/root.zig");
+const agent_mod = @import("../../agent/root.zig");
 
 /// Metadata about a session file, for listing.
 pub const SessionInfo = struct {
@@ -436,28 +436,28 @@ pub fn findMostRecentSession(allocator: std.mem.Allocator, cwd: []const u8) !?[]
 
 /// Find the most recent valid session in a specific directory.
 pub fn findMostRecentSessionInDir(allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var best_path: ?[]const u8 = null;
-    var best_mtime: i128 = 0;
+    var best_mtime: std.Io.Timestamp = .zero;
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
 
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
 
         if (isValidSessionFile(full_path)) {
-            const stat = dir.statFile(entry.name) catch {
+            const stat = dir.statFile(std.Options.debug_io, entry.name, .{}) catch {
                 allocator.free(full_path);
                 continue;
             };
-            if (best_path == null or stat.mtime > best_mtime) {
+            if (best_path == null or stat.mtime.toNanoseconds() > best_mtime.toNanoseconds()) {
                 if (best_path) |old| allocator.free(old);
                 best_path = full_path;
                 best_mtime = stat.mtime;
@@ -475,15 +475,17 @@ pub fn findMostRecentSessionInDir(allocator: std.mem.Allocator, dir_path: []cons
 /// Check if a file starts with a valid session header.
 /// Reads only the first line (up to 4KB) to minimize I/O.
 fn isValidSessionFile(path: []const u8) bool {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{}) catch return false;
+    defer file.close(std.Options.debug_io);
 
     var buf: [4096]u8 = undefined;
-    const n = file.read(&buf) catch return false;
-    if (n == 0) return false;
+    var file_reader = file.reader(std.Options.debug_io, &buf);
+    const first_chunk = file_reader.interface.allocRemaining(std.heap.smp_allocator, .limited(buf.len)) catch return false;
+    defer std.heap.smp_allocator.free(first_chunk);
+    if (first_chunk.len == 0) return false;
 
-    const first_line_end = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
-    const first_line = buf[0..first_line_end];
+    const first_line_end = std.mem.indexOfScalar(u8, first_chunk, '\n') orelse first_chunk.len;
+    const first_line = first_chunk[0..first_line_end];
 
     // Tiny parse helper allocation, freed immediately after header validation.
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, first_line, .{
@@ -511,27 +513,27 @@ pub fn listSessions(allocator: std.mem.Allocator, cwd: []const u8) ![]SessionInf
 /// List all valid sessions in a specific directory.
 /// Returns metadata sorted by most recent first.
 pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) ![]SessionInfo {
-    var dir = std.fs.openDirAbsolute(session_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, session_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var results: std.ArrayListUnmanaged(SessionInfo) = .empty;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
 
         const full_path = try std.fs.path.join(allocator, &.{ session_dir, entry.name });
-        const stat = dir.statFile(entry.name) catch {
+        const stat = dir.statFile(std.Options.debug_io, entry.name, .{}) catch {
             allocator.free(full_path);
             continue;
         };
 
         if (scanSessionFile(allocator, full_path)) |info| {
             var session = info;
-            session.modified_at = stat.mtime;
+            session.modified_at = stat.mtime.toNanoseconds();
             try results.append(allocator, session);
         } else {
             allocator.free(full_path);
@@ -560,7 +562,7 @@ pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) 
 /// Read a session file and extract listing metadata.
 /// Reads the full file but only JSON-parses the header and first user message.
 fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo {
-    const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return null;
+    const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(10 * 1024 * 1024)) catch return null;
     defer allocator.free(content);
 
     var session_id: ?[]const u8 = null;
@@ -734,7 +736,7 @@ test "current visible branch includes buffered session metadata before flush" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const session_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(session_dir);
 
     var store = SessionStore.create(std.testing.allocator, session_dir, "/tmp/project");
@@ -754,7 +756,7 @@ test "listSessionsInDir returns empty slice for empty directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const session_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(session_dir);
 
     const sessions = try listSessionsInDir(std.testing.allocator, session_dir);
@@ -767,7 +769,7 @@ test "openForResume returns resume context and transfers store ownership" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "session.jsonl",
         .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
             "{\"type\":\"model_change\",\"id\":\"m0\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:00Z\",\"provider\":\"anthropic\",\"modelId\":\"claude\"}\n" ++
@@ -775,7 +777,7 @@ test "openForResume returns resume context and transfers store ownership" {
             "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":\"t0\",\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
     });
 
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session.jsonl");
+    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     var opened = try SessionStore.openForResume(std.testing.allocator, path);
@@ -822,8 +824,8 @@ test "applyCompaction preserves artifact fields and rebuilds current context" {
     _ = store.appendMessage(testUserMessage("first", 1));
     _ = store.appendMessage(testUserMessage("second", 2));
 
-    var details_obj: std.json.ObjectMap = .init(allocator);
-    try details_obj.put("artifact", .{ .string = "file-index" });
+    var details_obj: std.json.ObjectMap = .{};
+    try details_obj.put(allocator, "artifact", .{ .string = "file-index" });
 
     const first_kept_id = store.currentEntryId().?;
     const rebuilt = try store.applyCompaction("summary", first_kept_id, 42, .{ .object = details_obj }, true);
@@ -873,13 +875,13 @@ test "open duplicates writer session and leaf ids from cached session data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "session.jsonl",
         .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
             "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
     });
 
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session.jsonl");
+    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     var store = try SessionStore.open(std.testing.allocator, path);
@@ -901,13 +903,13 @@ test "cache invalidation works when store uses arena allocator" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "session.jsonl",
         .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
             "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
     });
 
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session.jsonl");
+    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

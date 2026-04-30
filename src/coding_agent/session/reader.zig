@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const agent = @import("../../agent3/root.zig");
+const agent = @import("../../agent/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
 
@@ -46,7 +46,7 @@ pub fn parseSessionContent(allocator: std.mem.Allocator, content: []const u8) !S
     if (header == null) {
         return .{ .header = null, .entries = &.{} };
     }
-    return .{ .header = header, .entries = entries.items };
+    return .{ .header = header, .entries = try entries.toOwnedSlice(allocator) };
 }
 
 fn parseLine(
@@ -64,9 +64,11 @@ fn parseLine(
 
 /// Read and parse a session file from disk.
 pub fn readSessionFile(allocator: std.mem.Allocator, path: []const u8) !SessionData {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 100 * 1024 * 1024); // 100MB max
+    const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{});
+    defer file.close(std.Options.debug_io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(100 * 1024 * 1024)); // 100MB max
     defer allocator.free(content);
     return parseSessionContent(allocator, content);
 }
@@ -317,13 +319,13 @@ test "readSessionFile frees raw file buffer after parse" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "session.jsonl",
         .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
             "{\"type\":\"message\",\"id\":\"1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
     });
 
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "session.jsonl");
+    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     var data = try readSessionFile(std.testing.allocator, path);

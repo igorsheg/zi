@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const diff_mod = @import("../../lib/diff.zig");
@@ -111,16 +111,16 @@ fn prepareArguments(allocator: std.mem.Allocator, args: std.json.Value) !std.jso
         }
     } else std.json.Array.init(allocator);
 
-    var folded_edit = std.json.ObjectMap.init(allocator);
-    errdefer folded_edit.deinit();
-    try folded_edit.put(try allocator.dupe(u8, "old_str"), .{ .string = try allocator.dupe(u8, old_str) });
-    try folded_edit.put(try allocator.dupe(u8, "new_str"), .{ .string = try allocator.dupe(u8, new_str) });
+    var folded_edit: std.json.ObjectMap = .{};
+    errdefer folded_edit.deinit(allocator);
+    try folded_edit.put(allocator, try allocator.dupe(u8, "old_str"), .{ .string = try allocator.dupe(u8, old_str) });
+    try folded_edit.put(allocator, try allocator.dupe(u8, "new_str"), .{ .string = try allocator.dupe(u8, new_str) });
     if (top_level_replace_all) |replace_all| {
-        try folded_edit.put(try allocator.dupe(u8, "replace_all"), .{ .bool = replace_all });
+        try folded_edit.put(allocator, try allocator.dupe(u8, "replace_all"), .{ .bool = replace_all });
     }
     try edits_array.append(.{ .object = folded_edit });
 
-    try normalized_obj.put(try allocator.dupe(u8, "edits"), .{ .array = edits_array });
+    try normalized_obj.put(allocator, try allocator.dupe(u8, "edits"), .{ .array = edits_array });
     if (normalized_obj.fetchSwapRemove("old_str")) |kv| {
         allocator.free(kv.key);
         json_value.freeJsonValue(allocator, kv.value);
@@ -224,24 +224,26 @@ fn execute(
     defer allocator.free(io_path);
 
     // Read file.
-    const file = std.fs.cwd().openFile(io_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, io_path, .{}) catch |err| {
         if (err == error.FileNotFound)
             return util.errorf(allocator, "file not found: {s}", .{resolved});
         return util.errorf(allocator, "edit tool: open failed: {s}", .{@errorName(err)});
     };
-    const stat = file.stat() catch {
-        file.close();
+    const stat = file.stat(std.Options.debug_io) catch {
+        file.close(std.Options.debug_io);
         return util.errorResult(allocator, "edit tool: stat failed");
     };
     if (stat.kind == .directory) {
-        file.close();
+        file.close(std.Options.debug_io);
         return util.errorf(allocator, "{s} is a directory, not a file.", .{resolved});
     }
-    const raw = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch {
-        file.close();
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    const raw = file_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024)) catch {
+        file.close(std.Options.debug_io);
         return util.errorResult(allocator, "edit tool: read failed");
     };
-    file.close();
+    file.close(std.Options.debug_io);
     defer allocator.free(raw);
 
     const ending = detectLineEnding(raw);
@@ -272,7 +274,7 @@ fn execute(
         allocator.dupe(u8, new_content) catch return util.errorResult(allocator, "alloc failed");
     defer allocator.free(final_bytes);
 
-    atomicWriteFile(io_path, final_bytes, stat.mode) catch
+    atomicWriteFile(io_path, final_bytes, stat.permissions) catch
         return util.errorResult(allocator, "edit tool: write failed");
 
     const inputs = [_]diff_mod.Input{.{
@@ -352,18 +354,16 @@ fn restoreCrlf(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out[0..n];
 }
 
-fn atomicWriteFile(path: []const u8, bytes: []const u8, mode: std.fs.File.Mode) !void {
-    var write_buffer: [4096]u8 = undefined;
-    var atomic_file = try std.fs.cwd().atomicFile(path, .{ .mode = mode, .write_buffer = &write_buffer });
-    defer atomic_file.deinit();
+fn atomicWriteFile(path: []const u8, bytes: []const u8, permissions: std.Io.File.Permissions) !void {
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(std.Options.debug_io, path, .{ .permissions = permissions, .replace = true });
+    defer atomic_file.deinit(std.Options.debug_io);
 
-    if (comptime builtin.os.tag != .windows) {
-        try atomic_file.file_writer.file.chmod(mode);
-    }
-    try atomic_file.file_writer.interface.writeAll(bytes);
-    try atomic_file.flush();
-    try atomic_file.file_writer.file.sync();
-    try atomic_file.renameIntoPlace();
+    var write_buffer: [4096]u8 = undefined;
+    var file_writer = atomic_file.file.writer(std.Options.debug_io, &write_buffer);
+    try file_writer.interface.writeAll(bytes);
+    try file_writer.interface.flush();
+    try atomic_file.file.sync(std.Options.debug_io);
+    try atomic_file.replace(std.Options.debug_io);
 }
 
 // ── tier-3 fuzzy normalization ──────────────────────────────────────
@@ -447,7 +447,7 @@ fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     while (k <= out.items.len) : (k += 1) {
         if (k == out.items.len or out.items[k] == '\n') {
             const line = out.items[line_start..k];
-            const t = std.mem.trimRight(u8, line, " \t");
+            const t = std.mem.trimEnd(u8, line, " \t");
             try trimmed.appendSlice(allocator, t);
             if (k < out.items.len) try trimmed.append(allocator, '\n');
             line_start = k + 1;
@@ -967,32 +967,39 @@ test "atomic write preserves mode and replaces hardlink identity" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile("target.txt", .{});
-    try file.writeAll("before\n");
-    try file.chmod(0o640);
-    file.close();
+    const file = try tmp.dir.createFile(std.Options.debug_io, "target.txt", .{});
+    var write_buf: [64]u8 = undefined;
+    var writer = file.writer(std.Options.debug_io, &write_buf);
+    try writer.interface.writeAll("before\n");
+    try writer.interface.flush();
+    try file.setPermissions(std.Options.debug_io, .fromMode(0o640));
+    file.close(std.Options.debug_io);
 
-    const target_path = try tmp.dir.realpathAlloc(testing.allocator, "target.txt");
+    const target_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "target.txt", testing.allocator);
     defer testing.allocator.free(target_path);
     const link_path = try std.fs.path.join(testing.allocator, &.{ std.fs.path.dirname(target_path).?, "linked.txt" });
     defer testing.allocator.free(link_path);
-    try std.posix.link(target_path, link_path);
+    const target_z = try testing.allocator.dupeZ(u8, target_path);
+    defer testing.allocator.free(target_z);
+    const link_z = try testing.allocator.dupeZ(u8, link_path);
+    defer testing.allocator.free(link_z);
+    if (std.c.link(target_z, link_z) != 0) return error.Unexpected;
 
-    const before_target = try tmp.dir.statFile("target.txt");
-    const before_link = try tmp.dir.statFile("linked.txt");
+    const before_target = try tmp.dir.statFile(std.Options.debug_io, "target.txt", .{});
+    const before_link = try tmp.dir.statFile(std.Options.debug_io, "linked.txt", .{});
     try testing.expectEqual(before_target.inode, before_link.inode);
 
-    try atomicWriteFile(target_path, "after\n", before_target.mode);
+    try atomicWriteFile(target_path, "after\n", before_target.permissions);
 
-    const after_target = try tmp.dir.statFile("target.txt");
-    const after_link = try tmp.dir.statFile("linked.txt");
+    const after_target = try tmp.dir.statFile(std.Options.debug_io, "target.txt", .{});
+    const after_link = try tmp.dir.statFile(std.Options.debug_io, "linked.txt", .{});
     try testing.expect(after_target.inode != before_target.inode);
     try testing.expectEqual(before_link.inode, after_link.inode);
-    try testing.expectEqual(before_target.mode, after_target.mode);
+    try testing.expectEqual(before_target.permissions, after_target.permissions);
 
-    const target_contents = try tmp.dir.readFileAlloc(testing.allocator, "target.txt", 1024);
+    const target_contents = try tmp.dir.readFileAlloc(std.Options.debug_io, "target.txt", testing.allocator, .limited(1024));
     defer testing.allocator.free(target_contents);
-    const link_contents = try tmp.dir.readFileAlloc(testing.allocator, "linked.txt", 1024);
+    const link_contents = try tmp.dir.readFileAlloc(std.Options.debug_io, "linked.txt", testing.allocator, .limited(1024));
     defer testing.allocator.free(link_contents);
     try testing.expectEqualStrings("after\n", target_contents);
     try testing.expectEqualStrings("before\n", link_contents);
@@ -1003,27 +1010,27 @@ test "execute returns unified diff content with structured diff details" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Options.debug_io, .{
         .sub_path = "note.txt",
         .data = "one\ntwo\nthree\n",
     });
 
-    const abs_path = try tmp.dir.realpathAlloc(testing.allocator, "note.txt");
+    const abs_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "note.txt", testing.allocator);
     defer testing.allocator.free(abs_path);
 
-    var edit_obj = std.json.ObjectMap.init(testing.allocator);
+    var edit_obj: std.json.ObjectMap = .{};
     errdefer json_value.freeJsonValue(testing.allocator, .{ .object = edit_obj });
-    try edit_obj.put(try testing.allocator.dupe(u8, "old_str"), .{ .string = try testing.allocator.dupe(u8, "two\n") });
-    try edit_obj.put(try testing.allocator.dupe(u8, "new_str"), .{ .string = try testing.allocator.dupe(u8, "TWO\n") });
+    try edit_obj.put(testing.allocator, try testing.allocator.dupe(u8, "old_str"), .{ .string = try testing.allocator.dupe(u8, "two\n") });
+    try edit_obj.put(testing.allocator, try testing.allocator.dupe(u8, "new_str"), .{ .string = try testing.allocator.dupe(u8, "TWO\n") });
 
     var edits_arr = std.json.Array.init(testing.allocator);
     errdefer json_value.freeJsonValue(testing.allocator, .{ .array = edits_arr });
     try edits_arr.append(.{ .object = edit_obj });
 
-    var args_obj = std.json.ObjectMap.init(testing.allocator);
+    var args_obj: std.json.ObjectMap = .{};
     errdefer json_value.freeJsonValue(testing.allocator, .{ .object = args_obj });
-    try args_obj.put(try testing.allocator.dupe(u8, "path"), .{ .string = try testing.allocator.dupe(u8, abs_path) });
-    try args_obj.put(try testing.allocator.dupe(u8, "edits"), .{ .array = edits_arr });
+    try args_obj.put(testing.allocator, try testing.allocator.dupe(u8, "path"), .{ .string = try testing.allocator.dupe(u8, abs_path) });
+    try args_obj.put(testing.allocator, try testing.allocator.dupe(u8, "edits"), .{ .array = edits_arr });
     const args: std.json.Value = .{ .object = args_obj };
     defer json_value.freeJsonValue(testing.allocator, args);
 
@@ -1056,7 +1063,7 @@ test "execute returns unified diff content with structured diff details" {
     try testing.expectEqual(@as(i64, 1), diff_details.object.get("stats").?.object.get("added").?.integer);
     try testing.expectEqual(@as(i64, 1), diff_details.object.get("stats").?.object.get("removed").?.integer);
 
-    const final_contents = try tmp.dir.readFileAlloc(testing.allocator, "note.txt", 1024);
+    const final_contents = try tmp.dir.readFileAlloc(std.Options.debug_io, "note.txt", testing.allocator, .limited(1024));
     defer testing.allocator.free(final_contents);
     try testing.expectEqualStrings("one\nTWO\nthree\n", final_contents);
 }

@@ -27,7 +27,7 @@ pub fn process(self: *Interactive) bool {
 
 pub fn finishKittyNegotiationIfDue(self: *Interactive) void {
     if (self.kitty_deadline_ns) |deadline| {
-        if (@import("std").time.nanoTimestamp() >= deadline) {
+        if (@as(i128, @intCast(@import("std").Io.Timestamp.now(@import("std").Options.debug_io, .awake).toNanoseconds())) >= deadline) {
             self.tui.terminal.enableModifyOtherKeys();
             self.kitty_deadline_ns = null;
             if (self.input.buf.items.len > 0) {

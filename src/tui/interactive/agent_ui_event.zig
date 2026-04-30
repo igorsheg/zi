@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const agent_mod = @import("../../agent3/root.zig");
+const agent_mod = @import("../../agent/root.zig");
 const ai_protocol = @import("../../ai/protocol.zig");
 const string_util = @import("../../lib/string_util.zig");
 const ui_event_mod = @import("../ui_event.zig");

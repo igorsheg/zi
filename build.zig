@@ -67,17 +67,19 @@ pub fn build(b: *std.Build) void {
         "-DLUA_USE_DLOPEN",
         "-fno-sanitize=undefined",
     };
-    lua_lib.addCSourceFiles(.{
+    lua_lib.root_module.addCSourceFiles(.{
         .root = lua_dep.path("."),
         .files = &lua_c_sources,
         .flags = &lua_cflags,
     });
-    lua_lib.addIncludePath(lua_dep.path("src"));
+    lua_lib.root_module.addIncludePath(lua_dep.path("src"));
     lua_lib.installHeadersDirectory(lua_dep.path("src"), "", .{
         .include_extensions = &.{".h"},
     });
 
     // Expose Lua headers to zig code via `@cImport` in src/extensions/lua_runtime.zig.
+    const env_mod = b.createModule(.{ .root_source_file = b.path("src/env.zig") });
+    exe_mod.addImport("env", env_mod);
     exe_mod.addIncludePath(lua_dep.path("src"));
     exe_mod.linkLibrary(lua_lib);
 
@@ -99,6 +101,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
+    test_mod.addImport("env", env_mod);
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);
     const tests = b.addTest(.{ .root_module = test_mod });

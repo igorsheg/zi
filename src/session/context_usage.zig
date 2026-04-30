@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent = @import("../agent3/root.zig");
+const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const faux = ai.faux;
 
@@ -145,7 +145,7 @@ fn getAssistantUsage(message: agent.protocol.AgentMessage) ?ai.protocol.Usage {
 
 fn estimateJsonSize(value: std.json.Value) usize {
     // Tiny stringify scratch allocation, freed before return.
-    var out: std.io.Writer.Allocating = .init(std.heap.page_allocator);
+    var out: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer out.deinit();
 
     var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };

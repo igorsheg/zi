@@ -1,6 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const json_util = @import("../../ai/json_util.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
@@ -92,7 +92,7 @@ fn execute(
         command = cd_split.command;
     }
 
-    std.fs.accessAbsolute(effective_cwd, .{}) catch {
+    std.Io.Dir.accessAbsolute(ctx.io, effective_cwd, .{}) catch {
         return util.errorf(allocator, "working directory does not exist: {s}", .{effective_cwd});
     };
 
@@ -117,14 +117,15 @@ fn execute(
         const lock_entry = lock_registry.global().acquireKey(git_lock_key) catch
             return util.errorResult(allocator, "bash tool: failed to acquire git lock");
         defer lock_registry.global().release(lock_entry);
-        return runCommand(allocator, final_command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
+        return runCommand(allocator, ctx.io, final_command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
     }
 
-    return runCommand(allocator, final_command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
+    return runCommand(allocator, ctx.io, final_command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
 }
 
 fn runCommand(
     allocator: std.mem.Allocator,
+    io: std.Io,
     command: []const u8,
     cwd: []const u8,
     timeout_secs: ?u64,
@@ -132,31 +133,29 @@ fn runCommand(
     on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) protocol.AgentToolResult {
-    var thread_safe_allocator: std.heap.ThreadSafeAllocator = .{ .child_allocator = allocator };
-    const io_allocator = thread_safe_allocator.allocator();
+    const io_allocator = std.heap.smp_allocator;
 
-    const shell_argv: []const []const u8 = if (std.fs.accessAbsolute("/bin/bash", .{}))
+    const shell_argv: []const []const u8 = if (std.Io.Dir.accessAbsolute(io, "/bin/bash", .{}))
         &.{ "/bin/bash", "-c", command }
     else |_|
         &.{ "/bin/sh", "-c", command };
 
-    var child = std.process.Child.init(shell_argv, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        child.pgid = 0;
-    }
-
-    child.spawn() catch |err| {
+    var child = std.process.spawn(io, .{
+        .argv = shell_argv,
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    }) catch |err| {
         return util.errorf(allocator, "command error: {s}", .{@errorName(err)});
     };
+    const child_id = child.id.?;
 
-    var abort_guard = AbortGuard.start(signal, .{ .interrupt_process_group = child.id });
+    var abort_guard = AbortGuard.start(signal, .{ .interrupt_process_group = child_id });
     defer abort_guard.stop();
 
-    var timeout_guard = TimeoutGuard.start(timeout_secs, child.id);
+    var timeout_guard = TimeoutGuard.start(timeout_secs, child_id);
     defer timeout_guard.stop();
 
     const completed = if (on_update) |cb|
@@ -165,7 +164,7 @@ fn runCommand(
         runBufferedCapture(allocator, io_allocator, &child);
     defer if (completed.output_text.len > 0) allocator.free(completed.output_text);
 
-    const term = child.wait() catch null;
+    const term = child.wait(io) catch null;
     timeout_guard.markExited();
 
     const result_text = formatCommandTranscript(allocator, command, completed.output_text) catch
@@ -190,7 +189,7 @@ fn runCommand(
     }
 
     if (term) |t| switch (t) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) {
                 const tail = std.fmt.allocPrint(allocator, "\n\nexit code {d}", .{code}) catch "";
                 defer if (tail.len > 0) allocator.free(tail);
@@ -208,47 +207,48 @@ fn runCommand(
 }
 
 const TimeoutGuard = struct {
-    done: *std.Thread.ResetEvent,
+    done: *std.Io.Event,
     did_timeout: *std.atomic.Value(bool),
     thread: ?std.Thread,
 
     fn start(timeout_secs: ?u64, process_group_id: std.process.Child.Id) TimeoutGuard {
         const secs = timeout_secs orelse return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        const done = std.heap.page_allocator.create(std.Thread.ResetEvent) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
+        const done = std.heap.page_allocator.create(std.Io.Event) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
         errdefer std.heap.page_allocator.destroy(done);
         const did_timeout = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        done.* = .{};
+        done.* = .unset;
         did_timeout.* = std.atomic.Value(bool).init(false);
         const thread = std.Thread.spawn(.{}, watchdog, .{ secs, process_group_id, done, did_timeout }) catch null;
         return .{ .done = done, .did_timeout = did_timeout, .thread = thread };
     }
 
     fn markExited(self: *TimeoutGuard) void {
-        self.done.set();
+        self.done.set(std.Options.debug_io);
     }
 
     fn stop(self: *TimeoutGuard) void {
-        self.done.set();
+        self.done.set(std.Options.debug_io);
         if (self.thread) |t| t.join();
         if (self.done != &noop_done) std.heap.page_allocator.destroy(self.done);
         if (self.did_timeout != &noop_timeout) std.heap.page_allocator.destroy(self.did_timeout);
         self.thread = null;
     }
 
-    var noop_done: std.Thread.ResetEvent = .{};
+    var noop_done: std.Io.Event = .unset;
     var noop_timeout = std.atomic.Value(bool).init(false);
 
-    fn watchdog(timeout_secs: u64, process_group_id: std.process.Child.Id, done: *std.Thread.ResetEvent, did_timeout: *std.atomic.Value(bool)) void {
-        done.timedWait(timeout_secs * std.time.ns_per_s) catch |err| switch (err) {
+    fn watchdog(timeout_secs: u64, process_group_id: std.process.Child.Id, done: *std.Io.Event, did_timeout: *std.atomic.Value(bool)) void {
+        done.waitTimeout(std.Options.debug_io, .{ .duration = .{ .raw = .fromSeconds(@intCast(timeout_secs)), .clock = .boot } }) catch |err| switch (err) {
             error.Timeout => {
                 did_timeout.store(true, .release);
                 killProcessGroup(process_group_id, std.posix.SIG.KILL);
             },
+            error.Canceled => {},
         };
     }
 };
 
-fn killProcessGroup(process_group_id: std.process.Child.Id, sig: u8) void {
+fn killProcessGroup(process_group_id: std.process.Child.Id, sig: std.posix.SIG) void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         std.posix.kill(process_group_id, sig) catch {};
         return;
@@ -264,7 +264,7 @@ const CompletedOutput = struct {
 const StreamKind = enum { stdout, stderr };
 
 const StreamingCapture = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     output: output_buffer.LineOutputBuffer,
     stdout_done: bool = false,
     stderr_done: bool = false,
@@ -281,15 +281,15 @@ const StreamingCapture = struct {
     }
 
     fn append(self: *StreamingCapture, bytes: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         self.output.addChunk(bytes) catch return;
         self.dirty = true;
     }
 
     fn markDone(self: *StreamingCapture, kind: StreamKind) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         switch (kind) {
             .stdout => self.stdout_done = true,
             .stderr => self.stderr_done = true,
@@ -297,14 +297,14 @@ const StreamingCapture = struct {
     }
 
     fn isComplete(self: *StreamingCapture) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         return self.stdout_done and self.stderr_done;
     }
 
     fn takeDirtySnapshot(self: *StreamingCapture, allocator: std.mem.Allocator) ?[]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         if (!self.dirty) return null;
         self.dirty = false;
         const snapshot = self.output.snapshotAlloc(allocator, TRUNCATED_FMT) catch return null;
@@ -312,8 +312,8 @@ const StreamingCapture = struct {
     }
 
     fn finishText(self: *StreamingCapture, allocator: std.mem.Allocator) ![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         const final = try self.output.finishAlloc(allocator, TRUNCATED_FMT);
         return final.text;
     }
@@ -376,7 +376,7 @@ fn runStreamingCapture(
     var last_emitted_hash: ?u64 = null;
 
     while (!capture.isComplete()) {
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
         if (last_emit_ns == 0 or now_ns - last_emit_ns >= STREAM_UPDATE_MIN_INTERVAL_MS * std.time.ns_per_ms) {
             if (capture.takeDirtySnapshot(allocator)) |snapshot| {
                 defer if (snapshot.len > 0) allocator.free(snapshot);
@@ -386,7 +386,7 @@ fn runStreamingCapture(
                 }
             }
         }
-        std.Thread.sleep(STREAM_UPDATE_POLL_MS * std.time.ns_per_ms);
+        std.Options.debug_io.sleep(.fromMilliseconds(STREAM_UPDATE_POLL_MS), .awake) catch {};
     }
 
     if (capture.takeDirtySnapshot(allocator)) |snapshot| {
@@ -402,10 +402,16 @@ fn runStreamingCapture(
     return .{ .output_text = capture.finishText(allocator) catch allocator.dupe(u8, "") catch &.{} };
 }
 
-fn readStream(file: std.fs.File, capture: *StreamingCapture, kind: StreamKind) void {
+fn readStream(file: std.Io.File, capture: *StreamingCapture, kind: StreamKind) void {
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = file.read(&buf) catch break;
+        const n = std.posix.read(file.handle, &buf) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Options.debug_io.sleep(.fromMilliseconds(1), .awake) catch {};
+                continue;
+            },
+            else => break,
+        };
         if (n == 0) break;
         capture.append(buf[0..n]);
     }
@@ -415,21 +421,22 @@ fn readStream(file: std.fs.File, capture: *StreamingCapture, kind: StreamKind) v
 test "TimeoutGuard.stop does not wait for the full timeout after process exit" {
     const testing = std.testing;
 
-    var child = std.process.Child.init(&.{ "/bin/sh", "-c", "exit 0" }, testing.allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(std.Options.debug_io, .{
+        .argv = &.{ "/bin/sh", "-c", "exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
 
-    var guard = TimeoutGuard.start(2, child.id);
+    var guard = TimeoutGuard.start(2, child.id.?);
 
-    _ = try child.wait();
+    _ = try child.wait(std.Options.debug_io);
     try testing.expect(!guard.did_timeout.load(.acquire));
     guard.markExited();
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
     guard.stop();
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) - start_ns;
 
     try testing.expect(elapsed_ns < 500 * std.time.ns_per_ms);
 }
@@ -462,7 +469,7 @@ test "runCommand handles concurrent stdout and stderr" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
 
-        const result = runCommand(arena.allocator(), cmd, "/tmp", 5, protocol.AbortSignal.none, null, null);
+        const result = runCommand(arena.allocator(), std.Options.debug_io, cmd, "/tmp", 5, protocol.AbortSignal.none, null, null);
 
         try testing.expect(!result.is_error);
         try testing.expectEqual(@as(usize, 1), result.content.len);
@@ -506,6 +513,7 @@ test "runCommand emits partial updates while command is still running" {
     var state = CallbackState{};
     const result = runCommand(
         arena.allocator(),
+        std.Options.debug_io,
         cmd,
         "/tmp",
         5,
@@ -525,10 +533,10 @@ test "runCommand abort kills the spawned process group, not just the shell pid" 
 
     const testing = std.testing;
     const abort_signal = @import("../../abort_signal.zig");
-    const pid_file = try std.fmt.allocPrint(testing.allocator, "/tmp/zi-bash-abort-{d}.pid", .{std.time.nanoTimestamp()});
+    const pid_file = try std.fmt.allocPrint(testing.allocator, "/tmp/zi-bash-abort-{d}.pid", .{@as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()))});
     defer testing.allocator.free(pid_file);
-    std.fs.deleteFileAbsolute(pid_file) catch {};
-    defer std.fs.deleteFileAbsolute(pid_file) catch {};
+    std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, pid_file) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, pid_file) catch {};
 
     const cmd = try std.fmt.allocPrint(testing.allocator,
         \\sleep 30 &
@@ -542,7 +550,7 @@ test "runCommand abort kills the spawned process group, not just the shell pid" 
     const signal = controller.beginRun();
     const Aborter = struct {
         fn run(c: *abort_signal.AbortController) void {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            std.Options.debug_io.sleep(.fromNanoseconds(@intCast(100 * std.time.ns_per_ms)), .awake) catch {};
             c.requestAbort();
         }
     };
@@ -551,29 +559,31 @@ test "runCommand abort kills the spawned process group, not just the shell pid" 
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const result = runCommand(arena.allocator(), cmd, "/tmp", 5, signal, null, null);
+    const result = runCommand(arena.allocator(), std.Options.debug_io, cmd, "/tmp", 5, signal, null, null);
 
     try testing.expect(result.is_error);
     try testing.expectEqual(@as(usize, 1), result.content.len);
     try testing.expect(result.content[0] == .text);
     try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "command aborted") != null);
 
-    var file = try std.fs.openFileAbsolute(pid_file, .{});
-    defer file.close();
-    const pid_text = try file.readToEndAlloc(testing.allocator, 64);
+    var file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, pid_file, .{});
+    defer file.close(std.Options.debug_io);
+    var read_buf: [64]u8 = undefined;
+    var reader = file.reader(std.Options.debug_io, &read_buf);
+    const pid_text = try reader.interface.allocRemaining(testing.allocator, .limited(64));
     defer testing.allocator.free(pid_text);
     const child_pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, pid_text, " \r\n\t"), 10);
 
-    const deadline_ms = std.time.milliTimestamp() + 1_000;
+    const deadline_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 1_000;
     while (true) {
-        std.posix.kill(child_pid, 0) catch |err| switch (err) {
+        std.posix.kill(child_pid, @enumFromInt(0)) catch |err| switch (err) {
             error.ProcessNotFound => break,
             else => return err,
         };
-        if (std.time.milliTimestamp() >= deadline_ms) {
+        if (std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() >= deadline_ms) {
             return error.TestUnexpectedBackgroundChildStillRunning;
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        std.Options.debug_io.sleep(.fromNanoseconds(@intCast(50 * std.time.ns_per_ms)), .awake) catch {};
     }
 }
 
@@ -673,9 +683,9 @@ fn unquote(text: []const u8) []const u8 {
 }
 
 fn stripBackground(cmd: []const u8) []const u8 {
-    const trimmed = std.mem.trimRight(u8, cmd, &std.ascii.whitespace);
+    const trimmed = std.mem.trimEnd(u8, cmd, &std.ascii.whitespace);
     if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '&') {
-        return std.mem.trimRight(u8, trimmed[0 .. trimmed.len - 1], &std.ascii.whitespace);
+        return std.mem.trimEnd(u8, trimmed[0 .. trimmed.len - 1], &std.ascii.whitespace);
     }
     return trimmed;
 }
@@ -726,12 +736,11 @@ fn evaluatePermission(cmd: []const u8, rules: []const PermissionRule) Permission
 }
 
 fn loadPermissions(allocator: std.mem.Allocator) ![]PermissionRule {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return &.{};
-    defer allocator.free(home);
+    const home = @import("env").get("HOME") orelse return &.{};
     const permissions_path = try std.fs.path.join(allocator, &.{ home, ".pi", "agent", "permissions.json" });
     defer allocator.free(permissions_path);
 
-    const raw = std.fs.cwd().readFileAlloc(allocator, permissions_path, 1024 * 1024) catch return &.{};
+    const raw = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, permissions_path, allocator, .limited(1024 * 1024)) catch return &.{};
     defer allocator.free(raw);
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return &.{};

@@ -1,7 +1,7 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const spawn_types = @import("../../spawn/types.zig");
 
 const c = lua_runtime.c;

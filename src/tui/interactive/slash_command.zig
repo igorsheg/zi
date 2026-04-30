@@ -16,7 +16,6 @@ pub const BuiltinInteractiveCommand = enum {
     login,
     settings,
     hotkeys,
-    mem,
 };
 
 pub fn parse(text: []const u8) ?ParsedSlashCommand {
@@ -25,7 +24,7 @@ pub fn parse(text: []const u8) ?ParsedSlashCommand {
     const space_idx = std.mem.indexOfScalar(u8, after_slash, ' ');
     const name = if (space_idx) |si| after_slash[0..si] else after_slash;
     if (name.len == 0) return null;
-    const args = if (space_idx) |si| std.mem.trimLeft(u8, after_slash[si + 1 ..], " ") else "";
+    const args = if (space_idx) |si| std.mem.trimStart(u8, after_slash[si + 1 ..], " ") else "";
     return .{ .name = name, .args = args };
 }
 
@@ -40,7 +39,6 @@ pub fn builtinInteractiveCommand(name: []const u8) ?BuiltinInteractiveCommand {
     if (std.mem.eql(u8, name, "login")) return .login;
     if (std.mem.eql(u8, name, "settings")) return .settings;
     if (std.mem.eql(u8, name, "hotkeys")) return .hotkeys;
-    if (std.mem.eql(u8, name, "mem")) return .mem;
     return null;
 }
 

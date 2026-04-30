@@ -33,6 +33,18 @@ pub const AbortGuard = struct {
         interrupt_process_group: ?std.process.Child.Id = null,
     };
 
+    /// Return the underlying TCP socket fd for Zig 0.16 std.http requests.
+    ///
+    /// std.http no longer exposes the old `stream_reader.getStream()` path,
+    /// but the request still owns a `Connection` while the body is being sent
+    /// and read. AbortGuard only uses this fd for `shutdown(SHUT_RDWR)` from a
+    /// watchdog thread to unblock an in-flight network read/write; ownership
+    /// remains with the http request/connection.
+    pub fn httpRequestShutdownFd(req: anytype) ?std.posix.fd_t {
+        const conn = req.connection orelse return null;
+        return conn.stream_reader.stream.socket.handle;
+    }
+
     /// Spawn the watchdog. No-ops (no thread) when the signal is inert
     /// or all actions are null.
     pub fn start(signal: AbortSignal, actions: Actions) AbortGuard {
@@ -124,11 +136,11 @@ pub const AbortGuard = struct {
             return;
         }
         signalProcessGroup(pgid, std.posix.SIG.INT);
-        std.Thread.sleep(150 * std.time.ns_per_ms);
+        std.Options.debug_io.sleep(.fromNanoseconds(150 * std.time.ns_per_ms), .awake) catch {};
         signalProcessGroup(pgid, std.posix.SIG.KILL);
     }
 
-    fn signalProcessGroup(pgid: std.process.Child.Id, sig: u8) void {
+    fn signalProcessGroup(pgid: std.process.Child.Id, sig: std.posix.SIG) void {
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
             std.posix.kill(pgid, sig) catch {};
             return;

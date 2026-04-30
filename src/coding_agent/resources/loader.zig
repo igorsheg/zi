@@ -505,7 +505,7 @@ fn appendPackageRoot(
 ) !void {
     const package_root = try resolveResourcePath(allocator, base_dir, package_source);
     defer allocator.free(package_root);
-    std.fs.accessAbsolute(package_root, .{}) catch return;
+    std.Io.Dir.accessAbsolute(std.Options.debug_io, package_root, .{}) catch return;
     const kind = try classifyStaticExtensionRoot(allocator, package_root);
 
     if (extension_filter) |ids| {
@@ -544,14 +544,14 @@ fn appendFilteredPackageExtensionRoot(
     const lua_path = try std.fs.path.join(allocator, &.{ package_root, "extensions", lua_file });
     defer allocator.free(lua_path);
     const root_path = blk: {
-        std.fs.accessAbsolute(lua_path, .{}) catch {
+        std.Io.Dir.accessAbsolute(std.Options.debug_io, lua_path, .{}) catch {
             const bundle_path = try std.fs.path.join(allocator, &.{ package_root, "extensions", trimmed });
             const init_path = std.fs.path.join(allocator, &.{ bundle_path, "init.lua" }) catch |err| {
                 allocator.free(bundle_path);
                 return err;
             };
             defer allocator.free(init_path);
-            std.fs.accessAbsolute(init_path, .{}) catch {
+            std.Io.Dir.accessAbsolute(std.Options.debug_io, init_path, .{}) catch {
                 allocator.free(bundle_path);
                 return;
             };
@@ -596,8 +596,8 @@ fn appendAfterStaticExtensionRoots(
     const after_dir = try std.fs.path.join(allocator, &.{ root.path, "after" });
     defer allocator.free(after_dir);
 
-    var dir = std.fs.openDirAbsolute(after_dir, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, after_dir, .{ .iterate = true }) catch return;
+    defer dir.close(std.Options.debug_io);
 
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
@@ -606,7 +606,7 @@ fn appendAfterStaticExtensionRoots(
     }
 
     var iter = dir.iterate();
-    while (iter.next() catch return) |entry| {
+    while (iter.next(std.Options.debug_io) catch return) |entry| {
         if (entry.kind != .directory) continue;
         try names.append(allocator, try allocator.dupe(u8, entry.name));
     }
@@ -635,7 +635,7 @@ fn classifyStaticExtensionRoot(allocator: std.mem.Allocator, path: []const u8) !
 
     const init_path = try std.fs.path.join(allocator, &.{ path, "init.lua" });
     defer allocator.free(init_path);
-    std.fs.accessAbsolute(init_path, .{}) catch return .runtime_root;
+    std.Io.Dir.accessAbsolute(std.Options.debug_io, init_path, .{}) catch return .runtime_root;
     return .synthetic_extension;
 }
 
@@ -651,12 +651,20 @@ fn resolvePromptInput(allocator: std.mem.Allocator, cwd: []const u8, input: []co
         try std.fs.path.join(allocator, &.{ cwd, input });
     defer allocator.free(resolved_path);
 
-    const file = std.fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, resolved_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return allocator.dupe(u8, input),
         else => return allocator.dupe(u8, input),
     };
-    defer file.close();
-    return file.readToEndAlloc(allocator, 1024 * 1024);
+    defer file.close(std.Options.debug_io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    return file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+}
+
+fn readFileAlloc(allocator: std.mem.Allocator, file: std.Io.File, limit: usize) ![]u8 {
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    return file_reader.interface.allocRemaining(allocator, .limited(limit));
 }
 
 fn allocSingleStringSlice(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
@@ -734,14 +742,14 @@ fn loadAgentsFilesFromPath(
     files: *std.ArrayListUnmanaged(types.AgentsFile),
     seen_paths: *std.StringHashMapUnmanaged(void),
 ) !void {
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
         try loadAgentsMdFile(allocator, path, entry.name, files, seen_paths);
@@ -757,15 +765,15 @@ fn loadAgentsMdFile(
 ) !void {
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, filename });
     errdefer allocator.free(file_path);
-    const file = std.fs.openFileAbsolute(file_path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, file_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             allocator.free(file_path);
             return;
         },
         else => return err,
     };
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer file.close(std.Options.debug_io);
+    const content = try readFileAlloc(allocator, file, 1024 * 1024);
     errdefer allocator.free(content);
     try appendUniqueAgentsFile(allocator, files, seen_paths, .{ .path = file_path, .content = content });
 }
@@ -796,7 +804,7 @@ fn loadContextFileCandidate(allocator: std.mem.Allocator, dir: []const u8, filen
     const path = try std.fs.path.join(allocator, &.{ dir, filename });
     errdefer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             allocator.free(path);
             return null;
@@ -806,9 +814,9 @@ fn loadContextFileCandidate(allocator: std.mem.Allocator, dir: []const u8, filen
             return null;
         },
     };
-    defer file.close();
+    defer file.close(std.Options.debug_io);
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const content = try readFileAlloc(allocator, file, 1024 * 1024);
     return .{ .path = path, .content = content };
 }
 
@@ -997,7 +1005,7 @@ fn loadPromptsFromPath(
     prompts: *std.ArrayListUnmanaged(types.PromptTemplate),
     diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
 ) !void {
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |dir_err| switch (dir_err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, path, .{ .iterate = true }) catch |dir_err| switch (dir_err) {
         error.FileNotFound => return,
         error.NotDir => {
             if (!std.mem.endsWith(u8, path, ".md")) return;
@@ -1006,10 +1014,10 @@ fn loadPromptsFromPath(
         },
         else => return dir_err,
     };
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
         const file_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
@@ -1025,13 +1033,15 @@ fn loadPromptFromFile(
     prompts: *std.ArrayListUnmanaged(types.PromptTemplate),
     diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
 ) !void {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+    const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{}) catch |err| {
         try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to open prompt file: {s}", .{@errorName(err)}), path));
         return;
     };
-    defer file.close();
+    defer file.close(std.Options.debug_io);
 
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    const content = file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch |err| {
         try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to read prompt file: {s}", .{@errorName(err)}), path));
         return;
     };
@@ -1078,7 +1088,7 @@ fn loadThemesFromPath(
     themes: *std.ArrayListUnmanaged(types.Theme),
     diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
 ) !void {
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |dir_err| switch (dir_err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, path, .{ .iterate = true }) catch |dir_err| switch (dir_err) {
         error.FileNotFound => return,
         error.NotDir => {
             if (!std.mem.endsWith(u8, path, ".json")) {
@@ -1093,10 +1103,10 @@ fn loadThemesFromPath(
             return;
         },
     };
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
         const file_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
@@ -1112,13 +1122,15 @@ fn loadThemeFromFile(
     themes: *std.ArrayListUnmanaged(types.Theme),
     diagnostics: *std.ArrayListUnmanaged(types.ResourceDiagnostic),
 ) !void {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+    const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{}) catch |err| {
         try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to open theme file: {s}", .{@errorName(err)}), path));
         return;
     };
-    defer file.close();
+    defer file.close(std.Options.debug_io);
 
-    const bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    const bytes = file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch |err| {
         try diagnostics.append(allocator, try themeDiagnostic(allocator, .warning, try std.fmt.allocPrint(allocator, "failed to read theme file: {s}", .{@errorName(err)}), path));
         return;
     };
@@ -1212,11 +1224,11 @@ fn resolveResourcePath(allocator: std.mem.Allocator, cwd: []const u8, path: []co
     const trimmed = std.mem.trim(u8, path, " \t\r\n");
     if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
     if (std.mem.eql(u8, trimmed, "~")) {
-        const home = std.posix.getenv("HOME") orelse return allocator.dupe(u8, trimmed);
+        const home = @import("env").get("HOME") orelse return allocator.dupe(u8, trimmed);
         return allocator.dupe(u8, home);
     }
     if (std.mem.startsWith(u8, trimmed, "~/")) {
-        const home = std.posix.getenv("HOME") orelse return allocator.dupe(u8, trimmed);
+        const home = @import("env").get("HOME") orelse return allocator.dupe(u8, trimmed);
         return std.fs.path.join(allocator, &.{ home, trimmed[2..] });
     }
     return std.fs.path.join(allocator, &.{ cwd, trimmed });
@@ -1445,36 +1457,36 @@ test "resource loader normalizes static extension ingress into canonical order" 
 
     var agent_tmp = std.testing.tmpDir(.{});
     defer agent_tmp.cleanup();
-    try agent_tmp.dir.makePath("extensions");
-    try agent_tmp.dir.makePath("after/05-early/extensions");
-    try agent_tmp.dir.makePath("after/10-extra/extensions");
-    try agent_tmp.dir.makePath("pkg-user/extensions");
-    try agent_tmp.dir.writeFile(.{ .sub_path = "extensions/user_global.lua", .data = "-- user global" });
-    try agent_tmp.dir.writeFile(.{ .sub_path = "after/05-early/extensions/user_after_early.lua", .data = "-- user after early" });
-    try agent_tmp.dir.writeFile(.{ .sub_path = "after/10-extra/extensions/user_after.lua", .data = "-- user after" });
-    try agent_tmp.dir.writeFile(.{ .sub_path = "pkg-user/extensions/user_package.lua", .data = "-- user package" });
-    const agent_root = try agent_tmp.dir.realpathAlloc(allocator, ".");
+    try agent_tmp.dir.createDirPath(std.Options.debug_io, "extensions");
+    try agent_tmp.dir.createDirPath(std.Options.debug_io, "after/05-early/extensions");
+    try agent_tmp.dir.createDirPath(std.Options.debug_io, "after/10-extra/extensions");
+    try agent_tmp.dir.createDirPath(std.Options.debug_io, "pkg-user/extensions");
+    try agent_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "extensions/user_global.lua", .data = "-- user global" });
+    try agent_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "after/05-early/extensions/user_after_early.lua", .data = "-- user after early" });
+    try agent_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "after/10-extra/extensions/user_after.lua", .data = "-- user after" });
+    try agent_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "pkg-user/extensions/user_package.lua", .data = "-- user package" });
+    const agent_root = try agent_tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(agent_root);
 
     var project_tmp = std.testing.tmpDir(.{});
     defer project_tmp.cleanup();
-    try project_tmp.dir.makePath("repo/.zi/extensions");
-    try project_tmp.dir.makePath("repo/.zi/pkg-project/extensions");
-    try project_tmp.dir.makePath("settings_project_root/extensions");
-    try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/extensions/project_local.lua", .data = "-- project local" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/pkg-project/extensions/project_package.lua", .data = "-- project package" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/pkg-project/extensions/project_package_disabled.lua", .data = "-- project package disabled" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "explicit.lua", .data = "-- explicit" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "settings_user.lua", .data = "-- settings user" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "settings_project_root/extensions/settings_project.lua", .data = "-- settings project" });
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "repo/.zi/extensions");
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "repo/.zi/pkg-project/extensions");
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "settings_project_root/extensions");
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "repo/.zi/extensions/project_local.lua", .data = "-- project local" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "repo/.zi/pkg-project/extensions/project_package.lua", .data = "-- project package" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "repo/.zi/pkg-project/extensions/project_package_disabled.lua", .data = "-- project package disabled" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "explicit.lua", .data = "-- explicit" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "settings_user.lua", .data = "-- settings user" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "settings_project_root/extensions/settings_project.lua", .data = "-- settings project" });
 
-    const cwd = try project_tmp.dir.realpathAlloc(allocator, "repo");
+    const cwd = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "repo", allocator);
     defer allocator.free(cwd);
-    const explicit_path = try project_tmp.dir.realpathAlloc(allocator, "explicit.lua");
+    const explicit_path = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "explicit.lua", allocator);
     defer allocator.free(explicit_path);
-    const settings_user_path = try project_tmp.dir.realpathAlloc(allocator, "settings_user.lua");
+    const settings_user_path = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "settings_user.lua", allocator);
     defer allocator.free(settings_user_path);
-    const settings_project_root = try project_tmp.dir.realpathAlloc(allocator, "settings_project_root");
+    const settings_project_root = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "settings_project_root", allocator);
     defer allocator.free(settings_project_root);
 
     var settings_manager = try settings_manager_mod.SettingsManager.inMemory(allocator, null);
@@ -1551,34 +1563,34 @@ test "resource loader resolves prompt inputs and discovers agents files" {
 
     var agent_tmp = std.testing.tmpDir(.{});
     defer agent_tmp.cleanup();
-    try agent_tmp.dir.makePath("skills/git");
-    try agent_tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "global rules" });
-    try agent_tmp.dir.writeFile(.{ .sub_path = "skills/git/SKILL.md", .data = "---\ndescription: git help\n---\nbody\n" });
-    const agent_root = try agent_tmp.dir.realpathAlloc(allocator, ".");
+    try agent_tmp.dir.createDirPath(std.Options.debug_io, "skills/git");
+    try agent_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "AGENTS.md", .data = "global rules" });
+    try agent_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "skills/git/SKILL.md", .data = "---\ndescription: git help\n---\nbody\n" });
+    const agent_root = try agent_tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(agent_root);
 
     var project_tmp = std.testing.tmpDir(.{});
     defer project_tmp.cleanup();
-    try project_tmp.dir.makePath("repo/nested");
-    try project_tmp.dir.makePath("repo/nested/.zi/skills/project-skill");
-    try project_tmp.dir.writeFile(.{ .sub_path = "repo/AGENTS.md", .data = "repo rules" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "repo/nested/CLAUDE.md", .data = "nested rules" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "repo/nested/.zi/skills/project-skill/SKILL.md", .data = "---\ndescription: project help\n---\nbody\n" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "append.txt", .data = "append from file" });
-    try project_tmp.dir.makePath("derived-root/skills/root-skill");
-    try project_tmp.dir.makePath("derived-root/prompts");
-    try project_tmp.dir.makePath("derived-root/agents");
-    try project_tmp.dir.writeFile(.{ .sub_path = "extra-skill.md", .data = "---\nname: extra-skill\ndescription: extra help\n---\nbody\n" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "derived-root/skills/root-skill/SKILL.md", .data = "---\ndescription: root help\n---\nbody\n" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "derived-root/prompts/root-prompt.md", .data = "root prompt body" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "derived-root/agents/root-agent.md", .data = "root agent rules" });
-    const cwd = try project_tmp.dir.realpathAlloc(allocator, "repo/nested");
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "repo/nested");
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "repo/nested/.zi/skills/project-skill");
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "repo/AGENTS.md", .data = "repo rules" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "repo/nested/CLAUDE.md", .data = "nested rules" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "repo/nested/.zi/skills/project-skill/SKILL.md", .data = "---\ndescription: project help\n---\nbody\n" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "append.txt", .data = "append from file" });
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "derived-root/skills/root-skill");
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "derived-root/prompts");
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "derived-root/agents");
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "extra-skill.md", .data = "---\nname: extra-skill\ndescription: extra help\n---\nbody\n" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "derived-root/skills/root-skill/SKILL.md", .data = "---\ndescription: root help\n---\nbody\n" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "derived-root/prompts/root-prompt.md", .data = "root prompt body" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "derived-root/agents/root-agent.md", .data = "root agent rules" });
+    const cwd = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "repo/nested", allocator);
     defer allocator.free(cwd);
-    const append_path = try project_tmp.dir.realpathAlloc(allocator, "append.txt");
+    const append_path = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "append.txt", allocator);
     defer allocator.free(append_path);
-    const extra_skill_path = try project_tmp.dir.realpathAlloc(allocator, "extra-skill.md");
+    const extra_skill_path = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "extra-skill.md", allocator);
     defer allocator.free(extra_skill_path);
-    const derived_root_path = try project_tmp.dir.realpathAlloc(allocator, "derived-root");
+    const derived_root_path = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "derived-root", allocator);
     defer allocator.free(derived_root_path);
 
     var loader = try ResourceLoader.init(allocator, .{
@@ -1668,7 +1680,7 @@ test "builtin root is last in canonical extension root order" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
     var loader = try ResourceLoader.init(allocator, .{

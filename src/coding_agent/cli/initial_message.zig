@@ -115,7 +115,7 @@ fn appendFileInput(
     const resolved_path = try tool_util.resolvePath(allocator, file_arg, cwd);
     defer allocator.free(resolved_path);
 
-    const file = std.fs.openFileAbsolute(resolved_path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, resolved_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             return .{ .err = .{ .batch_file_not_found = try allocator.dupe(u8, resolved_path) } };
         },
@@ -126,9 +126,9 @@ fn appendFileInput(
             } } };
         },
     };
-    defer file.close();
+    defer file.close(std.Options.debug_io);
 
-    const file_stat = file.stat() catch |err| {
+    const file_stat = file.stat(std.Options.debug_io) catch |err| {
         return .{ .err = .{ .batch_file_read_failed = .{
             .path = try allocator.dupe(u8, resolved_path),
             .err_name = @errorName(err),
@@ -136,7 +136,9 @@ fn appendFileInput(
     };
     if (file_stat.size == 0) return .{ .ok = false };
 
-    const raw = file.readToEndAlloc(allocator, max_batch_file_bytes) catch |err| {
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    const raw = file_reader.interface.allocRemaining(allocator, .limited(max_batch_file_bytes)) catch |err| {
         return .{ .err = .{ .batch_file_read_failed = .{
             .path = try allocator.dupe(u8, resolved_path),
             .err_name = @errorName(err),
@@ -213,8 +215,8 @@ test "prepareBatchInput merges stdin file text and prompt in pi order" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "notes.txt", .data = "hello from file" });
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.txt", .data = "hello from file" });
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const prepared = try prepareBatchInput(allocator, cwd, .{
@@ -245,10 +247,10 @@ test "prepareBatchInput attaches image files and skips empty files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "empty.txt", .data = "" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "empty.txt", .data = "" });
     const png = pngHeader(64, 32);
-    try tmp.dir.writeFile(.{ .sub_path = "shot.bin", .data = &png });
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "shot.bin", .data = &png });
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const prepared = try prepareBatchInput(allocator, cwd, .{
@@ -282,8 +284,8 @@ test "prepareBatchInput omits oversized images when auto-resize is enabled" {
     defer tmp.cleanup();
 
     const png = pngHeader(640, 480);
-    try tmp.dir.writeFile(.{ .sub_path = "large.bin", .data = &png });
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "large.bin", .data = &png });
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const prepared = try prepareBatchInput(allocator, cwd, .{
@@ -311,8 +313,8 @@ test "prepareInitialMessage treats empty interactive file inputs as no startup c
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "empty.txt", .data = "" });
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "empty.txt", .data = "" });
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const prepared = try prepareInitialMessage(allocator, cwd, .{
@@ -332,7 +334,7 @@ test "prepareBatchInput reports missing file arguments" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const prepared = try prepareBatchInput(allocator, cwd, .{

@@ -87,40 +87,38 @@ pub const Result = union(enum) {
     }
 };
 
-pub fn run(allocator: std.mem.Allocator, request: Request) Result {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
     if (request.argv.len == 0) return errorResult(allocator, "empty argv");
 
-    var env_map_storage: ?std.process.EnvMap = null;
+    var env_map_storage: ?std.process.Environ.Map = null;
     defer if (env_map_storage) |*env_map| env_map.deinit();
     if (request.env.len > 0 or request.clear_env) {
         env_map_storage = if (request.clear_env)
-            std.process.EnvMap.init(allocator)
+            std.process.Environ.Map.init(allocator)
         else
-            std.process.getEnvMap(allocator) catch return errorResult(allocator, "failed to read environment");
+            std.process.Environ.Map.init(allocator);
         for (request.env) |pair| {
             env_map_storage.?.put(pair.key, pair.value) catch return errorResult(allocator, "failed to build environment");
         }
     }
 
-    var child = std.process.Child.init(request.argv, allocator);
-    child.cwd = request.cwd;
-    child.env_map = if (env_map_storage) |*env_map| env_map else null;
-    child.stdin_behavior = if (request.stdin != null) .Pipe else .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        child.pgid = 0;
-    }
-
-    child.spawn() catch |err| {
+    var child = std.process.spawn(io, .{
+        .argv = request.argv,
+        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .environ_map = if (env_map_storage) |*env_map| env_map else null,
+        .stdin = if (request.stdin != null) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    }) catch |err| {
         return errorFmt(allocator, "spawn failed: {s}", .{@errorName(err)});
     };
+    const child_id = child.id.?;
 
-    var timeout_guard = TimeoutGuard.start(request.timeout_ms, child.id);
+    var timeout_guard = TimeoutGuard.start(request.timeout_ms, child_id);
     defer timeout_guard.stop();
 
-    var thread_safe_allocator: std.heap.ThreadSafeAllocator = .{ .child_allocator = allocator };
-    const io_allocator = thread_safe_allocator.allocator();
+    const io_allocator = std.heap.smp_allocator;
 
     var stdout_capture = Capture.init(io_allocator, request.max_stdout_bytes);
     defer stdout_capture.deinit();
@@ -138,13 +136,16 @@ pub fn run(allocator: std.mem.Allocator, request: Request) Result {
 
     if (request.stdin) |stdin_bytes| {
         if (child.stdin) |stdin_file| {
-            stdin_file.writeAll(stdin_bytes) catch {};
-            stdin_file.close();
+            var write_buf: [4096]u8 = undefined;
+            var stdin_writer = stdin_file.writer(io, &write_buf);
+            stdin_writer.interface.writeAll(stdin_bytes) catch {};
+            stdin_writer.interface.flush() catch {};
+            stdin_file.close(io);
             child.stdin = null;
         }
     }
 
-    const term = child.wait() catch |err| {
+    const term = child.wait(io) catch |err| {
         timeout_guard.markExited();
         if (stdout_thread) |thread| thread.join();
         if (stderr_thread) |thread| thread.join();
@@ -182,11 +183,13 @@ pub fn run(allocator: std.mem.Allocator, request: Request) Result {
 
     return .{ .completed = .{
         .code = switch (term) {
-            .Exited => |code| code,
+            .exited => |code| code,
             else => null,
         },
         .signal = switch (term) {
-            .Signal, .Stopped, .Unknown => |sig| sig,
+            .signal => |sig| @intFromEnum(sig),
+            .stopped => |sig| @intFromEnum(sig),
+            .unknown => |sig| sig,
             else => null,
         },
         .stdout = stdout,
@@ -211,10 +214,10 @@ const Capture = struct {
         self.* = undefined;
     }
 
-    fn readAll(self: *Capture, file: std.fs.File) void {
+    fn readAll(self: *Capture, file: std.Io.File) void {
         var local_buf: [4096]u8 = undefined;
         while (true) {
-            const n = file.read(&local_buf) catch {
+            const n = std.posix.read(file.handle, &local_buf) catch {
                 self.err = error.ReadFailed;
                 return;
             };
@@ -236,47 +239,48 @@ const Capture = struct {
 };
 
 const TimeoutGuard = struct {
-    done: *std.Thread.ResetEvent,
+    done: *std.Io.Event,
     did_timeout: *std.atomic.Value(bool),
     thread: ?std.Thread,
 
     fn start(timeout_ms: ?u64, process_group_id: std.process.Child.Id) TimeoutGuard {
         const ms = timeout_ms orelse return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        const done = std.heap.page_allocator.create(std.Thread.ResetEvent) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
+        const done = std.heap.page_allocator.create(std.Io.Event) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
         errdefer std.heap.page_allocator.destroy(done);
         const did_timeout = std.heap.page_allocator.create(std.atomic.Value(bool)) catch return .{ .done = &noop_done, .did_timeout = &noop_timeout, .thread = null };
-        done.* = .{};
+        done.* = .unset;
         did_timeout.* = std.atomic.Value(bool).init(false);
         const thread = std.Thread.spawn(.{}, watchdog, .{ ms, process_group_id, done, did_timeout }) catch null;
         return .{ .done = done, .did_timeout = did_timeout, .thread = thread };
     }
 
     fn markExited(self: *TimeoutGuard) void {
-        self.done.set();
+        self.done.set(std.Options.debug_io);
     }
 
     fn stop(self: *TimeoutGuard) void {
-        self.done.set();
+        self.done.set(std.Options.debug_io);
         if (self.thread) |thread| thread.join();
         if (self.done != &noop_done) std.heap.page_allocator.destroy(self.done);
         if (self.did_timeout != &noop_timeout) std.heap.page_allocator.destroy(self.did_timeout);
         self.thread = null;
     }
 
-    fn watchdog(timeout_ms: u64, process_group_id: std.process.Child.Id, done: *std.Thread.ResetEvent, did_timeout: *std.atomic.Value(bool)) void {
-        done.timedWait(timeout_ms * std.time.ns_per_ms) catch |err| switch (err) {
+    fn watchdog(timeout_ms: u64, process_group_id: std.process.Child.Id, done: *std.Io.Event, did_timeout: *std.atomic.Value(bool)) void {
+        done.waitTimeout(std.Options.debug_io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .boot } }) catch |err| switch (err) {
             error.Timeout => {
                 did_timeout.store(true, .release);
                 killProcessGroup(process_group_id, std.posix.SIG.KILL);
             },
+            error.Canceled => {},
         };
     }
 
-    var noop_done: std.Thread.ResetEvent = .{};
+    var noop_done: std.Io.Event = .unset;
     var noop_timeout = std.atomic.Value(bool).init(false);
 };
 
-fn killProcessGroup(process_group_id: std.process.Child.Id, sig: u8) void {
+fn killProcessGroup(process_group_id: std.process.Child.Id, sig: std.posix.SIG) void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         std.posix.kill(process_group_id, sig) catch {};
         return;
@@ -310,7 +314,7 @@ fn errorFmt(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytyp
 
 test "system command runs argv and captures stdout" {
     const allocator = std.testing.allocator;
-    var result = run(allocator, .{ .argv = &.{ "/bin/sh", "-c", "printf hello" } });
+    var result = run(allocator, std.Options.debug_io, .{ .argv = &.{ "/bin/sh", "-c", "printf hello" } });
     defer result.deinit(allocator);
     try std.testing.expect(result == .completed);
     try std.testing.expectEqual(@as(?u32, 0), result.completed.code);
@@ -322,10 +326,10 @@ test "system command passes cwd env and stdin" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
-    var result = run(allocator, .{
+    var result = run(allocator, std.Options.debug_io, .{
         .argv = &.{ "/bin/sh", "-c", "printf \"$FOO:\"; pwd; printf ':'; cat" },
         .cwd = cwd,
         .stdin = "input",
@@ -340,7 +344,7 @@ test "system command passes cwd env and stdin" {
 
 test "system command reports nonzero exit as completed" {
     const allocator = std.testing.allocator;
-    var result = run(allocator, .{ .argv = &.{ "/bin/sh", "-c", "printf nope >&2; exit 7" } });
+    var result = run(allocator, std.Options.debug_io, .{ .argv = &.{ "/bin/sh", "-c", "printf nope >&2; exit 7" } });
     defer result.deinit(allocator);
     try std.testing.expect(result == .completed);
     try std.testing.expectEqual(@as(?u32, 7), result.completed.code);
@@ -349,7 +353,7 @@ test "system command reports nonzero exit as completed" {
 
 test "system command reports timeout with partial output" {
     const allocator = std.testing.allocator;
-    var result = run(allocator, .{
+    var result = run(allocator, std.Options.debug_io, .{
         .argv = &.{ "/bin/sh", "-c", "printf start; sleep 2" },
         .timeout_ms = 100,
     });

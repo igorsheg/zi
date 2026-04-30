@@ -251,6 +251,7 @@ pub const SlashCommandProvider = struct {
 
 pub const CombinedAutocompleteProvider = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     registry: *const CommandRegistry,
     cwd: []const u8,
 
@@ -298,7 +299,7 @@ pub const CombinedAutocompleteProvider = struct {
 
         fn reset(self: *AsyncSearch) void {
             if (self.child) |*child| {
-                _ = child.kill() catch {};
+                child.kill(std.Options.debug_io);
             }
             self.child = null;
             if (self.arena) |*arena| arena.deinit();
@@ -332,9 +333,10 @@ pub const CombinedAutocompleteProvider = struct {
         .tick = @ptrCast(&tickImpl),
     };
 
-    pub fn init(allocator: std.mem.Allocator, registry: *const CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, registry: *const CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
         return .{
             .allocator = allocator,
+            .io = io,
             .registry = registry,
             .cwd = cwd,
         };
@@ -473,18 +475,18 @@ pub const CombinedAutocompleteProvider = struct {
     fn buildPathSuggestions(self: *CombinedAutocompleteProvider, prefix: []const u8) usize {
         const plan = self.resolveSearchPlan(prefix) orelse return 0;
 
-        var dir = std.fs.openDirAbsolute(plan.search_dir, .{ .iterate = true }) catch return 0;
-        defer dir.close();
+        var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, plan.search_dir, .{ .iterate = true }) catch return 0;
+        defer dir.close(std.Options.debug_io);
 
         var iter = dir.iterate();
         var count: usize = 0;
-        while (iter.next() catch null) |entry| {
+        while (iter.next(std.Options.debug_io) catch null) |entry| {
             if (count >= self.item_buf.len) break;
             if (!startsWithIgnoreCase(entry.name, plan.search_prefix)) continue;
 
             var is_directory = entry.kind == .directory;
             if (!is_directory and entry.kind == .sym_link) {
-                const stat: ?std.fs.File.Stat = dir.statFile(entry.name) catch null;
+                const stat: ?std.Io.File.Stat = dir.statFile(std.Options.debug_io, entry.name, .{}) catch null;
                 if (stat) |value| {
                     is_directory = value.kind == .directory;
                 }
@@ -606,7 +608,7 @@ pub const CombinedAutocompleteProvider = struct {
         self.async_search.is_quoted_prefix = plan.is_quoted_prefix;
         self.async_search.refresh_mode = plan.refresh_mode;
         self.async_search.auto_accept_single_on_tab = plan.auto_accept_single_on_tab;
-        self.async_search.debounce_until_ns = std.time.nanoTimestamp() + if (plan.refresh_mode == .force) @as(i128, 0) else attachment_debounce_ns;
+        self.async_search.debounce_until_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + if (plan.refresh_mode == .force) @as(i128, 0) else attachment_debounce_ns;
         self.async_search.phase = if (plan.refresh_mode == .force) .scanning else .debouncing;
         if (plan.refresh_mode == .force) {
             _ = self.startAsyncSearchProcess();
@@ -657,6 +659,8 @@ pub const CombinedAutocompleteProvider = struct {
     }
 
     fn startAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
+        if (self.spawnAsyncSearchProcess("/opt/homebrew/bin/fd")) return true;
+        if (self.spawnAsyncSearchProcess("/usr/local/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("fd")) return true;
         if (self.spawnAsyncSearchProcess("fdfind")) return true;
         self.async_search.stdout_closed = true;
@@ -712,20 +716,17 @@ pub const CombinedAutocompleteProvider = struct {
             argc += 1;
         }
 
-        var child = std.process.Child.init(argv[0..argc], self.allocator);
-        child.expand_arg0 = .expand;
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.spawn() catch return false;
-        child.waitForSpawn() catch {
-            _ = child.wait() catch {};
-            return false;
-        };
+        var child = std.process.spawn(self.io, .{
+            .argv = argv[0..argc],
+            .expand_arg0 = .expand,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch return false;
 
         if (child.stdout) |stdout_file| {
             setNonblocking(stdout_file.handle) catch {
-                _ = child.kill() catch {};
+                child.kill(std.Options.debug_io);
                 return false;
             };
             self.async_search.stdout_closed = false;
@@ -734,7 +735,7 @@ pub const CombinedAutocompleteProvider = struct {
         }
         if (child.stderr) |stderr_file| {
             setNonblocking(stderr_file.handle) catch {
-                _ = child.kill() catch {};
+                child.kill(std.Options.debug_io);
                 return false;
             };
             self.async_search.stderr_closed = false;
@@ -766,11 +767,11 @@ pub const CombinedAutocompleteProvider = struct {
         _ = std.posix.poll(pollfds[0..count], async_pipe_poll_ms) catch {};
     }
 
-    fn drainAsyncPipe(self: *CombinedAutocompleteProvider, file: std.fs.File, buffer: *std.ArrayList(u8), closed: *bool) void {
+    fn drainAsyncPipe(self: *CombinedAutocompleteProvider, file: std.Io.File, buffer: *std.ArrayList(u8), closed: *bool) void {
         const arena = self.async_search.arenaAllocator();
         var chunk: [4096]u8 = undefined;
         while (true) {
-            const n = file.read(&chunk) catch |err| switch (err) {
+            const n = std.posix.read(file.handle, &chunk) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => {
                     closed.* = true;
@@ -781,15 +782,16 @@ pub const CombinedAutocompleteProvider = struct {
                 closed.* = true;
                 return;
             }
-            if (buffer.items.len + n > max_async_output_bytes) {
+            const bytes = chunk[0..n];
+            if (buffer.items.len + bytes.len > max_async_output_bytes) {
                 const remaining = max_async_output_bytes - buffer.items.len;
                 if (remaining > 0) {
-                    buffer.appendSlice(arena, chunk[0..remaining]) catch {};
+                    buffer.appendSlice(arena, bytes[0..remaining]) catch {};
                 }
                 closed.* = true;
                 return;
             }
-            buffer.appendSlice(arena, chunk[0..n]) catch {
+            buffer.appendSlice(arena, bytes) catch {
                 closed.* = true;
                 return;
             };
@@ -800,7 +802,7 @@ pub const CombinedAutocompleteProvider = struct {
         defer self.cancelAsyncSearch();
 
         if (self.async_search.child) |*child| {
-            _ = child.wait() catch {};
+            _ = child.wait(std.Options.debug_io) catch {};
             self.async_search.child = null;
         }
         self.collectAsyncCandidates();
@@ -852,7 +854,7 @@ pub const CombinedAutocompleteProvider = struct {
         const arena = self.async_search.arenaAllocator();
         var iter = std.mem.splitScalar(u8, self.async_search.stdout_buf.items, '\n');
         while (iter.next()) |raw_line| {
-            const line = std.mem.trimRight(u8, raw_line, "\r");
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (line.len == 0) continue;
 
             const has_trailing_separator = std.mem.endsWith(u8, line, "/");
@@ -999,7 +1001,7 @@ pub const CombinedAutocompleteProvider = struct {
     }
 
     fn expandHomePath(self: *CombinedAutocompleteProvider, path: []const u8) ?[]const u8 {
-        const home = std.posix.getenv("HOME") orelse return null;
+        const home = @import("env").get("HOME") orelse return null;
         if (std.mem.eql(u8, path, "~")) return home;
         if (!std.mem.startsWith(u8, path, "~/")) return null;
 
@@ -1089,8 +1091,8 @@ fn currentLineStart(text: []const u8, cursor: u32) u32 {
 }
 
 fn isDirectoryAbsolute(path: []const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
-    defer dir.close();
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, path, .{}) catch return false;
+    defer dir.close(std.Options.debug_io);
     return true;
 }
 
@@ -1275,25 +1277,26 @@ fn appendEscapedRegex(builder: *std.ArrayList(u8), allocator: std.mem.Allocator,
 }
 
 fn setNonblocking(fd: std.posix.fd_t) !void {
-    var flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    flags |= 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags);
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.Unexpected;
+    var new_flags: std.c.O = @bitCast(@as(c_uint, @intCast(flags)));
+    new_flags.NONBLOCK = true;
+    if (std.c.fcntl(fd, std.c.F.SETFL, @as(c_uint, @bitCast(new_flags))) < 0) return error.Unexpected;
 }
 
 fn hasAsyncSearchBackend() bool {
-    return commandExists("fd") or commandExists("fdfind");
+    return commandExists("/opt/homebrew/bin/fd") or commandExists("/usr/local/bin/fd") or commandExists("fd") or commandExists("fdfind");
 }
 
 fn commandExists(command: []const u8) bool {
-    const result = std.process.Child.run(.{
-        .allocator = std.testing.allocator,
+    var child = std.process.spawn(std.Options.debug_io, .{
         .argv = &.{ command, "--version" },
-        .max_output_bytes = 1024,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch return false;
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-    return switch (result.term) {
-        .Exited => |code| code == 0,
+    const term = child.wait(std.Options.debug_io) catch return false;
+    return switch (term) {
+        .exited => |code| code == 0,
         else => false,
     };
 }
@@ -1383,15 +1386,15 @@ test "SlashCommandProvider apply inserts command" {
 test "CombinedAutocompleteProvider regular prose does not trigger bare path suggestions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "notes.md", .data = "hello" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
 
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
     defer provider.deinit();
     var sink = TestSink{};
 
@@ -1403,15 +1406,15 @@ test "CombinedAutocompleteProvider regular prose does not trigger bare path sugg
 test "CombinedAutocompleteProvider force tab completes slash command arguments with paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "notes.md", .data = "hello" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
 
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
     defer provider.deinit();
     var sink = TestSink{};
 
@@ -1430,17 +1433,17 @@ test "CombinedAutocompleteProvider async at-file search publishes on tick" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "notes.md", .data = "hello" });
-    try tmp.dir.makePath("docs");
-    try tmp.dir.writeFile(.{ .sub_path = "docs/guide.md", .data = "hi" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
+    try tmp.dir.createDirPath(std.Options.debug_io, "docs");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "docs/guide.md", .data = "hi" });
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
 
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
     defer provider.deinit();
     var sink = TestSink{};
 
@@ -1459,16 +1462,16 @@ test "CombinedAutocompleteProvider replaces stale at-file request before tick pu
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "guide.md", .data = "hello" });
-    try tmp.dir.writeFile(.{ .sub_path = "notes.md", .data = "world" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "guide.md", .data = "hello" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "world" });
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
 
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
     defer provider.deinit();
     var sink = TestSink{};
 
@@ -1486,22 +1489,22 @@ test "CombinedAutocompleteProvider async at-file search respects gitignore while
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "ignored/\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "visible.md", .data = "ok" });
-    try tmp.dir.makePath("ignored");
-    try tmp.dir.writeFile(.{ .sub_path = "ignored/secret.md", .data = "nope" });
-    try tmp.dir.makePath(".pi");
-    try tmp.dir.writeFile(.{ .sub_path = ".pi/config.json", .data = "{}" });
-    try tmp.dir.makePath(".git");
-    try tmp.dir.writeFile(.{ .sub_path = ".git/config", .data = "[core]" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".gitignore", .data = "ignored/\n" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "visible.md", .data = "ok" });
+    try tmp.dir.createDirPath(std.Options.debug_io, "ignored");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "ignored/secret.md", .data = "nope" });
+    try tmp.dir.createDirPath(std.Options.debug_io, ".pi");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".pi/config.json", .data = "{}" });
+    try tmp.dir.createDirPath(std.Options.debug_io, ".git");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".git/config", .data = "[core]" });
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
 
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
     defer provider.deinit();
     var sink = TestSink{};
 
@@ -1519,19 +1522,19 @@ test "CombinedAutocompleteProvider async at-file search excludes ignored scoped 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "ignored/\n" });
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = "src/keep.md", .data = "ok" });
-    try tmp.dir.makePath("ignored/src");
-    try tmp.dir.writeFile(.{ .sub_path = "ignored/src/secret.md", .data = "nope" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".gitignore", .data = "ignored/\n" });
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/keep.md", .data = "ok" });
+    try tmp.dir.createDirPath(std.Options.debug_io, "ignored/src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "ignored/src/secret.md", .data = "nope" });
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
 
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, cwd);
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
     defer provider.deinit();
     var sink = TestSink{};
 
@@ -1546,7 +1549,7 @@ test "CombinedAutocompleteProvider apply consumes trailing quote when completing
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, &reg, "/tmp");
+    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, "/tmp");
     defer provider.deinit();
     const item = SelectItem{ .value = "\"two words.txt\"", .label = "two words.txt" };
     const result = provider.applyImpl("\"tw\"", 3, &item, .{ .start_byte = 0, .end_byte = 3 }).?;

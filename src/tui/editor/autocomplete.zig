@@ -251,19 +251,18 @@ pub const AutocompleteSession = struct {
 const testing = std.testing;
 
 fn hasAsyncSearchBackend() bool {
-    return commandExists("fd") or commandExists("fdfind");
+    return commandExists("/opt/homebrew/bin/fd") or commandExists("/usr/local/bin/fd") or commandExists("fd") or commandExists("fdfind");
 }
 
 fn commandExists(command: []const u8) bool {
-    const result = std.process.Child.run(.{
-        .allocator = testing.allocator,
+    var child = std.process.spawn(std.Options.debug_io, .{
         .argv = &.{ command, "--version" },
-        .max_output_bytes = 1024,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch return false;
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-    return switch (result.term) {
-        .Exited => |code| code == 0,
+    const term = child.wait(std.Options.debug_io) catch return false;
+    return switch (term) {
+        .exited => |code| code == 0,
         else => false,
     };
 }
@@ -329,7 +328,7 @@ test "AutocompleteSession enter accepts slash command selection and requests sub
 }
 
 fn makeCombinedProvider(registry: *const @import("../../coding_agent/slash_commands.zig").CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
-    return CombinedAutocompleteProvider.init(testing.allocator, registry, cwd);
+    return CombinedAutocompleteProvider.init(testing.allocator, std.Options.debug_io, registry, cwd);
 }
 
 test "AutocompleteSession enter accepts file completion without submit" {
@@ -337,10 +336,10 @@ test "AutocompleteSession enter accepts file completion without submit" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "const x = 1;" });
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const x = 1;" });
 
-    const cwd = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
     defer testing.allocator.free(cwd);
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
@@ -369,10 +368,10 @@ test "AutocompleteSession tab on directory completion refreshes into the expande
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "const x = 1;" });
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const x = 1;" });
 
-    const cwd = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
     defer testing.allocator.free(cwd);
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
@@ -405,9 +404,9 @@ test "AutocompleteSession tab force-completes a single at-file suggestion after 
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "notes.md", .data = "hello" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
 
-    const cwd = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
     defer testing.allocator.free(cwd);
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);

@@ -1,12 +1,14 @@
 const std = @import("std");
 
 const max_piped_stdin_bytes = 100 * 1024 * 1024;
-const stdin_file: std.fs.File = .{ .handle = std.posix.STDIN_FILENO };
+const stdin_file: std.Io.File = .{ .handle = std.posix.STDIN_FILENO, .flags = .{ .nonblocking = false } };
 
 pub fn readPipedStdin(allocator: std.mem.Allocator) !?[]const u8 {
-    if (std.posix.isatty(stdin_file.handle)) return null;
+    if (try stdin_file.isTty(std.Options.debug_io)) return null;
 
-    const raw = try stdin_file.readToEndAlloc(allocator, max_piped_stdin_bytes);
+    var buf: [4096]u8 = undefined;
+    var reader = stdin_file.reader(std.Options.debug_io, &buf);
+    const raw = try reader.interface.allocRemaining(allocator, .limited(max_piped_stdin_bytes));
     return try normalizeOwnedPipedStdin(allocator, raw);
 }
 

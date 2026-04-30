@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const agent_mod = @import("../../agent3/root.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_mod = @import("../../agent/root.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const coding_agent_mod = @import("../../coding_agent/root.zig");
 
 const AgentEvent = agent_mod.protocol.AgentEvent;

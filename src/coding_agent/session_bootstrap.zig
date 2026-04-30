@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_mod = @import("../agent3/root.zig");
+const agent_mod = @import("../agent/root.zig");
 const session_runtime = @import("session/root.zig");
 const session_core = @import("../session/root.zig");
 const resources = @import("resources/root.zig");
@@ -167,6 +167,7 @@ pub const ExtensionRuntimeBundle = struct {
 
 pub const ReloadExtensionOptions = struct {
     resource_loader: resources.ResourceLoader,
+    io: std.Io = std.Options.debug_io,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
     tools: ?[]const tool_def.ToolDefinition = null,
     tool_allowlist: ?[]const []const u8 = null,
@@ -204,6 +205,7 @@ const BuiltinDefinitions = struct {
 
 const BuiltinOptions = struct {
     cwd: []const u8,
+    io: std.Io,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
     tools: ?[]const tool_def.ToolDefinition = null,
     session_id: []const u8 = "",
@@ -217,6 +219,7 @@ fn buildBuiltinDefinitions(allocator: std.mem.Allocator, options: BuiltinOptions
     else
         true;
     var bundle = try builtin_tools_mod.build(allocator, options.cwd, .{
+        .io = options.io,
         .image_auto_resize = image_auto_resize,
     });
     bundle.ctx.session_id = options.session_id;
@@ -230,6 +233,7 @@ fn buildBuiltinDefinitions(allocator: std.mem.Allocator, options: BuiltinOptions
 pub const PrepareOptions = struct {
     api_key: []const u8 = "",
     cwd: []const u8,
+    io: std.Io = std.Options.debug_io,
     resource_loader: ?resources.ResourceLoader = null,
     system_prompt: ?[]const u8 = null,
     context_files: []const resources.types.AgentsFile = &.{},
@@ -273,6 +277,7 @@ pub fn prepareSessionDeps(
 
     var builtins = try buildBuiltinDefinitions(allocator, .{
         .cwd = options.cwd,
+        .io = options.io,
         .settings_manager = options.settings_manager,
         .tools = options.tools,
         .session_id = session_store.sessionId(),
@@ -305,6 +310,7 @@ pub fn prepareSessionDeps(
     var extension_runtime = try buildExtensionRuntime(
         allocator,
         resource_loader,
+        options.io,
         builtins.definitions,
         options.tools != null,
         options.extension_generation,
@@ -356,6 +362,7 @@ pub fn prepareExtensionRuntimeBundle(
 ) !ExtensionRuntimeBundle {
     var builtins = try buildBuiltinDefinitions(allocator, .{
         .cwd = options.resource_loader.cwd,
+        .io = options.io,
         .settings_manager = options.settings_manager,
         .tools = options.tools,
         .session_id = options.session_id,
@@ -366,6 +373,7 @@ pub fn prepareExtensionRuntimeBundle(
     var extension_runtime = try buildExtensionRuntime(
         allocator,
         options.resource_loader,
+        options.io,
         builtins.definitions,
         options.tools != null,
         options.extension_generation,
@@ -558,6 +566,7 @@ const ExtensionRuntime = struct {
 fn buildExtensionRuntime(
     allocator: std.mem.Allocator,
     resource_loader: resources.ResourceLoader,
+    io: std.Io,
     builtin_definitions: []const tool_def.ToolDefinition,
     has_custom_tools: bool,
     generation: extension_runner_mod.Generation,
@@ -572,6 +581,7 @@ fn buildExtensionRuntime(
     const runner_ptr = allocator.create(ExtensionRunner) catch return runtime;
     errdefer allocator.destroy(runner_ptr);
     runner_ptr.* = ExtensionRunner.init(allocator, generation);
+    runner_ptr.io = io;
     runner_ptr.cwd = resource_loader.cwd;
     runner_ptr.builtin_tool_definitions = if (has_custom_tools) &.{} else builtin_definitions;
     runner_ptr.attachLuaState(state_ptr);
@@ -611,7 +621,7 @@ fn buildExtensionRuntime(
         defer shared_buf.deinit(allocator);
         for (lua_dirs.items) |d| {
             if (shared_buf.items.len > 0) shared_buf.append(allocator, ';') catch {};
-            shared_buf.writer(allocator).print("{s}/?.lua;{s}/?/init.lua", .{ d, d }) catch {};
+            shared_buf.print(allocator, "{s}/?.lua;{s}/?/init.lua", .{ d, d }) catch {};
         }
         runner_ptr.shared_lua_paths = allocator.dupe(u8, shared_buf.items) catch null;
     }
@@ -728,12 +738,12 @@ test "system prompt is built from ResourceLoader-owned inputs" {
 
     var cwd_tmp = testing.tmpDir(.{});
     defer cwd_tmp.cleanup();
-    const cwd = try cwd_tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try cwd_tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     var agent_tmp = testing.tmpDir(.{});
     defer agent_tmp.cleanup();
-    const agent_dir = try agent_tmp.dir.realpathAlloc(allocator, ".");
+    const agent_dir = try agent_tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(agent_dir);
 
     const context_files = [_]resources.types.AgentsFile{.{
@@ -966,8 +976,8 @@ test "stream closure derives request api key from oauth.getApiKey when the activ
     auth.set("proxy-oauth-key", .{ .oauth = .{
         .refresh = "refresh-token",
         .access = "access-token",
-        .expires = std.time.milliTimestamp() + 60_000,
-        .extras = std.json.ObjectMap.init(testing.allocator),
+        .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 60_000,
+        .extras = .{},
     } });
 
     var runner_ref: ExtensionRunnerRef = .{ .current = &runner };

@@ -16,7 +16,7 @@ pub fn prepareTerminal(self: *Interactive) !void {
     self.tui.terminal.enableBracketedPaste();
     self.tui.terminal.queryKittyProtocol();
     self.tui.terminal.enableMouseTracking();
-    self.kitty_deadline_ns = std.time.nanoTimestamp() + 150_000_000;
+    self.kitty_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + 150_000_000;
 }
 
 pub fn bindEditor(self: *Interactive) void {
@@ -41,7 +41,7 @@ pub fn bindRuntimeEvents(self: *Interactive) void {
 }
 
 pub fn bindAutocomplete(self: *Interactive) void {
-    self.autocomplete_provider = CombinedAutocompleteProvider.init(self.allocator, &self.command_registry, self.cwd);
+    self.autocomplete_provider = CombinedAutocompleteProvider.init(self.allocator, self.io, &self.command_registry, self.cwd);
     self.autocomplete_provider_bound = true;
     self.active_editor.setAutocompleteProvider(self.autocomplete_provider.provider());
 }

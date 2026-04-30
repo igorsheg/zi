@@ -6,7 +6,7 @@
 //! Supports limit + offset pagination.
 
 const std = @import("std");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("../../lib/output_buffer.zig");
@@ -71,17 +71,21 @@ fn execute(
         ctx.cwd,
     };
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    var child = std.process.spawn(ctx.io, .{
         .argv = &argv,
-        .max_output_bytes = 8 * 1024 * 1024,
+        .stdout = .pipe,
+        .stderr = .ignore,
     }) catch |err|
         return util.errorf(allocator, "find error: {s}", .{@errorName(err)});
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(ctx.io, &stdout_buf);
+    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024)) catch |err|
+        return util.errorf(allocator, "find read error: {s}", .{@errorName(err)});
+    defer allocator.free(stdout);
+    const term = child.wait(ctx.io) catch return util.errorResult(allocator, "find wait failed");
 
-    const code: u8 = switch (result.term) {
-        .Exited => |c| c,
+    const code: u8 = switch (term) {
+        .exited => |c| c,
         else => 2,
     };
 
@@ -91,11 +95,11 @@ fn execute(
         paths.deinit(allocator);
     }
 
-    var line_it = std.mem.splitScalar(u8, result.stdout, '\n');
+    var line_it = std.mem.splitScalar(u8, stdout, '\n');
     while (line_it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        const rel = std.fs.path.relative(allocator, ctx.cwd, trimmed) catch continue;
+        const rel = std.fs.path.relative(allocator, ctx.cwd, null, ctx.cwd, trimmed) catch continue;
         if (rel.len == 0 or std.mem.startsWith(u8, rel, "..")) {
             allocator.free(rel);
             continue;
@@ -108,12 +112,7 @@ fn execute(
 
     if (paths.items.len == 0) {
         if (code != 0 and code != 1) {
-            const stderr_t = std.mem.trim(u8, result.stderr, " \t\n\r");
-            if (stderr_t.len > 0) {
-                const dup = allocator.dupe(u8, stderr_t) catch
-                    return util.errorResult(allocator, "find failed");
-                return util.errorResult(allocator, dup);
-            }
+            return util.errorf(allocator, "find exited with code {d}", .{code});
         }
         return util.textResult(allocator, allocator.dupe(u8, "no files found matching pattern") catch "no files found matching pattern");
     }

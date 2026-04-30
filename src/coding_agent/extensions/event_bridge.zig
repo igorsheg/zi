@@ -26,7 +26,7 @@
 //! follow-up; out of scope here.
 
 const std = @import("std");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const ai_protocol = @import("../../ai/protocol.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
 const resource_types = @import("../resources/types.zig");
@@ -1273,8 +1273,8 @@ test "semantic message event exposes assistant text and tool calls" {
         \\end)
     , "subscribe_semantic_message");
 
-    var args = std.json.ObjectMap.init(testing.allocator);
-    defer args.deinit();
+    var args: std.json.ObjectMap = .{};
+    defer args.deinit(testing.allocator);
     const content = [_]ai_protocol.AssistantMessage.AssistantContentBlock{
         .{ .text = .{ .text = "hello" } },
         .{ .tool_call = .{ .id = "call-1", .name = "todo", .arguments = .{ .object = args } } },
@@ -1337,9 +1337,9 @@ test "event_bridge tool_execution_start exposes tool_name and args to handler" {
     , "subscribe");
 
     // Build a synthetic args JSON value: { command = "ls -la" }
-    var args_obj = std.json.ObjectMap.init(testing.allocator);
-    defer args_obj.deinit();
-    try args_obj.put("command", .{ .string = "ls -la" });
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(testing.allocator);
+    try args_obj.put(testing.allocator, "command", .{ .string = "ls -la" });
 
     try handleAgentEvent(&runner, .{
         .tool_execution_start = .{
@@ -1511,9 +1511,9 @@ test "beforeToolCall blocks tool execution when handler returns block=true" {
         \\end)
     , "subscribe");
 
-    var args_obj = std.json.ObjectMap.init(testing.allocator);
-    defer args_obj.deinit();
-    try args_obj.put("command", .{ .string = "rm -rf /" });
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(testing.allocator);
+    try args_obj.put(testing.allocator, "command", .{ .string = "rm -rf /" });
 
     const tc = ai_protocol.ToolCall{
         .id = "id-1",
@@ -1548,9 +1548,9 @@ test "beforeToolCall returns mutated args when handler rewrites them" {
         \\end)
     , "subscribe");
 
-    var args_obj = std.json.ObjectMap.init(testing.allocator);
-    defer args_obj.deinit();
-    try args_obj.put("command", .{ .string = "rm -rf /" });
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(testing.allocator);
+    try args_obj.put(testing.allocator, "command", .{ .string = "rm -rf /" });
 
     const tc = ai_protocol.ToolCall{
         .id = "id-2",

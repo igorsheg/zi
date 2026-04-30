@@ -28,7 +28,7 @@ pub const ExtensionPromptFlow = struct {
         const a = arena.allocator();
         const owned_prompt = try extension_ui.PromptRequest.clone(a, prompt);
         const deadline_ns = if (owned_prompt.timeout_ms) |ms|
-            std.time.nanoTimestamp() + @as(i128, @intCast(ms)) * std.time.ns_per_ms
+            @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + @as(i128, @intCast(ms)) * std.time.ns_per_ms
         else
             null;
 

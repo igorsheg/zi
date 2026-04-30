@@ -1,5 +1,5 @@
 const ai = @import("../../ai/root.zig");
-const agent_mod = @import("../../agent3/root.zig");
+const agent_mod = @import("../../agent/root.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
 const settings_types_mod = @import("../settings/types.zig");
 const event_bridge = @import("../extensions/event_bridge.zig");

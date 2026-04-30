@@ -74,7 +74,7 @@ pub const FileSettingsStorage = struct {
         const file = self.fileForScope(scope);
 
         // Check if file exists before locking (pi-mono: settings-manager.ts:185-188)
-        const file_exists = std.fs.cwd().access(file.path, .{}) != error.FileNotFound;
+        const file_exists = std.Io.Dir.cwd().access(std.Options.debug_io, file.path, .{}) != error.FileNotFound;
 
         var locked = false;
         if (file_exists) {

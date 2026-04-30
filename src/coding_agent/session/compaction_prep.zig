@@ -12,7 +12,7 @@
 //! Owned by slice zi-v3j.10.2.
 
 const std = @import("std");
-const agent = @import("../../agent3/root.zig");
+const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const proto = @import("../../session/protocol.zig");
 const context_mod = @import("../../session/context.zig");
@@ -505,7 +505,7 @@ fn appendAssistantParts(
             if (!first_tc) try tool_call_buf.appendSlice(allocator, "; ");
             const args_str = try stringifyJson(allocator, tc.arguments);
             defer allocator.free(args_str);
-            try tool_call_buf.writer(allocator).print("{s}({s})", .{ tc.name, args_str });
+            try tool_call_buf.print(allocator, "{s}({s})", .{ tc.name, args_str });
             first_tc = false;
         },
     };
@@ -545,7 +545,7 @@ fn truncateForSummary(allocator: std.mem.Allocator, text: []const u8, max_chars:
 }
 
 fn stringifyJson(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
     try jw.write(value);
@@ -626,8 +626,8 @@ fn testAssistantToolCallEntry(
     path: []const u8,
 ) !SessionEntry {
     const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
-    var args_obj: std.json.ObjectMap = .init(allocator);
-    try args_obj.put("path", .{ .string = path });
+    var args_obj: std.json.ObjectMap = .{};
+    try args_obj.put(allocator, "path", .{ .string = path });
     content[0] = .{ .tool_call = .{
         .id = "tc-1",
         .name = tool_name,

@@ -16,26 +16,26 @@ pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
 
     // github-copilot: multiple token sources
     if (eql(u8, provider, "github-copilot")) {
-        return std.posix.getenv("COPILOT_GITHUB_TOKEN") orelse
-            std.posix.getenv("GH_TOKEN") orelse
-            std.posix.getenv("GITHUB_TOKEN");
+        return @import("env").get("COPILOT_GITHUB_TOKEN") orelse
+            @import("env").get("GH_TOKEN") orelse
+            @import("env").get("GITHUB_TOKEN");
     }
 
     // anthropic: oauth token takes precedence over api key
     if (eql(u8, provider, "anthropic")) {
-        return std.posix.getenv("ANTHROPIC_OAUTH_TOKEN") orelse
-            std.posix.getenv("ANTHROPIC_API_KEY");
+        return @import("env").get("ANTHROPIC_OAUTH_TOKEN") orelse
+            @import("env").get("ANTHROPIC_API_KEY");
     }
 
     // google-vertex: explicit API key, or ADC env-var-based check
     if (eql(u8, provider, "google-vertex")) {
-        if (std.posix.getenv("GOOGLE_CLOUD_API_KEY")) |key| return key;
+        if (@import("env").get("GOOGLE_CLOUD_API_KEY")) |key| return key;
 
-        const has_project = std.posix.getenv("GOOGLE_CLOUD_PROJECT") != null or
-            std.posix.getenv("GCLOUD_PROJECT") != null;
-        const has_location = std.posix.getenv("GOOGLE_CLOUD_LOCATION") != null;
+        const has_project = @import("env").get("GOOGLE_CLOUD_PROJECT") != null or
+            @import("env").get("GCLOUD_PROJECT") != null;
+        const has_location = @import("env").get("GOOGLE_CLOUD_LOCATION") != null;
         // NOTE: skipping ADC file check (would need fs access). only env-var sources.
-        const has_creds = std.posix.getenv("GOOGLE_APPLICATION_CREDENTIALS") != null;
+        const has_creds = @import("env").get("GOOGLE_APPLICATION_CREDENTIALS") != null;
 
         if (has_creds and has_project and has_location) return "<authenticated>";
         return null;
@@ -43,19 +43,19 @@ pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
 
     // amazon-bedrock: multiple credential sources
     if (eql(u8, provider, "amazon-bedrock")) {
-        if (std.posix.getenv("AWS_PROFILE") != null) return "<authenticated>";
-        if (std.posix.getenv("AWS_ACCESS_KEY_ID") != null and
-            std.posix.getenv("AWS_SECRET_ACCESS_KEY") != null) return "<authenticated>";
-        if (std.posix.getenv("AWS_BEARER_TOKEN_BEDROCK") != null) return "<authenticated>";
-        if (std.posix.getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != null) return "<authenticated>";
-        if (std.posix.getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != null) return "<authenticated>";
-        if (std.posix.getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != null) return "<authenticated>";
+        if (@import("env").get("AWS_PROFILE") != null) return "<authenticated>";
+        if (@import("env").get("AWS_ACCESS_KEY_ID") != null and
+            @import("env").get("AWS_SECRET_ACCESS_KEY") != null) return "<authenticated>";
+        if (@import("env").get("AWS_BEARER_TOKEN_BEDROCK") != null) return "<authenticated>";
+        if (@import("env").get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != null) return "<authenticated>";
+        if (@import("env").get("AWS_CONTAINER_CREDENTIALS_FULL_URI") != null) return "<authenticated>";
+        if (@import("env").get("AWS_WEB_IDENTITY_TOKEN_FILE") != null) return "<authenticated>";
         return null;
     }
 
     // Standard provider → env var map
     const env_var = envVarForProvider(provider) orelse return null;
-    return std.posix.getenv(env_var);
+    return @import("env").get(env_var);
 }
 
 fn envVarForProvider(provider: []const u8) ?[:0]const u8 {

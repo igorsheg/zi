@@ -6,7 +6,6 @@ const control_mod = @import("control.zig");
 const conversation_state = @import("conversation_state.zig");
 const loop_mod = @import("loop.zig");
 const message_memory = @import("message_memory.zig");
-const profile = @import("../debug/profile.zig");
 const shared_committed_mod = @import("shared_committed.zig");
 const SharedCommitted = shared_committed_mod.SharedCommitted;
 const testing = std.testing;
@@ -400,8 +399,6 @@ pub const Agent = struct {
     }
 
     pub fn cloneConversationView(self: *const Agent, allocator: std.mem.Allocator) !conversation_state.ConversationView {
-        var clone_timer = profile.ScopedTimer.begin(.clone_conversation_view);
-        defer clone_timer.end();
 
         const in_flight = try self.in_flight.freeze(allocator);
         errdefer if (in_flight) |*frozen| {
@@ -719,7 +716,7 @@ fn emitMissingProviderError(
             },
             .stop_reason = .@"error",
             .error_message = err_message,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
         },
     } }, callback_ctx);
 }

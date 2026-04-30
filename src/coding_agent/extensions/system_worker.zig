@@ -23,6 +23,7 @@ pub const Request = struct {
 
 const Handler = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     result_sink: ?ResultSink = null,
 
     pub fn handle(self: *Handler, request: *Request) void {
@@ -48,7 +49,7 @@ const Handler = struct {
         for (request.env, 0..) |pair, i| {
             env_pairs[i] = .{ .key = pair.key, .value = pair.value };
         }
-        return system_command.run(self.allocator, .{
+        return system_command.run(self.allocator, self.io, .{
             .argv = request.argv,
             .cwd = request.cwd,
             .stdin = request.stdin,
@@ -70,12 +71,14 @@ const WorkerImpl = blocking_worker_mod.BlockingWorker(Request, Handler, .{
 
 pub const SystemWorker = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     worker: WorkerImpl,
 
-    pub fn init(allocator: std.mem.Allocator) !SystemWorker {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !SystemWorker {
         return .{
             .allocator = allocator,
-            .worker = try WorkerImpl.init(allocator, .{ .allocator = allocator }),
+            .io = io,
+            .worker = try WorkerImpl.init(allocator, .{ .allocator = allocator, .io = io }),
         };
     }
 
@@ -122,6 +125,7 @@ test "system worker publishes command result" {
     var sink = Sink{};
     var handler = Handler{
         .allocator = allocator,
+        .io = std.Options.debug_io,
         .result_sink = .{ .ptr = @ptrCast(&sink), .submit = &Sink.submit },
     };
     var request = Request{

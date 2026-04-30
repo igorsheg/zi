@@ -19,7 +19,7 @@ pub fn resolveConfigValue(config: []const u8) ?[]const u8 {
     if (config.len > 0 and config[0] == '!') {
         return executeCommand(config);
     }
-    if (std.posix.getenv(config)) |env_val| {
+    if (@import("env").get(config)) |env_val| {
         return env_val;
     }
     return config;
@@ -31,7 +31,7 @@ pub fn resolveConfigValueUncached(config: []const u8) ?[]const u8 {
     if (config.len > 0 and config[0] == '!') {
         return executeCommandUncached(config);
     }
-    if (std.posix.getenv(config)) |env_val| {
+    if (@import("env").get(config)) |env_val| {
         return env_val;
     }
     return config;
@@ -97,20 +97,23 @@ fn executeCommandUncached(config: []const u8) ?[]const u8 {
     const command = config[1..]; // strip "!"
     if (command.len == 0) return null;
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    var child = std.process.spawn(std.Options.debug_io, .{
         .argv = &.{ "/bin/sh", "-c", command },
-        .max_output_bytes = 50 * 1024,
+        .stdout = .pipe,
+        .stderr = .ignore,
     }) catch return null;
 
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(std.Options.debug_io, &stdout_buf);
+    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(50 * 1024)) catch return null;
+    defer allocator.free(stdout);
 
-    if (result.term != .Exited or result.term.Exited != 0) {
+    const term = child.wait(std.Options.debug_io) catch return null;
+    if (term != .exited or term.exited != 0) {
         return null;
     }
 
-    const trimmed = string_util.dupeTrimmed(allocator, result.stdout, &std.ascii.whitespace) catch return null;
+    const trimmed = string_util.dupeTrimmed(allocator, stdout, &std.ascii.whitespace) catch return null;
     errdefer allocator.free(trimmed);
     if (trimmed.len == 0) {
         return null;

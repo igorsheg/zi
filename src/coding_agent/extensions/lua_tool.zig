@@ -25,7 +25,7 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const abort_signal_mod = @import("../../abort_signal.zig");
 const ai = @import("../../ai/root.zig");
 const api = @import("api.zig");
@@ -218,6 +218,7 @@ fn serviceYieldedToolCoroutine(
 
     const cfg = spawn_types.SpawnConfig{
         .allocator = runner.allocator,
+        .io = runner.io,
         .cwd = req.cwd,
         .task = req.task,
         .model = req.model,
@@ -238,26 +239,26 @@ fn spawnResultToToolResult(allocator: std.mem.Allocator, spawn_result: spawn_typ
     const text = spawn_result.text() orelse "";
     var result = try textResult(allocator, text, spawn_result.exit_code != 0);
 
-    var out = std.json.ObjectMap.init(allocator);
+    var out: std.json.ObjectMap = .{};
     errdefer {
         const v: std.json.Value = .{ .object = out };
         lua_runtime.freeJsonValue(allocator, v);
     }
 
-    try out.put(try allocator.dupe(u8, "cancelled"), .{ .bool = spawn_result.cancelled });
-    if (spawn_result.model) |m| try out.put(try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, m) });
-    if (spawn_result.stop_reason) |sr| try out.put(try allocator.dupe(u8, "stop_reason"), .{ .string = try allocator.dupe(u8, sr) });
-    if (spawn_result.error_message) |em| try out.put(try allocator.dupe(u8, "error_message"), .{ .string = try allocator.dupe(u8, em) });
+    try out.put(allocator, try allocator.dupe(u8, "cancelled"), .{ .bool = spawn_result.cancelled });
+    if (spawn_result.model) |m| try out.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, m) });
+    if (spawn_result.stop_reason) |sr| try out.put(allocator, try allocator.dupe(u8, "stop_reason"), .{ .string = try allocator.dupe(u8, sr) });
+    if (spawn_result.error_message) |em| try out.put(allocator, try allocator.dupe(u8, "error_message"), .{ .string = try allocator.dupe(u8, em) });
 
-    var usage = std.json.ObjectMap.init(allocator);
-    try usage.put(try allocator.dupe(u8, "input"), .{ .integer = @intCast(spawn_result.usage.input) });
-    try usage.put(try allocator.dupe(u8, "output"), .{ .integer = @intCast(spawn_result.usage.output) });
-    try usage.put(try allocator.dupe(u8, "cache_read"), .{ .integer = @intCast(spawn_result.usage.cache_read) });
-    try usage.put(try allocator.dupe(u8, "cache_write"), .{ .integer = @intCast(spawn_result.usage.cache_write) });
-    try usage.put(try allocator.dupe(u8, "total_tokens"), .{ .integer = @intCast(spawn_result.usage.context_tokens) });
-    try usage.put(try allocator.dupe(u8, "cost"), .{ .float = spawn_result.usage.cost });
-    try usage.put(try allocator.dupe(u8, "turns"), .{ .integer = @intCast(spawn_result.usage.turns) });
-    try out.put(try allocator.dupe(u8, "usage"), .{ .object = usage });
+    var usage: std.json.ObjectMap = .{};
+    try usage.put(allocator, try allocator.dupe(u8, "input"), .{ .integer = @intCast(spawn_result.usage.input) });
+    try usage.put(allocator, try allocator.dupe(u8, "output"), .{ .integer = @intCast(spawn_result.usage.output) });
+    try usage.put(allocator, try allocator.dupe(u8, "cache_read"), .{ .integer = @intCast(spawn_result.usage.cache_read) });
+    try usage.put(allocator, try allocator.dupe(u8, "cache_write"), .{ .integer = @intCast(spawn_result.usage.cache_write) });
+    try usage.put(allocator, try allocator.dupe(u8, "total_tokens"), .{ .integer = @intCast(spawn_result.usage.context_tokens) });
+    try usage.put(allocator, try allocator.dupe(u8, "cost"), .{ .float = spawn_result.usage.cost });
+    try usage.put(allocator, try allocator.dupe(u8, "turns"), .{ .integer = @intCast(spawn_result.usage.turns) });
+    try out.put(allocator, try allocator.dupe(u8, "usage"), .{ .object = usage });
 
     result.details = .{ .object = out };
     return result;
@@ -484,14 +485,14 @@ fn testGetModel(_: *anyopaque) agent_protocol.Model {
 }
 
 fn testModelJson(allocator: std.mem.Allocator, model: agent_protocol.Model) !std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
-    try obj.put(try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, model.id) });
-    try obj.put(try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, model.name) });
-    try obj.put(try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, ai.json_util.providerToString(model.provider)) });
-    try obj.put(try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, ai.provider.apiToString(model.api)) });
-    try obj.put(try allocator.dupe(u8, "context_window"), .{ .integer = @intCast(model.context_window) });
-    try obj.put(try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(model.max_tokens) });
-    try obj.put(try allocator.dupe(u8, "reasoning"), .{ .bool = model.reasoning });
+    var obj: std.json.ObjectMap = .{};
+    try obj.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, model.id) });
+    try obj.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, model.name) });
+    try obj.put(allocator, try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, ai.json_util.providerToString(model.provider)) });
+    try obj.put(allocator, try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, ai.provider.apiToString(model.api)) });
+    try obj.put(allocator, try allocator.dupe(u8, "context_window"), .{ .integer = @intCast(model.context_window) });
+    try obj.put(allocator, try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(model.max_tokens) });
+    try obj.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .bool = model.reasoning });
     return .{ .object = obj };
 }
 
@@ -782,11 +783,11 @@ fn loadToolOverrideFixture(state: *lua_runtime.LuaState, runner: *runner_mod.Ext
 }
 
 fn todoArgs(allocator: std.mem.Allocator, action: []const u8, text: ?[]const u8, id: ?i64) !std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
-    errdefer obj.deinit();
-    try obj.put("action", .{ .string = action });
-    if (text) |value| try obj.put("text", .{ .string = value });
-    if (id) |value| try obj.put("id", .{ .integer = value });
+    var obj: std.json.ObjectMap = .{};
+    errdefer obj.deinit(allocator);
+    try obj.put(allocator, "action", .{ .string = action });
+    if (text) |value| try obj.put(allocator, "text", .{ .string = value });
+    if (id) |value| try obj.put(allocator, "id", .{ .integer = value });
     return .{ .object = obj };
 }
 
@@ -834,8 +835,8 @@ test "tool override example keeps extension read while preserving builtin render
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var args_obj = std.json.ObjectMap.init(allocator);
-    try args_obj.put("path", .{ .string = ".env" });
+    var args_obj: std.json.ObjectMap = .{};
+    try args_obj.put(allocator, "path", .{ .string = ".env" });
     const result = agent_tool.execute(agent_tool.ctx, allocator, "read-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
     try testing.expect(result.is_error);
     try testing.expectEqualStrings("Access denied: .env", result.content[0].text.text);
@@ -972,12 +973,12 @@ const TestStateStore = struct {
     }
 
     fn sessionInfo(session: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
-        var obj = std.json.ObjectMap.init(allocator);
-        obj.put(allocator.dupe(u8, "id") catch return null, .{ .string = allocator.dupe(u8, "session-test") catch return null }) catch return null;
-        obj.put(allocator.dupe(u8, "cwd") catch return null, .{ .string = allocator.dupe(u8, "/tmp/project") catch return null }) catch return null;
-        obj.put(allocator.dupe(u8, "file") catch return null, .null) catch return null;
+        var obj: std.json.ObjectMap = .{};
+        obj.put(allocator, allocator.dupe(u8, "id") catch return null, .{ .string = allocator.dupe(u8, "session-test") catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "cwd") catch return null, .{ .string = allocator.dupe(u8, "/tmp/project") catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "file") catch return null, .null) catch return null;
         const self: *TestStateStore = @ptrCast(@alignCast(session));
-        obj.put(allocator.dupe(u8, "name") catch return null, if (self.session_name) |name| .{ .string = allocator.dupe(u8, name) catch return null } else .null) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "name") catch return null, if (self.session_name) |name| .{ .string = allocator.dupe(u8, name) catch return null } else .null) catch return null;
         return .{ .object = obj };
     }
 
@@ -996,14 +997,14 @@ const TestStateStore = struct {
         _ = session;
         var arr = std.json.Array.init(allocator);
         if (std.mem.eql(u8, tool_name, "todo")) {
-            var details = std.json.ObjectMap.init(allocator);
-            details.put(allocator.dupe(u8, "nextId") catch return null, .{ .integer = 2 }) catch return null;
-            var obj = std.json.ObjectMap.init(allocator);
-            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-1") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "tool_call_id") catch return null, .{ .string = allocator.dupe(u8, "call-1") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "tool_name") catch return null, .{ .string = allocator.dupe(u8, "todo") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "details") catch return null, .{ .object = details }) catch return null;
-            obj.put(allocator.dupe(u8, "is_error") catch return null, .{ .bool = false }) catch return null;
+            var details: std.json.ObjectMap = .{};
+            details.put(allocator, allocator.dupe(u8, "nextId") catch return null, .{ .integer = 2 }) catch return null;
+            var obj: std.json.ObjectMap = .{};
+            obj.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-1") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "tool_call_id") catch return null, .{ .string = allocator.dupe(u8, "call-1") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "tool_name") catch return null, .{ .string = allocator.dupe(u8, "todo") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "details") catch return null, .{ .object = details }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "is_error") catch return null, .{ .bool = false }) catch return null;
             arr.append(.{ .object = obj }) catch return null;
         }
         return .{ .array = arr };
@@ -1031,11 +1032,11 @@ const TestStateStore = struct {
             const source = self.note_source_entry_id orelse return .{ .array = arr };
             if (!std.mem.eql(u8, wanted, source)) return .{ .array = arr };
         }
-        var obj = std.json.ObjectMap.init(allocator);
-        obj.put(allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, note_kind) catch return null }) catch return null;
-        if (self.note_title) |title| obj.put(allocator.dupe(u8, "title") catch return null, .{ .string = allocator.dupe(u8, title) catch return null }) catch return null;
-        if (self.note_source_entry_id) |source| obj.put(allocator.dupe(u8, "source_entry_id") catch return null, .{ .string = allocator.dupe(u8, source) catch return null }) catch return null;
-        obj.put(allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
+        var obj: std.json.ObjectMap = .{};
+        obj.put(allocator, allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, note_kind) catch return null }) catch return null;
+        if (self.note_title) |title| obj.put(allocator, allocator.dupe(u8, "title") catch return null, .{ .string = allocator.dupe(u8, title) catch return null }) catch return null;
+        if (self.note_source_entry_id) |source| obj.put(allocator, allocator.dupe(u8, "source_entry_id") catch return null, .{ .string = allocator.dupe(u8, source) catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
         arr.append(.{ .object = obj }) catch return null;
         return .{ .array = arr };
     }
@@ -1055,30 +1056,30 @@ const TestStateStore = struct {
     fn entry(session: *anyopaque, allocator: std.mem.Allocator, entry_id: []const u8) ?std.json.Value {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         if (std.mem.eql(u8, entry_id, "message-1")) {
-            var obj = std.json.ObjectMap.init(allocator);
-            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "message-1") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "message") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "user") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hello") catch return null }) catch return null;
+            var obj: std.json.ObjectMap = .{};
+            obj.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "message-1") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "message") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "user") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hello") catch return null }) catch return null;
             return .{ .object = obj };
         }
         if (std.mem.eql(u8, entry_id, "note-1")) {
             const note_kind = self.note_kind orelse return null;
-            var obj = std.json.ObjectMap.init(allocator);
-            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "note-1") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "extension_note") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, note_kind) catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
-            if (self.note_source_entry_id) |source| obj.put(allocator.dupe(u8, "source_entry_id") catch return null, .{ .string = allocator.dupe(u8, source) catch return null }) catch return null;
+            var obj: std.json.ObjectMap = .{};
+            obj.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "note-1") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "extension_note") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, note_kind) catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
+            if (self.note_source_entry_id) |source| obj.put(allocator, allocator.dupe(u8, "source_entry_id") catch return null, .{ .string = allocator.dupe(u8, source) catch return null }) catch return null;
             return .{ .object = obj };
         }
         if (std.mem.eql(u8, entry_id, "label-1")) {
             const target = self.label_target_entry_id orelse return null;
-            var obj = std.json.ObjectMap.init(allocator);
-            obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "label-1") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "label") catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "target_entry_id") catch return null, .{ .string = allocator.dupe(u8, target) catch return null }) catch return null;
-            obj.put(allocator.dupe(u8, "label") catch return null, if (self.label_value) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
+            var obj: std.json.ObjectMap = .{};
+            obj.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "label-1") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "label") catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "target_entry_id") catch return null, .{ .string = allocator.dupe(u8, target) catch return null }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "label") catch return null, if (self.label_value) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
             return .{ .object = obj };
         }
         return null;
@@ -1097,11 +1098,11 @@ const TestStateStore = struct {
     fn appendLabeledTestEntry(allocator: std.mem.Allocator, arr: *std.json.Array, self: *TestStateStore, target_entry_id: []const u8, wanted_label: []const u8, text: []const u8) !void {
         const current = self.latestLabel(target_entry_id) orelse return;
         if (!std.mem.eql(u8, current, wanted_label)) return;
-        var obj = std.json.ObjectMap.init(allocator);
-        try obj.put(try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, target_entry_id) });
-        try obj.put(try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "message") });
-        try obj.put(try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "user") });
-        try obj.put(try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+        var obj: std.json.ObjectMap = .{};
+        try obj.put(allocator, try allocator.dupe(u8, "entry_id"), .{ .string = try allocator.dupe(u8, target_entry_id) });
+        try obj.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "message") });
+        try obj.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "user") });
+        try obj.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
         try arr.append(.{ .object = obj });
     }
 
@@ -1122,10 +1123,10 @@ const TestStateStore = struct {
         var arr = std.json.Array.init(allocator);
         const target = self.label_target_entry_id orelse return .{ .array = arr };
         if (target_entry_id) |wanted| if (!std.mem.eql(u8, wanted, target)) return .{ .array = arr };
-        var obj = std.json.ObjectMap.init(allocator);
-        obj.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "label-1") catch return null }) catch return null;
-        obj.put(allocator.dupe(u8, "target_entry_id") catch return null, .{ .string = allocator.dupe(u8, target) catch return null }) catch return null;
-        obj.put(allocator.dupe(u8, "label") catch return null, if (self.label_value) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
+        var obj: std.json.ObjectMap = .{};
+        obj.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "label-1") catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "target_entry_id") catch return null, .{ .string = allocator.dupe(u8, target) catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "label") catch return null, if (self.label_value) |value| .{ .string = allocator.dupe(u8, value) catch return null } else .null) catch return null;
         arr.append(.{ .object = obj }) catch return null;
         return .{ .array = arr };
     }
@@ -1135,16 +1136,16 @@ const TestStateStore = struct {
         _ = include_tools;
         var arr = std.json.Array.init(allocator);
         if (limit != 1) {
-            var first = std.json.ObjectMap.init(allocator);
-            first.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-1") catch return null }) catch return null;
-            first.put(allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "user") catch return null }) catch return null;
-            first.put(allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hello") catch return null }) catch return null;
+            var first: std.json.ObjectMap = .{};
+            first.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-1") catch return null }) catch return null;
+            first.put(allocator, allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "user") catch return null }) catch return null;
+            first.put(allocator, allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hello") catch return null }) catch return null;
             arr.append(.{ .object = first }) catch return null;
         }
-        var second = std.json.ObjectMap.init(allocator);
-        second.put(allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-2") catch return null }) catch return null;
-        second.put(allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "assistant") catch return null }) catch return null;
-        second.put(allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hi") catch return null }) catch return null;
+        var second: std.json.ObjectMap = .{};
+        second.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "entry-2") catch return null }) catch return null;
+        second.put(allocator, allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "assistant") catch return null }) catch return null;
+        second.put(allocator, allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hi") catch return null }) catch return null;
         arr.append(.{ .object = second }) catch return null;
         return .{ .array = arr };
     }
@@ -2111,9 +2112,9 @@ test "lua tool returning a string produces a single text content block" {
     const ext_tool = runner.tool_registry.get("echo").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
 
-    var args_obj = std.json.ObjectMap.init(testing.allocator);
-    defer args_obj.deinit();
-    try args_obj.put("who", .{ .string = "zi" });
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(testing.allocator);
+    try args_obj.put(testing.allocator, "who", .{ .string = "zi" });
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

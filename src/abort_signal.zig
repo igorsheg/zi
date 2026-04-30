@@ -56,12 +56,12 @@ pub const AbortSignal = struct {
         };
 
         const deadline_ns: ?i128 = if (timeout_ns) |timeout|
-            std.time.nanoTimestamp() + @as(i128, @intCast(timeout))
+            @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + @as(i128, @intCast(timeout))
         else
             null;
 
-        controller.mutex.lock();
-        defer controller.mutex.unlock();
+        controller.mutex.lockUncancelable(std.Options.debug_io);
+        defer controller.mutex.unlock(std.Options.debug_io);
 
         while (true) {
             if (self.isAborted()) return .aborted;
@@ -70,14 +70,14 @@ pub const AbortSignal = struct {
             }
 
             if (deadline_ns) |deadline| {
-                const now = std.time.nanoTimestamp();
+                const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
                 if (now >= deadline) return .timeout;
-                const remaining = @as(u64, @intCast(deadline - now));
-                controller.condition.timedWait(&controller.mutex, remaining) catch |err| switch (err) {
-                    error.Timeout => continue,
-                };
+                const remaining = @as(i96, @intCast(deadline - now));
+                controller.mutex.unlock(std.Options.debug_io);
+                std.Options.debug_io.sleep(.fromNanoseconds(remaining), .awake) catch {};
+                controller.mutex.lockUncancelable(std.Options.debug_io);
             } else {
-                controller.condition.wait(&controller.mutex);
+                controller.condition.waitUncancelable(std.Options.debug_io, &controller.mutex);
             }
         }
     }
@@ -95,19 +95,19 @@ pub const AbortSignal = struct {
 /// One owner mutates it (`beginRun`, `requestAbort`); readers receive
 /// `AbortSignal` snapshots that stay valid for the lifetime of the run.
 pub const AbortController = struct {
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
 
     pub fn beginRun(self: *AbortController) AbortSignal {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         self.aborted.store(true, .release);
         const next_generation = self.generation.load(.acquire) + 1;
         self.generation.store(next_generation, .release);
-        self.condition.broadcast();
+        self.condition.broadcast(std.Options.debug_io);
         self.aborted.store(false, .release);
 
         return .{
@@ -129,7 +129,7 @@ pub const AbortController = struct {
     }
 
     pub fn notifyWaiters(self: *AbortController) void {
-        self.condition.broadcast();
+        self.condition.broadcast(std.Options.debug_io);
     }
 
     pub fn isAborted(self: *const AbortController) bool {
@@ -174,7 +174,7 @@ test "AbortSignal.waitUntil wakes for abort without polling" {
     var ctx: WaitCtx = .{ .signal = signal, .result = &result };
     const thread = try std.Thread.spawn(.{}, WaitCtx.run, .{&ctx});
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    std.Options.debug_io.sleep(.fromNanoseconds(@intCast(10 * std.time.ns_per_ms)), .awake) catch {};
     controller.requestAbort();
     thread.join();
     try std.testing.expectEqual(.aborted, result);

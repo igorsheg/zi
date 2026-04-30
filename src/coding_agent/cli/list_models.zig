@@ -7,7 +7,7 @@ const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const plan = @import("plan.zig");
 
-const stdout: std.fs.File = .{ .handle = std.posix.STDOUT_FILENO };
+const stdout: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
 const Model = ai.protocol.Model;
 
 const ColumnWidths = struct {
@@ -25,7 +25,7 @@ pub fn run(
     options: plan.ListModelsPlan,
 ) !result.ExecutionResult {
     var out_buf: [4096]u8 = undefined;
-    var out_writer = stdout.writer(&out_buf);
+    var out_writer = stdout.writer(std.Options.debug_io, &out_buf);
     try writeListModels(&out_writer.interface, allocator, runtime, options);
     try out_writer.end();
     return .ok;
@@ -237,6 +237,7 @@ const TestRuntime = struct {
     fn runtime(self: *TestRuntime) runtime_mod.Runtime {
         return .{
             .allocator = self.allocator,
+            .io = std.Options.debug_io,
             .cwd = "/test",
             .auth_storage = &self.auth_storage,
             .settings_manager = undefined,

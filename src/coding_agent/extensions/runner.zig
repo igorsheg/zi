@@ -2,7 +2,7 @@ const std = @import("std");
 const registries = @import("registries/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../abort_signal.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const session_core = @import("../../session/root.zig");
 const ai = @import("../../ai/root.zig");
 const resource_types = @import("../resources/types.zig");
@@ -363,6 +363,7 @@ pub const LoadContext = struct {
 
 pub const ExtensionRunner = struct {
     allocator: std.mem.Allocator,
+    io: std.Io = std.Options.debug_io,
 
     /// Monotonic generation identifier. Never reused across reloads.
     generation: Generation,
@@ -1272,14 +1273,14 @@ pub const ExtensionRunner = struct {
             else => return error.InvalidOAuthCredential,
         };
 
-        var extras = std.json.ObjectMap.init(allocator);
+        var extras: std.json.ObjectMap = .{};
         errdefer {
             var eit = extras.iterator();
             while (eit.next()) |e| {
                 allocator.free(e.key_ptr.*);
                 ai.json_util.freeJsonValue(allocator, e.value_ptr.*);
             }
-            extras.deinit();
+            extras.deinit(allocator);
         }
 
         c.lua_pushnil(L);
@@ -1291,7 +1292,7 @@ pub const ExtensionRunner = struct {
             const duped_key = try allocator.dupe(u8, key);
             errdefer allocator.free(duped_key);
             const value = try lua_runtime.luaValueToJson(L, -1, allocator);
-            try extras.put(duped_key, value);
+            try extras.put(allocator, duped_key, value);
         }
 
         return .{
@@ -1332,7 +1333,7 @@ pub const ExtensionRunner = struct {
         // Private root first.
         if (provenance) |prov| {
             if (self.module_roots.get(prov.state_owner_id)) |private_root| {
-                buf.writer(self.allocator).print("{s}/?.lua;{s}/?/init.lua", .{ private_root, private_root }) catch {};
+                buf.print(self.allocator, "{s}/?.lua;{s}/?/init.lua", .{ private_root, private_root }) catch {};
             }
         }
 
@@ -1549,7 +1550,7 @@ test "dispatchOAuthGetApiKey executes the claim callback on the lua-owning threa
         .refresh = try allocator.dupe(u8, "refresh-token"),
         .access = try allocator.dupe(u8, "access-token"),
         .expires = 1234,
-        .extras = std.json.ObjectMap.init(allocator),
+        .extras = .{},
     };
     defer auth_types.deinitOAuthCredential(allocator, &credential);
 
@@ -1625,7 +1626,7 @@ test "ExtensionRunner registries survive populated deinit" {
     defer runner.deinit();
 
     // Tool: ownership transferred to registry on accept.
-    const params = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    const params = std.json.Value{ .object = .{} };
     const accepted = try runner.tool_registry.register(.{
         .name = try allocator.dupe(u8, "task"),
         .label = try allocator.dupe(u8, "Task"),

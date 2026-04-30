@@ -48,7 +48,7 @@ const runner_mod = @import("runner.zig");
 const tool_registry_mod = @import("registries/tool_registry.zig");
 const theme_mod = @import("../../tui/theme.zig");
 const theme_tokens = @import("../../themes/tokens.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_renderer);
@@ -603,9 +603,9 @@ test "dispatchRenderCall parses args into an owned call presentation document" {
         \\})
     , "register");
 
-    var args_obj = std.json.ObjectMap.init(testing.allocator);
-    defer args_obj.deinit();
-    try args_obj.put("path", .{ .string = "src/main.zig" });
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(testing.allocator);
+    try args_obj.put(testing.allocator, "path", .{ .string = "src/main.zig" });
 
     const out = dispatchRenderCall(testing.allocator, &runner, .{
         .tool_name = "callable",

@@ -10,7 +10,7 @@ const ai = @import("../ai/root.zig");
 
 const Stringify = std.json.Stringify;
 
-pub fn writeAgentEvent(writer: *std.io.Writer, event: protocol.AgentEvent) !void {
+pub fn writeAgentEvent(writer: *std.Io.Writer, event: protocol.AgentEvent) !void {
     var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();

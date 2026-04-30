@@ -5,11 +5,14 @@ pub const std_options: std.Options = .{
     .logFn = logging.logFn,
 };
 
+pub var std_options_debug_threaded_io_storage: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+pub const std_options_debug_threaded_io: *std.Io.Threaded = &std_options_debug_threaded_io_storage;
+
 test {
+    std.Io.Threaded.global_single_threaded.allocator = std.heap.smp_allocator;
     logging.setThreadLabel(.@"test");
     _ = @import("abort_signal.zig");
     _ = @import("storage.zig");
-    _ = @import("debug/tracked_allocator.zig");
     _ = @import("logging.zig");
     _ = @import("ai/root.zig");
     _ = @import("json/root.zig");
@@ -19,7 +22,7 @@ test {
     _ = @import("coding_agent/cli/help.zig");
     _ = @import("coding_agent/cli/initial_message.zig");
     _ = @import("coding_agent/cli/run_interactive.zig");
-    _ = @import("agent3/root.zig");
+    _ = @import("agent/root.zig");
     _ = @import("coding_agent/session/root.zig");
     _ = @import("coding_agent/root.zig");
     _ = @import("coding_agent/system_prompt.zig");

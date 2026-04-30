@@ -105,7 +105,7 @@ fn runLoop(
     event_ctx: ?*anyopaque,
 ) void {
     const trace = openTraceFile();
-    defer if (trace) |f| f.close();
+    defer if (trace) |f| f.close(std.Options.debug_io);
 
     var first_turn = true;
 
@@ -349,8 +349,8 @@ const WorkerToolUpdate = struct {
 
 const WorkerUpdateQueue = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     updates: std.ArrayList(WorkerToolUpdate) = .empty,
 
     fn init(allocator: std.mem.Allocator) WorkerUpdateQueue {
@@ -367,20 +367,20 @@ const WorkerUpdateQueue = struct {
     }
 
     fn enqueue(self: *WorkerUpdateQueue, update: WorkerToolUpdate) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         self.updates.append(self.allocator, update) catch {
             var dropped = update;
             dropped.deinit(self.allocator);
             return;
         };
-        self.condition.broadcast();
+        self.condition.broadcast(std.Options.debug_io);
     }
 
     fn drainInto(self: *WorkerUpdateQueue, out: *std.ArrayListUnmanaged(WorkerToolUpdate), allocator: std.mem.Allocator) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         for (self.updates.items) |update| {
             out.append(allocator, update) catch {
@@ -392,19 +392,19 @@ const WorkerUpdateQueue = struct {
     }
 
     fn waitForActivity(self: *WorkerUpdateQueue, timeout_ns: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.updates.items.len > 0) return;
-        self.condition.timedWait(&self.mutex, timeout_ns) catch |err| switch (err) {
-            error.Timeout => {},
-        };
+        self.mutex.unlock(std.Options.debug_io);
+        std.Options.debug_io.sleep(.fromNanoseconds(@intCast(timeout_ns)), .awake) catch {};
+        self.mutex.lockUncancelable(std.Options.debug_io);
     }
 
     fn notify(self: *WorkerUpdateQueue) void {
-        self.mutex.lock();
-        self.condition.broadcast();
-        self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        self.condition.broadcast(std.Options.debug_io);
+        self.mutex.unlock(std.Options.debug_io);
     }
 };
 
@@ -751,7 +751,7 @@ fn finalizePreparedToolCall(
         .content = trm_content.items,
         .details = final_details,
         .is_error = final_is_error,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
     const tool_result_msg = message_memory.cloneToolResultMessage(run_allocator, unowned_tool_result_msg) catch unowned_tool_result_msg;
 
@@ -943,9 +943,9 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = &.{},
-        .details = .{ .object = std.json.ObjectMap.init(allocator) },
+        .details = .{ .object = .{} },
         .is_error = true,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
     errdefer allocator.free(owned_text);
 
@@ -953,18 +953,18 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = &.{},
-        .details = .{ .object = std.json.ObjectMap.init(allocator) },
+        .details = .{ .object = .{} },
         .is_error = true,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
     content[0] = .{ .text = .{ .text = owned_text } };
     return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = content,
-        .details = .{ .object = std.json.ObjectMap.init(allocator) },
+        .details = .{ .object = .{} },
         .is_error = true,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
 }
 
@@ -1000,7 +1000,7 @@ test "makeErrorToolResult owns copied text" {
         allocator.free(result.content[0].text.text);
         allocator.free(result.content);
         var details = result.details.?.object;
-        details.deinit();
+        details.deinit(allocator);
     }
 
     try std.testing.expectEqual(@as(usize, 1), result.content.len);
@@ -1010,17 +1010,17 @@ test "makeErrorToolResult owns copied text" {
 }
 
 test "validateToolArguments rejects missing required field" {
-    var schema_obj = std.json.ObjectMap.init(std.testing.allocator);
-    defer schema_obj.deinit();
-    try schema_obj.put("type", .{ .string = "object" });
+    var schema_obj: std.json.ObjectMap = .{};
+    defer schema_obj.deinit(std.testing.allocator);
+    try schema_obj.put(std.testing.allocator, "type", .{ .string = "object" });
 
     var required = std.json.Array.init(std.testing.allocator);
     defer required.deinit();
     try required.append(.{ .string = "path" });
-    try schema_obj.put("required", .{ .array = required });
+    try schema_obj.put(std.testing.allocator, "required", .{ .array = required });
 
-    var args_obj = std.json.ObjectMap.init(std.testing.allocator);
-    defer args_obj.deinit();
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(std.testing.allocator);
 
     const err_msg = validateToolArguments(
         std.testing.allocator,
@@ -1061,7 +1061,7 @@ test "parallel worker tools overlap and finalize in source order" {
                     ctx.shared.started_first.store(true, .release);
                     var i: usize = 0;
                     while (i < 100 and !ctx.shared.started_second.load(.acquire)) : (i += 1) {
-                        std.Thread.sleep(1_000_000);
+                        std.Options.debug_io.sleep(.fromNanoseconds(@intCast(1_000_000)), .awake) catch {};
                     }
                     ctx.shared.first_saw_second.store(ctx.shared.started_second.load(.acquire), .release);
                 },
@@ -1069,7 +1069,7 @@ test "parallel worker tools overlap and finalize in source order" {
                     ctx.shared.started_second.store(true, .release);
                     var i: usize = 0;
                     while (i < 100 and !ctx.shared.started_first.load(.acquire)) : (i += 1) {
-                        std.Thread.sleep(1_000_000);
+                        std.Options.debug_io.sleep(.fromNanoseconds(@intCast(1_000_000)), .awake) catch {};
                     }
                     ctx.shared.second_saw_first.store(ctx.shared.started_first.load(.acquire), .release);
                 },
@@ -1185,7 +1185,7 @@ test "parallel worker updates stream live before source-ordered finalization" {
         ) protocol.AgentToolResult {
             const ctx: *ToolCtx = @ptrCast(@alignCast(raw_ctx.?));
             switch (ctx.which) {
-                .first => std.Thread.sleep(30 * std.time.ns_per_ms),
+                .first => std.Options.debug_io.sleep(.fromMilliseconds(30), .awake) catch {},
                 .second => {
                     if (on_update) |cb| {
                         cb(.{
@@ -1193,7 +1193,7 @@ test "parallel worker updates stream live before source-ordered finalization" {
                             .is_error = false,
                         }, update_ctx);
                     }
-                    std.Thread.sleep(5 * std.time.ns_per_ms);
+                    std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
                 },
             }
             return makeAgentToolTextResult(allocator, switch (ctx.which) {
@@ -1307,15 +1307,15 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
                 cb(.{ .content = &.{.{ .text = .{ .text = "working" } }}, .is_error = false }, update_ctx);
             }
             while (!signal.isAborted()) {
-                std.Thread.sleep(std.time.ns_per_ms);
+                std.Options.debug_io.sleep(.fromNanoseconds(@intCast(std.time.ns_per_ms)), .awake) catch {};
             }
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+            std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
             return makeAgentToolTextResult(allocator, "aborted", true);
         }
     };
     const Aborter = struct {
         fn run(controller: *abort_signal_mod.AbortController) void {
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+            std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
             controller.requestAbort();
         }
     };
@@ -1394,19 +1394,19 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
 
 // ── trace file (ZI_LOOP_TRACE) ──────────────────────────────────────
 
-fn openTraceFile() ?std.fs.File {
-    const path = std.posix.getenv("ZI_LOOP_TRACE") orelse return null;
+fn openTraceFile() ?std.Io.File {
+    const path = @import("env").get("ZI_LOOP_TRACE") orelse return null;
     if (path.len == 0) return null;
-    return std.fs.cwd().createFile(path, .{
+    return std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{
         .read = false,
         .truncate = false,
     }) catch return null;
 }
 
-fn traceWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+fn traceWrite(f: ?std.Io.File, comptime fmt: []const u8, args: anytype) void {
     const file = f orelse return;
-    file.seekFromEnd(0) catch {};
     var buf: [4096]u8 = undefined;
-    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    file.writeAll(slice) catch {};
+    var writer = file.writer(std.Options.debug_io, &buf);
+    writer.interface.print(fmt, args) catch return;
+    writer.interface.flush() catch {};
 }

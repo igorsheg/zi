@@ -105,7 +105,7 @@ pub const AnthropicProvider = struct {
         };
 
         // Setup HTTP client
-        var client: std.http.Client = .{ .allocator = allocator };
+        var client: std.http.Client = .{ .allocator = allocator, .io = std.Options.debug_io };
         defer client.deinit();
 
         // Build extra headers
@@ -172,7 +172,7 @@ pub const AnthropicProvider = struct {
         defer req.deinit();
 
         var abort_guard = AbortGuard.start(options.signal, .{
-            .shutdown_fd = if (req.connection) |conn| conn.stream_reader.getStream().handle else null,
+            .shutdown_fd = AbortGuard.httpRequestShutdownFd(&req),
         });
         defer abort_guard.stop();
 
@@ -226,7 +226,7 @@ pub const AnthropicProvider = struct {
         var state = StreamState{
             .allocator = allocator,
             .scratch = &scratch_arena,
-            .content_blocks = .{},
+            .content_blocks = .empty,
             .partial = protocol.AssistantMessage{
                 .content = &.{},
                 .api = .anthropic_messages,
@@ -241,7 +241,7 @@ pub const AnthropicProvider = struct {
                     .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
                 },
                 .stop_reason = .stop,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             },
             .stop_reason = null,
         };
@@ -644,10 +644,10 @@ fn addAnthropicMetadata(
     const metadata_context: *const AnthropicMetadataContext = @ptrCast(@alignCast(ctx.?));
     const user_id = anthropicMetadataUserId(metadata_context.metadata) orelse return false;
 
-    var metadata = std.json.ObjectMap.init(allocator);
-    errdefer metadata.deinit();
-    try metadata.put("user_id", .{ .string = user_id });
-    try payload.object.put("metadata", .{ .object = metadata });
+    var metadata: std.json.ObjectMap = .{};
+    errdefer metadata.deinit(allocator);
+    try metadata.put(allocator, "user_id", .{ .string = user_id });
+    try payload.object.put(allocator, "metadata", .{ .object = metadata });
     return true;
 }
 
@@ -656,7 +656,7 @@ fn addAnthropicMetadata(
 // =================================================================
 
 fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets) !void {
-    var out = std.io.Writer.Allocating.fromArrayList(allocator, buf);
+    var out = std.Io.Writer.Allocating.fromArrayList(allocator, buf);
     var jw: std.json.Stringify = .{ .writer = &out.writer };
 
     try jw.beginObject();
@@ -967,7 +967,8 @@ fn parseToolArgs(state: *StreamState, json_str: []const u8) std.json.Value {
 }
 
 fn emptyObject(allocator: std.mem.Allocator) std.json.Value {
-    return .{ .object = std.json.ObjectMap.init(allocator) };
+    _ = allocator;
+    return .{ .object = .{} };
 }
 
 /// Build a snapshot of `state.partial.content` for mid-stream
@@ -1040,7 +1041,7 @@ fn emitFailure(
         .stop_reason = .@"error",
         .error_message = owned_message,
         .failure = failure,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     } } }, ctx);
 }
 
@@ -1070,9 +1071,9 @@ test "Anthropic request transform maps metadata user_id" {
     var payload: std.ArrayListUnmanaged(u8) = .empty;
     defer payload.deinit(allocator);
 
-    var metadata = std.json.ObjectMap.init(allocator);
-    defer metadata.deinit();
-    try metadata.put("user_id", .{ .string = "user-123" });
+    var metadata: std.json.ObjectMap = .{};
+    defer metadata.deinit(allocator);
+    try metadata.put(allocator, "user_id", .{ .string = "user-123" });
 
     const model = testAnthropicModel();
     try buildRequestJson(allocator, &payload, model, .{ .messages = &.{} }, .{ .metadata = .{ .object = metadata } }, false, null, null);

@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const ai_completion = @import("../ai_completion.zig");
 const ai_complete_worker_mod = @import("../extensions/ai_complete_worker.zig");
 const extension_runner_mod = @import("../extensions/runner.zig");

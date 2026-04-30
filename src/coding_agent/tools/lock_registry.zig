@@ -42,7 +42,7 @@
 const std = @import("std");
 
 pub const Entry = struct {
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
     refcount: u32 = 0,
     /// Owned by the registry's allocator; used by `release` to
     /// remove the map entry when refcount hits zero.
@@ -50,14 +50,14 @@ pub const Entry = struct {
 };
 
 pub const Registry = struct {
-    meta: std.Thread.Mutex = .{},
+    meta: std.Io.Mutex = .init,
     gpa: std.mem.Allocator,
     locks: std.StringHashMapUnmanaged(*Entry) = .empty,
 
     /// Acquire an exclusive lock on `key`. Blocks until available.
     /// Caller must pair with `release(entry)`.
     pub fn acquireKey(self: *Registry, key: []const u8) !*Entry {
-        self.meta.lock();
+        self.meta.lockUncancelable(std.Options.debug_io);
         const entry = blk: {
             if (self.locks.get(key)) |existing| {
                 existing.refcount += 1;
@@ -71,9 +71,9 @@ pub const Registry = struct {
             try self.locks.put(self.gpa, owned_key, new_entry);
             break :blk new_entry;
         };
-        self.meta.unlock();
+        self.meta.unlock(std.Options.debug_io);
 
-        entry.mu.lock();
+        entry.mu.lockUncancelable(std.Options.debug_io);
         return entry;
     }
 
@@ -89,10 +89,10 @@ pub const Registry = struct {
     /// Release a previously-acquired entry. Decrements refcount and
     /// frees the entry when no other holders remain.
     pub fn release(self: *Registry, entry: *Entry) void {
-        entry.mu.unlock();
+        entry.mu.unlock(std.Options.debug_io);
 
-        self.meta.lock();
-        defer self.meta.unlock();
+        self.meta.lockUncancelable(std.Options.debug_io);
+        defer self.meta.unlock(std.Options.debug_io);
 
         entry.refcount -= 1;
         if (entry.refcount == 0) {
@@ -113,8 +113,8 @@ pub const Registry = struct {
 
     /// Test-only: current number of tracked entries.
     pub fn liveEntryCount(self: *Registry) usize {
-        self.meta.lock();
-        defer self.meta.unlock();
+        self.meta.lockUncancelable(std.Options.debug_io);
+        defer self.meta.unlock(std.Options.debug_io);
         return self.locks.count();
     }
 };
@@ -125,9 +125,9 @@ pub const Registry = struct {
 ///
 /// Caller owns the returned slice.
 pub fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.fs.realpath(path, &buf)) |real| {
-        return allocator.dupe(u8, real);
+    if (std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, path, allocator)) |real_z| {
+        defer allocator.free(real_z);
+        return allocator.dupe(u8, real_z);
     } else |_| {
         return std.fs.path.resolve(allocator, &.{path});
     }
@@ -165,10 +165,10 @@ test "canonicalizePath resolves realpath for existing path" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const f = try tmp.dir.createFile("target.txt", .{});
-    f.close();
+    const f = try tmp.dir.createFile(std.Options.debug_io, "target.txt", .{});
+    f.close(std.Options.debug_io);
 
-    const real = try tmp.dir.realpathAlloc(alloc, "target.txt");
+    const real = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "target.txt", alloc);
     defer alloc.free(real);
 
     const canon = try canonicalizePath(alloc, real);
@@ -218,7 +218,7 @@ test "acquireKey serializes two threads on same key" {
                         prev = new_prev;
                     } else break;
                 }
-                std.Thread.sleep(10_000); // 10us
+                std.Options.debug_io.sleep(.fromNanoseconds(@intCast(10_000)), .awake) catch {}; // 10us
                 _ = ic.fetchSub(1, .acq_rel);
                 r.release(e);
             }
@@ -259,10 +259,10 @@ test "acquirePath canonicalizes before locking" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const f = try tmp.dir.createFile("same.txt", .{});
-    f.close();
+    const f = try tmp.dir.createFile(std.Options.debug_io, "same.txt", .{});
+    f.close(std.Options.debug_io);
 
-    const real = try tmp.dir.realpathAlloc(alloc, "same.txt");
+    const real = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "same.txt", alloc);
     defer alloc.free(real);
 
     // Absolute path.

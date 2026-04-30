@@ -30,6 +30,7 @@ pub const SseParser = struct {
     id_buf: [512]u8 = undefined,
     id_len: usize = 0,
     has_id: bool = false,
+    needs_reset: bool = false,
     data_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     // Persistent state (survives event boundaries)
@@ -53,6 +54,8 @@ pub const SseParser = struct {
     /// Feed a single line (without trailing \n or \r\n).
     /// Returns SseEvent on event boundary (blank line) if data was present.
     pub fn feedLine(self: *SseParser, line: []const u8) error{ OutOfMemory, EventDataTooLarge }!?SseEvent {
+        if (self.needs_reset and line.len != 0) self.reset();
+
         // Blank line → dispatch event if we have data
         if (line.len == 0) {
             if (self.data_buf.items.len == 0) {
@@ -78,7 +81,7 @@ pub const SseParser = struct {
                 self.last_event_id_len = self.id_len;
             }
 
-            self.reset();
+            self.needs_reset = true;
             return evt;
         }
 
@@ -133,6 +136,7 @@ pub const SseParser = struct {
         self.event_len = 0;
         self.id_len = 0;
         self.has_id = false;
+        self.needs_reset = false;
         self.data_buf.clearRetainingCapacity();
     }
 };
@@ -155,18 +159,19 @@ pub fn streamEvents(
 
     while (true) {
         var chunk_writer: std.Io.Writer = .fixed(chunk_buf);
-        const n = streamReaderChunk(reader, &chunk_writer, .limited(effective_chunk_size)) catch |err| switch (err) {
-            error.EndOfStream => {
+        const n = streamReaderChunk(reader, &chunk_writer, .limited(effective_chunk_size)) catch |err| {
+            if (err == error.EndOfStream) {
                 _ = try drainReaderBufferInto(reader, &pending, allocator);
                 try flushPendingLines(parser, &pending, handler, false);
                 return;
-            },
-            error.WriteFailed => unreachable,
-            else => return err,
+            }
+            if (err == error.WriteFailed) unreachable;
+            return err;
         };
 
         var progressed = false;
-        if (n != 0) {
+        _ = n;
+        if (chunk_writer.buffered().len != 0) {
             try pending.appendSlice(allocator, chunk_writer.buffered());
             progressed = true;
         }
@@ -188,7 +193,10 @@ pub fn streamEvents(
 
 fn streamReaderChunk(reader: anytype, w: *std.Io.Writer, limit: std.Io.Limit) !usize {
     return switch (comptime @typeInfo(@TypeOf(reader))) {
-        .pointer => reader.*.stream(w, limit),
+        .pointer => |info| switch (comptime @typeInfo(info.child)) {
+            .pointer => streamReaderChunk(reader.*, w, limit),
+            else => reader.*.stream(w, limit),
+        },
         else => reader.stream(w, limit),
     };
 }
@@ -349,7 +357,7 @@ test "CRLF handling via trimmed input" {
     var p = SseParser.init(std.testing.allocator);
     defer p.deinit();
     // simulate what streamEvents does: trim \r
-    const line = std.mem.trimRight(u8, "data: hello\r", "\r");
+    const line = std.mem.trimEnd(u8, "data: hello\r", "\r");
     _ = try p.feedLine(line);
     const evt = (try p.feedLine("")).?;
     try std.testing.expectEqualStrings("hello", evt.data);

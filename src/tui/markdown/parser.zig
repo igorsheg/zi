@@ -95,7 +95,7 @@ fn detectHeading(line: []const u8) ?HeadingMatch {
     if (level == 0 or pos >= trimmed.len or trimmed[pos] != ' ') return null;
     return .{
         .level = level,
-        .content = std.mem.trimRight(u8, trimmed[pos + 1 ..], " \t"),
+        .content = std.mem.trimEnd(u8, trimmed[pos + 1 ..], " \t"),
     };
 }
 

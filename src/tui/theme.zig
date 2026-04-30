@@ -28,7 +28,7 @@ pub const Theme = struct {
     }
 
     pub fn detectTerminalBackground() Background {
-        return terminalBackgroundFromColorFgbg(std.posix.getenv("COLORFGBG") orelse "");
+        return terminalBackgroundFromColorFgbg(@import("env").get("COLORFGBG") orelse "");
     }
 };
 

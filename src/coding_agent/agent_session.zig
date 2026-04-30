@@ -1,8 +1,8 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_mod = @import("../agent3/root.zig");
-const agent_impl = @import("../agent3/agent.zig");
-const control_mod = @import("../agent3/control.zig");
+const agent_mod = @import("../agent/root.zig");
+const agent_impl = @import("../agent/agent.zig");
+const control_mod = @import("../agent/control.zig");
 const session_runtime = @import("session/root.zig");
 const session_core = @import("../session/root.zig");
 const tool_def = @import("tools/definition.zig");
@@ -650,7 +650,7 @@ pub const AgentSession = struct {
         const user_msg = protocol.AgentMessage{
             .user = .{
                 .content = user_content,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             },
         };
         const prompts = [_]protocol.AgentMessage{user_msg};
@@ -868,7 +868,7 @@ test "provider projection refreshes the current model from the rebuilt catalog" 
     const initial = model_registry.find(.{ .custom = "proxy-a" }, "proxy-model") orelse return error.MissingCatalogEntry;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const agent_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    const agent_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
     defer alloc.free(agent_dir);
 
     var ca = AgentSession.initTestSession(alloc, .{
@@ -1078,7 +1078,7 @@ fn writeReadOverrideExtension(
 
     const src = try out.toOwnedSlice();
     defer allocator.free(src);
-    try tmp.dir.writeFile(.{ .sub_path = "extensions/read.lua", .data = src });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "extensions/read.lua", .data = src });
 }
 
 fn createAgentDirWithReadOverride(
@@ -1088,9 +1088,9 @@ fn createAgentDirWithReadOverride(
     guideline: []const u8,
     result_text: []const u8,
 ) ![]const u8 {
-    try tmp.dir.makeDir("extensions");
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
     try writeReadOverrideExtension(allocator, tmp, snippet, guideline, result_text);
-    return tmp.dir.realpathAlloc(allocator, ".");
+    return tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
 }
 
 /// Test helper: create a AgentSession wired to a faux provider.
@@ -1440,8 +1440,8 @@ test "AgentSession: user extension overrides builtin tool at execution time" {
 
     var fp = faux.FauxProvider.init(allocator);
     defer fp.deinit();
-    var args_obj = std.json.ObjectMap.init(allocator);
-    try args_obj.put(try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, "/tmp/ignored") });
+    var args_obj: std.json.ObjectMap = .{};
+    try args_obj.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, "/tmp/ignored") });
     const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
         faux.fauxToolCall("read", "tc-read-1", .{ .object = args_obj }),
     };
@@ -1527,8 +1527,8 @@ test "AgentSession refreshes visible tools and prompt after runtime tool registr
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makeDir("extensions");
-    try tmp.dir.writeFile(.{ .sub_path = "extensions/dynamic.lua", .data = "return function(zi)\n" ++
+    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "extensions/dynamic.lua", .data = "return function(zi)\n" ++
         "  zi.register_command({\n" ++
         "    name = \"add_dynamic_tool\",\n" ++
         "    description = \"add a dynamic tool\",\n" ++
@@ -1544,7 +1544,7 @@ test "AgentSession refreshes visible tools and prompt after runtime tool registr
         "    end,\n" ++
         "  })\n" ++
         "end\n" });
-    const agent_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const agent_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(agent_dir);
 
     var fp = faux.FauxProvider.init(allocator);
@@ -1808,7 +1808,7 @@ test "AgentSession: session persistence round-trip" {
     }
 
     // Clean up the session file
-    std.fs.deleteFileAbsolute(session_file) catch {};
+    std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, session_file) catch {};
 }
 
 // tool call round-trip: faux returns tool_call → tool executes → faux called again
@@ -2049,7 +2049,7 @@ test "AgentSession: continue sends restored context to provider" {
     // Seed with loaded messages + a new user prompt
     const new_user = protocol.AgentMessage{ .user = .{
         .content = .{ .text = "follow up" },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     } };
     var all_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     try all_messages.appendSlice(allocator, loaded.messages);
@@ -2080,7 +2080,7 @@ test "AgentSession: continue sends restored context to provider" {
     try testing.expect(ctx.messages.len >= 3);
 
     // Clean up
-    std.fs.deleteFileAbsolute(session_file) catch {};
+    std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, session_file) catch {};
 }
 
 // convertToLlm through the loop: compaction_summary in initial state → provider receives wrapped text

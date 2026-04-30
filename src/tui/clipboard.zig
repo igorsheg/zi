@@ -76,7 +76,11 @@ fn emitOsc52(text: []const u8) void {
     @memcpy(seq[prefix.len .. prefix.len + encoded.len], encoded);
     @memcpy(seq[prefix.len + encoded.len ..], suffix);
 
-    _ = posix.write(posix.STDOUT_FILENO, seq) catch {};
+    const stdout: std.Io.File = .{ .handle = posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
+    var out_buf: [512]u8 = undefined;
+    var writer = stdout.writer(std.Options.debug_io, &out_buf);
+    writer.interface.writeAll(seq) catch return;
+    writer.interface.flush() catch {};
 }
 
 fn readImageMacos(allocator: std.mem.Allocator) ?[]u8 {
@@ -94,8 +98,8 @@ fn readImageLinux(allocator: std.mem.Allocator) ?[]u8 {
 }
 
 fn isWaylandSession() bool {
-    if (posix.getenv("WAYLAND_DISPLAY") != null) return true;
-    const session_type = posix.getenv("XDG_SESSION_TYPE") orelse return false;
+    if (@import("env").get("WAYLAND_DISPLAY") != null) return true;
+    const session_type = @import("env").get("XDG_SESSION_TYPE") orelse return false;
     return std.mem.eql(u8, session_type, "wayland");
 }
 
@@ -128,18 +132,24 @@ fn readImageViaCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?
 }
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    var child = std.process.spawn(std.Options.debug_io, .{
         .argv = argv,
-        .max_output_bytes = max_clipboard_image_bytes,
+        .stdout = .pipe,
+        .stderr = .ignore,
     }) catch return null;
-    defer allocator.free(result.stderr);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(std.Options.debug_io, &stdout_buf);
+    const stdout = stdout_reader.interface.allocRemaining(allocator, .limited(max_clipboard_image_bytes)) catch return null;
+    const term = child.wait(std.Options.debug_io) catch {
+        allocator.free(stdout);
+        return null;
+    };
 
-    if (result.term != .Exited or result.term.Exited != 0 or result.stdout.len == 0) {
-        allocator.free(result.stdout);
+    if (term != .exited or term.exited != 0 or stdout.len == 0) {
+        allocator.free(stdout);
         return null;
     }
-    return result.stdout;
+    return stdout;
 }
 
 fn decodeBase64Owned(allocator: std.mem.Allocator, encoded: []const u8) ?[]u8 {
@@ -158,31 +168,31 @@ fn decodeBase64Owned(allocator: std.mem.Allocator, encoded: []const u8) ?[]u8 {
 }
 
 fn copyViaCommand(argv: []const []const u8, text: []const u8) bool {
-    // Short-lived child-process bookkeeping allocator; storage dies with the
-    // helper process object before return.
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.expand_arg0 = .expand;
-
-    child.spawn() catch return false;
-    child.waitForSpawn() catch {
-        _ = child.wait() catch {};
-        return false;
-    };
+    var child = std.process.spawn(std.Options.debug_io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .expand_arg0 = .expand,
+    }) catch return false;
 
     if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(text) catch {
-            _ = child.wait() catch {};
+        var write_buf: [4096]u8 = undefined;
+        var stdin_writer = stdin_file.writer(std.Options.debug_io, &write_buf);
+        stdin_writer.interface.writeAll(text) catch {
+            _ = child.wait(std.Options.debug_io) catch {};
             return false;
         };
-        stdin_file.close();
+        stdin_writer.interface.flush() catch {
+            _ = child.wait(std.Options.debug_io) catch {};
+            return false;
+        };
+        stdin_file.close(std.Options.debug_io);
         child.stdin = null;
     }
 
-    const term = child.wait() catch return false;
-    return term == .Exited and term.Exited == 0;
+    const term = child.wait(std.Options.debug_io) catch return false;
+    return term == .exited and term.exited == 0;
 }
 
 const testing = std.testing;
@@ -195,7 +205,7 @@ test "clipboard base64 decoder ignores surrounding whitespace" {
 
 test "clipboard detects wayland sessions from standard environment variables" {
     const actual = isWaylandSession();
-    const expected = posix.getenv("WAYLAND_DISPLAY") != null or
-        (if (posix.getenv("XDG_SESSION_TYPE")) |value| std.mem.eql(u8, value, "wayland") else false);
+    const expected = @import("env").get("WAYLAND_DISPLAY") != null or
+        (if (@import("env").get("XDG_SESSION_TYPE")) |value| std.mem.eql(u8, value, "wayland") else false);
     try testing.expectEqual(expected, actual);
 }

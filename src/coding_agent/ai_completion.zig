@@ -39,7 +39,7 @@ pub fn runPreparedTextCompletion(
 
     const messages = [_]ai.protocol.Message{.{ .user = .{
         .content = .{ .text = request.prompt },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     } }};
     const context = ai.protocol.Context{
         .system_prompt = request.system_prompt,

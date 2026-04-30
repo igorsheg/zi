@@ -1,4 +1,4 @@
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 
 pub fn label(level: agent_protocol.ThinkingLevel) []const u8 {
     return switch (level) {

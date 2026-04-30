@@ -56,7 +56,7 @@ pub fn handle(self: anytype, event: keys_mod.MouseEvent) void {
         },
         .transcript_selection => {
             const zone = mouseZone(self, event, true) orelse return;
-            const now_ns = std.time.nanoTimestamp();
+            const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
             switch (event.kind) {
                 .drag, .move => {
                     if (self.transcript.updateSelection(zone.width, zone.height, zone.local_x, zone.local_y, zone.zone, now_ns)) {

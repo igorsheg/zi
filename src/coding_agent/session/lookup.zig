@@ -106,12 +106,13 @@ fn resolveAbsolutePath(
     path: []const u8,
     display_ref: []const u8,
 ) std.mem.Allocator.Error!Resolution {
-    const resolved = std.fs.realpathAlloc(allocator, path) catch |err| switch (err) {
+    const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, path, allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FileNotFound => return .{ .err = .{ .not_found = display_ref } },
         else => return .{ .err = .{ .lookup_failed = @errorName(err) } },
     };
-    return .{ .ok = resolved };
+    defer allocator.free(resolved_z);
+    return .{ .ok = try allocator.dupe(u8, resolved_z) };
 }
 
 fn looksLikeSessionPath(ref: []const u8) bool {
@@ -121,7 +122,7 @@ fn looksLikeSessionPath(ref: []const u8) bool {
         std.mem.endsWith(u8, ref, ".jsonl");
 }
 
-fn writeSessionFile(dir: std.fs.Dir, sub_path: []const u8, session_id: []const u8) !void {
+fn writeSessionFile(dir: std.Io.Dir, sub_path: []const u8, session_id: []const u8) !void {
     const content = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"type\":\"session\",\"id\":\"{s}\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}}\n" ++
@@ -130,7 +131,7 @@ fn writeSessionFile(dir: std.fs.Dir, sub_path: []const u8, session_id: []const u
     );
     defer std.testing.allocator.free(content);
 
-    try dir.writeFile(.{
+    try dir.writeFile(std.Options.debug_io, .{
         .sub_path = sub_path,
         .data = content,
     });
@@ -142,15 +143,15 @@ test "resolvePath picks the most recent valid session file in a directory" {
 
     const first_name = "first.jsonl";
     try writeSessionFile(tmp.dir, first_name, "session-old");
-    std.Thread.sleep(2 * std.time.ns_per_ms);
-    try tmp.dir.writeFile(.{ .sub_path = "invalid.jsonl", .data = "not json\n" });
-    std.Thread.sleep(2 * std.time.ns_per_ms);
+    std.Options.debug_io.sleep(.fromNanoseconds(@intCast(2 * std.time.ns_per_ms)), .awake) catch {};
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "invalid.jsonl", .data = "not json\n" });
+    std.Options.debug_io.sleep(.fromNanoseconds(@intCast(2 * std.time.ns_per_ms)), .awake) catch {};
     const second_name = "second.jsonl";
     try writeSessionFile(tmp.dir, second_name, "session-new");
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
-    const expected = try tmp.dir.realpathAlloc(std.testing.allocator, second_name);
+    const expected = try tmp.dir.realPathFileAlloc(std.Options.debug_io, second_name, std.testing.allocator);
     defer std.testing.allocator.free(expected);
 
     const resolved = try resolvePathInDir(std.testing.allocator, cwd, cwd, .most_recent);
@@ -170,9 +171,9 @@ test "resolvePath resolves explicit path references relative to cwd and reports 
     const file_name = "named-session.jsonl";
     try writeSessionFile(tmp.dir, file_name, "session-path");
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
-    const expected = try tmp.dir.realpathAlloc(std.testing.allocator, file_name);
+    const expected = try tmp.dir.realPathFileAlloc(std.Options.debug_io, file_name, std.testing.allocator);
     defer std.testing.allocator.free(expected);
 
     const resolved = try resolvePathInDir(std.testing.allocator, cwd, cwd, .{ .reference = file_name });
@@ -203,9 +204,9 @@ test "resolvePath resolves local session id prefixes and rejects ambiguous match
     try writeSessionFile(tmp.dir, first_name, "abcdef01");
     try writeSessionFile(tmp.dir, second_name, "abc99999");
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
-    const expected = try tmp.dir.realpathAlloc(std.testing.allocator, first_name);
+    const expected = try tmp.dir.realPathFileAlloc(std.Options.debug_io, first_name, std.testing.allocator);
     defer std.testing.allocator.free(expected);
 
     const resolved = try resolvePathInDir(std.testing.allocator, cwd, cwd, .{ .reference = "abcdef" });

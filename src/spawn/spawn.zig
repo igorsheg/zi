@@ -29,8 +29,8 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     //
     // Run `tail -f $ZI_SPAWN_TRACE` in another terminal during a
     // hang to see what the child is doing in real time.
-    const trace_file: ?std.fs.File = openTraceFile();
-    defer if (trace_file) |f| f.close();
+    const trace_file: ?std.Io.File = openTraceFile(config.io);
+    defer if (trace_file) |f| f.close(config.io);
 
     // -- build argv --
     //
@@ -49,12 +49,12 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     var tmp_dir_path: ?[]const u8 = null;
     var tmp_file_path: ?[]const u8 = null;
     defer {
-        if (tmp_file_path) |p| std.fs.deleteFileAbsolute(p) catch {};
-        if (tmp_dir_path) |d| std.fs.deleteDirAbsolute(d) catch {};
+        if (tmp_file_path) |p| std.Io.Dir.deleteFileAbsolute(config.io, p) catch {};
+        if (tmp_dir_path) |d| std.Io.Dir.deleteDirAbsolute(config.io, d) catch {};
     }
     if (config.argv_override == null) {
         if (config.append_system_prompt) |asp| {
-            if (writeTempPrompt(allocator, asp)) |tmp| {
+            if (writeTempPrompt(config.io, allocator, asp)) |tmp| {
                 tmp_dir_path = tmp.dir;
                 tmp_file_path = tmp.path;
                 built.argv.appendSlice(allocator, &.{ "--append-system-prompt", tmp.path }) catch {};
@@ -74,27 +74,25 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     }
 
     // -- spawn --
-    var child = std.process.Child.init(built.argv.items, allocator);
-    child.cwd = config.cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        child.pgid = 0;
-    }
-
-    child.spawn() catch {
+    var child = std.process.spawn(config.io, .{
+        .argv = built.argv.items,
+        .cwd = .{ .path = config.cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    }) catch {
         result.exit_code = 1;
         result.error_message = allocator.dupe(u8, "failed to spawn zi process") catch null;
-        if (trace_file) |f| traceWrite(f, "--- spawn FAILED to launch\n", .{});
+        if (trace_file) |f| traceWrite(config.io, f, "--- spawn FAILED to launch\n", .{});
         return result;
     };
 
     if (trace_file) |f| {
-        traceWrite(f, "--- spawn START pid={d} task=\"{s}\"\n", .{ child.id, config.task });
-        traceWrite(f, "    argv:", .{});
-        for (built.argv.items) |a| traceWrite(f, " {s}", .{a});
-        traceWrite(f, "\n", .{});
+        traceWrite(config.io, f, "--- spawn START pid={d} task=\"{s}\"\n", .{ child.id.?, config.task });
+        traceWrite(config.io, f, "    argv:", .{});
+        for (built.argv.items) |a| traceWrite(config.io, f, " {s}", .{a});
+        traceWrite(config.io, f, "\n", .{});
     }
 
     // -- read stdout line by line, parse events --
@@ -138,26 +136,30 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     if (child.stderr) |stderr_file| {
         var stderr_buf: [4096]u8 = undefined;
         while (true) {
-            const n = stderr_file.read(&stderr_buf) catch break;
+            const n = std.posix.read(stderr_file.handle, &stderr_buf) catch break;
             if (n == 0) break;
-            result.stderr_output.appendSlice(allocator, stderr_buf[0..n]) catch break;
+            const chunk = stderr_buf[0..n];
+            result.stderr_output.appendSlice(allocator, chunk) catch break;
         }
     }
     if (trace_file) |f| {
         if (result.stderr_output.items.len > 0) {
-            traceWrite(f, "--- stderr ({d} bytes):\n", .{result.stderr_output.items.len});
-            f.writeAll(result.stderr_output.items) catch {};
-            traceWrite(f, "\n", .{});
+            traceWrite(config.io, f, "--- stderr ({d} bytes):\n", .{result.stderr_output.items.len});
+            var trace_buf: [4096]u8 = undefined;
+            var trace_writer = f.writer(config.io, &trace_buf);
+            trace_writer.interface.writeAll(result.stderr_output.items) catch {};
+            trace_writer.interface.flush() catch {};
+            traceWrite(config.io, f, "\n", .{});
         }
     }
 
     // -- wait for exit --
-    const term = child.wait() catch {
+    const term = child.wait(config.io) catch {
         result.exit_code = 1;
         return result;
     };
     result.exit_code = switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
 
@@ -171,12 +173,12 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     }
 
     if (trace_file) |f| {
-        traceWrite(f, "--- spawn END exit={d} stop_reason={?s} final_text_len={d}\n", .{
+        traceWrite(config.io, f, "--- spawn END exit={d} stop_reason={?s} final_text_len={d}\n", .{
             result.exit_code,
             result.stop_reason,
             result.output.items.len,
         });
-        traceWrite(f, "--- /spawn ---\n\n", .{});
+        traceWrite(config.io, f, "--- /spawn ---\n\n", .{});
     }
 
     return result;
@@ -184,7 +186,7 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
 
 // -- stdout processing --
 
-fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config: types.SpawnConfig, trace_file: ?std.fs.File) void {
+fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config: types.SpawnConfig, trace_file: ?std.Io.File) void {
     const allocator = config.allocator;
     const stdout_file = child.stdout orelse return;
 
@@ -206,33 +208,40 @@ fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config:
             }
         }
 
-        const n = stdout_file.read(&read_buf) catch {
-            if (config.signal) |sig| {
-                if (sig.isAborted()) result.cancelled = true;
-            }
-            break;
+        const n = std.posix.read(stdout_file.handle, &read_buf) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Options.debug_io.sleep(.fromMilliseconds(1), .awake) catch {};
+                continue;
+            },
+            else => {
+                if (config.signal) |sig| {
+                    if (sig.isAborted()) result.cancelled = true;
+                }
+                break;
+            },
         };
         if (n == 0) break;
+        const chunk = read_buf[0..n];
 
         var start: usize = 0;
-        for (0..n) |i| {
-            if (read_buf[i] == '\n') {
-                const segment = read_buf[start..i];
+        for (0..chunk.len) |i| {
+            if (chunk[i] == '\n') {
+                const segment = chunk[start..i];
                 if (line_buf.items.len > 0) {
                     line_buf.appendSlice(allocator, segment) catch {};
-                    if (trace_file) |f| traceLine(f, line_buf.items);
+                    if (trace_file) |f| traceLine(config.io, f, line_buf.items);
                     processLine(line_buf.items, result, config);
                     line_buf.clearRetainingCapacity();
                 } else {
-                    if (trace_file) |f| traceLine(f, segment);
+                    if (trace_file) |f| traceLine(config.io, f, segment);
                     processLine(segment, result, config);
                 }
                 start = i + 1;
             }
         }
 
-        if (start < n) {
-            line_buf.appendSlice(allocator, read_buf[start..n]) catch {};
+        if (start < chunk.len) {
+            line_buf.appendSlice(allocator, chunk[start..]) catch {};
         }
     }
 
@@ -242,7 +251,7 @@ fn readAndProcess(child: *std.process.Child, result: *types.SpawnResult, config:
 
     // flush any trailing data without a final newline
     if (line_buf.items.len > 0) {
-        if (trace_file) |f| traceLine(f, line_buf.items);
+        if (trace_file) |f| traceLine(config.io, f, line_buf.items);
         processLine(line_buf.items, result, config);
     }
 }
@@ -414,31 +423,33 @@ fn killChild(child: *std.process.Child) void {
 /// null if the env var is unset, the path is invalid, or the file
 /// can't be opened. All trace operations are best-effort: failures
 /// silently disable tracing for the rest of this spawn.
-fn openTraceFile() ?std.fs.File {
-    const path = std.posix.getenv("ZI_SPAWN_TRACE") orelse return null;
+fn openTraceFile(io: std.Io) ?std.Io.File {
+    const path = @import("env").get("ZI_SPAWN_TRACE") orelse return null;
     if (path.len == 0) return null;
-    return std.fs.cwd().createFile(path, .{
+    return std.Io.Dir.cwd().createFile(io, path, .{
         .read = false,
         .truncate = false,
     }) catch return null;
 }
 
-fn traceWrite(f: std.fs.File, comptime fmt: []const u8, args: anytype) void {
+fn traceWrite(io: std.Io, f: std.Io.File, comptime fmt: []const u8, args: anytype) void {
     // Seek to end first so concurrent spawns don't clobber each
     // other. Append mode would be cleaner but createFile doesn't
     // expose O_APPEND directly; this is good enough for v1 since
     // we don't expect interleaved writes within a record.
-    f.seekFromEnd(0) catch {};
     var buf: [4096]u8 = undefined;
-    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    f.writeAll(slice) catch {};
+    var writer = f.writer(io, &buf);
+    writer.interface.print(fmt, args) catch return;
+    writer.interface.flush() catch {};
 }
 
-fn traceLine(f: std.fs.File, line: []const u8) void {
-    f.seekFromEnd(0) catch {};
-    f.writeAll("    ") catch {};
-    f.writeAll(line) catch {};
-    f.writeAll("\n") catch {};
+fn traceLine(io: std.Io, f: std.Io.File, line: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var writer = f.writer(io, &buf);
+    writer.interface.writeAll("    ") catch return;
+    writer.interface.writeAll(line) catch return;
+    writer.interface.writeAll("\n") catch return;
+    writer.interface.flush() catch {};
 }
 
 const WatchdogCtx = struct {
@@ -475,7 +486,7 @@ fn abortWatchdog(ctx: WatchdogCtx) void {
     // reaps via waitpid internally, which would race the main
     // thread's `child.wait()` and crash with ECHILD. Sending the
     // signal directly leaves reaping to the main thread.
-    interruptProcessGroup(ctx.child.id);
+    if (ctx.child.id) |id| interruptProcessGroup(id);
 }
 
 fn watchdogDone(ctx: ?*anyopaque) bool {
@@ -489,11 +500,11 @@ fn interruptProcessGroup(pgid: std.process.Child.Id) void {
         return;
     }
     signalProcessGroup(pgid, std.posix.SIG.INT);
-    std.Thread.sleep(150 * std.time.ns_per_ms);
+    std.Options.debug_io.sleep(.fromMilliseconds(150), .awake) catch {};
     signalProcessGroup(pgid, std.posix.SIG.KILL);
 }
 
-fn signalProcessGroup(pgid: std.process.Child.Id, sig: u8) void {
+fn signalProcessGroup(pgid: std.process.Child.Id, sig: std.posix.SIG) void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         std.posix.kill(pgid, sig) catch {};
         return;
@@ -535,7 +546,8 @@ fn buildChildArgv(allocator: std.mem.Allocator, config: types.SpawnConfig) !Buil
     }
 
     var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_exe = try std.fs.selfExePath(&self_exe_buf);
+    const self_exe_len = try std.process.executablePath(std.Options.debug_io, &self_exe_buf);
+    const self_exe = self_exe_buf[0..self_exe_len];
     const self_exe_owned = try allocator.dupe(u8, self_exe);
     try built.owned_strings.append(allocator, self_exe_owned);
 
@@ -551,19 +563,23 @@ fn buildChildArgv(allocator: std.mem.Allocator, config: types.SpawnConfig) !Buil
 
 const TempFile = struct { dir: []const u8, path: []const u8 };
 
-fn writeTempPrompt(allocator: std.mem.Allocator, content: []const u8) !TempFile {
+fn writeTempPrompt(io: std.Io, allocator: std.mem.Allocator, content: []const u8) !TempFile {
     var rand_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    std.Options.debug_io.randomSecure(&rand_buf) catch std.Options.debug_io.random(&rand_buf);
     const hex = std.fmt.bytesToHex(rand_buf, .lower);
     const dir_name = try std.fmt.allocPrint(allocator, "/tmp/zi-spawn-{s}", .{&hex});
-    try std.fs.makeDirAbsolute(dir_name);
+    try std.Io.Dir.cwd().createDirPath(io, dir_name);
 
     const file_path = try std.fmt.allocPrint(allocator, "{s}/prompt.md", .{dir_name});
     errdefer allocator.free(file_path);
 
-    const file = try std.fs.createFileAbsolute(file_path, .{ .mode = 0o600 });
-    defer file.close();
-    try file.writeAll(content);
+    const file = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o600));
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(io, &write_buf);
+    try file_writer.interface.writeAll(content);
+    try file_writer.interface.flush();
 
     return .{ .dir = dir_name, .path = file_path };
 }
@@ -641,14 +657,14 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
 
     const Aborter = struct {
         fn run(c: *@import("../abort_signal.zig").AbortController) void {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            std.Options.debug_io.sleep(.fromNanoseconds(@intCast(100 * std.time.ns_per_ms)), .awake) catch {};
             c.requestAbort();
         }
     };
     const t = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
     defer t.join();
 
-    const start = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds();
     var result = ziSpawn(.{
         .allocator = testing.allocator,
         .cwd = ".",
@@ -657,7 +673,7 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
         .signal = signal,
     });
     defer result.deinit(testing.allocator);
-    const elapsed_ms = std.time.milliTimestamp() - start;
+    const elapsed_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() - start;
 
     // Watchdog poll cadence is 100ms; killing + wait adds a little
     // overhead. 2s gives a generous ceiling that still proves we

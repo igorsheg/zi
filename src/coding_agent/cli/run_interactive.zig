@@ -40,7 +40,9 @@ pub fn run(
 ) !result.ExecutionResult {
     logging.setThreadLabel(.tui);
 
-    if (!std.posix.isatty(std.posix.STDIN_FILENO) or !std.posix.isatty(std.posix.STDOUT_FILENO)) {
+    const stdin_file: std.Io.File = .{ .handle = std.posix.STDIN_FILENO, .flags = .{ .nonblocking = false } };
+    const stdout_file: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
+    if (!(stdin_file.isTty(std.Options.debug_io) catch false) or !(stdout_file.isTty(std.Options.debug_io) catch false)) {
         return .{ .err = .interactive_requires_tty };
     }
 
@@ -88,6 +90,7 @@ pub fn run(
         .model = effective_model,
         .api_key = api_key,
         .cwd = runtime.cwd,
+        .io = runtime.io,
         .max_tokens = 4096,
         .auth_storage = runtime.auth_storage,
         .settings_manager = runtime.settings_manager,
@@ -127,19 +130,13 @@ pub fn run(
             .keep_recent_tokens = @intCast(@max(compaction_settings.keep_recent_tokens, 0)),
         },
     });
-    const memory_diagnostics = @import("../../debug/tracked_allocator.zig").Diagnostics{
-        .root = ctx.root_tracker,
-        .agent = ctx.agent_backing_tracker,
-        .tui = ctx.tui_backing_tracker,
-        .msg = ctx.msg_backing_tracker,
-    };
     var interactive = try interactive_mod.Interactive.init(
-        ctx.tui_backing_tracker.allocator(),
+        ctx.allocator,
         ctx.msg_allocator,
         runtime_host,
-        &memory_diagnostics,
         resolver,
         runtime.cwd,
+        runtime.io,
         runtime.auth_storage,
         runtime.settings_manager,
     );
@@ -234,8 +231,8 @@ test "interactive startup prepares shared @file prompt content" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "notes.txt", .data = "hello from file" });
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.txt", .data = "hello from file" });
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const resolved = try resolveStartupAction(allocator, cwd, .{

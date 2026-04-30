@@ -6,7 +6,7 @@ const ansi = @import("ansi.zig");
 /// Set by Terminal.installSignalHandlers(), cleared by Terminal.deinit().
 var global_terminal: ?*Terminal = null;
 
-fn signalCleanupHandler(_: i32) callconv(.c) void {
+fn signalCleanupHandler(_: std.posix.SIG) callconv(.c) void {
     if (global_terminal) |t| {
         t.emergencyRestore();
     }
@@ -107,7 +107,8 @@ pub const Terminal = struct {
     // --- Output helpers ---
 
     fn canControlOutput(self: *const Terminal) bool {
-        return posix.isatty(self.fd_out);
+        const file: std.Io.File = .{ .handle = self.fd_out, .flags = .{ .nonblocking = false } };
+        return file.isTty(std.Options.debug_io) catch false;
     }
 
     pub fn write(self: *Terminal, data: []const u8) void {
@@ -216,7 +217,11 @@ pub const Terminal = struct {
     /// Minimal restore for signal/panic context (async-signal-safe).
     /// Only uses write() — no allocations, no locks.
     pub fn emergencyRestore(self: *Terminal) void {
-        _ = posix.write(self.fd_out, ansi.emergency_restore) catch {};
+        const out: std.Io.File = .{ .handle = self.fd_out, .flags = .{ .nonblocking = false } };
+        var buf: [128]u8 = undefined;
+        var writer = out.writer(std.Options.debug_io, &buf);
+        writer.interface.writeAll(ansi.emergency_restore) catch {};
+        writer.interface.flush() catch {};
         if (self.original_termios) |orig| {
             posix.tcsetattr(self.fd_in, .FLUSH, orig) catch {};
         }
@@ -235,13 +240,11 @@ pub const Terminal = struct {
 };
 
 fn writeAll(fd: posix.fd_t, data: []const u8) void {
-    var written: usize = 0;
-    while (written < data.len) {
-        written += posix.write(fd, data[written..]) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return,
-        };
-    }
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(std.Options.debug_io, &buf);
+    writer.interface.writeAll(data) catch return;
+    writer.interface.flush() catch {};
 }
 
 // --- Tests ---
@@ -265,9 +268,15 @@ test "Terminal deinit is idempotent on fresh instance" {
     try std.testing.expect(!t.cursor_hidden);
 }
 
+fn testPipe() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.Unexpected;
+    return fds;
+}
+
 test "Terminal deinit does not write control sequences to non-tty output" {
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[0]);
+    const pipe = try testPipe();
+    defer _ = std.c.close(pipe[0]);
 
     var t = Terminal.init();
     t.fd_out = pipe[1];
@@ -278,7 +287,7 @@ test "Terminal deinit does not write control sequences to non-tty output" {
     t.enableModifyOtherKeys();
 
     t.deinit();
-    std.posix.close(pipe[1]);
+    _ = std.c.close(pipe[1]);
 
     var read_buf: [256]u8 = undefined;
     const n = try std.posix.read(pipe[0], &read_buf);

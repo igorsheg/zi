@@ -27,6 +27,7 @@ pub const Bundle = struct {
 };
 
 pub const BuildOptions = struct {
+    io: std.Io = std.Options.debug_io,
     image_auto_resize: bool = true,
 };
 
@@ -36,7 +37,7 @@ pub const BuildOptions = struct {
 /// outlives the bundle.
 pub fn build(allocator: std.mem.Allocator, cwd: []const u8, options: BuildOptions) !Bundle {
     const ctx = try allocator.create(util.BuiltinCtx);
-    ctx.* = .{ .cwd = cwd, .image_auto_resize = options.image_auto_resize };
+    ctx.* = .{ .cwd = cwd, .io = options.io, .image_auto_resize = options.image_auto_resize };
 
     var definitions = try allocator.alloc(tool_def.ToolDefinition, 7);
     definitions[0] = bash_tool.definition(ctx);

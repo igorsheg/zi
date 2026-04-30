@@ -316,7 +316,7 @@ fn luaTableToJson(
         return .{ .array = arr };
     }
 
-    var obj = std.json.ObjectMap.init(allocator);
+    var obj: std.json.ObjectMap = .{};
     errdefer freeJsonValue(allocator, .{ .object = obj });
 
     // Iterate via lua_next: push nil, then each call replaces the key
@@ -350,7 +350,7 @@ fn luaTableToJson(
         errdefer allocator.free(key_dup);
 
         const value = try luaValueToJson(L, -1, allocator);
-        try obj.put(key_dup, value);
+        try obj.put(allocator, key_dup, value);
 
         c.lua_pop(L, 1); // pop value, keep key for next iteration
     }

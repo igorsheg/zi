@@ -29,12 +29,12 @@ pub const DiffDetails = struct {
 /// Shape:
 /// `{ kind = "diff", version = 2, diff = <diff_json document> }`.
 pub fn diffToJsonValue(allocator: std.mem.Allocator, document: diff.DiffDocument) !std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
+    var obj: std.json.ObjectMap = .{};
     errdefer json_util.freeJsonValue(allocator, .{ .object = obj });
 
-    try obj.put(try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, DIFF_KIND) });
-    try obj.put(try allocator.dupe(u8, "version"), .{ .integer = DIFF_VERSION });
-    try obj.put(try allocator.dupe(u8, "diff"), try diff_json.toJsonValue(allocator, document));
+    try obj.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, DIFF_KIND) });
+    try obj.put(allocator, try allocator.dupe(u8, "version"), .{ .integer = DIFF_VERSION });
+    try obj.put(allocator, try allocator.dupe(u8, "diff"), try diff_json.toJsonValue(allocator, document));
 
     return .{ .object = obj };
 }

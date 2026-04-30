@@ -19,7 +19,7 @@ pub fn generate() PkceChallenge {
     var result: PkceChallenge = undefined;
 
     var random_bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std.Options.debug_io.randomSecure(&random_bytes) catch std.Options.debug_io.random(&random_bytes);
 
     _ = std.base64.url_safe_no_pad.Encoder.encode(&result.verifier_buf, &random_bytes);
 
@@ -35,7 +35,7 @@ pub const STATE_LEN = std.base64.url_safe_no_pad.Encoder.calcSize(16);
 
 pub fn generateState() [STATE_LEN]u8 {
     var random_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std.Options.debug_io.randomSecure(&random_bytes) catch std.Options.debug_io.random(&random_bytes);
     var buf: [STATE_LEN]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&buf, &random_bytes);
     return buf;

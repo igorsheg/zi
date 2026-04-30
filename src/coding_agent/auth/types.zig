@@ -32,7 +32,7 @@ pub fn freeOAuthCredential(allocator: std.mem.Allocator, cred: OAuthCredential) 
         allocator.free(e.key_ptr.*);
         json_util.freeJsonValue(allocator, e.value_ptr.*);
     }
-    extras.deinit();
+    extras.deinit(allocator);
 }
 
 pub fn deinitOAuthCredential(allocator: std.mem.Allocator, cred: *OAuthCredential) void {
@@ -46,14 +46,14 @@ pub fn cloneOAuthCredential(allocator: std.mem.Allocator, cred: OAuthCredential)
     const access = try allocator.dupe(u8, cred.access);
     errdefer allocator.free(access);
 
-    var extras = std.json.ObjectMap.init(allocator);
+    var extras: std.json.ObjectMap = .{};
     errdefer {
         var it = extras.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             json_util.freeJsonValue(allocator, entry.value_ptr.*);
         }
-        extras.deinit();
+        extras.deinit(allocator);
     }
 
     var it = cred.extras.iterator();
@@ -61,7 +61,7 @@ pub fn cloneOAuthCredential(allocator: std.mem.Allocator, cred: OAuthCredential)
         const key = try allocator.dupe(u8, entry.key_ptr.*);
         errdefer allocator.free(key);
         const value = try json_util.cloneJsonValue(allocator, entry.value_ptr.*);
-        try extras.put(key, value);
+        try extras.put(allocator, key, value);
     }
 
     return .{
@@ -159,14 +159,14 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.Value) !AuthCredential
         const access_dup = try allocator.dupe(u8, access_val.string);
         errdefer allocator.free(access_dup);
 
-        var extras = std.json.ObjectMap.init(allocator);
+        var extras: std.json.ObjectMap = .{};
         errdefer {
             var eit = extras.iterator();
             while (eit.next()) |e| {
                 allocator.free(e.key_ptr.*);
                 json_util.freeJsonValue(allocator, e.value_ptr.*);
             }
-            extras.deinit();
+            extras.deinit(allocator);
         }
 
         var obj_it = obj.object.iterator();
@@ -180,7 +180,7 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.Value) !AuthCredential
             const duped_key = try allocator.dupe(u8, k);
             errdefer allocator.free(duped_key);
             const cloned_val = try json_util.cloneJsonValue(allocator, field.value_ptr.*);
-            try extras.put(duped_key, cloned_val);
+            try extras.put(allocator, duped_key, cloned_val);
         }
 
         return .{ .oauth = .{
@@ -207,7 +207,7 @@ fn freeOneCredential(allocator: std.mem.Allocator, cred: AuthCredential) void {
 
 /// Write AuthStorageData as JSON matching pi-mono's format.
 /// Produces `JSON.stringify(data, null, 2)` output — 2-space indent.
-pub fn writeAuthJson(writer: *std.io.Writer, data: *const AuthStorageData) !void {
+pub fn writeAuthJson(writer: *std.Io.Writer, data: *const AuthStorageData) !void {
     var jw: std.json.Stringify = .{
         .writer = writer,
         .options = .{ .whitespace = .indent_2 },
@@ -313,7 +313,7 @@ test "round-trip serialize then parse preserves data" {
         .refresh = try std.testing.allocator.dupe(u8, "rt-1"),
         .access = try std.testing.allocator.dupe(u8, "at-2"),
         .expires = 9999999,
-        .extras = std.json.ObjectMap.init(std.testing.allocator),
+        .extras = .{},
     } });
 
     const json = try json_write.toOwnedSlice(std.testing.allocator, &data, writeAuthJson);

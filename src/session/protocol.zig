@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent = @import("../agent3/root.zig");
+const agent = @import("../agent/root.zig");
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
 

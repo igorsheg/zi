@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai_protocol = @import("../ai/protocol.zig");
-const agent_root = @import("../agent3/root.zig");
-const control_mod = @import("../agent3/control.zig");
+const agent_root = @import("../agent/root.zig");
+const control_mod = @import("../agent/control.zig");
 const agent_protocol = agent_root.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const transcript_mod = @import("transcript.zig");
@@ -15,10 +15,9 @@ const themes_builtin = @import("../themes/builtin.zig");
 const buffer_mod = @import("buffer.zig");
 const cell_mod = @import("cell.zig");
 const editor_mod = @import("components/editor.zig");
-const conversation_state_mod = @import("../agent3/conversation_state.zig");
-const message_memory = @import("../agent3/message_memory.zig");
+const conversation_state_mod = @import("../agent/conversation_state.zig");
+const message_memory = @import("../agent/message_memory.zig");
 const json_util = @import("../ai/json_util.zig");
-const profile = @import("../debug/profile.zig");
 
 const Transcript = transcript_mod.Transcript;
 const TranscriptItem = transcript_mod.TranscriptItem;
@@ -213,8 +212,6 @@ pub const ProjectionState = struct {
         options: RebuildOptions,
         use_committed_cache: bool,
     ) void {
-        var reconcile_timer = profile.ScopedTimer.begin(.reconcile_from_state);
-        defer reconcile_timer.end();
 
         const allocator = transcript.allocator;
 
@@ -353,8 +350,6 @@ pub fn reconcileFromSnapshots(
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
 ) void {
-    var reconcile_timer = profile.ScopedTimer.begin(.reconcile_from_state);
-    defer reconcile_timer.end();
 
     var desired_items = buildDesiredItems(transcript.allocator, resolver, transcript, view, queued, options, transcript.hide_thinking_block) catch return;
     defer {
@@ -464,8 +459,6 @@ fn buildDesiredItemsFull(
     hide_thinking_block: bool,
     cache_out: ?*std.ArrayList(CachedCommittedItem),
 ) !std.ArrayList(DesiredItem) {
-    var build_timer = profile.ScopedTimer.begin(.build_desired_items);
-    defer build_timer.end();
 
     var desired_items: std.ArrayList(DesiredItem) = .empty;
     errdefer {
@@ -521,8 +514,6 @@ fn buildDesiredItemsFromCommittedCache(
     hide_thinking_block: bool,
     cache_items: []const CachedCommittedItem,
 ) !std.ArrayList(DesiredItem) {
-    var build_timer = profile.ScopedTimer.begin(.build_desired_items);
-    defer build_timer.end();
 
     var desired_items: std.ArrayList(DesiredItem) = .empty;
     errdefer {
@@ -1549,7 +1540,7 @@ fn customContentText(
                 if (idx > 0) try out.append(allocator, '\n');
                 switch (block) {
                     .text => |text| try out.appendSlice(allocator, text.text),
-                    .image => |image| try out.writer(allocator).print("[image: {s}]", .{image.mime_type}),
+                    .image => |image| try out.print(allocator, "[image: {s}]", .{image.mime_type}),
                 }
             }
             return out.toOwnedSlice(allocator);
@@ -1570,7 +1561,7 @@ fn joinUserBlocksText(
             .text => |text| try out.appendSlice(allocator, text.text),
             .image => {
                 image_index += 1;
-                try out.writer(allocator).print("[image{d}]", .{image_index});
+                try out.print(allocator, "[image{d}]", .{image_index});
             },
         }
     }

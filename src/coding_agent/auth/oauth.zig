@@ -203,7 +203,7 @@ const DynamicOAuthProvider = struct {
     }
 };
 
-var dynamic_provider_mutex: std.Thread.Mutex = .{};
+var dynamic_provider_mutex: std.Io.Mutex = .init;
 var dynamic_providers: std.ArrayListUnmanaged(DynamicOAuthProvider) = .empty;
 
 // ── Anthropic (Claude Pro/Max) ──────────────────────────────────────────
@@ -438,8 +438,8 @@ fn unregisterClaimProviderLocked(id: []const u8, owner_id: []const u8, generatio
 }
 
 pub fn syncClaimProvider(allocator: std.mem.Allocator, claim: *const provider_mod.ClaimRegistration) SyncClaimProviderError!void {
-    dynamic_provider_mutex.lock();
-    defer dynamic_provider_mutex.unlock();
+    dynamic_provider_mutex.lockUncancelable(std.Options.debug_io);
+    defer dynamic_provider_mutex.unlock(std.Options.debug_io);
 
     if (!claim.oauth_enabled) {
         _ = removeClaimProviderByOwnerLocked(claim.name, claim.owner_id);
@@ -478,14 +478,14 @@ pub fn syncClaimProvider(allocator: std.mem.Allocator, claim: *const provider_mo
 }
 
 pub fn unregisterClaimProvider(id: []const u8, owner_id: []const u8, generation: u64) bool {
-    dynamic_provider_mutex.lock();
-    defer dynamic_provider_mutex.unlock();
+    dynamic_provider_mutex.lockUncancelable(std.Options.debug_io);
+    defer dynamic_provider_mutex.unlock(std.Options.debug_io);
     return unregisterClaimProviderLocked(id, owner_id, generation);
 }
 
 pub fn unregisterProvidersByGeneration(generation: u64) void {
-    dynamic_provider_mutex.lock();
-    defer dynamic_provider_mutex.unlock();
+    dynamic_provider_mutex.lockUncancelable(std.Options.debug_io);
+    defer dynamic_provider_mutex.unlock(std.Options.debug_io);
 
     var i: usize = 0;
     while (i < dynamic_providers.items.len) {
@@ -499,8 +499,8 @@ pub fn unregisterProvidersByGeneration(generation: u64) void {
 }
 
 pub fn listProviders(allocator: std.mem.Allocator) ![]ProviderListEntry {
-    dynamic_provider_mutex.lock();
-    defer dynamic_provider_mutex.unlock();
+    dynamic_provider_mutex.lockUncancelable(std.Options.debug_io);
+    defer dynamic_provider_mutex.unlock(std.Options.debug_io);
 
     const total = builtin_providers.len + dynamic_providers.items.len;
     const entries = try allocator.alloc(ProviderListEntry, total);
@@ -525,8 +525,8 @@ pub fn listProviders(allocator: std.mem.Allocator) ![]ProviderListEntry {
 pub fn findProvider(id: []const u8) ?OAuthProvider {
     if (findBuiltinProvider(id)) |provider| return provider;
 
-    dynamic_provider_mutex.lock();
-    defer dynamic_provider_mutex.unlock();
+    dynamic_provider_mutex.lockUncancelable(std.Options.debug_io);
+    defer dynamic_provider_mutex.unlock(std.Options.debug_io);
 
     for (dynamic_providers.items) |provider| {
         if (std.mem.eql(u8, provider.id, id)) {
@@ -539,8 +539,8 @@ pub fn findProvider(id: []const u8) ?OAuthProvider {
 }
 
 pub fn resetDynamicProvidersForTest() void {
-    dynamic_provider_mutex.lock();
-    defer dynamic_provider_mutex.unlock();
+    dynamic_provider_mutex.lockUncancelable(std.Options.debug_io);
+    defer dynamic_provider_mutex.unlock(std.Options.debug_io);
 
     for (dynamic_providers.items) |*provider| provider.deinit();
     dynamic_providers.deinit(std.heap.page_allocator);
@@ -555,23 +555,18 @@ const JsonField = struct {
 };
 
 fn tokenExchangeJson(allocator: std.mem.Allocator, url_str: []const u8, fields: []const JsonField) ExchangeResult {
-    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer payload_buf.deinit(allocator);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
 
-    {
-        var out: std.io.Writer.Allocating = .fromArrayList(allocator, &payload_buf);
-        var jw: std.json.Stringify = .{ .writer = &out.writer };
-
-        jw.beginObject() catch return .{ .err = "JSON write error" };
-        for (fields) |f| {
-            jw.objectField(f.key) catch return .{ .err = "JSON write error" };
-            jw.write(f.value) catch return .{ .err = "JSON write error" };
-        }
-        jw.endObject() catch return .{ .err = "JSON write error" };
-        payload_buf = out.toArrayList();
+    jw.beginObject() catch return .{ .err = "JSON write error" };
+    for (fields) |f| {
+        jw.objectField(f.key) catch return .{ .err = "JSON write error" };
+        jw.write(f.value) catch return .{ .err = "JSON write error" };
     }
+    jw.endObject() catch return .{ .err = "JSON write error" };
 
-    return doTokenExchange(allocator, url_str, "application/json", payload_buf.items, 5 * 60 * 1000);
+    return doTokenExchange(allocator, url_str, "application/json", out.written(), 5 * 60 * 1000);
 }
 
 fn tokenExchangeForm(allocator: std.mem.Allocator, url_str: []const u8, fields: []const JsonField) ExchangeResult {
@@ -595,7 +590,7 @@ fn doTokenExchange(
     payload: []const u8,
     expires_buffer_ms: i64,
 ) ExchangeResult {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.Options.debug_io };
     defer client.deinit();
 
     var body_writer_buf: [8192]u8 = undefined;
@@ -640,14 +635,14 @@ fn doTokenExchange(
         else => return .{ .err = "expires_in is not a number" },
     };
 
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds();
     const expires_ms = now_ms + expires_in * 1000 - expires_buffer_ms;
 
     return .{ .success = .{
         .refresh = allocator.dupe(u8, refresh_token) catch return .{ .err = "OOM" },
         .access = allocator.dupe(u8, access_token) catch return .{ .err = "OOM" },
         .expires = expires_ms,
-        .extras = std.json.ObjectMap.init(allocator),
+        .extras = .{},
     } };
 }
 

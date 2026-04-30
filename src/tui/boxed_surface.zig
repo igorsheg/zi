@@ -283,7 +283,7 @@ fn rowAscii(buf: *const Buffer, y: u32, out: []u8) []const u8 {
         out[len] = if (cp <= 0x7f) @intCast(cp) else '?';
         len += 1;
     }
-    return std.mem.trimRight(u8, out[0..len], " ");
+    return std.mem.trimEnd(u8, out[0..len], " ");
 }
 
 test "owned surface renders collapsed rows and gaps from an arbitrary offset" {

@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const posix = std.posix;
 
 const log = std.log.scoped(.callback_server);
@@ -34,41 +34,44 @@ pub fn waitForCallback(
     expected_state: []const u8,
     cancelled: *const std.atomic.Value(bool),
 ) CallbackResult {
-    const address = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    var server = address.listen(.{ .reuse_address = true }) catch |err| {
+    const address = net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
+    var server = address.listen(std.Options.debug_io, .{ .reuse_address = true }) catch |err| {
         log.err("failed to listen on port {d}: {s}", .{ port, @errorName(err) });
         return .{ .err = "failed to bind callback server" };
     };
-    defer server.deinit();
+    defer server.deinit(std.Options.debug_io);
 
     while (!cancelled.load(.acquire)) {
         var pfd = [1]posix.pollfd{.{
-            .fd = server.stream.handle,
+            .fd = server.socket.handle,
             .events = posix.POLL.IN,
             .revents = undefined,
         }};
         const ready = posix.poll(&pfd, 500) catch continue;
         if (ready == 0) continue;
 
-        const conn = server.accept() catch continue;
-        defer conn.stream.close();
+        const stream = server.accept(std.Options.debug_io) catch continue;
+        defer stream.close(std.Options.debug_io);
 
         var read_buf: [4096]u8 = undefined;
-        var reader = conn.stream.reader(&read_buf);
-        const request_line = reader.interface().takeDelimiter('\n') catch null orelse {
-            sendResponse(conn.stream, "400 Bad Request", error_html);
+        var reader = stream.reader(std.Options.debug_io, &read_buf);
+        const request_bytes = reader.interface.allocRemaining(allocator, .limited(read_buf.len)) catch {
+            sendResponse(stream, "400 Bad Request", error_html);
             continue; // keep listening for the real callback
         };
+        defer allocator.free(request_bytes);
+        const request_line_end = std.mem.indexOfScalar(u8, request_bytes, '\n') orelse request_bytes.len;
+        const request_line = request_bytes[0..request_line_end];
 
         const result = parseCallbackRequest(allocator, request_line, path, expected_state);
 
         switch (result) {
             .success => {
-                sendResponse(conn.stream, "200 OK", success_html);
+                sendResponse(stream, "200 OK", success_html);
                 return result;
             },
             .err => {
-                sendResponse(conn.stream, "400 Bad Request", error_html);
+                sendResponse(stream, "400 Bad Request", error_html);
                 continue; // keep listening — stray or malformed request
             },
             else => continue,
@@ -80,7 +83,7 @@ pub fn waitForCallback(
 
 fn sendResponse(stream: net.Stream, status: []const u8, body: []const u8) void {
     var write_buf: [4096]u8 = undefined;
-    var writer = stream.writer(&write_buf);
+    var writer = stream.writer(std.Options.debug_io, &write_buf);
     const w = &writer.interface;
 
     w.print("HTTP/1.1 {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
@@ -99,7 +102,7 @@ pub fn parseCallbackRequest(
     expected_path: []const u8,
     expected_state: []const u8,
 ) CallbackResult {
-    const line = std.mem.trimRight(u8, request_line, "\r");
+    const line = std.mem.trimEnd(u8, request_line, "\r");
 
     if (!std.mem.startsWith(u8, line, "GET ")) {
         return .{ .err = "not a GET request" };

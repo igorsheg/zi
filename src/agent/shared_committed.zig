@@ -174,7 +174,7 @@ fn makeUserMessage(alloc: std.mem.Allocator, text: []const u8) !protocol.AgentMe
 }
 
 test "empty SharedCommitted has no messages" {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -185,7 +185,7 @@ test "empty SharedCommitted has no messages" {
 }
 
 test "fromMessages builds one segment" {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -206,7 +206,7 @@ test "fromMessages builds one segment" {
 }
 
 test "appendMessage chains segments and releases old" {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -229,7 +229,7 @@ test "appendMessage chains segments and releases old" {
 }
 
 test "retain keeps shared alive after one release" {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 

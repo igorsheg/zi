@@ -53,7 +53,7 @@ pub const AuthStorage = struct {
     /// persistInsideLock, persistProviderChange) MUST NOT acquire
     /// the mutex themselves — they run inside an already-locked
     /// public method. std.Thread.Mutex is non-recursive.
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
     /// Create a file-backed AuthStorage, loading from disk.
     /// pi-mono source: auth-storage.ts:195-197
@@ -116,8 +116,8 @@ pub const AuthStorage = struct {
     /// Reload credentials from backend.
     /// pi-mono source: auth-storage.ts:247-260
     pub fn reload(self: *AuthStorage) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         self.reloadLocked();
     }
 
@@ -158,16 +158,16 @@ pub const AuthStorage = struct {
     ///
     /// pi-mono source: auth-storage.ts:286-288
     pub fn get(self: *AuthStorage, provider: []const u8) ?types.AuthCredential {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         return self.data.get(provider);
     }
 
     /// Set credential for a provider. Updates in-memory and persists.
     /// pi-mono source: auth-storage.ts:293-296
     pub fn set(self: *AuthStorage, provider: []const u8, credential: types.AuthCredential) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         // Update in-memory — need to dupe key and credential values
         const key_duped = self.allocator.dupe(u8, provider) catch return;
@@ -196,8 +196,8 @@ pub const AuthStorage = struct {
     /// Remove credential for a provider.
     /// pi-mono source: auth-storage.ts:301-304
     pub fn remove(self: *AuthStorage, provider: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.data.fetchRemove(provider)) |old| {
             freeCredential(self.allocator, old.value);
@@ -209,16 +209,16 @@ pub const AuthStorage = struct {
     /// Check if credentials exist for a provider in storage.
     /// pi-mono source: auth-storage.ts:316-318
     pub fn has(self: *AuthStorage, provider: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         return self.data.get(provider) != null;
     }
 
     /// List all provider IDs with credentials. Caller owns returned slice and strings.
     /// pi-mono source: auth-storage.ts:309-311
     pub fn list(self: *AuthStorage, allocator: std.mem.Allocator) ![][]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         const count = self.data.count();
         if (count == 0) return &.{};
@@ -251,8 +251,8 @@ pub const AuthStorage = struct {
     /// Set a runtime API key override (not persisted). Used for CLI --api-key.
     /// pi-mono source: auth-storage.ts:213-215
     pub fn setRuntimeApiKey(self: *AuthStorage, provider: []const u8, key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         const key_duped = self.allocator.dupe(u8, provider) catch return;
         const val_duped = self.allocator.dupe(u8, key) catch {
@@ -271,8 +271,8 @@ pub const AuthStorage = struct {
     /// Remove a runtime API key override.
     /// pi-mono source: auth-storage.ts:220-222
     pub fn removeRuntimeApiKey(self: *AuthStorage, provider: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.runtime_overrides.fetchRemove(provider)) |old| {
             self.allocator.free(old.key);
@@ -283,14 +283,14 @@ pub const AuthStorage = struct {
     /// Set fallback resolver for API keys not found via other tiers.
     /// pi-mono source: auth-storage.ts:228-230
     pub fn setFallbackResolver(self: *AuthStorage, resolver: *const fn (provider: []const u8) ?[]const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         self.fallback_resolver = resolver;
     }
 
     pub fn setExtensionOAuthRefreshHook(self: *AuthStorage, hook: ?ExtensionOAuthRefreshHook) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         self.extension_oauth_refresh_hook = hook;
     }
 
@@ -298,8 +298,8 @@ pub const AuthStorage = struct {
     /// Does NOT auto-refresh OAuth tokens — just checks availability.
     /// pi-mono source: auth-storage.ts:324-330
     pub fn hasAuth(self: *AuthStorage, provider: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         if (self.runtime_overrides.get(provider) != null) return true;
         if (self.data.get(provider) != null) return true;
@@ -324,8 +324,8 @@ pub const AuthStorage = struct {
     ///
     /// pi-mono source: auth-storage.ts:424-485
     pub fn getApiKey(self: *AuthStorage, provider: []const u8) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
 
         // 1. Runtime override
         if (self.runtime_overrides.get(provider)) |key| return key;
@@ -339,7 +339,7 @@ pub const AuthStorage = struct {
                     // buffer is baked into `expires` at refresh time
                     // (oauth.zig: now + expires_in*1000 - 5*60*1000), so
                     // any expired check here doesn't need its own slack.
-                    const now_ms = std.time.milliTimestamp();
+                    const now_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds();
                     if (now_ms < oa.expires) return oa.access;
 
                     // Slow path: refresh under lock. On failure, fall
@@ -427,7 +427,7 @@ pub const AuthStorage = struct {
 
         // Race-window check: did the disk copy already get refreshed
         // by a peer? If so, install it in-memory and return.
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds();
         if (base_from_disk and now_ms < base_cred.expires) {
             self.installRefreshedCredential(provider, base_cred) catch return null;
             // Look up the just-installed credential — installRefreshedCredential
@@ -568,12 +568,12 @@ pub const AuthStorage = struct {
                 const access = try allocator.dupe(u8, oa.access);
                 errdefer allocator.free(access);
 
-                var extras = std.json.ObjectMap.init(allocator);
+                var extras: std.json.ObjectMap = .{};
                 var eit = oa.extras.iterator();
                 while (eit.next()) |entry| {
                     const k = try allocator.dupe(u8, entry.key_ptr.*);
                     const v = try ai.json_util.cloneJsonValue(allocator, entry.value_ptr.*);
-                    try extras.put(k, v);
+                    try extras.put(allocator, k, v);
                 }
 
                 return .{ .oauth = .{
@@ -599,7 +599,7 @@ pub const AuthStorage = struct {
                     allocator.free(entry.key_ptr.*);
                     ai.json_util.freeJsonValue(allocator, entry.value_ptr.*);
                 }
-                extras.deinit();
+                extras.deinit(allocator);
             },
         }
     }
@@ -687,16 +687,16 @@ test "oauth-backed claim providers resolve auth by visible claim name only" {
     storage.set("anthropic-messages", .{ .oauth = .{
         .refresh = "delegate-refresh",
         .access = "delegate-access",
-        .expires = std.time.milliTimestamp() + 60_000,
-        .extras = std.json.ObjectMap.init(allocator),
+        .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 60_000,
+        .extras = .{},
     } });
     try std.testing.expect(storage.getApiKey("proxy") == null);
 
     storage.set("proxy", .{ .oauth = .{
         .refresh = "proxy-refresh",
         .access = "proxy-access",
-        .expires = std.time.milliTimestamp() + 60_000,
-        .extras = std.json.ObjectMap.init(allocator),
+        .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 60_000,
+        .extras = .{},
     } });
     const key = storage.getApiKey("proxy");
     try std.testing.expect(key != null);
@@ -728,8 +728,8 @@ test "extension-owned oauth refresh uses the agent-thread hook and persists the 
             return .{ .success = .{
                 .refresh = alloc.dupe(u8, "new-refresh") catch return .{ .err = "oom" },
                 .access = alloc.dupe(u8, "new-access") catch return .{ .err = "oom" },
-                .expires = std.time.milliTimestamp() + 60_000,
-                .extras = std.json.ObjectMap.init(alloc),
+                .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 60_000,
+                .extras = .{},
             } };
         }
     };
@@ -740,8 +740,8 @@ test "extension-owned oauth refresh uses the agent-thread hook and persists the 
     storage.set("proxy-refresh", .{ .oauth = .{
         .refresh = "old-refresh",
         .access = "old-access",
-        .expires = std.time.milliTimestamp() - 1,
-        .extras = std.json.ObjectMap.init(allocator),
+        .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() - 1,
+        .extras = .{},
     } });
 
     const key = storage.getApiKey("proxy-refresh");

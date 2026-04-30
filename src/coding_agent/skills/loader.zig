@@ -13,7 +13,7 @@ pub const LoadOptions = struct {
 };
 
 pub fn loadSkills(allocator: std.mem.Allocator, options: LoadOptions) !types.LoadResult {
-    const cwd = if (options.cwd) |cwd| try allocator.dupe(u8, cwd) else try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd = if (options.cwd) |cwd| try allocator.dupe(u8, cwd) else try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
     const agent_dir = if (options.agent_dir) |agent_dir| try allocator.dupe(u8, agent_dir) else try storage.getAgentDir(allocator, null);
@@ -38,20 +38,20 @@ pub fn loadSkills(allocator: std.mem.Allocator, options: LoadOptions) !types.Loa
         const resolved = try resolveSkillPath(allocator, cwd, raw_path);
         defer allocator.free(resolved);
 
-        if (std.fs.openDirAbsolute(resolved, .{})) |opened_dir| {
+        if (std.Io.Dir.openDirAbsolute(std.Options.debug_io, resolved, .{})) |opened_dir| {
             var dir = opened_dir;
-            dir.close();
+            dir.close(std.Options.debug_io);
             try loadSkillDirectory(allocator, resolved, .path, &collector);
         } else |dir_err| switch (dir_err) {
             error.NotDir => {
-                const file = std.fs.openFileAbsolute(resolved, .{}) catch |file_err| switch (file_err) {
+                const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, resolved, .{}) catch |file_err| switch (file_err) {
                     error.FileNotFound => {
                         try collector.appendWarning(allocator, resolved, "skill path does not exist");
                         continue;
                     },
                     else => return file_err,
                 };
-                file.close();
+                file.close(std.Options.debug_io);
 
                 if (std.mem.endsWith(u8, resolved, ".md")) {
                     try loadSkillFile(allocator, resolved, .path, &collector);
@@ -96,9 +96,11 @@ fn loadSkillFile(
     source_kind: types.SourceKind,
     collector: *Collector,
 ) !void {
-    const file = try std.fs.openFileAbsolute(file_path, .{});
-    defer file.close();
-    const raw = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, file_path, .{});
+    defer file.close(std.Options.debug_io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(std.Options.debug_io, &read_buf);
+    const raw = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     defer allocator.free(raw);
 
     const parsed = try parse.parseFrontmatter(allocator, raw);
@@ -167,7 +169,11 @@ const Collector = struct {
     }
 
     fn addSkill(self: *Collector, allocator: std.mem.Allocator, skill: types.Skill) !void {
-        const realpath = std.fs.realpathAlloc(allocator, skill.file_path) catch try allocator.dupe(u8, skill.file_path);
+        const realpath = blk: {
+            const z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, skill.file_path, allocator) catch break :blk try allocator.dupe(u8, skill.file_path);
+            defer allocator.free(z);
+            break :blk try allocator.dupe(u8, z);
+        };
         errdefer allocator.free(realpath);
         if (self.loaded_realpaths.contains(realpath)) {
             allocator.free(realpath);
@@ -208,9 +214,9 @@ const Collector = struct {
 
 fn resolveSkillPath(allocator: std.mem.Allocator, cwd: []const u8, raw_path: []const u8) ![]const u8 {
     const normalized = if (std.mem.eql(u8, raw_path, "~"))
-        try allocator.dupe(u8, std.posix.getenv("HOME") orelse raw_path)
+        try allocator.dupe(u8, @import("env").get("HOME") orelse raw_path)
     else if (std.mem.startsWith(u8, raw_path, "~/")) blk: {
-        const home = std.posix.getenv("HOME") orelse break :blk try allocator.dupe(u8, raw_path);
+        const home = @import("env").get("HOME") orelse break :blk try allocator.dupe(u8, raw_path);
         break :blk try std.fs.path.join(allocator, &.{ home, raw_path[2..] });
     } else try allocator.dupe(u8, raw_path);
     defer allocator.free(normalized);
@@ -240,19 +246,19 @@ test "load skills from defaults and explicit paths" {
 
     var agent_tmp = std.testing.tmpDir(.{});
     defer agent_tmp.cleanup();
-    try agent_tmp.dir.makePath("skills/git");
-    try agent_tmp.dir.writeFile(.{ .sub_path = "skills/git/SKILL.md", .data = "---\ndescription: git help\n---\nbody\n" });
-    const agent_root = try agent_tmp.dir.realpathAlloc(allocator, ".");
+    try agent_tmp.dir.createDirPath(std.Options.debug_io, "skills/git");
+    try agent_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "skills/git/SKILL.md", .data = "---\ndescription: git help\n---\nbody\n" });
+    const agent_root = try agent_tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(agent_root);
 
     var project_tmp = std.testing.tmpDir(.{});
     defer project_tmp.cleanup();
-    try project_tmp.dir.makePath("repo/.zi/skills/project-skill");
-    try project_tmp.dir.writeFile(.{ .sub_path = "repo/.zi/skills/project-skill/SKILL.md", .data = "---\ndescription: project help\n---\nbody\n" });
-    try project_tmp.dir.writeFile(.{ .sub_path = "extra.md", .data = "---\nname: extra\ndescription: extra help\n---\nbody\n" });
-    const cwd = try project_tmp.dir.realpathAlloc(allocator, "repo");
+    try project_tmp.dir.createDirPath(std.Options.debug_io, "repo/.zi/skills/project-skill");
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "repo/.zi/skills/project-skill/SKILL.md", .data = "---\ndescription: project help\n---\nbody\n" });
+    try project_tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "extra.md", .data = "---\nname: extra\ndescription: extra help\n---\nbody\n" });
+    const cwd = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "repo", allocator);
     defer allocator.free(cwd);
-    const extra_path = try project_tmp.dir.realpathAlloc(allocator, "extra.md");
+    const extra_path = try project_tmp.dir.realPathFileAlloc(std.Options.debug_io, "extra.md", allocator);
     defer allocator.free(extra_path);
 
     const result = try loadSkills(allocator, .{

@@ -133,7 +133,8 @@ pub fn parseStreaming(
 }
 
 fn emptyObject(allocator: std.mem.Allocator) std.json.Value {
-    return .{ .object = std.json.ObjectMap.init(allocator) };
+    _ = allocator;
+    return .{ .object = .{} };
 }
 
 fn isBlank(src: []const u8) bool {
@@ -317,7 +318,7 @@ const Parser = struct {
         std.debug.assert(self.src[self.index] == '{');
         self.index += 1;
 
-        var obj = std.json.ObjectMap.init(self.arena);
+        var obj: std.json.ObjectMap = .{};
 
         while (true) {
             self.skipBlank();
@@ -360,7 +361,7 @@ const Parser = struct {
                 },
             };
 
-            try obj.put(key, value);
+            try obj.put(self.arena, key, value);
 
             self.skipBlank();
             if (self.index < self.src.len and self.src[self.index] == ',') {

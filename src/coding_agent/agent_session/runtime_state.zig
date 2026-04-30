@@ -45,15 +45,15 @@ pub fn set(
     key: []const u8,
     value: std.json.Value,
 ) !void {
-    var data = std.json.ObjectMap.init(self.allocator);
+    var data: std.json.ObjectMap = .{};
     errdefer {
         const wrapped: std.json.Value = .{ .object = data };
         ai.json_util.freeJsonValue(self.allocator, wrapped);
     }
 
-    try data.put(try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
-    try data.put(try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
-    try data.put(try self.allocator.dupe(u8, "value"), try ai.json_util.cloneJsonValue(self.allocator, value));
+    try data.put(self.allocator, try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
+    try data.put(self.allocator, try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
+    try data.put(self.allocator, try self.allocator.dupe(u8, "value"), try ai.json_util.cloneJsonValue(self.allocator, value));
 
     self.session_store.appendCustomEntry(extension_state_entry_type, .{ .object = data });
 }
@@ -63,15 +63,15 @@ pub fn delete(
     state_owner_id: []const u8,
     key: []const u8,
 ) !void {
-    var data = std.json.ObjectMap.init(self.allocator);
+    var data: std.json.ObjectMap = .{};
     errdefer {
         const wrapped: std.json.Value = .{ .object = data };
         ai.json_util.freeJsonValue(self.allocator, wrapped);
     }
 
-    try data.put(try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
-    try data.put(try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
-    try data.put(try self.allocator.dupe(u8, "deleted"), .{ .bool = true });
+    try data.put(self.allocator, try self.allocator.dupe(u8, "state_owner_id"), .{ .string = try self.allocator.dupe(u8, state_owner_id) });
+    try data.put(self.allocator, try self.allocator.dupe(u8, "key"), .{ .string = try self.allocator.dupe(u8, key) });
+    try data.put(self.allocator, try self.allocator.dupe(u8, "deleted"), .{ .bool = true });
 
     self.session_store.appendCustomEntry(extension_state_entry_type, .{ .object = data });
 }

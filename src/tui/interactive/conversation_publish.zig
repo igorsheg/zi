@@ -1,5 +1,5 @@
 const std = @import("std");
-const agent_mod = @import("../../agent3/root.zig");
+const agent_mod = @import("../../agent/root.zig");
 const coding_agent_mod = @import("../../coding_agent/root.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
@@ -45,7 +45,7 @@ pub fn publishForAgentEvent(self: *Interactive, event: AgentEvent) void {
 }
 
 fn monotonicNowNs() u64 {
-    return @intCast(std.time.nanoTimestamp());
+    return @intCast(@as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())));
 }
 
 fn flushPendingConversationPublish(self: *Interactive) void {

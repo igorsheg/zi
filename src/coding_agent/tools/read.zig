@@ -11,7 +11,7 @@
 //! - per-line byte cap so a single absurd line can't blow the budget
 
 const std = @import("std");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("../../lib/output_buffer.zig");
@@ -77,7 +77,7 @@ fn execute(
     }
 
     // Stat to disambiguate file vs directory.
-    const stat = std.fs.cwd().statFile(resolved) catch |err| {
+    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, resolved, .{}) catch |err| {
         return util.errorf(allocator, "read tool: {s}: {s}", .{ resolved, @errorName(err) });
     };
 
@@ -95,12 +95,14 @@ fn execute(
 }
 
 fn sniffImageMime(path: []const u8) !?image.Mime {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{});
+    defer file.close(std.Options.debug_io);
 
     var header_buf: [64]u8 = undefined;
-    const header_len = try file.readAll(&header_buf);
-    return image.sniffMime(header_buf[0..header_len]);
+    var file_reader = file.reader(std.Options.debug_io, &header_buf);
+    const header = file_reader.interface.allocRemaining(std.heap.smp_allocator, .limited(64)) catch return null;
+    defer std.heap.smp_allocator.free(header);
+    return image.sniffMime(header);
 }
 
 fn readImage(
@@ -109,11 +111,13 @@ fn readImage(
     mime: image.Mime,
     policy: image.InlinePolicy,
 ) protocol.AgentToolResult {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err|
+    const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{}) catch |err|
         return util.errorf(allocator, "failed to open image: {s}", .{@errorName(err)});
-    defer file.close();
+    defer file.close(std.Options.debug_io);
     // 16MB cap on raw image bytes — generous but bounded.
-    const raw = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err|
+    var image_read_buf: [4096]u8 = undefined;
+    var image_reader = file.reader(std.Options.debug_io, &image_read_buf);
+    const raw = image_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024)) catch |err|
         return util.errorf(allocator, "failed to read image: {s}", .{@errorName(err)});
     defer allocator.free(raw);
 
@@ -161,9 +165,9 @@ fn readImage(
 }
 
 fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentToolResult {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err|
+    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, path, .{ .iterate = true }) catch |err|
         return util.errorf(allocator, "cannot list directory: {s}", .{@errorName(err)});
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var names: std.ArrayList([]const u8) = .empty;
     defer {
@@ -172,7 +176,7 @@ fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentT
     }
 
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(std.Options.debug_io) catch null) |entry| {
         const formatted = if (entry.kind == .directory)
             std.fmt.allocPrint(allocator, "{s}/", .{entry.name}) catch continue
         else
@@ -204,13 +208,15 @@ fn readTextFile(
     path: []const u8,
     range: ?[2]i64,
 ) protocol.AgentToolResult {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err|
+    const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{}) catch |err|
         return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
-    defer file.close();
+    defer file.close(std.Options.debug_io);
     // Cap raw read at 4MB so a runaway file doesn't OOM us. Truncation
     // happens after numbering — the per-line + per-output-byte limits
     // pare it down further.
-    const raw = file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch |err|
+    var text_read_buf: [4096]u8 = undefined;
+    var text_reader = file.reader(std.Options.debug_io, &text_read_buf);
+    const raw = text_reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch |err|
         return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
     defer allocator.free(raw);
 
@@ -307,9 +313,9 @@ test "sniffImageMime detects supported image bytes regardless of extension" {
     defer tmp.cleanup();
 
     const png = pngHeader(16, 32);
-    try tmp.dir.writeFile(.{ .sub_path = "mystery.txt", .data = &png });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "mystery.txt", .data = &png });
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
     const path = try std.fs.path.join(allocator, &.{ cwd, "mystery.txt" });
     defer allocator.free(path);
@@ -323,9 +329,9 @@ test "readImage omits oversized inline images when auto-resize is enabled" {
     defer tmp.cleanup();
 
     const png = pngHeader(300, 200);
-    try tmp.dir.writeFile(.{ .sub_path = "large.png", .data = &png });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "large.png", .data = &png });
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
     const path = try std.fs.path.join(allocator, &.{ cwd, "large.png" });
     defer allocator.free(path);
@@ -354,9 +360,9 @@ test "readImage attaches original when auto-resize is disabled" {
     defer tmp.cleanup();
 
     const png = pngHeader(300, 200);
-    try tmp.dir.writeFile(.{ .sub_path = "large.png", .data = &png });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "large.png", .data = &png });
 
-    const cwd = try tmp.dir.realpathAlloc(allocator, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
     const path = try std.fs.path.join(allocator, &.{ cwd, "large.png" });
     defer allocator.free(path);

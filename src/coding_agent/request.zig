@@ -4,7 +4,7 @@ const ai_protocol = @import("../ai/protocol.zig");
 const auth_types = @import("auth/types.zig");
 const extension_runner = @import("extensions/runner.zig");
 const extension_ui = @import("extensions/ui.zig");
-const message_memory = @import("../agent3/message_memory.zig");
+const message_memory = @import("../agent/message_memory.zig");
 const mailbox_mod = @import("../runtime/mailbox.zig");
 
 /// AgentRequest — mailbox payload for the TUI → agent mutation channel.
@@ -55,8 +55,8 @@ pub const ExtensionOAuthLoginCallbacks = struct {
 };
 
 pub const ExtensionPromptResponse = struct {
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     completed: bool = false,
     result: ?Result = null,
 
@@ -99,25 +99,25 @@ pub const ExtensionPromptResponse = struct {
     }
 
     pub fn finish(self: *ExtensionPromptResponse, result: Result) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         if (self.completed) return;
         self.result = result;
         self.completed = true;
-        self.condition.broadcast();
+        self.condition.broadcast(std.Options.debug_io);
     }
 
     pub fn wait(self: *ExtensionPromptResponse) Result {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        while (!self.completed) self.condition.wait(&self.mutex);
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        while (!self.completed) self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
         return self.result.?;
     }
 };
 
 pub const ExtensionOAuthLoginResponse = struct {
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     completed: bool = false,
     result: ?Result = null,
 
@@ -138,27 +138,27 @@ pub const ExtensionOAuthLoginResponse = struct {
     };
 
     pub fn finish(self: *ExtensionOAuthLoginResponse, result: Result) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         std.debug.assert(!self.completed);
         self.result = result;
         self.completed = true;
-        self.condition.broadcast();
+        self.condition.broadcast(std.Options.debug_io);
     }
 
     pub fn wait(self: *ExtensionOAuthLoginResponse) Result {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         while (!self.completed) {
-            self.condition.wait(&self.mutex);
+            self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
         }
         return self.result.?;
     }
 };
 
 pub const ExtensionOAuthRefreshResponse = struct {
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     completed: bool = false,
     result: ?Result = null,
 
@@ -177,19 +177,19 @@ pub const ExtensionOAuthRefreshResponse = struct {
     };
 
     pub fn finish(self: *ExtensionOAuthRefreshResponse, result: Result) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         std.debug.assert(!self.completed);
         self.result = result;
         self.completed = true;
-        self.condition.broadcast();
+        self.condition.broadcast(std.Options.debug_io);
     }
 
     pub fn wait(self: *ExtensionOAuthRefreshResponse) Result {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
         while (!self.completed) {
-            self.condition.wait(&self.mutex);
+            self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
         }
         return self.result.?;
     }
@@ -207,7 +207,7 @@ pub const AgentRequest = union(enum) {
     new_session: void,
     set_model: struct { model: ai_protocol.Model },
     set_model_by_pattern: struct { pattern: []const u8 },
-    set_thinking_level: struct { level: @import("../agent3/types.zig").ThinkingLevel },
+    set_thinking_level: struct { level: @import("../agent/types.zig").ThinkingLevel },
     refresh_status_snapshot: void,
     /// Manual compaction request — /compact. Mirrors pi-mono's
     /// `agentSession.compact(customInstructions)`. Lifecycle runs through
@@ -442,8 +442,8 @@ test "RequestQueue extension_oauth_refresh round-trips provider id and credentia
     var q = try RequestQueue.init(allocator);
     defer q.deinit();
 
-    var extras = std.json.ObjectMap.init(allocator);
-    defer extras.deinit();
+    var extras: std.json.ObjectMap = .{};
+    defer extras.deinit(allocator);
     var response: ExtensionOAuthRefreshResponse = .{};
     const provider_id = try allocator.dupe(u8, "corp-ai");
     q.push(.{ .extension_oauth_refresh = .{
@@ -483,7 +483,7 @@ test "ExtensionOAuthLoginResponse lets a worker wait for agent-thread completion
     var ctx = WaitCtx{ .response = &response };
     const thread = try std.Thread.spawn(.{}, waiter.run, .{&ctx});
 
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
     response.finish(.unsupported);
     thread.join();
 

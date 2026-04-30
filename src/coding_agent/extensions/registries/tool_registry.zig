@@ -122,7 +122,7 @@ fn dummyTool(allocator: std.mem.Allocator, name: []const u8, source_kind: []cons
         .name = try allocator.dupe(u8, name),
         .label = try allocator.dupe(u8, name),
         .description = try allocator.dupe(u8, "test tool"),
-        .parameters = .{ .object = std.json.ObjectMap.init(allocator) },
+        .parameters = .{ .object = .{} },
         .impl = .{ .lua = 1 },
         .source = .{ .kind = source_kind, .id = name },
         .owned = true,
@@ -146,7 +146,7 @@ test "ToolRegistry first-registered-wins" {
         testing.allocator.free(t2.label);
         testing.allocator.free(t2.description);
         var p = t2.parameters.object;
-        p.deinit();
+        p.deinit(testing.allocator);
     }
     try testing.expect(!(try reg.register(t2)));
     try testing.expectEqual(@as(usize, 1), reg.count());

@@ -174,7 +174,7 @@ pub fn streamCore(
         return;
     };
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.Options.debug_io };
     defer client.deinit();
 
     var extra_headers_buf: [16]std.http.Header = undefined;
@@ -211,7 +211,7 @@ pub fn streamCore(
     defer req.deinit();
 
     var abort_guard = AbortGuard.start(options.signal, .{
-        .shutdown_fd = if (req.connection) |conn| conn.stream_reader.getStream().handle else null,
+        .shutdown_fd = AbortGuard.httpRequestShutdownFd(&req),
     });
     defer abort_guard.stop();
 
@@ -324,7 +324,7 @@ const StreamState = struct {
                     .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
                 },
                 .stop_reason = .stop,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             },
         };
     }
@@ -869,7 +869,7 @@ fn buildFinalContent(allocator: std.mem.Allocator, items: []const ItemState) ![]
 }
 
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
     try jw.write(value);
     return out.toOwnedSlice();
@@ -880,7 +880,7 @@ fn encodeTextSignatureV1(
     id: []const u8,
     phase: ?[]const u8,
 ) ![]const u8 {
-    var out: std.io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
     var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
     try jw.beginObject();
     try jw.objectField("v");
@@ -1026,7 +1026,7 @@ pub fn emitFailure(
         .stop_reason = .@"error",
         .error_message = msg,
         .failure = failure,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
 }
@@ -1083,7 +1083,7 @@ pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, strict_
 
 fn resolveCacheRetention(cache_retention: ?protocol.CacheRetention) protocol.CacheRetention {
     if (cache_retention) |retention| return retention;
-    const env = std.posix.getenv("PI_CACHE_RETENTION") orelse return .short;
+    const env = @import("env").get("PI_CACHE_RETENTION") orelse return .short;
     if (std.mem.eql(u8, env, "long")) return .long;
     return .short;
 }
@@ -1103,7 +1103,7 @@ pub fn buildRequestJson(
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
 ) !void {
-    var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
@@ -1363,7 +1363,7 @@ fn flushPendingSyntheticToolResults(
             .content = &.{.{ .text = .{ .text = "No result provided" } }},
             .details = null,
             .is_error = true,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
         };
         const mapped_id = try getMappedToolCallId(allocator, tool_id_map.items, pending.id);
         defer allocator.free(mapped_id);
@@ -1477,7 +1477,7 @@ fn writeAssistantMessage(
             try jw.write(tcall.name);
             try jw.objectField("arguments");
             // Stringify the JSON arguments into a string field.
-            var args_buf: std.io.Writer.Allocating = .init(allocator);
+            var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
             var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
             try inner.write(tcall.arguments);
@@ -1979,8 +1979,8 @@ test "writeInputOpts preserves same-model tool call ids" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var same_model_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer same_model_args.object.deinit();
+    var same_model_args = std.json.Value{ .object = .{} };
+    defer same_model_args.object.deinit(alloc);
 
     const assistant = protocol.AssistantMessage{
         .content = &.{.{ .tool_call = .{
@@ -1999,7 +1999,7 @@ test "writeInputOpts preserves same-model tool call ids" {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
     try jw.beginArray();
     try writeInputOpts(alloc, &jw, protocol.Model{
@@ -2026,8 +2026,8 @@ test "writeInputOpts remaps foreign tool result ids to the replayed function cal
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var foreign_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer foreign_args.object.deinit();
+    var foreign_args = std.json.Value{ .object = .{} };
+    defer foreign_args.object.deinit(alloc);
 
     const assistant = protocol.AssistantMessage{
         .content = &.{.{ .tool_call = .{
@@ -2054,7 +2054,7 @@ test "writeInputOpts remaps foreign tool result ids to the replayed function cal
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
     try jw.beginArray();
     try writeInputOpts(alloc, &jw, test_model, ctx, false);
@@ -2070,8 +2070,8 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var synthetic_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer synthetic_args.object.deinit();
+    var synthetic_args = std.json.Value{ .object = .{} };
+    defer synthetic_args.object.deinit(alloc);
 
     const tool_calling_assistant = protocol.AssistantMessage{
         .content = &.{.{ .tool_call = .{
@@ -2100,7 +2100,7 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
     try jw.beginArray();
     try writeInputOpts(alloc, &jw, protocol.Model{
@@ -2127,8 +2127,8 @@ test "writeInputOpts serializes invalid tool-result utf-8 as output text" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var foreign_args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer foreign_args.object.deinit();
+    var foreign_args = std.json.Value{ .object = .{} };
+    defer foreign_args.object.deinit(alloc);
 
     const assistant = protocol.AssistantMessage{
         .content = &.{.{ .tool_call = .{
@@ -2155,7 +2155,7 @@ test "writeInputOpts serializes invalid tool-result utf-8 as output text" {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    var allocating = std.io.Writer.Allocating.fromArrayList(alloc, &out);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
     try jw.beginArray();
     try writeInputOpts(alloc, &jw, test_model, ctx, false);

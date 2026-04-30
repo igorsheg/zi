@@ -164,7 +164,7 @@ pub const OpenAICompletionsProvider = struct {
             return;
         };
 
-        var client: std.http.Client = .{ .allocator = allocator };
+        var client: std.http.Client = .{ .allocator = allocator, .io = std.Options.debug_io };
         defer client.deinit();
 
         // Bearer token in Authorization header. Stack buffer for
@@ -210,7 +210,7 @@ pub const OpenAICompletionsProvider = struct {
         defer req.deinit();
 
         var abort_guard = AbortGuard.start(options.signal, .{
-            .shutdown_fd = if (req.connection) |conn| conn.stream_reader.getStream().handle else null,
+            .shutdown_fd = AbortGuard.httpRequestShutdownFd(&req),
         });
         defer abort_guard.stop();
 
@@ -404,7 +404,7 @@ const StreamState = struct {
                     .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
                 },
                 .stop_reason = .stop,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             },
         };
     }
@@ -764,7 +764,7 @@ fn attachThoughtSignature(
         if (b.kind != .tool_call) continue;
         if (!std.mem.eql(u8, b.tool_id, tool_id)) continue;
         // Stringify the detail object via std.json.Stringify.
-        var out: std.io.Writer.Allocating = .init(allocator);
+        var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
         jw.write(detail) catch return;
@@ -866,7 +866,7 @@ fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: std.json.Va
     return switch (raw) {
         .string => |s| if (s.len > 0) try allocator.dupe(u8, s) else null,
         else => blk: {
-            var out: std.io.Writer.Allocating = .init(allocator);
+            var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
             jw.write(raw) catch return error.OutOfMemory;
@@ -905,7 +905,7 @@ fn buildRequestJson(
     context: protocol.Context,
     reasoning: ?protocol.ThinkingLevel,
 ) !void {
-    var allocating = std.io.Writer.Allocating.fromArrayList(allocator, out);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
@@ -1132,7 +1132,7 @@ fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, 
             try jw.objectField("arguments");
             // Stringify the JSON value as a string field. Tiny scratch
             // buffer, freed before return.
-            var args_buf: std.io.Writer.Allocating = .init(allocator);
+            var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
             var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
             try inner.write(tc.arguments);
@@ -1190,7 +1190,7 @@ fn emitFailure(
         .stop_reason = .@"error",
         .error_message = message,
         .failure = failure,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
 }

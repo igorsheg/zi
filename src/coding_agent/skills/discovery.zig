@@ -17,16 +17,16 @@ fn discoverRecursive(
     include_root_markdown: bool,
     files: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
-    var entries = std.ArrayListUnmanaged(std.fs.Dir.Entry){};
+    var entries = std.ArrayListUnmanaged(std.Io.Dir.Entry).empty;
     defer entries.deinit(allocator);
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         try entries.append(allocator, entry);
     }
 
@@ -60,10 +60,10 @@ test "discover skill files finds SKILL roots and root markdown files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/git");
-    try tmp.dir.writeFile(.{ .sub_path = "skills/readme.md", .data = "plain" });
-    try tmp.dir.writeFile(.{ .sub_path = "skills/git/SKILL.md", .data = "skill" });
-    const root = try tmp.dir.realpathAlloc(allocator, "skills");
+    try tmp.dir.createDirPath(std.Options.debug_io, "skills/git");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "skills/readme.md", .data = "plain" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "skills/git/SKILL.md", .data = "skill" });
+    const root = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "skills", allocator);
     defer allocator.free(root);
 
     const files = try discoverSkillFiles(allocator, root);

@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent_mod = @import("../agent3/root.zig");
+const agent_mod = @import("../agent/root.zig");
 const storage = @import("../storage.zig");
 const agent_session_mod = @import("agent_session.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
@@ -36,6 +36,7 @@ pub const CreateOptions = struct {
     /// attached or its lookup returns empty.
     api_key: []const u8 = "",
     cwd: []const u8,
+    io: std.Io = std.Options.debug_io,
     /// ResourceLoader bootstrap input: custom system-prompt source.
     system_prompt: ?[]const u8 = null,
     /// ResourceLoader bootstrap input: injected AGENTS/CLAUDE-style files.
@@ -77,6 +78,7 @@ pub fn createAgentSession(
     const prepared = try session_bootstrap.prepareSessionDeps(allocator, .{
         .api_key = options.api_key,
         .cwd = options.cwd,
+        .io = options.io,
         .system_prompt = options.system_prompt,
         .context_files = options.context_files,
         .extension_paths = options.extension_paths,

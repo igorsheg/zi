@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const resolve_mod = @import("../resolve.zig");
 
 pub fn modelsGet(self: anytype, allocator: std.mem.Allocator) ?std.json.Value {
@@ -22,15 +22,15 @@ pub fn resolveModelRef(self: anytype, model_ref: []const u8) ?ai.protocol.Model 
 }
 
 fn modelJson(allocator: std.mem.Allocator, model: protocol.Model) !std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
-    try obj.put(try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, model.id) });
-    try obj.put(try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, model.name) });
+    var obj: std.json.ObjectMap = .{};
+    try obj.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, model.id) });
+    try obj.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, model.name) });
     const provider = ai.json_util.providerToString(model.provider);
-    try obj.put(try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, provider) });
+    try obj.put(allocator, try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, provider) });
     const api = ai.provider.apiToString(model.api);
-    try obj.put(try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, api) });
-    try obj.put(try allocator.dupe(u8, "context_window"), .{ .integer = @intCast(model.context_window) });
-    try obj.put(try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(model.max_tokens) });
-    try obj.put(try allocator.dupe(u8, "reasoning"), .{ .bool = model.reasoning });
+    try obj.put(allocator, try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, api) });
+    try obj.put(allocator, try allocator.dupe(u8, "context_window"), .{ .integer = @intCast(model.context_window) });
+    try obj.put(allocator, try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(model.max_tokens) });
+    try obj.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .bool = model.reasoning });
     return .{ .object = obj };
 }

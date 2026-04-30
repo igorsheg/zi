@@ -203,9 +203,9 @@ pub const SettingsManager = struct {
 
         var raw_obj: std.json.ObjectMap = if (capture.content) |c| blk: {
             const parsed = std.json.parseFromSlice(std.json.Value, a, c, .{}) catch
-                break :blk std.json.ObjectMap.init(a);
-            if (parsed.value == .object) break :blk parsed.value.object else break :blk std.json.ObjectMap.init(a);
-        } else std.json.ObjectMap.init(a);
+                break :blk .{};
+            if (parsed.value == .object) break :blk parsed.value.object else break :blk .{};
+        } else .{};
 
         const modified = if (scope == .global) &self.modified_fields else &self.modified_project_fields;
         const nested_modified = if (scope == .global) &self.modified_nested else &self.modified_project_nested;
@@ -515,7 +515,7 @@ pub const SettingsManager = struct {
         if (self.settings.terminal) |t| {
             if (t.clear_on_shrink) |v| return v;
         }
-        if (std.posix.getenv("PI_CLEAR_ON_SHRINK")) |v| {
+        if (@import("env").get("PI_CLEAR_ON_SHRINK")) |v| {
             return std.mem.eql(u8, v, "1");
         }
         return false;
@@ -582,7 +582,7 @@ pub const SettingsManager = struct {
 
     pub fn getShowHardwareCursor(self: *const SettingsManager) bool {
         if (self.settings.show_hardware_cursor) |v| return v;
-        if (std.posix.getenv("PI_HARDWARE_CURSOR")) |v| {
+        if (@import("env").get("PI_HARDWARE_CURSOR")) |v| {
             return std.mem.eql(u8, v, "1");
         }
         return false;

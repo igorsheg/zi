@@ -67,6 +67,7 @@ pub const SpawnResult = struct {
 
 pub const SpawnConfig = struct {
     allocator: std.mem.Allocator,
+    io: std.Io = std.Options.debug_io,
     cwd: []const u8,
     task: []const u8,
     model: ?[]const u8 = null,

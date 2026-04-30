@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const agent = @import("../../agent3/root.zig");
+const agent = @import("../../agent/root.zig");
 const settings_mod = @import("../settings/root.zig");
 
 pub const TEXT_ONLY: []const ai.protocol.Model.InputType = &.{.text};

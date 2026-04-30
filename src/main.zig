@@ -1,9 +1,8 @@
 const std = @import("std");
 const terminal_mod = @import("tui/terminal.zig");
-const memory_debug = @import("debug/tracked_allocator.zig");
 const logging = @import("logging.zig");
-const profile = @import("debug/profile.zig");
 const cli = @import("coding_agent/cli/root.zig");
+const env = @import("env");
 
 /// Restore terminal on panic (raw mode, cursor, keyboard protocol).
 pub const panic = terminal_mod.panic;
@@ -11,22 +10,14 @@ pub const std_options: std.Options = .{
     .logFn = logging.logFn,
 };
 
-const stderr: std.fs.File = .{ .handle = std.posix.STDERR_FILENO };
+const stderr: std.Io.File = .{ .handle = std.posix.STDERR_FILENO, .flags = .{ .nonblocking = false } };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    env.setProcessEnvironment(init.environ_map);
     logging.setThreadLabel(.main);
 
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-
-    var root_tracker = memory_debug.TrackedAllocator.init("root", gpa.allocator(), gpa.allocator());
-    defer root_tracker.deinit();
-    var agent_backing_tracker = memory_debug.TrackedAllocator.init("agent_backing", root_tracker.allocator(), root_tracker.allocator());
-    defer agent_backing_tracker.deinit();
-    var tui_backing_tracker = memory_debug.TrackedAllocator.init("tui_backing", root_tracker.allocator(), root_tracker.allocator());
-    defer tui_backing_tracker.deinit();
-    var msg_backing_tracker = memory_debug.TrackedAllocator.init("msg_backing", root_tracker.allocator(), root_tracker.allocator());
-    defer msg_backing_tracker.deinit();
 
     // zi-wub.12: dedicated arena owned by the agent thread. Single
     // owner during steady state — TUI thread only touches it during
@@ -36,24 +27,21 @@ pub fn main() !void {
     // TUI keeps local state on its own tracked allocator/backing
     // tracker (zi-wub.11), so the ThreadSafeAllocator band-aid (.13)
     // is no longer needed.
-    var agent_arena = std.heap.ArenaAllocator.init(agent_backing_tracker.allocator());
+    var agent_arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer agent_arena.deinit();
     const allocator = agent_arena.allocator();
 
-    // Dedicated thread-safe GPA for cross-thread mailbox payloads
+    // Dedicated thread-safe allocator for cross-thread mailbox payloads
     // and mailbox backing storage (event queue, request queue,
-    // converted agent events, login callbacks). Wraps the
-    // ROOT GPA directly — NOT the arena — so producer/consumer pairs
-    // can free individually and we don't pin growing payloads in the
-    // arena's lifetime. See `docs/runtime.md` for the ownership rule
-    // behind this split.
-    var ts_msg: std.heap.ThreadSafeAllocator = .{ .child_allocator = msg_backing_tracker.allocator() };
-    const msg_allocator = ts_msg.allocator();
+    // converted agent events, login callbacks). This is NOT the arena,
+    // so producer/consumer pairs can free individually and we don't pin
+    // growing payloads in the arena's lifetime.
+    const msg_allocator = std.heap.smp_allocator;
 
     var raw_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer raw_args.deinit(allocator);
 
-    var process_args = std.process.args();
+    var process_args = std.process.Args.Iterator.init(init.minimal.args);
     _ = process_args.next();
     while (process_args.next()) |arg| {
         try raw_args.append(allocator, arg);
@@ -90,14 +78,11 @@ pub fn main() !void {
     });
     defer log_session.deinit();
 
-    profile.initFromEnv();
-    defer profile.logDumpInfo();
-
     var cli_runtime: ?cli.runtime.Runtime = null;
     defer if (cli_runtime) |*runtime| runtime.deinit();
 
     if (planRequiresRuntime(execution_plan)) {
-        cli_runtime = switch (try cli.runtime.Runtime.init(allocator)) {
+        cli_runtime = switch (try cli.runtime.Runtime.init(allocator, init.io)) {
             .ok => |runtime| runtime,
             .err => |diag| {
                 try writeRuntimeInitDiagnostic(diag);
@@ -109,10 +94,6 @@ pub fn main() !void {
     const execution_result = try cli.dispatch.run(.{
         .allocator = allocator,
         .msg_allocator = msg_allocator,
-        .root_tracker = &root_tracker,
-        .agent_backing_tracker = &agent_backing_tracker,
-        .tui_backing_tracker = &tui_backing_tracker,
-        .msg_backing_tracker = &msg_backing_tracker,
     }, if (cli_runtime) |*runtime| runtime else null, execution_plan);
     switch (execution_result) {
         .ok => {},
@@ -125,28 +106,28 @@ pub fn main() !void {
 
 fn writeParseDiagnostic(diag: cli.parse.ParseDiagnostic) !void {
     var err_buf: [1024]u8 = undefined;
-    var err_writer = stderr.writer(&err_buf);
+    var err_writer = stderr.writer(std.Options.debug_io, &err_buf);
     try cli.diagnostics.writeParseDiagnostic(&err_writer.interface, diag);
     try err_writer.end();
 }
 
 fn writePlanDiagnostic(diag: cli.plan.PlanDiagnostic) !void {
     var err_buf: [1024]u8 = undefined;
-    var err_writer = stderr.writer(&err_buf);
+    var err_writer = stderr.writer(std.Options.debug_io, &err_buf);
     try cli.diagnostics.writePlanDiagnostic(&err_writer.interface, diag);
     try err_writer.end();
 }
 
 fn writeRuntimeInitDiagnostic(diag: cli.runtime.InitDiagnostic) !void {
     var err_buf: [1024]u8 = undefined;
-    var err_writer = stderr.writer(&err_buf);
+    var err_writer = stderr.writer(std.Options.debug_io, &err_buf);
     try cli.diagnostics.writeRuntimeInitDiagnostic(&err_writer.interface, diag);
     try err_writer.end();
 }
 
 fn writeExecutionDiagnostic(diag: cli.result.ExecutionDiagnostic) !void {
     var err_buf: [1024]u8 = undefined;
-    var err_writer = stderr.writer(&err_buf);
+    var err_writer = stderr.writer(std.Options.debug_io, &err_buf);
     try cli.diagnostics.writeExecutionDiagnostic(&err_writer.interface, diag);
     try err_writer.end();
 }

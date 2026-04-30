@@ -54,7 +54,7 @@ const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
 const command_registry = @import("registries/command_registry.zig");
 const tool_def = @import("../tools/definition.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
 const session_core = @import("../../session/root.zig");
@@ -1161,11 +1161,11 @@ test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" 
     const blocks = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
     const text = try testing.allocator.dupe(u8, "child output");
     blocks[0] = .{ .text = .{ .text = text } };
-    var usage = std.json.ObjectMap.init(testing.allocator);
-    try usage.put(try testing.allocator.dupe(u8, "input"), .{ .integer = 1 });
-    var details = std.json.ObjectMap.init(testing.allocator);
-    try details.put(try testing.allocator.dupe(u8, "cancelled"), .{ .bool = true });
-    try details.put(try testing.allocator.dupe(u8, "usage"), .{ .object = usage });
+    var usage: std.json.ObjectMap = .{};
+    try usage.put(testing.allocator, try testing.allocator.dupe(u8, "input"), .{ .integer = 1 });
+    var details: std.json.ObjectMap = .{};
+    try details.put(testing.allocator, try testing.allocator.dupe(u8, "cancelled"), .{ .bool = true });
+    try details.put(testing.allocator, try testing.allocator.dupe(u8, "usage"), .{ .object = usage });
     const spawn_result: agent_protocol.AgentToolResult = .{ .content = blocks, .is_error = false, .details = .{ .object = details } };
     runner.current_spawn_result = .{ .result = spawn_result };
     defer {

@@ -3,7 +3,7 @@
 //! second round-trip and steers them toward `read` for future calls.
 
 const std = @import("std");
-const protocol = @import("../../agent3/types.zig");
+const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("../../lib/output_buffer.zig");
@@ -46,9 +46,9 @@ fn execute(
         return util.errorResult(allocator, "ls tool: failed to resolve path");
     defer allocator.free(resolved);
 
-    var dir = std.fs.cwd().openDir(resolved, .{ .iterate = true }) catch |err|
+    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, resolved, .{ .iterate = true }) catch |err|
         return util.errorf(allocator, "ls tool: cannot open {s}: {s}", .{ resolved, @errorName(err) });
-    defer dir.close();
+    defer dir.close(std.Options.debug_io);
 
     var names: std.ArrayList([]const u8) = .empty;
     defer {
@@ -56,7 +56,7 @@ fn execute(
         names.deinit(allocator);
     }
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(std.Options.debug_io) catch null) |entry| {
         const formatted = if (entry.kind == .directory)
             std.fmt.allocPrint(allocator, "{s}/", .{entry.name}) catch continue
         else

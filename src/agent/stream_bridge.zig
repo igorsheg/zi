@@ -34,7 +34,7 @@ pub const StreamBridge = struct {
                 }
                 self.sink(.{ .message_end = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
             },
-            else => |_| {
+            else => {
                 if (extractPartial(event)) |partial| {
                     self.sink(.{ .message_update = .{
                         .message = .{ .assistant = partial },

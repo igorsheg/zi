@@ -18,13 +18,14 @@ pub const InitResult = union(enum) {
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     cwd: []const u8,
     auth_storage: *auth.storage.AuthStorage,
     settings_manager: *settings_mod.manager.SettingsManager,
     model_registry: *coding_agent.ModelRegistry,
 
-    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!InitResult {
-        const cwd = try resolveCwd(allocator);
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!InitResult {
+        const cwd = try resolveCwd(allocator, io);
         errdefer allocator.free(cwd);
 
         const auth_storage = try allocator.create(auth.storage.AuthStorage);
@@ -55,6 +56,7 @@ pub const Runtime = struct {
 
         return .{ .ok = .{
             .allocator = allocator,
+            .io = io,
             .cwd = cwd,
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
@@ -74,8 +76,8 @@ pub const Runtime = struct {
     }
 };
 
-fn resolveCwd(allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
-    return std.fs.cwd().realpathAlloc(allocator, ".") catch |err| switch (err) {
+fn resolveCwd(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]const u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => try allocator.dupe(u8, "/unknown"),
     };

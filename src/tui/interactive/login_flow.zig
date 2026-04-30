@@ -172,7 +172,7 @@ fn threadFn(ctx: *Context) void {
                 self.msg_allocator.free(e.key_ptr.*);
                 json_util.freeJsonValue(self.msg_allocator, e.value_ptr.*);
             }
-            extras.deinit();
+            extras.deinit(self.msg_allocator);
             _ = self.publishLifecycleUiEvent(.{ .login_complete = .{
                 .provider_id = provider_id,
                 .success = true,
@@ -201,13 +201,15 @@ fn threadFn(ctx: *Context) void {
 fn onAuth(url: []const u8, ctx: ?*anyopaque) void {
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
 
-    _ = std.process.Child.run(.{
-        .allocator = self.msg_allocator,
+    var child = std.process.spawn(std.Options.debug_io, .{
         .argv = if (builtin.os.tag == .macos)
             &.{ "open", url }
         else
             &.{ "xdg-open", url },
-    }) catch {};
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+    _ = child.wait(std.Options.debug_io) catch {};
 
     const msg = self.msg_allocator.dupe(u8, "login: check your browser") catch return;
     _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = msg, .kind = .auth_url } });

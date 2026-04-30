@@ -21,11 +21,11 @@ const UtcParts = struct {
 };
 
 pub fn isoDateNow(allocator: std.mem.Allocator) ![]u8 {
-    return formatIsoDate(allocator, std.time.timestamp());
+    return formatIsoDate(allocator, std.Io.Timestamp.now(std.Options.debug_io, .real).toSeconds());
 }
 
 pub fn isoTimestampNow(allocator: std.mem.Allocator) ![]u8 {
-    return formatIsoTimestamp(allocator, std.time.timestamp());
+    return formatIsoTimestamp(allocator, std.Io.Timestamp.now(std.Options.debug_io, .real).toSeconds());
 }
 
 pub fn formatIsoDate(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u8 {
@@ -58,7 +58,7 @@ pub fn isoToEpochMs(timestamp: []const u8) i64 {
 
 /// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y".
 pub fn relativeTimeLabel(iso_ts: []const u8) []const u8 {
-    return relativeTimeLabelAt(iso_ts, std.time.timestamp());
+    return relativeTimeLabelAt(iso_ts, std.Io.Timestamp.now(std.Options.debug_io, .real).toSeconds());
 }
 
 pub fn relativeTimeLabelAt(iso_ts: []const u8, now_epoch_s: i64) []const u8 {

@@ -842,106 +842,106 @@ pub fn applyTypedFieldToRaw(
 ) !void {
     const key = types.settingsFieldToJsonKey(field);
     switch (field) {
-        .last_changelog_version => try putOptionalString(object, key, settings.last_changelog_version),
-        .default_provider => try putOptionalString(object, key, settings.default_provider),
-        .default_model => try putOptionalString(object, key, settings.default_model),
-        .theme => try putOptionalString(object, key, settings.theme),
-        .shell_path => try putOptionalString(object, key, settings.shell_path),
-        .shell_command_prefix => try putOptionalString(object, key, settings.shell_command_prefix),
-        .session_dir => try putOptionalString(object, key, settings.session_dir),
+        .last_changelog_version => try putOptionalString(allocator, object, key, settings.last_changelog_version),
+        .default_provider => try putOptionalString(allocator, object, key, settings.default_provider),
+        .default_model => try putOptionalString(allocator, object, key, settings.default_model),
+        .theme => try putOptionalString(allocator, object, key, settings.theme),
+        .shell_path => try putOptionalString(allocator, object, key, settings.shell_path),
+        .shell_command_prefix => try putOptionalString(allocator, object, key, settings.shell_command_prefix),
+        .session_dir => try putOptionalString(allocator, object, key, settings.session_dir),
 
         .default_thinking_level => {
             if (settings.default_thinking_level) |v|
-                try object.put(key, .{ .string = types.defaultThinkingLevelToString(v) });
+                try object.put(allocator, key, .{ .string = types.defaultThinkingLevelToString(v) });
         },
         .transport => {
             if (settings.transport) |v|
-                try object.put(key, .{ .string = types.transportToString(v) });
+                try object.put(allocator, key, .{ .string = types.transportToString(v) });
         },
         .steering_mode => {
             if (settings.steering_mode) |v|
-                try object.put(key, .{ .string = types.steeringModeToString(v) });
+                try object.put(allocator, key, .{ .string = types.steeringModeToString(v) });
         },
         .follow_up_mode => {
             if (settings.follow_up_mode) |v|
-                try object.put(key, .{ .string = types.followUpModeToString(v) });
+                try object.put(allocator, key, .{ .string = types.followUpModeToString(v) });
         },
         .double_escape_action => {
             if (settings.double_escape_action) |v|
-                try object.put(key, .{ .string = types.doubleEscapeActionToString(v) });
+                try object.put(allocator, key, .{ .string = types.doubleEscapeActionToString(v) });
         },
         .tree_filter_mode => {
             if (settings.tree_filter_mode) |v|
-                try object.put(key, .{ .string = types.treeFilterModeToString(v) });
+                try object.put(allocator, key, .{ .string = types.treeFilterModeToString(v) });
         },
 
-        .hide_thinking_block => try putOptionalBool(object, key, settings.hide_thinking_block),
-        .quiet_startup => try putOptionalBool(object, key, settings.quiet_startup),
-        .collapse_changelog => try putOptionalBool(object, key, settings.collapse_changelog),
-        .enable_skill_commands => try putOptionalBool(object, key, settings.enable_skill_commands),
-        .show_hardware_cursor => try putOptionalBool(object, key, settings.show_hardware_cursor),
+        .hide_thinking_block => try putOptionalBool(allocator, object, key, settings.hide_thinking_block),
+        .quiet_startup => try putOptionalBool(allocator, object, key, settings.quiet_startup),
+        .collapse_changelog => try putOptionalBool(allocator, object, key, settings.collapse_changelog),
+        .enable_skill_commands => try putOptionalBool(allocator, object, key, settings.enable_skill_commands),
+        .show_hardware_cursor => try putOptionalBool(allocator, object, key, settings.show_hardware_cursor),
 
-        .editor_padding_x => try putOptionalInt(object, key, settings.editor_padding_x),
-        .autocomplete_max_visible => try putOptionalInt(object, key, settings.autocomplete_max_visible),
+        .editor_padding_x => try putOptionalInt(allocator, object, key, settings.editor_padding_x),
+        .autocomplete_max_visible => try putOptionalInt(allocator, object, key, settings.autocomplete_max_visible),
 
         .compaction => {
             if (settings.compaction) |c| {
-                var nested = ObjectMap.init(allocator);
-                if (c.enabled) |v| try nested.put("enabled", .{ .bool = v });
-                if (c.reserve_tokens) |v| try nested.put("reserveTokens", .{ .integer = v });
-                if (c.keep_recent_tokens) |v| try nested.put("keepRecentTokens", .{ .integer = v });
-                try object.put(key, .{ .object = nested });
+                var nested: ObjectMap = .{};
+                if (c.enabled) |v| try nested.put(allocator, "enabled", .{ .bool = v });
+                if (c.reserve_tokens) |v| try nested.put(allocator, "reserveTokens", .{ .integer = v });
+                if (c.keep_recent_tokens) |v| try nested.put(allocator, "keepRecentTokens", .{ .integer = v });
+                try object.put(allocator, key, .{ .object = nested });
             }
         },
         .branch_summary => {
             if (settings.branch_summary) |s| {
-                var nested = ObjectMap.init(allocator);
-                if (s.reserve_tokens) |v| try nested.put("reserveTokens", .{ .integer = v });
-                if (s.skip_prompt) |v| try nested.put("skipPrompt", .{ .bool = v });
-                try object.put(key, .{ .object = nested });
+                var nested: ObjectMap = .{};
+                if (s.reserve_tokens) |v| try nested.put(allocator, "reserveTokens", .{ .integer = v });
+                if (s.skip_prompt) |v| try nested.put(allocator, "skipPrompt", .{ .bool = v });
+                try object.put(allocator, key, .{ .object = nested });
             }
         },
         .retry => {
             if (settings.retry) |r| {
-                var nested = ObjectMap.init(allocator);
-                if (r.enabled) |v| try nested.put("enabled", .{ .bool = v });
-                if (r.max_retries) |v| try nested.put("maxRetries", .{ .integer = v });
-                if (r.base_delay_ms) |v| try nested.put("baseDelayMs", .{ .integer = v });
-                if (r.max_delay_ms) |v| try nested.put("maxDelayMs", .{ .integer = v });
-                try object.put(key, .{ .object = nested });
+                var nested: ObjectMap = .{};
+                if (r.enabled) |v| try nested.put(allocator, "enabled", .{ .bool = v });
+                if (r.max_retries) |v| try nested.put(allocator, "maxRetries", .{ .integer = v });
+                if (r.base_delay_ms) |v| try nested.put(allocator, "baseDelayMs", .{ .integer = v });
+                if (r.max_delay_ms) |v| try nested.put(allocator, "maxDelayMs", .{ .integer = v });
+                try object.put(allocator, key, .{ .object = nested });
             }
         },
         .terminal => {
             if (settings.terminal) |t| {
-                var nested = ObjectMap.init(allocator);
-                if (t.show_images) |v| try nested.put("showImages", .{ .bool = v });
-                if (t.clear_on_shrink) |v| try nested.put("clearOnShrink", .{ .bool = v });
-                try object.put(key, .{ .object = nested });
+                var nested: ObjectMap = .{};
+                if (t.show_images) |v| try nested.put(allocator, "showImages", .{ .bool = v });
+                if (t.clear_on_shrink) |v| try nested.put(allocator, "clearOnShrink", .{ .bool = v });
+                try object.put(allocator, key, .{ .object = nested });
             }
         },
         .images => {
             if (settings.images) |i| {
-                var nested = ObjectMap.init(allocator);
-                if (i.auto_resize) |v| try nested.put("autoResize", .{ .bool = v });
-                if (i.block_images) |v| try nested.put("blockImages", .{ .bool = v });
-                try object.put(key, .{ .object = nested });
+                var nested: ObjectMap = .{};
+                if (i.auto_resize) |v| try nested.put(allocator, "autoResize", .{ .bool = v });
+                if (i.block_images) |v| try nested.put(allocator, "blockImages", .{ .bool = v });
+                try object.put(allocator, key, .{ .object = nested });
             }
         },
         .thinking_budgets => {
             if (settings.thinking_budgets) |t| {
-                var nested = ObjectMap.init(allocator);
-                if (t.minimal) |v| try nested.put("minimal", .{ .integer = v });
-                if (t.low) |v| try nested.put("low", .{ .integer = v });
-                if (t.medium) |v| try nested.put("medium", .{ .integer = v });
-                if (t.high) |v| try nested.put("high", .{ .integer = v });
-                try object.put(key, .{ .object = nested });
+                var nested: ObjectMap = .{};
+                if (t.minimal) |v| try nested.put(allocator, "minimal", .{ .integer = v });
+                if (t.low) |v| try nested.put(allocator, "low", .{ .integer = v });
+                if (t.medium) |v| try nested.put(allocator, "medium", .{ .integer = v });
+                if (t.high) |v| try nested.put(allocator, "high", .{ .integer = v });
+                try object.put(allocator, key, .{ .object = nested });
             }
         },
         .markdown => {
             if (settings.markdown) |m| {
-                var nested = ObjectMap.init(allocator);
-                if (m.code_block_indent) |v| try nested.put("codeBlockIndent", .{ .string = v });
-                try object.put(key, .{ .object = nested });
+                var nested: ObjectMap = .{};
+                if (m.code_block_indent) |v| try nested.put(allocator, "codeBlockIndent", .{ .string = v });
+                try object.put(allocator, key, .{ .object = nested });
             }
         },
 
@@ -959,17 +959,17 @@ pub fn applyTypedFieldToRaw(
                     switch (pkg) {
                         .string => |s| try arr.append(.{ .string = s }),
                         .filtered => |f| {
-                            var pkg_obj = ObjectMap.init(allocator);
-                            try pkg_obj.put("source", .{ .string = f.source });
-                            if (f.extensions) |exts| try pkg_obj.put("extensions", try buildJsonStringArray(allocator, exts));
-                            if (f.skills) |sk| try pkg_obj.put("skills", try buildJsonStringArray(allocator, sk));
-                            if (f.prompts) |pr| try pkg_obj.put("prompts", try buildJsonStringArray(allocator, pr));
-                            if (f.themes) |th| try pkg_obj.put("themes", try buildJsonStringArray(allocator, th));
+                            var pkg_obj: ObjectMap = .{};
+                            try pkg_obj.put(allocator, "source", .{ .string = f.source });
+                            if (f.extensions) |exts| try pkg_obj.put(allocator, "extensions", try buildJsonStringArray(allocator, exts));
+                            if (f.skills) |sk| try pkg_obj.put(allocator, "skills", try buildJsonStringArray(allocator, sk));
+                            if (f.prompts) |pr| try pkg_obj.put(allocator, "prompts", try buildJsonStringArray(allocator, pr));
+                            if (f.themes) |th| try pkg_obj.put(allocator, "themes", try buildJsonStringArray(allocator, th));
                             try arr.append(.{ .object = pkg_obj });
                         },
                     }
                 }
-                try object.put(key, .{ .array = arr });
+                try object.put(allocator, key, .{ .array = arr });
             }
         },
 
@@ -977,27 +977,27 @@ pub fn applyTypedFieldToRaw(
             if (settings.models) |models| {
                 var arr = try std.json.Array.initCapacity(allocator, models.len);
                 for (models) |m| {
-                    var obj = ObjectMap.init(allocator);
-                    try obj.put("id", .{ .string = m.id });
-                    try obj.put("name", .{ .string = m.name });
-                    try obj.put("api", .{ .string = m.api });
-                    try obj.put("provider", .{ .string = m.provider });
-                    try obj.put("baseUrl", .{ .string = m.base_url });
-                    if (m.reasoning) try obj.put("reasoning", .{ .bool = true });
-                    if (m.input_has_image) try obj.put("inputHasImage", .{ .bool = true });
-                    try obj.put("contextWindow", .{ .integer = @intCast(m.context_window) });
-                    try obj.put("maxTokens", .{ .integer = @intCast(m.max_tokens) });
+                    var obj: ObjectMap = .{};
+                    try obj.put(allocator, "id", .{ .string = m.id });
+                    try obj.put(allocator, "name", .{ .string = m.name });
+                    try obj.put(allocator, "api", .{ .string = m.api });
+                    try obj.put(allocator, "provider", .{ .string = m.provider });
+                    try obj.put(allocator, "baseUrl", .{ .string = m.base_url });
+                    if (m.reasoning) try obj.put(allocator, "reasoning", .{ .bool = true });
+                    if (m.input_has_image) try obj.put(allocator, "inputHasImage", .{ .bool = true });
+                    try obj.put(allocator, "contextWindow", .{ .integer = @intCast(m.context_window) });
+                    try obj.put(allocator, "maxTokens", .{ .integer = @intCast(m.max_tokens) });
                     if (m.cost_input != 0 or m.cost_output != 0 or m.cost_cache_read != 0 or m.cost_cache_write != 0) {
-                        var cost = ObjectMap.init(allocator);
-                        try cost.put("input", .{ .float = m.cost_input });
-                        try cost.put("output", .{ .float = m.cost_output });
-                        try cost.put("cacheRead", .{ .float = m.cost_cache_read });
-                        try cost.put("cacheWrite", .{ .float = m.cost_cache_write });
-                        try obj.put("cost", .{ .object = cost });
+                        var cost: ObjectMap = .{};
+                        try cost.put(allocator, "input", .{ .float = m.cost_input });
+                        try cost.put(allocator, "output", .{ .float = m.cost_output });
+                        try cost.put(allocator, "cacheRead", .{ .float = m.cost_cache_read });
+                        try cost.put(allocator, "cacheWrite", .{ .float = m.cost_cache_write });
+                        try obj.put(allocator, "cost", .{ .object = cost });
                     }
                     try arr.append(.{ .object = obj });
                 }
-                try object.put(key, .{ .array = arr });
+                try object.put(allocator, key, .{ .array = arr });
             }
         },
     }
@@ -1019,104 +1019,104 @@ pub fn applyTypedNestedFieldToRaw(
 
     var nested: ObjectMap = if (object.get(json_key)) |v| blk: {
         if (v == .object) break :blk v.object;
-        break :blk ObjectMap.init(allocator);
-    } else ObjectMap.init(allocator);
+        break :blk .{};
+    } else .{};
 
     switch (field) {
         .compaction => {
             if (settings.compaction) |c| {
                 if (std.mem.eql(u8, nested_key, "enabled")) {
-                    if (c.enabled) |v| try nested.put("enabled", .{ .bool = v });
+                    if (c.enabled) |v| try nested.put(allocator, "enabled", .{ .bool = v });
                 } else if (std.mem.eql(u8, nested_key, "reserveTokens")) {
-                    if (c.reserve_tokens) |v| try nested.put("reserveTokens", .{ .integer = v });
+                    if (c.reserve_tokens) |v| try nested.put(allocator, "reserveTokens", .{ .integer = v });
                 } else if (std.mem.eql(u8, nested_key, "keepRecentTokens")) {
-                    if (c.keep_recent_tokens) |v| try nested.put("keepRecentTokens", .{ .integer = v });
+                    if (c.keep_recent_tokens) |v| try nested.put(allocator, "keepRecentTokens", .{ .integer = v });
                 }
             }
         },
         .branch_summary => {
             if (settings.branch_summary) |s| {
                 if (std.mem.eql(u8, nested_key, "reserveTokens")) {
-                    if (s.reserve_tokens) |v| try nested.put("reserveTokens", .{ .integer = v });
+                    if (s.reserve_tokens) |v| try nested.put(allocator, "reserveTokens", .{ .integer = v });
                 } else if (std.mem.eql(u8, nested_key, "skipPrompt")) {
-                    if (s.skip_prompt) |v| try nested.put("skipPrompt", .{ .bool = v });
+                    if (s.skip_prompt) |v| try nested.put(allocator, "skipPrompt", .{ .bool = v });
                 }
             }
         },
         .retry => {
             if (settings.retry) |r| {
                 if (std.mem.eql(u8, nested_key, "enabled")) {
-                    if (r.enabled) |v| try nested.put("enabled", .{ .bool = v });
+                    if (r.enabled) |v| try nested.put(allocator, "enabled", .{ .bool = v });
                 } else if (std.mem.eql(u8, nested_key, "maxRetries")) {
-                    if (r.max_retries) |v| try nested.put("maxRetries", .{ .integer = v });
+                    if (r.max_retries) |v| try nested.put(allocator, "maxRetries", .{ .integer = v });
                 } else if (std.mem.eql(u8, nested_key, "baseDelayMs")) {
-                    if (r.base_delay_ms) |v| try nested.put("baseDelayMs", .{ .integer = v });
+                    if (r.base_delay_ms) |v| try nested.put(allocator, "baseDelayMs", .{ .integer = v });
                 } else if (std.mem.eql(u8, nested_key, "maxDelayMs")) {
-                    if (r.max_delay_ms) |v| try nested.put("maxDelayMs", .{ .integer = v });
+                    if (r.max_delay_ms) |v| try nested.put(allocator, "maxDelayMs", .{ .integer = v });
                 }
             }
         },
         .terminal => {
             if (settings.terminal) |t| {
                 if (std.mem.eql(u8, nested_key, "showImages")) {
-                    if (t.show_images) |v| try nested.put("showImages", .{ .bool = v });
+                    if (t.show_images) |v| try nested.put(allocator, "showImages", .{ .bool = v });
                 } else if (std.mem.eql(u8, nested_key, "clearOnShrink")) {
-                    if (t.clear_on_shrink) |v| try nested.put("clearOnShrink", .{ .bool = v });
+                    if (t.clear_on_shrink) |v| try nested.put(allocator, "clearOnShrink", .{ .bool = v });
                 }
             }
         },
         .images => {
             if (settings.images) |i| {
                 if (std.mem.eql(u8, nested_key, "autoResize")) {
-                    if (i.auto_resize) |v| try nested.put("autoResize", .{ .bool = v });
+                    if (i.auto_resize) |v| try nested.put(allocator, "autoResize", .{ .bool = v });
                 } else if (std.mem.eql(u8, nested_key, "blockImages")) {
-                    if (i.block_images) |v| try nested.put("blockImages", .{ .bool = v });
+                    if (i.block_images) |v| try nested.put(allocator, "blockImages", .{ .bool = v });
                 }
             }
         },
         .thinking_budgets => {
             if (settings.thinking_budgets) |t| {
                 if (std.mem.eql(u8, nested_key, "minimal")) {
-                    if (t.minimal) |v| try nested.put("minimal", .{ .integer = v });
+                    if (t.minimal) |v| try nested.put(allocator, "minimal", .{ .integer = v });
                 } else if (std.mem.eql(u8, nested_key, "low")) {
-                    if (t.low) |v| try nested.put("low", .{ .integer = v });
+                    if (t.low) |v| try nested.put(allocator, "low", .{ .integer = v });
                 } else if (std.mem.eql(u8, nested_key, "medium")) {
-                    if (t.medium) |v| try nested.put("medium", .{ .integer = v });
+                    if (t.medium) |v| try nested.put(allocator, "medium", .{ .integer = v });
                 } else if (std.mem.eql(u8, nested_key, "high")) {
-                    if (t.high) |v| try nested.put("high", .{ .integer = v });
+                    if (t.high) |v| try nested.put(allocator, "high", .{ .integer = v });
                 }
             }
         },
         .markdown => {
             if (settings.markdown) |m| {
                 if (std.mem.eql(u8, nested_key, "codeBlockIndent")) {
-                    if (m.code_block_indent) |v| try nested.put("codeBlockIndent", .{ .string = v });
+                    if (m.code_block_indent) |v| try nested.put(allocator, "codeBlockIndent", .{ .string = v });
                 }
             }
         },
         else => {},
     }
 
-    try object.put(json_key, .{ .object = nested });
+    try object.put(allocator, json_key, .{ .object = nested });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-fn putOptionalString(object: *ObjectMap, key: []const u8, value: ?[]const u8) !void {
-    if (value) |v| try object.put(key, .{ .string = v });
+fn putOptionalString(allocator: std.mem.Allocator, object: *ObjectMap, key: []const u8, value: ?[]const u8) !void {
+    if (value) |v| try object.put(allocator, key, .{ .string = v });
 }
 
-fn putOptionalBool(object: *ObjectMap, key: []const u8, value: ?bool) !void {
-    if (value) |v| try object.put(key, .{ .bool = v });
+fn putOptionalBool(allocator: std.mem.Allocator, object: *ObjectMap, key: []const u8, value: ?bool) !void {
+    if (value) |v| try object.put(allocator, key, .{ .bool = v });
 }
 
-fn putOptionalInt(object: *ObjectMap, key: []const u8, value: ?i64) !void {
-    if (value) |v| try object.put(key, .{ .integer = v });
+fn putOptionalInt(allocator: std.mem.Allocator, object: *ObjectMap, key: []const u8, value: ?i64) !void {
+    if (value) |v| try object.put(allocator, key, .{ .integer = v });
 }
 
 fn putOptionalStringArray(allocator: std.mem.Allocator, object: *ObjectMap, key: []const u8, value: ?[]const []const u8) !void {
     if (value) |arr| {
-        try object.put(key, try buildJsonStringArray(allocator, arr));
+        try object.put(allocator, key, try buildJsonStringArray(allocator, arr));
     }
 }
 
@@ -1216,7 +1216,7 @@ test "applyTypedFieldToRaw writes nested struct to raw object" {
         .compaction = .{ .enabled = true, .reserve_tokens = 8000 },
     };
 
-    var raw = ObjectMap.init(allocator);
+    var raw: ObjectMap = .{};
 
     try applyTypedFieldToRaw(allocator, &raw, .compaction, &settings);
 

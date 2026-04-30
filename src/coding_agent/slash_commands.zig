@@ -53,7 +53,6 @@ pub const BUILTIN_COMMANDS = [_]SlashCommand{
     .{ .name = "copy", .description = "Copy last agent message to clipboard", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "name", .description = "Set session display name", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "session", .description = "Show session info and stats", .source = .builtin, .action = .{ .builtin = &stubHandler } },
-    .{ .name = "mem", .description = "Write memory diagnostics to disk", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "hotkeys", .description = "Show all keyboard shortcuts", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "settings", .description = "Open settings menu", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "login", .description = "Login with OAuth provider", .source = .builtin, .action = .{ .builtin = &stubHandler } },

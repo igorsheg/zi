@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai_protocol = @import("../../ai/protocol.zig");
-const agent_protocol = @import("../../agent3/types.zig");
+const agent_protocol = @import("../../agent/types.zig");
 const session_protocol = @import("../../session/protocol.zig");
 
 pub const TextModeResult = union(enum) {
@@ -20,7 +20,7 @@ pub fn evaluateTextModeResult(allocator: std.mem.Allocator, messages: []const ag
     };
 }
 
-pub fn writeAssistantText(writer: *std.io.Writer, assistant: ai_protocol.AssistantMessage) !void {
+pub fn writeAssistantText(writer: *std.Io.Writer, assistant: ai_protocol.AssistantMessage) !void {
     for (assistant.content) |content| {
         switch (content) {
             .text => |text| try writer.print("{s}\n", .{text.text}),
@@ -29,7 +29,7 @@ pub fn writeAssistantText(writer: *std.io.Writer, assistant: ai_protocol.Assista
     }
 }
 
-pub fn writeJsonSessionPreamble(writer: *std.io.Writer, header: ?session_protocol.SessionHeader) !void {
+pub fn writeJsonSessionPreamble(writer: *std.Io.Writer, header: ?session_protocol.SessionHeader) !void {
     const session_header = header orelse return;
     var jw: std.json.Stringify = .{ .writer = writer };
     try jw.beginObject();

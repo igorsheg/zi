@@ -1,5 +1,6 @@
 const std = @import("std");
-const agent = @import("../../agent3/root.zig");
+const runtime_fs = @import("../../runtime/fs.zig");
+const agent = @import("../../agent/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
 const time_util = @import("../../lib/time_util.zig");
@@ -39,7 +40,7 @@ pub const SessionWriter = struct {
         const header_cwd = allocator.dupe(u8, owned_cwd) catch @panic("OOM");
 
         // Ensure directory exists
-        std.fs.cwd().makePath(session_dir) catch {};
+        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, session_dir) catch {};
 
         const file_ts = allocator.dupe(u8, timestamp) catch @panic("OOM");
         defer allocator.free(file_ts);
@@ -280,11 +281,11 @@ pub const SessionWriter = struct {
             self.buffered_entries.clearRetainingCapacity();
             return;
         }
-        const file = std.fs.createFileAbsolute(self.session_file, .{}) catch return;
-        defer file.close();
+        const file = std.Io.Dir.createFileAbsolute(std.Options.debug_io, self.session_file, .{}) catch return;
+        defer file.close(std.Options.debug_io);
 
         var buf: [4096]u8 = undefined;
-        var fw = file.writer(&buf);
+        var fw = file.writer(std.Options.debug_io, &buf);
         for (self.buffered_entries.items) |fe| {
             switch (fe) {
                 .header => |h| json.writeHeader(&fw.interface, h) catch continue,
@@ -310,14 +311,11 @@ pub const SessionWriter = struct {
             },
             else => {},
         };
-        const file = try std.fs.openFileAbsolute(self.session_file, .{ .mode = .read_write });
-        defer file.close();
-        try file.seekFromEnd(0);
         var buf: [4096]u8 = undefined;
-        var fw = file.writerStreaming(&buf);
-        try json.writeEntry(&fw.interface, entry);
-        try fw.interface.writeAll("\n");
-        try fw.end();
+        var fw = std.Io.Writer.fixed(&buf);
+        try json.writeEntry(&fw, entry);
+        try fw.writeAll("\n");
+        runtime_fs.appendFile(std.Options.debug_io, self.session_file, fw.buffered()) catch {};
     }
 
     /// Generate a unique 8-char hex ID, collision-checked.
@@ -325,7 +323,7 @@ pub const SessionWriter = struct {
         var buf: [4]u8 = undefined;
 
         for (0..100) |_| {
-            std.crypto.random.bytes(&buf);
+            std.Options.debug_io.randomSecure(&buf) catch std.Options.debug_io.random(&buf);
             const hex = std.fmt.bytesToHex(buf, .lower);
             const id = try self.allocator.dupe(u8, &hex);
             if (!self.ids.contains(id)) {
@@ -333,7 +331,7 @@ pub const SessionWriter = struct {
             }
         }
         var big_buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&big_buf);
+        std.Options.debug_io.randomSecure(&big_buf) catch std.Options.debug_io.random(&big_buf);
         const hex = std.fmt.bytesToHex(big_buf, .lower);
         return try self.allocator.dupe(u8, &hex);
     }
@@ -365,7 +363,7 @@ fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, s
 
 fn generateUuid(buf: *[36]u8) void {
     var random_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std.Options.debug_io.randomSecure(&random_bytes) catch std.Options.debug_io.random(&random_bytes);
     random_bytes[6] = (random_bytes[6] & 0x0f) | 0x40;
     random_bytes[8] = (random_bytes[8] & 0x3f) | 0x80;
 

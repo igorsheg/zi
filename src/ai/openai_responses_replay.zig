@@ -231,7 +231,7 @@ fn appendAssistantItems(
                 null;
             errdefer if (item_id) |id| allocator.free(id);
 
-            var args_buf: std.io.Writer.Allocating = .init(allocator);
+            var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
             var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
             try inner.write(tool_call.arguments);
@@ -594,7 +594,7 @@ fn flushPendingSyntheticToolResults(
             .content = content,
             .details = null,
             .is_error = true,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
         } });
     }
 }
@@ -997,8 +997,8 @@ test "transformMessages converts cross-model thinking to text and strips tool th
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer args.object.deinit();
+    var args = std.json.Value{ .object = .{} };
+    defer args.object.deinit(alloc);
 
     const messages: []const protocol.Message = &.{
         .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
@@ -1050,8 +1050,8 @@ test "convertResponsesMessages hashes foreign responses item ids like pi-mono" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var args = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer args.object.deinit();
+    var args = std.json.Value{ .object = .{} };
+    defer args.object.deinit(alloc);
 
     const raw_id = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==";
 

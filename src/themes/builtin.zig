@@ -6,17 +6,18 @@ const cell_mod = @import("../tui/cell.zig");
 const Theme = theme_mod.Theme;
 const Color = cell_mod.Color;
 
-var builtin_once = std.once(initBuiltins);
+var builtins_initialized: std.atomic.Value(bool) = .init(false);
+var builtins_mutex: std.Io.Mutex = .init;
 var dark_theme: Theme = undefined;
 var light_theme: Theme = undefined;
 
 pub fn dark() *const Theme {
-    builtin_once.call();
+    ensureBuiltins();
     return &dark_theme;
 }
 
 pub fn light() *const Theme {
-    builtin_once.call();
+    ensureBuiltins();
     return &light_theme;
 }
 
@@ -25,6 +26,15 @@ pub fn defaultForTerminal() *const Theme {
         .dark => dark(),
         .light => light(),
     };
+}
+
+fn ensureBuiltins() void {
+    if (builtins_initialized.load(.acquire)) return;
+    builtins_mutex.lockUncancelable(std.Options.debug_io);
+    defer builtins_mutex.unlock(std.Options.debug_io);
+    if (builtins_initialized.load(.monotonic)) return;
+    initBuiltins();
+    builtins_initialized.store(true, .release);
 }
 
 fn initBuiltins() void {

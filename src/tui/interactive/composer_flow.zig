@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai_protocol = @import("../../ai/protocol.zig");
-const message_memory = @import("../../agent3/message_memory.zig");
+const message_memory = @import("../../agent/message_memory.zig");
 const coding_agent_mod = @import("../../coding_agent/root.zig");
 const clipboard_images = @import("clipboard_images.zig");
 
