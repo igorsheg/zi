@@ -7,7 +7,7 @@
 /// stderr is collected after stdout EOF.
 const std = @import("std");
 const types = @import("types.zig");
-const runtime_process = @import("../runtime/process.zig");
+const runtime_process = @import("../zio/root.zig").process;
 
 const log = std.log.scoped(.zi_spawn);
 
@@ -539,11 +539,11 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
     // We fire the abort signal from a side thread after 100ms and
     // assert ziSpawn returns promptly.
     const override = [_][]const u8{ "sh", "-c", "sleep 30" };
-    var controller = @import("../abort_signal.zig").AbortController{};
+    var controller = @import("../zio/root.zig").AbortController{};
     const signal = controller.beginRun();
 
     const Aborter = struct {
-        fn run(c: *@import("../abort_signal.zig").AbortController) void {
+        fn run(c: *@import("../zio/root.zig").AbortController) void {
             std.Options.debug_io.sleep(.fromNanoseconds(@intCast(100 * std.time.ns_per_ms)), .awake) catch {};
             c.requestAbort();
         }

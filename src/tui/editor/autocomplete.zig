@@ -7,7 +7,7 @@ const component_mod = @import("../component.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const buffer_mod = @import("buffer.zig");
 const keybindings = @import("../keybindings.zig");
-const runtime_process = @import("../../runtime/process.zig");
+const runtime_process = @import("../../zio/root.zig").process;
 
 const Key = keys_mod.Key;
 const Theme = theme_mod.Theme;

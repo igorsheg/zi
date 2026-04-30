@@ -22,9 +22,8 @@ pub const AbortGuard = struct {
     /// The watchdog thread holds a pointer to this; if it lived inline in
     /// the struct, returning from start() would copy the struct and leave
     /// the watchdog with a dangling pointer to the old stack frame.
-    shared_done: *std.atomic.Value(bool),
+    state: *State,
     thread: ?std.Thread,
-    allocator: std.mem.Allocator,
     signal: AbortSignal,
     io: std.Io,
 
@@ -53,36 +52,37 @@ pub const AbortGuard = struct {
             (actions.shutdown_fd == null and actions.kill_pid == null and actions.interrupt_process_group == null))
         {
             return .{
-                .shared_done = &noop_done,
+                .state = &noop_state,
                 .thread = null,
-                .allocator = std.heap.page_allocator,
                 .signal = AbortSignal.none,
                 .io = io,
             };
         }
-        const done = std.heap.page_allocator.create(std.atomic.Value(bool)) catch {
+        const state = std.heap.page_allocator.create(State) catch {
             return .{
-                .shared_done = &noop_done,
+                .state = &noop_state,
                 .thread = null,
-                .allocator = std.heap.page_allocator,
                 .signal = AbortSignal.none,
                 .io = io,
             };
         };
-        done.* = std.atomic.Value(bool).init(false);
+        state.* = .{};
         const ctx = WatchdogCtx{
             .signal = signal,
-            .done = done,
+            .state = state,
             .shutdown_fd = actions.shutdown_fd,
             .kill_pid = actions.kill_pid,
             .interrupt_process_group = actions.interrupt_process_group,
             .io = io,
         };
         const thread = std.Thread.spawn(.{}, watchdog, .{ctx}) catch null;
+        if (thread == null) {
+            std.heap.page_allocator.destroy(state);
+            return .{ .state = &noop_state, .thread = null, .signal = AbortSignal.none, .io = io };
+        }
         return .{
-            .shared_done = done,
+            .state = state,
             .thread = thread,
-            .allocator = std.heap.page_allocator,
             .signal = signal,
             .io = io,
         };
@@ -91,20 +91,25 @@ pub const AbortGuard = struct {
     /// Signal the watchdog to exit and join it. Must be called before
     /// closing/deiniting the guarded resource (socket, child process).
     pub fn stop(self: *AbortGuard) void {
-        self.shared_done.store(true, .release);
+        self.state.done.store(true, .release);
         self.signal.notifyWaiters();
         if (self.thread) |t| t.join();
         self.thread = null;
-        if (self.shared_done != &noop_done) {
-            self.allocator.destroy(self.shared_done);
+        if (self.state != &noop_state) {
+            std.heap.page_allocator.destroy(self.state);
         }
+        self.state = &noop_state;
     }
 
-    var noop_done = std.atomic.Value(bool).init(true);
+    const State = struct {
+        done: std.atomic.Value(bool) = .init(false),
+    };
+
+    var noop_state = State{ .done = .init(true) };
 
     const WatchdogCtx = struct {
         signal: AbortSignal,
-        done: *std.atomic.Value(bool),
+        state: *State,
         shutdown_fd: ?std.posix.fd_t,
         kill_pid: ?std.process.Child.Id,
         interrupt_process_group: ?std.process.Child.Id,
@@ -112,12 +117,12 @@ pub const AbortGuard = struct {
     };
 
     fn watchdog(ctx: WatchdogCtx) void {
-        switch (ctx.signal.waitUntil(null, &donePredicate, @ptrCast(ctx.done))) {
+        switch (ctx.signal.waitUntilIo(ctx.io, null, &donePredicate, @ptrCast(ctx.state))) {
             .aborted => {},
             .predicate, .timeout, .none => return,
         }
 
-        if (ctx.done.load(.acquire)) return;
+        if (ctx.state.done.load(.acquire)) return;
 
         if (ctx.shutdown_fd) |fd| {
             const SHUT_RDWR = 2;
@@ -132,8 +137,8 @@ pub const AbortGuard = struct {
     }
 
     fn donePredicate(ctx: ?*anyopaque) bool {
-        const done: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
-        return done.load(.acquire);
+        const state: *State = @ptrCast(@alignCast(ctx.?));
+        return state.done.load(.acquire);
     }
 
     fn interruptProcessGroup(io: std.Io, pgid: std.process.Child.Id) void {

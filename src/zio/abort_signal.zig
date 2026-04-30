@@ -48,6 +48,18 @@ pub const AbortSignal = struct {
         predicate: ?WaitPredicate,
         predicate_ctx: ?*anyopaque,
     ) WaitResult {
+        return self.waitUntilIo(std.Options.debug_io, timeout_ns, predicate, predicate_ctx);
+    }
+
+    /// Same as `waitUntil`, but participates in the caller-provided `std.Io`
+    /// backend for clocks, sleep, mutex, and condition waits.
+    pub fn waitUntilIo(
+        self: AbortSignal,
+        io: std.Io,
+        timeout_ns: ?u64,
+        predicate: ?WaitPredicate,
+        predicate_ctx: ?*anyopaque,
+    ) WaitResult {
         const controller = self.controller orelse {
             if (predicate) |pred| {
                 if (pred(predicate_ctx)) return .predicate;
@@ -56,12 +68,12 @@ pub const AbortSignal = struct {
         };
 
         const deadline_ns: ?i128 = if (timeout_ns) |timeout|
-            @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + @as(i128, @intCast(timeout))
+            @as(i128, @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds())) + @as(i128, @intCast(timeout))
         else
             null;
 
-        controller.mutex.lockUncancelable(std.Options.debug_io);
-        defer controller.mutex.unlock(std.Options.debug_io);
+        controller.mutex.lockUncancelable(io);
+        defer controller.mutex.unlock(io);
 
         while (true) {
             if (self.isAborted()) return .aborted;
@@ -70,14 +82,14 @@ pub const AbortSignal = struct {
             }
 
             if (deadline_ns) |deadline| {
-                const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+                const now = @as(i128, @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()));
                 if (now >= deadline) return .timeout;
                 const remaining = @as(i96, @intCast(deadline - now));
-                controller.mutex.unlock(std.Options.debug_io);
-                std.Options.debug_io.sleep(.fromNanoseconds(remaining), .awake) catch {};
-                controller.mutex.lockUncancelable(std.Options.debug_io);
+                controller.mutex.unlock(io);
+                io.sleep(.fromNanoseconds(remaining), .awake) catch {};
+                controller.mutex.lockUncancelable(io);
             } else {
-                controller.condition.waitUncancelable(std.Options.debug_io, &controller.mutex);
+                controller.condition.waitUncancelable(io, &controller.mutex);
             }
         }
     }
@@ -129,7 +141,11 @@ pub const AbortController = struct {
     }
 
     pub fn notifyWaiters(self: *AbortController) void {
-        self.condition.broadcast(std.Options.debug_io);
+        self.notifyWaitersIo(std.Options.debug_io);
+    }
+
+    pub fn notifyWaitersIo(self: *AbortController, io: std.Io) void {
+        self.condition.broadcast(io);
     }
 
     pub fn isAborted(self: *const AbortController) bool {

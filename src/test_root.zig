@@ -11,7 +11,7 @@ pub const std_options_debug_threaded_io: *std.Io.Threaded = &std_options_debug_t
 test {
     std.Io.Threaded.global_single_threaded.allocator = std.heap.smp_allocator;
     logging.setThreadLabel(.@"test");
-    _ = @import("abort_signal.zig");
+    _ = @import("zio/root.zig");
     _ = @import("storage.zig");
     _ = @import("logging.zig");
     _ = @import("ai/root.zig");
@@ -36,7 +36,7 @@ test {
     _ = @import("tui/editor/root.zig");
     _ = @import("coding_agent/slash_commands.zig");
     _ = @import("spawn/root.zig");
-    _ = @import("runtime/system_command.zig");
+    _ = @import("coding_agent/extensions/system_command.zig");
     _ = @import("coding_agent/extensions/lua_runtime.zig");
     _ = @import("coding_agent/extensions/registries/root.zig");
     _ = @import("coding_agent/extensions/runner.zig");

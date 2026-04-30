@@ -2,8 +2,8 @@ const std = @import("std");
 const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
-const runtime_process = @import("../runtime/process.zig");
-const runtime_fd = @import("../runtime/fd.zig");
+const runtime_process = @import("../zio/root.zig").process;
+const runtime_fd = @import("fd.zig");
 
 const SelectItem = select_list_mod.SelectItem;
 const CommandRegistry = slash_commands_mod.CommandRegistry;

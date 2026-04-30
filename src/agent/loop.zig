@@ -1,4 +1,4 @@
-const abort_signal_mod = @import("../abort_signal.zig");
+const abort_signal_mod = @import("../zio/root.zig").abort;
 const AbortSignal = abort_signal_mod.AbortSignal;
 const std = @import("std");
 const ai = @import("../ai/root.zig");

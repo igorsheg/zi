@@ -1,7 +1,7 @@
 const std = @import("std");
 const registries = @import("registries/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
-const abort_signal = @import("../../abort_signal.zig");
+const abort_signal = @import("../../zio/root.zig").abort;
 const agent_protocol = @import("../../agent/types.zig");
 const session_core = @import("../../session/root.zig");
 const ai = @import("../../ai/root.zig");
@@ -12,7 +12,7 @@ const oauth_mod = @import("../auth/oauth.zig");
 const auth_types = @import("../auth/types.zig");
 const request_mod = @import("../request.zig");
 const extension_ui = @import("ui.zig");
-const system_command = @import("../../runtime/system_command.zig");
+const system_command = @import("system_command.zig");
 
 const log = std.log.scoped(.zi_runner);
 

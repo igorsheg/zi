@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_fd = @import("../runtime/fd.zig");
+const runtime_fd = @import("fd.zig");
 const ansi = @import("ansi.zig");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");

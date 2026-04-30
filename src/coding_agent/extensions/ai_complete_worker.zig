@@ -1,7 +1,8 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const blocking_worker_mod = @import("../../runtime/blocking_worker.zig");
-const mailbox_mod = @import("../../runtime/mailbox.zig");
+const zio = @import("../../zio/root.zig");
+const blocking_worker_mod = zio.worker;
+const mailbox_mod = zio.mailbox;
 const extension_runner = @import("runner.zig");
 const ai_completion = @import("../ai_completion.zig");
 

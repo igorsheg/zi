@@ -12,7 +12,7 @@ const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
-const runtime_process = @import("../../runtime/process.zig");
+const runtime_process = @import("../../zio/root.zig").process;
 
 /// Hard cap on matches we ever return to the model. Both collection
 /// and rendering enforce it; the constants used to be split (collect

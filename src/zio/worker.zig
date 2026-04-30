@@ -1,7 +1,7 @@
 const std = @import("std");
 const mailbox_mod = @import("mailbox.zig");
 
-/// A tiny typed worker-thread wrapper around `runtime.Mailbox`.
+/// A tiny typed worker-thread wrapper around `zio.Mailbox`.
 ///
 /// This owns only mechanics: thread spawn/join, mailbox wait/drain, and
 /// drained-request cleanup. Product semantics stay in the typed `Handler`.

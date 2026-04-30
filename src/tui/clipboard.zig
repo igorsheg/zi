@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const runtime_process = @import("../runtime/process.zig");
+const runtime_process = @import("../zio/root.zig").process;
 
 const supported_image_mime_types = [_][]const u8{
     "image/png",

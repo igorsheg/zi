@@ -1,6 +1,7 @@
 const std = @import("std");
-const blocking_worker_mod = @import("../runtime/blocking_worker.zig");
-const mailbox_mod = @import("../runtime/mailbox.zig");
+const zio = @import("../zio/root.zig");
+const blocking_worker_mod = zio.worker;
+const mailbox_mod = zio.mailbox;
 const session_store = @import("../coding_agent/session/store.zig");
 const ui_event_mod = @import("ui_event.zig");
 

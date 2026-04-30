@@ -1,7 +1,8 @@
 const std = @import("std");
-const blocking_worker_mod = @import("../../runtime/blocking_worker.zig");
-const mailbox_mod = @import("../../runtime/mailbox.zig");
-const system_command = @import("../../runtime/system_command.zig");
+const zio = @import("../../zio/root.zig");
+const blocking_worker_mod = zio.worker;
+const mailbox_mod = zio.mailbox;
+const system_command = @import("system_command.zig");
 const extension_runner = @import("runner.zig");
 
 const log = std.log.scoped(.system_worker);

@@ -1,4 +1,4 @@
-const abort_signal_mod = @import("../abort_signal.zig");
+const abort_signal_mod = @import("../zio/root.zig").abort;
 const std = @import("std");
 
 /// Known API types. Custom values supported via `.custom` variant.

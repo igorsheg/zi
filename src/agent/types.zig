@@ -16,7 +16,7 @@ pub const ToolResultMessage = ai.protocol.ToolResultMessage;
 pub const Usage = ai.protocol.Usage;
 pub const StopReason = ai.protocol.StopReason;
 pub const StreamOptions = ai.protocol.StreamOptions;
-pub const AbortSignal = @import("../abort_signal.zig").AbortSignal;
+pub const AbortSignal = @import("../zio/root.zig").AbortSignal;
 pub const SimpleStreamOptions = ai.protocol.SimpleStreamOptions;
 
 /// Stream hook — wraps provider's streamSimple with context for closure state.

@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 
-const mailbox_mod = @import("../../runtime/mailbox.zig");
+const mailbox_mod = @import("../../zio/root.zig").mailbox;
 const ui_event_mod = @import("../ui_event.zig");
 
 const UiEvent = ui_event_mod.UiEvent;

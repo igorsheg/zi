@@ -38,6 +38,13 @@ pub const State = enum {
     closed,
 };
 
+pub const CloseMode = enum {
+    /// Stop accepting sends and preserve already queued work for consumers.
+    graceful,
+    /// Stop accepting sends and cleanup/drop all queued work immediately.
+    immediate,
+};
+
 /// Mailbox(T) is zi's small typed cross-thread message primitive.
 ///
 /// Durable semantic contract:
@@ -244,11 +251,32 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         }
 
         pub fn close(self: *Self) void {
+            self.closeMode(.graceful);
+        }
+
+        pub fn closeImmediate(self: *Self) void {
+            self.closeMode(.immediate);
+        }
+
+        pub fn closeMode(self: *Self, mode: CloseMode) void {
             self.mutex.lockUncancelable(std.Options.debug_io);
             defer self.mutex.unlock(std.Options.debug_io);
 
-            if (self.state != .active) return;
-            self.state = if (self.queue.len == 0) .closed else .closing;
+            if (self.state == .closed) return;
+            switch (mode) {
+                .graceful => {
+                    if (self.state != .active) return;
+                    self.state = if (self.queue.len == 0) .closed else .closing;
+                },
+                .immediate => {
+                    for (0..self.queue.len) |i| {
+                        Self.cleanupItem(self.queue.itemPtr(i), self.allocator);
+                    }
+                    self.queue.len = 0;
+                    self.queue.head = 0;
+                    self.state = .closed;
+                },
+            }
             self.signalWakeLocked();
         }
 
@@ -595,6 +623,37 @@ test "Mailbox coalesces pipe wake readiness until the queue drains" {
 
     pfd[0].revents = 0;
     try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pfd, 0));
+}
+
+test "Mailbox closeImmediate closes, cleans pending work, and wakes terminal waiters" {
+    const Msg = struct { value: u32 };
+    const CleanupState = struct {
+        var cleaned: usize = 0;
+        fn cleanup(item: *anyopaque, _: std.mem.Allocator) void {
+            const msg: *Msg = @ptrCast(@alignCast(item));
+            _ = msg;
+            cleaned += 1;
+        }
+    };
+
+    CleanupState.cleaned = 0;
+    var mailbox = try Mailbox(Msg, .{ .cleanup = .{ .custom = &CleanupState.cleanup }, .wakeup = .pipe }).init(std.testing.allocator);
+    defer mailbox.deinit();
+
+    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 1 }));
+    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 2 }));
+    mailbox.closeImmediate();
+
+    try std.testing.expectEqual(State.closed, mailbox.lifecycleState());
+    try std.testing.expect(mailbox.isDrained());
+    try std.testing.expectEqual(@as(usize, 2), CleanupState.cleaned);
+    try std.testing.expectEqual(@as(usize, 0), mailbox.pendingDepth());
+    try std.testing.expect(try mailbox.waitReadable(0));
+
+    switch (mailbox.trySend(.{ .value = 3 })) {
+        .closed => |msg| try std.testing.expectEqual(@as(u32, 3), msg.value),
+        else => return error.UnexpectedResult,
+    }
 }
 
 test "Mailbox close transitions active to closing to closed and preserves queued work" {

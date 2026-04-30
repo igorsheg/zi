@@ -1,5 +1,5 @@
 const std = @import("std");
-const process = @import("process.zig");
+const process = @import("../../zio/root.zig").process;
 
 pub const default_max_output_bytes: usize = process.default_max_output_bytes;
 pub const EnvPair = process.EnvPair;

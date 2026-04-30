@@ -52,8 +52,9 @@ const provider_failure = @import("provider_failure.zig");
 const request_transform = @import("request_transform.zig");
 const partial_json = @import("../json/partial.zig");
 const replay = @import("openai_responses_replay.zig");
-const AbortSignal = @import("../abort_signal.zig").AbortSignal;
-const AbortGuard = @import("../abort_guard.zig").AbortGuard;
+const zio_abort = @import("../zio/root.zig").abort;
+const AbortSignal = zio_abort.AbortSignal;
+const AbortGuard = zio_abort.AbortGuard;
 
 // =============================================================================
 // Public surface

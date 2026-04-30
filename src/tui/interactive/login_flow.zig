@@ -5,7 +5,7 @@ const json_util = @import("../../ai/json_util.zig");
 const request_mod = @import("../../coding_agent/request.zig");
 const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
 const list_picker_mod = @import("../components/list_picker.zig");
-const runtime_process = @import("../../runtime/process.zig");
+const runtime_process = @import("../../zio/root.zig").process;
 
 const Interactive = @import("../interactive.zig").Interactive;
 const PickerSelection = list_picker_mod.Selection;

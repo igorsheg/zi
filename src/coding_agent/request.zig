@@ -5,7 +5,7 @@ const auth_types = @import("auth/types.zig");
 const extension_runner = @import("extensions/runner.zig");
 const extension_ui = @import("extensions/ui.zig");
 const message_memory = @import("../agent/message_memory.zig");
-const mailbox_mod = @import("../runtime/mailbox.zig");
+const mailbox_mod = @import("../zio/root.zig").mailbox;
 
 /// AgentRequest — mailbox payload for the TUI → agent mutation channel.
 ///

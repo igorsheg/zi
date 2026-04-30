@@ -1,5 +1,5 @@
 const std = @import("std");
-const mailbox_mod = @import("../runtime/mailbox.zig");
+const mailbox_mod = @import("../zio/root.zig").mailbox;
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 
