@@ -311,11 +311,12 @@ pub const SessionWriter = struct {
             },
             else => {},
         };
-        var buf: [4096]u8 = undefined;
-        var fw = std.Io.Writer.fixed(&buf);
-        try json.writeEntry(&fw, entry);
-        try fw.writeAll("\n");
-        zio_fs.appendFile(std.Options.debug_io, self.session_file, fw.buffered()) catch {};
+
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try json.writeEntry(&out.writer, entry);
+        try out.writer.writeAll("\n");
+        try zio_fs.appendFile(std.Options.debug_io, self.session_file, out.written());
     }
 
     /// Generate a unique 8-char hex ID, collision-checked.

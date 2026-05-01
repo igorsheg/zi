@@ -796,6 +796,53 @@ test "openForResume returns resume context and transfers store ownership" {
     try std.testing.expectEqualStrings("u1", resumed_store.currentEntryId().?);
 }
 
+test "append after flush persists entries larger than fixed scratch buffer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(session_dir);
+
+    var store = SessionStore.create(std.testing.allocator, session_dir, "/tmp/project");
+    errdefer store.deinit();
+
+    _ = store.appendMessage(testUserMessage("first", 1)) orelse return error.MissingUserEntry;
+
+    const first_assistant = try testAssistantMessageWithUsage(std.testing.allocator, "ok", 10, 2);
+    defer std.testing.allocator.free(first_assistant.assistant.content);
+    _ = store.appendMessage(first_assistant) orelse return error.MissingAssistantEntry;
+
+    const large_text = try std.testing.allocator.alloc(u8, 8192);
+    defer std.testing.allocator.free(large_text);
+    @memset(large_text, 'x');
+
+    const large_assistant = try testAssistantMessageWithUsage(std.testing.allocator, large_text, 20, 3);
+    defer std.testing.allocator.free(large_assistant.assistant.content);
+    const large_id = store.appendMessage(large_assistant) orelse return error.MissingLargeAssistantEntry;
+    const large_id_copy = try std.testing.allocator.dupe(u8, large_id);
+    defer std.testing.allocator.free(large_id_copy);
+
+    _ = store.appendMessage(testUserMessage("after large", 4)) orelse return error.MissingTrailingUserEntry;
+
+    const path = try std.testing.allocator.dupe(u8, store.sessionFile());
+    defer std.testing.allocator.free(path);
+    store.deinit();
+
+    var opened = try SessionStore.openForResume(std.testing.allocator, path);
+    defer opened.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), opened.messages.len);
+    try std.testing.expectEqualStrings("first", opened.messages[0].user.content.text);
+    try std.testing.expectEqualStrings("ok", opened.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, large_text.len), opened.messages[2].assistant.content[0].text.text.len);
+    try std.testing.expectEqualStrings("after large", opened.messages[3].user.content.text);
+
+    const branch = try opened.store.?.buildCurrentBranchAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(branch);
+    try std.testing.expectEqualStrings(large_id_copy, branch[branch.len - 2].id);
+    try std.testing.expectEqualStrings(large_id_copy, branch[branch.len - 1].parent_id.?);
+}
+
 test "appendRuntimeDefaults seeds model change before thinking level change" {
     var store = SessionStore.createEphemeral(std.testing.allocator);
     defer store.deinit();
