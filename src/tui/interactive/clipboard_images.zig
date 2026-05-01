@@ -45,20 +45,40 @@ pub fn buildSubmittedUserContent(
 ) !BuiltSubmitContent {
     if (pending_images.len == 0) return .{ .content = .{ .text = text } };
 
-    const text_block_count: usize = if (text.len > 0) 1 else 0;
-    const blocks = try allocator.alloc(ai_protocol.UserMessage.UserMessageContent.Block, pending_images.len + text_block_count);
+    var blocks: std.ArrayList(ai_protocol.UserMessage.UserMessageContent.Block) = .empty;
+    errdefer blocks.deinit(allocator);
 
-    var next_index: usize = 0;
-    if (text.len > 0) {
-        blocks[next_index] = .{ .text = .{ .text = text } };
-        next_index += 1;
-    }
-    for (pending_images) |attachment| {
-        blocks[next_index] = .{ .image = attachment.image };
-        next_index += 1;
+    var attached: std.DynamicBitSetUnmanaged = try .initEmpty(allocator, pending_images.len);
+    defer attached.deinit(allocator);
+
+    var segment_start: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '[') {
+            if (parseImageMarkerWithId(text, index, pending_images.len)) |marker| {
+                const segment = std.mem.trim(u8, text[segment_start..index], " \t\r\n");
+                if (segment.len > 0) try blocks.append(allocator, .{ .text = .{ .text = segment } });
+
+                const attachment_index = marker.id - 1;
+                try blocks.append(allocator, .{ .image = pending_images[attachment_index].image });
+                attached.set(attachment_index);
+
+                index = marker.end;
+                segment_start = index;
+                continue;
+            }
+        }
+        index += 1;
     }
 
-    return .{ .content = .{ .blocks = blocks } };
+    const tail = std.mem.trim(u8, text[segment_start..], " \t\r\n");
+    if (tail.len > 0) try blocks.append(allocator, .{ .text = .{ .text = tail } });
+
+    for (pending_images, 0..) |attachment, attachment_index| {
+        if (!attached.isSet(attachment_index)) try blocks.append(allocator, .{ .image = attachment.image });
+    }
+
+    return .{ .content = .{ .blocks = try blocks.toOwnedSlice(allocator) } };
 }
 
 pub fn prepareClipboardImageAttachment(
@@ -89,6 +109,64 @@ pub fn prepareClipboardImageAttachment(
             } };
         },
     }
+}
+
+pub fn stripPendingImageMarkers(allocator: std.mem.Allocator, text: []const u8, pending_image_count: usize) ![]u8 {
+    if (pending_image_count == 0 or text.len == 0) return allocator.dupe(u8, text);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '[') {
+            if (parseImageMarker(text, index, pending_image_count)) |end| {
+                index = end;
+                while (index < text.len and out.items.len > 0 and isAsciiWhitespace(out.items[out.items.len - 1]) and isAsciiWhitespace(text[index])) {
+                    index += 1;
+                }
+                continue;
+            }
+        }
+        try out.append(allocator, text[index]);
+        index += 1;
+    }
+
+    const stripped = std.mem.trim(u8, out.items, " \t\r\n");
+    if (stripped.len == out.items.len) return out.toOwnedSlice(allocator);
+    const result = try allocator.dupe(u8, stripped);
+    out.deinit(allocator);
+    return result;
+}
+
+fn isAsciiWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
+}
+
+const ImageMarker = struct {
+    id: usize,
+    end: usize,
+};
+
+fn parseImageMarker(text: []const u8, start: usize, pending_image_count: usize) ?usize {
+    return if (parseImageMarkerWithId(text, start, pending_image_count)) |marker| marker.end else null;
+}
+
+fn parseImageMarkerWithId(text: []const u8, start: usize, pending_image_count: usize) ?ImageMarker {
+    if (start >= text.len or text[start] != '[') return null;
+    const prefix = "[image";
+    if (!std.mem.startsWith(u8, text[start..], prefix)) return null;
+
+    var index = start + prefix.len;
+    if (index >= text.len or text[index] < '1' or text[index] > '9') return null;
+
+    var id: usize = 0;
+    while (index < text.len and text[index] >= '0' and text[index] <= '9') : (index += 1) {
+        id = id * 10 + (text[index] - '0');
+    }
+    if (index >= text.len or text[index] != ']') return null;
+    if (id == 0 or id > pending_image_count) return null;
+    return .{ .id = id, .end = index + 1 };
 }
 
 pub fn pendingImageBannerText(
@@ -174,7 +252,38 @@ test "prepareClipboardImageAttachment rejects oversized clipboard image when aut
     }
 }
 
-test "buildSubmittedUserContent places text before pending images" {
+test "buildSubmittedUserContent preserves inline image marker placement" {
+    const data1 = try testing.allocator.dupe(u8, "one");
+    defer testing.allocator.free(data1);
+    const mime1 = try testing.allocator.dupe(u8, "image/png");
+    defer testing.allocator.free(mime1);
+    const data2 = try testing.allocator.dupe(u8, "two");
+    defer testing.allocator.free(data2);
+    const mime2 = try testing.allocator.dupe(u8, "image/jpeg");
+    defer testing.allocator.free(mime2);
+
+    const pending = [_]PendingImageAttachment{
+        .{ .image = .{ .data = data1, .mime_type = mime1 } },
+        .{ .image = .{ .data = data2, .mime_type = mime2 } },
+    };
+
+    var built = try buildSubmittedUserContent(testing.allocator, "before [image2] middle [image1] after", &pending);
+    defer built.deinit(testing.allocator);
+
+    switch (built.content) {
+        .blocks => |blocks| {
+            try testing.expectEqual(@as(usize, 5), blocks.len);
+            try testing.expectEqualStrings("before", blocks[0].text.text);
+            try testing.expectEqualStrings("image/jpeg", blocks[1].image.mime_type);
+            try testing.expectEqualStrings("middle", blocks[2].text.text);
+            try testing.expectEqualStrings("image/png", blocks[3].image.mime_type);
+            try testing.expectEqualStrings("after", blocks[4].text.text);
+        },
+        .text => return error.ExpectedBlockContent,
+    }
+}
+
+test "buildSubmittedUserContent appends images whose markers were deleted" {
     const data = try testing.allocator.dupe(u8, "ZGF0YQ==");
     defer testing.allocator.free(data);
     const mime_type = try testing.allocator.dupe(u8, "image/png");
@@ -196,6 +305,18 @@ test "buildSubmittedUserContent places text before pending images" {
         },
         .text => return error.ExpectedBlockContent,
     }
+}
+
+test "stripPendingImageMarkers removes inline image placeholders" {
+    const stripped = try stripPendingImageMarkers(testing.allocator, "look [image1] and [image2]", 2);
+    defer testing.allocator.free(stripped);
+    try testing.expectEqualStrings("look and", stripped);
+}
+
+test "stripPendingImageMarkers preserves unrelated bracketed text" {
+    const stripped = try stripPendingImageMarkers(testing.allocator, "[image1] [image3] [paste #1]", 2);
+    defer testing.allocator.free(stripped);
+    try testing.expectEqualStrings("[image3] [paste #1]", stripped);
 }
 
 test "pendingImageBannerText includes latest image details and clear shortcut" {

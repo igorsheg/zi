@@ -217,7 +217,7 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
         // Filter release events (event type 3, encoded as :<event> after modifier)
         if (param_count > 1) {
             const event_type = extractEventType(params_slice);
-            if (event_type == 3) return .{ .key = .{ .code = .escape }, .len = seq_len }; // consume but ignore release
+            if (event_type == 3) return null;
         }
         return parseKittyU(params[0], if (param_count > 1) params[1] else 0, seq_len);
     }
@@ -555,6 +555,12 @@ test "kitty CSI-u protocol parses codepoints and modifiers" {
     // With modifier: ctrl+a
     const kca = parseKey("\x1b[97;5u", true).?;
     try std.testing.expect(kca.key.ctrl);
+
+    // Alt+v in kitty protocol.
+    const kav = parseKey("\x1b[118;3u", true).?;
+    try std.testing.expectEqual(KeyCode.char, kav.key.code);
+    try std.testing.expectEqual(@as(?u21, 'v'), kav.key.char);
+    try std.testing.expect(kav.key.alt);
     // Special kitty codepoints
     try std.testing.expectEqual(KeyCode.enter, parseKey("\x1b[13u", true).?.key.code);
 
@@ -570,10 +576,8 @@ test "kitty CSI-u protocol parses codepoints and modifiers" {
     const kp0 = parseKey("\x1b[57399u", true).?;
     try std.testing.expectEqual(@as(?u21, '0'), kp0.key.char); // KP_0
 
-    // Release events (event type 3) are filtered
-    const release = parseKey("\x1b[97;1:3u", true).?;
-    try std.testing.expectEqual(@as(usize, 9), release.len); // consumed (ESC [ 9 7 ; 1 : 3 u)
-    try std.testing.expectEqual(KeyCode.escape, release.key.code);
+    // Release events (event type 3) are filtered without synthesizing Escape.
+    try std.testing.expect(parseKey("\x1b[97;1:3u", true) == null);
 }
 
 test "multi-byte UTF-8 characters" {

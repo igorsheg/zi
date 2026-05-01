@@ -72,16 +72,12 @@ pub fn handlePasteImageShortcut(self: *Interactive) void {
                 self.tui.dirty = true;
                 return;
             };
-            refreshPendingImageBanner(self);
-            self.refreshHeaderVisibility();
 
-            var status_buf: [96]u8 = undefined;
+            var marker_buf: [32]u8 = undefined;
             const pending_count = self.pending_images.items.len;
-            const status = if (pending_count == 1)
-                "attached clipboard image"
-            else
-                std.fmt.bufPrint(&status_buf, "attached clipboard image ({d} pending)", .{pending_count}) catch "attached clipboard image";
-            self.status_line.setPrimary(status, self.theme.fg(.success));
+            const marker = std.fmt.bufPrint(&marker_buf, "[image{d}]", .{pending_count}) catch "[image]";
+            self.active_editor.insertTextAtCursor(marker);
+            self.refreshHeaderVisibility();
         },
     }
     self.tui.dirty = true;

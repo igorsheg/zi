@@ -1557,6 +1557,9 @@ fn joinUserBlocksText(
             .text => |text| try out.appendSlice(allocator, text.text),
             .image => {
                 image_index += 1;
+                if (out.items.len > 0 and !std.ascii.isWhitespace(out.items[out.items.len - 1])) {
+                    try out.append(allocator, ' ');
+                }
                 try out.print(allocator, "[image{d}]", .{image_index});
             },
         }
@@ -1854,11 +1857,11 @@ test "rebuildFromSnapshots includes summaries displayable custom messages and ed
     );
 
     try testing.expectEqual(@as(usize, 1), editor.history.items.len);
-    try testing.expectEqualStrings("hello[image1] world", editor.history.items[0]);
+    try testing.expectEqualStrings("hello [image1] world", editor.history.items[0]);
     const rendered = try renderTranscriptText(testing.allocator, &transcript, 60);
     defer testing.allocator.free(rendered);
 
-    try testing.expect(std.mem.indexOf(u8, rendered, "hello[image1] world") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "hello [image1] world") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "kept the recent turns") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "previous branch summary") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "shown custom") != null);

@@ -10,26 +10,19 @@ const supported_image_mime_types = [_][]const u8{
     "image/gif",
 };
 const max_clipboard_image_bytes = 50 * 1024 * 1024;
-const macos_clipboard_image_script =
-    \\ObjC.import("AppKit");
-    \\ObjC.import("Foundation");
-    \\var pb = $.NSPasteboard.generalPasteboard;
-    \\var data = pb.dataForType($.NSPasteboardTypePNG);
-    \\if (!data) {
-    \\  var tiff = pb.dataForType($.NSPasteboardTypeTIFF);
-    \\  if (tiff) {
-    \\    var rep = $.NSBitmapImageRep.imageRepWithData(tiff);
-    \\    if (rep) {
-    \\      data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
-    \\    }
-    \\  }
-    \\}
-    \\if (!data) {
-    \\  "";
-    \\} else {
-    \\  ObjC.unwrap(data.base64EncodedStringWithOptions(0));
-    \\}
-;
+const clipboard_list_timeout_ms = 1000;
+const clipboard_read_timeout_ms = 3000;
+
+const macos_clipboard = if (builtin.os.tag == .macos) struct {
+    extern fn zi_clipboard_read_png(out_bytes: *[*]u8, out_len: *usize) bool;
+    extern fn zi_clipboard_free(ptr: [*]u8) void;
+} else struct {
+    fn zi_clipboard_read_png(_: *[*]u8, _: *usize) bool {
+        return false;
+    }
+
+    fn zi_clipboard_free(_: [*]u8) void {}
+};
 
 /// Best-effort clipboard write for TUI interactions.
 ///
@@ -54,6 +47,7 @@ pub fn readImage(allocator: std.mem.Allocator) ?[]u8 {
     return switch (builtin.os.tag) {
         .macos => readImageMacos(allocator),
         .linux => readImageLinux(allocator),
+        .windows => readImageWindows(allocator),
         else => null,
     };
 }
@@ -85,17 +79,29 @@ fn emitOsc52(text: []const u8) void {
 }
 
 fn readImageMacos(allocator: std.mem.Allocator) ?[]u8 {
-    return readImageViaCommand(allocator, &.{ "pngpaste", "-" }) orelse
-        readImageViaCommand(allocator, &.{ "/opt/homebrew/bin/pngpaste", "-" }) orelse
-        readImageViaCommand(allocator, &.{ "/usr/local/bin/pngpaste", "-" }) orelse
-        readImageViaMacOsascript(allocator);
+    var native_bytes: [*]u8 = undefined;
+    var native_len: usize = 0;
+    if (!macos_clipboard.zi_clipboard_read_png(&native_bytes, &native_len)) return null;
+    defer macos_clipboard.zi_clipboard_free(native_bytes);
+
+    if (native_len == 0 or native_len > max_clipboard_image_bytes) return null;
+    return allocator.dupe(u8, native_bytes[0..native_len]) catch null;
 }
 
 fn readImageLinux(allocator: std.mem.Allocator) ?[]u8 {
     if (isWaylandSession()) {
-        return readImageViaWlPaste(allocator) orelse readImageViaXclip(allocator);
+        return readImageViaWlPaste(allocator) orelse readImageViaXclip(allocator) orelse readImageWslWindowsClipboard(allocator);
     }
-    return readImageViaXclip(allocator) orelse readImageViaWlPaste(allocator);
+    return readImageViaXclip(allocator) orelse readImageViaWlPaste(allocator) orelse readImageWslWindowsClipboard(allocator);
+}
+
+fn readImageWindows(allocator: std.mem.Allocator) ?[]u8 {
+    return readImageViaPowerShell(allocator, "powershell.exe");
+}
+
+fn readImageWslWindowsClipboard(allocator: std.mem.Allocator) ?[]u8 {
+    if (!isWsl()) return null;
+    return readImageViaPowerShell(allocator, "powershell.exe");
 }
 
 fn isWaylandSession() bool {
@@ -104,7 +110,34 @@ fn isWaylandSession() bool {
     return std.mem.eql(u8, session_type, "wayland");
 }
 
+fn isWsl() bool {
+    if (@import("env").get("WSL_DISTRO_NAME") != null) return true;
+    if (@import("env").get("WSLENV") != null) return true;
+
+    const file = std.fs.openFileAbsolute("/proc/version", .{}) catch return false;
+    defer file.close();
+    var buf: [512]u8 = undefined;
+    const n = file.read(&buf) catch return false;
+    return std.ascii.indexOfIgnoreCase(buf[0..n], "microsoft") != null or
+        std.ascii.indexOfIgnoreCase(buf[0..n], "wsl") != null;
+}
+
 fn readImageViaWlPaste(allocator: std.mem.Allocator) ?[]u8 {
+    const preferred = if (runCommandCaptureTimeout(
+        allocator,
+        &.{ "wl-paste", "--list-types" },
+        clipboard_list_timeout_ms,
+    )) |types| blk: {
+        defer allocator.free(types);
+        break :blk selectPreferredImageMimeType(types);
+    } else null;
+
+    if (preferred) |mime_type| {
+        if (readImageViaCommand(allocator, &.{ "wl-paste", "--type", mime_type, "--no-newline" })) |bytes| {
+            return bytes;
+        }
+    }
+
     for (supported_image_mime_types) |mime_type| {
         if (readImageViaCommand(allocator, &.{ "wl-paste", "--type", mime_type, "--no-newline" })) |bytes| {
             return bytes;
@@ -114,6 +147,21 @@ fn readImageViaWlPaste(allocator: std.mem.Allocator) ?[]u8 {
 }
 
 fn readImageViaXclip(allocator: std.mem.Allocator) ?[]u8 {
+    const preferred = if (runCommandCaptureTimeout(
+        allocator,
+        &.{ "xclip", "-selection", "clipboard", "-t", "TARGETS", "-o" },
+        clipboard_list_timeout_ms,
+    )) |targets| blk: {
+        defer allocator.free(targets);
+        break :blk selectPreferredImageMimeType(targets);
+    } else null;
+
+    if (preferred) |mime_type| {
+        if (readImageViaCommand(allocator, &.{ "xclip", "-selection", "clipboard", "-t", mime_type, "-o" })) |bytes| {
+            return bytes;
+        }
+    }
+
     for (supported_image_mime_types) |mime_type| {
         if (readImageViaCommand(allocator, &.{ "xclip", "-selection", "clipboard", "-t", mime_type, "-o" })) |bytes| {
             return bytes;
@@ -122,19 +170,34 @@ fn readImageViaXclip(allocator: std.mem.Allocator) ?[]u8 {
     return null;
 }
 
-fn readImageViaMacOsascript(allocator: std.mem.Allocator) ?[]u8 {
-    const encoded = runCommandCapture(allocator, &.{ "/usr/bin/osascript", "-l", "JavaScript", "-e", macos_clipboard_image_script }) orelse return null;
+fn readImageViaPowerShell(allocator: std.mem.Allocator, exe: []const u8) ?[]u8 {
+    const script =
+        \\Add-Type -AssemblyName System.Windows.Forms;
+        \\Add-Type -AssemblyName System.Drawing;
+        \\$img = [System.Windows.Forms.Clipboard]::GetImage();
+        \\if ($img) {
+        \\  $ms = New-Object System.IO.MemoryStream;
+        \\  $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png);
+        \\  [Convert]::ToBase64String($ms.ToArray());
+        \\}
+    ;
+    const encoded = runCommandCaptureTimeout(allocator, &.{ exe, "-NoProfile", "-Command", script }, 5000) orelse return null;
     defer allocator.free(encoded);
     return decodeBase64Owned(allocator, encoded);
 }
 
 fn readImageViaCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
-    return runCommandCapture(allocator, argv);
+    return runCommandCaptureTimeout(allocator, argv, clipboard_read_timeout_ms);
 }
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
+    return runCommandCaptureTimeout(allocator, argv, null);
+}
+
+fn runCommandCaptureTimeout(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: ?u64) ?[]u8 {
     var result = runtime_process.run(allocator, std.Options.debug_io, .{
         .argv = argv,
+        .timeout_ms = timeout_ms,
         .max_stdout_bytes = max_clipboard_image_bytes,
         .capture_stderr = false,
     });
@@ -150,6 +213,23 @@ fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ?[]
     }
     if (completed.stdout.len == 0) return null;
     return allocator.dupe(u8, completed.stdout) catch null;
+}
+
+fn selectPreferredImageMimeType(types_text: []const u8) ?[]const u8 {
+    for (supported_image_mime_types) |preferred| {
+        var lines = std.mem.splitScalar(u8, types_text, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (std.mem.eql(u8, baseMimeType(trimmed), preferred)) return preferred;
+        }
+    }
+    return null;
+}
+
+fn baseMimeType(mime_type: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, mime_type, " \t\r\n");
+    const semi = std.mem.indexOfScalar(u8, trimmed, ';') orelse return trimmed;
+    return std.mem.trim(u8, trimmed[0..semi], " \t\r\n");
 }
 
 fn decodeBase64Owned(allocator: std.mem.Allocator, encoded: []const u8) ?[]u8 {
@@ -187,6 +267,12 @@ fn copyViaCommand(argv: []const []const u8, text: []const u8) bool {
 }
 
 const testing = std.testing;
+
+test "clipboard image mime selection prefers supported types" {
+    try testing.expectEqualStrings("image/png", selectPreferredImageMimeType("text/plain\nimage/bmp\nimage/png; charset=binary\n").?);
+    try testing.expectEqualStrings("image/png", selectPreferredImageMimeType("image/jpeg\r\nimage/png\r\n").?);
+    try testing.expect(selectPreferredImageMimeType("text/plain\nimage/bmp\n") == null);
+}
 
 test "clipboard base64 decoder ignores surrounding whitespace" {
     const decoded = decodeBase64Owned(testing.allocator, " aGVsbG8=\n") orelse return error.ExpectedDecode;
