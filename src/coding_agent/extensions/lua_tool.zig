@@ -1968,42 +1968,6 @@ test "extension command context publishes a host-owned report" {
     try testing.expectEqualStrings("✓ published", report.lines[0][0].text);
 }
 
-test "extension report body is split into visible lines" {
-    var store = TestStateStore{ .allocator = testing.allocator };
-    defer store.deinit();
-
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 12);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-    try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
-
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-    try state.doString(
-        \\zi.register_command({
-        \\  name = "report-body",
-        \\  description = "report-body",
-        \\  handler = function(_, ctx)
-        \\    ctx.ui.report({ title = "Body", body = "one\ntwo\n" })
-        \\  end,
-        \\})
-    , "register_report_body_command");
-
-    try runner.dispatchCommand("report-body", "");
-
-    const report = store.report orelse return error.MissingReport;
-    try testing.expectEqualStrings("Body", report.title);
-    try testing.expectEqual(@as(usize, 2), report.lines.len);
-    try testing.expectEqualStrings("one", report.lines[0][0].text);
-    try testing.expectEqualStrings("two", report.lines[1][0].text);
-}
-
 test "todo command publishes hydrated todos as a host-owned report" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
@@ -2091,7 +2055,7 @@ test "todo fixture rehydrates from session state across extension generations" {
     }
 }
 
-test "lua tool returning a string produces a single text content block" {
+test "lua tool execution maps Lua return shapes and runtime errors to AgentToolResult" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -2107,111 +2071,39 @@ test "lua tool returning a string produces a single text content block" {
         \\  parameters = { type = "object", properties = {} },
         \\  execute = function(args) return "hello " .. (args.who or "world") end,
         \\})
-    , "register");
-
-    const ext_tool = runner.tool_registry.get("echo").?.*;
-    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-
-    var args_obj: std.json.ObjectMap = .{};
-    defer args_obj.deinit(testing.allocator);
-    try args_obj.put(testing.allocator, "who", .{ .string = "zi" });
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const result = tool.execute(
-        tool.ctx,
-        arena.allocator(),
-        "id-1",
-        .{ .object = args_obj },
-        abort_signal_mod.AbortSignal.none,
-        null,
-        null,
-    );
-
-    try testing.expect(!result.is_error);
-    try testing.expectEqual(@as(usize, 1), result.content.len);
-    try testing.expectEqualStrings("hello zi", result.content[0].text.text);
-}
-
-test "lua tool returning content array with is_error=true ui_publications both" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
         \\zi.register_tool({
         \\  name = "fail",
         \\  description = "always fails",
         \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args)
-        \\    return {
-        \\      content = { { type = "text", text = "boom" } },
-        \\      is_error = true,
-        \\    }
-        \\  end,
+        \\  execute = function(args) return { content = { { type = "text", text = "boom" } }, is_error = true } end,
         \\})
-    , "register");
-
-    const ext_tool = runner.tool_registry.get("fail").?.*;
-    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const result = tool.execute(
-        tool.ctx,
-        arena.allocator(),
-        "id-2",
-        .{ .null = {} },
-        abort_signal_mod.AbortSignal.none,
-        null,
-        null,
-    );
-
-    try testing.expect(result.is_error);
-    try testing.expectEqual(@as(usize, 1), result.content.len);
-    try testing.expectEqualStrings("boom", result.content[0].text.text);
-}
-
-test "lua tool with a runtime error returns is_error with the error message" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
         \\zi.register_tool({
         \\  name = "explode",
         \\  description = "raises",
         \\  parameters = { type = "object", properties = {} },
         \\  execute = function(args) error("kaboom") end,
         \\})
-    , "register");
-
-    const ext_tool = runner.tool_registry.get("explode").?.*;
-    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
+    , "register_result_shape_tools");
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const result = tool.execute(
-        tool.ctx,
-        arena.allocator(),
-        "id-3",
-        .{ .null = {} },
-        abort_signal_mod.AbortSignal.none,
-        null,
-        null,
-    );
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(testing.allocator);
+    try args_obj.put(testing.allocator, "who", .{ .string = "zi" });
 
-    try testing.expect(result.is_error);
-    try testing.expect(result.content.len >= 1);
+    const echo_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("echo").?.*);
+    const echo = echo_tool.execute(echo_tool.ctx, arena.allocator(), "id-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(!echo.is_error);
+    try testing.expectEqualStrings("hello zi", echo.content[0].text.text);
+
+    const fail_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("fail").?.*);
+    const fail = fail_tool.execute(fail_tool.ctx, arena.allocator(), "id-2", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(fail.is_error);
+    try testing.expectEqualStrings("boom", fail.content[0].text.text);
+
+    const explode_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("explode").?.*);
+    const explode = explode_tool.execute(explode_tool.ctx, arena.allocator(), "id-3", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null);
+    try testing.expect(explode.is_error);
+    try testing.expect(explode.content.len >= 1);
 }

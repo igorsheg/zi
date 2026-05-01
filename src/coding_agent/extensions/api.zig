@@ -946,7 +946,7 @@ test "zi.on subscribes a Lua handler to the right event chain" {
     try testing.expect(me[0].lua_ref != c.LUA_REFNIL);
 }
 
-test "zi.on rejects unknown event names with a Lua-catchable error" {
+test "zi.on rejects invalid subscriptions with Lua-catchable errors" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -956,18 +956,21 @@ test "zi.on rejects unknown event names with a Lua-catchable error" {
     installZiTable(&state, &runner);
 
     try state.doString(
-        \\local ok, err = pcall(function()
-        \\  zi.on("not_a_real_event", function() end)
-        \\end)
-        \\assert(not ok, "expected error")
-        \\assert(string.find(err, "not_a_real_event") ~= nil,
-        \\  "error should mention the bad name, got: " .. tostring(err))
-    , "test_unknown_event");
+        \\local cases = {
+        \\  { name = "not_a_real_event", handler = function() end, want = "not_a_real_event" },
+        \\  { name = "message_end", handler = "not a function", want = "function" },
+        \\}
+        \\for _, case in ipairs(cases) do
+        \\  local ok, err = pcall(function() zi.on(case.name, case.handler) end)
+        \\  assert(not ok, "expected error")
+        \\  assert(string.find(err, case.want) ~= nil, tostring(err))
+        \\end
+    , "test_invalid_event_subscriptions");
 
     try testing.expectEqual(@as(usize, 0), runner.event_registry.count());
 }
 
-test "zi.on rejects non-function handler" {
+test "zi.spawn validates required task and callback shapes" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -977,48 +980,16 @@ test "zi.on rejects non-function handler" {
     installZiTable(&state, &runner);
 
     try state.doString(
-        \\local ok, err = pcall(function()
-        \\  zi.on("message_end", "not a function")
-        \\end)
-        \\assert(not ok)
-        \\assert(string.find(err, "function") ~= nil)
-    , "test_bad_handler");
-
-    try testing.expectEqual(@as(usize, 0), runner.event_registry.count());
-}
-
-test "zi.spawn validates required 'task' field" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
-
-    try state.doString(
-        \\local ok, err = pcall(function() zi.spawn({}) end)
-        \\assert(not ok)
-        \\assert(string.find(err, "task") ~= nil, "expected task error, got: " .. tostring(err))
-    , "spawn_missing_task");
-}
-
-test "zi.spawn rejects non-function values in 'on' table" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
-
-    try state.doString(
-        \\local ok, err = pcall(function()
-        \\  zi.spawn({ task = "x", on = { message_end = "not a fn" } })
-        \\end)
-        \\assert(not ok)
-        \\assert(string.find(err, "function") ~= nil, "got: " .. tostring(err))
-    , "spawn_bad_on");
+        \\local cases = {
+        \\  { spec = {}, want = "task" },
+        \\  { spec = { task = "x", on = { message_end = "not a fn" } }, want = "function" },
+        \\}
+        \\for _, case in ipairs(cases) do
+        \\  local ok, err = pcall(function() zi.spawn(case.spec) end)
+        \\  assert(not ok)
+        \\  assert(string.find(err, case.want) ~= nil, tostring(err))
+        \\end
+    , "spawn_validation");
 }
 
 test "zi.spawn end-to-end: dispatches per-event callbacks via argv_override" {
@@ -1253,7 +1224,7 @@ test "zi.on accepts every reserved v2 event" {
     try testing.expectEqual(@as(usize, 29), runner.event_registry.count());
 }
 
-test "zi.register_command registers a command end-to-end" {
+test "zi.register_command registers commands and disambiguates duplicate visible names" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -1263,36 +1234,15 @@ test "zi.register_command registers a command end-to-end" {
     installZiTable(&state, &runner);
 
     try state.doString(
-        \\local ok = zi.register_command({
-        \\  name = "greet",
-        \\  description = "say hello",
-        \\  handler = function(args, ctx) end,
-        \\})
-        \\assert(ok == true, "registration should succeed")
-    , "test_register_command");
-
-    try testing.expectEqual(@as(usize, 1), runner.command_registry.count());
-    const cmd = runner.command_registry.getByVisibleName("greet").?;
-    try testing.expectEqualStrings("greet", cmd.name);
-    try testing.expectEqualStrings("greet", cmd.visible_name);
-    try testing.expectEqualStrings("say hello", cmd.description);
-}
-
-test "zi.register_command duplicate names aggregate" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
-
-    try state.doString(
+        \\assert(zi.register_command({ name = "greet", description = "say hello", handler = function() end }) == true)
         \\zi.register_command({ name = "dup", description = "first", handler = function() end })
         \\zi.register_command({ name = "dup", description = "second", handler = function() end })
-    , "test_dup");
+    , "test_register_commands");
 
-    try testing.expectEqual(@as(usize, 2), runner.command_registry.count());
+    try testing.expectEqual(@as(usize, 3), runner.command_registry.count());
+    const cmd = runner.command_registry.getByVisibleName("greet").?;
+    try testing.expectEqualStrings("greet", cmd.name);
+    try testing.expectEqualStrings("say hello", cmd.description);
     try testing.expect(runner.command_registry.getByVisibleName("dup") == null);
     try testing.expect(runner.command_registry.getByVisibleName("dup:1") != null);
     try testing.expect(runner.command_registry.getByVisibleName("dup:2") != null);

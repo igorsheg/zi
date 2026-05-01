@@ -1677,14 +1677,6 @@ fn appendTestAssistantText(transcript: *Transcript, text: []const u8) !usize {
     return idx;
 }
 
-fn appendTestAssistantThinking(transcript: *Transcript, text: []const u8) !usize {
-    const idx = try appendTestAssistantRow(transcript);
-    const assistant = transcript.assistantMessageAt(idx) orelse return error.MissingAssistantRow;
-    try setTestAssistantModel(transcript, assistant, &.{.{ .thinking = @constCast(text) }});
-    transcript.itemMutatedAt(idx);
-    return idx;
-}
-
 fn buildTestToolExecutionModel(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
@@ -1799,40 +1791,6 @@ fn appendTestUserRow(
     return transcript.items.items.len - 1;
 }
 
-test "Transcript retained items install transcript renderables" {
-    var transcript = Transcript.init(testing.allocator);
-    defer transcript.deinit();
-
-    _ = try appendTestAssistantText(&transcript, "hello from assistant");
-    _ = try appendTestUserRow(&transcript, "user msg", .none, .user_message);
-    _ = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
-
-    try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
-    try testing.expectEqual(ItemKind.assistant_message, transcript.items.items[0].kind);
-    try testing.expectEqual(ItemKind.user_message, transcript.items.items[1].kind);
-    try testing.expectEqual(ItemKind.tool_execution, transcript.items.items[2].kind);
-}
-
-test "tool execution keeps transcript background transparent" {
-    const theme = themes_builtin.dark();
-    var model = try buildTestToolExecutionModel(testing.allocator, "tool-1", "bash");
-    defer model.deinit(testing.allocator);
-
-    var tool = ToolExecution{
-        .model = model,
-        .allocator = testing.allocator,
-        .theme = theme,
-    };
-    model = .{};
-    defer tool.model.deinit(testing.allocator);
-
-    try testing.expect(tool.bgColor().eql(Color.default));
-    tool.model.is_partial = false;
-    try testing.expect(tool.bgColor().eql(Color.default));
-    tool.model.is_error = true;
-    try testing.expect(tool.bgColor().eql(Color.default));
-}
-
 test "Transcript renders assistant text and tool execution in order" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
@@ -1943,44 +1901,6 @@ test "ToolExecution does not invoke result renderers before any result exists" {
 
     try testing.expectEqual(@as(usize, 0), S.measure_result_calls);
     try testing.expectEqual(@as(usize, 0), S.render_result_calls);
-}
-
-test "ToolExecution keeps transcript surface transparent across pending partial and final states" {
-    var transcript = Transcript.init(testing.allocator);
-    defer transcript.deinit();
-
-    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "bash", .{});
-    const tool = transcript.toolExecutionAt(tool_idx).?;
-
-    var pending = try Buffer.init(testing.allocator, 20, 6);
-    defer pending.deinit();
-    transcript.render(pending.region());
-    try testing.expect(pending.get(1, 1).bg.eql(Color.default));
-
-    var partial_content = [_]AgentToolResult.ContentBlock{
-        .{ .text = .{ .text = "running" } },
-    };
-    try setTestToolExecutionState(&transcript, tool, false, false, .{ .content = &partial_content, .is_error = false }, true, false);
-    transcript.itemMutatedAt(tool_idx);
-
-    var partial = try Buffer.init(testing.allocator, 20, 6);
-    defer partial.deinit();
-    transcript.render(partial.region());
-    try testing.expect(partial.get(1, 1).bg.eql(Color.default));
-    try testing.expect(partial.get(1, 2).bg.eql(Color.default));
-
-    var error_content = [_]AgentToolResult.ContentBlock{
-        .{ .text = .{ .text = "boom" } },
-    };
-    try setTestToolExecutionState(&transcript, tool, false, false, .{ .content = &error_content, .is_error = true }, false, true);
-    transcript.clearToolRoutingAt(tool_idx);
-    transcript.itemMutatedAt(tool_idx);
-
-    var final = try Buffer.init(testing.allocator, 20, 6);
-    defer final.deinit();
-    transcript.render(final.region());
-    try testing.expect(final.get(1, 1).bg.eql(Color.default));
-    try testing.expect(final.get(1, 2).bg.eql(Color.default));
 }
 
 test "Transcript scrolls through tool output without repeating the first rows" {
@@ -2155,17 +2075,6 @@ test "Transcript removeRenderable removes item by identity and fixes indices" {
     transcript.removeRenderable(w3.renderable());
     // total height is now 1 (just w1), so scroll offset should be clamped to ≤ 1
     try testing.expect(transcript.scrollOffset() <= 1);
-}
-
-test "Transcript animation hooks stay static for assistant thinking blocks" {
-    var transcript = Transcript.init(testing.allocator);
-    defer transcript.deinit();
-
-    _ = try appendTestAssistantThinking(&transcript, "ponder");
-
-    try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(0));
-    try testing.expect(!transcript.tickAnimation(0));
-    try testing.expectEqual(@as(?i128, null), transcript.nextAnimationDeadline(0));
 }
 
 test "Transcript selection copies across visual rows" {

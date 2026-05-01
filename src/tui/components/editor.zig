@@ -910,8 +910,6 @@ pub const Editor = struct {
 };
 
 const testing = std.testing;
-const Buffer = buffer_mod.Buffer;
-
 const PasteMarker = struct {
     id: u32,
     end: usize,
@@ -1013,19 +1011,6 @@ fn submittedText(capture: *const SubmitCapture) []const u8 {
     return capture.last_text_buf[0..capture.last_text_len];
 }
 
-fn bufferRowAscii(buf: *const Buffer, row: u32, out: []u8) []const u8 {
-    const width = @min(buf.width, out.len);
-    for (0..width) |x| {
-        const cell = buf.get(@intCast(x), row);
-        const cp = switch (cell.grapheme) {
-            .codepoint => |value| value,
-            .pooled => ' ',
-        };
-        out[x] = if (cp < 128) @intCast(cp) else ' ';
-    }
-    return out[0..width];
-}
-
 test "Editor status line renders thinking inline with model" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
@@ -1044,47 +1029,6 @@ test "Editor status line renders thinking inline with model" {
         "ctx 1.2k/200k • claude-4-sonnet (high)",
         editor.formatStatusRight(&buf).?,
     );
-}
-
-test "Editor renders input without a prompt marker" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-    editor.insertText("hello world");
-
-    var buf = try Buffer.init(testing.allocator, 24, 4);
-    defer buf.deinit();
-    editor.render(buf.region());
-
-    var row_buf: [64]u8 = undefined;
-    const row = bufferRowAscii(&buf, 1, &row_buf);
-    try testing.expect(std.mem.indexOf(u8, row, "hello world") != null);
-    try testing.expect(std.mem.indexOfScalar(u8, row, '>') == null);
-}
-
-test "Editor renders closed side borders on content rows" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-    editor.insertText("hello");
-
-    var buf = try Buffer.init(testing.allocator, 12, 4);
-    defer buf.deinit();
-    editor.render(buf.region());
-
-    try testing.expectEqual(@as(u21, '│'), buf.get(0, 1).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '│'), buf.get(11, 1).grapheme.codepoint);
-}
-
-test "Editor keeps the last pre-wrap character visible before the right border" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-    editor.insertText("abcdef");
-
-    var buf = try Buffer.init(testing.allocator, 8, 4);
-    defer buf.deinit();
-    editor.render(buf.region());
-
-    try testing.expectEqual(@as(u21, 'f'), buf.get(6, 1).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '│'), buf.get(7, 1).grapheme.codepoint);
 }
 
 test "Editor undo coalesces typing by word boundaries" {

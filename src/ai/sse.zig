@@ -267,111 +267,56 @@ fn flushPendingLines(
 // Tests
 // =============================================================================
 
-test "basic event with event type and data" {
+test "SseParser dispatches event blocks with type id retry and multiline data semantics" {
     var p = SseParser.init(std.testing.allocator);
     defer p.deinit();
+
+    try std.testing.expect((try p.feedLine("id: 42")) == null);
+    try std.testing.expect((try p.feedLine("retry: 3000")) == null);
     try std.testing.expect((try p.feedLine("event: message_start")) == null);
-    try std.testing.expect((try p.feedLine("data: {\"type\":\"message_start\"}")) == null);
+    try std.testing.expect((try p.feedLine("data: line1")) == null);
+    try std.testing.expect((try p.feedLine("data: line2")) == null);
     const evt = (try p.feedLine("")).?;
+    try std.testing.expectEqualStrings("42", evt.id.?);
     try std.testing.expectEqualStrings("message_start", evt.event.?);
-    try std.testing.expectEqualStrings("{\"type\":\"message_start\"}", evt.data);
-}
-
-test "id field captured and persists across events" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
-    _ = try p.feedLine("id: 42");
-    _ = try p.feedLine("data: first");
-    const e1 = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("42", e1.id.?);
-
-    // second event has no id: field but inherits last_event_id
-    _ = try p.feedLine("data: second");
-    const e2 = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("42", e2.id.?);
-}
-
-test "retry field parsed" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
-    _ = try p.feedLine("retry: 3000");
-    _ = try p.feedLine("data: x");
-    _ = try p.feedLine("");
+    try std.testing.expectEqualStrings("line1\nline2", evt.data);
     try std.testing.expectEqual(@as(u64, 3000), p.retry_ms.?);
 
-    // non-numeric retry ignored
+    _ = try p.feedLine("data: second");
+    const inherited = (try p.feedLine("")).?;
+    try std.testing.expectEqualStrings("42", inherited.id.?);
+
     _ = try p.feedLine("retry: abc");
     try std.testing.expectEqual(@as(u64, 3000), p.retry_ms.?);
 }
 
-test "multi-line data joined with newline" {
+test "SseParser ignores comments and event-only blocks while preserving empty data events" {
     var p = SseParser.init(std.testing.allocator);
     defer p.deinit();
-    _ = try p.feedLine("data: line1");
-    _ = try p.feedLine("data: line2");
-    _ = try p.feedLine("data: line3");
-    const evt = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("line1\nline2\nline3", evt.data);
-}
 
-test "comments ignored" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
-    try std.testing.expect((try p.feedLine(": this is a comment")) == null);
-    _ = try p.feedLine("data: hello");
-    const evt = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("hello", evt.data);
-}
-
-test "blank line without data emits nothing" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
+    try std.testing.expect((try p.feedLine(": comment")) == null);
     _ = try p.feedLine("event: ping");
     try std.testing.expect((try p.feedLine("")) == null);
-}
 
-test "bare data: dispatches event with empty data" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
     _ = try p.feedLine("data:");
-    const evt = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("", evt.data);
+    const empty = (try p.feedLine("")).?;
+    try std.testing.expectEqualStrings("", empty.data);
 }
 
-test "event with no data does not dispatch" {
+test "SseParser accepts wire-format value variants and multiple events" {
     var p = SseParser.init(std.testing.allocator);
     defer p.deinit();
-    _ = try p.feedLine("event: ping");
-    try std.testing.expect((try p.feedLine("")) == null);
-}
 
-test "colon without space preserves full value" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
     _ = try p.feedLine("data:no-space");
-    const evt = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("no-space", evt.data);
-}
+    try std.testing.expectEqualStrings("no-space", (try p.feedLine("")).?.data);
 
-test "CRLF handling via trimmed input" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
-    // simulate what streamEvents does: trim \r
-    const line = std.mem.trimEnd(u8, "data: hello\r", "\r");
+    const line = std.mem.trimEnd(u8, "data: crlf\r", "\r");
     _ = try p.feedLine(line);
-    const evt = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("hello", evt.data);
-}
-
-test "multiple events in sequence" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
+    try std.testing.expectEqualStrings("crlf", (try p.feedLine("")).?.data);
 
     _ = try p.feedLine("event: a");
     _ = try p.feedLine("data: 1");
-    const e1 = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("a", e1.event.?);
-    try std.testing.expectEqualStrings("1", e1.data);
+    try std.testing.expectEqualStrings("a", (try p.feedLine("")).?.event.?);
 
     _ = try p.feedLine("event: b");
     _ = try p.feedLine("data: 2");

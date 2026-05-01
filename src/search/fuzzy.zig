@@ -233,81 +233,35 @@ fn sortAlphabetically(indices: []usize, texts: []const []const u8) void {
     }
 }
 
-// ── Tests ──
-
-test "fuzzyMatch exact match" {
-    const m = fuzzyMatch("abc", "abc");
-    try std.testing.expect(m.matches);
-    try std.testing.expect(m.score < 0);
+test "fuzzyMatch accepts case-insensitive ordered subsequences and rejects misses" {
+    try std.testing.expect(fuzzyMatch("ABC", "abc").matches);
+    try std.testing.expect(fuzzyMatch("ac", "abc").matches);
+    try std.testing.expect(!fuzzyMatch("z", "abc").matches);
 }
 
-test "fuzzyMatch subsequence" {
-    const m = fuzzyMatch("ac", "abc");
-    try std.testing.expect(m.matches);
+test "fuzzyMatch ranks word-boundary and consecutive matches ahead of scattered matches" {
+    try std.testing.expect(fuzzyMatch("fb", "foo-bar").score < fuzzyMatch("fb", "fxxbxx").score);
+    try std.testing.expect(fuzzyMatch("abc", "abcdef").score < fuzzyMatch("abc", "axbxcx").score);
 }
 
-test "fuzzyMatch no match" {
-    const m = fuzzyMatch("z", "abc");
-    try std.testing.expect(!m.matches);
-}
+test "fuzzyFilter returns all matching tokens in stable relevance order" {
+    const ranked = [_][]const u8{ "xxabcxx", "abc", "xaxbxc" };
+    var ranked_out: [3]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 3), fuzzyFilter("abc", &ranked, &ranked_out));
+    try std.testing.expectEqual(@as(usize, 1), ranked_out[0]);
 
-test "fuzzyMatch case insensitive" {
-    const m = fuzzyMatch("ABC", "abc");
-    try std.testing.expect(m.matches);
-}
+    const multi_token = [_][]const u8{ "foobar", "foo", "bar" };
+    var multi_out: [3]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 1), fuzzyFilter("foo bar", &multi_token, &multi_out));
+    try std.testing.expectEqual(@as(usize, 0), multi_out[0]);
 
-test "fuzzyMatch word boundary bonus" {
-    const boundary = fuzzyMatch("fb", "foo-bar");
-    const no_boundary = fuzzyMatch("fb", "fxxbxx");
-    try std.testing.expect(boundary.matches);
-    try std.testing.expect(no_boundary.matches);
-    try std.testing.expect(boundary.score < no_boundary.score);
-}
+    const empty_query = [_][]const u8{ "cherry", "apple", "banana" };
+    var empty_out: [3]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 3), fuzzyFilter("", &empty_query, &empty_out));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0 }, &empty_out);
 
-test "fuzzyMatch consecutive bonus" {
-    const consecutive = fuzzyMatch("abc", "abcdef");
-    const scattered = fuzzyMatch("abc", "axbxcx");
-    try std.testing.expect(consecutive.matches);
-    try std.testing.expect(scattered.matches);
-    try std.testing.expect(consecutive.score < scattered.score);
-}
-
-test "fuzzyFilter multi-token" {
-    const texts = [_][]const u8{ "foobar", "foo", "bar" };
-    var out: [3]usize = undefined;
-    const n = fuzzyFilter("foo bar", &texts, &out);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqual(@as(usize, 0), out[0]);
-}
-
-test "fuzzyFilter sorts by score" {
-    const texts = [_][]const u8{ "xxabcxx", "abc", "xaxbxc" };
-    var out: [3]usize = undefined;
-    const n = fuzzyFilter("abc", &texts, &out);
-    try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqual(@as(usize, 1), out[0]);
-}
-
-test "fuzzyFilter empty query returns all in alphabetical order" {
-    const texts = [_][]const u8{ "cherry", "apple", "banana" };
-    var out: [3]usize = undefined;
-    const n = fuzzyFilter("", &texts, &out);
-    try std.testing.expectEqual(@as(usize, 3), n);
-    // Should be sorted alphabetically: apple(1), banana(2), cherry(0)
-    try std.testing.expectEqual(@as(usize, 1), out[0]); // apple
-    try std.testing.expectEqual(@as(usize, 2), out[1]); // banana
-    try std.testing.expectEqual(@as(usize, 0), out[2]); // cherry
-}
-
-test "fuzzyFilter deterministic tiebreaker on equal scores" {
-    // "a" and "b" both start with a single char match at position 0
-    // with query "x" — wait, that won't match. Use items that produce equal scores.
-    // Two items where query matches identically: "xa" and "xb" with query "x"
-    const texts = [_][]const u8{ "xb", "xa" };
-    var out: [2]usize = undefined;
-    const n = fuzzyFilter("x", &texts, &out);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    // Equal scores → alphabetical: "xa"(1) before "xb"(0)
-    try std.testing.expectEqual(@as(usize, 1), out[0]); // xa
-    try std.testing.expectEqual(@as(usize, 0), out[1]); // xb
+    const ties = [_][]const u8{ "xb", "xa" };
+    var tie_out: [2]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 2), fuzzyFilter("x", &ties, &tie_out));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, &tie_out);
 }

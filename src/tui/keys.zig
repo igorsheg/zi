@@ -587,23 +587,17 @@ test "multi-byte UTF-8 characters" {
     try std.testing.expectEqual(@as(usize, 2), result.len);
 }
 
-test "parseSgrMouse scroll up" {
-    const result = parseSgrMouse("\x1b[<64;10;20M");
-    try std.testing.expect(result != null);
-    try std.testing.expectEqual(MouseEventKind.scroll, result.?.event.kind);
-    try std.testing.expectEqual(MouseButton.scroll_up, result.?.event.button);
-    try std.testing.expectEqual(@as(u16, 9), result.?.event.x);
-    try std.testing.expectEqual(@as(u16, 19), result.?.event.y);
-}
+test "SGR mouse parser handles scroll press drag and release events" {
+    const scroll_up = parseSgrMouse("\x1b[<64;10;20M").?;
+    try std.testing.expectEqual(MouseEventKind.scroll, scroll_up.event.kind);
+    try std.testing.expectEqual(MouseButton.scroll_up, scroll_up.event.button);
+    try std.testing.expectEqual(@as(u16, 9), scroll_up.event.x);
+    try std.testing.expectEqual(@as(u16, 19), scroll_up.event.y);
 
-test "parseSgrMouse scroll down" {
-    const result = parseSgrMouse("\x1b[<65;5;15M");
-    try std.testing.expect(result != null);
-    try std.testing.expectEqual(MouseEventKind.scroll, result.?.event.kind);
-    try std.testing.expectEqual(MouseButton.scroll_down, result.?.event.button);
-}
+    const scroll_down = parseSgrMouse("\x1b[<65;5;15M").?;
+    try std.testing.expectEqual(MouseEventKind.scroll, scroll_down.event.kind);
+    try std.testing.expectEqual(MouseButton.scroll_down, scroll_down.event.button);
 
-test "parseSgrMouse press drag release" {
     const down = parseSgrMouse("\x1b[<0;10;20M").?;
     try std.testing.expectEqual(MouseEventKind.down, down.event.kind);
     try std.testing.expectEqual(MouseButton.left, down.event.button);
@@ -617,22 +611,13 @@ test "parseSgrMouse press drag release" {
     try std.testing.expectEqual(MouseButton.none, up.event.button);
 }
 
-test "parseInput returns mouse for SGR scroll" {
-    const result = parseInput("\x1b[<64;1;1M", false);
-    try std.testing.expect(result != null);
-    switch (result.?) {
-        .mouse => |m| {
-            try std.testing.expectEqual(MouseEventKind.scroll, m.event.kind);
-            try std.testing.expectEqual(MouseButton.scroll_up, m.event.button);
-        },
+test "parseInput prioritizes SGR mouse sequences and falls back to keys" {
+    switch (parseInput("\x1b[<64;1;1M", false).?) {
+        .mouse => |m| try std.testing.expectEqual(MouseButton.scroll_up, m.event.button),
         .key => try std.testing.expect(false),
     }
-}
 
-test "parseInput returns key for regular input" {
-    const result = parseInput("a", false);
-    try std.testing.expect(result != null);
-    switch (result.?) {
+    switch (parseInput("a", false).?) {
         .key => |k| try std.testing.expectEqual(KeyCode.char, k.key.code),
         .mouse => try std.testing.expect(false),
     }

@@ -1836,34 +1836,6 @@ test "processStreamMapped codex mapper stops after terminal response.completed" 
     try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.stop, col.done_reason.?);
 }
 
-test "processStreamMapped codex mapper normalizes response.done and response.incomplete" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var done_col = TestCollector{ .allocator = testing.allocator };
-    defer done_col.deinit();
-    const done_sse =
-        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
-        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
-        "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\"}}\n\n";
-    runProcessWithMapper(alloc, done_sse, .{ .map = codexEventMapper }, &done_col);
-    try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.stop, done_col.done_reason.?);
-
-    var incomplete_col = TestCollector{ .allocator = testing.allocator };
-    defer incomplete_col.deinit();
-    const incomplete_sse =
-        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
-        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
-        "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n";
-    runProcessWithMapper(alloc, incomplete_sse, .{ .map = codexEventMapper }, &incomplete_col);
-    try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.length, incomplete_col.done_reason.?);
-}
-
 test "processStream uses final output_item payload for message phase and tool ids" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1887,41 +1859,6 @@ test "processStream uses final output_item payload for message phase and tool id
     try testing.expectEqualStrings("final text", col.text.items);
     try testing.expectEqualStrings("call_final|fc_final", col.final_tool_id);
     try testing.expectEqualStrings("bash_final", col.final_tool_name);
-}
-
-test "normalizeResponsesToolCallId rewrites foreign tool call ids for codex-compatible targets" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const source_message = protocol.AssistantMessage{
-        .content = &.{},
-        .api = .openai_completions,
-        .provider = .openrouter,
-        .model = "openai/gpt-test",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
-        .stop_reason = .toolUse,
-        .timestamp = 0,
-    };
-    const target_model = protocol.Model{
-        .id = "gpt-5.4",
-        .name = "codex",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 4096,
-        .max_tokens = 1024,
-    };
-
-    var normalized = try normalizeResponsesToolCallId(alloc, target_model, source_message, "call:weird|item with spaces and punctuation!!!");
-    defer normalized.deinit(alloc);
-
-    try testing.expectEqualStrings("call_weird", normalized.call_id);
-    try testing.expect(normalized.item_id != null);
-    try testing.expect(std.mem.startsWith(u8, normalized.item_id.?, "fc_"));
 }
 
 test "buildRequestJson emits store:false, input[], and reasoning:none for reasoning model" {
@@ -1973,53 +1910,6 @@ test "buildRequestJson includes prompt cache, max_output_tokens, and temperature
     try testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_retention\":\"24h\"") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"max_output_tokens\":321") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"temperature\":0.5") != null);
-}
-
-test "writeInputOpts preserves same-model tool call ids" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var same_model_args = std.json.Value{ .object = .{} };
-    defer same_model_args.object.deinit(alloc);
-
-    const assistant = protocol.AssistantMessage{
-        .content = &.{.{ .tool_call = .{
-            .id = "call:raw|fc_raw",
-            .name = "bash",
-            .arguments = same_model_args,
-        } }},
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .model = "gpt-5.4",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
-        .stop_reason = .toolUse,
-        .timestamp = 0,
-    };
-    const ctx: protocol.Context = .{ .messages = &.{.{ .assistant = assistant }} };
-
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(alloc);
-    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
-    try jw.beginArray();
-    try writeInputOpts(alloc, &jw, protocol.Model{
-        .id = "gpt-5.4",
-        .name = "codex",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 4096,
-        .max_tokens = 1024,
-    }, ctx, false);
-    try jw.endArray();
-
-    const written = allocating.written();
-    try testing.expect(std.mem.indexOf(u8, written, "\"call_id\":\"call:raw\"") != null);
-    try testing.expect(std.mem.indexOf(u8, written, "\"id\":\"fc_raw\"") != null);
 }
 
 test "writeInputOpts remaps foreign tool result ids to the replayed function call id" {

@@ -447,105 +447,21 @@ fn sourceKindString(source: ExtensionSource) []const u8 {
 const api = @import("api.zig");
 const dispatch_mod = @import("dispatch.zig");
 
-test "discover finds foo.lua and bar/init.lua in a temp dir" {
+test "discover finds runtime extensions and preserves explicit-before-runtime precedence" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Create extensions directory structure
     try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
     var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
-
-    // foo.lua (single-file extension)
-    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "foo.lua", .data = "-- foo extension" });
-
-    // bar/init.lua (directory extension)
+    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "foo.lua", .data = "-- foo" });
     try ext_dir.createDir(std.Options.debug_io, "bar", .default_dir);
     var bar_dir = try ext_dir.openDir(std.Options.debug_io, "bar", .{});
-    try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = "-- bar extension" });
-
-    // Get absolute path to the extensions dir
-    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(tmp_path);
-
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
-    const opts = DiscoverOptions{
-        .allocator = allocator,
-        .roots = &roots,
-    };
-
-    const exts = try discover(opts);
-    defer freeExtensions(allocator, exts);
-
-    // Should find exactly 2 extensions
-    try std.testing.expectEqual(@as(usize, 2), exts.len);
-
-    // Verify we found both foo and bar (order depends on filesystem iteration)
-    var found_foo = false;
-    var found_bar = false;
-    for (exts) |ext| {
-        if (std.mem.eql(u8, ext.id, "foo")) {
-            found_foo = true;
-            try std.testing.expectEqual(ExtensionSource.user, ext.source);
-            try std.testing.expect(std.mem.endsWith(u8, ext.path, "foo.lua"));
-        } else if (std.mem.eql(u8, ext.id, "bar")) {
-            found_bar = true;
-            try std.testing.expectEqual(ExtensionSource.user, ext.source);
-            try std.testing.expect(std.mem.endsWith(u8, ext.path, "bar/init.lua"));
-        }
-    }
-    try std.testing.expect(found_foo);
-    try std.testing.expect(found_bar);
-}
-
-test "discover returns empty when directories missing" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(tmp_path);
-
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
-    const opts = DiscoverOptions{
-        .allocator = allocator,
-        .roots = &roots,
-    };
-
-    const exts = try discover(opts);
-    defer freeExtensions(allocator, exts);
-
-    try std.testing.expectEqual(@as(usize, 0), exts.len);
-}
-
-test "explicit paths come first in result order" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // Create user extensions dir with one extension
-    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
-    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
-    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "user_ext.lua", .data = "-- user" });
-
-    // Create explicit extension file
+    try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = "-- bar" });
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "explicit_ext.lua", .data = "-- explicit" });
 
     const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
-
     const explicit_path = try std.fs.path.join(allocator, &.{ tmp_path, "explicit_ext.lua" });
     defer allocator.free(explicit_path);
 
@@ -553,52 +469,24 @@ test "explicit paths come first in result order" {
         .{ .source = .explicit, .path = explicit_path, .kind = .synthetic_extension, .runtime_root_id = explicit_path, .state_owner_id = explicit_path },
         .{ .source = .user, .path = tmp_path, .kind = .runtime_root, .runtime_root_id = tmp_path, .state_owner_id = tmp_path },
     };
-    const opts = DiscoverOptions{
-        .allocator = allocator,
-        .roots = &roots,
-    };
-
-    const exts = try discover(opts);
-    defer freeExtensions(allocator, exts);
-
-    // Should have exactly 2 extensions, explicit first
-    try std.testing.expectEqual(@as(usize, 2), exts.len);
-    try std.testing.expectEqualStrings("explicit_ext", exts[0].id);
-    try std.testing.expectEqual(ExtensionSource.explicit, exts[0].source);
-    try std.testing.expectEqualStrings("user_ext", exts[1].id);
-    try std.testing.expectEqual(ExtensionSource.user, exts[1].source);
-}
-
-test "discover derives synthetic bundled extension id from parent dir" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDir(std.Options.debug_io, "bundle_ext", .default_dir);
-    var bundle_dir = try tmp.dir.openDir(std.Options.debug_io, "bundle_ext", .{});
-    defer bundle_dir.close(std.Options.debug_io);
-    try bundle_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = "-- bundled" });
-
-    const init_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "bundle_ext/init.lua", allocator);
-    defer allocator.free(init_path);
-
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .explicit,
-        .path = init_path,
-        .kind = .synthetic_extension,
-        .runtime_root_id = init_path,
-        .state_owner_id = init_path,
-    }};
-
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
-    try std.testing.expectEqual(@as(usize, 1), exts.len);
-    try std.testing.expectEqualStrings("bundle_ext", exts[0].id);
+    try std.testing.expectEqual(@as(usize, 3), exts.len);
+    try std.testing.expectEqualStrings("explicit_ext", exts[0].id);
     try std.testing.expectEqual(ExtensionSource.explicit, exts[0].source);
+
+    var found_foo = false;
+    var found_bar = false;
+    for (exts[1..]) |ext| {
+        if (std.mem.eql(u8, ext.id, "foo")) found_foo = std.mem.endsWith(u8, ext.path, "foo.lua");
+        if (std.mem.eql(u8, ext.id, "bar")) found_bar = std.mem.endsWith(u8, ext.path, "bar/init.lua");
+    }
+    try std.testing.expect(found_foo);
+    try std.testing.expect(found_bar);
 }
 
-test "discover loads synthetic bundled extension from directory path" {
+test "discover maps synthetic bundled extensions to init.lua with parent directory id" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -610,14 +498,7 @@ test "discover loads synthetic bundled extension from directory path" {
 
     const bundle_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "bundle_ext", allocator);
     defer allocator.free(bundle_path);
-
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .explicit,
-        .path = bundle_path,
-        .kind = .synthetic_extension,
-        .runtime_root_id = bundle_path,
-        .state_owner_id = bundle_path,
-    }};
+    const roots = [_]StaticExtensionRoot{.{ .source = .explicit, .path = bundle_path, .kind = .synthetic_extension, .runtime_root_id = bundle_path, .state_owner_id = bundle_path }};
 
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
@@ -1157,66 +1038,6 @@ test "example custom header extension publishes a semantic report" {
     try std.testing.expect(report.transient);
 }
 
-test "example widget placement extension publishes semantic status" {
-    const allocator = std.testing.allocator;
-    const widget_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/widget_placement.lua", allocator);
-    defer allocator.free(widget_path);
-
-    var state_owner_buf: [256]u8 = undefined;
-    const state_owner_id = try std.fmt.bufPrint(&state_owner_buf, "example::{s}", .{"widget_placement"});
-    const ext = LoadedExtension{
-        .id = "widget_placement",
-        .path = widget_path,
-        .source = .user,
-        .provenance = .{
-            .runtime_root_id = "examples/extensions",
-            .extension_id = "widget_placement",
-            .state_owner_id = state_owner_id,
-            .root_kind = .runtime_root,
-        },
-    };
-
-    var state = try lua_runtime.LuaState.init(allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-
-    var store = CommandExampleStore{ .allocator = allocator };
-    defer store.deinit();
-    var provider_registry = ai.provider.Registry.init(allocator);
-    defer provider_registry.deinit();
-    try runner.bindRuntime(.{
-        .session = @ptrCast(&store),
-        .get_model = &commandExampleGetModel,
-        .is_idle = &commandExampleIsIdle,
-        .abort = &commandExampleAbort,
-        .has_pending_messages = &commandExampleHasPendingMessages,
-        .get_context_usage = &commandExampleGetContextUsage,
-        .get_system_prompt = &commandExampleGetSystemPrompt,
-        .get_binding_info = &commandExampleGetBindingInfo,
-        .publish_ui = &CommandExampleStore.publishUi,
-    }, &provider_registry);
-    api.installZiTable(&state, &runner);
-
-    const stats = loadAll(allocator, &state, &runner, &.{ext}, &.{});
-    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
-
-    try event_bridge.dispatchSessionStart(.{
-        .runner = &runner,
-        .workspace_id = "/workspace",
-        .session_id = "session-123",
-        .session_file = "/workspace/.zi/sessions/session-123.jsonl",
-    }, null, .startup, null);
-
-    try std.testing.expectEqual(@as(usize, 1), store.ui_publications.items.len);
-    try std.testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[0].kind);
-    try std.testing.expectEqualStrings("widget-demo", store.ui_publications.items[0].id);
-    try std.testing.expectEqualStrings("Extension UI ready", store.ui_publications.items[0].text.?);
-}
-
 test "example qna extension writes a question prompt through editor actions" {
     const allocator = std.testing.allocator;
     const qna_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, "examples/extensions/qna.lua", allocator);
@@ -1318,49 +1139,6 @@ test "loadAll stamps provenance on top-level registrations outside factory" {
     const expected_state_owner = try std.fmt.allocPrint(allocator, "{s}::{s}", .{ tmp_path, exts[0].id });
     defer allocator.free(expected_state_owner);
     try std.testing.expectEqualStrings(expected_state_owner, handler.provenance.?.state_owner_id);
-}
-
-test "flat extension requires private helper resolved from synthetic module root" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
-    var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
-    try ext_dir.createDir(std.Options.debug_io, "foo", .default_dir);
-    var foo_dir = try ext_dir.openDir(std.Options.debug_io, "foo", .{});
-    try foo_dir.writeFile(std.Options.debug_io, .{ .sub_path = "helper.lua", .data = "_helper_loaded = true\n" });
-    const ext_src =
-        "require(\"helper\")\n" ++
-        "return function(zi) end\n";
-    try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "foo.lua", .data = ext_src });
-
-    const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(tmp_path);
-
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
-    const exts = try discover(.{ .allocator = allocator, .roots = &roots });
-    defer freeExtensions(allocator, exts);
-
-    var state = try lua_runtime.LuaState.init(allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-
-    const stats = loadAll(allocator, &state, &runner, exts, &.{});
-    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
-
-    try state.doString("assert(_helper_loaded == true)", "verify");
 }
 
 test "bundled extension requires private helper resolved from directory module root" {

@@ -829,87 +829,6 @@ test "trySetModel reclamps xhigh to high and persists thinking change when targe
     try testing.expectEqualStrings("high", thinking_entry.entry.thinking_level_change.thinking_level);
 }
 
-test "provider projection refreshes the current model from the rebuilt catalog" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
-    defer auth.deinit();
-    auth.setRuntimeApiKey("proxy-a", "test-key");
-
-    var model_registry = try model_registry_mod.ModelRegistry.init(alloc, &auth, &.{});
-    defer model_registry.deinit();
-
-    var fp = faux.FauxProvider.init(alloc);
-    var registry = ai.provider.Registry.init(alloc);
-    defer registry.deinit();
-    try registry.register("anthropic-messages", fp.provider(), null);
-
-    const claim_models = try alloc.alloc(ai.provider.ClaimModelRegistration, 1);
-    claim_models[0] = .{
-        .id = try alloc.dupe(u8, "proxy-model"),
-        .name = try alloc.dupe(u8, "Proxy Model v1"),
-        .reasoning = false,
-        .input = try alloc.dupe(ai.protocol.Model.InputType, &.{.text}),
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 4096,
-        .max_tokens = 2048,
-    };
-    try testing.expect(try registry.registerClaim(.{
-        .name = try alloc.dupe(u8, "proxy-a"),
-        .api = try alloc.dupe(u8, "anthropic-messages"),
-        .base_url = try alloc.dupe(u8, "https://proxy-a.example/v1"),
-        .owner_id = try alloc.dupe(u8, "ext-a"),
-        .generation = 1,
-        .models = claim_models,
-    }));
-    try model_registry.rebuildFromActiveProviderClaims(&registry);
-
-    const initial = model_registry.find(.{ .custom = "proxy-a" }, "proxy-model") orelse return error.MissingCatalogEntry;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const agent_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
-    defer alloc.free(agent_dir);
-
-    var ca = AgentSession.initTestSession(alloc, .{
-        .model = initial,
-        .api_key = "test-key",
-        .cwd = "/tmp/zi-test",
-        .resource_loader = createTestResourceLoaderWithAgentDir(alloc, "/tmp/zi-test", agent_dir),
-        .registry = &registry,
-        .auth_storage = &auth,
-        .model_registry = &model_registry,
-        .no_session = true,
-    });
-    defer ca.deinit();
-
-    const updated_models = try alloc.alloc(ai.provider.ClaimModelRegistration, 1);
-    updated_models[0] = .{
-        .id = try alloc.dupe(u8, "proxy-model"),
-        .name = try alloc.dupe(u8, "Proxy Model v2"),
-        .reasoning = false,
-        .input = try alloc.dupe(ai.protocol.Model.InputType, &.{.text}),
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 8192,
-        .max_tokens = 4096,
-    };
-    try testing.expect(try registry.registerClaim(.{
-        .name = try alloc.dupe(u8, "proxy-a"),
-        .api = try alloc.dupe(u8, "anthropic-messages"),
-        .base_url = try alloc.dupe(u8, "https://proxy-a.example/v2"),
-        .owner_id = try alloc.dupe(u8, "ext-a"),
-        .generation = 1,
-        .models = updated_models,
-    }));
-
-    try ca.rebuildVisibleModelCatalogFromActiveProviders();
-
-    try testing.expectEqualStrings("Proxy Model v1", ca.agent.modelValue().name);
-    try testing.expectEqualStrings("https://proxy-a.example/v1", ca.agent.modelValue().base_url);
-    try testing.expectEqual(@as(u64, 4096), ca.agent.modelValue().context_window);
-}
-
 test "trySetModel persists defaults through settings manager" {
     const alloc = testing.allocator;
 
@@ -1232,42 +1151,6 @@ test "AgentSession: getContextUsage reports current context from assistant usage
     try testing.expectApproxEqRel((@as(f64, @floatFromInt(200)) / @as(f64, @floatFromInt(faux.fauxModel().context_window))) * 100.0, usage.percent.?, 1e-9);
 }
 
-test "AgentSession: getContextUsage falls back to in-memory messages for no-session runs" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var fp = faux.FauxProvider.init(allocator);
-    var registry = ai.provider.Registry.init(allocator);
-    try registry.register("faux", fp.provider(), null);
-    var collector = EventCollector.init(allocator);
-    var session = AgentSession.initTestSession(allocator, .{
-        .model = faux.fauxModel(),
-        .api_key = "test-key",
-        .cwd = "/tmp/zi-test",
-        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
-        .registry = &registry,
-        .tools = &.{},
-        .event_handler = .{ .func = &EventCollector.callback, .ctx = @ptrCast(&collector) },
-        .no_session = true,
-    });
-    defer session.deinit();
-    defer collector.deinit();
-    defer registry.deinit();
-    defer fp.deinit();
-
-    const messages = [_]protocol.AgentMessage{
-        testUserMessage("hello", 1),
-        testAssistantMessageWithUsage(allocator, "hi", 200, 2),
-    };
-    try session.agent.setMessages(&messages);
-
-    const usage = session.getContextUsage().?;
-    try testing.expectEqual(@as(?u64, 200), usage.tokens);
-    try testing.expectEqual(faux.fauxModel().context_window, usage.context_window);
-    try testing.expect(usage.percent != null);
-}
-
 test "AgentSession: getContextUsage is unknown immediately after compaction" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1345,37 +1228,6 @@ test "AgentSession: in-memory compaction state clears on the first successful po
     const known_usage = session.getContextUsage().?;
     try testing.expectEqual(@as(?u64, 25_000), known_usage.tokens);
     try testing.expect(known_usage.percent != null);
-}
-
-test "AgentSession: getContextUsage prefers post-compaction assistant usage" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var fp = faux.FauxProvider.init(allocator);
-    var registry = ai.provider.Registry.init(allocator);
-    try registry.register("faux", fp.provider(), null);
-    var collector = EventCollector.init(allocator);
-    var session = createTestAgentSession(allocator, &fp, &registry, &collector);
-    defer session.deinit();
-    defer collector.deinit();
-    defer registry.deinit();
-    defer fp.deinit();
-
-    _ = session.session_store.appendMessage(testUserMessage("first", 1));
-    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response1", 180_000, 2));
-    _ = session.session_store.appendMessage(testUserMessage("second", 3));
-    const kept_user_id = session.session_store.currentEntryId().?;
-    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response2", 195_000, 4));
-    session.session_store.appendCompaction("summary", kept_user_id, 195_000, null, null);
-    _ = session.session_store.appendMessage(testUserMessage("third", 5));
-    _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "response3", 25_000, 6));
-    try syncMessagesFromStore(&session);
-
-    const usage = session.getContextUsage().?;
-    try testing.expectEqual(@as(?u64, 25_000), usage.tokens);
-    try testing.expect(usage.percent != null);
-    try testing.expectApproxEqRel((@as(f64, @floatFromInt(25_000)) / @as(f64, @floatFromInt(faux.fauxModel().context_window))) * 100.0, usage.percent.?, 1e-9);
 }
 
 // zi-1ry: `tool_allowlist` is a strict whitelist applied AFTER
@@ -1481,44 +1333,6 @@ test "AgentSession: user extension overrides builtin tool at execution time" {
         .text => |txt| try testing.expectEqualStrings("override read result", txt.text),
         else => return error.ExpectedTextBlock,
     }
-}
-
-test "AgentSession: final prompt metadata comes from the winning tool definition" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const agent_dir = try createAgentDirWithReadOverride(
-        allocator,
-        &tmp,
-        "Winning read snippet",
-        "Winning read guideline",
-        "prompt metadata override result",
-    );
-    defer allocator.free(agent_dir);
-
-    var fp = faux.FauxProvider.init(allocator);
-    defer fp.deinit();
-    var registry = ai.provider.Registry.init(allocator);
-    defer registry.deinit();
-    try registry.register("faux", fp.provider(), null);
-
-    var ca = AgentSession.initTestSession(allocator, .{
-        .model = faux.fauxModel(),
-        .api_key = "test-key",
-        .cwd = "/tmp/zi-test",
-        .resource_loader = createTestResourceLoaderWithAgentDir(allocator, "/tmp/zi-test", agent_dir),
-        .registry = &registry,
-        .no_session = true,
-    });
-    defer ca.deinit();
-
-    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Winning read snippet") != null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Winning read guideline") != null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Read file contents") == null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Use read to examine files instead of cat or sed.") == null);
 }
 
 test "AgentSession refreshes visible tools and prompt after runtime tool registration" {

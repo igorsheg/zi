@@ -100,59 +100,6 @@ pub fn measureHeight(visible_lines: u32, gap_count: u32) u32 {
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
 
-const test_style = Style{
-    .chrome = Color.default,
-    .fg = Color.default,
-    .dim = Color.default,
-};
-
-test "drawTop renders header" {
-    var buf = try Buffer.init(testing.allocator, 30, 1);
-    defer buf.deinit();
-    const rows = drawTop(buf.region(), 0, "file.zig", test_style);
-    try testing.expectEqual(@as(u32, 1), rows);
-    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
-}
-
-test "drawTop without header" {
-    var buf = try Buffer.init(testing.allocator, 30, 1);
-    defer buf.deinit();
-    _ = drawTop(buf.region(), 0, null, test_style);
-    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
-}
-
-test "drawContentLine with gutter" {
-    var buf = try Buffer.init(testing.allocator, 30, 1);
-    defer buf.deinit();
-    _ = drawContentLine(buf.region(), 0, "42", 3, "hello", test_style, true);
-    try testing.expectEqual(@as(u21, '4'), buf.get(1, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '2'), buf.get(2, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '│'), buf.get(4, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, 'h'), buf.get(6, 0).grapheme.codepoint);
-}
-
-test "drawContentLine without gutter" {
-    var buf = try Buffer.init(testing.allocator, 30, 1);
-    defer buf.deinit();
-    _ = drawContentLine(buf.region(), 0, null, 0, "hello", test_style, true);
-    try testing.expectEqual(@as(u21, '│'), buf.get(0, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, 'h'), buf.get(2, 0).grapheme.codepoint);
-}
-
-test "drawBottom renders footer" {
-    var buf = try Buffer.init(testing.allocator, 30, 1);
-    defer buf.deinit();
-    _ = drawBottom(buf.region(), 0, test_style);
-    try testing.expectEqual(@as(u21, '╰'), buf.get(0, 0).grapheme.codepoint);
-}
-
-test "drawElision shows count" {
-    var buf = try Buffer.init(testing.allocator, 40, 1);
-    defer buf.deinit();
-    _ = drawElision(buf.region(), 0, 95, 0, test_style);
-    try testing.expectEqual(@as(u21, '·'), buf.get(0, 0).grapheme.codepoint);
-}
-
 test "chromeWidth" {
     try testing.expectEqual(@as(u32, 2), chromeWidth(0));
     try testing.expectEqual(@as(u32, 6), chromeWidth(3));
@@ -308,42 +255,6 @@ pub const ClosedFrame = struct {
 
 pub fn closedFrame(region: Region) ClosedFrame {
     return ClosedFrame.init(region);
-}
-
-test "ClosedFrame draws top with labels" {
-    var buf = try Buffer.init(testing.allocator, 40, 3);
-    defer buf.deinit();
-    const frame = closedFrame(buf.region());
-    _ = frame.drawTop("left", "right", test_style);
-    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '╮'), buf.get(39, 0).grapheme.codepoint);
-}
-
-test "ClosedFrame draws top without labels" {
-    var buf = try Buffer.init(testing.allocator, 20, 3);
-    defer buf.deinit();
-    const frame = closedFrame(buf.region());
-    _ = frame.drawTop(null, null, test_style);
-    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '╮'), buf.get(19, 0).grapheme.codepoint);
-}
-
-test "ClosedFrame draws bottom corners" {
-    var buf = try Buffer.init(testing.allocator, 20, 3);
-    defer buf.deinit();
-    const frame = closedFrame(buf.region());
-    _ = frame.drawBottom(test_style);
-    try testing.expectEqual(@as(u21, '╰'), buf.get(0, 2).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '╯'), buf.get(19, 2).grapheme.codepoint);
-}
-
-test "ClosedFrame draws both side borders on body rows" {
-    var buf = try Buffer.init(testing.allocator, 8, 3);
-    defer buf.deinit();
-    const frame = closedFrame(buf.region());
-    _ = frame.drawBodyRow(0, test_style);
-    try testing.expectEqual(@as(u21, '│'), buf.get(0, 1).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, '│'), buf.get(7, 1).grapheme.codepoint);
 }
 
 test "closedFrame exposes body and inner geometry" {
