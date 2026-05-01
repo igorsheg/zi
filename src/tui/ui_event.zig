@@ -7,12 +7,20 @@ const ai_protocol = @import("../ai/protocol.zig");
 const theme_mod = @import("theme.zig");
 const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const request_mod = @import("../coding_agent/request.zig");
+const keys_mod = @import("keys.zig");
 const session_store_mod = @import("../coding_agent/session/store.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 
 pub const ExtensionCommandEntry = struct {
     name: []u8,
     description: []u8,
+};
+
+pub const ExtensionKeybindingEntry = struct {
+    id: []u8,
+    description: []u8,
+    key: keys_mod.Key,
+    display: []u8,
 };
 
 /// TUI-owned event type. All cross-thread payloads are deep-copied and
@@ -105,6 +113,9 @@ pub const UiEvent = union(enum) {
 
     extension_commands_updated: struct {
         commands: []ExtensionCommandEntry,
+    },
+    extension_keybindings_updated: struct {
+        keybindings: []ExtensionKeybindingEntry,
     },
     extension_report_shown: struct {
         report: extension_ui.Report,
@@ -250,6 +261,14 @@ pub const UiEvent = union(enum) {
                     allocator.free(cmd.description);
                 }
                 allocator.free(u.commands);
+            },
+            .extension_keybindings_updated => |u| {
+                for (u.keybindings) |kb| {
+                    allocator.free(kb.id);
+                    allocator.free(kb.description);
+                    allocator.free(kb.display);
+                }
+                allocator.free(u.keybindings);
             },
             .extension_report_shown => |*u| u.report.deinit(allocator),
             .extension_ui_published => |u| {

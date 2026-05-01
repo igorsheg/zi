@@ -349,6 +349,17 @@ pub fn matches(action: Action, key: Key) bool {
     return false;
 }
 
+pub fn isReservedForExtensions(key: Key) bool {
+    return matches(.app_interrupt, key) or
+        matches(.app_clear, key) or
+        matches(.app_exit, key) or
+        matches(.input_submit, key) or
+        matches(.input_new_line, key) or
+        matches(.input_tab, key) or
+        matches(.select_confirm, key) or
+        matches(.select_cancel, key);
+}
+
 pub fn resolveEditorCommand(key: Key) EditorCommand {
     if (matches(.editor_undo, key)) return .{ .action = .editor_undo };
     if (matches(.input_new_line, key)) return .{ .action = .input_new_line };
@@ -437,6 +448,13 @@ test "keybindings match defaults across editor picker and app actions" {
         try testing.expect(!matches(.app_paste_image, .{ .code = .char, .char = 'v', .alt = true }));
     }
     try testing.expect(!matches(.app_toggle_tools, .{ .code = .char, .char = 'o' }));
+}
+
+test "keybindings reserve safety and submit keys from extension overrides" {
+    try testing.expect(isReservedForExtensions(.{ .code = .escape }));
+    try testing.expect(isReservedForExtensions(.{ .code = .enter }));
+    try testing.expect(isReservedForExtensions(.{ .code = .char, .char = 'c', .ctrl = true }));
+    try testing.expect(!isReservedForExtensions(.{ .code = .char, .char = 'f', .ctrl = true }));
 }
 
 test "keybindings resolve editor commands with current editor semantics" {

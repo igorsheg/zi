@@ -155,6 +155,11 @@ pub const RuntimeHost = struct {
         try runner.dispatchCommand(name, args);
     }
 
+    pub fn dispatchExtensionKeybinding(self: *RuntimeHost, id: []const u8) !void {
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        try runner.dispatchKeybinding(id);
+    }
+
     pub fn deliverExtensionAsyncResult(self: *RuntimeHost, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) !void {
         var original = result;
         defer original.deinit(self.msg_allocator);

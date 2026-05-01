@@ -81,6 +81,8 @@ pub fn handle(self: anytype, key: Key) void {
         }
     }
 
+    if (dispatchExtensionKeybinding(self, key)) return;
+
     if (keybindings.matches(.app_toggle_tools, key)) {
         self.tool_output_expanded = !self.tool_output_expanded;
         self.transcript.setToolOutputExpanded(self.tool_output_expanded);
@@ -117,6 +119,22 @@ pub fn handle(self: anytype, key: Key) void {
         self.refreshHeaderVisibility();
         self.tui.dirty = true;
     }
+}
+
+fn dispatchExtensionKeybinding(self: anytype, key: Key) bool {
+    if (keybindings.isReservedForExtensions(key)) return false;
+    for (self.extension_keybindings.items) |entry| {
+        if (Key.eql(entry.key, key)) {
+            const id = self.msg_allocator.dupe(u8, entry.id) catch return true;
+            _ = self.dispatchIdleRequest(.{ .extension_keybinding = .{ .id = id } }, .{
+                .busy_message = "cannot run keybinding while agent is running",
+                .loader_message = "Running keybinding...",
+                .spawn_failed_message = "failed to queue extension keybinding",
+            });
+            return true;
+        }
+    }
+    return false;
 }
 
 pub fn handleScroll(self: anytype, key: Key) bool {

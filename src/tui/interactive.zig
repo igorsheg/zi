@@ -235,6 +235,7 @@ pub const Interactive = struct {
     autocomplete_provider: CombinedAutocompleteProvider = undefined,
     autocomplete_provider_bound: bool = false,
     hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
+    extension_keybindings: std.ArrayListUnmanaged(ui_event_mod.ExtensionKeybindingEntry) = .empty,
 
     // ── Flow-owned transient pickers ────────────────────────────
     resume_picker_flow: ?ResumePickerFlow = null,
@@ -309,37 +310,35 @@ pub const Interactive = struct {
         auth_storage: *auth_storage_mod.AuthStorage,
         settings_manager: *settings_manager_mod.SettingsManager,
     ) !Interactive {
-        const state_allocator = allocator;
-
         var self: Interactive = .{
-            .allocator = state_allocator,
+            .allocator = allocator,
             .msg_allocator = msg_allocator,
             .io = io,
-            .tui = try TUI.init(state_allocator),
+            .tui = try TUI.init(allocator),
             .theme_storage = undefined,
             .theme = undefined,
             .cwd = cwd,
-            .editor = editor_mod.Editor.init(state_allocator),
-            .status_line = StatusLine.init(state_allocator),
-            .pending_image_banner = text_mod.Text.init(state_allocator),
-            .extension_ui_state = ExtensionUiState.init(state_allocator),
+            .editor = editor_mod.Editor.init(allocator),
+            .status_line = StatusLine.init(allocator),
+            .pending_image_banner = text_mod.Text.init(allocator),
+            .extension_ui_state = ExtensionUiState.init(allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
-            .transcript = Transcript.init(state_allocator),
-            .transcript_container = container_mod.Container.init(state_allocator),
+            .transcript = Transcript.init(allocator),
+            .transcript_container = container_mod.Container.init(allocator),
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
-            .status_data = StatusData.init(state_allocator),
+            .status_data = StatusData.init(allocator),
             .runtime_host = runtime_host,
-            .header_container = container_mod.Container.init(state_allocator),
-            .pending_container = container_mod.Container.init(state_allocator),
-            .status_container = container_mod.Container.init(state_allocator),
-            .composer_above_container = container_mod.Container.init(state_allocator),
-            .editor_container = container_mod.Container.init(state_allocator),
-            .composer_below_container = container_mod.Container.init(state_allocator),
-            .command_registry = CommandRegistry.init(state_allocator),
-            .input = input_buffer_mod.InputBuffer.init(state_allocator),
+            .header_container = container_mod.Container.init(allocator),
+            .pending_container = container_mod.Container.init(allocator),
+            .status_container = container_mod.Container.init(allocator),
+            .composer_above_container = container_mod.Container.init(allocator),
+            .editor_container = container_mod.Container.init(allocator),
+            .composer_below_container = container_mod.Container.init(allocator),
+            .command_registry = CommandRegistry.init(allocator),
+            .input = input_buffer_mod.InputBuffer.init(allocator),
             .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
             .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
@@ -411,6 +410,8 @@ pub const Interactive = struct {
         self.clearPendingImages();
         self.pending_images.deinit(self.allocator);
         if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
+        self.clearExtensionKeybindings();
+        self.extension_keybindings.deinit(self.allocator);
         self.command_registry.deinit();
         self.runtime_host.deinit();
         if (self.last_published_status_snapshot) |*snapshot| {
@@ -1100,6 +1101,45 @@ pub const Interactive = struct {
             break :blk owned;
         };
         _ = self.publishLifecycleUiEvent(.{ .extension_commands_updated = .{ .commands = commands } });
+        self.publishExtensionKeybindingsSnapshot();
+    }
+
+    pub fn publishExtensionKeybindingsSnapshot(self: *Interactive) void {
+        const extension_bindings = blk: {
+            const runner = self.runtime_host.currentSession().extensionRunner() orelse break :blk self.msg_allocator.alloc(ui_event_mod.ExtensionKeybindingEntry, 0) catch return;
+            var count: usize = 0;
+            for (runner.keybinding_registry.items()) |entry| count += entry.keys.len;
+            var owned = self.msg_allocator.alloc(ui_event_mod.ExtensionKeybindingEntry, count) catch return;
+            var built: usize = 0;
+            errdefer {
+                for (owned[0..built]) |kb| {
+                    self.msg_allocator.free(kb.id);
+                    self.msg_allocator.free(kb.description);
+                    self.msg_allocator.free(kb.display);
+                }
+                self.msg_allocator.free(owned);
+            }
+            for (runner.keybinding_registry.items()) |entry| {
+                for (entry.keys, 0..) |key, i| {
+                    owned[built] = .{
+                        .id = self.msg_allocator.dupe(u8, entry.id) catch return,
+                        .description = self.msg_allocator.dupe(u8, entry.description) catch {
+                            self.msg_allocator.free(owned[built].id);
+                            return;
+                        },
+                        .key = key,
+                        .display = self.msg_allocator.dupe(u8, entry.displays[i]) catch {
+                            self.msg_allocator.free(owned[built].id);
+                            self.msg_allocator.free(owned[built].description);
+                            return;
+                        },
+                    };
+                    built += 1;
+                }
+            }
+            break :blk owned;
+        };
+        _ = self.publishLifecycleUiEvent(.{ .extension_keybindings_updated = .{ .keybindings = extension_bindings } });
     }
 
     pub fn publishPendingExtensionUi(self: *Interactive) void {
@@ -1120,6 +1160,42 @@ pub const Interactive = struct {
 
     pub fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {
         extension_ui_flow.applyCommandsUpdate(self, commands);
+    }
+
+    pub fn applyExtensionKeybindingsUpdate(self: *Interactive, entries: []const ui_event_mod.ExtensionKeybindingEntry) void {
+        self.clearExtensionKeybindings();
+        for (entries) |kb| {
+            const id = self.allocator.dupe(u8, kb.id) catch continue;
+            const description = self.allocator.dupe(u8, kb.description) catch {
+                self.allocator.free(id);
+                continue;
+            };
+            const display = self.allocator.dupe(u8, kb.display) catch {
+                self.allocator.free(id);
+                self.allocator.free(description);
+                continue;
+            };
+            self.extension_keybindings.append(self.allocator, .{
+                .id = id,
+                .description = description,
+                .key = kb.key,
+                .display = display,
+            }) catch {
+                self.allocator.free(id);
+                self.allocator.free(description);
+                self.allocator.free(display);
+                continue;
+            };
+        }
+    }
+
+    pub fn clearExtensionKeybindings(self: *Interactive) void {
+        for (self.extension_keybindings.items) |kb| {
+            self.allocator.free(kb.id);
+            self.allocator.free(kb.description);
+            self.allocator.free(kb.display);
+        }
+        self.extension_keybindings.clearRetainingCapacity();
     }
 
     /// Agent-thread handler for `AgentRequest.compact`. The runner emits

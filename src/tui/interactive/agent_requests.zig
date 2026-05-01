@@ -70,6 +70,17 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                     };
                     self.publishPendingExtensionUi();
                 },
+                .extension_keybinding => |ek| {
+                    idle_processed = true;
+                    if (self.runtime_host.currentSession().extensionRunner()) |runner| {
+                        runner.async_dispatcher = .{ .ptr = @ptrCast(self), .submit = submitExtensionAsyncFromRunner };
+                    }
+                    self.runtime_host.dispatchExtensionKeybinding(ek.id) catch |err| {
+                        const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
+                        _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
+                    };
+                    self.publishPendingExtensionUi();
+                },
                 .extension_oauth_login => |oauth| {
                     idle_processed = true;
                     const result: request_mod.ExtensionOAuthLoginResponse.Result = self.runtime_host.dispatchExtensionOAuthLogin(oauth.provider_id, oauth.callbacks) catch |err| blk: {

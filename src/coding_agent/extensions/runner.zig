@@ -387,6 +387,7 @@ pub const ExtensionRunner = struct {
     /// (commands are v2) but the slot exists so the bind seam
     /// (`ExtensionRuntime.Bound.command_actions`) has a target.
     command_registry: registries.CommandRegistry,
+    keybinding_registry: registries.KeybindingRegistry,
 
     /// Provider queue — pending custom-provider registrations that
     /// arrived during the pre-bind load phase. Drained by
@@ -567,6 +568,7 @@ pub const ExtensionRunner = struct {
             .tool_registry = registries.ToolRegistry.init(allocator),
             .event_registry = registries.EventRegistry.init(allocator),
             .command_registry = registries.CommandRegistry.init(allocator),
+            .keybinding_registry = registries.KeybindingRegistry.init(allocator),
             .provider_queue = registries.ProviderQueue.init(allocator),
             .loaded_extensions = .empty,
             .hook_arena = std.heap.ArenaAllocator.init(allocator),
@@ -720,6 +722,7 @@ pub const ExtensionRunner = struct {
         // will revisit this.
         self.clearAsyncState();
         self.provider_queue.deinit();
+        self.keybinding_registry.deinit();
         self.command_registry.deinit();
         self.event_registry.deinit();
         self.tool_registry.deinit();
@@ -884,6 +887,50 @@ pub const ExtensionRunner = struct {
     /// first argument and a command context as the second. If the
     /// handler yields, returns `error.UnexpectedYield` — command
     /// bodies are not yieldable in this slice.
+    pub fn dispatchKeybinding(self: *ExtensionRunner, id: []const u8) !void {
+        self.assertOnLuaThread();
+
+        const state = self.lua_state orelse return error.MissingLuaState;
+        var kb_opt: ?*const registries.keybinding.KeybindingDef = null;
+        for (self.keybinding_registry.items()) |*entry| {
+            if (std.mem.eql(u8, entry.id, id)) {
+                kb_opt = entry;
+                break;
+            }
+        }
+        const kb = kb_opt orelse return error.UnknownKeybinding;
+
+        var co = try lua_runtime.Coroutine.init(state);
+        var co_owned = true;
+        defer if (co_owned) co.deinit();
+
+        _ = lua_runtime.c.lua_rawgeti(co.L, lua_runtime.c.LUA_REGISTRYINDEX, kb.lua_ref);
+        if (lua_runtime.c.lua_type(co.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+            lua_runtime.c.lua_pop(co.L, 1);
+            return error.InvalidHandlerRef;
+        }
+
+        context_mod.pushCommandContext(co.L, self, kb.source.provenance) catch {
+            lua_runtime.c.lua_pop(co.L, 1);
+            return error.ContextPushFailed;
+        };
+
+        self.setModuleContext(state, kb.source.provenance);
+        if (kb.source.provenance) |provenance| {
+            self.beginExecutionContext(self.sourceForProvenance(provenance));
+            defer self.endExecutionContext();
+        }
+
+        const r = try co.resumeWith(1);
+        switch (r.status) {
+            .yielded => {
+                co_owned = false;
+                return error.UnexpectedYield;
+            },
+            .ok, .finished => {},
+        }
+    }
+
     pub fn dispatchCommand(self: *ExtensionRunner, name: []const u8, args: []const u8) !void {
         self.assertOnLuaThread();
 

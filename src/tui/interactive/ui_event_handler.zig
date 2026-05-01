@@ -167,6 +167,7 @@ pub fn handle(self: anytype, ev: *UiEvent) void {
         .resume_sessions_loaded => |r| self.applyResumeSessionsLoaded(r.generation, r.sessions),
         .resume_sessions_failed => |f| self.applyResumeSessionsFailed(f.generation, f.message),
         .extension_commands_updated => |u| self.applyExtensionCommandsUpdate(u.commands),
+        .extension_keybindings_updated => |u| self.applyExtensionKeybindingsUpdate(u.keybindings),
         .extension_report_shown => |u| self.applyExtensionReport(u.report),
         .extension_ui_published => |u| self.applyExtensionUiPublications(u.updates),
         .extension_editor_actions => |u| self.applyExtensionEditorActions(u.actions),

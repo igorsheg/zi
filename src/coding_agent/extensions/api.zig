@@ -48,6 +48,7 @@ const system_api = @import("system_api.zig");
 const spawn_api = @import("spawn_api.zig");
 const provider_api = @import("provider_api.zig");
 const command_api = @import("command_api.zig");
+const keybinding_api = @import("keybinding_api.zig");
 const event_api = @import("event_api.zig");
 const tool_api = @import("tool_api.zig");
 const tool_registry = @import("registries/tool_registry.zig");
@@ -60,6 +61,7 @@ const spawn_types = @import("../../spawn/types.zig");
 const session_core = @import("../../session/root.zig");
 const ai = @import("../../ai/root.zig");
 const oauth_mod = @import("../auth/oauth.zig");
+const keys_mod = @import("../../tui/keys.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
@@ -82,6 +84,10 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     // zi.register_command
     state.pushCClosureWithUserdata(command_api.ziRegisterCommand, runner);
     c.lua_setfield(L, -2, "register_command");
+
+    // zi.register_keybinding
+    state.pushCClosureWithUserdata(keybinding_api.ziRegisterKeybinding, runner);
+    c.lua_setfield(L, -2, "register_keybinding");
 
     // zi.register_provider
     state.pushCClosureWithUserdata(provider_api.ziRegisterProvider, runner);
@@ -1246,4 +1252,25 @@ test "zi.register_command registers commands and disambiguates duplicate visible
     try testing.expect(runner.command_registry.getByVisibleName("dup") == null);
     try testing.expect(runner.command_registry.getByVisibleName("dup:1") != null);
     try testing.expect(runner.command_registry.getByVisibleName("dup:2") != null);
+}
+
+test "zi.register_keybinding registers normalized key specs" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    installZiTable(&state, &runner);
+
+    try state.doString(
+        \\assert(zi.register_keybinding({ id = "starter.pick", key = "ctrl+f", description = "Pick starter", handler = function(ctx) end }) == true)
+    , "test_register_keybindings");
+
+    try testing.expectEqual(@as(usize, 1), runner.keybinding_registry.count());
+    const kb = runner.keybinding_registry.items()[0];
+    try testing.expectEqualStrings("starter.pick", kb.id);
+    try testing.expectEqualStrings("Pick starter", kb.description);
+    try testing.expectEqual(@as(usize, 1), kb.keys.len);
+    try testing.expect(keys_mod.Key.eql(kb.keys[0], .{ .code = .char, .char = 'f', .ctrl = true }));
 }

@@ -48,6 +48,51 @@ pub const ParseResult = struct {
     len: usize,
 };
 
+pub const KeySpecParseError = error{InvalidKeySpec};
+
+pub fn parseKeySpec(text: []const u8) KeySpecParseError!Key {
+    var key_text = text;
+    var key: Key = .{ .code = .char };
+    var it = std.mem.splitScalar(u8, text, '+');
+    while (it.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) return error.InvalidKeySpec;
+        if (std.ascii.eqlIgnoreCase(part, "ctrl") or std.ascii.eqlIgnoreCase(part, "control")) {
+            key.ctrl = true;
+        } else if (std.ascii.eqlIgnoreCase(part, "alt") or std.ascii.eqlIgnoreCase(part, "meta")) {
+            key.alt = true;
+        } else if (std.ascii.eqlIgnoreCase(part, "shift")) {
+            key.shift = true;
+        } else {
+            key_text = part;
+        }
+    }
+
+    if (std.ascii.eqlIgnoreCase(key_text, "enter") or std.ascii.eqlIgnoreCase(key_text, "return")) key.code = .enter else if (std.ascii.eqlIgnoreCase(key_text, "esc") or std.ascii.eqlIgnoreCase(key_text, "escape")) key.code = .escape else if (std.ascii.eqlIgnoreCase(key_text, "tab")) key.code = .tab else if (std.ascii.eqlIgnoreCase(key_text, "backspace") or std.ascii.eqlIgnoreCase(key_text, "bs")) key.code = .backspace else if (std.ascii.eqlIgnoreCase(key_text, "up")) key.code = .up else if (std.ascii.eqlIgnoreCase(key_text, "down")) key.code = .down else if (std.ascii.eqlIgnoreCase(key_text, "left")) key.code = .left else if (std.ascii.eqlIgnoreCase(key_text, "right")) key.code = .right else if (std.ascii.eqlIgnoreCase(key_text, "home")) key.code = .home else if (std.ascii.eqlIgnoreCase(key_text, "end")) key.code = .end else if (std.ascii.eqlIgnoreCase(key_text, "pageup") or std.ascii.eqlIgnoreCase(key_text, "page_up") or std.ascii.eqlIgnoreCase(key_text, "page up")) key.code = .page_up else if (std.ascii.eqlIgnoreCase(key_text, "pagedown") or std.ascii.eqlIgnoreCase(key_text, "page_down") or std.ascii.eqlIgnoreCase(key_text, "page down")) key.code = .page_down else if (std.ascii.eqlIgnoreCase(key_text, "delete") or std.ascii.eqlIgnoreCase(key_text, "del")) key.code = .delete else if (std.ascii.eqlIgnoreCase(key_text, "insert") or std.ascii.eqlIgnoreCase(key_text, "ins")) key.code = .insert else if (key_text.len >= 2 and (key_text[0] == 'f' or key_text[0] == 'F')) {
+        const n = std.fmt.parseInt(u8, key_text[1..], 10) catch return error.InvalidKeySpec;
+        key.code = switch (n) {
+            1 => .f1,
+            2 => .f2,
+            3 => .f3,
+            4 => .f4,
+            5 => .f5,
+            6 => .f6,
+            7 => .f7,
+            8 => .f8,
+            9 => .f9,
+            10 => .f10,
+            11 => .f11,
+            12 => .f12,
+            else => return error.InvalidKeySpec,
+        };
+    } else if (key_text.len == 1) {
+        key.code = .char;
+        key.char = std.ascii.toLower(key_text[0]);
+    } else return error.InvalidKeySpec;
+
+    return key;
+}
+
 pub const MouseEventKind = enum {
     down,
     up,
@@ -474,6 +519,12 @@ fn parseUtf8Char(data: []const u8) ?ParseResult {
 }
 
 // --- tests ---
+
+test "parseKeySpec normalizes modifiers and named keys" {
+    try std.testing.expect(Key.eql(try parseKeySpec("ctrl+f"), .{ .code = .char, .char = 'f', .ctrl = true }));
+    try std.testing.expect(Key.eql(try parseKeySpec("shift+enter"), .{ .code = .enter, .shift = true }));
+    try std.testing.expectError(error.InvalidKeySpec, parseKeySpec("ctrl+"));
+}
 
 test "single-byte keys: printable, control, special" {
     // Printable char
