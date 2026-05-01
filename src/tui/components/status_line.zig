@@ -6,6 +6,7 @@ const status_data_mod = @import("../status_data.zig");
 const theme_mod = @import("../theme.zig");
 const shimmer_mod = @import("../shimmer.zig");
 const grapheme_mod = @import("../grapheme.zig");
+const shuffle_text_mod = @import("../shuffle_text.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -14,6 +15,7 @@ const Measurement = component_mod.Measurement;
 const StatusData = status_data_mod.StatusData;
 const Theme = theme_mod.Theme;
 const Shimmer = shimmer_mod.Config;
+const ShuffleText = shuffle_text_mod.ShuffleText;
 
 /// Single TUI-owned composer for the status area.
 ///
@@ -34,6 +36,7 @@ pub const StatusLine = struct {
 
     primary_buf: std.ArrayListUnmanaged(u8) = .empty,
     working_buf: std.ArrayListUnmanaged(u8) = .empty,
+    primary_shuffle: ?ShuffleText = null,
 
     pub fn init(allocator: std.mem.Allocator) StatusLine {
         return .{ .allocator = allocator };
@@ -42,6 +45,7 @@ pub const StatusLine = struct {
     pub fn deinit(self: *StatusLine) void {
         self.primary_buf.deinit(self.allocator);
         self.working_buf.deinit(self.allocator);
+        if (self.primary_shuffle) |*shuffle| shuffle.deinit();
     }
 
     pub fn setPrimary(self: *StatusLine, text: []const u8, fg: Color) void {
@@ -49,11 +53,13 @@ pub const StatusLine = struct {
         self.primary_buf.appendSlice(self.allocator, text) catch return;
         self.primary_text = self.primary_buf.items;
         self.primary_fg = fg;
+        self.startPrimaryShuffle() catch {};
     }
 
     pub fn clearPrimary(self: *StatusLine) void {
         self.primary_buf.clearRetainingCapacity();
         self.primary_text = "";
+        if (self.primary_shuffle) |*shuffle| shuffle.stop();
     }
 
     pub fn setWorking(self: *StatusLine, text: []const u8) void {
@@ -94,16 +100,36 @@ pub const StatusLine = struct {
     }
 
     pub fn nextAnimationDeadline(self: *StatusLine, now_ns: i128) ?i128 {
-        if (!self.working_active or self.working_message.len == 0) return null;
-        return shimmer_mod.nextDeadline(now_ns, self.shimmerConfig());
+        var deadline: ?i128 = null;
+        if (self.working_active and self.working_message.len > 0) {
+            deadline = shimmer_mod.nextDeadline(now_ns, self.shimmerConfig());
+        }
+        if (!self.working_active) {
+            if (self.primary_shuffle) |shuffle| {
+                if (shuffle.isRunning()) {
+                    const shuffle_deadline = now_ns + @as(i128, @intCast(shuffle.options.frame_ms * std.time.ns_per_ms));
+                    deadline = if (deadline) |d| @min(d, shuffle_deadline) else shuffle_deadline;
+                }
+            }
+        }
+        return deadline;
     }
 
     pub fn tickAnimation(self: *StatusLine, now_ns: i128) bool {
-        if (!self.working_active or self.working_message.len == 0) return false;
-        const phase = shimmer_mod.phaseForTime(now_ns, self.shimmerConfig(), self.working_message);
-        if (phase == self.shimmer_phase) return false;
-        self.shimmer_phase = phase;
-        return true;
+        var changed = false;
+        if (self.working_active and self.working_message.len > 0) {
+            const phase = shimmer_mod.phaseForTime(now_ns, self.shimmerConfig(), self.working_message);
+            if (phase != self.shimmer_phase) {
+                self.shimmer_phase = phase;
+                changed = true;
+            }
+        }
+        if (!self.working_active) {
+            if (self.primary_shuffle) |*shuffle| {
+                changed = (shuffle.tick(nsToMs(now_ns)) catch false) or changed;
+            }
+        }
+        return changed;
     }
 
     pub fn measure(self: *StatusLine, width: u32) Measurement {
@@ -161,6 +187,9 @@ pub const StatusLine = struct {
             const fg = if (self.theme) |theme| theme.fg(.dim) else self.primary_fg;
             return .{ .text = self.working_message, .fg = fg };
         }
+        if (self.primary_shuffle) |shuffle| {
+            if (shuffle.isRunning()) return .{ .text = shuffle.rendered(), .fg = self.primary_fg };
+        }
         return .{ .text = self.primary_text, .fg = self.primary_fg };
     }
 
@@ -177,6 +206,19 @@ pub const StatusLine = struct {
         var x = working_cols;
         if (x < region.width) x += region.writeStr(x, 0, separator, self.primarySegment().fg, Color.default, .{});
         if (x < region.width) _ = region.writeStr(x, 0, extension, self.primarySegment().fg, Color.default, .{});
+    }
+
+    fn startPrimaryShuffle(self: *StatusLine) !void {
+        if (self.primary_text.len == 0) return;
+        if (self.primary_shuffle == null) {
+            self.primary_shuffle = try ShuffleText.init(self.allocator, .{
+                .duration_ms = 220,
+                .frame_ms = 33,
+            });
+        }
+        const shuffle = &self.primary_shuffle.?;
+        try shuffle.setText(self.primary_text);
+        try shuffle.start(currentMs());
     }
 
     fn shimmerConfig(self: *const StatusLine) Shimmer {
@@ -196,6 +238,17 @@ pub const StatusLine = struct {
         };
     }
 };
+
+fn currentMs() u64 {
+    const ms = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds();
+    if (ms <= 0) return 0;
+    return @intCast(ms);
+}
+
+fn nsToMs(ns: i128) u64 {
+    if (ns <= 0) return 0;
+    return @intCast(@divFloor(ns, std.time.ns_per_ms));
+}
 
 const testing = std.testing;
 

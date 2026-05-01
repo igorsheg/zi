@@ -28,6 +28,7 @@ pub const status_data = @import("status_data.zig");
 pub const autocomplete = @import("autocomplete.zig");
 pub const keybindings = @import("keybindings.zig");
 pub const interactive = @import("interactive.zig");
+pub const shuffle_text = @import("shuffle_text.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
