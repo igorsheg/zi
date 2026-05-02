@@ -90,7 +90,8 @@ pub const AutocompleteProvider = struct {
 const max_command_candidates = 256;
 const max_path_candidates = 64;
 const max_async_results = 20;
-const max_async_scan_results = 100;
+const max_async_scan_results = 300;
+const max_local_path_scan_results = 300;
 const max_async_output_bytes = 256 * 1024;
 const max_path_bytes = 512;
 const path_delimiters = [_]u8{ ' ', '\t', '"', '\'', '=' };
@@ -226,7 +227,15 @@ pub const SlashCommandProvider = struct {
             n += 1;
         }
 
-        const matched = search.plain.filter(prefix_after_slash, self.text_buf[0..n], &self.index_buf);
+        var field_storage: [max_command_candidates][2]search.plain.Field = undefined;
+        var rows: [max_command_candidates][]const search.plain.Field = undefined;
+        for (0..n) |i| {
+            const cmd = self.getCommand(i);
+            field_storage[i][0] = .{ .name = "name", .text = cmd.name, .weight = 24 };
+            field_storage[i][1] = .{ .name = "description", .text = cmd.description orelse "", .weight = -8 };
+            rows[i] = field_storage[i][0..2];
+        }
+        const matched = search.plain.filterFields(prefix_after_slash, rows[0..n], &self.index_buf);
         for (0..matched) |i| {
             const idx = self.index_buf[i];
             const cmd = self.getCommand(idx);
@@ -459,7 +468,15 @@ pub const CombinedAutocompleteProvider = struct {
             n += 1;
         }
 
-        const matched = search.plain.filter(prefix_after_slash, self.command_names[0..n], &self.command_indices);
+        var field_storage: [max_command_candidates][2]search.plain.Field = undefined;
+        var rows: [max_command_candidates][]const search.plain.Field = undefined;
+        for (0..n) |i| {
+            const cmd = self.getCommand(i);
+            field_storage[i][0] = .{ .name = "name", .text = cmd.name, .weight = 24 };
+            field_storage[i][1] = .{ .name = "description", .text = cmd.description orelse "", .weight = -8 };
+            rows[i] = field_storage[i][0..2];
+        }
+        const matched = search.plain.filterFields(prefix_after_slash, rows[0..n], &self.command_indices);
         const clamped = @min(matched, self.item_buf.len);
         for (0..clamped) |i| {
             const idx = self.command_indices[i];
@@ -480,11 +497,14 @@ pub const CombinedAutocompleteProvider = struct {
         var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, plan.search_dir, .{ .iterate = true }) catch return 0;
         defer dir.close(std.Options.debug_io);
 
+        var name_storage: [max_local_path_scan_results][max_path_bytes]u8 = undefined;
+        var candidates: [max_local_path_scan_results]search.path.Candidate = undefined;
+        var candidate_count: usize = 0;
+
         var iter = dir.iterate();
-        var count: usize = 0;
         while (iter.next(std.Options.debug_io) catch null) |entry| {
-            if (count >= self.item_buf.len) break;
-            if (!startsWithIgnoreCase(entry.name, plan.search_prefix)) continue;
+            if (candidate_count >= candidates.len) break;
+            if (entry.name.len == 0 or entry.name.len > max_path_bytes) continue;
 
             var is_directory = entry.kind == .directory;
             if (!is_directory and entry.kind == .sym_link) {
@@ -494,19 +514,36 @@ pub const CombinedAutocompleteProvider = struct {
                 }
             }
 
-            const display_path = self.buildDisplayPath(count, plan.display_prefix, entry.name) orelse continue;
-            const completion_value = self.buildCompletionValue(count, display_path, is_directory, plan.is_at_prefix, plan.is_quoted_prefix) orelse continue;
-            const label = self.buildLabel(count, entry.name, is_directory) orelse continue;
+            @memcpy(name_storage[candidate_count][0..entry.name.len], entry.name);
+            const name = name_storage[candidate_count][0..entry.name.len];
+            candidates[candidate_count] = .{ .path = name, .is_directory = is_directory };
+            candidate_count += 1;
+        }
 
-            self.item_buf[count] = .{
+        var selected_indices: [max_path_candidates]usize = undefined;
+        var selected_count: usize = 0;
+        if (plan.search_prefix.len == 0) {
+            selected_count = @min(candidate_count, selected_indices.len);
+            for (0..selected_count) |i| selected_indices[i] = i;
+            sortLocalPathCandidateIndices(selected_indices[0..selected_count], candidates[0..candidate_count]);
+        } else {
+            selected_count = search.path.filterCandidates(plan.search_prefix, candidates[0..candidate_count], &selected_indices);
+        }
+
+        const count = @min(selected_count, self.item_buf.len);
+        for (selected_indices[0..count], 0..) |candidate_idx, out_idx| {
+            const candidate = candidates[candidate_idx];
+            const display_path = self.buildDisplayPath(out_idx, plan.display_prefix, candidate.path) orelse continue;
+            const completion_value = self.buildCompletionValue(out_idx, display_path, candidate.is_directory, plan.is_at_prefix, plan.is_quoted_prefix) orelse continue;
+            const label = self.buildLabel(out_idx, candidate.path, candidate.is_directory) orelse continue;
+
+            self.item_buf[out_idx] = .{
                 .value = completion_value,
                 .label = label,
             };
-            self.item_is_directory[count] = is_directory;
-            count += 1;
+            self.item_is_directory[out_idx] = candidate.is_directory;
         }
 
-        sortItems(self.item_buf[0..count], self.item_is_directory[0..count]);
         return count;
     }
 
@@ -687,7 +724,7 @@ pub const CombinedAutocompleteProvider = struct {
         argc += 1;
         argv[argc] = "--max-results";
         argc += 1;
-        argv[argc] = "100";
+        argv[argc] = "300";
         argc += 1;
         argv[argc] = "--type";
         argc += 1;
@@ -818,11 +855,11 @@ pub const CombinedAutocompleteProvider = struct {
             for (0..selected_count) |idx| selected_indices[idx] = idx;
         } else {
             const arena = self.async_search.arenaAllocator();
-            const paths = arena.alloc([]const u8, self.async_search.candidates.items.len) catch return null;
+            const candidates = arena.alloc(search.path.Candidate, self.async_search.candidates.items.len) catch return null;
             for (self.async_search.candidates.items, 0..) |candidate, idx| {
-                paths[idx] = candidate.relative_path;
+                candidates[idx] = .{ .path = candidate.relative_path, .is_directory = candidate.is_directory };
             }
-            selected_count = search.path.filter(self.async_search.query, paths, &selected_indices);
+            selected_count = search.path.filterCandidates(self.async_search.query, candidates, &selected_indices);
             if (selected_count == 0) return null;
         }
 
@@ -1230,6 +1267,25 @@ fn shouldSwap(left: SelectItem, left_is_dir: bool, right: SelectItem, right_is_d
     return asciiLessThanIgnoreCase(right.label, left.label);
 }
 
+fn sortLocalPathCandidateIndices(indices: []usize, candidates: []const search.path.Candidate) void {
+    var i: usize = 1;
+    while (i < indices.len) : (i += 1) {
+        const idx = indices[i];
+        var j = i;
+        while (j > 0 and localPathCandidateLessThan(idx, indices[j - 1], candidates)) : (j -= 1) {
+            indices[j] = indices[j - 1];
+        }
+        indices[j] = idx;
+    }
+}
+
+fn localPathCandidateLessThan(a_idx: usize, b_idx: usize, candidates: []const search.path.Candidate) bool {
+    const a = candidates[a_idx];
+    const b = candidates[b_idx];
+    if (a.is_directory != b.is_directory) return a.is_directory;
+    return asciiLessThanIgnoreCase(a.path, b.path);
+}
+
 fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
     const shared = @min(a.len, b.len);
     for (0..shared) |idx| {
@@ -1242,39 +1298,53 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 fn buildFdPathQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, query, '/')) |_| {
-        const has_trailing_separator = std.mem.endsWith(u8, query, "/");
-        const trimmed = std.mem.trim(u8, query, "/");
-        if (trimmed.len == 0) return allocator.dupe(u8, query);
+    const trimmed_query = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed_query.len == 0) return allocator.dupe(u8, query);
 
-        var builder: std.ArrayList(u8) = .empty;
-        errdefer builder.deinit(allocator);
+    var builder: std.ArrayList(u8) = .empty;
+    errdefer builder.deinit(allocator);
+
+    if (std.mem.indexOfScalar(u8, trimmed_query, '/')) |_| {
+        const has_trailing_separator = std.mem.endsWith(u8, trimmed_query, "/");
+        const trimmed = std.mem.trim(u8, trimmed_query, "/");
+        if (trimmed.len == 0) return allocator.dupe(u8, trimmed_query);
 
         var first = true;
         var iter = std.mem.splitScalar(u8, trimmed, '/');
         while (iter.next()) |segment| {
             if (segment.len == 0) continue;
             if (!first) try builder.appendSlice(allocator, "[\\\\/]");
-            try appendEscapedRegex(&builder, allocator, segment);
+            try appendFuzzyRegexSegment(&builder, allocator, segment);
             first = false;
         }
 
-        if (first) return allocator.dupe(u8, query);
+        if (first) return allocator.dupe(u8, trimmed_query);
         if (has_trailing_separator) try builder.appendSlice(allocator, "[\\\\/]");
         return builder.toOwnedSlice(allocator);
     }
-    return allocator.dupe(u8, query);
+
+    try appendFuzzyRegexSegment(&builder, allocator, trimmed_query);
+    return builder.toOwnedSlice(allocator);
+}
+
+fn appendFuzzyRegexSegment(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text, 0..) |byte, idx| {
+        if (idx > 0) try builder.appendSlice(allocator, ".*");
+        try appendEscapedRegexByte(builder, allocator, byte);
+    }
 }
 
 fn appendEscapedRegex(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text) |byte| {
-        switch (byte) {
-            '.', '*', '+', '?', '^', '$', '{', '}', '(', ')', '|', '[', ']', '\\' => {
-                try builder.append(allocator, '\\');
-                try builder.append(allocator, byte);
-            },
-            else => try builder.append(allocator, byte),
-        }
+    for (text) |byte| try appendEscapedRegexByte(builder, allocator, byte);
+}
+
+fn appendEscapedRegexByte(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: u8) !void {
+    switch (byte) {
+        '.', '*', '+', '?', '^', '$', '{', '}', '(', ')', '|', '[', ']', '\\' => {
+            try builder.append(allocator, '\\');
+            try builder.append(allocator, byte);
+        },
+        else => try builder.append(allocator, byte),
     }
 }
 

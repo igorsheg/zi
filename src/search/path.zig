@@ -17,6 +17,11 @@ pub const Options = struct {
     case_sensitive: bool = false,
 };
 
+pub const Candidate = struct {
+    path: []const u8,
+    is_directory: bool = false,
+};
+
 pub fn rank(query: []const u8, candidate_path: []const u8) Match {
     return rankWithOptions(query, candidate_path, .{});
 }
@@ -53,6 +58,10 @@ pub fn filter(query: []const u8, paths: []const []const u8, out_indices: []usize
     return filterWithOptions(query, paths, out_indices, .{});
 }
 
+pub fn filterCandidates(query: []const u8, candidates: []const Candidate, out_indices: []usize) usize {
+    return filterCandidatesWithOptions(query, candidates, out_indices, .{});
+}
+
 pub fn filterWithOptions(query: []const u8, paths: []const []const u8, out_indices: []usize, opts: Options) usize {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) {
@@ -76,6 +85,32 @@ pub fn filterWithOptions(query: []const u8, paths: []const []const u8, out_indic
     }
 
     sortByScore(out_indices[0..count], scores_buf[0..count], paths);
+    return count;
+}
+
+pub fn filterCandidatesWithOptions(query: []const u8, candidates: []const Candidate, out_indices: []usize, opts: Options) usize {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) {
+        const n = @min(candidates.len, out_indices.len);
+        for (0..n) |i| out_indices[i] = i;
+        return n;
+    }
+
+    var scores_buf: [8192]f64 = undefined;
+    var count: usize = 0;
+
+    for (candidates, 0..) |candidate, idx| {
+        if (count >= out_indices.len or count >= scores_buf.len) break;
+
+        const match = rankWithOptions(trimmed, candidate.path, opts);
+        if (!match.matches) continue;
+
+        out_indices[count] = idx;
+        scores_buf[count] = adjustedCandidateScore(trimmed, candidate, match.score, opts);
+        count += 1;
+    }
+
+    sortCandidatesByScore(out_indices[0..count], scores_buf[0..count], candidates);
     return count;
 }
 
@@ -458,6 +493,56 @@ fn scanToEnd(
     return .{ .rank = rank_score, .index = last_index + 1 };
 }
 
+fn adjustedCandidateScore(query: []const u8, candidate: Candidate, base_score: f64, opts: Options) f64 {
+    var score = base_score;
+    const basename = std.fs.path.basename(candidate.path);
+    const query_basename = std.fs.path.basename(query);
+
+    if (equals(query_basename, basename, opts.case_sensitive)) {
+        score -= 100.0;
+    } else if (startsWith(basename, query_basename, opts.case_sensitive)) {
+        score -= 40.0;
+    } else if (contains(basename, query_basename, opts.case_sensitive)) {
+        score -= 15.0;
+    }
+
+    // Direct children are less surprising than very deep matches for autocomplete.
+    score += @as(f64, @floatFromInt(separatorCount(candidate.path))) * 0.75;
+
+    // Directories are useful continuation points in @file completion.
+    if (candidate.is_directory) score -= 3.0;
+
+    return score;
+}
+
+fn separatorCount(path_value: []const u8) usize {
+    var count: usize = 0;
+    for (path_value) |byte| {
+        if (byte == sep) count += 1;
+    }
+    return count;
+}
+
+fn equals(a: []const u8, b: []const u8, case_sensitive: bool) bool {
+    if (case_sensitive) return std.mem.eql(u8, a, b);
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn startsWith(haystack: []const u8, needle: []const u8, case_sensitive: bool) bool {
+    if (needle.len > haystack.len) return false;
+    return equals(haystack[0..needle.len], needle, case_sensitive);
+}
+
+fn contains(haystack: []const u8, needle: []const u8, case_sensitive: bool) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (equals(haystack[i..][0..needle.len], needle, case_sensitive)) return true;
+    }
+    return false;
+}
+
 fn sortByScore(indices: []usize, scores: []f64, texts: []const []const u8) void {
     var i: usize = 1;
     while (i < indices.len) : (i += 1) {
@@ -480,6 +565,31 @@ fn scoreLessThan(score_a: f64, idx_a: usize, score_b: f64, idx_b: usize, texts: 
     const text_a = if (idx_a < texts.len) texts[idx_a] else "";
     const text_b = if (idx_b < texts.len) texts[idx_b] else "";
     return std.mem.lessThan(u8, text_a, text_b);
+}
+
+fn sortCandidatesByScore(indices: []usize, scores: []f64, candidates: []const Candidate) void {
+    var i: usize = 1;
+    while (i < indices.len) : (i += 1) {
+        const idx = indices[i];
+        const score = scores[i];
+        var j: usize = i;
+        while (j > 0 and candidateScoreLessThan(score, idx, scores[j - 1], indices[j - 1], candidates)) : (j -= 1) {
+            indices[j] = indices[j - 1];
+            scores[j] = scores[j - 1];
+        }
+        indices[j] = idx;
+        scores[j] = score;
+    }
+}
+
+fn candidateScoreLessThan(score_a: f64, idx_a: usize, score_b: f64, idx_b: usize, candidates: []const Candidate) bool {
+    if (score_a < score_b) return true;
+    if (score_a > score_b) return false;
+
+    const a = if (idx_a < candidates.len) candidates[idx_a] else Candidate{ .path = "" };
+    const b = if (idx_b < candidates.len) candidates[idx_b] else Candidate{ .path = "" };
+    if (a.is_directory != b.is_directory) return a.is_directory;
+    return std.mem.lessThan(u8, a.path, b.path);
 }
 
 fn sortUsizes(values: []usize) void {
@@ -530,4 +640,31 @@ test "path highlight returns basename match indices" {
     const matches = highlight("file", "a/path/to/file", &matches_buf);
 
     try testing.expectEqualSlices(usize, &.{ 10, 11, 12, 13 }, matches);
+}
+
+test "path candidate filter boosts exact and prefix basename matches" {
+    const candidates = [_]Candidate{
+        .{ .path = "deep/path/to/main.zig" },
+        .{ .path = "main.zig" },
+        .{ .path = "src/domain/index.zig" },
+    };
+    var out: [3]usize = undefined;
+
+    const n = filterCandidates("main", &candidates, &out);
+
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(usize, 1), out[0]);
+}
+
+test "path candidate filter prefers directory continuation on tie" {
+    const candidates = [_]Candidate{
+        .{ .path = "src/file", .is_directory = false },
+        .{ .path = "src/dir", .is_directory = true },
+    };
+    var out: [2]usize = undefined;
+
+    const n = filterCandidates("src", &candidates, &out);
+
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 1), out[0]);
 }

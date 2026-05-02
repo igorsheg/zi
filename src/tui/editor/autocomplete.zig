@@ -355,6 +355,39 @@ test "AutocompleteSession enter accepts file completion without submit" {
     try testing.expect(!session.isActive());
 }
 
+test "AutocompleteSession fuzzy-matches local path segment" {
+    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Options.debug_io, "src");
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const x = 1;" });
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/other.txt", .data = "hello" });
+
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(cwd);
+
+    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var provider = makeCombinedProvider(&registry, cwd);
+    defer provider.deinit();
+    var session = AutocompleteSession.init(themes_builtin.dark());
+    session.setProvider(provider.provider());
+
+    var buffer = PromptBuffer.init(testing.allocator);
+    defer buffer.deinit();
+    buffer.setText("./src/mz");
+
+    session.refresh(&buffer);
+    try testing.expect(session.isActive());
+    try testing.expectEqualStrings("main.zig", session.list.getSelectedItem().?.label);
+
+    const outcome = session.processInput(.{ .code = .enter }, &buffer);
+    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
+    try testing.expectEqualStrings("./src/main.zig", buffer.text());
+}
+
 test "AutocompleteSession tab on directory completion refreshes into the expanded directory" {
     const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
 

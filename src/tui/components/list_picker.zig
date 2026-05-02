@@ -308,11 +308,12 @@ pub const ListPicker = struct {
             }
             self.filtered_count = count;
         } else {
-            var texts: [MAX_ITEMS][]const u8 = undefined;
+            var field_storage: [MAX_ITEMS][3]search.plain.Field = undefined;
+            var rows: [MAX_ITEMS][]const search.plain.Field = undefined;
             for (0..count) |i| {
-                texts[i] = self.getSearchText(i);
+                rows[i] = self.searchFieldsFor(i, &field_storage[i]);
             }
-            const n = search.plain.filter(query, texts[0..count], &self.match_indices);
+            const n = search.plain.filterFields(query, rows[0..count], &self.match_indices);
             for (0..n) |i| {
                 const source_index = self.match_indices[i];
                 self.filtered_source_indices[i] = source_index;
@@ -331,6 +332,28 @@ pub const ListPicker = struct {
         }
         if (idx < self.all_items.len) return self.all_items[idx].label;
         return "";
+    }
+
+    fn searchFieldsFor(self: *const ListPicker, idx: usize, storage: *[3]search.plain.Field) []const search.plain.Field {
+        if (idx >= self.all_items.len) return &.{};
+        const item = self.all_items[idx];
+        var n: usize = 0;
+
+        storage[n] = .{ .name = "label", .text = item.label, .weight = 24 };
+        n += 1;
+
+        const search_text = self.getSearchText(idx);
+        if (!std.mem.eql(u8, search_text, item.label)) {
+            storage[n] = .{ .name = "search", .text = search_text, .weight = 12 };
+            n += 1;
+        }
+
+        if (item.description) |description| {
+            storage[n] = .{ .name = "description", .text = description, .weight = -8 };
+            n += 1;
+        }
+
+        return storage[0..n];
     }
 
     fn selectedSourceIndex(self: *const ListPicker) ?usize {
