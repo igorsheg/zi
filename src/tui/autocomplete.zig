@@ -2,7 +2,9 @@ const std = @import("std");
 const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
-const runtime_process = @import("../zio/root.zig").process;
+const zio = @import("../zio/root.zig");
+const runtime_process = zio.process;
+const runtime_fs_walk = zio.fs_walk;
 const runtime_fd = @import("fd.zig");
 
 const SelectItem = select_list_mod.SelectItem;
@@ -91,6 +93,7 @@ const max_command_candidates = 256;
 const max_path_candidates = 64;
 const max_async_results = 20;
 const max_async_scan_results = 300;
+const max_async_visited_entries = 10_000;
 const max_local_path_scan_results = 300;
 const max_async_output_bytes = 256 * 1024;
 const max_path_bytes = 512;
@@ -307,6 +310,7 @@ pub const CombinedAutocompleteProvider = struct {
         debounce_until_ns: i128 = 0,
         stdout_closed: bool = false,
         stderr_closed: bool = false,
+        scan_started: bool = false,
 
         fn reset(self: *AsyncSearch) void {
             if (self.child) |*child| {
@@ -329,6 +333,7 @@ pub const CombinedAutocompleteProvider = struct {
             self.debounce_until_ns = 0;
             self.stdout_closed = false;
             self.stderr_closed = false;
+            self.scan_started = false;
         }
 
         fn arenaAllocator(self: *AsyncSearch) std.mem.Allocator {
@@ -655,7 +660,7 @@ pub const CombinedAutocompleteProvider = struct {
     }
 
     fn processAsyncSearchTick(self: *CombinedAutocompleteProvider) bool {
-        if (self.async_search.child == null) {
+        if (!self.async_search.scan_started) {
             if (!self.startAsyncSearchProcess()) return true;
         }
 
@@ -698,6 +703,8 @@ pub const CombinedAutocompleteProvider = struct {
     }
 
     fn startAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
+        self.async_search.scan_started = true;
+        if (self.collectNativeAsyncCandidates()) return true;
         if (self.spawnAsyncSearchProcess("/opt/homebrew/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("/usr/local/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("fd")) return true;
@@ -705,6 +712,51 @@ pub const CombinedAutocompleteProvider = struct {
         self.async_search.stdout_closed = true;
         self.async_search.stderr_closed = true;
         return false;
+    }
+
+    fn collectNativeAsyncCandidates(self: *CombinedAutocompleteProvider) bool {
+        const arena = self.async_search.arenaAllocator();
+        const Ctx = struct {
+            provider: *CombinedAutocompleteProvider,
+            arena: std.mem.Allocator,
+            gitignore: []const u8,
+
+            fn onEntry(ctx: *@This(), entry: runtime_fs_walk.Entry) !void {
+                if (ctx.provider.async_search.candidates.items.len >= max_async_scan_results) return;
+                if (isIgnoredByGitignore(ctx.gitignore, entry.relative_path)) return;
+                if (ctx.provider.async_search.query.len > 0) {
+                    const candidate = search.path.Candidate{ .path = entry.relative_path, .is_directory = entry.is_directory };
+                    var tmp: [1]usize = undefined;
+                    if (search.path.filterCandidates(ctx.provider.async_search.query, &.{candidate}, &tmp) == 0) return;
+                }
+                const path = try ctx.arena.dupe(u8, entry.relative_path);
+                try ctx.provider.async_search.candidates.append(ctx.arena, .{
+                    .relative_path = path,
+                    .is_directory = entry.is_directory,
+                });
+            }
+        };
+
+        const gitignore = self.readRootGitignore(arena) catch "";
+        var ctx = Ctx{ .provider = self, .arena = arena, .gitignore = gitignore };
+        runtime_fs_walk.walkProject(
+            std.Options.debug_io,
+            arena,
+            self.async_search.base_dir,
+            .{ .max_visited = max_async_visited_entries },
+            &ctx,
+            Ctx.onEntry,
+        ) catch return false;
+
+        self.async_search.stdout_closed = true;
+        self.async_search.stderr_closed = true;
+        return true;
+    }
+
+    fn readRootGitignore(self: *CombinedAutocompleteProvider, allocator: std.mem.Allocator) ![]const u8 {
+        const path = try std.fs.path.join(allocator, &.{ self.async_search.base_dir, ".gitignore" });
+        defer allocator.free(path);
+        return zio.fs.readFileAlloc(std.Options.debug_io, allocator, path, .limited(64 * 1024));
     }
 
     fn spawnAsyncSearchProcess(self: *CombinedAutocompleteProvider, command: []const u8) bool {
@@ -783,6 +835,7 @@ pub const CombinedAutocompleteProvider = struct {
         }
 
         self.async_search.child = child;
+        self.async_search.scan_started = true;
         return true;
     }
 
@@ -1295,6 +1348,25 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
         if (lhs > rhs) return false;
     }
     return a.len < b.len;
+}
+
+fn isIgnoredByGitignore(gitignore: []const u8, relative_path: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, gitignore, '\n');
+    while (iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '!') continue;
+        const pattern = std.mem.trim(u8, line, "/");
+        if (pattern.len == 0) continue;
+        if (std.mem.eql(u8, relative_path, pattern)) return true;
+        if (relative_path.len > pattern.len and
+            std.mem.startsWith(u8, relative_path, pattern) and
+            relative_path[pattern.len] == '/')
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn buildFdPathQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
