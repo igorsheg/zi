@@ -262,7 +262,7 @@ fn commandExists(command: []const u8) bool {
 fn driveAsyncTick(session: *AutocompleteSession, buffer: *PromptBuffer) TickOutcome {
     var now_ns: i128 = 0;
     var attempts: usize = 0;
-    while (attempts < 10000) : (attempts += 1) {
+    while (attempts < 8) : (attempts += 1) {
         const outcome = session.tickAnimation(buffer, now_ns);
         if (outcome.changed) return outcome;
         now_ns += 16 * std.time.ns_per_ms;

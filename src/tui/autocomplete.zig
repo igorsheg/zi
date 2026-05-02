@@ -2,10 +2,8 @@ const std = @import("std");
 const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
-const runtime_env = @import("env");
 const zio = @import("../zio/root.zig");
 const runtime_process = zio.process;
-const runtime_fs_walk = zio.fs_walk;
 const runtime_fd = @import("fd.zig");
 
 const SelectItem = select_list_mod.SelectItem;
@@ -94,8 +92,6 @@ const max_command_candidates = 256;
 const max_path_candidates = 64;
 const max_async_results = 20;
 const max_async_scan_results = 300;
-const max_native_collected_entries = 2_000;
-const max_async_visited_entries = 10_000;
 const max_local_path_scan_results = 300;
 const max_async_output_bytes = 256 * 1024;
 const max_path_bytes = 512;
@@ -298,8 +294,6 @@ pub const CombinedAutocompleteProvider = struct {
     const AsyncSearch = struct {
         arena: ?std.heap.ArenaAllocator = null,
         child: ?std.process.Child = null,
-        native_thread: ?std.Thread = null,
-        native_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         stdout_buf: std.ArrayList(u8) = .empty,
         stderr_buf: std.ArrayList(u8) = .empty,
         candidates: std.ArrayList(AsyncCandidate) = .empty,
@@ -321,10 +315,6 @@ pub const CombinedAutocompleteProvider = struct {
                 child.kill(std.Options.debug_io);
             }
             self.child = null;
-            if (self.native_thread) |thread| {
-                thread.join();
-                self.native_thread = null;
-            }
             if (self.arena) |*arena| arena.deinit();
             self.arena = null;
             self.stdout_buf = .empty;
@@ -342,7 +332,6 @@ pub const CombinedAutocompleteProvider = struct {
             self.stdout_closed = false;
             self.stderr_closed = false;
             self.scan_started = false;
-            self.native_done.store(false, .release);
         }
 
         fn arenaAllocator(self: *AsyncSearch) std.mem.Allocator {
@@ -673,19 +662,6 @@ pub const CombinedAutocompleteProvider = struct {
             if (!self.startAsyncSearchProcess()) return true;
         }
 
-        if (self.async_search.native_thread != null) {
-            if (!self.async_search.native_done.load(.acquire)) {
-                std.Thread.yield() catch {};
-                return false;
-            }
-            const thread = self.async_search.native_thread.?;
-            thread.join();
-            self.async_search.native_thread = null;
-            self.async_search.stdout_closed = true;
-            self.async_search.stderr_closed = true;
-            return true;
-        }
-
         if (self.async_search.child) |*child| {
             var round: usize = 0;
             while (round < 4) : (round += 1) {
@@ -726,122 +702,13 @@ pub const CombinedAutocompleteProvider = struct {
 
     fn startAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
         self.async_search.scan_started = true;
-        const started = if (preferNativeFileSearch())
-            self.startNativeAsyncSearchProcess()
-        else
-            self.startFdAsyncSearchProcess();
-        if (started) return true;
-        self.async_search.stdout_closed = true;
-        self.async_search.stderr_closed = true;
-        return false;
-    }
-
-    fn startFdAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
         if (self.spawnAsyncSearchProcess("/opt/homebrew/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("/usr/local/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("fd")) return true;
         if (self.spawnAsyncSearchProcess("fdfind")) return true;
-        return false;
-    }
-
-    fn startNativeAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
-        self.async_search.native_done.store(false, .release);
-        self.async_search.native_thread = std.Thread.spawn(.{}, nativeAsyncSearchThread, .{self}) catch return false;
-        return true;
-    }
-
-    fn nativeAsyncSearchThread(self: *CombinedAutocompleteProvider) void {
-        _ = self.collectNativeAsyncCandidates();
-        self.async_search.native_done.store(true, .release);
-    }
-
-    fn collectNativeAsyncCandidates(self: *CombinedAutocompleteProvider) bool {
-        const arena = self.async_search.arenaAllocator();
-        const Ctx = struct {
-            provider: *CombinedAutocompleteProvider,
-            arena: std.mem.Allocator,
-            gitignore: []const u8,
-
-            fn onEntry(ctx: *@This(), entry: runtime_fs_walk.Entry) !void {
-                if (isIgnoredByGitignore(ctx.gitignore, entry.relative_path)) return;
-                if (ctx.provider.async_search.query.len == 0) {
-                    if (ctx.provider.async_search.candidates.items.len >= max_native_collected_entries) return;
-                    const path = try ctx.arena.dupe(u8, entry.relative_path);
-                    try ctx.provider.async_search.candidates.append(ctx.arena, .{
-                        .relative_path = path,
-                        .is_directory = entry.is_directory,
-                    });
-                    return;
-                }
-
-                const candidate = search.path.Candidate{ .path = entry.relative_path, .is_directory = entry.is_directory };
-                var tmp: [1]usize = undefined;
-                if (search.path.filterCandidates(ctx.provider.async_search.query, &.{candidate}, &tmp) == 0) return;
-                try ctx.provider.offerNativeAsyncCandidate(ctx.arena, entry);
-            }
-        };
-
-        const gitignore = self.readRootGitignore(arena) catch "";
-        var ctx = Ctx{ .provider = self, .arena = arena, .gitignore = gitignore };
-        runtime_fs_walk.walkProject(
-            std.Options.debug_io,
-            arena,
-            self.async_search.base_dir,
-            .{ .max_visited = max_async_visited_entries },
-            &ctx,
-            Ctx.onEntry,
-        ) catch return false;
-
         self.async_search.stdout_closed = true;
         self.async_search.stderr_closed = true;
-        return true;
-    }
-
-    fn offerNativeAsyncCandidate(self: *CombinedAutocompleteProvider, arena: std.mem.Allocator, entry: runtime_fs_walk.Entry) !void {
-        if (self.async_search.candidates.items.len < max_async_scan_results) {
-            const path = try arena.dupe(u8, entry.relative_path);
-            try self.async_search.candidates.append(arena, .{ .relative_path = path, .is_directory = entry.is_directory });
-            return;
-        }
-
-        var candidate_buf: [max_async_scan_results + 1]search.path.Candidate = undefined;
-        for (self.async_search.candidates.items, 0..) |candidate, idx| {
-            candidate_buf[idx] = .{ .path = candidate.relative_path, .is_directory = candidate.is_directory };
-        }
-        candidate_buf[max_async_scan_results] = .{ .path = entry.relative_path, .is_directory = entry.is_directory };
-
-        var selected: [max_async_scan_results]usize = undefined;
-        const selected_count = search.path.filterCandidates(self.async_search.query, candidate_buf[0 .. max_async_scan_results + 1], &selected);
-        if (selected_count == 0) return;
-
-        var selected_old = [_]bool{false} ** max_async_scan_results;
-        var new_selected = false;
-        for (selected[0..selected_count]) |idx| {
-            if (idx == max_async_scan_results) {
-                new_selected = true;
-            } else if (idx < selected_old.len) {
-                selected_old[idx] = true;
-            }
-        }
-        if (!new_selected) return;
-
-        var slot: ?usize = null;
-        for (selected_old, 0..) |kept, idx| {
-            if (!kept) {
-                slot = idx;
-                break;
-            }
-        }
-        const replacement = slot orelse return;
-
-        const path = try arena.dupe(u8, entry.relative_path);
-        self.async_search.candidates.items[replacement] = .{ .relative_path = path, .is_directory = entry.is_directory };
-    }
-
-    fn readRootGitignore(self: *CombinedAutocompleteProvider, allocator: std.mem.Allocator) ![]const u8 {
-        const path = try std.fs.path.join(allocator, &.{ self.async_search.base_dir, ".gitignore" });
-        defer allocator.free(path);
-        return zio.fs.readFileAlloc(std.Options.debug_io, allocator, path, .limited(64 * 1024));
+        return false;
     }
 
     fn spawnAsyncSearchProcess(self: *CombinedAutocompleteProvider, command: []const u8) bool {
@@ -1435,69 +1302,6 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
     return a.len < b.len;
 }
 
-fn preferNativeFileSearch() bool {
-    const backend = runtime_env.get("ZI_FILE_SEARCH_BACKEND") orelse return false;
-    return std.mem.eql(u8, backend, "native");
-}
-
-fn isIgnoredByGitignore(gitignore: []const u8, relative_path: []const u8) bool {
-    var iter = std.mem.splitScalar(u8, gitignore, '\n');
-    while (iter.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        if (line[0] == '!') continue;
-        const pattern = std.mem.trim(u8, line, "/");
-        if (pattern.len == 0) continue;
-        if (gitignorePatternMatches(pattern, relative_path)) return true;
-    }
-    return false;
-}
-
-fn gitignorePatternMatches(pattern: []const u8, relative_path: []const u8) bool {
-    if (wildcardMatch(pattern, relative_path)) return true;
-    if (relative_path.len > pattern.len and
-        std.mem.startsWith(u8, relative_path, pattern) and
-        relative_path[pattern.len] == '/')
-    {
-        return true;
-    }
-
-    if (std.mem.indexOfScalar(u8, pattern, '/') == null) {
-        var iter = std.mem.splitScalar(u8, relative_path, '/');
-        while (iter.next()) |segment| {
-            if (wildcardMatch(pattern, segment)) return true;
-        }
-    }
-    return false;
-}
-
-fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
-    var p: usize = 0;
-    var t: usize = 0;
-    var star: ?usize = null;
-    var retry: usize = 0;
-
-    while (t < text.len) {
-        if (p < pattern.len and (pattern[p] == '?' or pattern[p] == text[t])) {
-            p += 1;
-            t += 1;
-        } else if (p < pattern.len and pattern[p] == '*') {
-            star = p;
-            retry = t;
-            p += 1;
-        } else if (star) |s| {
-            p = s + 1;
-            retry += 1;
-            t = retry;
-        } else {
-            return false;
-        }
-    }
-
-    while (p < pattern.len and pattern[p] == '*') p += 1;
-    return p == pattern.len;
-}
-
 fn buildFdPathQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
     const trimmed_query = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed_query.len == 0) return allocator.dupe(u8, query);
@@ -1582,7 +1386,7 @@ fn hasItem(items: []const SelectItem, value: []const u8) bool {
 fn drainAsyncProvider(provider: *CombinedAutocompleteProvider, sink: SuggestionSink) bool {
     var now_ns: i128 = 0;
     var attempts: usize = 0;
-    while (attempts < 10000) : (attempts += 1) {
+    while (attempts < 8) : (attempts += 1) {
         if (provider.tickImpl(now_ns, sink)) return true;
         now_ns += async_tick_interval_ns;
     }
@@ -1682,13 +1486,6 @@ test "CombinedAutocompleteProvider force tab completes slash command arguments w
     try std.testing.expectEqual(RequestMode.force, sink.result.?.refresh_mode);
     try std.testing.expect(sink.result.?.auto_accept_single_on_tab);
     try std.testing.expect(!sink.result.?.submit_on_confirm);
-}
-
-test "gitignore matcher supports directory basename and wildcard patterns" {
-    try std.testing.expect(isIgnoredByGitignore("ignored/\n*.log\nbuild\n", "ignored/secret.md"));
-    try std.testing.expect(isIgnoredByGitignore("ignored/\n*.log\nbuild\n", "src/error.log"));
-    try std.testing.expect(isIgnoredByGitignore("ignored/\n*.log\nbuild\n", "src/build/output.o"));
-    try std.testing.expect(!isIgnoredByGitignore("ignored/\n*.log\nbuild\n", "src/main.zig"));
 }
 
 test "CombinedAutocompleteProvider async at-file search publishes on tick" {
