@@ -95,6 +95,7 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
         .capture_stdout = false,
         .max_stderr_bytes = 1024 * 1024,
         .on_chunk = .{ .ctx = @ptrCast(&line_ctx), .func = &JsonlCtx.onChunk },
+        .on_wait = if (config.on_wait) |cb| .{ .ctx = config.on_wait_ctx, .func = cb } else null,
     });
     defer proc_result.deinit(allocator);
     line_ctx.flushTail();
@@ -438,7 +439,7 @@ fn buildChildArgv(allocator: std.mem.Allocator, config: types.SpawnConfig) !Buil
     const self_exe_owned = try allocator.dupe(u8, self_exe);
     try built.owned_strings.append(allocator, self_exe_owned);
 
-    try built.argv.appendSlice(allocator, &.{ self_exe_owned, "--mode", "json", "-p", "--no-session" });
+    try built.argv.appendSlice(allocator, &.{ self_exe_owned, "--mode", "json", "--no-session" });
     if (config.model) |m| {
         try built.argv.appendSlice(allocator, &.{ "--model", m });
     }
@@ -489,15 +490,14 @@ test "buildChildArgv produces expected production shape" {
     defer built.deinit(testing.allocator);
 
     // self-exe path is dynamic; assert flag layout from index 1 onward.
-    try testing.expect(built.argv.items.len >= 9);
+    try testing.expect(built.argv.items.len >= 8);
     try testing.expectEqualStrings("--mode", built.argv.items[1]);
     try testing.expectEqualStrings("json", built.argv.items[2]);
-    try testing.expectEqualStrings("-p", built.argv.items[3]);
-    try testing.expectEqualStrings("--no-session", built.argv.items[4]);
-    try testing.expectEqualStrings("--model", built.argv.items[5]);
-    try testing.expectEqualStrings("claude-sonnet-4-5", built.argv.items[6]);
-    try testing.expectEqualStrings("--tools", built.argv.items[7]);
-    try testing.expectEqualStrings("bash,read", built.argv.items[8]);
+    try testing.expectEqualStrings("--no-session", built.argv.items[3]);
+    try testing.expectEqualStrings("--model", built.argv.items[4]);
+    try testing.expectEqualStrings("claude-sonnet-4-5", built.argv.items[5]);
+    try testing.expectEqualStrings("--tools", built.argv.items[6]);
+    try testing.expectEqualStrings("bash,read", built.argv.items[7]);
 }
 
 test "buildChildArgv argv_override bypasses self-exe construction" {

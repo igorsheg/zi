@@ -14,6 +14,7 @@ const json_util = @import("../ai/json_util.zig");
 const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const display_wrap_mod = @import("display_wrap.zig");
+const rendered_tool_result_view = @import("rendered_tool_result.zig");
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
@@ -461,6 +462,8 @@ pub const ToolExecutionRowModel = struct {
     args: std.json.Value = .null,
     args_json_source: ?[]u8 = null,
     result: ?AgentToolResult = null,
+    rendered_call: ?*rendered_tool_result_view.RenderedToolResult = null,
+    rendered_result: ?*rendered_tool_result_view.RenderedToolResult = null,
     is_partial: bool = true,
     is_error: bool = false,
     execution_started: bool = false,
@@ -500,6 +503,8 @@ pub const ToolExecutionRowModel = struct {
             .args = args,
             .args_json_source = args_json_source,
             .result = result,
+            .rendered_call = null,
+            .rendered_result = null,
             .is_partial = self.is_partial,
             .is_error = self.is_error,
             .execution_started = self.execution_started,
@@ -509,6 +514,8 @@ pub const ToolExecutionRowModel = struct {
 
     pub fn deinit(self: *ToolExecutionRowModel, allocator: std.mem.Allocator) void {
         if (self.result) |result| result.free(allocator);
+        if (self.rendered_call) |rendered| rendered.deinit(allocator);
+        if (self.rendered_result) |rendered| rendered.deinit(allocator);
         json_util.freeJsonValue(allocator, self.args);
         if (self.args_json_source) |source| allocator.free(source);
         if (self.tool_name) |tool_name| allocator.free(tool_name);
@@ -690,6 +697,10 @@ pub const ToolExecution = struct {
     }
 
     fn renderCall(self: *ToolExecution, region: Region) void {
+        if (self.model.rendered_call) |rendered| {
+            rendered_tool_result_view.renderSlice(rendered, region, self.theme, self.expanded, 0);
+            return;
+        }
         if (self.renderer.render_call) |render_fn| {
             var ctx = self.makeRenderContext(region);
             render_fn(&ctx);
@@ -711,6 +722,11 @@ pub const ToolExecution = struct {
         // pending tools do not render placeholder/malformed result
         // states before projected args/results are complete.
         if (self.model.result == null) return;
+
+        if (self.model.rendered_result) |rendered| {
+            rendered_tool_result_view.renderSlice(rendered, region, self.theme, self.expanded, skip_rows);
+            return;
+        }
 
         if (self.renderer.render_result_slice) |render_fn| {
             var ctx = self.makeRenderContext(region);
@@ -751,6 +767,7 @@ pub const ToolExecution = struct {
 
     fn measureResult(self: *ToolExecution, width: u32) u32 {
         if (self.model.result == null) return 0;
+        if (self.model.rendered_result) |rendered| return rendered_tool_result_view.measure(rendered, self.expanded);
         if (self.renderer.measure_result) |measure_fn| {
             var ctx = self.makeMeasureContext(width);
             return measure_fn(&ctx);

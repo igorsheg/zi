@@ -22,6 +22,15 @@ pub const ChunkCallback = struct {
     }
 };
 
+pub const WaitCallback = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque) void,
+
+    fn call(self: WaitCallback) void {
+        self.func(self.ctx);
+    }
+};
+
 pub const Request = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
@@ -36,6 +45,9 @@ pub const Request = struct {
     process_group: bool = true,
     signal: ?AbortSignal = null,
     on_chunk: ?ChunkCallback = null,
+    /// Called from the thread that invoked run() while the child is alive.
+    /// Use this to drain thread-safe event queues produced by on_chunk.
+    on_wait: ?WaitCallback = null,
 };
 
 pub const Completed = struct {
@@ -166,7 +178,10 @@ const RunContext = struct {
             return errorFmt(ctx.allocator, "capture setup failed: {s}", .{@errorName(err)});
         };
         ctx.writeStdin();
+
+        ctx.pumpWhileCapturing();
         ctx.captureTasksJoin();
+        if (ctx.request.on_wait) |callback| callback.call();
 
         const term = ctx.waitChild() catch |err| return errorFmt(ctx.allocator, "wait failed: {s}", .{@errorName(err)});
         if (ctx.timeout_guard) |*guard| guard.markExited();
@@ -244,6 +259,13 @@ const RunContext = struct {
         return ctx.child.?.wait(ctx.io);
     }
 
+    fn pumpWhileCapturing(ctx: *RunContext) void {
+        while (!ctx.capture_tasks.done(&ctx.stdout_capture, &ctx.stderr_capture)) {
+            if (ctx.request.on_wait) |callback| callback.call();
+            ctx.io.sleep(.fromMilliseconds(poll_interval_ms), .awake) catch {};
+        }
+    }
+
     fn didTimeout(ctx: *const RunContext) bool {
         const guard = ctx.timeout_guard orelse return false;
         return guard.didTimeout();
@@ -284,6 +306,10 @@ const CaptureTasks = struct {
         self.stdout_thread = null;
         self.stderr_thread = null;
     }
+
+    fn done(_: *const CaptureTasks, stdout_capture: *const Capture, stderr_capture: *const Capture) bool {
+        return stdout_capture.done.load(.acquire) and stderr_capture.done.load(.acquire);
+    }
 };
 
 const CaptureError = error{ OutputTooLarge, ReadFailed };
@@ -293,6 +319,7 @@ const Capture = struct {
     max_bytes: usize,
     buf: std.ArrayListUnmanaged(u8) = .empty,
     err: ?CaptureError = null,
+    done: std.atomic.Value(bool) = .init(false),
 
     store: bool,
 
@@ -306,6 +333,7 @@ const Capture = struct {
     }
 
     fn readAll(self: *Capture, io: std.Io, file: std.Io.File, kind: StreamKind, on_chunk: ?ChunkCallback) void {
+        defer self.done.store(true, .release);
         // Child pipes are still read with the OS primitive because std.Io.File
         // reader currently does not preserve this subprocess capture test's
         // behavior on every backend. This is isolated here so the rest of the

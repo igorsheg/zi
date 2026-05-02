@@ -23,6 +23,11 @@ pub const EventCallback = *const fn (
     ctx: ?*anyopaque,
 ) void;
 
+/// Caller-thread pump callback. `EventCallback` may run on process reader
+/// threads; `WaitCallback` runs on the thread that called ziSpawn while the
+/// child is alive, so Lua/agent owners can safely drain queued events here.
+pub const WaitCallback = *const fn (ctx: ?*anyopaque) void;
+
 pub const UsageStats = struct {
     input: u64 = 0,
     output: u64 = 0,
@@ -79,6 +84,8 @@ pub const SpawnConfig = struct {
     /// contract. `on_event_ctx` is passed through verbatim.
     on_event: ?EventCallback = null,
     on_event_ctx: ?*anyopaque = null,
+    on_wait: ?WaitCallback = null,
+    on_wait_ctx: ?*anyopaque = null,
 
     /// Test-only escape hatch. When set, ziSpawn skips its own
     /// argv construction (self-exe + --mode json + ...) and runs

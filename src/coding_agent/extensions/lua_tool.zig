@@ -216,6 +216,12 @@ fn serviceYieldedToolCoroutine(
         .callbacks_ref = req.callbacks_ref,
     };
 
+    var fanout = SpawnEventFanout{
+        .allocator = runner.allocator,
+        .lua = if (req.callbacks_ref != c.LUA_NOREF) &trampoline_ctx else null,
+    };
+
+    const has_observer = fanout.lua != null;
     const cfg = spawn_types.SpawnConfig{
         .allocator = runner.allocator,
         .io = runner.io,
@@ -225,15 +231,73 @@ fn serviceYieldedToolCoroutine(
         .tools = req.tools,
         .append_system_prompt = req.append_system_prompt,
         .signal = runner.current_signal,
-        .on_event = if (req.callbacks_ref != c.LUA_NOREF) &api.eventTrampoline else null,
-        .on_event_ctx = if (req.callbacks_ref != c.LUA_NOREF) @ptrCast(&trampoline_ctx) else null,
+        .on_event = if (has_observer) &SpawnEventFanout.callback else null,
+        .on_event_ctx = if (has_observer) @ptrCast(&fanout) else null,
+        .on_wait = if (has_observer) &SpawnEventFanout.drainCallback else null,
+        .on_wait_ctx = if (has_observer) @ptrCast(&fanout) else null,
     };
 
     var spawn_result = spawn_mod.ziSpawn(cfg);
     defer spawn_result.deinit(runner.allocator);
+    defer fanout.deinit();
+
+    try fanout.drain();
 
     runner.current_spawn_result = .{ .result = try spawnResultToToolResult(allocator, spawn_result) };
 }
+
+const SpawnEventFanout = struct {
+    const PendingEvent = struct {
+        kind: []const u8,
+        event: std.json.Value,
+    };
+
+    allocator: std.mem.Allocator,
+    lua: ?*api.TrampolineCtx = null,
+    events: std.ArrayList(PendingEvent) = .empty,
+    mutex: std.Io.Mutex = .init,
+
+    fn callback(kind: []const u8, event: std.json.Value, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+
+        const owned_kind = self.allocator.dupe(u8, kind) catch return;
+        errdefer self.allocator.free(owned_kind);
+        const owned_event = ai.json_util.cloneJsonValue(self.allocator, event) catch return;
+        errdefer ai.json_util.freeJsonValue(self.allocator, owned_event);
+        self.events.append(self.allocator, .{ .kind = owned_kind, .event = owned_event }) catch return;
+    }
+
+    fn drainCallback(ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.drain() catch {};
+    }
+
+    fn drain(self: *SpawnEventFanout) !void {
+        var drained: std.ArrayList(PendingEvent) = .empty;
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        std.mem.swap(std.ArrayList(PendingEvent), &drained, &self.events);
+        self.mutex.unlock(std.Options.debug_io);
+        defer freeEvents(self.allocator, &drained);
+
+        for (drained.items) |entry| {
+            if (self.lua) |lua| api.eventTrampoline(entry.kind, entry.event, @ptrCast(lua));
+        }
+    }
+
+    fn deinit(self: *SpawnEventFanout) void {
+        freeEvents(self.allocator, &self.events);
+    }
+
+    fn freeEvents(allocator: std.mem.Allocator, events: *std.ArrayList(PendingEvent)) void {
+        for (events.items) |entry| {
+            allocator.free(entry.kind);
+            ai.json_util.freeJsonValue(allocator, entry.event);
+        }
+        events.deinit(allocator);
+    }
+};
 
 fn spawnResultToToolResult(allocator: std.mem.Allocator, spawn_result: spawn_types.SpawnResult) !AgentToolResult {
     const text = spawn_result.text() orelse "";

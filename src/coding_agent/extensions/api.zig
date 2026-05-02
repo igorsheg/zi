@@ -1105,67 +1105,6 @@ test "zi.register_tool surfaces validation errors as Lua errors" {
     try testing.expectEqual(@as(usize, 0), runner.tool_registry.count());
 }
 
-// Wrapper because lua_pushcclosure expects lua_CFunction, not lua_KFunction.
-const ziSpawnContinueWrapper = spawn_api.ziSpawnContinueWrapper;
-
-test "zi.spawn yields from tool coroutine and resumes with spawn-shaped result" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    installZiTable(&state, &runner);
-    runner.attachLuaState(&state);
-
-    var co = try lua_runtime.Coroutine.init(&state);
-    defer co.deinit();
-
-    try state.doString(
-        \\function run_spawn()
-        \\  return zi.spawn({ task = "demo", cwd = "." })
-        \\end
-    , "spawn_yield_test");
-
-    _ = c.lua_getglobal(co.L, "run_spawn");
-    const first = try co.resumeWith(0);
-    try testing.expectEqual(lua_runtime.Coroutine.Status.yielded, first.status);
-    try testing.expect(runner.current_spawn_request != null);
-    defer if (runner.current_spawn_request) |*req| {
-        req.deinit(testing.allocator);
-        runner.current_spawn_request = null;
-    };
-
-    const blocks = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
-    const text = try testing.allocator.dupe(u8, "child output");
-    blocks[0] = .{ .text = .{ .text = text } };
-    var usage: std.json.ObjectMap = .{};
-    try usage.put(testing.allocator, try testing.allocator.dupe(u8, "input"), .{ .integer = 1 });
-    var details: std.json.ObjectMap = .{};
-    try details.put(testing.allocator, try testing.allocator.dupe(u8, "cancelled"), .{ .bool = true });
-    try details.put(testing.allocator, try testing.allocator.dupe(u8, "usage"), .{ .object = usage });
-    const spawn_result: agent_protocol.AgentToolResult = .{ .content = blocks, .is_error = false, .details = .{ .object = details } };
-    runner.current_spawn_result = .{ .result = spawn_result };
-    defer {
-        for (spawn_result.content) |b| switch (b) {
-            .text => |tb| testing.allocator.free(tb.text),
-            else => {},
-        };
-        testing.allocator.free(spawn_result.content);
-        lua_runtime.freeJsonValue(testing.allocator, spawn_result.details);
-    }
-
-    c.lua_pushlightuserdata(co.L, &runner);
-    c.lua_pushcclosure(co.L, ziSpawnContinueWrapper, 1);
-    const second = try co.resumeWith(0);
-    try testing.expectEqual(lua_runtime.Coroutine.Status.finished, second.status);
-    _ = c.lua_getfield(co.L, -1, "output");
-    try testing.expectEqualStrings("child output", lstring(co.L, -1));
-    c.lua_pop(co.L, 1);
-    _ = c.lua_getfield(co.L, -1, "cancelled");
-    try testing.expect(c.lua_toboolean(co.L, -1) != 0);
-    c.lua_pop(co.L, 1);
-}
-
 test "zi.on accepts every reserved v2 event" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();

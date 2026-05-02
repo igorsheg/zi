@@ -3,6 +3,8 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const spawn_types = @import("../../spawn/types.zig");
+const spawn_mod = @import("../../spawn/spawn.zig");
+const ai = @import("../../ai/root.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
@@ -19,8 +21,39 @@ pub fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return 0;
     } orelse return 0;
 
-    runner.current_spawn_request = req;
-    return c.lua_yieldk(L, 0, req.continuation_ctx, ziSpawnContinue);
+    var owned_req = req;
+    defer {
+        if (owned_req.callbacks_ref != c.LUA_NOREF) c.luaL_unref(owned_req.source_L, c.LUA_REGISTRYINDEX, owned_req.callbacks_ref);
+        owned_req.deinit(runner.allocator);
+    }
+
+    var fanout = SpawnEventFanout{
+        .allocator = runner.allocator,
+        .lua = if (owned_req.callbacks_ref != c.LUA_NOREF) .{ .L = L, .callbacks_ref = owned_req.callbacks_ref } else null,
+    };
+    defer fanout.deinit();
+
+    const has_observer = fanout.lua != null;
+    const cfg = spawn_types.SpawnConfig{
+        .allocator = runner.allocator,
+        .io = runner.io,
+        .cwd = owned_req.cwd,
+        .task = owned_req.task,
+        .model = owned_req.model,
+        .tools = owned_req.tools,
+        .append_system_prompt = owned_req.append_system_prompt,
+        .signal = runner.current_signal,
+        .on_event = if (has_observer) &SpawnEventFanout.callback else null,
+        .on_event_ctx = if (has_observer) @ptrCast(&fanout) else null,
+        .on_wait = if (has_observer) &SpawnEventFanout.drainCallback else null,
+        .on_wait_ctx = if (has_observer) @ptrCast(&fanout) else null,
+    };
+
+    var result = spawn_mod.ziSpawn(cfg);
+    defer result.deinit(runner.allocator);
+    fanout.drain() catch {};
+    pushSpawnResult(L, result);
+    return 1;
 }
 
 fn ziSpawnContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) callconv(.c) c_int {
@@ -157,6 +190,59 @@ pub const TrampolineCtx = struct {
     callbacks_ref: c_int,
 };
 
+const SpawnEventFanout = struct {
+    const PendingEvent = struct {
+        kind: []const u8,
+        event: std.json.Value,
+    };
+
+    allocator: std.mem.Allocator,
+    lua: ?TrampolineCtx = null,
+    events: std.ArrayList(PendingEvent) = .empty,
+    mutex: std.Io.Mutex = .init,
+
+    fn callback(kind: []const u8, event: std.json.Value, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+
+        const owned_kind = self.allocator.dupe(u8, kind) catch return;
+        errdefer self.allocator.free(owned_kind);
+        const owned_event = ai.json_util.cloneJsonValue(self.allocator, event) catch return;
+        errdefer ai.json_util.freeJsonValue(self.allocator, owned_event);
+        self.events.append(self.allocator, .{ .kind = owned_kind, .event = owned_event }) catch return;
+    }
+
+    fn drainCallback(ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.drain() catch {};
+    }
+
+    fn drain(self: *SpawnEventFanout) !void {
+        var drained: std.ArrayList(PendingEvent) = .empty;
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        std.mem.swap(std.ArrayList(PendingEvent), &drained, &self.events);
+        self.mutex.unlock(std.Options.debug_io);
+        defer freeEvents(self.allocator, &drained);
+
+        for (drained.items) |entry| {
+            if (self.lua) |*lua| eventTrampoline(entry.kind, entry.event, @ptrCast(lua));
+        }
+    }
+
+    fn deinit(self: *SpawnEventFanout) void {
+        freeEvents(self.allocator, &self.events);
+    }
+
+    fn freeEvents(allocator: std.mem.Allocator, events: *std.ArrayList(PendingEvent)) void {
+        for (events.items) |entry| {
+            allocator.free(entry.kind);
+            ai.json_util.freeJsonValue(allocator, entry.event);
+        }
+        events.deinit(allocator);
+    }
+};
+
 pub fn eventTrampoline(
     kind: []const u8,
     event: std.json.Value,
@@ -228,15 +314,34 @@ pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.Agent
         c.lua_setfield(L, -2, "usage");
     }
 
+    c.lua_pushboolean(L, if (result.is_error) 1 else 0);
+    c.lua_setfield(L, -2, "is_error");
+
+    c.lua_createtable(L, @intCast(result.content.len), 0);
+    var content_i: c.lua_Integer = 1;
     var text: []const u8 = "";
     for (result.content) |block| {
         switch (block) {
             .text => |tb| {
                 if (text.len == 0) text = tb.text;
+                c.lua_createtable(L, 0, 2);
+                _ = c.lua_pushlstring(L, "text".ptr, 4);
+                c.lua_setfield(L, -2, "type");
+                _ = c.lua_pushlstring(L, tb.text.ptr, tb.text.len);
+                c.lua_setfield(L, -2, "text");
+                c.lua_rawseti(L, -2, content_i);
+                content_i += 1;
             },
             else => {},
         }
     }
+    c.lua_setfield(L, -2, "content");
+
+    if (result.details != .null) {
+        lua_runtime.pushJsonValue(L, result.details) catch c.lua_pushnil(L);
+        c.lua_setfield(L, -2, "details");
+    }
+
     _ = c.lua_pushlstring(L, text.ptr, text.len);
     c.lua_setfield(L, -2, "output");
     _ = c.lua_pushlstring(L, text.ptr, text.len);

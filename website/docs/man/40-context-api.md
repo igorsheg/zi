@@ -37,6 +37,9 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 `ctx.abort()`
 : Request abort on the active run, when bound.
 
+`ctx.update(partial_result)`
+: Update the current in-flight tool preview from a tool execution. The argument uses the normal tool-result shape (`content`, optional `details`, optional `is_error`). This is live presentation only; the tool's final return remains authoritative.
+
 `ctx.has_pending_messages()`
 : Return whether the session has queued/pending messages, when bound.
 
@@ -280,7 +283,7 @@ Fields:
 : Optional child working directory. Defaults to `.`.
 
 `on`
-: Optional table of event-name callback functions.
+: Optional table of event-name callback functions keyed by child event name. Callbacks receive child JSON events on the parent extension/Lua thread while the child is running, so they may update extension-owned state and publish non-yielding current-tool previews with `ctx.update`.
 
 Caveats:
 

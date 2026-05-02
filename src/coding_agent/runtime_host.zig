@@ -18,6 +18,7 @@ const session_event_mod = @import("session_event.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const request_mod = @import("request.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
+const lua_renderer = @import("extensions/lua_renderer.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
 
 pub const QueueKind = control_mod.QueueKind;
@@ -473,9 +474,9 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         publisher: ConversationSnapshotPublisher,
     ) bool {
-
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
+        self.attachExtensionRenderedResults(&view) catch {};
 
         const envelope = conversation_state.ConversationSnapshotEnvelope{
             .session_generation = self.session_generation,
@@ -484,6 +485,93 @@ pub const RuntimeHost = struct {
         };
         if (!publisher.publish(envelope)) return false;
         return true;
+    }
+
+    fn attachExtensionRenderedResults(self: *RuntimeHost, view: *conversation_state.ConversationView) !void {
+        const runner = self.session.extensionRunner() orelse return;
+        if (!runner.isOnLuaThread()) return;
+
+        if (view.in_flight) |*turn| {
+            for (turn.tool_executions) |*tool| {
+                if (tool.rendered_call == null) {
+                    tool.rendered_call = lua_renderer.dispatchRenderCall(self.msg_allocator, runner, .{
+                        .tool_name = tool.tool_name,
+                        .args = tool.args,
+                        .width = 120,
+                    });
+                }
+                const result = tool.result orelse continue;
+                if (tool.rendered_result != null) continue;
+                tool.rendered_result = lua_renderer.dispatchRenderResultFromResult(self.msg_allocator, runner, .{
+                    .tool_name = tool.tool_name,
+                    .args = tool.args,
+                    .result = result,
+                    .width = 120,
+                    .is_error = tool.is_error,
+                });
+            }
+        }
+
+        var rendered: std.ArrayList(conversation_state.RenderedToolRenderEntry) = .empty;
+        errdefer {
+            for (rendered.items) |*entry| entry.deinit(self.msg_allocator);
+            rendered.deinit(self.msg_allocator);
+        }
+
+        for (view.committed.flat, 0..) |message, index| {
+            if (message != .assistant) continue;
+            const assistant = message.assistant;
+            for (assistant.content) |block| {
+                if (block != .tool_call) continue;
+                const call = block.tool_call;
+                const result_message = findCommittedToolResultMessage(view.committed.flat[index + 1 ..], call.id);
+                const rendered_call = lua_renderer.dispatchRenderCall(self.msg_allocator, runner, .{
+                    .tool_name = call.name,
+                    .args = call.arguments,
+                    .width = 120,
+                });
+                const rendered_result = if (result_message) |tool_result| blk: {
+                    const agent_result = toolResultMessageAsAgentToolResult(tool_result);
+                    break :blk lua_renderer.dispatchRenderResultFromResult(self.msg_allocator, runner, .{
+                        .tool_name = tool_result.tool_name,
+                        .args = call.arguments,
+                        .result = agent_result,
+                        .width = 120,
+                        .is_error = tool_result.is_error,
+                    });
+                } else null;
+                if (rendered_call == null and rendered_result == null) continue;
+                errdefer if (rendered_call) |r| r.deinit(self.msg_allocator);
+                errdefer if (rendered_result) |r| r.deinit(self.msg_allocator);
+                try rendered.append(self.msg_allocator, .{
+                    .tool_call_id = try self.msg_allocator.dupe(u8, call.id),
+                    .rendered_call = rendered_call,
+                    .rendered_result = rendered_result,
+                });
+            }
+        }
+
+        view.rendered_tool_renders = try rendered.toOwnedSlice(self.msg_allocator);
+    }
+
+    fn findCommittedToolResultMessage(
+        messages: []const agent_mod.protocol.AgentMessage,
+        tool_call_id: []const u8,
+    ) ?agent_mod.protocol.ToolResultMessage {
+        for (messages) |message| {
+            if (message != .tool_result) continue;
+            const tool_result = message.tool_result;
+            if (std.mem.eql(u8, tool_result.tool_call_id, tool_call_id)) return tool_result;
+        }
+        return null;
+    }
+
+    fn toolResultMessageAsAgentToolResult(tool_result: agent_mod.protocol.ToolResultMessage) agent_mod.protocol.AgentToolResult {
+        return .{
+            .content = @ptrCast(tool_result.content),
+            .details = tool_result.details orelse .null,
+            .is_error = tool_result.is_error,
+        };
     }
 
     pub fn publishQueuedSnapshot(

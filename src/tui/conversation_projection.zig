@@ -18,6 +18,7 @@ const editor_mod = @import("components/editor.zig");
 const conversation_state_mod = @import("../agent/conversation_state.zig");
 const message_memory = @import("../agent/message_memory.zig");
 const json_util = @import("../ai/json_util.zig");
+const rendered_tool_result_view = @import("rendered_tool_result.zig");
 
 const Transcript = transcript_mod.Transcript;
 const TranscriptItem = transcript_mod.TranscriptItem;
@@ -580,6 +581,7 @@ fn appendCommittedDesiredItems(
                             tool_call,
                             assistant,
                             findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
+                            findRenderedToolRender(view.view.rendered_tool_renders, tool_call.id),
                             options,
                         ),
                     );
@@ -609,7 +611,7 @@ fn appendTransientDesiredItems(
                 buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids, options.theme, hide_thinking_block, options.hidden_thinking_label),
             );
         }
-        for (turn.tool_executions) |tool| {
+        for (turn.tool_executions) |*tool| {
             try appendDesiredItem(
                 allocator,
                 desired_items,
@@ -719,11 +721,11 @@ fn buildToolExecutionDesiredItem(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
     transcript: *Transcript,
-    tool_execution: conversation_state_mod.ToolExecution,
+    tool_execution: *conversation_state_mod.ToolExecution,
     theme: *const Theme,
 ) !DesiredItem {
     const item_id = toolExecutionId(tool_execution.tool_call_id);
-    const semantic_version = toolExecutionSemanticVersion(tool_execution);
+    const semantic_version = toolExecutionSemanticVersion(tool_execution.*);
     if (transcript.hasRetainedMatch(item_id, semantic_version)) {
         return .{ .item_id = item_id, .semantic_version = semantic_version };
     }
@@ -740,6 +742,7 @@ fn buildCommittedToolCallDesiredItem(
     tool_call: agent_protocol.ToolCall,
     assistant: agent_protocol.AssistantMessage,
     result_message: ?agent_protocol.ToolResultMessage,
+    rendered: RenderedToolRender,
     options: RebuildOptions,
 ) !DesiredItem {
     const item_id = toolExecutionId(tool_call.id);
@@ -753,6 +756,7 @@ fn buildCommittedToolCallDesiredItem(
         tool_call,
         assistant,
         result_message,
+        rendered,
         options.retry_attempt,
         options.theme,
     );
@@ -821,6 +825,7 @@ fn createCommittedToolCallRow(
     tool_call: agent_protocol.ToolCall,
     assistant: agent_protocol.AssistantMessage,
     result_message: ?agent_protocol.ToolResultMessage,
+    rendered: RenderedToolRender,
     retry_attempt: u32,
     theme: *const Theme,
 ) !TranscriptItem {
@@ -850,6 +855,8 @@ fn createCommittedToolCallRow(
         true,
         false,
         result,
+        rendered.rendered_call,
+        rendered.rendered_result,
         result_message,
         false,
         if (result_message) |message| message.is_error else is_error,
@@ -889,6 +896,28 @@ fn findCommittedToolResultMessage(
         if (std.mem.eql(u8, tool_result.tool_call_id, tool_call_id)) return tool_result;
     }
     return null;
+}
+
+const RenderedToolRender = struct {
+    rendered_call: ?*rendered_tool_result_view.RenderedToolResult = null,
+    rendered_result: ?*rendered_tool_result_view.RenderedToolResult = null,
+};
+
+fn findRenderedToolRender(
+    entries: []conversation_state_mod.RenderedToolRenderEntry,
+    tool_call_id: []const u8,
+) RenderedToolRender {
+    for (entries) |*entry| {
+        if (!std.mem.eql(u8, entry.tool_call_id, tool_call_id)) continue;
+        const rendered = RenderedToolRender{
+            .rendered_call = entry.rendered_call,
+            .rendered_result = entry.rendered_result,
+        };
+        entry.rendered_call = null;
+        entry.rendered_result = null;
+        return rendered;
+    }
+    return .{};
 }
 
 fn extractUserMessageText(
@@ -1045,7 +1074,7 @@ pub fn createUserMessageRow(
 fn createToolExecutionRow(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
-    tool_execution: conversation_state_mod.ToolExecution,
+    tool_execution: *conversation_state_mod.ToolExecution,
     theme: *const Theme,
 ) !TranscriptItem {
     var model = try buildToolExecutionRowModel(
@@ -1057,12 +1086,17 @@ fn createToolExecutionRow(
         tool_execution.args_complete,
         tool_execution.execution_started,
         tool_execution.result,
+        tool_execution.rendered_call,
+        tool_execution.rendered_result,
         null,
         tool_execution.is_partial,
         tool_execution.is_error,
     );
     defer model.deinit(allocator);
-    return createToolExecutionRowParts(allocator, resolver, &model, theme);
+    const row = try createToolExecutionRowParts(allocator, resolver, &model, theme);
+    tool_execution.rendered_call = null;
+    tool_execution.rendered_result = null;
+    return row;
 }
 
 fn buildToolExecutionRowModel(
@@ -1074,6 +1108,8 @@ fn buildToolExecutionRowModel(
     args_complete: bool,
     execution_started: bool,
     result: ?AgentToolResult,
+    rendered_call: ?*rendered_tool_result_view.RenderedToolResult,
+    rendered_result: ?*rendered_tool_result_view.RenderedToolResult,
     result_message: ?agent_protocol.ToolResultMessage,
     is_partial: bool,
     is_error: bool,
@@ -1100,7 +1136,9 @@ fn buildToolExecutionRowModel(
     } else if (result) |value| {
         model.result = try value.clone(allocator);
     }
+    model.rendered_call = rendered_call;
     if (model.result) |*owned| owned.is_error = model.is_error;
+    if (model.result != null) model.rendered_result = rendered_result;
     return model;
 }
 

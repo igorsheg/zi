@@ -5,6 +5,7 @@ const partial_json = @import("../json/partial.zig");
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 const shared_committed_mod = @import("shared_committed.zig");
+const rendered_tool_result = @import("rendered_tool_result.zig");
 
 pub const SharedCommitted = shared_committed_mod.SharedCommitted;
 
@@ -12,13 +13,29 @@ pub const SharedCommitted = shared_committed_mod.SharedCommitted;
 /// refcounted shared handle — retained on construction, released on
 /// deinit. The in-flight turn is still deep-cloned (single message,
 /// bounded cost).
+pub const RenderedToolRenderEntry = struct {
+    tool_call_id: []u8,
+    rendered_call: ?*rendered_tool_result.RenderedToolResult = null,
+    rendered_result: ?*rendered_tool_result.RenderedToolResult = null,
+
+    pub fn deinit(self: *RenderedToolRenderEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        if (self.rendered_call) |rendered| rendered.deinit(allocator);
+        if (self.rendered_result) |rendered| rendered.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const ConversationView = struct {
     committed: *SharedCommitted,
     in_flight: ?InFlightTurn = null,
+    rendered_tool_renders: []RenderedToolRenderEntry = &.{},
 
     pub fn deinit(self: *ConversationView, allocator: std.mem.Allocator) void {
         self.committed.release();
         if (self.in_flight) |*turn| turn.deinit(allocator);
+        for (self.rendered_tool_renders) |*entry| entry.deinit(allocator);
+        allocator.free(self.rendered_tool_renders);
         self.* = undefined;
     }
 };
@@ -82,6 +99,8 @@ pub const ToolExecution = struct {
     result_message: ?protocol.ToolResultMessage = null,
     is_partial: bool = false,
     is_error: bool = false,
+    rendered_call: ?*rendered_tool_result.RenderedToolResult = null,
+    rendered_result: ?*rendered_tool_result.RenderedToolResult = null,
 
     pub fn clone(self: ToolExecution, allocator: std.mem.Allocator) !ToolExecution {
         const tool_call_id = try allocator.dupe(u8, self.tool_call_id);
@@ -117,6 +136,8 @@ pub const ToolExecution = struct {
             .result_message = result_message,
             .is_partial = self.is_partial,
             .is_error = self.is_error,
+            .rendered_call = null,
+            .rendered_result = null,
         };
     }
 
@@ -127,6 +148,8 @@ pub const ToolExecution = struct {
         if (self.args_json_source) |source| allocator.free(source);
         if (self.result) |result| result.free(allocator);
         if (self.result_message) |*result_message| message_memory.freeToolResultMessage(allocator, result_message);
+        if (self.rendered_call) |rendered| rendered.deinit(allocator);
+        if (self.rendered_result) |rendered| rendered.deinit(allocator);
         self.* = undefined;
     }
 };

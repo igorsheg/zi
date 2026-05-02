@@ -7,7 +7,7 @@
 //!
 //! Since zi-wub.5/.6 the agent thread is the single owner of
 //! `lua_state`, so any `render_result` dispatch must happen there.
-//! This module builds a `LuaRenderState` by running the hook against a
+//! This module builds a `RenderedToolResult` by running the hook against a
 //! tool result and deep-copying the returned spans into arena-owned
 //! Zig data. Callers decide whether to render immediately, cache, or
 //! discard the result.
@@ -29,7 +29,7 @@
 //!
 //! ## Ownership
 //!
-//! Every `*LuaRenderState` is arena-allocated: one arena per
+//! Every `*RenderedToolResult` is arena-allocated: one arena per
 //! render state, freed wholesale on `deinit`. Strings parsed from
 //! the Lua stack are duped into the arena before the coroutine
 //! deinits. After `dispatchRenderResult` returns, the state holds
@@ -48,57 +48,15 @@ const runner_mod = @import("runner.zig");
 const tool_registry_mod = @import("registries/tool_registry.zig");
 const theme_mod = @import("../../tui/theme.zig");
 const theme_tokens = @import("../../themes/tokens.zig");
+const rendered_tool_result_view = @import("../../tui/rendered_tool_result.zig");
 const agent_protocol = @import("../../agent/types.zig");
+
+pub const Span = rendered_tool_result_view.Span;
+pub const Line = rendered_tool_result_view.Line;
+pub const RenderedToolResult = rendered_tool_result_view.RenderedToolResult;
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_renderer);
-
-// ─────────────────────────────────────────────────────────────────
-// Span data model
-// ─────────────────────────────────────────────────────────────────
-
-/// A single styled text run inside a line. Width-agnostic: the
-/// painter handles truncation at paint time based on the active
-/// region width.
-///
-/// `fg` and `bg` are theme role indices (resolved to concrete
-/// colors by the painter using the active `Theme`). Storing role
-/// names rather than RGB preserves theme swaps at paint time.
-pub const Span = struct {
-    text: []const u8,
-    fg: ?theme_mod.FgColor = null,
-    bg: ?theme_mod.BgColor = null,
-    bold: bool = false,
-    dim: bool = false,
-    italic: bool = false,
-    underline: bool = false,
-};
-
-pub const Line = []const Span;
-
-/// Arena-owned set of rendered lines. Two variants because the
-/// agent tree view shows a different shape when collapsed vs
-/// expanded (tool-call list length, summary presence). Both are
-/// computed up front so the TUI can toggle without re-dispatching
-/// through Lua.
-pub const LuaRenderState = struct {
-    arena: std.heap.ArenaAllocator,
-    collapsed: []const Line,
-    expanded: []const Line,
-
-    pub fn deinit(self: *LuaRenderState, parent_allocator: std.mem.Allocator) void {
-        self.arena.deinit();
-        parent_allocator.destroy(self);
-    }
-
-    /// Type-erased deinit fn for `runner.PendingRender`. The runner
-    /// stores `*anyopaque` to avoid a circular import; this is the
-    /// adapter that bridges back to the typed pointer.
-    pub fn deinitOpaque(state: *anyopaque, allocator: std.mem.Allocator) void {
-        const self: *LuaRenderState = @ptrCast(@alignCast(state));
-        self.deinit(allocator);
-    }
-};
 
 // ─────────────────────────────────────────────────────────────────
 // Dispatch
@@ -125,7 +83,7 @@ pub fn dispatchRenderCall(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
     input: DispatchCallInput,
-) ?*LuaRenderState {
+) ?*RenderedToolResult {
     const tool = runner.tool_registry.get(input.tool_name) orelse return null;
     const ref = tool.render_call_ref orelse return null;
     const state_ptr = runner.lua_state orelse return null;
@@ -133,7 +91,7 @@ pub fn dispatchRenderCall(
     runner.assertOnLuaThread();
     runner.setModuleContext(state_ptr, tool.source.provenance);
 
-    const out_state = allocator.create(LuaRenderState) catch return null;
+    const out_state = allocator.create(RenderedToolResult) catch return null;
     out_state.* = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
         .collapsed = &.{},
@@ -175,7 +133,7 @@ pub fn dispatchRenderResultFromResult(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
     input: DispatchInputFromResult,
-) ?*LuaRenderState {
+) ?*RenderedToolResult {
     return dispatchRenderResultFromResultOn(allocator, runner, input, null);
 }
 
@@ -191,7 +149,7 @@ pub fn dispatchRenderResultFromResultOn(
     runner: *runner_mod.ExtensionRunner,
     input: DispatchInputFromResult,
     current_L: ?*c.lua_State,
-) ?*LuaRenderState {
+) ?*RenderedToolResult {
     const tool = runner.tool_registry.get(input.tool_name) orelse return null;
     const ref = tool.render_result_ref orelse return null;
     const state_ptr = runner.lua_state orelse return null;
@@ -203,7 +161,7 @@ pub fn dispatchRenderResultFromResultOn(
     // private helpers from the extension's module root.
     runner.setModuleContext(state_ptr, tool.source.provenance);
 
-    const out_state = allocator.create(LuaRenderState) catch return null;
+    const out_state = allocator.create(RenderedToolResult) catch return null;
     out_state.* = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
         .collapsed = &.{},
@@ -304,7 +262,7 @@ fn pushAgentToolResult(L: *c.lua_State, r: agent_protocol.AgentToolResult) void 
 }
 
 /// Run the render_result hook for `tool_name` if one exists, and
-/// return an owned `*LuaRenderState` with both collapsed and
+/// return an owned `*RenderedToolResult` with both collapsed and
 /// expanded variants. Returns null on any failure — caller falls
 /// back to default rendering.
 ///
@@ -314,7 +272,7 @@ pub fn dispatchRenderResult(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
     input: DispatchInput,
-) ?*LuaRenderState {
+) ?*RenderedToolResult {
     const tool = runner.tool_registry.get(input.tool_name) orelse return null;
     const ref = tool.render_result_ref orelse return null;
     const state_ptr = runner.lua_state orelse return null;
@@ -326,7 +284,7 @@ pub fn dispatchRenderResult(
     runner.setModuleContext(state_ptr, tool.source.provenance);
 
     // Arena owns every string we produce for the returned state.
-    const out_state = allocator.create(LuaRenderState) catch return null;
+    const out_state = allocator.create(RenderedToolResult) catch return null;
     out_state.* = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
         .collapsed = &.{},
