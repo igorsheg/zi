@@ -3,8 +3,8 @@ const component_mod = @import("component.zig");
 const container_mod = @import("container.zig");
 const overlay_mod = @import("overlay.zig");
 const renderer_mod = @import("renderer.zig");
-const terminal_mod = @import("terminal.zig");
-const keys_mod = @import("keys.zig");
+const terminal_mod = @import("terminal/mod.zig");
+const keys_mod = @import("terminal/keys.zig");
 const buffer_mod = @import("buffer.zig");
 
 const Component = component_mod.Component;

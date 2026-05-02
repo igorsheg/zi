@@ -1,5 +1,5 @@
 const std = @import("std");
-const terminal_mod = @import("tui/terminal.zig");
+const terminal_mod = @import("tui/terminal/mod.zig");
 const logging = @import("logging.zig");
 const cli = @import("coding_agent/cli/root.zig");
 const runtime_app = @import("runtime/app.zig");

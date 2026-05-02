@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addIncludePath(lua_dep.path("src"));
     exe_mod.linkLibrary(lua_lib);
     if (target.result.os.tag == .macos) {
-        exe_mod.addCSourceFile(.{ .file = b.path("src/tui/clipboard_macos.m"), .flags = &.{"-fobjc-arc"} });
+        exe_mod.addCSourceFile(.{ .file = b.path("src/tui/terminal/clipboard_macos.m"), .flags = &.{"-fobjc-arc"} });
         exe_mod.linkFramework("AppKit", .{});
         exe_mod.linkFramework("Foundation", .{});
     }
@@ -110,7 +110,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);
     if (target.result.os.tag == .macos) {
-        test_mod.addCSourceFile(.{ .file = b.path("src/tui/clipboard_macos.m"), .flags = &.{"-fobjc-arc"} });
+        test_mod.addCSourceFile(.{ .file = b.path("src/tui/terminal/clipboard_macos.m"), .flags = &.{"-fobjc-arc"} });
         test_mod.linkFramework("AppKit", .{});
         test_mod.linkFramework("Foundation", .{});
     }

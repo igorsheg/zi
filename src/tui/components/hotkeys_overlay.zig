@@ -14,7 +14,7 @@ const CursorState = component_mod.CursorState;
 const Region = buffer_mod.Region;
 const Theme = theme_mod.Theme;
 const Color = cell_mod.Color;
-const Key = @import("../keys.zig").Key;
+const Key = @import("../terminal/keys.zig").Key;
 
 pub const HotkeysOverlay = struct {
     theme: ?*const Theme = null,

@@ -1,7 +1,7 @@
 const std = @import("std");
-const clipboard_mod = @import("../clipboard.zig");
+const clipboard_mod = @import("../terminal/clipboard.zig");
 const container_mod = @import("../container.zig");
-const keys_mod = @import("../keys.zig");
+const keys_mod = @import("../terminal/keys.zig");
 const transcript_mod = @import("../transcript.zig");
 
 const ChildRect = container_mod.ChildRect;

@@ -1,4 +1,4 @@
-const keys_mod = @import("../keys.zig");
+const keys_mod = @import("../terminal/keys.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 

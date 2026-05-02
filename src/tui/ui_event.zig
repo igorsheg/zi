@@ -7,7 +7,7 @@ const ai_protocol = @import("../ai/protocol.zig");
 const theme_mod = @import("theme.zig");
 const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const request_mod = @import("../coding_agent/request.zig");
-const keys_mod = @import("keys.zig");
+const keys_mod = @import("terminal/keys.zig");
 const session_store_mod = @import("../coding_agent/session/store.zig");
 const RunOutcome = runtime_host_mod.RunOutcome;
 

@@ -3,7 +3,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const keybinding_registry = @import("registries/keybinding_registry.zig");
 const tool_registry = @import("registries/tool_registry.zig");
-const keys_mod = @import("../../tui/keys.zig");
+const keys_mod = @import("../../tui/terminal/keys.zig");
 
 const c = lua_runtime.c;
 

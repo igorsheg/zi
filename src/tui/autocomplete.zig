@@ -4,7 +4,7 @@ const select_list_mod = @import("components/select_list.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const zio = @import("../zio/root.zig");
 const runtime_process = zio.process;
-const runtime_fd = @import("fd.zig");
+const runtime_fd = @import("terminal/fd.zig");
 
 const SelectItem = select_list_mod.SelectItem;
 const CommandRegistry = slash_commands_mod.CommandRegistry;

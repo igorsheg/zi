@@ -61,7 +61,7 @@ const spawn_types = @import("../../spawn/types.zig");
 const session_core = @import("../../session/root.zig");
 const ai = @import("../../ai/root.zig");
 const oauth_mod = @import("../auth/oauth.zig");
-const keys_mod = @import("../../tui/keys.zig");
+const keys_mod = @import("../../tui/terminal/keys.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);

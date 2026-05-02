@@ -1,7 +1,7 @@
 const std = @import("std");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("buffer.zig");
-const keys_mod = @import("keys.zig");
+const keys_mod = @import("terminal/keys.zig");
 
 const Region = buffer_mod.Region;
 const Key = keys_mod.Key;

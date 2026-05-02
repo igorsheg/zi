@@ -1,7 +1,7 @@
 //! Extension keybinding registry — runtime extension-owned key claims.
 
 const std = @import("std");
-const keys = @import("../../../tui/keys.zig");
+const keys = @import("../../../tui/terminal/keys.zig");
 const tool_registry = @import("tool_registry.zig");
 const lua_runtime = @import("../lua_runtime.zig");
 const LuaRef = c_int;

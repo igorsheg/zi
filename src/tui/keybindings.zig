@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const keys_mod = @import("keys.zig");
+const keys_mod = @import("terminal/keys.zig");
 
 const Key = keys_mod.Key;
 
