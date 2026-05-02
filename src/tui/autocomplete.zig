@@ -706,14 +706,21 @@ pub const CombinedAutocompleteProvider = struct {
 
     fn startAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
         self.async_search.scan_started = true;
-        if (!preferFdFileSearch() and self.collectNativeAsyncCandidates()) return true;
+        const started = if (preferFdFileSearch())
+            self.startFdAsyncSearchProcess()
+        else
+            self.collectNativeAsyncCandidates();
+        if (started) return true;
+        self.async_search.stdout_closed = true;
+        self.async_search.stderr_closed = true;
+        return false;
+    }
+
+    fn startFdAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
         if (self.spawnAsyncSearchProcess("/opt/homebrew/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("/usr/local/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("fd")) return true;
         if (self.spawnAsyncSearchProcess("fdfind")) return true;
-        if (preferFdFileSearch() and self.collectNativeAsyncCandidates()) return true;
-        self.async_search.stdout_closed = true;
-        self.async_search.stderr_closed = true;
         return false;
     }
 
