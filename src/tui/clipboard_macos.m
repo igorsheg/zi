@@ -17,6 +17,19 @@ static NSData *zi_png_data_from_image(NSImage *image) {
     return [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
 }
 
+bool zi_clipboard_write_text(const uint8_t *bytes, size_t len) {
+    if (bytes == NULL && len != 0) return false;
+
+    @autoreleasepool {
+        NSString *text = [[NSString alloc] initWithBytes:bytes length:len encoding:NSUTF8StringEncoding];
+        if (text == nil) return false;
+
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        [pasteboard clearContents];
+        return [pasteboard setString:text forType:NSPasteboardTypeString];
+    }
+}
+
 bool zi_clipboard_read_png(uint8_t **out_bytes, size_t *out_len) {
     if (out_bytes == NULL || out_len == NULL) return false;
     *out_bytes = NULL;

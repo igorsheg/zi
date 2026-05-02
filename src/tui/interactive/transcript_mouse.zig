@@ -140,6 +140,9 @@ fn copySelection(self: anytype, width: u32) void {
     const text = selected orelse return;
     defer self.allocator.free(text);
 
-    clipboard_mod.copyText(text);
-    self.status_line.setPrimary("copied selection", self.theme.fg(.success));
+    if (clipboard_mod.copyText(text)) {
+        self.status_line.setPrimary("copied selection", self.theme.fg(.success));
+    } else {
+        self.status_line.setPrimary("failed to copy selection", self.theme.fg(.@"error"));
+    }
 }

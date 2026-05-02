@@ -14,9 +14,14 @@ const clipboard_list_timeout_ms = 1000;
 const clipboard_read_timeout_ms = 3000;
 
 const macos_clipboard = if (builtin.os.tag == .macos) struct {
+    extern fn zi_clipboard_write_text(bytes: [*]const u8, len: usize) bool;
     extern fn zi_clipboard_read_png(out_bytes: *[*]u8, out_len: *usize) bool;
     extern fn zi_clipboard_free(ptr: [*]u8) void;
 } else struct {
+    fn zi_clipboard_write_text(_: [*]const u8, _: usize) bool {
+        return false;
+    }
+
     fn zi_clipboard_read_png(_: *[*]u8, _: *usize) bool {
         return false;
     }
@@ -27,15 +32,18 @@ const macos_clipboard = if (builtin.os.tag == .macos) struct {
 /// Best-effort clipboard write for TUI interactions.
 ///
 /// Always emits OSC 52 first so remote sessions can still copy through the
-/// terminal. Local helper tools are then attempted opportunistically.
-pub fn copyText(text: []const u8) void {
-    if (text.len == 0) return;
+/// terminal. Local/native helpers are then attempted opportunistically. The
+/// return value reports whether a local/native helper confirmed success; OSC 52
+/// delivery cannot be acknowledged by the terminal.
+pub fn copyText(text: []const u8) bool {
+    if (text.len == 0) return false;
     emitOsc52(text);
 
-    switch (builtin.os.tag) {
-        .macos => _ = copyViaCommand(&.{"/usr/bin/pbcopy"}, text),
-        else => {},
-    }
+    return switch (builtin.os.tag) {
+        .macos => macos_clipboard.zi_clipboard_write_text(text.ptr, text.len) or
+            copyViaCommand(&.{"/usr/bin/pbcopy"}, text),
+        else => true,
+    };
 }
 
 /// Best-effort clipboard image read for interactive paste.
