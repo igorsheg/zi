@@ -2,6 +2,7 @@ const std = @import("std");
 const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
+const runtime_env = @import("env");
 const zio = @import("../zio/root.zig");
 const runtime_process = zio.process;
 const runtime_fs_walk = zio.fs_walk;
@@ -93,6 +94,7 @@ const max_command_candidates = 256;
 const max_path_candidates = 64;
 const max_async_results = 20;
 const max_async_scan_results = 300;
+const max_native_collected_entries = 2_000;
 const max_async_visited_entries = 10_000;
 const max_local_path_scan_results = 300;
 const max_async_output_bytes = 256 * 1024;
@@ -704,11 +706,12 @@ pub const CombinedAutocompleteProvider = struct {
 
     fn startAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
         self.async_search.scan_started = true;
-        if (self.collectNativeAsyncCandidates()) return true;
+        if (!preferFdFileSearch() and self.collectNativeAsyncCandidates()) return true;
         if (self.spawnAsyncSearchProcess("/opt/homebrew/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("/usr/local/bin/fd")) return true;
         if (self.spawnAsyncSearchProcess("fd")) return true;
         if (self.spawnAsyncSearchProcess("fdfind")) return true;
+        if (preferFdFileSearch() and self.collectNativeAsyncCandidates()) return true;
         self.async_search.stdout_closed = true;
         self.async_search.stderr_closed = true;
         return false;
@@ -722,7 +725,7 @@ pub const CombinedAutocompleteProvider = struct {
             gitignore: []const u8,
 
             fn onEntry(ctx: *@This(), entry: runtime_fs_walk.Entry) !void {
-                if (ctx.provider.async_search.candidates.items.len >= max_async_scan_results) return;
+                if (ctx.provider.async_search.candidates.items.len >= max_native_collected_entries) return;
                 if (isIgnoredByGitignore(ctx.gitignore, entry.relative_path)) return;
                 if (ctx.provider.async_search.query.len > 0) {
                     const candidate = search.path.Candidate{ .path = entry.relative_path, .is_directory = entry.is_directory };
@@ -1348,6 +1351,11 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
         if (lhs > rhs) return false;
     }
     return a.len < b.len;
+}
+
+fn preferFdFileSearch() bool {
+    const backend = runtime_env.get("ZI_FILE_SEARCH_BACKEND") orelse return false;
+    return std.mem.eql(u8, backend, "fd");
 }
 
 fn isIgnoredByGitignore(gitignore: []const u8, relative_path: []const u8) bool {
