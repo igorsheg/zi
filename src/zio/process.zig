@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const AbortGuard = @import("abort_guard.zig").AbortGuard;
 const AbortSignal = @import("abort_signal.zig").AbortSignal;
+const TaskGroup = @import("task_group.zig").TaskGroup;
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
 const poll_interval_ms: u64 = 25;
@@ -273,14 +274,17 @@ const RunContext = struct {
 };
 
 const CaptureTasks = struct {
-    stdout_thread: ?std.Thread = null,
-    stderr_thread: ?std.Thread = null,
+    group: IoGroupCaptureTasks = .{},
+    threads: ThreadCaptureTasks = .{},
+    active: Active = .none,
 
-    /// Blocking child-pipe capture is intentionally isolated behind this type.
-    /// std.Io.Group is the preferred structured primitive, but these reads must
-    /// have true concurrency on every supported backend to avoid pipe deadlocks.
-    /// Once std.Io subprocess pipe reads preserve current behavior across
-    /// backends, this is the single seam to replace with TaskGroup-owned work.
+    const Active = enum { none, group, threads };
+
+    /// Child-pipe capture prefers the structured zio/std.Io path. It must use
+    /// true concurrency: stdout and stderr have to drain simultaneously or a
+    /// child can deadlock once either pipe fills. If the active backend cannot
+    /// provide concurrency, fall back to dedicated blocking reader threads behind
+    /// this same process primitive.
     const StartError = error{ConcurrencyUnavailable};
 
     fn start(
@@ -291,6 +295,79 @@ const CaptureTasks = struct {
         stderr_capture: *Capture,
         on_chunk: ?ChunkCallback,
     ) StartError!void {
+        self.group.start(io, child, stdout_capture, stderr_capture, on_chunk) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                self.group.cancel();
+                try self.threads.start(io, child, stdout_capture, stderr_capture, on_chunk);
+                self.active = .threads;
+                return;
+            },
+        };
+        self.active = .group;
+    }
+
+    fn join(self: *CaptureTasks) void {
+        switch (self.active) {
+            .none => {},
+            .group => self.group.join(),
+            .threads => self.threads.join(),
+        }
+        self.active = .none;
+    }
+
+    fn done(_: *const CaptureTasks, stdout_capture: *const Capture, stderr_capture: *const Capture) bool {
+        return stdout_capture.done.load(.acquire) and stderr_capture.done.load(.acquire);
+    }
+};
+
+const IoGroupCaptureTasks = struct {
+    group: TaskGroup = undefined,
+    started: bool = false,
+
+    fn start(
+        self: *IoGroupCaptureTasks,
+        io: std.Io,
+        child: std.process.Child,
+        stdout_capture: *Capture,
+        stderr_capture: *Capture,
+        on_chunk: ?ChunkCallback,
+    ) CaptureTasks.StartError!void {
+        self.group = TaskGroup.init(io);
+        self.started = true;
+        errdefer self.cancel();
+        if (child.stdout) |stdout_file| {
+            try self.group.concurrent(Capture.readAll, .{ stdout_capture, io, stdout_file, StreamKind.stdout, on_chunk });
+        }
+        if (child.stderr) |stderr_file| {
+            try self.group.concurrent(Capture.readAll, .{ stderr_capture, io, stderr_file, StreamKind.stderr, on_chunk });
+        }
+    }
+
+    fn join(self: *IoGroupCaptureTasks) void {
+        if (!self.started) return;
+        self.group.wait() catch {};
+        self.started = false;
+    }
+
+    fn cancel(self: *IoGroupCaptureTasks) void {
+        if (!self.started) return;
+        self.group.cancel();
+        self.started = false;
+    }
+};
+
+const ThreadCaptureTasks = struct {
+    stdout_thread: ?std.Thread = null,
+    stderr_thread: ?std.Thread = null,
+
+    fn start(
+        self: *ThreadCaptureTasks,
+        io: std.Io,
+        child: std.process.Child,
+        stdout_capture: *Capture,
+        stderr_capture: *Capture,
+        on_chunk: ?ChunkCallback,
+    ) CaptureTasks.StartError!void {
         errdefer self.join();
         if (child.stdout) |stdout_file| {
             self.stdout_thread = std.Thread.spawn(.{}, Capture.readAll, .{ stdout_capture, io, stdout_file, StreamKind.stdout, on_chunk }) catch return error.ConcurrencyUnavailable;
@@ -300,15 +377,11 @@ const CaptureTasks = struct {
         }
     }
 
-    fn join(self: *CaptureTasks) void {
+    fn join(self: *ThreadCaptureTasks) void {
         if (self.stdout_thread) |thread| thread.join();
         if (self.stderr_thread) |thread| thread.join();
         self.stdout_thread = null;
         self.stderr_thread = null;
-    }
-
-    fn done(_: *const CaptureTasks, stdout_capture: *const Capture, stderr_capture: *const Capture) bool {
-        return stdout_capture.done.load(.acquire) and stderr_capture.done.load(.acquire);
     }
 };
 
@@ -332,13 +405,33 @@ const Capture = struct {
         self.* = undefined;
     }
 
+    fn readAllIo(self: *Capture, io: std.Io, file: std.Io.File, kind: StreamKind, on_chunk: ?ChunkCallback) void {
+        defer self.done.store(true, .release);
+        var local_buf: [4096]u8 = undefined;
+        while (true) {
+            const n = file.readStreaming(io, &.{&local_buf}) catch |err| switch (err) {
+                error.EndOfStream => return,
+                error.WouldBlock => {
+                    io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    continue;
+                },
+                else => {
+                    self.err = error.ReadFailed;
+                    return;
+                },
+            };
+            self.acceptChunk(kind, local_buf[0..n], on_chunk) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    }
+
     fn readAll(self: *Capture, io: std.Io, file: std.Io.File, kind: StreamKind, on_chunk: ?ChunkCallback) void {
         defer self.done.store(true, .release);
-        // Child pipes are still read with the OS primitive because std.Io.File
-        // reader currently does not preserve this subprocess capture test's
-        // behavior on every backend. This is isolated here so the rest of the
-        // process runner can move toward std.Io structured concurrency without
-        // spreading raw fd reads through higher layers.
+        // Fallback path: dedicated threads perform blocking OS pipe reads. This
+        // stays isolated here so higher layers keep using zio.process while the
+        // preferred TaskGroup/std.Io capture path matures across backends.
         var local_buf: [4096]u8 = undefined;
         while (true) {
             const n = std.posix.read(file.handle, &local_buf) catch |err| switch (err) {
@@ -353,17 +446,18 @@ const Capture = struct {
             };
             if (n == 0) return;
             const chunk = local_buf[0..n];
-            if (on_chunk) |callback| callback.call(kind, chunk);
-            if (!self.store) continue;
-            if (self.buf.items.len + n > self.max_bytes) {
-                self.err = error.OutputTooLarge;
-                return;
-            }
-            self.buf.appendSlice(self.allocator, chunk) catch {
-                self.err = error.ReadFailed;
+            self.acceptChunk(kind, chunk, on_chunk) catch |err| {
+                self.err = err;
                 return;
             };
         }
+    }
+
+    fn acceptChunk(self: *Capture, kind: StreamKind, chunk: []const u8, on_chunk: ?ChunkCallback) CaptureError!void {
+        if (on_chunk) |callback| callback.call(kind, chunk);
+        if (!self.store) return;
+        if (self.buf.items.len + chunk.len > self.max_bytes) return error.OutputTooLarge;
+        self.buf.appendSlice(self.allocator, chunk) catch return error.ReadFailed;
     }
 
     fn toOwnedParent(self: *Capture, allocator: std.mem.Allocator) ![]u8 {
@@ -477,6 +571,29 @@ test "process.run captures stdout and stderr concurrently" {
     };
     try std.testing.expectEqualSlices(u8, "out", completed.stdout);
     try std.testing.expectEqualSlices(u8, "err", completed.stderr);
+}
+
+test "process.run drains large stdout and stderr concurrently" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const script =
+        "i=0; " ++
+        "while [ $i -lt 2048 ]; do " ++
+        "printf 'oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo'; " ++
+        "printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' >&2; " ++
+        "i=$((i+1)); " ++
+        "done";
+    const argv = [_][]const u8{ shell_argv[0], shell_argv[1], script };
+
+    var result = run(allocator, std.Options.debug_io, .{ .argv = &argv, .timeout_ms = 5000 });
+    defer result.deinit(allocator);
+
+    const completed = switch (result) {
+        .completed => |completed| completed,
+        else => return error.UnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stdout.len);
+    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stderr.len);
 }
 
 test "process.run writes stdin and closes the pipe" {
