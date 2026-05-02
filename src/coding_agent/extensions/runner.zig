@@ -533,10 +533,11 @@ pub const ExtensionRunner = struct {
     /// the smallest seam.
     hook_arena: std.heap.ArenaAllocator,
 
-    /// Per-extension private module root directories, keyed by
-    /// `state_owner_id`. Set during extension load so that later
-    /// execution (tool, event, render) can prepend the right
-    /// private root to `package.path`.
+    /// Per-extension private Lua module root directories, keyed by
+    /// `state_owner_id`. Bundled extensions get `<extension>/lua`;
+    /// flat single-file extensions intentionally get no private root.
+    /// Later execution (tool, event, render) prepends the right root
+    /// to `package.path`.
     module_roots: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     /// Shared `lua/` search paths built from the canonical ordered
@@ -1356,11 +1357,12 @@ pub const ExtensionRunner = struct {
         return ptr[0..len];
     }
 
-    /// Record the private module root for an extension so that later
-    /// execution entry points can resolve `require("helper")` relative
-    /// to the extension's directory.
+    /// Record the private Lua module root for a bundled extension so
+    /// that later execution entry points can resolve namespaced modules
+    /// from `<extension>/lua`. Flat single-file extensions do not get a
+    /// synthetic private root; they use shared runtime `lua/` modules.
     pub fn recordModuleRoot(self: *ExtensionRunner, state_owner_id: []const u8, path: []const u8) !void {
-        const root = try moduleRootFromExtensionPath(self.allocator, path);
+        const root = try moduleRootFromExtensionPath(self.allocator, path) orelse return;
         errdefer self.allocator.free(root);
         const key = try self.allocator.dupe(u8, state_owner_id);
         errdefer self.allocator.free(key);
@@ -1368,8 +1370,9 @@ pub const ExtensionRunner = struct {
     }
 
     /// Set Lua `package.path` for the execution context belonging to
-    /// `provenance`. Prepends the extension's private root (if any),
-    /// then the shared `lua/` roots, then the default builtin paths.
+    /// `provenance`. Prepends the bundled extension's private `lua/`
+    /// root (if any), then shared runtime `lua/` roots, then the default
+    /// builtin paths.
     /// Single-threaded: every entry point overwrites the path for
     /// its own context, so nested callbacks naturally inherit the
     /// current tool's module context.
@@ -1402,17 +1405,12 @@ pub const ExtensionRunner = struct {
     }
 };
 
-fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
     const basename = std.fs.path.basename(path);
-    if (std.mem.eql(u8, basename, "init.lua")) {
-        const dir = std.fs.path.dirname(path) orelse path;
-        return try allocator.dupe(u8, dir);
-    }
-    if (std.mem.endsWith(u8, path, ".lua")) {
-        return try allocator.dupe(u8, path[0 .. path.len - 4]);
-    }
+    if (!std.mem.eql(u8, basename, "init.lua")) return null;
+
     const dir = std.fs.path.dirname(path) orelse path;
-    return try allocator.dupe(u8, dir);
+    return try std.fs.path.join(allocator, &.{ dir, "lua" });
 }
 
 // =============================================================================

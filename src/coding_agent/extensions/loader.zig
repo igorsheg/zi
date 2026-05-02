@@ -401,8 +401,10 @@ fn loadOne(
     runner.beginLoadContext(load_source);
     defer runner.endLoadContext();
 
-    // Record the module root before execution so that `require` in
-    // top-level code and the factory resolve truthfully.
+    // Record the private Lua module root before execution so that
+    // `require` in top-level code and the factory resolve truthfully.
+    // Only bundled extensions (`extensions/<id>/init.lua`) get a
+    // private root, and it is `extensions/<id>/lua`.
     runner.recordModuleRoot(ext.provenance.state_owner_id, ext.path) catch |err| {
         log.warn("failed to record module root for {s}: {s}", .{ ext.id, @errorName(err) });
     };
@@ -1150,9 +1152,10 @@ test "bundled extension requires private helper resolved from directory module r
     var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     try ext_dir.createDir(std.Options.debug_io, "bar", .default_dir);
     var bar_dir = try ext_dir.openDir(std.Options.debug_io, "bar", .{});
-    try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "helper.lua", .data = "_bar_helper_loaded = true\n" });
+    try bar_dir.createDirPath(std.Options.debug_io, "lua/bar");
+    try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "lua/bar/helper.lua", .data = "_bar_helper_loaded = true\n" });
     const ext_src =
-        "require(\"helper\")\n" ++
+        "require(\"bar.helper\")\n" ++
         "return function(zi) end\n";
     try bar_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = ext_src });
 
@@ -1247,10 +1250,11 @@ test "event handler dispatch inherits extension module context for require" {
     var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     try ext_dir.createDir(std.Options.debug_io, "evt", .default_dir);
     var evt_dir = try ext_dir.openDir(std.Options.debug_io, "evt", .{});
-    try evt_dir.writeFile(std.Options.debug_io, .{ .sub_path = "helper.lua", .data = "_evt_helper_loaded = true\n" });
+    try evt_dir.createDirPath(std.Options.debug_io, "lua/evt");
+    try evt_dir.writeFile(std.Options.debug_io, .{ .sub_path = "lua/evt/helper.lua", .data = "_evt_helper_loaded = true\n" });
     const ext_src =
         "zi.on(\"message_end\", function(event, ctx)\n" ++
-        "  require(\"helper\")\n" ++
+        "  require(\"evt.helper\")\n" ++
         "end)\n" ++
         "return function(zi) end\n";
     try evt_dir.writeFile(std.Options.debug_io, .{ .sub_path = "init.lua", .data = ext_src });

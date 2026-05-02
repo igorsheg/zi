@@ -190,8 +190,7 @@ pub const LuaState = struct {
         c.lua_pushcclosure(self.L, func, 1);
     }
 
-    /// Configure Lua's `package.path` so extensions can
-    /// `require("lib/foo")` relative to their extension dir.
+    /// Configure Lua's `package.path` from explicit module roots.
     ///
     /// Builds the canonical `<dir>/?.lua;<dir>/?/init.lua` pair for
     /// each search directory. Empty string entries are skipped.
@@ -200,11 +199,11 @@ pub const LuaState = struct {
     /// fail to find modules, which is caught by the loader's
     /// per-extension error handling).
     ///
-    /// Why not use the agent dir's `lib/` directly: matching
-    /// pi-mono's convention, each extension is self-contained and
-    /// its `lib/` is a subdirectory of the extension dir. A tool
-    /// in `.zi/extensions/task.lua` can `require("lib/render")`
-    /// and Lua resolves that to `.zi/extensions/lib/render.lua`.
+    /// The extension system follows a Neovim-style runtime layout:
+    /// bundled extensions put private modules under
+    /// `extensions/<id>/lua/`, and runtime roots can expose shared
+    /// modules under `<root>/lua/`. A bundled extension can require
+    /// `my_ext.render` from `extensions/my-ext/lua/my_ext/render.lua`.
     pub fn setPackagePath(self: *LuaState, dirs: []const []const u8) !void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
