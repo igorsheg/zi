@@ -726,10 +726,10 @@ pub const CombinedAutocompleteProvider = struct {
 
     fn startAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
         self.async_search.scan_started = true;
-        const started = if (preferFdFileSearch())
-            self.startFdAsyncSearchProcess()
+        const started = if (preferNativeFileSearch())
+            self.startNativeAsyncSearchProcess()
         else
-            self.startNativeAsyncSearchProcess();
+            self.startFdAsyncSearchProcess();
         if (started) return true;
         self.async_search.stdout_closed = true;
         self.async_search.stderr_closed = true;
@@ -1435,9 +1435,9 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
     return a.len < b.len;
 }
 
-fn preferFdFileSearch() bool {
+fn preferNativeFileSearch() bool {
     const backend = runtime_env.get("ZI_FILE_SEARCH_BACKEND") orelse return false;
-    return std.mem.eql(u8, backend, "fd");
+    return std.mem.eql(u8, backend, "native");
 }
 
 fn isIgnoredByGitignore(gitignore: []const u8, relative_path: []const u8) bool {
