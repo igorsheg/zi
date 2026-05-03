@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Small zio-owned long-running process supervisor.
 ///
@@ -125,7 +126,7 @@ const Job = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
-            .pgid = null,
+            .pgid = if (supportsProcessGroups()) 0 else null,
         }) catch {
             _ = self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .exit, .code = null });
             return;
@@ -166,7 +167,14 @@ const Job = struct {
         self.stopping = true;
         const child_id = self.child_id;
         self.mutex.unlock(self.io);
-        if (child_id) |pid| std.posix.kill(pid, .TERM) catch {};
+        if (child_id) |pid| {
+            killChild(pid, .TERM);
+            self.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            self.mutex.lockUncancelable(self.io);
+            const still_running = self.child_id == pid;
+            self.mutex.unlock(self.io);
+            if (still_running) killChild(pid, .KILL);
+        }
     }
 
     fn write(self: *Job, data: []const u8) !void {
@@ -188,6 +196,19 @@ const Job = struct {
         }
     }
 };
+
+fn supportsProcessGroups() bool {
+    return builtin.os.tag != .windows and builtin.os.tag != .wasi;
+}
+
+fn killChild(child_id: std.process.Child.Id, sig: std.posix.SIG) void {
+    if (supportsProcessGroups()) {
+        const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(child_id));
+        std.posix.kill(group_pid, sig) catch {};
+    } else {
+        std.posix.kill(child_id, sig) catch {};
+    }
+}
 
 const testing = std.testing;
 
@@ -312,5 +333,24 @@ test "zio job stop terminates a running child" {
 
     try waitUntil(struct {
         fn pred(s: *TestSink) bool { return s.hasExit(3); }
+    }.pred, &sink);
+}
+
+test "zio job stop escalates children that ignore TERM" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var sink = TestSink{ .allocator = testing.allocator };
+    defer sink.deinit();
+    var manager = Manager.init(testing.allocator, std.Options.debug_io, .{ .ptr = @ptrCast(&sink), .submit = &TestSink.sink });
+    defer manager.deinit();
+
+    const script = "trap '' TERM; while :; do sleep 1; done";
+    const argv = try testing.allocator.dupe([]const u8, &.{ try testing.allocator.dupe(u8, "/bin/sh"), try testing.allocator.dupe(u8, "-c"), try testing.allocator.dupe(u8, script) });
+    try manager.start(4, .{ .argv = argv });
+    std.Options.debug_io.sleep(.fromMilliseconds(30), .awake) catch {};
+    manager.stop(4);
+
+    try waitUntil(struct {
+        fn pred(s: *TestSink) bool { return s.hasExit(4); }
     }.pred, &sink);
 }
