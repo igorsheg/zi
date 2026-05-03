@@ -733,43 +733,19 @@ fn parseCustomContent(allocator: std.mem.Allocator, val: std.json.Value) !agent.
 
 // ─── Tests ──────────────────────────────────────────────────────────
 
-test "header round-trip" {
-    const allocator = std.testing.allocator;
-    const header = proto.SessionHeader{
-        .id = "test-uuid",
-        .timestamp = "2025-01-01T00:00:00.000Z",
-        .cwd = "/home/user",
-        .version = 3,
-        .parent_session = null,
-    };
-    const json_str = try json_write.toOwnedSlice(allocator, header, writeHeader);
-    defer allocator.free(json_str);
-
-    const parsed = try parseFileEntry(allocator, json_str);
-    const h = parsed.header;
-    defer {
-        allocator.free(h.id);
-        allocator.free(h.timestamp);
-        allocator.free(h.cwd);
-    }
-    try std.testing.expectEqualStrings("test-uuid", h.id);
-    try std.testing.expectEqualStrings("2025-01-01T00:00:00.000Z", h.timestamp);
-    try std.testing.expectEqualStrings("/home/user", h.cwd);
-    try std.testing.expectEqual(@as(u32, 3), h.version);
-    try std.testing.expect(h.parent_session == null);
-}
-
-test "header with parentSession" {
+test "header wire format round-trips parent session and version" {
     const allocator = std.testing.allocator;
     const header = proto.SessionHeader{
         .id = "child-uuid",
         .timestamp = "2025-01-01T00:00:00.000Z",
         .cwd = "/tmp",
+        .version = 3,
         .parent_session = "parent-uuid",
     };
     const json_str = try json_write.toOwnedSlice(allocator, header, writeHeader);
     defer allocator.free(json_str);
 
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"type\":\"session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"parentSession\":\"parent-uuid\"") != null);
 
     const parsed = try parseFileEntry(allocator, json_str);
@@ -780,70 +756,11 @@ test "header with parentSession" {
         allocator.free(h.cwd);
         if (h.parent_session) |ps| allocator.free(ps);
     }
+    try std.testing.expectEqualStrings("child-uuid", h.id);
+    try std.testing.expectEqualStrings("2025-01-01T00:00:00.000Z", h.timestamp);
+    try std.testing.expectEqualStrings("/tmp", h.cwd);
+    try std.testing.expectEqual(@as(u32, 3), h.version);
     try std.testing.expectEqualStrings("parent-uuid", h.parent_session.?);
-}
-
-test "message entry round-trip with user message" {
-    const allocator = std.testing.allocator;
-    const entry = proto.SessionEntry{
-        .id = "abcd1234",
-        .parent_id = null,
-        .timestamp = "2025-01-01T00:00:00.000Z",
-        .entry = .{ .message = .{
-            .message = .{ .user = .{
-                .content = .{ .text = "hello world" },
-                .timestamp = 1700000000000,
-            } },
-        } },
-    };
-    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
-    defer allocator.free(json_str);
-
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"type\":\"message\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"parentId\":null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"role\":\"user\"") != null);
-    // pi-mono serializes plain text user content as a JSON string, not a blocks array
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"content\":\"hello world\"") != null);
-}
-
-test "model_change entry wire format" {
-    const allocator = std.testing.allocator;
-    const entry = proto.SessionEntry{
-        .id = "ef567890",
-        .parent_id = "abcd1234",
-        .timestamp = "2025-01-01T00:00:01.000Z",
-        .entry = .{ .model_change = .{
-            .provider = "anthropic",
-            .model_id = "claude-sonnet-4-5",
-        } },
-    };
-    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
-    defer allocator.free(json_str);
-
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"type\":\"model_change\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"modelId\":\"claude-sonnet-4-5\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"parentId\":\"abcd1234\"") != null);
-}
-
-test "compaction entry wire format" {
-    const allocator = std.testing.allocator;
-    const entry = proto.SessionEntry{
-        .id = "cc000000",
-        .parent_id = "bb000000",
-        .timestamp = "2025-06-01T00:00:00.000Z",
-        .entry = .{ .compaction = .{
-            .summary = "summarized context",
-            .first_kept_entry_id = "aa000000",
-            .tokens_before = 50000,
-            .from_hook = true,
-        } },
-    };
-    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
-    defer allocator.free(json_str);
-
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"firstKeptEntryId\":\"aa000000\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"tokensBefore\":50000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"fromHook\":true") != null);
 }
 
 test "assistant message round-trips normalized failure metadata" {

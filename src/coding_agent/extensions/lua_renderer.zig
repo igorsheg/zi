@@ -555,7 +555,7 @@ test "dispatchRenderCall parses args into an owned call presentation document" {
         \\  execute = function() end,
         \\  render_call = function(args, ctx)
         \\    return {
-        \\      lines = { { { text = "call ", fg = "muted" }, { text = args.path, fg = "accent", bold = true } } }
+        \\      lines = { { { text = "call ", fg = "muted" }, { text = args.path, fg = "accent", bold = ctx.width == 80 } } }
         \\    }
         \\  end,
         \\})
@@ -580,94 +580,7 @@ test "dispatchRenderCall parses args into an owned call presentation document" {
     try testing.expect(out.collapsed[0][1].bold);
 }
 
-test "dispatchRenderCall on lua error returns null for fallback" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\zi.register_tool({
-        \\  name = "bad_call",
-        \\  description = "bad",
-        \\  parameters = { type = "object" },
-        \\  execute = function() end,
-        \\  render_call = function() error("nope") end,
-        \\})
-    , "register");
-
-    const out = dispatchRenderCall(testing.allocator, &runner, .{
-        .tool_name = "bad_call",
-        .args = .null,
-        .width = 80,
-    });
-    try testing.expect(out == null);
-}
-
-test "dispatchRenderResult with no hook returns null" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\zi.register_tool({
-        \\  name = "plain",
-        \\  description = "no renderer",
-        \\  parameters = { type = "object" },
-        \\  execute = function() end,
-        \\})
-    , "register");
-
-    const out = dispatchRenderResult(testing.allocator, &runner, .{
-        .tool_name = "plain",
-        .args = .null,
-        .result = .null,
-        .width = 80,
-        .is_error = false,
-    });
-    try testing.expect(out == null);
-}
-
-test "dispatchRenderResult parses string shortcut into one-line one-span" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\zi.register_tool({
-        \\  name = "shortcut",
-        \\  description = "short",
-        \\  parameters = { type = "object" },
-        \\  execute = function() end,
-        \\  render_result = function(result, ctx)
-        \\    return "hello world"
-        \\  end,
-        \\})
-    , "register");
-
-    const out = dispatchRenderResult(testing.allocator, &runner, .{
-        .tool_name = "shortcut",
-        .args = .null,
-        .result = .null,
-        .width = 80,
-        .is_error = false,
-    }) orelse return error.TestUnexpectedResult;
-    defer out.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(usize, 1), out.collapsed.len);
-    try testing.expectEqual(@as(usize, 1), out.collapsed[0].len);
-    try testing.expectEqualStrings("hello world", out.collapsed[0][0].text);
-}
-
-test "dispatchRenderResult parses structured spans with theme roles" {
+test "dispatchRenderResult renders collapsed and expanded result presentations" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
@@ -682,11 +595,12 @@ test "dispatchRenderResult parses structured spans with theme roles" {
         \\  parameters = { type = "object" },
         \\  execute = function() end,
         \\  render_result = function(result, ctx)
+        \\    if not ctx.expanded then return "" end
         \\    return {
         \\      lines = {
         \\        {
         \\          { text = "Task", fg = "accent", bold = true },
-        \\          { text = " done", fg = "dim" },
+        \\          { text = ctx.is_error and " failed" or " done", fg = "dim" },
         \\        },
         \\        "simple string line",
         \\      },
@@ -704,50 +618,18 @@ test "dispatchRenderResult parses structured spans with theme roles" {
     }) orelse return error.TestUnexpectedResult;
     defer out.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 2), out.collapsed.len);
-    try testing.expectEqual(@as(usize, 2), out.collapsed[0].len);
-    try testing.expectEqualStrings("Task", out.collapsed[0][0].text);
-    try testing.expectEqual(theme_mod.FgColor.accent, out.collapsed[0][0].fg.?);
-    try testing.expect(out.collapsed[0][0].bold);
-    try testing.expectEqualStrings(" done", out.collapsed[0][1].text);
-    try testing.expectEqual(theme_mod.FgColor.dim, out.collapsed[0][1].fg.?);
-    try testing.expectEqualStrings("simple string line", out.collapsed[1][0].text);
-}
-
-test "dispatchRenderResult treats empty collapsed output as zero-row minimal presentation" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\zi.register_tool({
-        \\  name = "minimal",
-        \\  description = "minimal",
-        \\  parameters = { type = "object" },
-        \\  execute = function() end,
-        \\  render_result = function(result, ctx)
-        \\    return ctx.expanded and "expanded output" or ""
-        \\  end,
-        \\})
-    , "register");
-
-    const out = dispatchRenderResult(testing.allocator, &runner, .{
-        .tool_name = "minimal",
-        .args = .null,
-        .result = .null,
-        .width = 80,
-        .is_error = false,
-    }) orelse return error.TestUnexpectedResult;
-    defer out.deinit(testing.allocator);
-
     try testing.expectEqual(@as(usize, 0), out.collapsed.len);
-    try testing.expectEqualStrings("expanded output", out.expanded[0][0].text);
+    try testing.expectEqual(@as(usize, 2), out.expanded.len);
+    try testing.expectEqual(@as(usize, 2), out.expanded[0].len);
+    try testing.expectEqualStrings("Task", out.expanded[0][0].text);
+    try testing.expectEqual(theme_mod.FgColor.accent, out.expanded[0][0].fg.?);
+    try testing.expect(out.expanded[0][0].bold);
+    try testing.expectEqualStrings(" done", out.expanded[0][1].text);
+    try testing.expectEqual(theme_mod.FgColor.dim, out.expanded[0][1].fg.?);
+    try testing.expectEqualStrings("simple string line", out.expanded[1][0].text);
 }
 
-test "dispatchRenderResult passes ctx.expanded differently to collapsed and expanded runs" {
+test "dispatchRenderResultFromResult owns rendered output after host result changes" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
@@ -757,30 +639,37 @@ test "dispatchRenderResult passes ctx.expanded differently to collapsed and expa
 
     try state.doString(
         \\zi.register_tool({
-        \\  name = "variant",
-        \\  description = "variant",
+        \\  name = "owned",
+        \\  description = "owned",
         \\  parameters = { type = "object" },
         \\  execute = function() end,
         \\  render_result = function(result, ctx)
-        \\    return ctx.expanded and "expanded form" or "collapsed form"
+        \\    return result.content[1].text
         \\  end,
         \\})
     , "register");
 
-    const out = dispatchRenderResult(testing.allocator, &runner, .{
-        .tool_name = "variant",
+    const text_buf = try testing.allocator.dupe(u8, "owned by host");
+    defer testing.allocator.free(text_buf);
+    var blocks = [_]agent_protocol.AgentToolResult.ContentBlock{
+        .{ .text = .{ .text = text_buf } },
+    };
+
+    const out = dispatchRenderResultFromResult(testing.allocator, &runner, .{
+        .tool_name = "owned",
         .args = .null,
-        .result = .null,
+        .result = .{ .content = &blocks },
         .width = 80,
         .is_error = false,
     }) orelse return error.TestUnexpectedResult;
     defer out.deinit(testing.allocator);
 
-    try testing.expectEqualStrings("collapsed form", out.collapsed[0][0].text);
-    try testing.expectEqualStrings("expanded form", out.expanded[0][0].text);
+    @memset(text_buf, 'x');
+    try testing.expectEqualStrings("owned by host", out.collapsed[0][0].text);
+    try testing.expectEqualStrings("owned by host", out.expanded[0][0].text);
 }
 
-test "dispatchRenderResult on lua error returns null" {
+test "renderer dispatch fails open for missing hooks and lua errors" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
@@ -790,20 +679,46 @@ test "dispatchRenderResult on lua error returns null" {
 
     try state.doString(
         \\zi.register_tool({
-        \\  name = "boom",
-        \\  description = "boom",
+        \\  name = "plain",
+        \\  description = "no renderer",
+        \\  parameters = { type = "object" },
+        \\  execute = function() end,
+        \\})
+        \\zi.register_tool({
+        \\  name = "bad_call",
+        \\  description = "bad call",
+        \\  parameters = { type = "object" },
+        \\  execute = function() end,
+        \\  render_call = function() error("nope") end,
+        \\})
+        \\zi.register_tool({
+        \\  name = "bad_result",
+        \\  description = "bad result",
         \\  parameters = { type = "object" },
         \\  execute = function() end,
         \\  render_result = function() error("nope") end,
         \\})
     , "register");
 
-    const out = dispatchRenderResult(testing.allocator, &runner, .{
-        .tool_name = "boom",
+    try testing.expect(dispatchRenderResult(testing.allocator, &runner, .{
+        .tool_name = "plain",
         .args = .null,
         .result = .null,
         .width = 80,
         .is_error = false,
-    });
-    try testing.expect(out == null);
+    }) == null);
+
+    try testing.expect(dispatchRenderCall(testing.allocator, &runner, .{
+        .tool_name = "bad_call",
+        .args = .null,
+        .width = 80,
+    }) == null);
+
+    try testing.expect(dispatchRenderResult(testing.allocator, &runner, .{
+        .tool_name = "bad_result",
+        .args = .null,
+        .result = .null,
+        .width = 80,
+        .is_error = false,
+    }) == null);
 }

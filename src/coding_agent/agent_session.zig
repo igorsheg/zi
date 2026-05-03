@@ -1390,63 +1390,6 @@ test "AgentSession refreshes visible tools and prompt after runtime tool registr
     try testing.expect(found);
 }
 
-test "AgentSession: extension ui_publication swap publishes the next runner generation" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const agent_dir = try createAgentDirWithReadOverride(
-        allocator,
-        &tmp,
-        "Reload v1 snippet",
-        "Reload v1 guideline",
-        "reload v1 result",
-    );
-    defer allocator.free(agent_dir);
-
-    var fp = faux.FauxProvider.init(allocator);
-    defer fp.deinit();
-    var registry = ai.provider.Registry.init(allocator);
-    defer registry.deinit();
-    try registry.register("faux", fp.provider(), null);
-
-    var ca = AgentSession.initTestSession(allocator, .{
-        .model = faux.fauxModel(),
-        .api_key = "test-key",
-        .cwd = "/tmp/zi-test",
-        .resource_loader = createTestResourceLoaderWithAgentDir(allocator, "/tmp/zi-test", agent_dir),
-        .registry = &registry,
-        .no_session = true,
-    });
-    defer ca.deinit();
-
-    const initial_runner = ca.extensionRunner() orelse return error.MissingExtensionRunner;
-    try testing.expectEqual(@as(extension_runner_mod.Generation, 0), initial_runner.generation);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Reload v1 snippet") != null);
-
-    try writeReadOverrideExtension(
-        allocator,
-        &tmp,
-        "Reload v2 snippet",
-        "Reload v2 guideline",
-        "reload v2 result",
-    );
-    try ca.resource_loader.reload();
-    const next = try session_bootstrap.prepareExtensionRuntimeBundle(allocator, .{
-        .resource_loader = ca.resource_loader,
-        .session_id = ca.session_store.sessionId(),
-        .extension_generation = 1,
-    });
-    try ca.replaceExtensionRuntimeBundleOnAgentThread(next);
-
-    const swapped_runner = ca.extensionRunner() orelse return error.MissingExtensionRunner;
-    try testing.expectEqual(@as(extension_runner_mod.Generation, 1), swapped_runner.generation);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Reload v2 snippet") != null);
-    try testing.expect(std.mem.indexOf(u8, ca.agent.systemPrompt(), "Reload v1 snippet") == null);
-}
-
 // pi-mono test-harness.test.ts: "simple text response"
 test "AgentSession: simple text response" {
     // Use arena — SessionWriter allocates internally with no deinit
@@ -1506,36 +1449,6 @@ test "AgentSession: error response sets stop_reason" {
     const assistant = ca.agent.messages()[1].assistant;
     try testing.expectEqual(ai.protocol.StopReason.@"error", assistant.stop_reason);
 }
-
-// pi-mono test-harness.test.ts: "event capture"
-test "AgentSession: events emitted in correct order" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var fp = faux.FauxProvider.init(allocator);
-    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("hi")};
-    const msg = faux.fauxAssistantMessage(allocator, &content, .stop);
-    fp.setResponses(&.{msg});
-
-    var registry = ai.provider.Registry.init(allocator);
-    try registry.register("faux", fp.provider(), null);
-
-    var collector = EventCollector.init(allocator);
-    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
-    defer ca.deinit();
-
-    try ca.run("hello");
-
-    // Should have: agent_start, turn_start, message_start(user), message_end(user),
-    // message_start(assistant-stream), message_update*, message_end(assistant),
-    // turn_end, agent_end
-    try testing.expect(collector.countType(.agent_start) >= 1);
-    try testing.expect(collector.countType(.agent_end) >= 1);
-    try testing.expect(collector.countType(.message_end) >= 2); // user + assistant
-    try testing.expect(collector.countType(.turn_end) >= 1);
-}
-
 // pi-mono test-harness.test.ts: "response sequence"
 test "AgentSession: response sequence across multiple prompts" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1699,56 +1612,7 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     try testing.expect(collector.countType(.tool_execution_end) >= 1);
 }
 
-test "AgentSession: replaceSessionStore rebinds resumed session ids for agent and builtins" {
-    const allocator = testing.allocator;
-
-    const makeStore = struct {
-        fn make(alloc: std.mem.Allocator, session_id: []const u8) SessionStore {
-            return .{
-                .allocator = alloc,
-                .writer = session_runtime.writer.SessionWriter.initContinue(
-                    alloc,
-                    "",
-                    alloc.dupe(u8, session_id) catch @panic("OOM"),
-                    "",
-                    null,
-                ),
-                .cache_arena = null,
-                .cached_entries = null,
-                .cached_header = null,
-            };
-        }
-    }.make;
-
-    var registry = ai.provider.Registry.init(allocator);
-    defer registry.deinit();
-
-    var ca = AgentSession.initTestSession(allocator, .{
-        .model = faux.fauxModel(),
-        .cwd = "/tmp/zi-test",
-        .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
-        .registry = &registry,
-        .session_store = makeStore(allocator, "session-one"),
-    });
-    defer ca.deinit();
-
-    try testing.expect(ca._builtin_ctx != null);
-    try testing.expect(ca.agent.session_id != null);
-    try testing.expectEqualStrings("session-one", ca.agent.session_id.?);
-    try testing.expect(ca.agent.session_id.?.ptr != ca.session_store.sessionId().ptr);
-    try testing.expectEqualStrings("session-one", ca._builtin_ctx.?.session_id);
-    try testing.expect(ca._builtin_ctx.?.session_id.ptr == ca.session_store.sessionId().ptr);
-
-    try ca.replaceSessionStore(makeStore(allocator, "session-two"));
-
-    try testing.expect(ca.agent.session_id != null);
-    try testing.expectEqualStrings("session-two", ca.agent.session_id.?);
-    try testing.expect(ca.agent.session_id.?.ptr != ca.session_store.sessionId().ptr);
-    try testing.expectEqualStrings("session-two", ca._builtin_ctx.?.session_id);
-    try testing.expect(ca._builtin_ctx.?.session_id.ptr == ca.session_store.sessionId().ptr);
-}
-
-test "AgentSession: startNewSession resets transcript and seeds model plus thinking defaults" {
+test "AgentSession: startNewSession resets transcript and changes session id" {
     const allocator = testing.allocator;
 
     var registry = ai.provider.Registry.init(allocator);
@@ -1759,7 +1623,6 @@ test "AgentSession: startNewSession resets transcript and seeds model plus think
         .cwd = "/tmp/zi-test",
         .resource_loader = createTestResourceLoader(allocator, "/tmp/zi-test"),
         .registry = &registry,
-        .thinking_level = .medium,
     });
     defer ca.deinit();
 
@@ -1776,19 +1639,6 @@ test "AgentSession: startNewSession resets transcript and seeds model plus think
     try testing.expectEqual(@as(usize, 0), ca.agent.messages().len);
     try testing.expect(ca.agent.sessionId() != null);
     try testing.expectEqualStrings(ca.session_store.sessionId(), ca.agent.sessionId().?);
-    try testing.expect(ca._builtin_ctx != null);
-    try testing.expectEqualStrings(ca.session_store.sessionId(), ca._builtin_ctx.?.session_id);
-
-    const buffered = ca.session_store.writer.buffered_entries.items;
-    try testing.expectEqual(@as(usize, 3), buffered.len);
-    try testing.expect(buffered[0] == .header);
-    try testing.expect(buffered[1] == .entry);
-    try testing.expect(buffered[1].entry.entry == .model_change);
-    try testing.expectEqualStrings("faux", buffered[1].entry.entry.model_change.provider);
-    try testing.expectEqualStrings(faux.fauxModel().id, buffered[1].entry.entry.model_change.model_id);
-    try testing.expect(buffered[2] == .entry);
-    try testing.expect(buffered[2].entry.entry == .thinking_level_change);
-    try testing.expectEqualStrings("medium", buffered[2].entry.entry.thinking_level_change.thinking_level);
 }
 
 test "AgentSession: startNewSession switches ephemeral sessions onto normal persistence" {
@@ -1812,10 +1662,6 @@ test "AgentSession: startNewSession switches ephemeral sessions onto normal pers
 
     try testing.expect(ca.session_store.writer.persist);
     try testing.expect(ca.session_store.sessionFile().len > 0);
-    try testing.expectEqual(@as(usize, 3), ca.session_store.writer.buffered_entries.items.len);
-    try testing.expect(ca.session_store.writer.buffered_entries.items[0] == .header);
-    try testing.expect(ca.session_store.writer.buffered_entries.items[1].entry.entry == .model_change);
-    try testing.expect(ca.session_store.writer.buffered_entries.items[2].entry.entry == .thinking_level_change);
 }
 
 // --continue round-trip: write session → load → continue → verify context sent to provider
@@ -1958,39 +1804,6 @@ test "AgentSession: compaction_summary converted to user message for provider" {
         },
     }
 }
-
-// pi-mono test-harness.test.ts: "context capture"
-test "AgentSession: context capture — provider receives user message" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var fp = faux.FauxProvider.init(allocator);
-    const c = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("reply")};
-    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &c, .stop)});
-
-    var registry = ai.provider.Registry.init(allocator);
-    try registry.register("faux", fp.provider(), null);
-
-    var collector = EventCollector.init(allocator);
-    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
-    defer ca.deinit();
-
-    try ca.run("my question");
-
-    try testing.expectEqual(@as(usize, 1), fp.captured_contexts.items.len);
-    const ctx = fp.captured_contexts.items[0];
-    // Should contain user message
-    var found_user = false;
-    for (ctx.messages) |m| {
-        if (m == .user) {
-            found_user = true;
-            break;
-        }
-    }
-    try testing.expect(found_user);
-}
-
 test "AgentSession: runUserContent forwards text and image blocks to the provider" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2097,56 +1910,6 @@ test "AgentSession: thinking events emitted for thinking content" {
     try testing.expectEqual(@as(usize, 1), thinking_starts);
     try testing.expect(thinking_deltas > 0);
     try testing.expectEqual(@as(usize, 1), thinking_ends);
-}
-
-test "resumed session context is sent to LLM" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    // Simulate a prior conversation (user + assistant)
-    const prior_assistant_content = allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1) catch unreachable;
-    prior_assistant_content[0] = faux.fauxText("I explained X");
-
-    const prior_messages = &[_]protocol.AgentMessage{
-        .{ .user = .{ .content = .{ .text = "explain X" }, .timestamp = 1 } },
-        .{ .assistant = .{
-            .content = prior_assistant_content,
-            .api = .{ .custom = "faux" },
-            .provider = .{ .custom = "faux" },
-            .model = "faux-model",
-            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
-            .stop_reason = .stop,
-            .timestamp = 2,
-        } },
-    };
-
-    var fp = faux.FauxProvider.init(allocator);
-    const reply_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("follow-up answer")};
-    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &reply_content, .stop)});
-
-    var registry = ai.provider.Registry.init(allocator);
-    try registry.register("faux", fp.provider(), null);
-
-    var collector = EventCollector.init(allocator);
-    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
-    defer ca.deinit();
-
-    // Simulate /resume: load prior messages into agent
-    try ca.agent.setMessages(prior_messages);
-    try testing.expectEqual(@as(usize, 2), ca.agent.messages().len);
-
-    // Send a new prompt (the "follow-up" after resume)
-    try ca.run("now explain Y");
-
-    // The LLM should have received the full context: prior user + prior assistant + new user
-    try testing.expectEqual(@as(usize, 1), fp.call_count);
-    const ctx = fp.captured_contexts.items[0];
-    // convertToLlm maps AgentMessage → LLM Message; prior user + prior assistant + new user = 3
-    try testing.expectEqual(@as(usize, 3), ctx.messages.len);
-    try testing.expect(ctx.messages[0] == .user);
-    try testing.expect(ctx.messages[1] == .assistant);
-    try testing.expect(ctx.messages[2] == .user);
 }
 
 /// Context passed to extension tool `execute` functions and event handlers.

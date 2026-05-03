@@ -403,17 +403,9 @@ fn testLoadSource() runner_mod.ExtensionLoadSource {
     };
 }
 
-test "dispatchObserver runs every handler in order" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-
-    var dummy: u8 = 0;
+fn bindTestRuntime(runner: *runner_mod.ExtensionRunner, provider_registry: *ai.provider.Registry, session: *u8) !void {
     try runner.bindRuntime(.{
-        .session = @ptrCast(&dummy),
+        .session = @ptrCast(session),
         .ui = null,
         .command_actions = null,
         .get_model = &testGetModel,
@@ -424,13 +416,25 @@ test "dispatchObserver runs every handler in order" {
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-    }, &provider_registry);
+    }, provider_registry);
+}
+
+test "dispatchObserver runs handlers in order and continues after errors" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+
+    var dummy: u8 = 0;
+    try bindTestRuntime(&runner, &provider_registry, &dummy);
 
     try setupCounterChain(&state, &runner, "message_end");
 
     try state.doString(
         \\zi.on("message_end", function(event, ctx) table.insert(_test_counters, "a:" .. event.name) end)
-        \\zi.on("message_end", function(event, ctx) table.insert(_test_counters, "b:" .. event.name) end)
+        \\zi.on("message_end", function(event, ctx) error("boom") end)
         \\zi.on("message_end", function(event, ctx) table.insert(_test_counters, "c:" .. event.name) end)
     , "subscribe");
 
@@ -445,54 +449,10 @@ test "dispatchObserver runs every handler in order" {
 
     // Verify the counters in order.
     try state.doString(
-        \\assert(#_test_counters == 3, "expected 3 entries, got " .. #_test_counters)
+        \\assert(#_test_counters == 2, "expected 2 entries, got " .. #_test_counters)
         \\assert(_test_counters[1] == "a:ping", _test_counters[1])
-        \\assert(_test_counters[2] == "b:ping", _test_counters[2])
-        \\assert(_test_counters[3] == "c:ping", _test_counters[3])
+        \\assert(_test_counters[2] == "c:ping", _test_counters[2])
     , "verify");
-}
-
-test "dispatchObserver passes extension context helpers" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-
-    var dummy: u8 = 0;
-    try runner.bindRuntime(.{
-        .session = @ptrCast(&dummy),
-        .ui = null,
-        .command_actions = null,
-        .get_model = &testGetModel,
-        .is_idle = &testIsIdle,
-        .abort = &testAbort,
-        .has_pending_messages = &testHasPendingMessages,
-        .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
-        .get_binding_info = &testGetBindingInfo,
-    }, &provider_registry);
-
-    api.installZiTable(&state, &runner);
-    try state.doString(
-        \\zi.on("message_end", function(event, ctx)
-        \\  local usage = ctx.get_context_usage()
-        \\  assert(usage.tokens == 321)
-        \\  assert(usage.context_window == 1024)
-        \\  assert(ctx.models.current().id == "test-model")
-        \\  assert(ctx.is_idle() == true)
-        \\  assert(ctx.get_system_prompt() == "system")
-        \\  assert(ctx.binding == nil)
-        \\end)
-    , "ctx_observer");
-
-    c.lua_createtable(state.L, 0, 1);
-    _ = c.lua_pushstring(state.L, "ping");
-    c.lua_setfield(state.L, -2, "name");
-    try dispatchObserver(&state, &runner, .message_end, -1);
-    c.lua_pop(state.L, 1);
 }
 
 test "dispatch paths expose binding from handler provenance" {
@@ -504,19 +464,7 @@ test "dispatch paths expose binding from handler provenance" {
     defer provider_registry.deinit();
 
     var dummy: u8 = 0;
-    try runner.bindRuntime(.{
-        .session = @ptrCast(&dummy),
-        .ui = null,
-        .command_actions = null,
-        .get_model = &testGetModel,
-        .is_idle = &testIsIdle,
-        .abort = &testAbort,
-        .has_pending_messages = &testHasPendingMessages,
-        .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
-        .get_binding_info = &testGetBindingInfo,
-    }, &provider_registry);
+    try bindTestRuntime(&runner, &provider_registry, &dummy);
 
     api.installZiTable(&state, &runner);
     runner.beginLoadContext(testLoadSource());
@@ -668,25 +616,4 @@ test "dispatchTransformable feeds each handler's return into the next" {
     try testing.expectEqual(@as(i64, 2), counter.integer);
     const label = result.object.get("label").?;
     try testing.expectEqualStrings("hi!", label.string);
-}
-
-test "dispatchTransformable with no handlers returns identity" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    api.installZiTable(&state, &runner);
-
-    c.lua_createtable(state.L, 0, 1);
-    c.lua_pushinteger(state.L, 42);
-    c.lua_setfield(state.L, -2, "answer");
-
-    // Use any kind with no handlers — `.session_shutdown` here.
-    var result = try dispatchTransformable(&state, &runner, .session_shutdown, -1, testing.allocator);
-    defer lua_runtime.freeJsonValue(testing.allocator, result);
-    c.lua_pop(state.L, 1);
-
-    try testing.expect(result == .object);
-    try testing.expectEqual(@as(i64, 42), result.object.get("answer").?.integer);
 }

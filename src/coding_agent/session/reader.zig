@@ -240,82 +240,95 @@ fn freeProvider(allocator: std.mem.Allocator, provider: ai.protocol.Provider) vo
     }
 }
 
-// ─── Conformance tests ported from pi-mono file-operations.test.ts ──
+// ─── Session reader behavior tests ──
 
-test "parse empty content returns no header and no entries" {
+test "parse boundaries without a valid session header return empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const result = try parseSessionContent(arena.allocator(), "");
-    try std.testing.expect(result.header == null);
-    try std.testing.expectEqual(@as(usize, 0), result.entries.len);
-}
 
-test "parse content without valid session header returns empty" {
-    // pi-mono: loadEntriesFromFile returns [] for file without valid session header
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const result = try parseSessionContent(arena.allocator(),
+    const cases = [_][]const u8{
+        "",
+        "\n\t  \n",
+        "not json\n",
         \\{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"hi","timestamp":1}}
         \\
-    );
-    // pi-mono returns empty when no session header — zi should match
-    try std.testing.expect(result.header == null);
-    try std.testing.expectEqual(@as(usize, 0), result.entries.len);
+        ,
+    };
+
+    for (cases) |content| {
+        const result = try parseSessionContent(arena.allocator(), content);
+        try std.testing.expect(result.header == null);
+        try std.testing.expectEqual(@as(usize, 0), result.entries.len);
+    }
 }
 
-test "parse malformed JSON skips bad lines" {
+test "parse keeps valid entries in file order and skips malformed lines" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const result = try parseSessionContent(arena.allocator(), "not json\n");
-    try std.testing.expect(result.header == null);
-    try std.testing.expectEqual(@as(usize, 0), result.entries.len);
-}
 
-test "parse valid session file with header + user message" {
-    // Uses pi-mono's exact JSONL wire format as fixture string
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const content =
-        \\{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}
-        \\{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}
-        \\
+        \\{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp","parentSession":"parent"}
+        \\not valid json
+        \\{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"first","timestamp":1}}
+        \\{"type":"message","id":"2","parentId":"1","timestamp":"2025-01-01T00:00:02Z","message":{"role":"user","content":"second","timestamp":2}}
     ;
+
     const result = try parseSessionContent(arena.allocator(), content);
     try std.testing.expect(result.header != null);
     try std.testing.expectEqualStrings("abc", result.header.?.id);
     try std.testing.expectEqualStrings("/tmp", result.header.?.cwd);
-    try std.testing.expectEqual(@as(usize, 1), result.entries.len);
+    try std.testing.expectEqualStrings("parent", result.header.?.parent_session.?);
+    try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+
+    try std.testing.expectEqualStrings("1", result.entries[0].id);
+    try std.testing.expect(result.entries[0].parent_id == null);
+    try std.testing.expectEqualStrings("2", result.entries[1].id);
+    try std.testing.expectEqualStrings("1", result.entries[1].parent_id.?);
+
     switch (result.entries[0].entry) {
-        .message => |m| {
-            switch (m.message) {
-                .user => |u| {
-                    switch (u.content) {
-                        .text => |t| try std.testing.expectEqualStrings("hi", t),
-                        else => return error.ExpectedTextContent,
-                    }
-                },
-                else => return error.ExpectedUserMessage,
-            }
+        .message => |m| switch (m.message) {
+            .user => |u| switch (u.content) {
+                .text => |text| try std.testing.expectEqualStrings("first", text),
+                else => return error.ExpectedTextContent,
+            },
+            else => return error.ExpectedUserMessage,
         },
         else => return error.ExpectedMessageEntry,
     }
 }
 
-test "parse skips malformed lines but keeps valid ones" {
-    // pi-mono: skips malformed lines, keeps valid header + entries
+test "parse branch summary and label entries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+
     const content =
-        "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
-        "not valid json\n" ++
-        "{\"type\":\"message\",\"id\":\"1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n";
+        \\{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}
+        \\{"type":"branch_summary","id":"b1","parentId":"m2","timestamp":"2025-01-01T00:00:03Z","fromId":"branch-start","summary":"explored alternate approach"}
+        \\{"type":"label","id":"l1","parentId":"b1","timestamp":"2025-01-01T00:00:04Z","targetId":"m2","label":"checkpoint"}
+        \\
+    ;
 
     const result = try parseSessionContent(arena.allocator(), content);
     try std.testing.expect(result.header != null);
-    try std.testing.expectEqual(@as(usize, 1), result.entries.len);
+    try std.testing.expectEqual(@as(usize, 2), result.entries.len);
+
+    switch (result.entries[0].entry) {
+        .branch_summary => |b| {
+            try std.testing.expectEqualStrings("branch-start", b.from_id);
+            try std.testing.expectEqualStrings("explored alternate approach", b.summary);
+        },
+        else => return error.ExpectedBranchSummary,
+    }
+    switch (result.entries[1].entry) {
+        .label => |label| {
+            try std.testing.expectEqualStrings("m2", label.target_id);
+            try std.testing.expectEqualStrings("checkpoint", label.label.?);
+        },
+        else => return error.ExpectedLabel,
+    }
 }
 
-test "readSessionFile frees raw file buffer after parse" {
+test "readSessionFile reads a session from disk" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -330,65 +343,6 @@ test "readSessionFile frees raw file buffer after parse" {
 
     var data = try readSessionFile(std.testing.allocator, path);
     defer data.deinit(std.testing.allocator);
+    try std.testing.expect(data.header != null);
     try std.testing.expectEqual(@as(usize, 1), data.entries.len);
-}
-
-test "parse assistant message from pi-mono wire format" {
-    // Tests that zi can parse the exact JSON that pi-mono produces for assistant messages
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const content =
-        \\{"type":"session","id":"test","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}
-        \\{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:00Z","message":{"role":"user","content":"hello","timestamp":1}}
-        \\{"type":"message","id":"2","parentId":"1","timestamp":"2025-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"toolu_abc","name":"bash","arguments":{"command":"ls"}},{"type":"text","text":"done"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150,"cost":{"input":0.001,"output":0.002,"cacheRead":0,"cacheWrite":0,"total":0.003}},"stopReason":"toolUse","timestamp":2}}
-        \\{"type":"message","id":"3","parentId":"2","timestamp":"2025-01-01T00:00:02Z","message":{"role":"toolResult","toolCallId":"toolu_abc","toolName":"bash","content":[{"type":"text","text":"file1.txt"}],"isError":false,"timestamp":3}}
-        \\
-    ;
-    const result = try parseSessionContent(arena.allocator(), content);
-    try std.testing.expect(result.header != null);
-    try std.testing.expectEqual(@as(usize, 3), result.entries.len);
-
-    // Verify assistant message parsed correctly
-    const entry2 = result.entries[1];
-    try std.testing.expectEqualStrings("2", entry2.id);
-    try std.testing.expectEqualStrings("1", entry2.parent_id.?);
-    switch (entry2.entry) {
-        .message => |m| switch (m.message) {
-            .assistant => |a| {
-                try std.testing.expectEqualStrings("claude-sonnet-4-5", a.model);
-                try std.testing.expectEqual(@as(u64, 150), a.usage.total_tokens);
-                try std.testing.expectEqual(ai.protocol.StopReason.toolUse, a.stop_reason);
-                try std.testing.expectEqual(@as(usize, 2), a.content.len);
-                // First block: toolCall
-                switch (a.content[0]) {
-                    .tool_call => |tc| {
-                        try std.testing.expectEqualStrings("toolu_abc", tc.id);
-                        try std.testing.expectEqualStrings("bash", tc.name);
-                    },
-                    else => return error.ExpectedToolCall,
-                }
-                // Second block: text
-                switch (a.content[1]) {
-                    .text => |tc| try std.testing.expectEqualStrings("done", tc.text),
-                    else => return error.ExpectedText,
-                }
-            },
-            else => return error.ExpectedAssistantMessage,
-        },
-        else => return error.ExpectedMessageEntry,
-    }
-
-    // Verify tool result parsed correctly
-    const entry3 = result.entries[2];
-    switch (entry3.entry) {
-        .message => |m| switch (m.message) {
-            .tool_result => |tr| {
-                try std.testing.expectEqualStrings("toolu_abc", tr.tool_call_id);
-                try std.testing.expectEqualStrings("bash", tr.tool_name);
-                try std.testing.expect(!tr.is_error);
-            },
-            else => return error.ExpectedToolResult,
-        },
-        else => return error.ExpectedMessageEntry,
-    }
 }

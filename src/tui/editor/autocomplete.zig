@@ -7,7 +7,6 @@ const component_mod = @import("../component.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const buffer_mod = @import("buffer.zig");
 const keybindings = @import("../keybindings.zig");
-const runtime_process = @import("../../zio/root.zig").process;
 
 const Key = keys_mod.Key;
 const Theme = theme_mod.Theme;
@@ -16,8 +15,6 @@ const SelectList = select_list_mod.SelectList;
 const Suggestions = autocomplete_mod.Suggestions;
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const RequestMode = autocomplete_mod.RequestMode;
-const SlashCommandProvider = autocomplete_mod.SlashCommandProvider;
-const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const PromptBuffer = buffer_mod.PromptBuffer;
 const Measurement = component_mod.Measurement;
 
@@ -251,207 +248,199 @@ pub const AutocompleteSession = struct {
 
 const testing = std.testing;
 
-fn hasAsyncSearchBackend() bool {
-    return commandExists("/opt/homebrew/bin/fd") or commandExists("/usr/local/bin/fd") or commandExists("fd") or commandExists("fdfind");
-}
+const TestProvider = struct {
+    items: []const SelectItem = &.{},
+    replacement_text: ?[]const u8 = null,
+    replace_range: autocomplete_mod.ReplaceRange = .{ .start_byte = 0, .end_byte = 0 },
+    result_replace_range: ?autocomplete_mod.ReplaceRange = null,
+    submit_on_confirm: bool = false,
+    refresh_mode: RequestMode = .regular,
+    auto_accept_single_on_tab: bool = false,
+    tick_items: []const SelectItem = &.{},
+    tick_changed: bool = false,
+    tick_auto_accept_single_on_tab: bool = false,
+    request_count: u32 = 0,
+    cancel_count: u32 = 0,
+    apply_count: u32 = 0,
+    last_mode: RequestMode = .regular,
+    last_text: []const u8 = "",
+    last_cursor: u32 = 0,
+    last_applied_value: []const u8 = "",
 
-fn commandExists(command: []const u8) bool {
-    return runtime_process.commandExists(std.heap.page_allocator, std.Options.debug_io, command);
-}
+    const vtable = AutocompleteProvider.VTable{
+        .request = @ptrCast(&requestImpl),
+        .cancel = @ptrCast(&cancelImpl),
+        .apply = @ptrCast(&applyImpl),
+        .tick = @ptrCast(&tickImpl),
+    };
 
-fn driveAsyncTick(session: *AutocompleteSession, buffer: *PromptBuffer) TickOutcome {
-    var now_ns: i128 = 0;
-    var attempts: usize = 0;
-    while (attempts < 8) : (attempts += 1) {
-        const outcome = session.tickAnimation(buffer, now_ns);
-        if (outcome.changed) return outcome;
-        now_ns += 16 * std.time.ns_per_ms;
+    fn provider(self: *TestProvider) AutocompleteProvider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
-    return .{ .changed = false, .accepted = false };
-}
 
-test "AutocompleteSession applies replacement range without borrowing mutable buffer slices" {
-    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
+    fn requestImpl(self: *TestProvider, snapshot: autocomplete_mod.RequestSnapshot, sink: autocomplete_mod.SuggestionSink) void {
+        self.request_count += 1;
+        self.last_mode = snapshot.mode;
+        self.last_text = snapshot.text;
+        self.last_cursor = snapshot.cursor_byte;
+        if (self.items.len == 0) {
+            sink.publish(null);
+            return;
+        }
+        sink.publish(.{
+            .items = self.items,
+            .replace_range = self.replace_range,
+            .submit_on_confirm = self.submit_on_confirm,
+            .refresh_mode = self.refresh_mode,
+            .auto_accept_single_on_tab = self.auto_accept_single_on_tab,
+        });
+    }
 
-    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
-    defer registry.deinit();
+    fn cancelImpl(self: *TestProvider) void {
+        self.cancel_count += 1;
+    }
 
-    var provider = SlashCommandProvider.init(&registry);
+    fn applyImpl(self: *TestProvider, _: []const u8, _: u32, item: *const SelectItem, _: autocomplete_mod.ReplaceRange) ?autocomplete_mod.ApplyResult {
+        self.apply_count += 1;
+        self.last_applied_value = item.value;
+        return .{
+            .replacement_text = self.replacement_text orelse item.value,
+            .cursor_in_replacement = @intCast((self.replacement_text orelse item.value).len),
+            .replace_range = self.result_replace_range,
+        };
+    }
+
+    fn tickImpl(self: *TestProvider, _: i128, sink: autocomplete_mod.SuggestionSink) bool {
+        if (!self.tick_changed) return false;
+        self.tick_changed = false;
+        if (self.tick_items.len == 0) {
+            sink.publish(null);
+            return true;
+        }
+        sink.publish(.{
+            .items = self.tick_items,
+            .replace_range = self.replace_range,
+            .auto_accept_single_on_tab = self.tick_auto_accept_single_on_tab,
+        });
+        return true;
+    }
+};
+
+test "AutocompleteSession activates, preserves selection, and applies provider result" {
+    const items = [_]SelectItem{
+        .{ .value = "alpha", .label = "alpha" },
+        .{ .value = "beta", .label = "beta" },
+    };
+    var provider = TestProvider{
+        .items = &items,
+        .replace_range = .{ .start_byte = 4, .end_byte = 6 },
+        .submit_on_confirm = true,
+    };
     var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
     defer buffer.deinit();
-    buffer.setText("/mo");
+    buffer.setTextAndCursor("say al tail", 6);
 
-    session.refresh(&buffer);
+    try testing.expectEqual(InputOutcome.consumed, session.processInput(.{ .code = .tab }, &buffer));
     try testing.expect(session.isActive());
+    try testing.expectEqual(@as(u32, 1), provider.request_count);
+    try testing.expectEqual(RequestMode.force, provider.last_mode);
 
-    const filler = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-    buffer.insertAtCursor(filler);
-
-    const outcome = session.processInput(.{ .code = .tab }, &buffer);
-    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
-    try testing.expectEqualStrings("/model " ++ filler, buffer.text());
-    try testing.expect(!session.isActive());
-}
-
-test "AutocompleteSession enter accepts slash command selection and requests submit" {
-    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
-
-    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    var provider = SlashCommandProvider.init(&registry);
-    var session = AutocompleteSession.init(themes_builtin.dark());
-    session.setProvider(provider.provider());
-
-    var buffer = PromptBuffer.init(testing.allocator);
-    defer buffer.deinit();
-    buffer.setText("/mo");
-
-    session.refresh(&buffer);
-    try testing.expect(session.isActive());
-
+    try testing.expectEqual(InputOutcome.consumed, session.processInput(.{ .code = .down }, &buffer));
     const outcome = session.processInput(.{ .code = .enter }, &buffer);
+
     try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = true } }, outcome);
-    try testing.expectEqualStrings("/model ", buffer.text());
+    try testing.expectEqualStrings("say beta tail", buffer.text());
+    try testing.expectEqualStrings("beta", provider.last_applied_value);
+    try testing.expectEqual(@as(u32, 1), provider.apply_count);
     try testing.expect(!session.isActive());
 }
 
-fn makeCombinedProvider(registry: *const @import("../../coding_agent/slash_commands.zig").CommandRegistry, cwd: []const u8) CombinedAutocompleteProvider {
-    return CombinedAutocompleteProvider.init(testing.allocator, std.Options.debug_io, registry, cwd);
-}
-
-test "AutocompleteSession enter accepts file completion without submit" {
-    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.Options.debug_io, "src");
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const x = 1;" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    var provider = makeCombinedProvider(&registry, cwd);
-    defer provider.deinit();
+test "AutocompleteSession honors provider replacement range over stale editor text" {
+    const items = [_]SelectItem{.{ .value = "model", .label = "model" }};
+    var provider = TestProvider{
+        .items = &items,
+        .replace_range = .{ .start_byte = 0, .end_byte = 3 },
+        .replacement_text = "/model ",
+    };
     var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
     defer buffer.deinit();
-    buffer.setText("./src/ma");
-
+    buffer.setText("/mo");
     session.refresh(&buffer);
     try testing.expect(session.isActive());
 
-    const outcome = session.processInput(.{ .code = .enter }, &buffer);
+    buffer.insertAtCursor(" extra");
+    const outcome = session.processInput(.{ .code = .tab }, &buffer);
+
     try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
-    try testing.expectEqualStrings("./src/main.zig", buffer.text());
+    try testing.expectEqualStrings("/model  extra", buffer.text());
     try testing.expect(!session.isActive());
 }
 
-test "AutocompleteSession fuzzy-matches local path segment" {
-    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.Options.debug_io, "src");
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const x = 1;" });
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/other.txt", .data = "hello" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    var provider = makeCombinedProvider(&registry, cwd);
-    defer provider.deinit();
+test "AutocompleteSession cancels on provider boundaries and keeps text edits unhandled" {
+    var provider = TestProvider{};
     var session = AutocompleteSession.init(themes_builtin.dark());
-    session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
     defer buffer.deinit();
-    buffer.setText("./src/mz");
+    buffer.setText("hello");
 
+    try testing.expectEqual(InputOutcome.unhandled, session.processInput(.{ .code = .tab }, &buffer));
+
+    const items = [_]SelectItem{.{ .value = "hello", .label = "hello" }};
+    provider.items = &items;
+    provider.replace_range = .{ .start_byte = 0, .end_byte = 5 };
+    session.setProvider(provider.provider());
     session.refresh(&buffer);
     try testing.expect(session.isActive());
-    try testing.expectEqualStrings("main.zig", session.list.getSelectedItem().?.label);
 
-    const outcome = session.processInput(.{ .code = .enter }, &buffer);
-    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
-    try testing.expectEqualStrings("./src/main.zig", buffer.text());
+    try testing.expectEqual(InputOutcome.unhandled, session.processInput(.{ .code = .char, .char = 'x' }, &buffer));
+    try testing.expect(session.isActive());
+
+    try testing.expectEqual(InputOutcome.cancelled, session.processInput(.{ .code = .escape }, &buffer));
+    try testing.expect(!session.isActive());
+    try testing.expectEqual(@as(u32, 1), provider.cancel_count);
+
+    provider.items = &.{};
+    session.refresh(&buffer);
+    try testing.expect(!session.isActive());
+    try testing.expectEqual(@as(u32, 2), provider.cancel_count);
 }
 
-test "AutocompleteSession tab on directory completion refreshes into the expanded directory" {
-    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.Options.debug_io, "src");
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/main.zig", .data = "const x = 1;" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    var provider = makeCombinedProvider(&registry, cwd);
-    defer provider.deinit();
+test "AutocompleteSession refreshes after directory-like accept and auto-accepts tick result" {
+    const dir_items = [_]SelectItem{.{ .value = "./src/", .label = "src/" }};
+    const file_items = [_]SelectItem{.{ .value = "./src/main.zig", .label = "main.zig" }};
+    var provider = TestProvider{
+        .items = &dir_items,
+        .tick_items = &file_items,
+        .replace_range = .{ .start_byte = 0, .end_byte = 4 },
+        .tick_changed = true,
+        .tick_auto_accept_single_on_tab = true,
+    };
     var session = AutocompleteSession.init(themes_builtin.dark());
     session.setProvider(provider.provider());
 
     var buffer = PromptBuffer.init(testing.allocator);
     defer buffer.deinit();
     buffer.setText("./sr");
-
     session.refresh(&buffer);
-    try testing.expect(session.isActive());
-    try testing.expectEqualStrings("src/", session.list.getSelectedItem().?.label);
 
-    const outcome = session.processInput(.{ .code = .tab }, &buffer);
-    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
+    provider.items = &file_items;
+    provider.replace_range = .{ .start_byte = 0, .end_byte = 6 };
+    try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, session.processInput(.{ .code = .tab }, &buffer));
     try testing.expectEqualStrings("./src/", buffer.text());
     try testing.expect(session.isActive());
     try testing.expectEqualStrings("main.zig", session.list.getSelectedItem().?.label);
-}
 
-test "AutocompleteSession tab force-completes a single at-file suggestion after async tick" {
-    if (!hasAsyncSearchBackend()) return error.SkipZigTest;
-
-    const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
-    defer registry.deinit();
-
-    var provider = makeCombinedProvider(&registry, cwd);
-    defer provider.deinit();
-    var session = AutocompleteSession.init(themes_builtin.dark());
-    session.setProvider(provider.provider());
-
-    var buffer = PromptBuffer.init(testing.allocator);
-    defer buffer.deinit();
-    buffer.setText("@no");
-
-    const first = session.processInput(.{ .code = .tab }, &buffer);
-    try testing.expectEqual(InputOutcome.consumed, first);
-
-    const tick = driveAsyncTick(&session, &buffer);
+    provider.replace_range = .{ .start_byte = 0, .end_byte = 6 };
+    const tick = session.tickAnimation(&buffer, 0);
     try testing.expect(tick.changed);
     try testing.expect(tick.accepted);
-    try testing.expectEqualStrings("@notes.md ", buffer.text());
+    try testing.expectEqualStrings("./src/main.zig", buffer.text());
     try testing.expect(!session.isActive());
 }

@@ -244,7 +244,7 @@ test "memory file round-trips content" {
     try std.testing.expectEqualStrings("hello world", content);
 }
 
-test "locked file acquire and release" {
+test "locked file round-trips content and releases lock" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -258,9 +258,17 @@ test "locked file acquire and release" {
     defer lf.deinit();
 
     try std.testing.expect(lf.acquireLock());
+    defer lf.releaseLock();
+
     tmp.dir.access(std.Options.debug_io, "test.json.lock", .{}) catch |err| {
         return if (err == error.FileNotFound) error.TestUnexpectedResult else err;
     };
+
+    try lf.writeContent("{\"ok\":true}");
+    const content = lf.readContent(allocator) orelse return error.TestUnexpectedResult;
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("{\"ok\":true}", content);
+
     lf.releaseLock();
     tmp.dir.access(std.Options.debug_io, "test.json.lock", .{}) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -269,35 +277,30 @@ test "locked file acquire and release" {
     return error.TestUnexpectedResult;
 }
 
-test "encodeCwd encodes paths matching pi-mono format" {
+test "storage path contracts" {
     const allocator = std.testing.allocator;
 
-    const r1 = try encodeCwd(allocator, "/Users/foo/bar");
-    defer allocator.free(r1);
-    try std.testing.expectEqualStrings("--Users-foo-bar--", r1);
+    const encoded = try encodeCwd(allocator, "/Users/foo/bar");
+    defer allocator.free(encoded);
+    try std.testing.expectEqualStrings("--Users-foo-bar--", encoded);
 
-    const r2 = try encodeCwd(allocator, "/tmp");
-    defer allocator.free(r2);
-    try std.testing.expectEqualStrings("--tmp--", r2);
-}
+    const windows_encoded = try encodeCwd(allocator, "C:\\Users\\foo\\bar");
+    defer allocator.free(windows_encoded);
+    try std.testing.expectEqualStrings("--C--Users-foo-bar--", windows_encoded);
 
-test "getProjectDir joins cwd with .zi" {
-    const allocator = std.testing.allocator;
-    const dir = try getProjectDir(allocator, "/home/user/project");
-    defer allocator.free(dir);
-    try std.testing.expectEqualStrings("/home/user/project/.zi", dir);
-}
+    const project_dir = try getProjectDir(allocator, "/home/user/project");
+    defer allocator.free(project_dir);
+    try std.testing.expectEqualStrings("/home/user/project/.zi", project_dir);
 
-test "getMemoryDiagnosticsDir nests under agent diagnostics" {
-    const allocator = std.testing.allocator;
-    const dir = try getMemoryDiagnosticsDir(allocator, "/tmp/zi-agent");
-    defer allocator.free(dir);
-    try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/memory", dir);
-}
+    const session_dir = try getSessionDirForCwd(allocator, "/Users/foo/bar", "/tmp/zi-agent");
+    defer allocator.free(session_dir);
+    try std.testing.expectEqualStrings("/tmp/zi-agent/sessions/--Users-foo-bar--", session_dir);
 
-test "getLogDiagnosticsDir nests under agent diagnostics" {
-    const allocator = std.testing.allocator;
-    const dir = try getLogDiagnosticsDir(allocator, "/tmp/zi-agent");
-    defer allocator.free(dir);
-    try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/logs", dir);
+    const memory_diagnostics_dir = try getMemoryDiagnosticsDir(allocator, "/tmp/zi-agent");
+    defer allocator.free(memory_diagnostics_dir);
+    try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/memory", memory_diagnostics_dir);
+
+    const log_diagnostics_dir = try getLogDiagnosticsDir(allocator, "/tmp/zi-agent");
+    defer allocator.free(log_diagnostics_dir);
+    try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/logs", log_diagnostics_dir);
 }

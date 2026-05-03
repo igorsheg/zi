@@ -709,6 +709,44 @@ fn parseThinkingFormat(
 
 const testing = std.testing;
 
+const test_provider = struct {
+    fn stream(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.StreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
+    fn streamSimple(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.SimpleStreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
+    fn getName(_: *anyopaque) []const u8 {
+        return "baseline";
+    }
+    fn deinit(_: *anyopaque) void {}
+
+    const vtable: provider_mod.Provider.VTable = .{
+        .stream = stream,
+        .stream_simple = streamSimple,
+        .get_name = getName,
+        .deinit = deinit,
+    };
+};
+
+fn registerAnthropicBaseline(providers: *provider_mod.Registry) !void {
+    try providers.register("anthropic-messages", .{
+        .ptr = undefined,
+        .vtable = &test_provider.vtable,
+    }, null);
+}
+
+fn testModel(id: []const u8, provider: protocol.Provider) protocol.Model {
+    return .{
+        .id = id,
+        .name = "Test Model",
+        .api = .openai_completions,
+        .provider = provider,
+        .base_url = "https://example.com",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 4096,
+        .max_tokens = 4096,
+    };
+}
+
 fn testClaimModelRegistration(allocator: std.mem.Allocator) !provider_mod.ClaimModelRegistration {
     return .{
         .id = try allocator.dupe(u8, "proxy-model"),
@@ -721,72 +759,38 @@ fn testClaimModelRegistration(allocator: std.mem.Allocator) !provider_mod.ClaimM
     };
 }
 
-test "registry returns all built-in models when custom is empty" {
-    const alloc = testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
-    defer auth.deinit();
-    var reg = try ModelRegistry.init(alloc, &auth, &.{});
-    defer reg.deinit();
-
-    try testing.expectEqual(generated.models.len, reg.getAll().len);
-    try testing.expectEqualStrings(generated.models[0].id, reg.getAll()[0].id);
-}
-
-test "find by provider+id matches anthropic claude-opus-4-6" {
-    const alloc = testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
-    defer auth.deinit();
-    var reg = try ModelRegistry.init(alloc, &auth, &.{});
-    defer reg.deinit();
-
-    const m = reg.find(.anthropic, "claude-opus-4-6") orelse
-        return error.MissingCatalogEntry;
-    try testing.expectEqualStrings("claude-opus-4-6", m.id);
-    try testing.expect(std.meta.eql(m.provider, protocol.Provider.anthropic));
-}
-
-test "rebuild includes active provider claim models with honest provider identity" {
+test "registry exposes built-ins, custom models, and exact lookups" {
     const alloc = testing.allocator;
     var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
     defer auth.deinit();
 
-    const custom: protocol.Model = .{
-        .id = "my-model",
-        .name = "My Model",
-        .api = .openai_completions,
-        .provider = .{ .custom = "my-provider" },
-        .base_url = "https://example.com",
-        .reasoning = false,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 4096,
-        .max_tokens = 4096,
-    };
+    const custom = testModel("my-model", .{ .custom = "my-provider" });
     var reg = try ModelRegistry.init(alloc, &auth, &.{custom});
+    defer reg.deinit();
+
+    try testing.expectEqual(generated.models.len + 1, reg.getAll().len);
+    try testing.expectEqualStrings(generated.models[0].id, reg.getAll()[0].id);
+
+    const built_in = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    try testing.expectEqualStrings("claude-opus-4-6", built_in.id);
+    try testing.expect(std.meta.eql(protocol.Provider.anthropic, built_in.provider));
+
+    const custom_by_name = reg.findByProviderName("my-provider", "my-model") orelse return error.MissingCatalogEntry;
+    try testing.expectEqualStrings("Test Model", custom_by_name.name);
+    try testing.expect(reg.find(.anthropic, "CLAUDE-OPUS-4-6") == null);
+    try testing.expect(reg.find(.openai, "claude-opus-4-6") == null);
+}
+
+test "active provider claims extend catalog without changing built-in identity" {
+    const alloc = testing.allocator;
+    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
+    defer auth.deinit();
+    var reg = try ModelRegistry.init(alloc, &auth, &.{});
     defer reg.deinit();
 
     var providers = provider_mod.Registry.init(alloc);
     defer providers.deinit();
-    const baseline = try alloc.create(provider_mod.Provider);
-    defer alloc.destroy(baseline);
-    baseline.* = .{
-        .ptr = undefined,
-        .vtable = &struct {
-            fn stream(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.StreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
-            fn streamSimple(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.SimpleStreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
-            fn getName(_: *anyopaque) []const u8 {
-                return "baseline";
-            }
-            fn deinit(_: *anyopaque) void {}
-            const table: provider_mod.Provider.VTable = .{
-                .stream = stream,
-                .stream_simple = streamSimple,
-                .get_name = getName,
-                .deinit = deinit,
-            };
-        }.table,
-    };
-    try providers.register("anthropic-messages", baseline.*, null);
+    try registerAnthropicBaseline(&providers);
 
     const claim_models = try alloc.alloc(provider_mod.ClaimModelRegistration, 1);
     claim_models[0] = try testClaimModelRegistration(alloc);
@@ -802,109 +806,32 @@ test "rebuild includes active provider claim models with honest provider identit
 
     try reg.rebuildFromActiveProviderClaims(&providers);
 
-    try testing.expectEqual(generated.models.len + 2, reg.getAll().len);
+    try testing.expectEqual(generated.models.len + 1, reg.getAll().len);
     const claim_model = reg.find(.{ .custom = "proxy-a" }, "proxy-model") orelse return error.MissingCatalogEntry;
     try testing.expectEqualStrings("Proxy Model", claim_model.name);
     try testing.expectEqualStrings("https://proxy-a.example", claim_model.base_url);
     try testing.expectEqual(@as(usize, 2), claim_model.input.len);
+    try testing.expect(std.meta.eql(protocol.Api.anthropic_messages, claim_model.api));
+
+    const built_in = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    try testing.expectEqualStrings("anthropic", json_util.providerToString(built_in.provider));
 }
 
-test "rebuild keeps built-in visible provider identity while override claims survive generation teardown" {
+test "auth visibility includes stored keys and claim api_key without leaking provider headers" {
     const alloc = testing.allocator;
     var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
     defer auth.deinit();
+    auth.setRuntimeApiKey("anthropic", "stored-key");
+
     var reg = try ModelRegistry.init(alloc, &auth, &.{});
     defer reg.deinit();
 
-    var providers = provider_mod.Registry.init(alloc);
-    defer providers.deinit();
-    const baseline = try alloc.create(provider_mod.Provider);
-    defer alloc.destroy(baseline);
-    baseline.* = .{
-        .ptr = undefined,
-        .vtable = &struct {
-            fn stream(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.StreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
-            fn streamSimple(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.SimpleStreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
-            fn getName(_: *anyopaque) []const u8 {
-                return "baseline";
-            }
-            fn deinit(_: *anyopaque) void {}
-            const table: provider_mod.Provider.VTable = .{
-                .stream = stream,
-                .stream_simple = streamSimple,
-                .get_name = getName,
-                .deinit = deinit,
-            };
-        }.table,
-    };
-    try providers.register("anthropic-messages", baseline.*, null);
-
-    const first: provider_mod.ClaimRegistration = .{
-        .name = try alloc.dupe(u8, "anthropic"),
-        .api = try alloc.dupe(u8, "anthropic-messages"),
-        .base_url = try alloc.dupe(u8, "https://gen1.example"),
-        .owner_id = try alloc.dupe(u8, "ext-shared"),
-        .generation = 1,
-    };
-    try testing.expect(try providers.registerClaim(first));
-
-    const second: provider_mod.ClaimRegistration = .{
-        .name = try alloc.dupe(u8, "anthropic"),
-        .api = try alloc.dupe(u8, "anthropic-messages"),
-        .base_url = try alloc.dupe(u8, "https://gen2.example"),
-        .owner_id = try alloc.dupe(u8, "ext-shared"),
-        .generation = 2,
-    };
-    try testing.expect(try providers.registerClaim(second));
-
-    try reg.rebuildFromActiveProviderClaims(&providers);
-    const built_in_before = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    try testing.expectEqualStrings(json_util.providerToString(built_in_before.provider), "anthropic");
-    try testing.expectEqualStrings("https://gen1.example", providers.activeClaimRegistrationByName("anthropic").?.base_url);
-
-    try providers.unregisterClaimsByGeneration(1);
-    try reg.rebuildFromActiveProviderClaims(&providers);
-
-    const built_in_after = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    try testing.expectEqualStrings(json_util.providerToString(built_in_after.provider), "anthropic");
-    try testing.expectEqualStrings("https://gen2.example", providers.activeClaimRegistrationByName("anthropic").?.base_url);
-
-    try providers.unregisterClaimsByGeneration(2);
-    try reg.rebuildFromActiveProviderClaims(&providers);
-
-    const built_in_restored = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
-    try testing.expectEqualStrings(json_util.providerToString(built_in_restored.provider), "anthropic");
-}
-
-test "claim-backed models report configured auth from provider api_key without leaking provider headers" {
-    const alloc = testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
-    defer auth.deinit();
-    var reg = try ModelRegistry.init(alloc, &auth, &.{});
-    defer reg.deinit();
+    const built_in = reg.find(.anthropic, "claude-opus-4-6") orelse return error.MissingCatalogEntry;
+    try testing.expect(reg.hasConfiguredAuth(built_in));
 
     var providers = provider_mod.Registry.init(alloc);
     defer providers.deinit();
-    const baseline = try alloc.create(provider_mod.Provider);
-    defer alloc.destroy(baseline);
-    baseline.* = .{
-        .ptr = undefined,
-        .vtable = &struct {
-            fn stream(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.StreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
-            fn streamSimple(_: *anyopaque, _: std.mem.Allocator, _: protocol.Model, _: protocol.Context, _: protocol.SimpleStreamOptions, _: provider_mod.EventCallback, _: ?*anyopaque) void {}
-            fn getName(_: *anyopaque) []const u8 {
-                return "baseline";
-            }
-            fn deinit(_: *anyopaque) void {}
-            const table: provider_mod.Provider.VTable = .{
-                .stream = stream,
-                .stream_simple = streamSimple,
-                .get_name = getName,
-                .deinit = deinit,
-            };
-        }.table,
-    };
-    try providers.register("anthropic-messages", baseline.*, null);
+    try registerAnthropicBaseline(&providers);
 
     const claim_models = try alloc.alloc(provider_mod.ClaimModelRegistration, 1);
     claim_models[0] = try testClaimModelRegistration(alloc);
@@ -935,11 +862,21 @@ test "claim-backed models report configured auth from provider api_key without l
         .models = claim_models,
     };
     try testing.expect(try providers.registerClaim(claim));
-
     try reg.rebuildFromActiveProviderClaims(&providers);
 
     const claim_model = reg.find(.{ .custom = "proxy-auth" }, "proxy-model") orelse return error.MissingCatalogEntry;
     try testing.expect(reg.hasConfiguredAuth(claim_model));
+
+    const available = try reg.getAvailable(alloc);
+    defer alloc.free(available);
+    var saw_claim = false;
+    for (available) |model| {
+        if (providersEqual(model.provider, .{ .custom = "proxy-auth" }) and std.mem.eql(u8, model.id, "proxy-model")) {
+            saw_claim = true;
+        }
+    }
+    try testing.expect(saw_claim);
+
     try testing.expect(claim_model.headers != null);
     try testing.expectEqual(@as(usize, 1), claim_model.headers.?.len);
     try testing.expectEqualStrings("x-model", claim_model.headers.?[0].key);
@@ -947,18 +884,4 @@ test "claim-backed models report configured auth from provider api_key without l
     for (claim_model.headers.?) |header| {
         try testing.expect(!std.mem.eql(u8, header.key, "x-provider"));
     }
-}
-
-test "hasConfiguredAuth delegates to AuthStorage.hasAuth" {
-    const alloc = testing.allocator;
-    var auth = try auth_storage_mod.AuthStorage.create(alloc, null);
-    defer auth.deinit();
-    auth.setRuntimeApiKey("anthropic", "test-key");
-
-    var reg = try ModelRegistry.init(alloc, &auth, &.{});
-    defer reg.deinit();
-
-    const m = reg.find(.anthropic, "claude-opus-4-6") orelse
-        return error.MissingCatalogEntry;
-    try testing.expect(reg.hasConfiguredAuth(m));
 }

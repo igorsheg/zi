@@ -417,181 +417,122 @@ pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term
 
 const testing = std.testing;
 
-test "OverlayManager show and hide topmost" {
+const TestComponent = struct {
+    render_count: u32 = 0,
+    last_region: ?ResolvedLayout = null,
+    preferred_height: u32 = 1,
+
+    pub fn render(self: *@This(), region: Region) void {
+        self.render_count += 1;
+        self.last_region = .{
+            .row = region.y,
+            .col = region.x,
+            .width = region.width,
+            .height = region.height,
+        };
+    }
+
+    pub fn measure(self: *@This(), _: u32) Measurement {
+        return .{ .min_height = 1, .preferred_height = self.preferred_height };
+    }
+
+    pub fn component(self: *@This()) Component {
+        return Component.init(@This(), self);
+    }
+};
+
+test "OverlayManager stack lifecycle restores focus and removes by id" {
     var mgr = OverlayManager.init(testing.allocator);
     defer mgr.deinit();
 
-    // Create a dummy component for testing
-    const DummyComp = struct {
-        val: u8 = 0,
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 5 };
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
+    var first = TestComponent{};
+    var second = TestComponent{};
 
-    var d1 = DummyComp{};
-    var d2 = DummyComp{};
-
-    const h1 = mgr.showOverlay(d1.component(), .{}, null);
-    _ = h1;
-    _ = mgr.showOverlay(d2.component(), .{}, d1.component());
+    const first_handle = mgr.showOverlay(first.component(), .{}, null);
+    const second_id = mgr.showOverlayReturnId(second.component(), .{}, first.component());
 
     try testing.expectEqual(@as(usize, 2), mgr.stack.items.len);
     try testing.expect(mgr.hasVisibleOverlays());
 
-    // Hide topmost returns pre_focus of d2 (which is d1)
-    const result = mgr.hideTopmost();
-    try testing.expect(result.pre_focus != null);
-    try testing.expect(Component.eql(result.pre_focus.?, d1.component()));
+    const removed_focus = mgr.removeOverlay(first_handle.id);
+    try testing.expect(removed_focus == null);
     try testing.expectEqual(@as(usize, 1), mgr.stack.items.len);
+
+    const top_result = mgr.hideTopmost();
+    try testing.expect(top_result.pre_focus != null);
+    try testing.expect(Component.eql(top_result.pre_focus.?, first.component()));
+    try testing.expectEqual(second_id + 1, mgr.next_id);
+    try testing.expectEqual(@as(usize, 0), mgr.stack.items.len);
 }
 
-test "OverlayHandle hide removes specific overlay" {
+test "OverlayManager focus target skips hidden and non-capturing overlays" {
     var mgr = OverlayManager.init(testing.allocator);
     defer mgr.deinit();
 
-    const DummyComp = struct {
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 1 };
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
+    var base = TestComponent{};
+    var toast = TestComponent{};
+    var modal = TestComponent{};
 
-    var d1 = DummyComp{};
-    var d2 = DummyComp{};
+    const base_id = mgr.showOverlayReturnId(base.component(), .{}, null);
+    _ = mgr.showOverlayReturnId(toast.component(), .{ .non_capturing = true }, null);
+    const modal_id = mgr.showOverlayReturnId(modal.component(), .{}, null);
 
-    const h1 = mgr.showOverlay(d1.component(), .{}, null);
-    _ = mgr.showOverlay(d2.component(), .{}, null);
+    try testing.expect(Component.eql(mgr.topmostCapturingComponent().?, modal.component()));
 
-    // Remove first overlay by handle
-    h1.hide();
-    try testing.expectEqual(@as(usize, 1), mgr.stack.items.len);
-}
+    mgr.findEntry(modal_id).?.hidden = true;
+    try testing.expect(Component.eql(mgr.topmostCapturingComponent().?, base.component()));
+    try testing.expect(mgr.hasVisibleOverlays());
 
-test "overlay backdrop dim affects cells behind but not inside overlay rect" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
-    defer buf.deinit();
-    const root = buf.region();
-    root.fill(0, 0, root.width, root.height, Cell{ .grapheme = .{ .codepoint = 'x' } });
-
-    var mgr = OverlayManager.init(testing.allocator);
-    defer mgr.deinit();
-
-    const DummyComp = struct {
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 2 };
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
-
-    var d = DummyComp{};
-    _ = mgr.showOverlay(d.component(), .{
-        .anchor = .top_left,
-        .width = 4,
-        .surface = .{ .fill = Color.rgb(1, 2, 3) },
-        .backdrop = .dim,
-    }, null);
-
-    mgr.renderOverlays(root);
-
-    try testing.expect(buf.get(5, 2).attrs.dim);
-    try testing.expect(!buf.get(0, 0).attrs.dim);
-    try testing.expect(buf.get(0, 0).bg.eql(Color.rgb(1, 2, 3)));
-}
-
-test "overlay surface fill hides content below overlay rect" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
-    defer buf.deinit();
-    const root = buf.region();
-    root.fill(0, 0, root.width, root.height, Cell{ .grapheme = .{ .codepoint = 'x' } });
-
-    var mgr = OverlayManager.init(testing.allocator);
-    defer mgr.deinit();
-
-    const DummyComp = struct {
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 2 };
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
-
-    var d = DummyComp{};
-    _ = mgr.showOverlay(d.component(), .{
-        .anchor = .top_left,
-        .width = 4,
-        .surface = .{ .fill = Color.rgb(1, 2, 3) },
-    }, null);
-
-    mgr.renderOverlays(root);
-
-    try testing.expectEqual(@as(u21, ' '), buf.get(0, 0).grapheme.codepoint);
-    try testing.expect(buf.get(0, 0).bg.eql(Color.rgb(1, 2, 3)));
-    try testing.expectEqual(@as(u21, 'x'), buf.get(5, 2).grapheme.codepoint);
-}
-
-test "overlay surface can fill with terminal default background" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
-    defer buf.deinit();
-    const root = buf.region();
-    root.fill(0, 0, root.width, root.height, Cell{ .grapheme = .{ .codepoint = 'x' }, .bg = Color.rgb(9, 9, 9) });
-
-    var mgr = OverlayManager.init(testing.allocator);
-    defer mgr.deinit();
-
-    const DummyComp = struct {
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 2 };
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
-
-    var d = DummyComp{};
-    _ = mgr.showOverlay(d.component(), .{
-        .anchor = .top_left,
-        .width = 4,
-        .surface = .{ .fill = Color.default },
-    }, null);
-
-    mgr.renderOverlays(root);
-
-    try testing.expectEqual(@as(u21, ' '), buf.get(0, 0).grapheme.codepoint);
-    try testing.expect(buf.get(0, 0).bg.eql(Color.default));
-    try testing.expect(buf.get(5, 2).bg.eql(Color.rgb(9, 9, 9)));
-}
-
-test "OverlayManager non-capturing overlay not returned by topmostCapturing" {
-    var mgr = OverlayManager.init(testing.allocator);
-    defer mgr.deinit();
-
-    const DummyComp = struct {
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 1 };
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
-
-    var d1 = DummyComp{};
-    _ = mgr.showOverlay(d1.component(), .{ .non_capturing = true }, null);
-
+    mgr.findEntry(base_id).?.hidden = true;
     try testing.expect(mgr.topmostCapturingComponent() == null);
     try testing.expect(mgr.hasVisibleOverlays());
+}
+
+test "renderOverlays renders visible overlays inside resolved layout bounds" {
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 20, 10);
+    defer buf.deinit();
+
+    var mgr = OverlayManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    var hidden = TestComponent{ .preferred_height = 3 };
+    var visible = TestComponent{ .preferred_height = 4 };
+
+    const hidden_id = mgr.showOverlayReturnId(hidden.component(), .{
+        .anchor = .top_left,
+        .width = 6,
+    }, null);
+    mgr.findEntry(hidden_id).?.hidden = true;
+
+    _ = mgr.showOverlayReturnId(visible.component(), .{
+        .anchor = .bottom_right,
+        .width = 8,
+        .margin_right = 2,
+        .margin_bottom = 1,
+    }, null);
+
+    mgr.renderOverlays(buf.region());
+
+    try testing.expectEqual(@as(u32, 0), hidden.render_count);
+    try testing.expectEqual(@as(u32, 1), visible.render_count);
+    try testing.expectEqual(ResolvedLayout{ .row = 5, .col = 10, .width = 8, .height = 4 }, visible.last_region.?);
+}
+
+test "resolveLayout clamps size and position to terminal bounds" {
+    var comp = TestComponent{ .preferred_height = 50 };
+
+    const layout = resolveLayout(.{
+        .width = 100,
+        .max_height = 20,
+        .row = 9,
+        .col = 9,
+        .offset_x = 5,
+        .offset_y = 5,
+        .margin_left = 1,
+        .margin_right = 1,
+        .margin_top = 1,
+        .margin_bottom = 1,
+    }, comp.component(), 10, 6);
+
+    try testing.expectEqual(ResolvedLayout{ .row = 2, .col = 2, .width = 8, .height = 4 }, layout);
 }

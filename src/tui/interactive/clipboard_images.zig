@@ -222,37 +222,39 @@ fn pngHeader(width: u32, height: u32) [24]u8 {
     };
 }
 
-test "prepareClipboardImageAttachment accepts clipboard png within inline policy" {
-    const png = pngHeader(64, 32);
-    var prepared = try prepareClipboardImageAttachment(testing.allocator, &png, .{});
-    defer prepared.deinit(testing.allocator);
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
 
-    switch (prepared) {
+test "prepareClipboardImageAttachment summarizes accepted images and rejects resize-required images" {
+    const png = pngHeader(64, 32);
+    var accepted = try prepareClipboardImageAttachment(testing.allocator, &png, .{});
+    defer accepted.deinit(testing.allocator);
+
+    switch (accepted) {
         .attach => |attachment| {
             try testing.expectEqualStrings("image/png", attachment.image.mime_type);
             try testing.expectEqual(image_mod.Dimensions{ .width = 64, .height = 32 }, attachment.dimensions.?);
         },
         .rejected => return error.ExpectedClipboardAttachment,
     }
-}
 
-test "prepareClipboardImageAttachment rejects oversized clipboard image when auto resize is enabled" {
-    const png = pngHeader(640, 480);
-    var prepared = try prepareClipboardImageAttachment(testing.allocator, &png, .{
+    const oversized_png = pngHeader(640, 480);
+    var rejected = try prepareClipboardImageAttachment(testing.allocator, &oversized_png, .{
         .auto_resize = true,
         .max_width = 100,
         .max_height = 100,
         .max_base64_bytes = 1024,
     });
-    defer prepared.deinit(testing.allocator);
+    defer rejected.deinit(testing.allocator);
 
-    switch (prepared) {
-        .rejected => |message| try testing.expect(std.mem.indexOf(u8, message, image_mod.omittedInlineNote()) != null),
+    switch (rejected) {
+        .rejected => |message| try expectContains(message, image_mod.omittedInlineNote()),
         .attach => return error.ExpectedClipboardRejection,
     }
 }
 
-test "buildSubmittedUserContent preserves inline image marker placement" {
+test "buildSubmittedUserContent preserves marker order and appends unmarked pending images" {
     const data1 = try testing.allocator.dupe(u8, "one");
     defer testing.allocator.free(data1);
     const mime1 = try testing.allocator.dupe(u8, "image/png");
@@ -261,10 +263,15 @@ test "buildSubmittedUserContent preserves inline image marker placement" {
     defer testing.allocator.free(data2);
     const mime2 = try testing.allocator.dupe(u8, "image/jpeg");
     defer testing.allocator.free(mime2);
+    const data3 = try testing.allocator.dupe(u8, "three");
+    defer testing.allocator.free(data3);
+    const mime3 = try testing.allocator.dupe(u8, "image/webp");
+    defer testing.allocator.free(mime3);
 
     const pending = [_]PendingImageAttachment{
         .{ .image = .{ .data = data1, .mime_type = mime1 } },
         .{ .image = .{ .data = data2, .mime_type = mime2 } },
+        .{ .image = .{ .data = data3, .mime_type = mime3 } },
     };
 
     var built = try buildSubmittedUserContent(testing.allocator, "before [image2] middle [image1] after", &pending);
@@ -272,54 +279,33 @@ test "buildSubmittedUserContent preserves inline image marker placement" {
 
     switch (built.content) {
         .blocks => |blocks| {
-            try testing.expectEqual(@as(usize, 5), blocks.len);
+            try testing.expectEqual(@as(usize, 6), blocks.len);
             try testing.expectEqualStrings("before", blocks[0].text.text);
             try testing.expectEqualStrings("image/jpeg", blocks[1].image.mime_type);
             try testing.expectEqualStrings("middle", blocks[2].text.text);
             try testing.expectEqualStrings("image/png", blocks[3].image.mime_type);
             try testing.expectEqualStrings("after", blocks[4].text.text);
+            try testing.expectEqualStrings("image/webp", blocks[5].image.mime_type);
         },
         .text => return error.ExpectedBlockContent,
     }
 }
 
-test "buildSubmittedUserContent appends images whose markers were deleted" {
-    const data = try testing.allocator.dupe(u8, "ZGF0YQ==");
-    defer testing.allocator.free(data);
-    const mime_type = try testing.allocator.dupe(u8, "image/png");
-    defer testing.allocator.free(mime_type);
-
-    const pending = [_]PendingImageAttachment{.{
-        .image = .{ .data = data, .mime_type = mime_type },
-        .dimensions = .{ .width = 10, .height = 20 },
-    }};
-
-    var built = try buildSubmittedUserContent(testing.allocator, "describe this", &pending);
-    defer built.deinit(testing.allocator);
-
-    switch (built.content) {
-        .blocks => |blocks| {
-            try testing.expectEqual(@as(usize, 2), blocks.len);
-            try testing.expectEqualStrings("describe this", blocks[0].text.text);
-            try testing.expectEqualStrings("image/png", blocks[1].image.mime_type);
-        },
-        .text => return error.ExpectedBlockContent,
-    }
-}
-
-test "stripPendingImageMarkers removes inline image placeholders" {
-    const stripped = try stripPendingImageMarkers(testing.allocator, "look [image1] and [image2]", 2);
+test "stripPendingImageMarkers removes only valid pending placeholders" {
+    const stripped = try stripPendingImageMarkers(testing.allocator, " look [image1] and [image2] ", 2);
     defer testing.allocator.free(stripped);
     try testing.expectEqualStrings("look and", stripped);
+
+    const with_unrelated = try stripPendingImageMarkers(testing.allocator, "[image1] [image3] [paste #1]", 2);
+    defer testing.allocator.free(with_unrelated);
+    try testing.expectEqualStrings("[image3] [paste #1]", with_unrelated);
+
+    const no_pending = try stripPendingImageMarkers(testing.allocator, "[image1] stays", 0);
+    defer testing.allocator.free(no_pending);
+    try testing.expectEqualStrings("[image1] stays", no_pending);
 }
 
-test "stripPendingImageMarkers preserves unrelated bracketed text" {
-    const stripped = try stripPendingImageMarkers(testing.allocator, "[image1] [image3] [paste #1]", 2);
-    defer testing.allocator.free(stripped);
-    try testing.expectEqualStrings("[image3] [paste #1]", stripped);
-}
-
-test "pendingImageBannerText includes latest image details and clear shortcut" {
+test "pendingImageBannerText includes latest image summary and clear shortcut" {
     const data1 = try testing.allocator.dupe(u8, "aaa");
     defer testing.allocator.free(data1);
     const mime1 = try testing.allocator.dupe(u8, "image/png");
@@ -337,8 +323,8 @@ test "pendingImageBannerText includes latest image details and clear shortcut" {
     const banner = try pendingImageBannerText(testing.allocator, &pending);
     defer testing.allocator.free(banner);
 
-    try testing.expect(std.mem.indexOf(u8, banner, "2 clipboard images pending") != null);
-    try testing.expect(std.mem.indexOf(u8, banner, "image/jpeg") != null);
-    try testing.expect(std.mem.indexOf(u8, banner, "30x40") != null);
-    try testing.expect(std.mem.indexOf(u8, banner, "ctrl+c") != null);
+    try expectContains(banner, "2 clipboard images pending");
+    try expectContains(banner, "image/jpeg");
+    try expectContains(banner, "30x40");
+    try expectContains(banner, "ctrl+c");
 }

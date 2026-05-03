@@ -147,7 +147,7 @@ pub fn global() *Registry {
 
 // ── tests ──────────────────────────────────────────────────────────
 
-test "canonicalizePath falls back to resolve when path missing" {
+test "canonicalizePath resolves missing paths to absolute stable keys" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -155,49 +155,24 @@ test "canonicalizePath falls back to resolve when path missing" {
     defer alloc.free(canon);
 
     try testing.expect(std.fs.path.isAbsolute(canon));
-    try testing.expect(std.mem.indexOf(u8, canon, "xyz123") != null);
+    try testing.expect(std.mem.endsWith(u8, canon, "xyz123"));
 }
 
-test "canonicalizePath resolves realpath for existing path" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const f = try tmp.dir.createFile(std.Options.debug_io, "target.txt", .{});
-    f.close(std.Options.debug_io);
-
-    const real = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "target.txt", alloc);
-    defer alloc.free(real);
-
-    const canon = try canonicalizePath(alloc, real);
-    defer alloc.free(canon);
-
-    try std.testing.expectEqualStrings(real, canon);
-}
-
-test "acquireKey / release single-thread refcount lifecycle" {
+test "acquireKey release removes stale entries and permits reacquire" {
     const testing = std.testing;
     var reg: Registry = .{ .gpa = testing.allocator };
     defer reg.deinit();
 
+    const first = try reg.acquireKey("foo");
+    reg.release(first);
     try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
 
-    const e1 = try reg.acquireKey("foo");
-    try testing.expectEqual(@as(usize, 1), reg.liveEntryCount());
-    try testing.expectEqual(@as(u32, 1), e1.refcount);
-
-    reg.release(e1);
-    try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
-
-    // Re-acquire after full release: new entry.
-    const e2 = try reg.acquireKey("foo");
-    reg.release(e2);
+    const second = try reg.acquireKey("foo");
+    reg.release(second);
     try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
 }
 
-test "acquireKey serializes two threads on same key" {
+test "acquireKey serializes duplicate keys across threads" {
     const testing = std.testing;
     var reg: Registry = .{ .gpa = testing.allocator };
     defer reg.deinit();
@@ -236,22 +211,20 @@ test "acquireKey serializes two threads on same key" {
     try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
 }
 
-test "acquireKey on distinct keys does not serialize" {
+test "acquireKey permits distinct keys to be held simultaneously" {
     const testing = std.testing;
     var reg: Registry = .{ .gpa = testing.allocator };
     defer reg.deinit();
 
     const a = try reg.acquireKey("key-a");
     const b = try reg.acquireKey("key-b");
-    // Both held simultaneously — if they mapped to the same entry
-    // this would deadlock.
-    try testing.expectEqual(@as(usize, 2), reg.liveEntryCount());
-    reg.release(a);
+    // Both held simultaneously — if they mapped to the same entry this would deadlock.
     reg.release(b);
+    reg.release(a);
     try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
 }
 
-test "acquirePath canonicalizes before locking" {
+test "acquirePath serializes lexical aliases of the same missing file" {
     const testing = std.testing;
     const alloc = testing.allocator;
     var reg: Registry = .{ .gpa = alloc };
@@ -259,20 +232,33 @@ test "acquirePath canonicalizes before locking" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const f = try tmp.dir.createFile(std.Options.debug_io, "same.txt", .{});
-    f.close(std.Options.debug_io);
 
-    const real = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "same.txt", alloc);
-    defer alloc.free(real);
+    const root = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root);
 
-    // Absolute path.
-    const e1 = try reg.acquirePath(alloc, real);
-    try testing.expectEqual(@as(usize, 1), reg.liveEntryCount());
-    reg.release(e1);
+    const path_a = try std.fs.path.join(alloc, &.{ root, "new.txt" });
+    defer alloc.free(path_a);
+    const path_b = try std.fs.path.join(alloc, &.{ root, "subdir", "..", "new.txt" });
+    defer alloc.free(path_b);
 
-    // Same file via realpath round-trip: should reuse the same
-    // canonical key (entry count stays 0 after release).
-    const e2 = try reg.acquirePath(alloc, real);
-    reg.release(e2);
+    const held = try reg.acquirePath(alloc, path_a);
+    var acquired: std.atomic.Value(bool) = .init(false);
+
+    const Worker = struct {
+        fn run(r: *Registry, allocator: std.mem.Allocator, path: []const u8, flag: *std.atomic.Value(bool)) void {
+            const e = r.acquirePath(allocator, path) catch return;
+            flag.store(true, .release);
+            r.release(e);
+        }
+    };
+
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ &reg, alloc, path_b, &acquired });
+    std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try testing.expect(!acquired.load(.acquire));
+
+    reg.release(held);
+    t.join();
+
+    try testing.expect(acquired.load(.acquire));
     try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
 }

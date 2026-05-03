@@ -231,7 +231,7 @@ fn isOverflowNeedle(text: []const u8) bool {
 
 const testing = std.testing;
 
-test "normalizeHttpFailure extracts openai error metadata" {
+test "normalizeHttpFailure preserves provider metadata and user-facing message" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -240,50 +240,48 @@ test "normalizeHttpFailure extracts openai error metadata" {
     try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, result.failure.kind);
     try testing.expectEqual(@as(?u16, 400), result.failure.http_status);
     try testing.expectEqualStrings("context_length_exceeded", result.failure.provider_code.?);
+    try testing.expectEqualStrings("invalid_request_error", result.failure.provider_type.?);
     try testing.expectEqualStrings("HTTP 400 Bad Request: context length exceeded", result.display_message);
 }
 
-test "normalizeHttpFailure labels empty bodies" {
+test "normalizeHttpFailure formats empty and raw bodies for users" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const result = try normalizeHttpFailure(allocator, .bad_request, "  \n ");
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, result.failure.kind);
-    try testing.expectEqualStrings("HTTP 400 Bad Request (empty body)", result.display_message);
+    const empty = try normalizeHttpFailure(allocator, .bad_request, "  \n ");
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, empty.failure.kind);
+    try testing.expectEqualStrings("HTTP 400 Bad Request (empty body)", empty.display_message);
+
+    const raw = try normalizeHttpFailure(allocator, .internal_server_error, "upstream exploded");
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, raw.failure.kind);
+    try testing.expectEqualStrings("HTTP 500 Internal Server Error: upstream exploded", raw.display_message);
 }
 
-test "normalizeHttpFailure extracts anthropic rate limit metadata" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+test "classifyHttpFailure honors status boundaries before provider text" {
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.auth, classifyHttpFailure(401, null, null, "rate limit exceeded"));
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.rate_limited, classifyHttpFailure(429, null, null, null));
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, classifyHttpFailure(503, null, null, null));
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, classifyHttpFailure(413, null, null, null));
 
-    const result = try normalizeHttpFailure(allocator, .too_many_requests, "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limit exceeded\"}}");
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.rate_limited, result.failure.kind);
-    try testing.expectEqualStrings("rate_limit_error", result.failure.provider_type.?);
-    try testing.expectEqualStrings("HTTP 429 Too Many Requests: rate limit exceeded", result.display_message);
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, classifyHttpFailure(400, null, null, "unknown bad request"));
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, classifyHttpFailure(400, null, "context_length_exceeded", null));
 }
 
-test "classifyProviderFailure maps anthropic sse error types" {
+test "classifyProviderFailure maps semantic categories without variant spray" {
     try testing.expectEqual(protocol.NormalizedFailure.Kind.auth, classifyProviderFailure("authentication_error", null, "bad key"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.rate_limited, classifyProviderFailure("rate_limit_error", null, "please slow down"));
     try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, classifyProviderFailure("invalid_request_error", null, "schema mismatch"));
-}
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, classifyProviderFailure("overloaded_error", null, "try again"));
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, classifyProviderFailure(null, "context_length_exceeded", null));
 
-test "normalizeHttpFailure extracts top-level provider metadata" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const result = try normalizeHttpFailure(allocator, .bad_request, "{\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\",\"message\":\"context length exceeded\"}");
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, result.failure.kind);
-    try testing.expectEqualStrings("context_length_exceeded", result.failure.provider_code.?);
-    try testing.expectEqualStrings("invalid_request_error", result.failure.provider_type.?);
-}
-
-test "classifyProviderFailure keeps throttling token text retryable" {
     try testing.expectEqual(
         protocol.NormalizedFailure.Kind.rate_limited,
         classifyProviderFailure("throttling_error", null, "Throttling error: Too many tokens, please wait before trying again."),
     );
+}
+
+test "classifyTransportFailure separates auth, retryable transport, and fatal" {
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.auth, classifyTransportFailure("invalid api key"));
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, classifyTransportFailure("connection reset by peer"));
+    try testing.expectEqual(protocol.NormalizedFailure.Kind.fatal, classifyTransportFailure("invalid response shape"));
 }

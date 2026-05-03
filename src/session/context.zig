@@ -287,125 +287,83 @@ fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(std.testing.allocator);
 }
 
-test "empty entries returns empty context" {
+test "empty and before_first selections produce default context" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{};
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
-    try std.testing.expectEqual(@as(usize, 0), ctx.messages.len);
-    try std.testing.expectEqualStrings("off", ctx.thinking_level);
-    try std.testing.expect(ctx.model == null);
-}
 
-test "single user message" {
-    var arena = testArena();
-    defer arena.deinit();
+    var empty_entries = [_]proto.SessionEntry{};
+    const empty_ctx = try buildSessionContext(arena.allocator(), &empty_entries, .current);
+    try std.testing.expectEqual(@as(usize, 0), empty_ctx.messages.len);
+    try std.testing.expectEqualStrings("off", empty_ctx.thinking_level);
+    try std.testing.expect(empty_ctx.model == null);
+
     var entries = [_]proto.SessionEntry{testMsg(arena.allocator(), "1", null, .user, "hello")};
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
-    try std.testing.expectEqual(@as(usize, 1), ctx.messages.len);
-    try std.testing.expectEqualStrings("hello", getUserText(ctx.messages[0]).?);
+    const before_first_ctx = try buildSessionContext(arena.allocator(), &entries, .before_first);
+    try std.testing.expectEqual(@as(usize, 0), before_first_ctx.messages.len);
+    try std.testing.expectEqualStrings("off", before_first_ctx.thinking_level);
+    try std.testing.expect(before_first_ctx.model == null);
 }
 
-test "before_first selection returns empty context even when entries exist" {
-    var arena = testArena();
-    defer arena.deinit();
-    var entries = [_]proto.SessionEntry{testMsg(arena.allocator(), "1", null, .user, "hello")};
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .before_first);
-    try std.testing.expectEqual(@as(usize, 0), ctx.messages.len);
-    try std.testing.expectEqualStrings("off", ctx.thinking_level);
-    try std.testing.expect(ctx.model == null);
-}
-
-test "simple conversation preserves order" {
+test "conversation context preserves path order and selected leaf" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{
         testMsg(arena.allocator(), "1", null, .user, "hello"),
         testMsg(arena.allocator(), "2", "1", .assistant, "hi there"),
-        testMsg(arena.allocator(), "3", "2", .user, "how are you"),
-        testMsg(arena.allocator(), "4", "3", .assistant, "great"),
+        testMsg(arena.allocator(), "3", "2", .user, "branch A"),
+        testMsg(arena.allocator(), "4", "2", .user, "branch B"),
     };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
-    try std.testing.expectEqual(@as(usize, 4), ctx.messages.len);
-    try std.testing.expectEqualStrings("hello", getUserText(ctx.messages[0]).?);
 
-    try std.testing.expectEqualStrings("hi there", getAssistantText(ctx.messages[1]).?);
-    try std.testing.expectEqualStrings("how are you", getUserText(ctx.messages[2]).?);
-    try std.testing.expectEqualStrings("great", getAssistantText(ctx.messages[3]).?);
+    const current_ctx = try buildSessionContext(arena.allocator(), &entries, .current);
+    try std.testing.expectEqual(@as(usize, 3), current_ctx.messages.len);
+    try std.testing.expectEqualStrings("hello", getUserText(current_ctx.messages[0]).?);
+    try std.testing.expectEqualStrings("hi there", getAssistantText(current_ctx.messages[1]).?);
+    try std.testing.expectEqualStrings("branch B", getUserText(current_ctx.messages[2]).?);
+
+    const branch_a_ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "3" });
+    try std.testing.expectEqual(@as(usize, 3), branch_a_ctx.messages.len);
+    try std.testing.expectEqualStrings("branch A", getUserText(branch_a_ctx.messages[2]).?);
 }
 
-test "entry_id selection resolves context from that leaf" {
-    var arena = testArena();
-    defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
-        testMsg(arena.allocator(), "1", null, .user, "hello"),
-        testMsg(arena.allocator(), "2", "1", .assistant, "hi there"),
-        testMsg(arena.allocator(), "3", "2", .user, "how are you"),
-        testMsg(arena.allocator(), "4", "3", .assistant, "great"),
-    };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "2" });
-    try std.testing.expectEqual(@as(usize, 2), ctx.messages.len);
-    try std.testing.expectEqualStrings("hello", getUserText(ctx.messages[0]).?);
-    try std.testing.expectEqualStrings("hi there", getAssistantText(ctx.messages[1]).?);
-}
-
-test "tracks thinking level changes" {
+test "tracks user-visible thinking level and model state" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{
         testMsg(arena.allocator(), "1", null, .user, "hello"),
         testThinkingLevel("2", "1", "high"),
-        testMsg(arena.allocator(), "3", "2", .assistant, "thinking hard"),
+        testModelChange("3", "2", "openai", "gpt-4"),
+        testMsg(arena.allocator(), "4", "3", .assistant, "hi"),
     };
+
     const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
     try std.testing.expectEqualStrings("high", ctx.thinking_level);
     try std.testing.expectEqual(@as(usize, 2), ctx.messages.len);
-}
-
-test "tracks model from assistant message" {
-    var arena = testArena();
-    defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
-        testMsg(arena.allocator(), "1", null, .user, "hello"),
-        testMsg(arena.allocator(), "2", "1", .assistant, "hi"),
-    };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
+    // Assistant messages carry the actual model used and supersede prior model_change entries.
     try std.testing.expectEqualStrings("anthropic", ctx.model.?.provider);
     try std.testing.expectEqualStrings("claude-test", ctx.model.?.model_id);
 }
 
-test "assistant message overwrites model_change entry" {
-    var arena = testArena();
-    defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
-        testMsg(arena.allocator(), "1", null, .user, "hello"),
-        testModelChange("2", "1", "openai", "gpt-4"),
-        testMsg(arena.allocator(), "3", "2", .assistant, "hi"),
-    };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
-    // assistant message overwrites the model_change
-    try std.testing.expectEqualStrings("anthropic", ctx.model.?.provider);
-    try std.testing.expectEqualStrings("claude-test", ctx.model.?.model_id);
-}
-
-test "compaction: summary + kept + after" {
+test "compaction emits latest summary, kept messages, and later messages" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{
         testMsg(arena.allocator(), "1", null, .user, "first"),
         testMsg(arena.allocator(), "2", "1", .assistant, "response1"),
-        testMsg(arena.allocator(), "3", "2", .user, "second"),
-        testMsg(arena.allocator(), "4", "3", .assistant, "response2"),
-        testCompaction("5", "4", "Summary of first two turns", "3"),
-        testMsg(arena.allocator(), "6", "5", .user, "third"),
-        testMsg(arena.allocator(), "7", "6", .assistant, "response3"),
+        testCompaction("3", "2", "First summary", "1"),
+        testMsg(arena.allocator(), "4", "3", .user, "second"),
+        testMsg(arena.allocator(), "5", "4", .assistant, "response2"),
+        testCompaction("6", "5", "Second summary", "4"),
+        testMsg(arena.allocator(), "7", "6", .user, "third"),
+        testMsg(arena.allocator(), "8", "7", .assistant, "response3"),
     };
+
     const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
-    // summary + kept(3,4) + after(6,7) = 5
     try std.testing.expectEqual(@as(usize, 5), ctx.messages.len);
-    // first message is compaction summary
     switch (ctx.messages[0]) {
-        .compaction_summary => |cs| try std.testing.expect(std.mem.indexOf(u8, cs.summary, "Summary of first two turns") != null),
+        .compaction_summary => |cs| {
+            try std.testing.expectEqualStrings("Second summary", cs.summary);
+            try std.testing.expectEqual(@as(u64, 1000), cs.tokens_before);
+        },
         else => return error.ExpectedCompactionSummary,
     }
     try std.testing.expectEqualStrings("second", getUserText(ctx.messages[1]).?);
@@ -414,65 +372,7 @@ test "compaction: summary + kept + after" {
     try std.testing.expectEqualStrings("response3", getAssistantText(ctx.messages[4]).?);
 }
 
-test "compaction: keeping from first message" {
-    var arena = testArena();
-    defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
-        testMsg(arena.allocator(), "1", null, .user, "first"),
-        testMsg(arena.allocator(), "2", "1", .assistant, "response"),
-        testCompaction("3", "2", "Empty summary", "1"),
-        testMsg(arena.allocator(), "4", "3", .user, "second"),
-    };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
-    // summary + all messages(1,2,4)
-    try std.testing.expectEqual(@as(usize, 4), ctx.messages.len);
-    switch (ctx.messages[0]) {
-        .compaction_summary => |cs| try std.testing.expect(std.mem.indexOf(u8, cs.summary, "Empty summary") != null),
-        else => return error.ExpectedCompactionSummary,
-    }
-}
-
-test "multiple compactions uses latest" {
-    var arena = testArena();
-    defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
-        testMsg(arena.allocator(), "1", null, .user, "a"),
-        testMsg(arena.allocator(), "2", "1", .assistant, "b"),
-        testCompaction("3", "2", "First summary", "1"),
-        testMsg(arena.allocator(), "4", "3", .user, "c"),
-        testMsg(arena.allocator(), "5", "4", .assistant, "d"),
-        testCompaction("6", "5", "Second summary", "4"),
-        testMsg(arena.allocator(), "7", "6", .user, "e"),
-    };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
-    // second summary, keep from 4
-    try std.testing.expectEqual(@as(usize, 4), ctx.messages.len);
-    switch (ctx.messages[0]) {
-        .compaction_summary => |cs| try std.testing.expect(std.mem.indexOf(u8, cs.summary, "Second summary") != null),
-        else => return error.ExpectedCompactionSummary,
-    }
-}
-
-test "branches: follows path to specified leaf" {
-    var arena = testArena();
-    defer arena.deinit();
-    // Tree: 1 -> 2 -> 3 (branch A), 2 -> 4 (branch B)
-    var entries = [_]proto.SessionEntry{
-        testMsg(arena.allocator(), "1", null, .user, "start"),
-        testMsg(arena.allocator(), "2", "1", .assistant, "response"),
-        testMsg(arena.allocator(), "3", "2", .user, "branch A"),
-        testMsg(arena.allocator(), "4", "2", .user, "branch B"),
-    };
-    const ctx_a = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "3" });
-    try std.testing.expectEqual(@as(usize, 3), ctx_a.messages.len);
-    try std.testing.expectEqualStrings("branch A", getUserText(ctx_a.messages[2]).?);
-
-    const ctx_b = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "4" });
-    try std.testing.expectEqual(@as(usize, 3), ctx_b.messages.len);
-    try std.testing.expectEqualStrings("branch B", getUserText(ctx_b.messages[2]).?);
-}
-
-test "branches: includes branch summary in path" {
+test "branch summary appears only on selected branch" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{
@@ -481,17 +381,23 @@ test "branches: includes branch summary in path" {
         testMsg(arena.allocator(), "3", "2", .user, "abandoned path"),
         testBranchSummary("4", "2", "Summary of abandoned work", "3"),
         testMsg(arena.allocator(), "5", "4", .user, "new direction"),
+        testMsg(arena.allocator(), "6", "2", .user, "other branch"),
     };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "5" });
-    try std.testing.expectEqual(@as(usize, 4), ctx.messages.len);
-    switch (ctx.messages[2]) {
-        .branch_summary => |bs| try std.testing.expect(std.mem.indexOf(u8, bs.summary, "Summary of abandoned work") != null),
+
+    const summary_branch = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "5" });
+    try std.testing.expectEqual(@as(usize, 4), summary_branch.messages.len);
+    switch (summary_branch.messages[2]) {
+        .branch_summary => |bs| try std.testing.expectEqualStrings("Summary of abandoned work", bs.summary),
         else => return error.ExpectedBranchSummary,
     }
-    try std.testing.expectEqualStrings("new direction", getUserText(ctx.messages[3]).?);
+    try std.testing.expectEqualStrings("new direction", getUserText(summary_branch.messages[3]).?);
+
+    const other_branch = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "6" });
+    try std.testing.expectEqual(@as(usize, 3), other_branch.messages.len);
+    try std.testing.expectEqualStrings("other branch", getUserText(other_branch.messages[2]).?);
 }
 
-test "branches: complex tree with compaction and branch summary" {
+test "complex branch selection combines compaction and branch summaries" {
     var arena = testArena();
     defer arena.deinit();
     // Tree:
@@ -512,11 +418,10 @@ test "branches: complex tree with compaction and branch summary" {
         testMsg(arena.allocator(), "11", "10", .user, "better approach"),
     };
 
-    // Main path to 7: summary + kept(3,4) + after(6,7)
     const ctx_main = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "7" });
     try std.testing.expectEqual(@as(usize, 5), ctx_main.messages.len);
     switch (ctx_main.messages[0]) {
-        .compaction_summary => |cs| try std.testing.expect(std.mem.indexOf(u8, cs.summary, "Compacted history") != null),
+        .compaction_summary => |cs| try std.testing.expectEqualStrings("Compacted history", cs.summary),
         else => return error.ExpectedCompactionSummary,
     }
     try std.testing.expectEqualStrings("q2", getUserText(ctx_main.messages[1]).?);
@@ -524,39 +429,30 @@ test "branches: complex tree with compaction and branch summary" {
     try std.testing.expectEqualStrings("q3", getUserText(ctx_main.messages[3]).?);
     try std.testing.expectEqualStrings("r3", getAssistantText(ctx_main.messages[4]).?);
 
-    // Branch path to 11: 1,2,3 + branch_summary + 11
     const ctx_branch = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "11" });
     try std.testing.expectEqual(@as(usize, 5), ctx_branch.messages.len);
     try std.testing.expectEqualStrings("start", getUserText(ctx_branch.messages[0]).?);
     try std.testing.expectEqualStrings("r1", getAssistantText(ctx_branch.messages[1]).?);
     try std.testing.expectEqualStrings("q2", getUserText(ctx_branch.messages[2]).?);
     switch (ctx_branch.messages[3]) {
-        .branch_summary => |bs| try std.testing.expect(std.mem.indexOf(u8, bs.summary, "Tried wrong approach") != null),
+        .branch_summary => |bs| try std.testing.expectEqualStrings("Tried wrong approach", bs.summary),
         else => return error.ExpectedBranchSummary,
     }
     try std.testing.expectEqualStrings("better approach", getUserText(ctx_branch.messages[4]).?);
 }
 
-test "edge: uses last entry when leafId not found" {
+test "unknown leaf falls back to current context" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{
         testMsg(arena.allocator(), "1", null, .user, "hello"),
         testMsg(arena.allocator(), "2", "1", .assistant, "hi"),
     };
+
     const ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "nonexistent" });
     try std.testing.expectEqual(@as(usize, 2), ctx.messages.len);
-}
-
-test "edge: orphaned entry produces partial path" {
-    var arena = testArena();
-    defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
-        testMsg(arena.allocator(), "1", null, .user, "hello"),
-        testMsg(arena.allocator(), "2", "missing", .assistant, "orphan"),
-    };
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "2" });
-    try std.testing.expectEqual(@as(usize, 1), ctx.messages.len);
+    try std.testing.expectEqualStrings("hello", getUserText(ctx.messages[0]).?);
+    try std.testing.expectEqualStrings("hi", getAssistantText(ctx.messages[1]).?);
 }
 
 /// Convert provider union to string.

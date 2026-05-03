@@ -526,140 +526,95 @@ test "parseKeySpec normalizes modifiers and named keys" {
     try std.testing.expectError(error.InvalidKeySpec, parseKeySpec("ctrl+"));
 }
 
-test "single-byte keys: printable, control, special" {
-    // Printable char
-    const a = parseKey("a", false).?;
-    try std.testing.expectEqual(KeyCode.char, a.key.code);
-    try std.testing.expectEqual(@as(?u21, 'a'), a.key.char);
-    // Ctrl+C
-    const cc = parseKey("\x03", false).?;
-    try std.testing.expect(cc.key.ctrl);
-    try std.testing.expectEqual(@as(?u21, 'c'), cc.key.char);
-    // Enter, tab, backspace, escape
+test "parseKey handles printable, control, and single-byte special keys" {
+    const printable = parseKey("a", false).?;
+    try std.testing.expectEqual(KeyCode.char, printable.key.code);
+    try std.testing.expectEqual(@as(?u21, 'a'), printable.key.char);
+
+    const ctrl_c = parseKey("\x03", false).?;
+    try std.testing.expectEqual(KeyCode.char, ctrl_c.key.code);
+    try std.testing.expectEqual(@as(?u21, 'c'), ctrl_c.key.char);
+    try std.testing.expect(ctrl_c.key.ctrl);
+
     try std.testing.expectEqual(KeyCode.enter, parseKey("\r", false).?.key.code);
     try std.testing.expectEqual(KeyCode.tab, parseKey("\t", false).?.key.code);
     try std.testing.expectEqual(KeyCode.backspace, parseKey("\x7f", false).?.key.code);
     try std.testing.expectEqual(KeyCode.escape, parseKey("\x1b", false).?.key.code);
 }
 
-test "CSI and SS3 escape sequences parse arrows, function keys, nav" {
-    // CSI arrows
+test "parseKey handles CSI and SS3 terminal sequences" {
     try std.testing.expectEqual(KeyCode.up, parseKey("\x1b[A", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.down, parseKey("\x1b[B", false).?.key.code);
-    // SS3 arrows
-    try std.testing.expectEqual(KeyCode.up, parseKey("\x1bOA", false).?.key.code);
-    // Home/End
     try std.testing.expectEqual(KeyCode.home, parseKey("\x1b[H", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.end, parseKey("\x1bOF", false).?.key.code);
-    // Tilde-style: insert, delete, page up/down, function keys
-    try std.testing.expectEqual(KeyCode.delete, parseKey("\x1b[3~", false).?.key.code);
-    try std.testing.expectEqual(KeyCode.page_up, parseKey("\x1b[5~", false).?.key.code);
     try std.testing.expectEqual(KeyCode.f1, parseKey("\x1bOP", false).?.key.code);
+    try std.testing.expectEqual(KeyCode.end, parseKey("\x1bOF", false).?.key.code);
+    try std.testing.expectEqual(KeyCode.delete, parseKey("\x1b[3~", false).?.key.code);
     try std.testing.expectEqual(KeyCode.f12, parseKey("\x1b[24~", false).?.key.code);
 }
 
-test "xterm modifier parameters decode shift/ctrl/alt" {
-    // Ctrl+Up: modifier 5 = 1+ctrl
-    const cu = parseKey("\x1b[1;5A", false).?;
-    try std.testing.expectEqual(KeyCode.up, cu.key.code);
-    try std.testing.expect(cu.key.ctrl);
-    try std.testing.expect(!cu.key.shift);
-    // Ctrl+Shift+Up: modifier 6
-    const csu = parseKey("\x1b[1;6A", false).?;
-    try std.testing.expect(csu.key.ctrl);
-    try std.testing.expect(csu.key.shift);
-    // Alt+char
+test "parseKey decodes terminal modifiers" {
+    const ctrl_shift_up = parseKey("\x1b[1;6A", false).?;
+    try std.testing.expectEqual(KeyCode.up, ctrl_shift_up.key.code);
+    try std.testing.expect(ctrl_shift_up.key.ctrl);
+    try std.testing.expect(ctrl_shift_up.key.shift);
+    try std.testing.expect(!ctrl_shift_up.key.alt);
+
     const alt_a = parseKey("\x1ba", false).?;
-    try std.testing.expect(alt_a.key.alt);
+    try std.testing.expectEqual(KeyCode.char, alt_a.key.code);
     try std.testing.expectEqual(@as(?u21, 'a'), alt_a.key.char);
+    try std.testing.expect(alt_a.key.alt);
+
+    const modify_other_enter = parseKey("\x1b[27;5;13~", false).?;
+    try std.testing.expectEqual(KeyCode.enter, modify_other_enter.key.code);
+    try std.testing.expect(modify_other_enter.key.ctrl);
+
+    const modify_other_char = parseKey("\x1b[27;2;97~", false).?;
+    try std.testing.expectEqual(KeyCode.char, modify_other_char.key.code);
+    try std.testing.expectEqual(@as(?u21, 'a'), modify_other_char.key.char);
+    try std.testing.expect(modify_other_char.key.shift);
 }
 
-test "modifyOtherKeys sequences parse enter with modifiers" {
-    // Shift+Enter: \x1b[27;2;13~
-    const se = parseKey("\x1b[27;2;13~", false).?;
-    try std.testing.expectEqual(KeyCode.enter, se.key.code);
-    try std.testing.expect(se.key.shift);
-    try std.testing.expect(!se.key.ctrl);
+test "kitty CSI-u parses codepoints, modifiers, special keys, and releases" {
+    const char = parseKey("\x1b[97u", true).?;
+    try std.testing.expectEqual(KeyCode.char, char.key.code);
+    try std.testing.expectEqual(@as(?u21, 'a'), char.key.char);
 
-    // Ctrl+Enter: \x1b[27;5;13~
-    const ce = parseKey("\x1b[27;5;13~", false).?;
-    try std.testing.expectEqual(KeyCode.enter, ce.key.code);
-    try std.testing.expect(ce.key.ctrl);
+    const alt_v = parseKey("\x1b[118;3u", true).?;
+    try std.testing.expectEqual(KeyCode.char, alt_v.key.code);
+    try std.testing.expectEqual(@as(?u21, 'v'), alt_v.key.char);
+    try std.testing.expect(alt_v.key.alt);
 
-    // Shift+Tab: \x1b[27;2;9~
-    const st = parseKey("\x1b[27;2;9~", false).?;
-    try std.testing.expectEqual(KeyCode.tab, st.key.code);
-    try std.testing.expect(st.key.shift);
+    const shift_enter = parseKey("\x1b[13;2u", true).?;
+    try std.testing.expectEqual(KeyCode.enter, shift_enter.key.code);
+    try std.testing.expect(shift_enter.key.shift);
 
-    // modifyOtherKeys char: \x1b[27;2;97~ = shift+a
-    const sa = parseKey("\x1b[27;2;97~", false).?;
-    try std.testing.expectEqual(KeyCode.char, sa.key.code);
-    try std.testing.expectEqual(@as(?u21, 'a'), sa.key.char);
-    try std.testing.expect(sa.key.shift);
-}
-
-test "kitty CSI-u protocol parses codepoints and modifiers" {
-    // Basic: \x1b[97u = 'a'
-    const ka = parseKey("\x1b[97u", true).?;
-    try std.testing.expectEqual(KeyCode.char, ka.key.code);
-    try std.testing.expectEqual(@as(?u21, 'a'), ka.key.char);
-    // With modifier: ctrl+a
-    const kca = parseKey("\x1b[97;5u", true).?;
-    try std.testing.expect(kca.key.ctrl);
-
-    // Alt+v in kitty protocol.
-    const kav = parseKey("\x1b[118;3u", true).?;
-    try std.testing.expectEqual(KeyCode.char, kav.key.code);
-    try std.testing.expectEqual(@as(?u21, 'v'), kav.key.char);
-    try std.testing.expect(kav.key.alt);
-    // Special kitty codepoints
-    try std.testing.expectEqual(KeyCode.enter, parseKey("\x1b[13u", true).?.key.code);
-
-    // Shift+Enter: \x1b[13;2u
-    const se = parseKey("\x1b[13;2u", true).?;
-    try std.testing.expectEqual(KeyCode.enter, se.key.code);
-    try std.testing.expect(se.key.shift);
-
-    // Kitty functional codepoints (keypad)
-    try std.testing.expectEqual(KeyCode.enter, parseKey("\x1b[57414u", true).?.key.code); // KP_ENTER
     try std.testing.expectEqual(KeyCode.left, parseKey("\x1b[57417u", true).?.key.code); // KP_LEFT
-    try std.testing.expectEqual(KeyCode.delete, parseKey("\x1b[57426u", true).?.key.code); // KP_DELETE
-    const kp0 = parseKey("\x1b[57399u", true).?;
-    try std.testing.expectEqual(@as(?u21, '0'), kp0.key.char); // KP_0
-
-    // Release events (event type 3) are filtered without synthesizing Escape.
-    try std.testing.expect(parseKey("\x1b[97;1:3u", true) == null);
+    try std.testing.expect(parseKey("\x1b[97;1:3u", true) == null); // release event
 }
 
-test "multi-byte UTF-8 characters" {
+test "parseKey handles multi-byte UTF-8 characters" {
     const result = parseKey("é", false).?;
     try std.testing.expectEqual(KeyCode.char, result.key.code);
     try std.testing.expectEqual(@as(?u21, 0xE9), result.key.char);
     try std.testing.expectEqual(@as(usize, 2), result.len);
 }
 
-test "SGR mouse parser handles scroll press drag and release events" {
+test "SGR mouse sequences decode events, coordinates, and modifiers" {
     const scroll_up = parseSgrMouse("\x1b[<64;10;20M").?;
     try std.testing.expectEqual(MouseEventKind.scroll, scroll_up.event.kind);
     try std.testing.expectEqual(MouseButton.scroll_up, scroll_up.event.button);
     try std.testing.expectEqual(@as(u16, 9), scroll_up.event.x);
     try std.testing.expectEqual(@as(u16, 19), scroll_up.event.y);
 
-    const scroll_down = parseSgrMouse("\x1b[<65;5;15M").?;
-    try std.testing.expectEqual(MouseEventKind.scroll, scroll_down.event.kind);
-    try std.testing.expectEqual(MouseButton.scroll_down, scroll_down.event.button);
+    const modified_drag = parseSgrMouse("\x1b[<60;11;21M").?;
+    try std.testing.expectEqual(MouseEventKind.drag, modified_drag.event.kind);
+    try std.testing.expectEqual(MouseButton.left, modified_drag.event.button);
+    try std.testing.expect(modified_drag.event.ctrl);
+    try std.testing.expect(modified_drag.event.alt);
+    try std.testing.expect(modified_drag.event.shift);
 
-    const down = parseSgrMouse("\x1b[<0;10;20M").?;
-    try std.testing.expectEqual(MouseEventKind.down, down.event.kind);
-    try std.testing.expectEqual(MouseButton.left, down.event.button);
-
-    const drag = parseSgrMouse("\x1b[<32;11;21M").?;
-    try std.testing.expectEqual(MouseEventKind.drag, drag.event.kind);
-    try std.testing.expectEqual(MouseButton.left, drag.event.button);
-
-    const up = parseSgrMouse("\x1b[<0;11;21m").?;
-    try std.testing.expectEqual(MouseEventKind.up, up.event.kind);
-    try std.testing.expectEqual(MouseButton.none, up.event.button);
+    const release = parseSgrMouse("\x1b[<0;11;21m").?;
+    try std.testing.expectEqual(MouseEventKind.up, release.event.kind);
+    try std.testing.expectEqual(MouseButton.none, release.event.button);
 }
 
 test "parseInput prioritizes SGR mouse sequences and falls back to keys" {

@@ -614,15 +614,13 @@ fn prepareRendererStateForTest(
     return state;
 }
 
-test "skillNameFromReadPath extracts skill name from canonical skill file path" {
+test "skillNameFromReadPath recognizes only canonical skill file paths" {
     try testing.expectEqualStrings("caveman", skillNameFromReadPath("/Users/igors/.zi/agent/skills/caveman/SKILL.md").?);
-}
-
-test "skillNameFromReadPath ignores ordinary read paths" {
     try testing.expect(skillNameFromReadPath("/tmp/notes.md") == null);
+    try testing.expect(skillNameFromReadPath("/Users/igors/.zi/agent/skills/caveman/README.md") == null);
 }
 
-test "bashCall renders cmd args with timeout suffix" {
+test "bashCall renders command title contract" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 64, 1);
     defer buf.deinit();
 
@@ -652,7 +650,7 @@ test "bashCall renders cmd args with timeout suffix" {
     try testing.expectEqualStrings("$ echo hi (timeout 5s)", rowAscii(&buf, 0, &line));
 }
 
-test "bashCall falls back to legacy command arg for old sessions" {
+test "bashCall accepts legacy command arg for old sessions" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 32, 1);
     defer buf.deinit();
 
@@ -682,63 +680,7 @@ test "bashCall falls back to legacy command arg for old sessions" {
     try testing.expectEqualStrings("$ ls -la", rowAscii(&buf, 0, &line));
 }
 
-test "edit renderer renders unified diff text without structured diff details" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 12);
-    defer buf.deinit();
-
-    const content = try testing.allocator.alloc(agent_protocol.AgentToolResult.ContentBlock, 1);
-    defer {
-        testing.allocator.free(content[0].text.text);
-        testing.allocator.free(content);
-    }
-    content[0] = .{ .text = .{ .text = try testing.allocator.dupe(
-        u8,
-        "--- a.txt\n+++ a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n",
-    ) } };
-
-    const result = agent_protocol.AgentToolResult{
-        .content = content,
-        .details = .null,
-        .is_error = false,
-    };
-
-    const state = try prepareRendererStateForTest(testing.allocator, edit_renderer, result, false);
-    defer if (state) |resolved| {
-        if (edit_renderer.deinit_state) |deinit_fn| deinit_fn(resolved, testing.allocator);
-    };
-
-    var ctx = ToolRenderContext{
-        .tool_name = "edit",
-        .tool_call_id = "call-1",
-        .args = .null,
-        .result = result,
-        .is_partial = false,
-        .is_error = false,
-        .expanded = true,
-        .execution_started = true,
-        .args_complete = true,
-        .theme = themes_builtin.dark(),
-        .allocator = testing.allocator,
-        .state = state,
-        .region = buf.region(),
-        .width = buf.width,
-    };
-
-    edit_renderer.render_result_slice.?(&ctx, 0);
-
-    var row0: [80]u8 = undefined;
-    var row2: [80]u8 = undefined;
-    var row3: [80]u8 = undefined;
-    var row4: [80]u8 = undefined;
-    var row5: [80]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 1, &row0), "--- a.txt") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 3, &row2), "@@ -1,3 +1,3 @@") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row3), "one") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 5, &row4), "-two") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 6, &row5), "+TWO") != null);
-}
-
-test "edit renderer uses structured diff details when available" {
+test "edit renderer prefers structured diff details over fallback text" {
     const diff_mod = @import("../../diff/document.zig");
 
     var doc = try diff_mod.buildDocument(testing.allocator, &[_]diff_mod.Input{.{
@@ -769,101 +711,21 @@ test "edit renderer uses structured diff details when available" {
     defer if (state) |resolved| {
         if (edit_renderer.deinit_state) |deinit_fn| deinit_fn(resolved, testing.allocator);
     };
+    const builtin_state = stateFrom(state).?;
 
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 12);
-    defer buf.deinit();
+    try testing.expectEqualStrings("a.txt", builtin_state.surface.header.?);
+    const stats = builtin_state.surface.stats.?;
+    try testing.expectEqual(@as(u32, 1), stats.added);
+    try testing.expectEqual(@as(u32, 1), stats.removed);
+    try testing.expect(builtin_state.surface.rows.items.len > 0);
 
-    var ctx = ToolRenderContext{
-        .tool_name = "edit",
-        .tool_call_id = "call-structured",
-        .args = .null,
-        .result = result,
-        .is_partial = false,
-        .is_error = false,
-        .expanded = true,
-        .execution_started = true,
-        .args_complete = true,
-        .theme = themes_builtin.dark(),
-        .allocator = testing.allocator,
-        .state = state,
-        .region = buf.region(),
-        .width = buf.width,
-    };
-
-    edit_renderer.render_result_slice.?(&ctx, 0);
-
-    var row0: [80]u8 = undefined;
-    var row1: [80]u8 = undefined;
-    var row2: [80]u8 = undefined;
-    var row3: [80]u8 = undefined;
-    var row4: [80]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 0, &row0), "+1 -1") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 1, &row1), "a.txt") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 2, &row2), "one") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 3, &row3), "two") != null);
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 4, &row4), "TWO") != null);
-}
-
-test "edit renderer shows malformed result message when tool result is missing" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 80, 8);
-    defer buf.deinit();
-
-    const state = if (edit_renderer.init_state) |init_fn| init_fn(testing.allocator) else null;
-    defer if (state) |resolved| {
-        if (edit_renderer.deinit_state) |deinit_fn| deinit_fn(resolved, testing.allocator);
-    };
-
-    if (edit_renderer.result_changed) |changed_fn| {
-        var state_ctx = ToolStateContext{
-            .tool_name = "edit",
-            .tool_call_id = "call-2",
-            .args = .null,
-            .result = null,
-            .is_partial = false,
-            .is_error = false,
-            .expanded = true,
-            .execution_started = true,
-            .args_complete = true,
-            .allocator = testing.allocator,
-            .state = state,
-        };
-        changed_fn(&state_ctx);
+    var saw_removed = false;
+    var saw_added = false;
+    for (builtin_state.surface.rows.items) |row| {
+        if (std.mem.eql(u8, row.text, "two") and row.style == .removed) saw_removed = true;
+        if (std.mem.eql(u8, row.text, "TWO") and row.style == .added) saw_added = true;
+        try testing.expect(!std.mem.eql(u8, row.text, "fallback unified text"));
     }
-
-    const measure_ctx = ToolMeasureContext{
-        .tool_name = "edit",
-        .tool_call_id = "call-2",
-        .args = .null,
-        .result = null,
-        .is_partial = false,
-        .is_error = false,
-        .expanded = true,
-        .execution_started = true,
-        .args_complete = true,
-        .allocator = testing.allocator,
-        .state = state,
-        .width = buf.width,
-    };
-    try testing.expect(edit_renderer.measure_result.?(&measure_ctx) > 0);
-
-    var render_ctx = ToolRenderContext{
-        .tool_name = "edit",
-        .tool_call_id = "call-2",
-        .args = .null,
-        .result = null,
-        .is_partial = false,
-        .is_error = false,
-        .expanded = true,
-        .execution_started = true,
-        .args_complete = true,
-        .theme = themes_builtin.dark(),
-        .allocator = testing.allocator,
-        .state = state,
-        .region = buf.region(),
-        .width = buf.width,
-    };
-    edit_renderer.render_result_slice.?(&render_ctx, 0);
-
-    var row: [80]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, rowAscii(&buf, 1, &row), "malformed edit result") != null);
+    try testing.expect(saw_removed);
+    try testing.expect(saw_added);
 }

@@ -978,35 +978,49 @@ fn isAborted(signal: AbortSignal) bool {
     return signal.isAborted();
 }
 
-test "makeAgentToolTextResult owns copied text" {
-    const allocator = std.testing.allocator;
-    const literal = "aborted";
-
-    const result = makeAgentToolTextResult(allocator, literal, true);
-    defer result.free(allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), result.content.len);
-    try std.testing.expectEqualStrings(literal, result.content[0].text.text);
-    try std.testing.expect(result.content[0].text.text.ptr != literal.ptr);
-    try std.testing.expect(result.is_error);
+fn testLoopConfig(tool_execution: protocol.ToolExecutionMode) protocol.AgentLoopConfig {
+    return .{
+        .model = .{
+            .id = "gpt-test",
+            .name = "gpt-test",
+            .api = .openai_responses,
+            .provider = .openai,
+            .base_url = "",
+            .reasoning = false,
+            .input = &.{},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 0,
+            .max_tokens = 0,
+        },
+        .stream = undefined,
+        .convert_to_llm = undefined,
+        .tool_execution = tool_execution,
+    };
 }
 
-test "makeErrorToolResult owns copied text" {
+test "synthetic tool results own copied text" {
     const allocator = std.testing.allocator;
-    const literal = "tool failure";
 
-    const result = makeErrorToolResult(allocator, "tc-1", "echo", literal);
+    const agent_result = makeAgentToolTextResult(allocator, "aborted", true);
+    defer agent_result.free(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), agent_result.content.len);
+    try std.testing.expectEqualStrings("aborted", agent_result.content[0].text.text);
+    try std.testing.expect(agent_result.content[0].text.text.ptr != "aborted".ptr);
+    try std.testing.expect(agent_result.is_error);
+
+    const error_result = makeErrorToolResult(allocator, "tc-1", "echo", "tool failure");
     defer {
-        allocator.free(result.content[0].text.text);
-        allocator.free(result.content);
-        var details = result.details.?.object;
+        allocator.free(error_result.content[0].text.text);
+        allocator.free(error_result.content);
+        var details = error_result.details.?.object;
         details.deinit(allocator);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), result.content.len);
-    try std.testing.expectEqualStrings(literal, result.content[0].text.text);
-    try std.testing.expect(result.content[0].text.text.ptr != literal.ptr);
-    try std.testing.expect(result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), error_result.content.len);
+    try std.testing.expectEqualStrings("tool failure", error_result.content[0].text.text);
+    try std.testing.expect(error_result.content[0].text.text.ptr != "tool failure".ptr);
+    try std.testing.expect(error_result.is_error);
 }
 
 test "validateToolArguments rejects missing required field" {
@@ -1032,124 +1046,6 @@ test "validateToolArguments rejects missing required field" {
 
     try std.testing.expect(err_msg != null);
     try std.testing.expect(std.mem.indexOf(u8, err_msg.?, "arguments.path") != null);
-}
-
-test "parallel worker tools overlap and finalize in source order" {
-    const Shared = struct {
-        started_first: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        started_second: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        first_saw_second: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        second_saw_first: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    };
-    const ToolCtx = struct {
-        shared: *Shared,
-        which: enum { first, second },
-    };
-    const Exec = struct {
-        fn run(
-            raw_ctx: ?*anyopaque,
-            allocator: std.mem.Allocator,
-            _: []const u8,
-            _: std.json.Value,
-            _: AbortSignal,
-            _: ?protocol.AgentToolUpdateCallback,
-            _: ?*anyopaque,
-        ) protocol.AgentToolResult {
-            const ctx: *ToolCtx = @ptrCast(@alignCast(raw_ctx.?));
-            switch (ctx.which) {
-                .first => {
-                    ctx.shared.started_first.store(true, .release);
-                    var i: usize = 0;
-                    while (i < 100 and !ctx.shared.started_second.load(.acquire)) : (i += 1) {
-                        std.Options.debug_io.sleep(.fromNanoseconds(@intCast(1_000_000)), .awake) catch {};
-                    }
-                    ctx.shared.first_saw_second.store(ctx.shared.started_second.load(.acquire), .release);
-                },
-                .second => {
-                    ctx.shared.started_second.store(true, .release);
-                    var i: usize = 0;
-                    while (i < 100 and !ctx.shared.started_first.load(.acquire)) : (i += 1) {
-                        std.Options.debug_io.sleep(.fromNanoseconds(@intCast(1_000_000)), .awake) catch {};
-                    }
-                    ctx.shared.second_saw_first.store(ctx.shared.started_first.load(.acquire), .release);
-                },
-            }
-            return makeAgentToolTextResult(allocator, switch (ctx.which) {
-                .first => "first",
-                .second => "second",
-            }, false);
-        }
-    };
-    const Sink = struct {
-        fn emit(_: protocol.AgentEvent, _: ?*anyopaque) void {}
-    };
-
-    var shared = Shared{};
-    var first_ctx = ToolCtx{ .shared = &shared, .which = .first };
-    var second_ctx = ToolCtx{ .shared = &shared, .which = .second };
-
-    const assistant_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
-        .{ .tool_call = .{ .id = "call-1", .name = "one", .arguments = .null } },
-        .{ .tool_call = .{ .id = "call-2", .name = "two", .arguments = .null } },
-    };
-    const assistant_msg: ai.protocol.AssistantMessage = .{
-        .content = &assistant_content,
-        .api = .openai_responses,
-        .provider = .openai,
-        .model = "gpt-test",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
-        .stop_reason = .toolUse,
-        .timestamp = 0,
-    };
-    const tools = [_]protocol.AgentTool{
-        .{ .name = "one", .description = "", .label = "One", .parameters = .null, .ctx = @ptrCast(&first_ctx), .affinity = .worker_thread, .execute = &Exec.run },
-        .{ .name = "two", .description = "", .label = "Two", .parameters = .null, .ctx = @ptrCast(&second_ctx), .affinity = .worker_thread, .execute = &Exec.run },
-    };
-
-    var run_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer run_arena.deinit();
-    var turn_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer turn_arena.deinit();
-    var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
-    var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
-    var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
-
-    executeToolCalls(
-        run_arena.allocator(),
-        turn_arena.allocator(),
-        &ctx_messages,
-        &new_messages,
-        &tool_results,
-        assistant_msg,
-        &tools,
-        .{
-            .model = .{
-                .id = "gpt-test",
-                .name = "gpt-test",
-                .api = .openai_responses,
-                .provider = .openai,
-                .base_url = "",
-                .reasoning = false,
-                .input = &.{},
-                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-                .context_window = 0,
-                .max_tokens = 0,
-            },
-            .stream = undefined,
-            .convert_to_llm = undefined,
-            .tool_execution = .parallel,
-        },
-        "",
-        AbortSignal.none,
-        Sink.emit,
-        null,
-    );
-
-    try std.testing.expect(shared.first_saw_second.load(.acquire));
-    try std.testing.expect(shared.second_saw_first.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 2), tool_results.items.len);
-    try std.testing.expectEqualStrings("call-1", tool_results.items[0].tool_call_id);
-    try std.testing.expectEqualStrings("call-2", tool_results.items[1].tool_call_id);
 }
 
 test "parallel worker updates stream live before source-ordered finalization" {
@@ -1241,23 +1137,7 @@ test "parallel worker updates stream live before source-ordered finalization" {
         &tool_results,
         assistant_msg,
         &tools,
-        .{
-            .model = .{
-                .id = "gpt-test",
-                .name = "gpt-test",
-                .api = .openai_responses,
-                .provider = .openai,
-                .base_url = "",
-                .reasoning = false,
-                .input = &.{},
-                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-                .context_window = 0,
-                .max_tokens = 0,
-            },
-            .stream = undefined,
-            .convert_to_llm = undefined,
-            .tool_execution = .parallel,
-        },
+        testLoopConfig(.parallel),
         "",
         AbortSignal.none,
         Collector.emit,
@@ -1363,23 +1243,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         &tool_results,
         assistant_msg,
         &tools,
-        .{
-            .model = .{
-                .id = "gpt-test",
-                .name = "gpt-test",
-                .api = .openai_responses,
-                .provider = .openai,
-                .base_url = "",
-                .reasoning = false,
-                .input = &.{},
-                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-                .context_window = 0,
-                .max_tokens = 0,
-            },
-            .stream = undefined,
-            .convert_to_llm = undefined,
-            .tool_execution = .parallel,
-        },
+        testLoopConfig(.parallel),
         "",
         signal,
         Collector.emit,

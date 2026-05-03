@@ -331,25 +331,20 @@ fn osRelease() []const u8 {
 /// so `streamCore` emits a clean error event instead of a silent no-op.
 const testing = std.testing;
 
-test "extractAccountId returns the chatgpt account claim from oauth tokens" {
+test "auth helpers extract ChatGPT account and build Codex headers" {
     const allocator = testing.allocator;
     const token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
     const account_id = try extractAccountId(allocator, token);
     defer allocator.free(account_id);
     try testing.expectEqualStrings("acct_123", account_id);
-}
 
-test "clampCodexReasoningEffort matches pi-mono codex rules" {
-    try testing.expectEqualStrings("low", clampCodexReasoningEffort("gpt-5.4", "minimal"));
-    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.1", "xhigh"));
-    try testing.expectEqualStrings("medium", clampCodexReasoningEffort("gpt-5.1-codex-mini", "low"));
-    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.1-codex-mini", "xhigh"));
-    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.4", "high"));
-}
+    var auth_buf: [256]u8 = undefined;
+    const auth = try buildBearerAuth(null, &auth_buf, token);
+    try testing.expectEqualStrings("Bearer " ++ token, auth);
+    try testing.expectError(error.NoApiKey, buildBearerAuth(null, &auth_buf, null));
 
-test "fillCodexHeaders matches the codex-required header set" {
     var headers: [6]protocol.Header = undefined;
-    const count = fillCodexHeaders(&headers, "acct_123", "pi (darwin darwin; aarch64)", "session-abc");
+    const count = fillCodexHeaders(&headers, account_id, "pi (darwin darwin; aarch64)", "session-abc");
     try testing.expectEqual(@as(usize, 6), count);
     try testing.expectEqualStrings("chatgpt-account-id", headers[0].key);
     try testing.expectEqualStrings("acct_123", headers[0].value);
@@ -357,10 +352,20 @@ test "fillCodexHeaders matches the codex-required header set" {
     try testing.expectEqualStrings("pi", headers[1].value);
     try testing.expectEqualStrings("user-agent", headers[2].key);
     try testing.expectEqualStrings("OpenAI-Beta", headers[3].key);
+    try testing.expectEqualStrings("responses=experimental", headers[3].value);
     try testing.expectEqualStrings("accept", headers[4].key);
     try testing.expectEqualStrings("text/event-stream", headers[4].value);
     try testing.expectEqualStrings("session_id", headers[5].key);
     try testing.expectEqualStrings("session-abc", headers[5].value);
+}
+
+test "clampCodexReasoningEffort matches codex model/API boundaries" {
+    try testing.expectEqualStrings("low", clampCodexReasoningEffort("gpt-5.4", "minimal"));
+    try testing.expectEqualStrings("low", clampCodexReasoningEffort("openai/gpt-5.2-codex", "minimal"));
+    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.1", "xhigh"));
+    try testing.expectEqualStrings("medium", clampCodexReasoningEffort("gpt-5.1-codex-mini", "low"));
+    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.1-codex-mini", "xhigh"));
+    try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.4", "high"));
 }
 
 test "Codex provider rejects websocket transport before auth" {
@@ -368,18 +373,6 @@ test "Codex provider rejects websocket transport before auth" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const model = protocol.Model{
-        .id = "gpt-5.4",
-        .name = "GPT-5.4",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 128000,
-        .max_tokens = 4096,
-    };
     const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
     const ctx = protocol.Context{ .messages = &.{msg} };
     var provider = OpenAICodexProvider.init(alloc);
@@ -387,7 +380,7 @@ test "Codex provider rejects websocket transport before auth" {
 
     provider.provider().stream(
         alloc,
-        model,
+        codexTestModel(),
         ctx,
         .{ .transport = .websocket },
         ErrorCapture.callback,
@@ -417,66 +410,8 @@ const ErrorCapture = struct {
     }
 };
 
-test "buildCodexRequestJson includes prompt_cache_key when session_id is set" {
+test "buildCodexRequestJson preserves Codex request contract" {
     const alloc = testing.allocator;
-    const model = protocol.Model{
-        .id = "gpt-5.4",
-        .name = "GPT-5.4",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 128000,
-        .max_tokens = 4096,
-    };
-    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
-    const ctx = protocol.Context{ .messages = &.{msg} };
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(alloc);
-
-    try buildCodexRequestJson(alloc, &out, model, ctx, .{ .session_id = "session-abc" }, null, null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"prompt_cache_key\":\"session-abc\"") != null);
-}
-
-test "buildCodexRequestJson omits reasoning when no reasoning effort is requested" {
-    const alloc = testing.allocator;
-    const model = protocol.Model{
-        .id = "gpt-5.4",
-        .name = "GPT-5.4",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 128000,
-        .max_tokens = 4096,
-    };
-    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
-    const ctx = protocol.Context{ .messages = &.{msg} };
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(alloc);
-
-    try buildCodexRequestJson(alloc, &out, model, ctx, .{}, null, null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning\"") == null);
-}
-
-test "buildCodexRequestJson writes codex tool strict null and temperature" {
-    const alloc = testing.allocator;
-    const model = protocol.Model{
-        .id = "gpt-5.4",
-        .name = "GPT-5.4",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 128000,
-        .max_tokens = 4096,
-    };
     var params = std.json.Value{ .object = .{} };
     defer params.object.deinit(alloc);
     const tool = protocol.Tool{
@@ -485,13 +420,53 @@ test "buildCodexRequestJson writes codex tool strict null and temperature" {
         .parameters = params,
     };
     const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
-    const ctx = protocol.Context{ .messages = &.{msg}, .tools = &.{tool} };
+    const ctx = protocol.Context{
+        .system_prompt = "be precise",
+        .messages = &.{msg},
+        .tools = &.{tool},
+    };
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
 
-    try buildCodexRequestJson(alloc, &out, model, ctx, .{ .temperature = 0.25 }, null, null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "\"strict\":null") != null);
+    try buildCodexRequestJson(alloc, &out, codexTestModel(), ctx, .{
+        .session_id = "session-abc",
+        .temperature = 0.25,
+    }, "low", "auto");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("gpt-5.4", root.get("model").?.string);
+    try testing.expectEqualStrings("be precise", root.get("instructions").?.string);
+    try testing.expectEqual(@as(usize, 1), root.get("input").?.array.items.len);
+    try testing.expectEqualStrings("medium", root.get("text").?.object.get("verbosity").?.string);
+    try testing.expectEqualStrings("reasoning.encrypted_content", root.get("include").?.array.items[0].string);
+    try testing.expectEqualStrings("session-abc", root.get("prompt_cache_key").?.string);
+    try testing.expectEqualStrings("auto", root.get("tool_choice").?.string);
+    try testing.expect(root.get("parallel_tool_calls").?.bool);
+    try testing.expectEqualStrings("low", root.get("reasoning").?.object.get("effort").?.string);
+    try testing.expectEqualStrings("auto", root.get("reasoning").?.object.get("summary").?.string);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"temperature\":0.25") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"strict\":null") != null);
+
+    out.clearRetainingCapacity();
+    try buildCodexRequestJson(alloc, &out, codexTestModel(), ctx, .{}, null, null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning\"") == null);
+}
+
+fn codexTestModel() protocol.Model {
+    return .{
+        .id = "gpt-5.4",
+        .name = "GPT-5.4",
+        .api = .openai_codex_responses,
+        .provider = .openai_codex,
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
 }
 
 fn buildBearerAuth(

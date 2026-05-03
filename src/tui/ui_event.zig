@@ -305,19 +305,67 @@ pub const UiEvent = union(enum) {
 
 const testing = std.testing;
 
-test "UiEvent deinit frees conversation snapshot payload" {
-    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
-    var ev = UiEvent{ .conversation_snapshot = .{
+test "UiEvent snapshot classification drives queue routing" {
+    const themes_builtin = @import("../themes/builtin.zig");
+
+    var status = UiEvent{ .status_snapshot = .{
+        .model_provider = try testing.allocator.dupe(u8, "openai"),
+        .model_id = try testing.allocator.dupe(u8, "gpt-5"),
+        .thinking_level = try testing.allocator.dupe(u8, "high"),
+        .context_tokens = 1,
+        .context_window = 2,
+    } };
+    defer status.deinit(testing.allocator);
+
+    var login = UiEvent{ .login_progress = .{
+        .message = try testing.allocator.dupe(u8, "check your browser"),
+        .kind = .auth_url,
+    } };
+    defer login.deinit(testing.allocator);
+
+    try testing.expect((UiEvent{ .theme_changed = themes_builtin.dark().* }).isSnapshotEvent());
+    try testing.expect(status.isSnapshotEvent());
+    try testing.expect(login.isSnapshotEvent());
+    try testing.expect(!(UiEvent{ .request_worker_finished = {} }).isSnapshotEvent());
+    try testing.expect(!(UiEvent{ .session_new_started = {} }).isSnapshotEvent());
+}
+
+test "UiEvent snapshot take helpers transfer mailbox ownership" {
+    const allocator = testing.allocator;
+
+    const shared = try conversation_state_mod.SharedCommitted.fromMessages(allocator, &.{});
+    var conversation = UiEvent{ .conversation_snapshot = .{
+        .session_generation = 2,
+        .conversation_version = 5,
         .view = .{
             .committed = shared,
             .in_flight = null,
         },
     } };
-    ev.deinit(testing.allocator);
-}
+    var taken_conversation = conversation.takeConversationSnapshot().?;
+    defer taken_conversation.deinit(allocator);
+    try testing.expectEqual(@as(u64, 2), taken_conversation.session_generation);
+    try testing.expectEqual(@as(u64, 5), taken_conversation.conversation_version);
+    try testing.expect(conversation.takeConversationSnapshot() == null);
+    conversation.deinit(allocator);
 
-test "UiEvent visible-model snapshot ownership transfers with take helper" {
-    const allocator = testing.allocator;
+    const queued_snapshot = blk: {
+        const steering = try allocator.alloc(runtime_host_mod.QueuedMessageText, 0);
+        errdefer allocator.free(steering);
+        const follow_up = try allocator.alloc(runtime_host_mod.QueuedMessageText, 0);
+        break :blk runtime_host_mod.QueuedMessageSnapshot{
+            .steering = steering,
+            .follow_up = follow_up,
+            .version = 9,
+        };
+    };
+    var queued = UiEvent{ .queued_snapshot = queued_snapshot };
+    var taken_queued = queued.takeQueuedSnapshot().?;
+    defer taken_queued.deinit(allocator);
+    try testing.expectEqual(@as(u64, 9), taken_queued.version);
+    try testing.expect(queued.takeQueuedSnapshot() == null);
+    queued.deinit(allocator);
+
     const models = try model_registry_mod.cloneOwnedModels(allocator, &.{.{
         .id = "proxy-model",
         .name = "Proxy Model",
@@ -330,74 +378,29 @@ test "UiEvent visible-model snapshot ownership transfers with take helper" {
         .context_window = 1024,
         .max_tokens = 1024,
     }});
-    var ev = UiEvent{ .visible_models_snapshot = .{ .models = models } };
-
-    const taken = ev.takeVisibleModelsSnapshot().?;
-    defer model_registry_mod.deinitOwnedModels(allocator, taken);
-
-    ev.deinit(allocator);
+    var visible = UiEvent{ .visible_models_snapshot = .{ .models = models } };
+    const taken_models = visible.takeVisibleModelsSnapshot().?;
+    defer model_registry_mod.deinitOwnedModels(allocator, taken_models);
+    try testing.expect(visible.takeVisibleModelsSnapshot() == null);
+    visible.deinit(allocator);
 }
 
-test "UiEvent takeConversationSnapshot disarms later cleanup" {
-    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
-    var ev = UiEvent{ .conversation_snapshot = .{
-        .view = .{
-            .committed = shared,
-            .in_flight = null,
-        },
-    } };
-    var snapshot = ev.takeConversationSnapshot().?;
-    defer snapshot.deinit(testing.allocator);
-
-    ev.deinit(testing.allocator);
-}
-
-test "UiEvent deinit frees tool-running label" {
-    var ev = UiEvent{ .tool_running = .{
-        .tool_name = try testing.allocator.dupe(u8, "bash"),
-    } };
-    ev.deinit(testing.allocator);
-}
-
-test "UiEvent deinit handles assistant failure without message" {
-    var ev = UiEvent{ .assistant_run_finished = .{
+test "UiEvent deinit accepts owned payload variants and nullable edge cases" {
+    var assistant = UiEvent{ .assistant_run_finished = .{
         .is_aborted = false,
         .error_message = null,
     } };
-    ev.deinit(testing.allocator);
-}
+    assistant.deinit(testing.allocator);
 
-test "UiEvent snapshot classification matches lossy transport variants" {
-    var snapshot = UiEvent{ .status_snapshot = .{
-        .model_provider = try testing.allocator.dupe(u8, "openai"),
-        .model_id = try testing.allocator.dupe(u8, "gpt-5"),
-        .thinking_level = try testing.allocator.dupe(u8, "high"),
-        .context_tokens = 1,
-        .context_window = 2,
+    var retry = UiEvent{ .retry_end = .{
+        .success = false,
+        .attempt = 2,
+        .final_error = null,
     } };
-    defer snapshot.deinit(testing.allocator);
+    retry.deinit(testing.allocator);
 
-    try testing.expect(snapshot.isSnapshotEvent());
-    try testing.expect(!(UiEvent{ .request_worker_finished = {} }).isSnapshotEvent());
-}
-
-test "UiEvent conversation snapshot is mailbox payload for live conversation state" {
-    const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
-    var ev = UiEvent{ .conversation_snapshot = .{
-        .session_generation = 2,
-        .conversation_version = 5,
-        .view = .{
-            .committed = shared,
-            .in_flight = null,
-        },
+    var tool = UiEvent{ .tool_running = .{
+        .tool_name = try testing.allocator.dupe(u8, "bash"),
     } };
-    try testing.expect(ev.isSnapshotEvent());
-
-    var taken = ev.takeConversationSnapshot().?;
-    defer taken.deinit(testing.allocator);
-    try testing.expectEqual(@as(u64, 2), taken.session_generation);
-    try testing.expectEqual(@as(u64, 5), taken.conversation_version);
-
-    // After take, deinit of the event is a no-op for the payload.
-    ev.deinit(testing.allocator);
+    tool.deinit(testing.allocator);
 }

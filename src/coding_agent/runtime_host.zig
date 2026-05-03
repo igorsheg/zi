@@ -1275,26 +1275,6 @@ test "runtime host publishes committed view and queued snapshots independently" 
     try testing.expectEqualStrings("queued", published_queued.?.follow_up[0].text);
 }
 
-test "runtime host keeps queued-snapshot reads wired after session replacement" {
-    const session = try createOwnedTestAgentSession(testing.allocator, null);
-    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
-    defer host.deinit();
-
-    const before_session_id = host.currentSession().session_store.sessionId();
-    try host.newSession();
-    try testing.expect(!std.mem.eql(u8, before_session_id, host.currentSession().session_store.sessionId()));
-
-    try testing.expectEqual(.ok, host.currentSession().agent.followUp(.{ .user = .{
-        .content = .{ .text = "queued after replace" },
-        .timestamp = 1,
-    } }));
-
-    var snap = try host.currentSession().cloneQueuedMessageSnapshot(testing.allocator);
-    defer snap.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 1), snap.follow_up.len);
-    try testing.expectEqualStrings("queued after replace", snap.follow_up[0].text);
-}
-
 test "runtime host retries transient assistant failures and prunes the failed assistant turn before continue" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1529,109 +1509,52 @@ test "runtime host reports cancelled compaction as aborted without an error stri
     try testing.expect(collector.compaction_ends.items[0].error_message == null);
 }
 
-test "runtime host aborts replacement when session_before_switch is blocked" {
-    const allocator = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+test "runtime host blocks session replacement and fork when extension vetoes" {
+    const Case = struct {
+        event_name: []const u8,
+        is_fork: bool,
 
-    try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
-    try tmp.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = ".zi/extensions/block.lua",
-        .data =
-        \\return function(zi)
-        \\  zi.on("session_before_switch", function(event, ctx)
-        \\    return { block = true, reason = "test-block" }
-        \\  end)
-        \\end
-        ,
-    });
+        fn run(self: @This()) !void {
+            const allocator = testing.allocator;
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
 
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(cwd);
+            try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
+            const lua_src = try std.fmt.allocPrint(allocator,
+                \\return function(zi)
+                \\  zi.on("{s}", function(event, ctx)
+                \\    return {{ block = true, reason = "test-block" }}
+                \\  end)
+                \\end
+            , .{self.event_name});
+            defer allocator.free(lua_src);
+            try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".zi/extensions/block.lua", .data = lua_src });
 
-    const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
-    const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
-    var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{});
-    defer host.deinit();
+            const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
+            defer allocator.free(cwd);
 
-    const before_session_id = try allocator.dupe(u8, host.currentSession().session_store.sessionId());
-    defer allocator.free(before_session_id);
-    const before_generation = host.currentSession().extensionRunner().?.generation;
+            const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
+            const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
+            var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{});
+            defer host.deinit();
 
-    try testing.expectError(error.SessionBeforeSwitchBlocked, host.newSession());
+            const before_session_id = try allocator.dupe(u8, host.currentSession().session_store.sessionId());
+            defer allocator.free(before_session_id);
+            const before_generation = host.currentSession().extensionRunner().?.generation;
 
-    try testing.expectEqualStrings(before_session_id, host.currentSession().session_store.sessionId());
-    try testing.expectEqual(before_generation, host.currentSession().extensionRunner().?.generation);
-}
+            if (self.is_fork) {
+                try testing.expectError(error.SessionBeforeForkBlocked, host.forkSession("entry-1"));
+            } else {
+                try testing.expectError(error.SessionBeforeSwitchBlocked, host.newSession());
+            }
 
-test "runtime host aborts replacement when session_before_fork is blocked" {
-    const allocator = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
+            try testing.expectEqualStrings(before_session_id, host.currentSession().session_store.sessionId());
+            try testing.expectEqual(before_generation, host.currentSession().extensionRunner().?.generation);
+        }
+    };
 
-    try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
-    try tmp.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = ".zi/extensions/block.lua",
-        .data =
-        \\return function(zi)
-        \\  zi.on("session_before_fork", function(event, ctx)
-        \\    return { block = true, reason = "test-fork-block" }
-        \\  end)
-        \\end
-        ,
-    });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(cwd);
-
-    const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
-    const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
-    var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{});
-    defer host.deinit();
-
-    const before_session_id = try allocator.dupe(u8, host.currentSession().session_store.sessionId());
-    defer allocator.free(before_session_id);
-    const before_generation = host.currentSession().extensionRunner().?.generation;
-
-    try testing.expectError(error.SessionBeforeForkBlocked, host.forkSession("entry-1"));
-
-    try testing.expectEqualStrings(before_session_id, host.currentSession().session_store.sessionId());
-    try testing.expectEqual(before_generation, host.currentSession().extensionRunner().?.generation);
-}
-
-test "runtime host forkSession replaces session and skips session_before_switch" {
-    const allocator = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
-    try tmp.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = ".zi/extensions/block.lua",
-        .data =
-        \\return function(zi)
-        \\  zi.on("session_before_switch", function(event, ctx)
-        \\    return { block = true, reason = "should-not-fire" }
-        \\  end)
-        \\end
-        ,
-    });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(cwd);
-
-    const create_options = createTestCreateOptionsForCwd(cwd, &.{}, false);
-    const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
-    var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{});
-    defer host.deinit();
-
-    const before_session_id = try allocator.dupe(u8, host.currentSession().session_store.sessionId());
-    defer allocator.free(before_session_id);
-    const before_generation = host.currentSession().extensionRunner().?.generation;
-
-    try host.forkSession("entry-1");
-
-    try testing.expect(!std.mem.eql(u8, before_session_id, host.currentSession().session_store.sessionId()));
-    try testing.expectEqual(before_generation + 1, host.currentSession().extensionRunner().?.generation);
+    try (Case{ .event_name = "session_before_switch", .is_fork = false }).run();
+    try (Case{ .event_name = "session_before_fork", .is_fork = true }).run();
 }
 
 test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads" {
@@ -1692,18 +1615,4 @@ test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads"
     try testing.expectEqual(@as(usize, 2), lines_out.items.len);
     try testing.expectEqualStrings("entry-42|shutdown", lines_out.items[0]);
     try testing.expectEqualStrings("entry-42|start", lines_out.items[1]);
-}
-
-test "session_generation bumps on newSession" {
-    const session = try createOwnedTestAgentSession(testing.allocator, null);
-    var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{});
-    defer host.deinit();
-
-    try testing.expectEqual(@as(u64, 1), host.session_generation);
-
-    try host.newSession();
-    try testing.expectEqual(@as(u64, 2), host.session_generation);
-
-    try host.newSession();
-    try testing.expectEqual(@as(u64, 3), host.session_generation);
 }

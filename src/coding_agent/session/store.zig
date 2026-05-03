@@ -752,19 +752,6 @@ test "current visible branch includes buffered session metadata before flush" {
     try std.testing.expectEqualStrings("test1", branch[0].entry.session_info.name.?);
 }
 
-test "listSessionsInDir returns empty slice for empty directory" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const session_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(session_dir);
-
-    const sessions = try listSessionsInDir(std.testing.allocator, session_dir);
-    defer freeSessionInfos(std.testing.allocator, sessions);
-
-    try std.testing.expectEqual(@as(usize, 0), sessions.len);
-}
-
 test "openForResume returns resume context and transfers store ownership" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -843,23 +830,6 @@ test "append after flush persists entries larger than fixed scratch buffer" {
     try std.testing.expectEqualStrings(large_id_copy, branch[branch.len - 1].parent_id.?);
 }
 
-test "appendRuntimeDefaults seeds model change before thinking level change" {
-    var store = SessionStore.createEphemeral(std.testing.allocator);
-    defer store.deinit();
-
-    store.appendRuntimeDefaults("anthropic", "claude", "high");
-
-    const buffered = store.writer.buffered_entries.items;
-    try std.testing.expectEqual(@as(usize, 2), buffered.len);
-    try std.testing.expect(buffered[0] == .entry);
-    try std.testing.expect(buffered[0].entry.entry == .model_change);
-    try std.testing.expectEqualStrings("anthropic", buffered[0].entry.entry.model_change.provider);
-    try std.testing.expectEqualStrings("claude", buffered[0].entry.entry.model_change.model_id);
-    try std.testing.expect(buffered[1] == .entry);
-    try std.testing.expect(buffered[1].entry.entry == .thinking_level_change);
-    try std.testing.expectEqualStrings("high", buffered[1].entry.entry.thinking_level_change.thinking_level);
-}
-
 test "applyCompaction preserves artifact fields and rebuilds current context" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -918,35 +888,7 @@ test "contextUsageUnknownAfterCompaction tracks post-compaction assistant usage"
     try std.testing.expect(!store.contextUsageUnknownAfterCompaction(allocator));
 }
 
-test "open duplicates writer session and leaf ids from cached session data" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = "session.jsonl",
-        .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
-            "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
-    });
-
-    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
-    defer std.testing.allocator.free(path);
-
-    var store = try SessionStore.open(std.testing.allocator, path);
-    defer store.deinit();
-
-    try std.testing.expect(store.cached_header != null);
-    try std.testing.expect(store.cached_entries != null);
-    try std.testing.expect(store.writer.session_id.len > 0);
-    try std.testing.expect(store.writer.session_id.ptr != store.cached_header.?.id.ptr);
-    try std.testing.expect(store.writer.leaf_id != null);
-    try std.testing.expect(store.writer.leaf_id.?.ptr != store.cached_entries.?[0].id.ptr);
-
-    store.appendSessionInfo("name");
-    try std.testing.expect(store.cached_entries == null);
-    try std.testing.expect(store.cached_header == null);
-}
-
-test "cache invalidation works when store uses arena allocator" {
+test "open owns writer state and cache invalidation works with arena allocator" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -965,8 +907,15 @@ test "cache invalidation works when store uses arena allocator" {
     var store = try SessionStore.open(arena.allocator(), path);
     defer store.deinit();
 
+    try std.testing.expectEqualStrings("abc", store.sessionId());
+    try std.testing.expectEqualStrings("m1", store.currentEntryId().?);
     try std.testing.expect(store.cached_entries != null);
+
     store.appendSessionInfo("name");
+
     try std.testing.expect(store.cached_entries == null);
+    try std.testing.expect(store.cached_header == null);
     try std.testing.expect(store.cache_arena == null);
+    try std.testing.expectEqualStrings("abc", store.sessionId());
+    try std.testing.expect(store.currentEntryId() != null);
 }

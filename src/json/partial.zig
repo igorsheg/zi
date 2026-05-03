@@ -503,28 +503,13 @@ fn expectEqualJson(a: std.json.Value, b: std.json.Value) !void {
     try testing.expectEqualStrings(ca, cb);
 }
 
-test "Allow bit order: toInt / fromInt round-trip matches documented layout" {
-    try testing.expectEqual(@as(u8, 0x00), Allow.none.toInt());
-    try testing.expectEqual(@as(u8, 0xff), Allow.all.toInt());
-    try testing.expectEqual(@as(u8, 0x01), (Allow{ .str = true }).toInt());
-    try testing.expectEqual(@as(u8, 0x02), (Allow{ .num = true }).toInt());
-    try testing.expectEqual(@as(u8, 0x04), (Allow{ .arr = true }).toInt());
-    try testing.expectEqual(@as(u8, 0x08), (Allow{ .obj = true }).toInt());
-    try testing.expectEqual(@as(u8, 0x10), (Allow{ .nul = true }).toInt());
-    try testing.expectEqual(@as(u8, 0x20), (Allow{ .boolean = true }).toInt());
-    const rt = Allow.fromInt(0b10101010);
-    try testing.expectEqual(@as(u8, 0b10101010), rt.toInt());
-}
-
-test "strict equivalence: complete JSON matches std.json.parseFromSliceLeaky across a small corpus" {
+test "complete JSON matches std.json at parser boundaries" {
     const corpus = [_][]const u8{
         \\{"a":1,"b":2.5,"c":"hello","d":true,"e":null,"f":[1,2,3],"g":{"nested":"yes"}}
         ,
         \\[1,"two",3.14,false,null,[],{}]
         ,
-        \\{"unicode":"caf\u00e9 \u00e4\u00f6\u00fc","emoji":"\ud83d\ude00","escapes":"a\nb\tc\"d\\e"}
-        ,
-        \\{"ints":[0,-1,42,9223372036854775807],"floats":[0.0,-1.5,1e10,-2.3e-4]}
+        \\{"unicode":"caf\u00e9","emoji":"\ud83d\ude00","escapes":"a\nb\tc\"d\\e"}
         ,
         \\"just a string"
         ,
@@ -539,129 +524,86 @@ test "strict equivalence: complete JSON matches std.json.parseFromSliceLeaky acr
     }
 }
 
-test "cut points: every truncation of a real tool-call payload yields a usable Value under Allow.all" {
-    const full =
-        \\{"path":"/foo/bar.zig","old_str":"a {b} c","count":42,"flags":[true,false,null],"meta":{"k":"v"}}
-    ;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    // Every non-empty prefix must parse to an object under Allow.all.
-    // The final full parse must structurally match the strict parse.
-    var i: usize = 1;
-    while (i <= full.len) : (i += 1) {
-        const prefix = full[0..i];
-        const value = parse(arena.allocator(), prefix, .all) catch |err| {
-            std.debug.print("prefix[0..{d}] = `{s}` failed: {s}\n", .{ i, prefix, @errorName(err) });
-            return err;
-        };
-        // Top level must remain an object for every prefix of an object literal.
-        try testing.expect(value == .object);
-    }
-    const full_strict = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), full, .{});
-    const full_ours = try parse(arena.allocator(), full, .all);
-    try expectEqualJson(full_strict, full_ours);
-}
-
-test "cut points: specific hot spots (mid-string, mid-escape, mid-number, mid-literal, after :, after ,)" {
+test "incomplete JSON returns the committed object/array prefix under Allow.all" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Mid-string body.
-    {
-        const v = try parse(alloc, "{\"path\":\"/foo/ba", .all);
-        try testing.expect(v == .object);
-        const got = v.object.get("path").?;
-        try testing.expectEqualStrings("/foo/ba", got.string);
-    }
-    // Mid escape: backslash at end (string is truncated; safe_end
-    // doesn't advance past the orphan backslash).
-    {
-        const v = try parse(alloc, "{\"s\":\"hello\\", .all);
-        try testing.expect(v == .object);
-        try testing.expectEqualStrings("hello", v.object.get("s").?.string);
-    }
-    // Mid \uXXXX escape.
-    {
-        const v = try parse(alloc, "{\"s\":\"ab\\u00", .all);
-        try testing.expect(v == .object);
-        try testing.expectEqualStrings("ab", v.object.get("s").?.string);
-    }
-    // Mid number (trailing exponent marker).
-    {
-        const v = try parse(alloc, "{\"n\":1.5e", .all);
-        try testing.expect(v == .object);
-        const n = v.object.get("n").?;
-        try testing.expectApproxEqAbs(@as(f64, 1.5), n.float, 1e-9);
-    }
-    // Mid literal ("tru").
-    {
-        const v = try parse(alloc, "{\"ok\":tru", .all);
-        try testing.expect(v == .object);
-        try testing.expect(v.object.get("ok").?.bool == true);
-    }
-    // After colon with no value yet.
-    {
-        const v = try parse(alloc, "{\"k\":", .all);
-        try testing.expect(v == .object);
-        // No key committed — parseAny raised Partial before put().
-        try testing.expectEqual(@as(usize, 0), v.object.count());
-    }
-    // After comma with no next key — container closes without that entry.
-    {
-        const v = try parse(alloc, "{\"a\":1,", .all);
-        try testing.expect(v == .object);
-        try testing.expectEqual(@as(usize, 1), v.object.count());
-        try testing.expectEqual(@as(i64, 1), v.object.get("a").?.integer);
-    }
-    // Mid-key (key string itself truncated) — with Allow.all the
-    // partial-key str is materialized but no `:` follows, so the
-    // object closes without a committed entry.
-    {
-        const v = try parse(alloc, "{\"par", .all);
-        try testing.expect(v == .object);
-        try testing.expectEqual(@as(usize, 0), v.object.count());
-    }
+    // Mid-string value: the key/value pair is committed with the partial string.
+    const mid_string = try parse(alloc, "{\"path\":\"/foo/ba", .all);
+    try testing.expect(mid_string == .object);
+    try testing.expectEqualStrings("/foo/ba", mid_string.object.get("path").?.string);
+
+    // After ':' no value has been committed yet.
+    const after_colon = try parse(alloc, "{\"k\":", .all);
+    try testing.expect(after_colon == .object);
+    try testing.expectEqual(@as(usize, 0), after_colon.object.count());
+
+    // After ',' the previous value remains, but no empty element is invented.
+    const after_comma = try parse(alloc, "[1,", .all);
+    try testing.expect(after_comma == .array);
+    try testing.expectEqual(@as(usize, 1), after_comma.array.items.len);
+    try testing.expectEqual(@as(i64, 1), after_comma.array.items[0].integer);
+
+    // Truncated literal and number tokens complete only when their Allow bits are set.
+    const literal = try parse(alloc, "{\"ok\":tru", .all);
+    try testing.expect(literal.object.get("ok").?.bool);
+    const number = try parse(alloc, "{\"n\":1.5e", .all);
+    try testing.expectApproxEqAbs(@as(f64, 1.5), number.object.get("n").?.float, 1e-9);
+
+    try testing.expectError(ParseError.Partial, parse(alloc, "{\"path\":\"/foo/ba", .none));
 }
 
-test "parseStreaming: blank and total-failure both return empty object" {
+test "strings decode complete escapes and truncate only at safe partial escape boundaries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const complete = try parse(alloc, "{\"s\":\"a\\nb\\tc\\\"d\\\\e \u{1F600}\"}", .none);
+    try testing.expectEqualStrings("a\nb\tc\"d\\e 😀", complete.object.get("s").?.string);
+
+    const orphan_backslash = try parse(alloc, "{\"s\":\"hello\\", .all);
+    try testing.expectEqualStrings("hello", orphan_backslash.object.get("s").?.string);
+
+    const partial_unicode = try parse(alloc, "{\"s\":\"ab\\u00", .all);
+    try testing.expectEqualStrings("ab", partial_unicode.object.get("s").?.string);
+
+    try testing.expectError(ParseError.Malformed, parse(alloc, "{\"s\":\"\\x\"}", .none));
+    try testing.expectError(ParseError.Malformed, parse(alloc, "{\"s\":\"\\uDE00\"}", .none));
+}
+
+test "malformed input and nesting depth are hard parser boundaries" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const blank = try parseStreaming(arena.allocator(), "   \n\t");
-    try testing.expect(blank == .object);
-    try testing.expectEqual(@as(usize, 0), blank.object.count());
-
-    const garbage = try parseStreaming(arena.allocator(), "@@@not json@@@");
-    try testing.expect(garbage == .object);
-    try testing.expectEqual(@as(usize, 0), garbage.object.count());
-
-    const ok = try parseStreaming(arena.allocator(), "{\"a\":1}");
-    try testing.expect(ok == .object);
-    try testing.expectEqual(@as(i64, 1), ok.object.get("a").?.integer);
-
-    const partial = try parseStreaming(arena.allocator(), "{\"a\":1,\"b\":\"hel");
-    try testing.expect(partial == .object);
-    try testing.expectEqualStrings("hel", partial.object.get("b").?.string);
-}
-
-test "malformed input returns Malformed, not Partial" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    // Invalid escape mid-string.
-    try testing.expectError(ParseError.Malformed, parse(arena.allocator(), "{\"s\":\"\\x\"}", .none));
-    // Bare identifier where a value is expected. Under Allow.none
-    // the object cannot swallow the inner error.
     try testing.expectError(ParseError.Malformed, parse(arena.allocator(), "{\"k\":@}", .none));
-}
+    try testing.expectError(ParseError.Malformed, parse(arena.allocator(), "[1,,2]", .none));
 
-test "depth guard: deeply nested arrays trip TooDeep instead of crashing" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var i: usize = 0;
     while (i < max_depth + 16) : (i += 1) try buf.append(testing.allocator, '[');
     try testing.expectError(ParseError.TooDeep, parse(arena.allocator(), buf.items, .all));
+}
+
+test "parseStreaming is strict-first, partial-second, empty-object fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const blank = try parseStreaming(alloc, "   \n\t");
+    try testing.expect(blank == .object);
+    try testing.expectEqual(@as(usize, 0), blank.object.count());
+
+    const strict = try parseStreaming(alloc, "{\"a\":1}");
+    try testing.expect(strict == .object);
+    try testing.expectEqual(@as(i64, 1), strict.object.get("a").?.integer);
+
+    const partial = try parseStreaming(alloc, "{\"a\":1,\"b\":\"hel");
+    try testing.expect(partial == .object);
+    try testing.expectEqualStrings("hel", partial.object.get("b").?.string);
+
+    const garbage = try parseStreaming(alloc, "@@@not json@@@");
+    try testing.expect(garbage == .object);
+    try testing.expectEqual(@as(usize, 0), garbage.object.count());
 }

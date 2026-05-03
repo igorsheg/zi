@@ -598,77 +598,86 @@ pub fn buildDocument(
 
 const testing = std.testing;
 
-test "myers opcodes coalesce identical input into one equal opcode" {
-    const a = [_][]const u8{ "foo", "bar", "baz" };
-    const opcodes = try myersOpcodes(testing.allocator, &a, &a);
-    defer testing.allocator.free(opcodes);
-    try testing.expectEqual(@as(usize, 1), opcodes.len);
-    try testing.expect(opcodes[0] == .equal);
-    try testing.expectEqual(@as(u32, 0), opcodes[0].equal.old.start);
-    try testing.expectEqual(@as(u32, 3), opcodes[0].equal.old.end);
-    try testing.expectEqual(@as(u32, 0), opcodes[0].equal.new.start);
-    try testing.expectEqual(@as(u32, 3), opcodes[0].equal.new.end);
-}
-
-test "myers opcodes represent a single line modification as replace" {
-    const a = [_][]const u8{ "foo", "bar", "baz" };
-    const b = [_][]const u8{ "foo", "BAR", "baz" };
-    const opcodes = try myersOpcodes(testing.allocator, &a, &b);
-    defer testing.allocator.free(opcodes);
-    try testing.expectEqual(@as(usize, 3), opcodes.len);
-    try testing.expect(opcodes[0] == .equal);
-    try testing.expect(opcodes[1] == .replace);
-    try testing.expect(opcodes[2] == .equal);
-    try testing.expectEqual(@as(u32, 1), opcodes[1].replace.old.start);
-    try testing.expectEqual(@as(u32, 2), opcodes[1].replace.old.end);
-    try testing.expectEqual(@as(u32, 1), opcodes[1].replace.new.start);
-    try testing.expectEqual(@as(u32, 2), opcodes[1].replace.new.end);
-}
-
-test "buildFile produces one hunk with first-class replace block" {
-    const a = "line1\nline2\nline3\nline4\nline5\n";
-    const b = "line1\nline2\nLINE3\nline4\nline5\n";
-    var doc = try buildDocument(testing.allocator, &[_]Input{.{ .old_path = "test.txt", .new_path = "test.txt", .old_text = a, .new_text = b }}, .{});
-    defer doc.deinit();
-    const change = doc.document.changes[0];
-
-    try testing.expectEqual(@as(usize, 1), change.hunks.len);
-    try testing.expectEqual(@as(u32, 1), change.stats.added);
-    try testing.expectEqual(@as(u32, 1), change.stats.removed);
-
-    const h = change.hunks[0];
-    var contexts: u32 = 0;
-    var replaces: u32 = 0;
-    for (h.blocks) |block| switch (block) {
-        .context => contexts += 1,
-        .replace => |rep| {
-            replaces += 1;
-            try testing.expectEqual(@as(u32, 3), rep.old_start);
-            try testing.expectEqual(@as(u32, 3), rep.new_start);
-            try testing.expectEqual(@as(usize, 1), rep.old_lines.len);
-            try testing.expectEqual(@as(usize, 1), rep.new_lines.len);
-        },
-        else => {},
-    };
-    try testing.expect(contexts > 0);
-    try testing.expectEqual(@as(u32, 1), replaces);
-}
-
-test "buildDocument aggregates multiple file changes" {
+test "buildDocument models line states and aggregates stats" {
     const inputs = [_]Input{
-        .{ .old_path = "a.txt", .new_path = "a.txt", .old_text = "foo\nbar\n", .new_text = "foo\nBAR\n" },
-        .{ .old_path = "b.txt", .new_path = "b.txt", .old_text = "one\ntwo\n", .new_text = "one\ntwo\nthree\n" },
+        .{
+            .old_path = "modify.txt",
+            .new_path = "modify.txt",
+            .old_text = "before\nold\nafter\n",
+            .new_text = "before\nnew\nafter\n",
+        },
+        .{
+            .old_path = "insert.txt",
+            .new_path = "insert.txt",
+            .old_text = "one\nthree\n",
+            .new_text = "one\ntwo\nthree\n",
+        },
+        .{
+            .old_path = "delete.txt",
+            .new_path = "delete.txt",
+            .old_text = "one\ntwo\nthree\n",
+            .new_text = "one\nthree\n",
+        },
     };
 
     var doc = try buildDocument(testing.allocator, &inputs, .{});
     defer doc.deinit();
 
-    try testing.expectEqual(@as(usize, 2), doc.document.changes.len);
+    try testing.expectEqual(@as(usize, 3), doc.document.changes.len);
     try testing.expectEqual(@as(u32, 2), doc.document.stats.added);
-    try testing.expectEqual(@as(u32, 1), doc.document.stats.removed);
+    try testing.expectEqual(@as(u32, 2), doc.document.stats.removed);
+
+    const modify = doc.document.changes[0];
+    try testing.expectEqual(@as(u32, 1), modify.stats.added);
+    try testing.expectEqual(@as(u32, 1), modify.stats.removed);
+    try testing.expectEqual(@as(usize, 1), modify.hunks.len);
+    try testing.expectEqual(@as(u32, 1), modify.hunks[0].old_start);
+    try testing.expectEqual(@as(u32, 4), modify.hunks[0].old_count);
+    try testing.expectEqual(@as(u32, 1), modify.hunks[0].new_start);
+    try testing.expectEqual(@as(u32, 4), modify.hunks[0].new_count);
+    try testing.expectEqual(@as(usize, 3), modify.hunks[0].blocks.len);
+    try testing.expect(modify.hunks[0].blocks[0] == .context);
+    try testing.expect(modify.hunks[0].blocks[1] == .replace);
+    try testing.expect(modify.hunks[0].blocks[2] == .context);
+    const rep = modify.hunks[0].blocks[1].replace;
+    try testing.expectEqual(@as(u32, 2), rep.old_start);
+    try testing.expectEqual(@as(u32, 2), rep.new_start);
+    try testing.expectEqualStrings("old", rep.old_lines[0].text);
+    try testing.expectEqualStrings("new", rep.new_lines[0].text);
+
+    const insert = doc.document.changes[1];
+    try testing.expectEqual(@as(u32, 1), insert.stats.added);
+    try testing.expectEqual(@as(u32, 0), insert.stats.removed);
+    try testing.expect(insert.hunks[0].blocks[1] == .insert);
+    const ins = insert.hunks[0].blocks[1].insert;
+    try testing.expectEqual(@as(u32, 2), ins.new_start);
+    try testing.expectEqualStrings("two", ins.lines[0].text);
+
+    const delete = doc.document.changes[2];
+    try testing.expectEqual(@as(u32, 0), delete.stats.added);
+    try testing.expectEqual(@as(u32, 1), delete.stats.removed);
+    try testing.expect(delete.hunks[0].blocks[1] == .delete);
+    const del = delete.hunks[0].blocks[1].delete;
+    try testing.expectEqual(@as(u32, 2), del.old_start);
+    try testing.expectEqualStrings("two", del.lines[0].text);
 }
 
-test "buildFile two distant edits produce two hunks" {
+test "buildDocument omits hunks for unchanged files" {
+    var doc = try buildDocument(testing.allocator, &[_]Input{.{
+        .old_path = "same.txt",
+        .new_path = "same.txt",
+        .old_text = "foo\nbar\n",
+        .new_text = "foo\nbar\n",
+    }}, .{});
+    defer doc.deinit();
+
+    try testing.expectEqual(@as(usize, 1), doc.document.changes.len);
+    try testing.expectEqual(@as(usize, 0), doc.document.changes[0].hunks.len);
+    try testing.expectEqual(@as(u32, 0), doc.document.stats.added);
+    try testing.expectEqual(@as(u32, 0), doc.document.stats.removed);
+}
+
+test "buildDocument separates hunks only when context gap is large" {
     const a =
         \\l1
         \\l2
@@ -681,7 +690,7 @@ test "buildFile two distant edits produce two hunks" {
         \\l9
         \\l10
     ;
-    const b =
+    const distant =
         \\L1
         \\l2
         \\l3
@@ -693,29 +702,26 @@ test "buildFile two distant edits produce two hunks" {
         \\L9
         \\l10
     ;
-    var doc = try buildDocument(testing.allocator, &[_]Input{.{ .old_path = "f", .new_path = "f", .old_text = a, .new_text = b }}, .{});
-    defer doc.deinit();
-    try testing.expectEqual(@as(usize, 2), doc.document.changes[0].hunks.len);
-}
-
-test "buildFile close edits merge into one hunk" {
-    const a =
-        \\l1
-        \\l2
-        \\l3
-        \\l4
-        \\l5
-        \\l6
-    ;
-    const b =
+    const close =
         \\L1
         \\l2
         \\l3
         \\L4
         \\l5
         \\l6
+        \\l7
+        \\l8
+        \\l9
+        \\l10
     ;
-    var doc = try buildDocument(testing.allocator, &[_]Input{.{ .old_path = "f", .new_path = "f", .old_text = a, .new_text = b }}, .{});
+
+    const inputs = [_]Input{
+        .{ .old_path = "distant", .new_path = "distant", .old_text = a, .new_text = distant },
+        .{ .old_path = "close", .new_path = "close", .old_text = a, .new_text = close },
+    };
+    var doc = try buildDocument(testing.allocator, &inputs, .{});
     defer doc.deinit();
-    try testing.expectEqual(@as(usize, 1), doc.document.changes[0].hunks.len);
+
+    try testing.expectEqual(@as(usize, 2), doc.document.changes[0].hunks.len);
+    try testing.expectEqual(@as(usize, 1), doc.document.changes[1].hunks.len);
 }

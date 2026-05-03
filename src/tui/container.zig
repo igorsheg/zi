@@ -298,15 +298,15 @@ const Buffer = buffer_mod.Buffer;
 
 const TestComponent = struct {
     height: u32,
-    rendered: bool = false,
-    label: u8 = 'X',
+    rendered_count: u32 = 0,
+    input_count: u32 = 0,
+    consumes_input: bool = false,
+    cursor: ?CursorState = null,
+    last_region: ?ChildRect = null,
 
     pub fn render(self: *TestComponent, region: Region) void {
-        self.rendered = true;
-        // Write label on first row to verify rendering
-        if (region.height > 0 and region.width > 0) {
-            region.set(0, 0, .{ .grapheme = .{ .codepoint = @as(u21, self.label) } });
-        }
+        self.rendered_count += 1;
+        self.last_region = .{ .x = region.x, .y = region.y, .width = region.width, .height = region.height };
     }
 
     pub fn measure(self: *TestComponent, width: u32) Measurement {
@@ -314,17 +314,47 @@ const TestComponent = struct {
         return .{ .min_height = 1, .preferred_height = self.height };
     }
 
+    pub fn handleInput(self: *TestComponent, _: Key) bool {
+        self.input_count += 1;
+        return self.consumes_input;
+    }
+
+    pub fn cursorState(self: *TestComponent) ?CursorState {
+        return self.cursor;
+    }
+
     pub fn component(self: *TestComponent) Component {
         return Component.init(TestComponent, self);
     }
 };
 
-test "Container lays out children vertically" {
+const AnimatedComp = struct {
+    height: u32 = 1,
+    deadline_ns: ?i128 = null,
+    ticked: bool = false,
+
+    pub fn render(_: *@This(), _: Region) void {}
+    pub fn measure(self: *@This(), _: u32) Measurement {
+        return .{ .min_height = 1, .preferred_height = self.height };
+    }
+    pub fn nextAnimationDeadline(self: *@This(), _: i128) ?i128 {
+        return self.deadline_ns;
+    }
+    pub fn tickAnimation(self: *@This(), _: i128) bool {
+        self.ticked = true;
+        return true;
+    }
+    pub fn component(self: *@This()) Component {
+        return Component.init(@This(), self);
+    }
+};
+
+test "Container stacks fixed children and measures their preferred height" {
     var container = Container.init(testing.allocator);
     defer container.deinit();
 
-    var a = TestComponent{ .height = 2, .label = 'A' };
-    var b = TestComponent{ .height = 3, .label = 'B' };
+    var a = TestComponent{ .height = 2 };
+    var b = TestComponent{ .height = 3 };
     container.addChild(a.component());
     container.addChild(b.component());
 
@@ -332,97 +362,21 @@ test "Container lays out children vertically" {
     defer buf.deinit();
     container.render(buf.region());
 
-    // A renders at row 0
-    try testing.expectEqual(@as(u21, 'A'), buf.get(0, 0).grapheme.codepoint);
-    // B renders at row 2 (after A's height of 2)
-    try testing.expectEqual(@as(u21, 'B'), buf.get(0, 2).grapheme.codepoint);
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 0, .width = 10, .height = 2 }, a.last_region.?);
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 2, .width = 10, .height = 3 }, b.last_region.?);
 
     const m = container.measure(10);
+    try testing.expectEqual(@as(u32, 1), m.min_height);
     try testing.expectEqual(@as(u32, 5), m.preferred_height);
 }
 
-test "Container flex child fills remaining space" {
+test "Container gives flex child remaining height and reports rendered geometry" {
     var container = Container.init(testing.allocator);
     defer container.deinit();
 
-    var header = TestComponent{ .height = 1, .label = 'H' };
-    var content = TestComponent{ .height = 0, .label = 'C' }; // will be flex
-    var footer = TestComponent{ .height = 1, .label = 'F' };
-
-    container.addChild(header.component());
-    container.addChild(content.component());
-    container.addChild(footer.component());
-    container.flex_child_index = 1; // content is flex
-
-    var buf = try Buffer.init(testing.allocator, 10, 10);
-    defer buf.deinit();
-    container.render(buf.region());
-
-    // Header at row 0
-    try testing.expectEqual(@as(u21, 'H'), buf.get(0, 0).grapheme.codepoint);
-    // Content at row 1, gets 10 - 1 - 1 = 8 rows
-    try testing.expectEqual(@as(u21, 'C'), buf.get(0, 1).grapheme.codepoint);
-    // Footer at row 9 (1 + 8 = 9)
-    try testing.expectEqual(@as(u21, 'F'), buf.get(0, 9).grapheme.codepoint);
-}
-
-test "Container delegates input to focused child" {
-    var container = Container.init(testing.allocator);
-    defer container.deinit();
-
-    // No focused child — input not consumed
-    try testing.expect(!container.handleInput(.{ .code = .char, .char = 'a' }));
-
-    // With a test component that doesn't handle input — still returns false
-    var a = TestComponent{ .height = 1 };
-    container.addChild(a.component());
-    container.focused_child_index = 0;
-    try testing.expect(!container.handleInput(.{ .code = .char, .char = 'a' }));
-}
-
-test "Container aggregates child animation deadlines and ticks" {
-    const AnimatedComp = struct {
-        height: u32 = 1,
-        deadline_ns: i128,
-        ticked: bool = false,
-
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(self: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = self.height };
-        }
-        pub fn nextAnimationDeadline(self: *@This(), _: i128) ?i128 {
-            return self.deadline_ns;
-        }
-        pub fn tickAnimation(self: *@This(), _: i128) bool {
-            self.ticked = true;
-            return true;
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
-
-    var container = Container.init(testing.allocator);
-    defer container.deinit();
-
-    var slow = AnimatedComp{ .deadline_ns = 50 };
-    var fast = AnimatedComp{ .deadline_ns = 10 };
-    container.addChild(slow.component());
-    container.addChild(fast.component());
-
-    try testing.expectEqual(@as(?i128, 10), container.nextAnimationDeadline(0));
-    try testing.expect(container.tickAnimation(10));
-    try testing.expect(slow.ticked);
-    try testing.expect(fast.ticked);
-}
-
-test "Container childRect reports rendered child geometry" {
-    var container = Container.init(testing.allocator);
-    defer container.deinit();
-
-    var header = TestComponent{ .height = 2, .label = 'H' };
-    var body = TestComponent{ .height = 0, .label = 'B' };
-    var footer = TestComponent{ .height = 1, .label = 'F' };
+    var header = TestComponent{ .height = 2 };
+    var body = TestComponent{ .height = 0 };
+    var footer = TestComponent{ .height = 1 };
     container.addChild(header.component());
     container.addChild(body.component());
     container.addChild(footer.component());
@@ -432,51 +386,83 @@ test "Container childRect reports rendered child geometry" {
     defer buf.deinit();
     container.render(buf.region());
 
-    const header_rect = container.childRect(0).?;
-    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 0, .width = 10, .height = 2 }, header_rect);
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 0, .width = 10, .height = 2 }, header.last_region.?);
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 2, .width = 10, .height = 5 }, body.last_region.?);
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 7, .width = 10, .height = 1 }, footer.last_region.?);
 
-    const body_rect = container.childRect(1).?;
-    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 2, .width = 10, .height = 5 }, body_rect);
-
-    const footer_rect = container.childRect(2).?;
-    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 7, .width = 10, .height = 1 }, footer_rect);
+    try testing.expectEqualDeep(header.last_region.?, container.childRect(0).?);
+    try testing.expectEqualDeep(body.last_region.?, container.childRect(1).?);
+    try testing.expectEqualDeep(footer.last_region.?, container.childRect(2).?);
 }
 
-test "Container animation skips clipped children" {
-    const AnimatedComp = struct {
-        height: u32 = 1,
-        deadline_ns: i128,
-        ticked: bool = false,
-
-        pub fn render(_: *@This(), _: Region) void {}
-        pub fn measure(self: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = self.height };
-        }
-        pub fn nextAnimationDeadline(self: *@This(), _: i128) ?i128 {
-            return self.deadline_ns;
-        }
-        pub fn tickAnimation(self: *@This(), _: i128) bool {
-            self.ticked = true;
-            return true;
-        }
-        pub fn component(self: *@This()) Component {
-            return Component.init(@This(), self);
-        }
-    };
-
+test "Container clips rendering to available height" {
     var container = Container.init(testing.allocator);
     defer container.deinit();
-    var visible = AnimatedComp{ .deadline_ns = 10 };
-    var clipped = AnimatedComp{ .deadline_ns = 5 };
+
+    var visible = TestComponent{ .height = 2 };
+    var clipped = TestComponent{ .height = 2 };
+    var hidden = TestComponent{ .height = 1 };
     container.addChild(visible.component());
     container.addChild(clipped.component());
+    container.addChild(hidden.component());
 
-    var buf = try Buffer.init(testing.allocator, 10, 1);
+    var buf = try Buffer.init(testing.allocator, 10, 3);
+    defer buf.deinit();
+    container.render(buf.region());
+
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 0, .width = 10, .height = 2 }, visible.last_region.?);
+    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 2, .width = 10, .height = 1 }, clipped.last_region.?);
+    try testing.expectEqual(@as(u32, 0), hidden.rendered_count);
+    try testing.expectEqual(@as(?ChildRect, null), container.childRect(2));
+}
+
+test "Container delegates input and cursor state to focused child" {
+    var container = Container.init(testing.allocator);
+    defer container.deinit();
+
+    var top = TestComponent{ .height = 2 };
+    var focused = TestComponent{
+        .height = 1,
+        .consumes_input = true,
+        .cursor = .{ .x = 4, .y = 1, .style = .bar },
+    };
+    container.addChild(top.component());
+    container.addChild(focused.component());
+
+    try testing.expect(!container.handleInput(.{ .code = .char, .char = 'a' }));
+    try testing.expectEqual(@as(u32, 0), top.input_count);
+    try testing.expectEqual(@as(u32, 0), focused.input_count);
+
+    container.focused_child_index = 1;
+    try testing.expect(container.handleInput(.{ .code = .char, .char = 'b' }));
+    try testing.expectEqual(@as(u32, 0), top.input_count);
+    try testing.expectEqual(@as(u32, 1), focused.input_count);
+
+    var buf = try Buffer.init(testing.allocator, 10, 5);
+    defer buf.deinit();
+    container.render(buf.region());
+
+    try testing.expectEqualDeep(CursorState{ .x = 4, .y = 3, .style = .bar }, container.cursorState().?);
+}
+
+test "Container aggregates animation only for rendered children" {
+    var container = Container.init(testing.allocator);
+    defer container.deinit();
+
+    var visible_slow = AnimatedComp{ .height = 1, .deadline_ns = 50 };
+    var visible_fast = AnimatedComp{ .height = 1, .deadline_ns = 10 };
+    var clipped = AnimatedComp{ .height = 1, .deadline_ns = 5 };
+    container.addChild(visible_slow.component());
+    container.addChild(visible_fast.component());
+    container.addChild(clipped.component());
+
+    var buf = try Buffer.init(testing.allocator, 10, 2);
     defer buf.deinit();
     container.render(buf.region());
 
     try testing.expectEqual(@as(?i128, 10), container.nextAnimationDeadline(0));
-    try testing.expect(container.tickAnimation(0));
-    try testing.expect(visible.ticked);
+    try testing.expect(container.tickAnimation(10));
+    try testing.expect(visible_slow.ticked);
+    try testing.expect(visible_fast.ticked);
     try testing.expect(!clipped.ticked);
 }

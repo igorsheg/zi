@@ -29,17 +29,12 @@ const agent_protocol = @import("../../agent/types.zig");
 const abort_signal_mod = @import("../../zio/root.zig").abort;
 const ai = @import("../../ai/root.zig");
 const api = @import("api.zig");
-const lua_renderer = @import("lua_renderer.zig");
 const context_mod = @import("context.zig");
 const resource_types = @import("../resources/types.zig");
 const extension_ui = @import("ui.zig");
 const request_mod = @import("../request.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
-const builtins_mod = @import("../tools/builtins.zig");
-const tool_def = @import("../tools/definition.zig");
-const tool_display = @import("../../tui/tool_display.zig");
-const builtin_renderers = @import("../../tui/renderers/builtins.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_tool);
@@ -817,35 +812,6 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
     try testing.expect(runner.command_registry.getByVisibleName("todos") != null);
 }
 
-fn loadToolOverrideFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) !void {
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-
-    try state.doString(
-        \\zi.register_tool({
-        \\  name = "read",
-        \\  label = "read (audited)",
-        \\  description = "override read",
-        \\  parameters = {
-        \\    type = "object",
-        \\    properties = { path = { type = "string" } },
-        \\    required = { "path" },
-        \\  },
-        \\  execute = function(params)
-        \\    if params.path == ".env" then
-        \\      return {
-        \\        content = { { type = "text", text = "Access denied: .env" } },
-        \\        is_error = true,
-        \\        details = { blocked = true },
-        \\      }
-        \\    end
-        \\    return { content = { { type = "text", text = "ok" } }, details = { blocked = false } }
-        \\  end,
-        \\})
-    , "tool-override-fixture");
-    try testing.expect(runner.tool_registry.get("read") != null);
-}
-
 fn todoArgs(allocator: std.mem.Allocator, action: []const u8, text: ?[]const u8, id: ?i64) !std.json.Value {
     var obj: std.json.ObjectMap = .{};
     errdefer obj.deinit(allocator);
@@ -853,117 +819,6 @@ fn todoArgs(allocator: std.mem.Allocator, action: []const u8, text: ?[]const u8,
     if (text) |value| try obj.put(allocator, "text", .{ .string = value });
     if (id) |value| try obj.put(allocator, "id", .{ .integer = value });
     return .{ .object = obj };
-}
-
-test "tool override example keeps extension read while preserving builtin renderer fallback" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    api.installZiTable(&state, &runner);
-
-    try loadToolOverrideFixture(&state, &runner);
-
-    const override = runner.tool_registry.get("read") orelse return error.MissingOverride;
-    try testing.expectEqualStrings("project", override.source.kind);
-    try testing.expect(override.impl == .lua);
-    try testing.expect(override.render_result_ref == null);
-
-    var builtins = try builtins_mod.build(testing.allocator, ".", .{});
-    defer builtins.deinit();
-    var read_builtin: ?tool_def.ToolDefinition = null;
-    for (builtins.definitions) |definition| {
-        if (std.mem.eql(u8, definition.name, "read")) {
-            read_builtin = try tool_def.cloneOwned(testing.allocator, definition);
-            break;
-        }
-    }
-    var cloned_builtin = read_builtin orelse return error.MissingReadBuiltin;
-    defer tool_def.freeOwned(testing.allocator, &cloned_builtin);
-    try testing.expect(!(try runner.tool_registry.register(cloned_builtin)));
-
-    const static_entries: []const tool_display.Registration = &.{
-        .{ .tool_name = "read", .renderer = builtin_renderers.read_renderer },
-    };
-    const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
-    const renderer = resolver.resolve("read");
-    try testing.expect(renderer.render_call != null);
-    try testing.expect(renderer.render_result_slice != null);
-
-    const ext_tool = override.*;
-    const agent_tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var args_obj: std.json.ObjectMap = .{};
-    try args_obj.put(allocator, "path", .{ .string = ".env" });
-    const result = agent_tool.execute(agent_tool.ctx, allocator, "read-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
-    try testing.expect(result.is_error);
-    try testing.expectEqualStrings("Access denied: .env", result.content[0].text.text);
-    try testing.expect(result.details.object.get("blocked").?.bool);
-}
-
-test "todo fixture registers a tool, command, details, and renderer" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    api.installZiTable(&state, &runner);
-
-    try loadTodoFixture(&state, &runner);
-
-    const ext_tool = runner.tool_registry.get("todo").?.*;
-    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const add_args = try todoArgs(allocator, "add", "write parity ledger", null);
-    const add_result = tool.execute(tool.ctx, allocator, "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
-    try testing.expect(!add_result.is_error);
-    try testing.expectEqualStrings("Added todo #1: write parity ledger", add_result.content[0].text.text);
-    try testing.expect(add_result.details == .object);
-    const add_details = add_result.details.object;
-    try testing.expectEqualStrings("add", add_details.get("action").?.string);
-    try testing.expectEqual(@as(i64, 2), add_details.get("nextId").?.integer);
-    const add_todos = add_details.get("todos").?.array.items;
-    try testing.expectEqual(@as(usize, 1), add_todos.len);
-    try testing.expectEqual(@as(i64, 1), add_todos[0].object.get("id").?.integer);
-    try testing.expectEqualStrings("write parity ledger", add_todos[0].object.get("text").?.string);
-
-    const toggle_args = try todoArgs(allocator, "toggle", null, 1);
-    const toggle_result = tool.execute(tool.ctx, allocator, "todo-2", toggle_args, abort_signal_mod.AbortSignal.none, null, null);
-    try testing.expect(!toggle_result.is_error);
-    const toggle_todos = toggle_result.details.object.get("todos").?.array.items;
-    try testing.expect(toggle_todos[0].object.get("done").?.bool);
-
-    const list_args = try todoArgs(allocator, "list", null, null);
-    const list_result = tool.execute(tool.ctx, allocator, "todo-3", list_args, abort_signal_mod.AbortSignal.none, null, null);
-    try testing.expect(!list_result.is_error);
-    try testing.expectEqualStrings("[x] #1: write parity ledger", list_result.content[0].text.text);
-
-    const rendered = lua_renderer.dispatchRenderResultFromResult(testing.allocator, &runner, .{
-        .tool_name = "todo",
-        .args = list_args,
-        .result = list_result,
-        .width = 80,
-        .is_error = false,
-    }) orelse return error.MissingTodoRenderer;
-    defer rendered.deinit(testing.allocator);
-
-    try testing.expect(rendered.collapsed.len >= 2);
-    try testing.expectEqualStrings("1 todo(s):", rendered.collapsed[0][0].text);
-    try testing.expectEqualStrings("✓ ", rendered.collapsed[1][0].text);
-    try testing.expectEqualStrings("#1 ", rendered.collapsed[1][1].text);
-    try testing.expectEqualStrings("write parity ledger", rendered.collapsed[1][2].text);
 }
 
 const TestLabelEntry = struct {

@@ -277,68 +277,44 @@ pub const RequestQueue = mailbox_mod.Mailbox(AgentRequest, .{
     .wakeup = .pipe,
 });
 
-test "RequestQueue round-trips a set_model_by_pattern payload" {
+test "RequestQueue preserves ordered API requests and owned payload boundaries" {
     const allocator = std.testing.allocator;
     var q = try RequestQueue.init(allocator);
     defer q.deinit();
 
-    const pattern = try allocator.dupe(u8, "proxy-a/proxy-model");
-    q.push(.{ .set_model_by_pattern = .{ .pattern = pattern } });
-
-    var buf: [2]AgentRequest = undefined;
-    const n = q.drainInto(&buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqualStrings("proxy-a/proxy-model", buf[0].set_model_by_pattern.pattern);
-    buf[0].deinit(allocator);
-}
-
-test "RequestQueue round-trips a resume_session payload and restore policy" {
-    const allocator = std.testing.allocator;
-    var q = try RequestQueue.init(allocator);
-    defer q.deinit();
-
-    const path = try allocator.dupe(u8, "/tmp/some/session.jsonl");
-    q.push(.{ .resume_session = .{
-        .path = path,
+    try std.testing.expectEqual(.ok, q.trySend(.{ .prompt = .{ .content = .{ .text = try allocator.dupe(u8, "hello") } } }));
+    try std.testing.expectEqual(.ok, q.trySend(.{ .resume_session = .{
+        .path = try allocator.dupe(u8, "/tmp/some/session.jsonl"),
         .restore_session_model = false,
-    } });
-
-    var buf: [4]AgentRequest = undefined;
-    const n = q.drainInto(&buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqualStrings("/tmp/some/session.jsonl", buf[0].resume_session.path);
-    try std.testing.expect(!buf[0].resume_session.restore_session_model);
-    buf[0].deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), q.drainInto(&buf));
-}
-
-test "RequestQueue shutdown sentinel round-trips as an ordered terminal request" {
-    const allocator = std.testing.allocator;
-    var q = try RequestQueue.init(allocator);
-    defer q.deinit();
-
-    const text = try allocator.dupe(u8, "hello");
-    try std.testing.expectEqual(.ok, q.trySend(.{ .prompt = .{ .content = .{ .text = text } } }));
-    try std.testing.expectEqual(.ok, q.trySend(.{ .new_session = {} }));
+    } }));
+    try std.testing.expectEqual(.ok, q.trySend(.{ .set_model_by_pattern = .{ .pattern = try allocator.dupe(u8, "proxy-a/proxy-model") } }));
+    try std.testing.expectEqual(.ok, q.trySend(.{ .extension_command = .{
+        .name = try allocator.dupe(u8, "my-cmd:1"),
+        .args = try allocator.dupe(u8, "hello world"),
+    } }));
     try std.testing.expectEqual(.ok, q.trySend(.{ .shutdown = {} }));
 
-    var buf: [3]AgentRequest = undefined;
+    var buf: [5]AgentRequest = undefined;
     const n = q.drainInto(&buf);
-    try std.testing.expectEqual(@as(usize, 3), n);
+    defer for (buf[0..n]) |*req| req.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), n);
     switch (buf[0].prompt.content) {
         .text => |payload| try std.testing.expectEqualStrings("hello", payload),
         else => return error.UnexpectedResult,
     }
-    switch (buf[1]) {
-        .new_session => {},
-        else => return error.UnexpectedResult,
-    }
-    switch (buf[2]) {
+    try std.testing.expectEqualStrings("/tmp/some/session.jsonl", buf[1].resume_session.path);
+    try std.testing.expect(!buf[1].resume_session.restore_session_model);
+    try std.testing.expectEqualStrings("proxy-a/proxy-model", buf[2].set_model_by_pattern.pattern);
+    try std.testing.expectEqualStrings("my-cmd:1", buf[3].extension_command.name);
+    try std.testing.expectEqualStrings("hello world", buf[3].extension_command.args);
+    switch (buf[4]) {
         .shutdown => {},
         else => return error.UnexpectedResult,
     }
-    for (buf[0..n]) |*req| req.deinit(allocator);
+
+    var empty: [1]AgentRequest = undefined;
+    try std.testing.expectEqual(@as(usize, 0), q.drainInto(&empty));
 }
 
 test "RequestQueue bounded policy rejects after capacity without disturbing pending work" {
@@ -407,51 +383,28 @@ test "RequestQueue wake pipe stays readable until the long-lived owner drains re
     try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pfd, 0));
 }
 
-test "RequestQueue extension_command round-trips owned name and args" {
+test "RequestQueue preserves extension OAuth hooks, credentials, and response cells" {
     const allocator = std.testing.allocator;
+    const callbacks = struct {
+        fn auth(_: []const u8, _: ?*anyopaque) void {}
+        fn progress(_: []const u8, _: ?*anyopaque) void {}
+    };
+
     var q = try RequestQueue.init(allocator);
     defer q.deinit();
 
-    const name = try allocator.dupe(u8, "my-cmd:1");
-    const args = try allocator.dupe(u8, "hello world");
-    q.push(.{ .extension_command = .{ .name = name, .args = args } });
-
-    var buf: [2]AgentRequest = undefined;
-    const n = q.drainInto(&buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqualStrings("my-cmd:1", buf[0].extension_command.name);
-    try std.testing.expectEqualStrings("hello world", buf[0].extension_command.args);
-    buf[0].deinit(allocator);
-}
-
-test "RequestQueue extension_oauth_login round-trips provider id and response cell" {
-    const allocator = std.testing.allocator;
-    var q = try RequestQueue.init(allocator);
-    defer q.deinit();
-
-    var response: ExtensionOAuthLoginResponse = .{};
-    const provider_id = try allocator.dupe(u8, "corp-ai");
-    q.push(.{ .extension_oauth_login = .{ .provider_id = provider_id, .callbacks = .{ .on_auth = undefined }, .response = &response } });
-
-    var buf: [2]AgentRequest = undefined;
-    const n = q.drainInto(&buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqualStrings("corp-ai", buf[0].extension_oauth_login.provider_id);
-    try std.testing.expect(buf[0].extension_oauth_login.response == &response);
-    buf[0].deinit(allocator);
-}
-
-test "RequestQueue extension_oauth_refresh round-trips provider id and credential" {
-    const allocator = std.testing.allocator;
-    var q = try RequestQueue.init(allocator);
-    defer q.deinit();
-
+    var login_response: ExtensionOAuthLoginResponse = .{};
+    var refresh_response: ExtensionOAuthRefreshResponse = .{};
     var extras: std.json.ObjectMap = .{};
     defer extras.deinit(allocator);
-    var response: ExtensionOAuthRefreshResponse = .{};
-    const provider_id = try allocator.dupe(u8, "corp-ai");
-    q.push(.{ .extension_oauth_refresh = .{
-        .provider_id = provider_id,
+
+    try std.testing.expectEqual(.ok, q.trySend(.{ .extension_oauth_login = .{
+        .provider_id = try allocator.dupe(u8, "corp-ai"),
+        .callbacks = .{ .on_auth = callbacks.auth, .on_progress = callbacks.progress, .ctx = @ptrFromInt(0x1) },
+        .response = &login_response,
+    } }));
+    try std.testing.expectEqual(.ok, q.trySend(.{ .extension_oauth_refresh = .{
+        .provider_id = try allocator.dupe(u8, "corp-ai"),
         .credential = .{
             .refresh = try allocator.dupe(u8, "rt-1"),
             .access = try allocator.dupe(u8, "at-1"),
@@ -459,16 +412,25 @@ test "RequestQueue extension_oauth_refresh round-trips provider id and credentia
             .extras = extras.move(),
         },
         .result_allocator = allocator,
-        .response = &response,
-    } });
+        .response = &refresh_response,
+    } }));
 
     var buf: [2]AgentRequest = undefined;
     const n = q.drainInto(&buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqualStrings("corp-ai", buf[0].extension_oauth_refresh.provider_id);
-    try std.testing.expectEqualStrings("rt-1", buf[0].extension_oauth_refresh.credential.refresh);
-    try std.testing.expect(buf[0].extension_oauth_refresh.response == &response);
-    buf[0].deinit(allocator);
+    defer for (buf[0..n]) |*req| req.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("corp-ai", buf[0].extension_oauth_login.provider_id);
+    try std.testing.expect(buf[0].extension_oauth_login.callbacks.on_auth == callbacks.auth);
+    try std.testing.expect(buf[0].extension_oauth_login.callbacks.on_progress.? == callbacks.progress);
+    try std.testing.expect(buf[0].extension_oauth_login.callbacks.ctx == @as(?*anyopaque, @ptrFromInt(0x1)));
+    try std.testing.expect(buf[0].extension_oauth_login.response == &login_response);
+    try std.testing.expectEqualStrings("corp-ai", buf[1].extension_oauth_refresh.provider_id);
+    try std.testing.expectEqualStrings("rt-1", buf[1].extension_oauth_refresh.credential.refresh);
+    try std.testing.expectEqualStrings("at-1", buf[1].extension_oauth_refresh.credential.access);
+    try std.testing.expectEqual(@as(i64, 42), buf[1].extension_oauth_refresh.credential.expires);
+    try std.testing.expect(buf[1].extension_oauth_refresh.result_allocator.ptr == allocator.ptr);
+    try std.testing.expect(buf[1].extension_oauth_refresh.response == &refresh_response);
 }
 
 test "ExtensionOAuthLoginResponse lets a worker wait for agent-thread completion" {

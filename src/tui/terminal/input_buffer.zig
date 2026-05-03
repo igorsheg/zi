@@ -302,19 +302,24 @@ const TestCtx = struct {
     }
 };
 
-test "InputBuffer emits complete CSI sequence in one feed" {
+test "InputBuffer preserves key sequence boundaries within a feed" {
     var buf = InputBuffer.init(testing.allocator);
     defer buf.deinit();
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("\x1b[13;2u", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    buf.feed("a\x1b[13;2ub\x1bOA\x1ba", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
 
-    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
-    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[0]);
+    try testing.expectEqual(@as(usize, 5), ctx.sequences.items.len);
+    try testing.expectEqualStrings("a", ctx.sequences.items[0]);
+    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[1]);
+    try testing.expectEqualStrings("b", ctx.sequences.items[2]);
+    try testing.expectEqualStrings("\x1bOA", ctx.sequences.items[3]);
+    try testing.expectEqualStrings("\x1ba", ctx.sequences.items[4]);
+    try testing.expectEqual(@as(usize, 0), ctx.pastes.items.len);
 }
 
-test "InputBuffer reassembles CSI sequence split across feeds" {
+test "InputBuffer waits for partial escape sequences across feeds" {
     var buf = InputBuffer.init(testing.allocator);
     defer buf.deinit();
     var ctx = TestCtx{ .allocator = testing.allocator };
@@ -326,6 +331,32 @@ test "InputBuffer reassembles CSI sequence split across feeds" {
     buf.feed(";2u", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
     try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
     try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[0]);
+
+    buf.feed("\x1b]0;title", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
+
+    buf.feed("\x07", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
+    try testing.expectEqualStrings("\x1b]0;title\x07", ctx.sequences.items[1]);
+}
+
+test "InputBuffer keeps mouse report boundaries" {
+    var buf = InputBuffer.init(testing.allocator);
+    defer buf.deinit();
+    var ctx = TestCtx{ .allocator = testing.allocator };
+    defer ctx.deinit();
+
+    buf.feed("\x1b[M", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
+
+    buf.feed(" !!x\x1b[<0;10", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
+    try testing.expectEqualStrings("\x1b[M !!", ctx.sequences.items[0]);
+    try testing.expectEqualStrings("x", ctx.sequences.items[1]);
+
+    buf.feed(";20M", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 3), ctx.sequences.items.len);
+    try testing.expectEqualStrings("\x1b[<0;10;20M", ctx.sequences.items[2]);
 }
 
 test "InputBuffer emits lone ESC after timeout" {
@@ -346,65 +377,35 @@ test "InputBuffer emits lone ESC after timeout" {
     try testing.expectEqualStrings("\x1b", ctx.sequences.items[0]);
 }
 
-test "InputBuffer handles bracketed paste" {
+test "InputBuffer handles bracketed paste split across key boundaries" {
     var buf = InputBuffer.init(testing.allocator);
     defer buf.deinit();
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("\x1b[200~hello world\x1b[201~", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-
-    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
-    try testing.expectEqual(@as(usize, 1), ctx.pastes.items.len);
-    try testing.expectEqualStrings("hello world", ctx.pastes.items[0]);
-}
-
-test "InputBuffer handles paste split across feeds" {
-    var buf = InputBuffer.init(testing.allocator);
-    defer buf.deinit();
-    var ctx = TestCtx{ .allocator = testing.allocator };
-    defer ctx.deinit();
-
-    buf.feed("\x1b[200~hello", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    buf.feed("a\x1b[200~hello", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
+    try testing.expectEqualStrings("a", ctx.sequences.items[0]);
     try testing.expectEqual(@as(usize, 0), ctx.pastes.items.len);
 
-    buf.feed(" world\x1b[201~", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    buf.feed(" world\x1b[201~\x1b[13;2u", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
+    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[1]);
     try testing.expectEqual(@as(usize, 1), ctx.pastes.items.len);
     try testing.expectEqualStrings("hello world", ctx.pastes.items[0]);
 }
 
-test "InputBuffer emits plain chars immediately" {
+test "InputBuffer consumes kitty response without taking surrounding input" {
     var buf = InputBuffer.init(testing.allocator);
     defer buf.deinit();
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("abc", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try buf.buf.appendSlice(testing.allocator, "a\x1b[?0ub");
+    try testing.expect(buf.consumeKittyResponse());
 
-    try testing.expectEqual(@as(usize, 3), ctx.sequences.items.len);
+    buf.drain(&TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
     try testing.expectEqualStrings("a", ctx.sequences.items[0]);
     try testing.expectEqualStrings("b", ctx.sequences.items[1]);
-    try testing.expectEqualStrings("c", ctx.sequences.items[2]);
-}
-
-test "InputBuffer detects kitty protocol response" {
-    var buf = InputBuffer.init(testing.allocator);
-    defer buf.deinit();
-
-    buf.buf.appendSlice(testing.allocator, "\x1b[?0u") catch {};
-    try testing.expect(buf.consumeKittyResponse());
-    try testing.expectEqual(@as(usize, 0), buf.buf.items.len);
-}
-
-test "classifyEscapeSequence identifies CSI, SS3, meta" {
-    // CSI complete: ESC [ 1 3 ; 2 u = 7 bytes
-    try testing.expectEqual(SeqStatus{ .complete = 7 }, classifyEscapeSequence("\x1b[13;2u"));
-    // CSI incomplete
-    try testing.expectEqual(SeqStatus.incomplete, classifyEscapeSequence("\x1b[13"));
-    // SS3
-    try testing.expectEqual(SeqStatus{ .complete = 3 }, classifyEscapeSequence("\x1bOA"));
-    // Meta
-    try testing.expectEqual(SeqStatus{ .complete = 2 }, classifyEscapeSequence("\x1ba"));
-    // Lone ESC
-    try testing.expectEqual(SeqStatus.incomplete, classifyEscapeSequence("\x1b"));
 }

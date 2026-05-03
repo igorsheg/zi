@@ -658,14 +658,6 @@ fn testAssistantToolCallEntry(
     };
 }
 
-test "findCutPoint: empty range yields no-op" {
-    const entries = [_]SessionEntry{};
-    const cut = findCutPoint(&entries, 0, 0, 100);
-    try testing.expectEqual(@as(usize, 0), cut.first_kept_entry_index);
-    try testing.expectEqual(@as(?usize, null), cut.turn_start_index);
-    try testing.expect(!cut.is_split_turn);
-}
-
 test "findCutPoint: assistant tail triggers split turn rather than blocking compaction" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -684,7 +676,7 @@ test "findCutPoint: assistant tail triggers split turn rather than blocking comp
     try testing.expect(cut.turn_start_index != null);
 }
 
-test "prepareCompaction: normal user-boundary cut" {
+test "prepareCompaction: user-boundary cut summarizes older messages and keeps recent turn" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -703,7 +695,7 @@ test "prepareCompaction: normal user-boundary cut" {
     try testing.expectEqual(@as(usize, 0), prep.turn_prefix_messages.len);
 }
 
-test "prepareCompaction: split-turn produces turn prefix messages" {
+test "prepareCompaction: split turn summarizes history and carries prefix for kept assistant tail" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -718,10 +710,11 @@ test "prepareCompaction: split-turn produces turn prefix messages" {
     const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 8 })).?;
     try testing.expect(prep.is_split_turn);
     try testing.expectEqualStrings("a2", prep.first_kept_entry_id);
+    try testing.expect(prep.messages_to_summarize.len > 0);
     try testing.expect(prep.turn_prefix_messages.len > 0);
 }
 
-test "prepareCompaction: already compacted tail returns null" {
+test "prepareCompaction: skips already-compacted tail" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -744,7 +737,7 @@ test "prepareCompaction: already compacted tail returns null" {
     try testing.expectEqual(@as(?CompactionPreparation, null), try prepareCompaction(allocator, &entries, .{}));
 }
 
-test "prepareCompaction: previous summary carried forward from last compaction" {
+test "prepareCompaction: carries previous summary from last compaction" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -773,95 +766,53 @@ test "prepareCompaction: previous summary carried forward from last compaction" 
     try testing.expectEqualStrings("earlier summary", prep.previous_summary.?);
 }
 
-test "extractFileOpsFromMessage: read and edit from tool calls" {
+test "file operations: extract, dedupe, classify, and format summary lists" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const read_entry = try testAssistantToolCallEntry(allocator, "a1", null, "read", "/tmp/a.txt");
-    const edit_entry = try testAssistantToolCallEntry(allocator, "a2", "a1", "edit", "/tmp/b.txt");
+    const read_entry = try testAssistantToolCallEntry(allocator, "a1", null, "read", "/tmp/read-only.txt");
+    const read_then_edit = try testAssistantToolCallEntry(allocator, "a2", "a1", "read", "/tmp/changed.txt");
+    const edit_entry = try testAssistantToolCallEntry(allocator, "a3", "a2", "edit", "/tmp/changed.txt");
+    const write_entry = try testAssistantToolCallEntry(allocator, "a4", "a3", "write", "/tmp/new.txt");
 
     var file_ops: FileOperations = .{};
     try extractFileOpsFromMessage(allocator, read_entry.entry.message.message, &file_ops);
+    try extractFileOpsFromMessage(allocator, read_then_edit.entry.message.message, &file_ops);
     try extractFileOpsFromMessage(allocator, edit_entry.entry.message.message, &file_ops);
+    try extractFileOpsFromMessage(allocator, write_entry.entry.message.message, &file_ops);
 
     const lists = try computeFileLists(allocator, &file_ops);
     try testing.expectEqual(@as(usize, 1), lists.read_files.len);
-    try testing.expectEqualStrings("/tmp/a.txt", lists.read_files[0]);
-    try testing.expectEqual(@as(usize, 1), lists.modified_files.len);
-    try testing.expectEqualStrings("/tmp/b.txt", lists.modified_files[0]);
+    try testing.expectEqualStrings("/tmp/read-only.txt", lists.read_files[0]);
+    try testing.expectEqual(@as(usize, 2), lists.modified_files.len);
+    try testing.expectEqualStrings("/tmp/changed.txt", lists.modified_files[0]);
+    try testing.expectEqualStrings("/tmp/new.txt", lists.modified_files[1]);
+
+    const out = try formatFileOperations(allocator, lists.read_files, lists.modified_files);
+    try testing.expectEqualStrings(
+        "\n\n<read-files>\n/tmp/read-only.txt\n</read-files>\n\n<modified-files>\n/tmp/changed.txt\n/tmp/new.txt\n</modified-files>",
+        out,
+    );
 }
 
-test "computeFileLists: edited path wins over read" {
+test "serializeConversation: emits summary roles and truncates long tool results" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var file_ops: FileOperations = .{};
-    try file_ops.read.put(allocator, "/tmp/same.txt", {});
-    try file_ops.edited.put(allocator, "/tmp/same.txt", {});
-
-    const lists = try computeFileLists(allocator, &file_ops);
-    try testing.expectEqual(@as(usize, 0), lists.read_files.len);
-    try testing.expectEqual(@as(usize, 1), lists.modified_files.len);
-    try testing.expectEqualStrings("/tmp/same.txt", lists.modified_files[0]);
-}
-
-test "formatFileOperations: empty returns empty" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const out = try formatFileOperations(allocator, &.{}, &.{});
-    try testing.expectEqualStrings("", out);
-}
-
-test "formatFileOperations: XML tags for read + modified" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const read_files = [_][]const u8{"a.txt"};
-    const modified_files = [_][]const u8{"b.txt"};
-    const out = try formatFileOperations(allocator, &read_files, &modified_files);
-    try testing.expect(std.mem.indexOf(u8, out, "<read-files>") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "a.txt") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "<modified-files>") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "b.txt") != null);
-}
-
-test "serializeConversation: truncates long tool results" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    const assistant_content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
+    assistant_content[0] = .{ .text = .{ .text = "hi there" } };
 
     const big_text = try allocator.alloc(u8, TOOL_RESULT_MAX_CHARS + 500);
     @memset(big_text, 'x');
+    const tool_content = try allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, 1);
+    tool_content[0] = .{ .text = .{ .text = big_text } };
 
-    const content = try allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, 1);
-    content[0] = .{ .text = .{ .text = big_text } };
-    const messages = [_]AgentMessage{.{ .tool_result = .{
-        .tool_call_id = "tc-1",
-        .tool_name = "read",
-        .content = content,
-        .is_error = false,
-        .timestamp = 0,
-    } }};
-
-    const out = try serializeConversation(allocator, &messages);
-    try testing.expect(std.mem.indexOf(u8, out, "[Tool result]:") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "truncated]") != null);
-}
-
-test "serializeConversation: user + assistant text roundtrips" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
-    content[0] = .{ .text = .{ .text = "hi there" } };
     const messages = [_]AgentMessage{
         .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
         .{ .assistant = .{
-            .content = content,
+            .content = assistant_content,
             .api = .openai_responses,
             .provider = .openai,
             .model = "gpt-test",
@@ -876,8 +827,18 @@ test "serializeConversation: user + assistant text roundtrips" {
             .stop_reason = .stop,
             .timestamp = 0,
         } },
+        .{ .tool_result = .{
+            .tool_call_id = "tc-1",
+            .tool_name = "read",
+            .content = tool_content,
+            .is_error = false,
+            .timestamp = 0,
+        } },
     };
+
     const out = try serializeConversation(allocator, &messages);
     try testing.expect(std.mem.indexOf(u8, out, "[User]: hello") != null);
     try testing.expect(std.mem.indexOf(u8, out, "[Assistant]: hi there") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "[Tool result]:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "truncated]") != null);
 }

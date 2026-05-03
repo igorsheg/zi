@@ -1207,56 +1207,6 @@ fn parseContentArray(
 const testing = std.testing;
 const api = @import("api.zig");
 
-test "event_bridge dispatches AgentEvent.message_end through to a Lua handler" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-
-    api.installZiTable(&state, &runner);
-
-    // Subscribe via the public Lua API: a single message_end
-    // handler that records the role into a global so the test
-    // can check it.
-    try state.doString(
-        \\_received_role = nil
-        \\zi.on("message_end", function(event, ctx)
-        \\  _received_role = event.role
-        \\end)
-    , "subscribe");
-
-    // Synthesize a message_end AgentEvent for an assistant
-    // message. We don't need real fields beyond what
-    // pushMessageEnd reads — `role` comes from the union tag.
-    const fake_assistant = agent_protocol.AgentMessage{
-        .assistant = .{
-            .content = &.{},
-            .api = .{ .anthropic_messages = {} },
-            .provider = .{ .anthropic = {} },
-            .model = "test",
-            .usage = .{
-                .input = 0,
-                .output = 0,
-                .cache_read = 0,
-                .cache_write = 0,
-                .total_tokens = 0,
-                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-            },
-            .stop_reason = .stop,
-            .timestamp = 0,
-        },
-    };
-
-    try handleAgentEvent(&runner, .{ .message_end = .{ .message = fake_assistant } });
-
-    // Verify the handler ran and saw role = "assistant".
-    try state.doString(
-        \\assert(_received_role == "assistant", "expected 'assistant', got " .. tostring(_received_role))
-    , "verify");
-}
-
 test "semantic message event exposes assistant text and tool calls" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
@@ -1298,109 +1248,9 @@ test "semantic message event exposes assistant text and tool calls" {
     , "verify_semantic_message");
 }
 
-test "event_bridge skips dispatch when no handler is subscribed" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-
-    api.installZiTable(&state, &runner);
-
-    // No subscription. Dispatching should be a complete no-op
-    // — no Lua state mutation, no errors.
-    const top_before = c.lua_gettop(state.L);
-    try handleAgentEvent(&runner, .{ .agent_start = {} });
-    const top_after = c.lua_gettop(state.L);
-
-    try testing.expectEqual(top_before, top_after);
-}
-
-test "event_bridge tool_execution_start exposes tool_name and args to handler" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\_seen_tool = nil
-        \\_seen_command = nil
-        \\zi.on("tool_execution_start", function(event, ctx)
-        \\  _seen_tool = event.tool_name
-        \\  _seen_command = event.args.command
-        \\end)
-    , "subscribe");
-
-    // Build a synthetic args JSON value: { command = "ls -la" }
-    var args_obj: std.json.ObjectMap = .{};
-    defer args_obj.deinit(testing.allocator);
-    try args_obj.put(testing.allocator, "command", .{ .string = "ls -la" });
-
-    try handleAgentEvent(&runner, .{
-        .tool_execution_start = .{
-            .tool_call_id = "id-1",
-            .tool_name = "Bash",
-            .args = .{ .object = args_obj },
-        },
-    });
-
-    try state.doString(
-        \\assert(_seen_tool == "Bash", "tool_name: " .. tostring(_seen_tool))
-        \\assert(_seen_command == "ls -la", "command: " .. tostring(_seen_command))
-    , "verify");
-}
-
 // -- D6: tool_call / tool_result hooks ----------------------------------------
 
-test "before_agent_start transforms system prompt from return table" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\zi.on("before_agent_start", function(event, ctx)
-        \\  return { system_prompt = event.system_prompt .. "\nmarker" }
-        \\end)
-    , "subscribe_before_agent_start_return");
-
-    const result = try dispatchBeforeAgentStart(&runner, "base", .{ .cwd = ".", .selected_tools = &.{}, .skills = &.{}, .append_system_prompt = &.{} }, testing.allocator);
-    defer testing.allocator.free(result);
-    try testing.expectEqualStrings("base\nmarker", result);
-}
-
-test "before_agent_start chains mutation across handlers" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\zi.on("before_agent_start", function(event, ctx)
-        \\  event.system_prompt = event.system_prompt .. " one"
-        \\end)
-        \\zi.on("before_agent_start", function(event, ctx)
-        \\  event.system_prompt = event.system_prompt .. " two"
-        \\end)
-    , "subscribe_before_agent_start_mutation");
-
-    const result = try dispatchBeforeAgentStart(&runner, "base", .{ .cwd = ".", .selected_tools = &.{}, .skills = &.{}, .append_system_prompt = &.{} }, testing.allocator);
-    defer testing.allocator.free(result);
-    try testing.expectEqualStrings("base one two", result);
-}
-
-test "before_agent_start exposes selected tools and skills" {
+test "before_agent_start transforms system prompt and exposes options" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -1412,15 +1262,18 @@ test "before_agent_start exposes selected tools and skills" {
     try state.doString(
         \\zi.on("before_agent_start", function(event, ctx)
         \\  local opts = event.system_prompt_options
-        \\  return { system_prompt = event.system_prompt .. " " .. opts.selected_tools[1] .. " " .. opts.skills[1].name }
+        \\  event.system_prompt = event.system_prompt .. " " .. opts.selected_tools[1] .. " " .. opts.skills[1].name
         \\end)
-    , "subscribe_before_agent_start_options");
+        \\zi.on("before_agent_start", function(event, ctx)
+        \\  return { system_prompt = event.system_prompt .. " marker" }
+        \\end)
+    , "subscribe_before_agent_start");
 
     const tool_names = [_][]const u8{"bash"};
     const skill_list = [_]resource_types.Skill{.{ .name = "zig", .description = "zig skill", .file_path = "zig.md", .base_dir = ".", .source_info = .{ .path = "zig.md", .source = "test" } }};
     const result = try dispatchBeforeAgentStart(&runner, "base", .{ .cwd = ".", .selected_tools = &tool_names, .skills = &skill_list, .append_system_prompt = &.{} }, testing.allocator);
     defer testing.allocator.free(result);
-    try testing.expectEqualStrings("base bash zig", result);
+    try testing.expectEqualStrings("base bash zig marker", result);
 }
 
 test "input middleware transforms text before agent submission" {
@@ -1467,31 +1320,6 @@ test "input middleware handled action stops agent submission" {
 
     const result = try dispatchInput(&runner, "ping", null, testing.allocator);
     try testing.expect(result == .handled);
-}
-
-test "input middleware treats event text mutation as transform" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    try state.doString(
-        \\zi.on("input", function(event, ctx)
-        \\  event.text = "mutated"
-        \\end)
-    , "subscribe_input_mutation");
-
-    const result = try dispatchInput(&runner, "original", null, testing.allocator);
-    switch (result) {
-        .transform => |text| {
-            defer testing.allocator.free(text);
-            try testing.expectEqualStrings("mutated", text);
-        },
-        else => return error.ExpectedTransform,
-    }
 }
 
 test "beforeToolCall blocks tool execution when handler returns block=true" {

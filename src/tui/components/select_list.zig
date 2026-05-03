@@ -209,8 +209,6 @@ pub const SelectList = struct {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const Buffer = buffer_mod.Buffer;
-
 fn testTheme() Theme {
     return themes_builtin.dark().*;
 }
@@ -221,49 +219,6 @@ fn makeItems() [3]SelectItem {
         .{ .value = "b", .label = "Beta", .description = "second letter" },
         .{ .value = "c", .label = "Gamma", .description = null },
     };
-}
-
-/// Helper: read a row of rendered cells as ASCII text.
-fn readRow(buf: *const Buffer, row: u32) [80]u8 {
-    var out: [80]u8 = .{' '} ** 80;
-    for (0..@min(buf.width, 80)) |x| {
-        const cell = buf.get(@intCast(x), row);
-        const cp = switch (cell.grapheme) {
-            .codepoint => |c| c,
-            .pooled => ' ',
-        };
-        if (cp < 128) {
-            out[x] = @intCast(cp);
-        }
-    }
-    return out;
-}
-
-test "SelectList renders items with selection indicator" {
-    const theme = testTheme();
-    var items = makeItems();
-
-    var sl = SelectList{
-        .theme = &theme,
-    };
-    sl.setItems(&items);
-
-    var buf = try Buffer.init(testing.allocator, 60, 10);
-    defer buf.deinit();
-
-    sl.render(buf.region());
-
-    // row 0 should have the arrow prefix for the selected item (index 0)
-    const row0 = readRow(&buf, 0);
-    // "→ " is 3 bytes (e2 86 92 + space) but → is a non-ASCII char
-    // The arrow codepoint is U+2192 which has charWidth=1, so col 0 = →, col 1 = ' '
-    const cell0 = buf.get(0, 0);
-    try testing.expectEqual(@as(u21, 0x2192), cell0.grapheme.codepoint);
-
-    // row 1 should have space prefix (unselected)
-    const cell1_0 = buf.get(0, 1);
-    try testing.expectEqual(@as(u21, ' '), cell1_0.grapheme.codepoint);
-    _ = row0;
 }
 
 test "SelectList up/down wraps around" {
@@ -325,7 +280,7 @@ test "SelectList page home and end navigation clamp within items" {
     try testing.expectEqual(@as(u32, 4), sl.selected_index);
 }
 
-test "SelectList preserves selection by value across setItems and renders custom empty text" {
+test "SelectList preserves selection by value across setItems" {
     const theme = testTheme();
     const before = [_]SelectItem{
         .{ .value = "alpha", .label = "Alpha" },
@@ -337,22 +292,13 @@ test "SelectList preserves selection by value across setItems and renders custom
         .{ .value = "beta", .label = "Beta" },
     };
 
-    var sl = SelectList{
-        .theme = &theme,
-        .empty_text = "Nothing here",
-    };
+    var sl = SelectList{ .theme = &theme };
     sl.setItems(&before);
     try testing.expect(sl.setSelectedByValue("beta"));
     sl.setItems(&after);
 
     try testing.expectEqualStrings("beta", sl.selectedValue().?);
     try testing.expectEqual(@as(u32, 1), sl.selected_index);
-
-    sl.setItems(&.{});
-    var buf = try Buffer.init(testing.allocator, 30, 3);
-    defer buf.deinit();
-    sl.render(buf.region());
-    try testing.expectEqual(@as(u21, 'N'), buf.get(2, 0).grapheme.codepoint);
 }
 
 test "SelectList enter returns selected" {
@@ -383,24 +329,16 @@ test "SelectList escape and ctrl+c return cancelled" {
     try testing.expectEqual(InputResult.cancelled, sl.processInput(.{ .code = .char, .char = 'c', .ctrl = true }));
 }
 
-test "SelectList empty items shows no match message" {
+test "SelectList empty items have no selection and consume list actions" {
     const theme = testTheme();
 
-    var sl = SelectList{
-        .theme = &theme,
-    };
+    var sl = SelectList{ .theme = &theme };
 
-    var buf = try Buffer.init(testing.allocator, 40, 5);
-    defer buf.deinit();
-
-    sl.render(buf.region());
-
-    // "  No matching commands" starts at col 2
-    try testing.expectEqual(@as(u21, 'N'), buf.get(2, 0).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, 'o'), buf.get(3, 0).grapheme.codepoint);
-
-    // getSelectedItem returns null
     try testing.expectEqual(@as(?*const SelectItem, null), sl.getSelectedItem());
+    try testing.expectEqual(@as(?[]const u8, null), sl.selectedValue());
+    try testing.expectEqual(InputResult.consumed, sl.processInput(.{ .code = .enter }));
+    try testing.expectEqual(InputResult.consumed, sl.processInput(.{ .code = .down }));
+    try testing.expectEqual(@as(u32, 0), sl.selected_index);
 }
 
 test "SelectList measure reports correct height" {

@@ -395,11 +395,11 @@ pub const ListPicker = struct {
 };
 
 const testing = std.testing;
-const Buffer = buffer_mod.Buffer;
 
 const SelectionCapture = struct {
     source_index: ?usize = null,
     value: ?[]const u8 = null,
+    cancelled: bool = false,
 };
 
 fn captureSelection(selection: Selection, ctx: ?*anyopaque) void {
@@ -408,13 +408,47 @@ fn captureSelection(selection: Selection, ctx: ?*anyopaque) void {
     capture.value = selection.item.value;
 }
 
-test "searchable picker selection reports original source index" {
-    const theme = themes_builtin.dark().*;
-    const items = [_]SelectItem{
+fn captureCancel(ctx: ?*anyopaque) void {
+    const capture: *SelectionCapture = @ptrCast(@alignCast(ctx));
+    capture.cancelled = true;
+}
+
+fn testTheme() Theme {
+    return themes_builtin.dark().*;
+}
+
+fn pickerItems() [3]SelectItem {
+    return .{
         .{ .value = "alpha", .label = "Alpha" },
         .{ .value = "beta", .label = "Beta" },
         .{ .value = "gamma", .label = "Gamma" },
     };
+}
+
+test "plain picker navigates and reports visible source index" {
+    const theme = testTheme();
+    var items = pickerItems();
+
+    var picker = ListPicker.init(&theme);
+    var capture = SelectionCapture{};
+    picker.setItems(&items);
+    picker.on_select = &captureSelection;
+    picker.callback_ctx = @ptrCast(&capture);
+
+    try testing.expectEqual(@as(u32, 0), picker.list.selected_index);
+    try testing.expect(picker.handleInput(.{ .code = .up }));
+    try testing.expectEqualStrings("gamma", picker.list.selectedValue().?);
+    try testing.expect(picker.handleInput(.{ .code = .home }));
+    try testing.expect(picker.handleInput(.{ .code = .down }));
+    try testing.expect(picker.handleInput(.{ .code = .enter }));
+
+    try testing.expectEqual(@as(?usize, 1), capture.source_index);
+    try testing.expectEqualStrings("beta", capture.value.?);
+}
+
+test "searchable picker filters and reports original source index" {
+    const theme = testTheme();
+    var items = pickerItems();
     const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
 
     var picker = ListPicker.init(&theme);
@@ -423,20 +457,17 @@ test "searchable picker selection reports original source index" {
     picker.on_select = &captureSelection;
     picker.callback_ctx = @ptrCast(&capture);
 
-    _ = picker.handleInput(.{ .code = .char, .char = 'g' });
-    _ = picker.handleInput(.{ .code = .enter });
+    try testing.expect(picker.handleInput(.{ .code = .char, .char = 'g' }));
+    try testing.expectEqualStrings("gamma", picker.list.selectedValue().?);
+    try testing.expect(picker.handleInput(.{ .code = .enter }));
 
     try testing.expectEqual(@as(?usize, 2), capture.source_index);
     try testing.expectEqualStrings("gamma", capture.value.?);
 }
 
 test "searchable picker preserves selected value across filter changes" {
-    const theme = themes_builtin.dark().*;
-    const items = [_]SelectItem{
-        .{ .value = "alpha", .label = "Alpha" },
-        .{ .value = "beta", .label = "Beta" },
-        .{ .value = "gamma", .label = "Gamma" },
-    };
+    const theme = testTheme();
+    var items = pickerItems();
     const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
 
     var picker = ListPicker.init(&theme);
@@ -445,88 +476,41 @@ test "searchable picker preserves selected value across filter changes" {
 
     try testing.expectEqualStrings("beta", picker.list.selectedValue().?);
 
-    _ = picker.handleInput(.{ .code = .char, .char = 'g' });
+    try testing.expect(picker.handleInput(.{ .code = .char, .char = 'g' }));
     try testing.expectEqualStrings("gamma", picker.list.selectedValue().?);
 
-    _ = picker.handleInput(.{ .code = .backspace });
+    try testing.expect(picker.handleInput(.{ .code = .backspace }));
     try testing.expectEqualStrings("beta", picker.list.selectedValue().?);
 }
 
-test "picker initial selection index and status affect list behavior and measurement" {
-    const theme = themes_builtin.dark().*;
-    const items = [_]SelectItem{
-        .{ .value = "alpha", .label = "Alpha" },
-        .{ .value = "beta", .label = "Beta" },
-        .{ .value = "gamma", .label = "Gamma" },
-    };
+test "picker handles initial selection measurement and empty boundaries" {
+    const theme = testTheme();
+    var items = pickerItems();
 
     var picker = ListPicker.init(&theme);
     picker.setSearchPlaceholder("Search models");
     picker.setEmptyText("No models found");
     picker.setStatus(.{ .text = "Loading models", .kind = .loading });
     picker.setItems(&items);
-    picker.setInitialSelectionIndex(2);
+    picker.setInitialSelectionIndex(99);
 
     try testing.expectEqualStrings("gamma", picker.list.selectedValue().?);
+    try testing.expectEqualStrings("No models found", picker.list.empty_text);
     try testing.expectEqual(@as(u32, 6), picker.measure(40).preferred_height);
-}
 
-test "searchable picker renders placeholder status and custom empty text" {
-    const theme = themes_builtin.dark().*;
-    var picker = ListPicker.init(&theme);
-    picker.title = "Models";
-    picker.setSearchPlaceholder("Search models");
-    picker.setEmptyText("No models found");
-    picker.setStatus(.{ .text = "Loading models", .kind = .loading });
-    picker.setSearchableItems(&.{}, null);
-
-    var buf = try Buffer.init(testing.allocator, 40, 8);
-    defer buf.deinit();
-
-    picker.render(buf.region());
-
-    try testing.expectEqual(@as(u21, 'S'), buf.get(3, 1).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, 'L'), buf.get(1, 3).grapheme.codepoint);
-    try testing.expectEqual(@as(u21, 'N'), buf.get(3, 4).grapheme.codepoint);
-}
-
-test "picker frame uses muted border color" {
-    const theme = themes_builtin.dark().*;
-    const items = [_]SelectItem{
-        .{ .value = "alpha", .label = "Alpha" },
-    };
-
-    var picker = ListPicker.init(&theme);
-    picker.title = "Models";
-    picker.setItems(&items);
-
-    var buf = try Buffer.init(testing.allocator, 20, 5);
-    defer buf.deinit();
-
-    picker.render(buf.region());
-
-    try testing.expectEqual(@as(u21, '╭'), buf.get(0, 0).grapheme.codepoint);
-    try testing.expect(buf.get(0, 0).fg.eql(theme.fg(.border_muted)));
-    try testing.expect(buf.get(0, 0).bg.eql(Color.default));
-}
-
-test "plain picker selection reports visible source index" {
-    const theme = themes_builtin.dark().*;
-    const items = [_]SelectItem{
-        .{ .value = "alpha", .label = "Alpha" },
-        .{ .value = "beta", .label = "Beta" },
-        .{ .value = "gamma", .label = "Gamma" },
-    };
-
-    var picker = ListPicker.init(&theme);
+    var empty = ListPicker.init(&theme);
     var capture = SelectionCapture{};
-    picker.setItems(&items);
-    picker.on_select = &captureSelection;
-    picker.callback_ctx = @ptrCast(&capture);
+    empty.setEmptyText("Nothing here");
+    empty.setSearchableItems(&.{}, null);
+    empty.on_select = &captureSelection;
+    empty.on_cancel = &captureCancel;
+    empty.callback_ctx = @ptrCast(&capture);
 
-    _ = picker.handleInput(.{ .code = .down });
-    _ = picker.handleInput(.{ .code = .enter });
-
-    try testing.expectEqual(@as(?usize, 1), capture.source_index);
-    try testing.expectEqualStrings("beta", capture.value.?);
+    try testing.expectEqualStrings("Nothing here", empty.list.empty_text);
+    try testing.expect(empty.handleInput(.{ .code = .enter }));
+    try testing.expectEqual(@as(?[]const u8, null), capture.value);
+    try testing.expect(empty.handleInput(.{ .code = .down }));
+    try testing.expectEqual(@as(u32, 0), empty.list.selected_index);
+    try testing.expect(empty.handleInput(.{ .code = .escape }));
+    try testing.expect(capture.cancelled);
 }

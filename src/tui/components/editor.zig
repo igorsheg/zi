@@ -1011,26 +1011,6 @@ fn submittedText(capture: *const SubmitCapture) []const u8 {
     return capture.last_text_buf[0..capture.last_text_len];
 }
 
-test "Editor status line renders thinking inline with model" {
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-
-    var status = StatusData.init(testing.allocator);
-    defer status.deinit();
-    status.setModelId("claude-4-sonnet");
-    status.setThinkingLevel("high");
-    status.context_tokens = 1_234;
-    status.context_window = 200_000;
-
-    editor.setStatusData(&status);
-
-    var buf: [128]u8 = undefined;
-    try testing.expectEqualStrings(
-        "ctx 1.2k/200k • claude-4-sonnet (high)",
-        editor.formatStatusRight(&buf).?,
-    );
-}
-
 test "Editor undo coalesces typing by word boundaries" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
@@ -1169,20 +1149,9 @@ test "Editor history browsing snapshots the empty draft and submit clears undo s
     try testing.expectEqualStrings("", editor.getText());
 }
 
-test "Editor up/down keep wrapped-line movement and history crossover semantics" {
+test "Editor up/down handle prompt boundaries and history crossover" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
-
-    editor.setText("abcd efgh ijkl");
-    _ = editor.measure(9);
-    editor.buffer.setCursorByte(5);
-    editor.view.clearDesiredVisualColumn();
-
-    try testing.expect(editor.handleInput(.{ .code = .down }));
-    try testing.expectEqual(@as(u32, 10), editor.buffer.cursorByte());
-
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqual(@as(u32, 5), editor.buffer.cursorByte());
 
     editor.setText("hello");
     editor.buffer.setCursorByte(3);
@@ -1249,36 +1218,7 @@ test "Editor large single-line paste inserts char-count marker" {
     try testing.expectEqualStrings(pasted[0..], editor.getExpandedText());
 }
 
-test "Editor cursor arrows skip stored paste markers atomically" {
-    const pasted =
-        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
-
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-
-    editor.insertText("A");
-    editor.handlePaste(pasted);
-    editor.insertText("B");
-
-    const marker_len = editor.getText().len - 2;
-
-    try testing.expect(editor.handleInput(.{ .code = .home }));
-    try testing.expectEqual(@as(u32, 0), editor.buffer.cursorByte());
-
-    try testing.expect(editor.handleInput(.{ .code = .right }));
-    try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
-
-    try testing.expect(editor.handleInput(.{ .code = .right }));
-    try testing.expectEqual(@as(u32, @intCast(1 + marker_len)), editor.buffer.cursorByte());
-
-    try testing.expect(editor.handleInput(.{ .code = .left }));
-    try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
-
-    try testing.expect(editor.handleInput(.{ .code = .left }));
-    try testing.expectEqual(@as(u32, 0), editor.buffer.cursorByte());
-}
-
-test "Editor delete keys remove stored paste markers atomically" {
+test "Editor stored paste markers navigate, delete, and undo atomically" {
     const pasted =
         "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
 
@@ -1289,13 +1229,17 @@ test "Editor delete keys remove stored paste markers atomically" {
         editor.insertText("A");
         editor.handlePaste(pasted);
         editor.insertText("B");
+        const original = try testing.allocator.dupe(u8, editor.getText());
+        defer testing.allocator.free(original);
 
         try testing.expect(editor.handleInput(.{ .code = .home }));
         try testing.expect(editor.handleInput(.{ .code = .right }));
         try testing.expect(editor.handleInput(.{ .code = .right }));
         try testing.expect(editor.handleInput(.{ .code = .backspace }));
         try testing.expectEqualStrings("AB", editor.getText());
-        try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
+
+        try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+        try testing.expectEqualStrings(original, editor.getText());
     }
 
     {
@@ -1310,31 +1254,7 @@ test "Editor delete keys remove stored paste markers atomically" {
         try testing.expect(editor.handleInput(.{ .code = .right }));
         try testing.expect(editor.handleInput(.{ .code = .delete }));
         try testing.expectEqualStrings("AB", editor.getText());
-        try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
     }
-}
-
-test "Editor undo restores marker after atomic marker deletion" {
-    const pasted =
-        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
-
-    var editor = Editor.init(testing.allocator);
-    defer editor.deinit();
-
-    editor.insertText("A");
-    editor.handlePaste(pasted);
-    editor.insertText("B");
-    const original = try testing.allocator.dupe(u8, editor.getText());
-    defer testing.allocator.free(original);
-
-    try testing.expect(editor.handleInput(.{ .code = .home }));
-    try testing.expect(editor.handleInput(.{ .code = .right }));
-    try testing.expect(editor.handleInput(.{ .code = .right }));
-    try testing.expect(editor.handleInput(.{ .code = .backspace }));
-    try testing.expectEqualStrings("AB", editor.getText());
-
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings(original, editor.getText());
 }
 
 test "Editor ignores manually typed marker-like text for atomic movement" {

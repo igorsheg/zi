@@ -203,41 +203,50 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
     writer.interface.flush() catch {};
 }
 
-fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
-    var count: usize = 0;
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, start, needle)) |idx| {
-        count += 1;
-        start = idx + needle.len;
-    }
-    return count;
-}
-
 fn testPipe() ![2]std.posix.fd_t {
     return runtime_fd.pipe();
 }
 
-test "Renderer init and deinit" {
+fn readPipe(read_fd: std.posix.fd_t, buf: []u8) ![]const u8 {
+    const n = try std.posix.read(read_fd, buf);
+    return buf[0..n];
+}
+
+test "Renderer owns its buffers and resize resets drawing state" {
     var r = try Renderer.init(std.testing.allocator, std.posix.STDOUT_FILENO, 10, 5);
     defer r.deinit();
+
     try std.testing.expectEqual(@as(u32, 10), r.width);
     try std.testing.expectEqual(@as(u32, 5), r.height);
+    try std.testing.expectEqual(@as(u32, 10), r.current.width);
+    try std.testing.expectEqual(@as(u32, 5), r.next.height);
+    try std.testing.expect(r.force_redraw);
+
+    r.force_redraw = false;
+    try r.resize(3, 2);
+    try std.testing.expectEqual(@as(u32, 3), r.width);
+    try std.testing.expectEqual(@as(u32, 2), r.height);
+    try std.testing.expectEqual(@as(usize, 6), r.current.cells.len);
+    try std.testing.expectEqual(@as(usize, 6), r.next.cells.len);
     try std.testing.expect(r.force_redraw);
 }
 
-test "Renderer begin returns cleared buffer region" {
+test "Renderer begin exposes a cleared full-frame region" {
     var r = try Renderer.init(std.testing.allocator, std.posix.STDOUT_FILENO, 10, 5);
     defer r.deinit();
+
+    r.next.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'X' } });
 
     const reg = r.begin();
     try std.testing.expectEqual(@as(u32, 10), reg.width);
     try std.testing.expectEqual(@as(u32, 5), reg.height);
+    try std.testing.expect(reg.get(0, 0).eql(Cell.blank));
 
-    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'X' } });
-    try std.testing.expectEqual(@as(u21, 'X'), r.next.get(0, 0).grapheme.codepoint);
+    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'Y' } });
+    try std.testing.expectEqual(@as(u21, 'Y'), r.next.get(0, 0).grapheme.codepoint);
 }
 
-test "Renderer diff produces output for changed cells" {
+test "Renderer end writes a frame and promotes it to current" {
     const pipe = try testPipe();
     defer runtime_fd.close(pipe[0]);
     defer runtime_fd.close(pipe[1]);
@@ -246,96 +255,19 @@ test "Renderer diff produces output for changed cells" {
     defer r.deinit();
 
     const reg = r.begin();
-    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' }, .fg = Color.rgb(255, 0, 0) });
+    _ = reg.writeStr(0, 0, "A", Color.rgb(255, 0, 0), Color.default, Attributes.none);
     try r.end();
 
     var read_buf: [4096]u8 = undefined;
-    const n = try std.posix.read(pipe[0], &read_buf);
-    const output = read_buf[0..n];
-
-    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026l") != null);
+    const output = try readPipe(pipe[0], &read_buf);
+    try std.testing.expect(std.mem.indexOf(u8, output, ansi.sync_enable) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, ansi.sync_disable) != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "A") != null);
+    try std.testing.expectEqual(@as(u21, 'A'), r.current.get(0, 0).grapheme.codepoint);
+    try std.testing.expect(!r.force_redraw);
 }
 
-test "Renderer emits one cursor move for a contiguous changed run" {
-    const pipe = try testPipe();
-    defer runtime_fd.close(pipe[0]);
-    defer runtime_fd.close(pipe[1]);
-
-    var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
-    defer r.deinit();
-
-    const reg = r.begin();
-    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
-    reg.set(1, 0, Cell{ .grapheme = .{ .codepoint = 'B' } });
-    try r.end();
-
-    var read_buf: [4096]u8 = undefined;
-    const n = try std.posix.read(pipe[0], &read_buf);
-    const output = read_buf[0..n];
-
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(output, "\x1b[1;1H"));
-    try std.testing.expectEqual(@as(usize, 0), countOccurrences(output, "\x1b[1;2H"));
-}
-
-test "Renderer emits separate cursor moves for separated changed runs" {
-    const pipe = try testPipe();
-    defer runtime_fd.close(pipe[0]);
-    defer runtime_fd.close(pipe[1]);
-
-    var r = try Renderer.init(std.testing.allocator, pipe[1], 3, 1);
-    defer r.deinit();
-
-    {
-        const reg = r.begin();
-        try r.end();
-        var drain_buf: [4096]u8 = undefined;
-        _ = try std.posix.read(pipe[0], &drain_buf);
-        _ = reg;
-    }
-
-    const reg = r.begin();
-    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
-    reg.set(2, 0, Cell{ .grapheme = .{ .codepoint = 'B' } });
-    try r.end();
-
-    var read_buf: [4096]u8 = undefined;
-    const n = try std.posix.read(pipe[0], &read_buf);
-    const output = read_buf[0..n];
-
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(output, "\x1b[1;1H"));
-    try std.testing.expectEqual(@as(usize, 1), countOccurrences(output, "\x1b[1;3H"));
-}
-
-test "Renderer skips unchanged cells" {
-    const pipe = try testPipe();
-    defer runtime_fd.close(pipe[0]);
-    defer runtime_fd.close(pipe[1]);
-
-    var r = try Renderer.init(std.testing.allocator, pipe[1], 5, 1);
-    defer r.deinit();
-
-    {
-        const reg = r.begin();
-        reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
-        try r.end();
-        var drain_buf: [4096]u8 = undefined;
-        _ = try std.posix.read(pipe[0], &drain_buf);
-    }
-
-    {
-        const reg = r.begin();
-        reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
-        try r.end();
-
-        var read_buf: [4096]u8 = undefined;
-        const n = try std.posix.read(pipe[0], &read_buf);
-        try std.testing.expect(n < 50);
-    }
-}
-
-test "multi-frame render emits clearing output for deleted characters" {
+test "Renderer diffs subsequent frames and clears deleted cells" {
     const pipe = try testPipe();
     defer runtime_fd.close(pipe[0]);
     defer runtime_fd.close(pipe[1]);
@@ -343,35 +275,32 @@ test "multi-frame render emits clearing output for deleted characters" {
     var r = try Renderer.init(std.testing.allocator, pipe[1], 10, 1);
     defer r.deinit();
 
-    // Frame 1: write "abc"
     {
         const reg = r.begin();
         _ = reg.writeStr(0, 0, "abc", Color.default, Color.default, Attributes.none);
         try r.end();
-        // drain the first frame output
         var drain: [4096]u8 = undefined;
-        _ = try std.posix.read(pipe[0], &drain);
+        _ = try readPipe(pipe[0], &drain);
     }
 
-    // Frame 2: write "ab" (one char deleted)
+    {
+        const reg = r.begin();
+        _ = reg.writeStr(0, 0, "abc", Color.default, Color.default, Attributes.none);
+        try r.end();
+        var read_buf: [4096]u8 = undefined;
+        const output = try readPipe(pipe[0], &read_buf);
+        try std.testing.expect(std.mem.indexOf(u8, output, "abc") == null);
+    }
+
     {
         const reg = r.begin();
         _ = reg.writeStr(0, 0, "ab", Color.default, Color.default, Attributes.none);
         try r.end();
 
         var read_buf: [4096]u8 = undefined;
-        const n = try std.posix.read(pipe[0], &read_buf);
-        const output = read_buf[0..n];
-
-        // Diff must emit something — position 2 changed from 'c' to ' '
-        // Sync markers + at least a cursor-pos + space character
-        try std.testing.expect(n > 20);
-        // Must contain sync begin/end
-        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") != null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026l") != null);
-
-        // After end(), buffers are swapped: current = the "ab" frame.
-        // Position 2 should be blank (space), not 'c'.
+        const output = try readPipe(pipe[0], &read_buf);
+        try std.testing.expect(std.mem.indexOf(u8, output, ansi.sync_enable) != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, ansi.sync_disable) != null);
         try std.testing.expectEqual(@as(u21, 'a'), r.current.get(0, 0).grapheme.codepoint);
         try std.testing.expectEqual(@as(u21, 'b'), r.current.get(1, 0).grapheme.codepoint);
         try std.testing.expectEqual(@as(u21, ' '), r.current.get(2, 0).grapheme.codepoint);

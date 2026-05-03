@@ -1417,15 +1417,31 @@ fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) !
 // Tests
 // =============================================================================
 
-test "ExtensionRunner unbinds back to stub state" {
+test "ExtensionRunner lifecycle binds once and unbinds to stub" {
     const allocator = std.testing.allocator;
     var runner = ExtensionRunner.init(allocator, 7);
     defer runner.deinit();
     var provider_registry = ai.provider.Registry.init(allocator);
     defer provider_registry.deinit();
 
-    try runner.bindRuntime(.{
-        .session = undefined,
+    try std.testing.expect(!runner.isBound());
+    try std.testing.expectEqual(@as(Generation, 7), runner.generation);
+
+    var session: u8 = 0;
+    try runner.bindRuntime(testBound(@ptrCast(&session)), &provider_registry);
+    try std.testing.expect(runner.isBound());
+
+    var other_session: u8 = 0;
+    try std.testing.expectError(error.AlreadyBound, runner.bindRuntime(testBound(@ptrCast(&other_session)), &provider_registry));
+
+    runner.unbindRuntime();
+    try std.testing.expect(!runner.isBound());
+    try std.testing.expect(runner.runtime == .stub);
+}
+
+fn testBound(session: *anyopaque) ExtensionRuntime.Bound {
+    return .{
+        .session = session,
         .ui = null,
         .command_actions = null,
         .get_model = &testGetModel,
@@ -1436,21 +1452,7 @@ test "ExtensionRunner unbinds back to stub state" {
         .get_context_usage = &testGetContextUsage,
         .get_system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-    }, &provider_registry);
-    try std.testing.expect(runner.isBound());
-
-    runner.unbindRuntime();
-    try std.testing.expect(!runner.isBound());
-    try std.testing.expect(runner.runtime == .stub);
-}
-
-test "ExtensionRunner starts in stub state" {
-    const allocator = std.testing.allocator;
-    var runner = ExtensionRunner.init(allocator, 0);
-    defer runner.deinit();
-
-    try std.testing.expect(!runner.isBound());
-    try std.testing.expect(runner.generation == 0);
+    };
 }
 
 fn testGetModel(_: *anyopaque) agent_protocol.Model {
@@ -1494,52 +1496,28 @@ fn testGetBindingInfo(_: *anyopaque) ExtensionBindingInfo {
     };
 }
 
-test "bindRuntime rejects double-bind" {
+test "async requests and results own cloned payloads" {
     const allocator = std.testing.allocator;
-    var runner = ExtensionRunner.init(allocator, 1);
-    defer runner.deinit();
-    var provider_registry = ai.provider.Registry.init(allocator);
-    defer provider_registry.deinit();
 
-    // First bind should succeed
-    var dummy: u8 = 0;
-    const ptr: *anyopaque = @ptrCast(&dummy);
-    const bound = ExtensionRuntime.Bound{
-        .session = ptr,
-        .ui = null,
-        .command_actions = null,
-        .get_model = &testGetModel,
-        .is_idle = &testIsIdle,
-        .abort = &testAbort,
-        .has_pending_messages = &testHasPendingMessages,
-        .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
-        .get_binding_info = &testGetBindingInfo,
-    };
+    var request = try (SystemRequest{
+        .argv = &.{ "echo", "hello" },
+        .cwd = "/tmp",
+        .stdin = "input",
+        .env = &.{.{ .key = "KEY", .value = "VALUE" }},
+        .timeout_ms = 1000,
+    }).clone(allocator);
+    defer request.deinit(allocator);
 
-    try runner.bindRuntime(bound, &provider_registry);
-    try std.testing.expect(runner.isBound());
+    try std.testing.expectEqual(@as(usize, 2), request.argv.len);
+    try std.testing.expectEqualStrings("echo", request.argv[0]);
+    try std.testing.expectEqualStrings("/tmp", request.cwd.?);
+    try std.testing.expectEqualStrings("input", request.stdin.?);
+    try std.testing.expectEqualStrings("KEY", request.env[0].key);
+    try std.testing.expectEqualStrings("VALUE", request.env[0].value);
 
-    // Second bind should fail
-    var dummy2: u8 = 0;
-    const ptr2: *anyopaque = @ptrCast(&dummy2);
-    const bound2 = ExtensionRuntime.Bound{
-        .session = ptr2,
-        .ui = null,
-        .command_actions = null,
-        .get_model = &testGetModel,
-        .is_idle = &testIsIdle,
-        .abort = &testAbort,
-        .has_pending_messages = &testHasPendingMessages,
-        .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
-        .get_binding_info = &testGetBindingInfo,
-    };
-
-    const result = runner.bindRuntime(bound2, &provider_registry);
-    try std.testing.expectError(error.AlreadyBound, result);
+    var result = try (AsyncResult{ .ai_complete = .{ .completed = .{ .text = "done" } } }).clone(allocator);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("done", result.ai_complete.completed.text);
 }
 
 test "dispatchOAuthGetApiKey executes the claim callback on the lua-owning thread" {
@@ -1577,19 +1555,8 @@ test "dispatchOAuthGetApiKey executes the claim callback on the lua-owning threa
         .generation = runner.generation,
     }));
 
-    try runner.bindRuntime(.{
-        .session = undefined,
-        .ui = null,
-        .command_actions = null,
-        .get_model = &testGetModel,
-        .is_idle = &testIsIdle,
-        .abort = &testAbort,
-        .has_pending_messages = &testHasPendingMessages,
-        .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
-        .get_binding_info = &testGetBindingInfo,
-    }, &provider_registry);
+    var session: u8 = 0;
+    try runner.bindRuntime(testBound(@ptrCast(&session)), &provider_registry);
 
     var credential = auth_types.OAuthCredential{
         .refresh = try allocator.dupe(u8, "refresh-token"),
@@ -1630,19 +1597,8 @@ test "bindRuntime replays queued providers, registers oauth claims, and unbindRu
         .generation = runner.generation,
     });
 
-    try runner.bindRuntime(.{
-        .session = undefined,
-        .ui = null,
-        .command_actions = null,
-        .get_model = &testGetModel,
-        .is_idle = &testIsIdle,
-        .abort = &testAbort,
-        .has_pending_messages = &testHasPendingMessages,
-        .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
-        .get_binding_info = &testGetBindingInfo,
-    }, &provider_registry);
+    var session: u8 = 0;
+    try runner.bindRuntime(testBound(@ptrCast(&session)), &provider_registry);
 
     try std.testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
     try std.testing.expectEqualStrings("proxy", provider_registry.get("anthropic-messages").?.getName());
@@ -1654,23 +1610,11 @@ test "bindRuntime replays queued providers, registers oauth claims, and unbindRu
     try std.testing.expect(oauth_mod.findProvider("proxy") == null);
 }
 
-test "ExtensionRunner owns four empty registries on init" {
-    const allocator = std.testing.allocator;
-    var runner = ExtensionRunner.init(allocator, 2);
-    defer runner.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), runner.tool_registry.count());
-    try std.testing.expectEqual(@as(usize, 0), runner.event_registry.count());
-    try std.testing.expectEqual(@as(usize, 0), runner.command_registry.count());
-    try std.testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
-}
-
-test "ExtensionRunner registries survive populated deinit" {
+test "ExtensionRunner owns populated registries until deinit" {
     const allocator = std.testing.allocator;
     var runner = ExtensionRunner.init(allocator, 3);
     defer runner.deinit();
 
-    // Tool: ownership transferred to registry on accept.
     const params = std.json.Value{ .object = .{} };
     const accepted = try runner.tool_registry.register(.{
         .name = try allocator.dupe(u8, "task"),
@@ -1683,10 +1627,7 @@ test "ExtensionRunner registries survive populated deinit" {
     });
     try std.testing.expect(accepted);
 
-    // Event: pure append.
     try runner.event_registry.subscribe(.tool_call, .{ .lua_ref = 8, .source_id = "task.lua" });
-
-    // Provider queue: pre-bind enqueue, never drained in this test.
     try runner.provider_queue.enqueueRegister(.{
         .name = try allocator.dupe(u8, "proxy"),
         .api = try allocator.dupe(u8, "anthropic-messages"),
@@ -1698,5 +1639,4 @@ test "ExtensionRunner registries survive populated deinit" {
     try std.testing.expectEqual(@as(usize, 1), runner.tool_registry.count());
     try std.testing.expectEqual(@as(usize, 1), runner.event_registry.count());
     try std.testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
-    // deinit (via defer) frees everything; testing.allocator catches leaks.
 }

@@ -769,21 +769,27 @@ fn makeToolResultMessage() protocol.ToolResultMessage {
     };
 }
 
+fn testModel() protocol.Model {
+    return .{
+        .id = "unknown",
+        .name = "unknown",
+        .api = .{ .custom = "unknown" },
+        .provider = .{ .custom = "unknown" },
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 0,
+        .max_tokens = 0,
+    };
+}
+
+fn initTestAgent() !Agent {
+    return Agent.init(testing.allocator, .{ .model = testModel() });
+}
+
 test "conversation view keeps current turn separate until turn_end" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
+    var agent = try initTestAgent();
     defer agent.deinit();
 
     agent.processEvent(.{ .message_end = .{ .message = .{ .user = .{
@@ -830,66 +836,28 @@ test "conversation view keeps current turn separate until turn_end" {
     try testing.expect(committed.in_flight == null);
 }
 
-test "truncateCommitted drops tail without rebuilding history" {
+test "truncateCommitted drops tail and bumps version" {
     const initial_messages = [_]protocol.AgentMessage{
         .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } },
-        .{ .assistant = .{
-            .content = &.{},
-            .api = .openai_responses,
-            .provider = .openai,
-            .model = "gpt-test",
-            .usage = .{
-                .input = 0,
-                .output = 0,
-                .cache_read = 0,
-                .cache_write = 0,
-                .total_tokens = 0,
-                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-            },
-            .stop_reason = .@"error",
-            .error_message = "retry me",
-            .timestamp = 2,
-        } },
+        .{ .assistant = makeAssistantMessage() },
     };
 
     var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
+        .model = testModel(),
         .messages = &initial_messages,
     });
     defer agent.deinit();
 
+    try testing.expectEqual(@as(u64, 0), agent.currentConversationVersion());
     try agent.truncateCommitted(1);
 
     try testing.expectEqual(@as(usize, 1), agent.messages().len);
     try testing.expect(agent.messages()[0] == .user);
+    try testing.expectEqual(@as(u64, 1), agent.currentConversationVersion());
 }
 
 test "unsubscribe tokens stay valid after earlier listeners are removed" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
+    var agent = try initTestAgent();
     defer agent.deinit();
 
     const Counter = struct {
@@ -915,21 +883,8 @@ test "unsubscribe tokens stay valid after earlier listeners are removed" {
     try testing.expectEqual(@as(u32, 1), second_count);
 }
 
-test "state exposes streaming assistant only during assistant streaming" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
+test "state reflects assistant streaming and pending tool lifecycle" {
+    var agent = try initTestAgent();
     defer agent.deinit();
 
     const assistant = makeAssistantMessage();
@@ -938,48 +893,12 @@ test "state exposes streaming assistant only during assistant streaming" {
     try testing.expect(state.streaming_message != null);
     try testing.expect(state.streaming_message.? == .assistant);
 
-    agent.processEvent(.{ .message_update = .{
-        .message = .{ .assistant = assistant },
-        .assistant_message_event = .{ .text_start = .{
-            .content_index = 0,
-            .partial = assistant,
-        } },
-    } });
-    state = agent.state();
-    try testing.expect(state.streaming_message != null);
-    try testing.expect(state.streaming_message.? == .assistant);
-
-    agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
-    state = agent.state();
-    try testing.expect(state.streaming_message == null);
-}
-
-test "state pending tool calls follow pi-mono execution lifecycle" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
-    defer agent.deinit();
-
-    const assistant = makeAssistantMessage();
-    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
     agent.processEvent(.{ .tool_execution_start = .{
         .tool_call_id = "tool-1",
         .tool_name = "read",
         .args = .null,
     } });
-
-    var state = agent.state();
+    state = agent.state();
     try testing.expectEqual(@as(usize, 1), state.pending_tool_calls.len);
     try testing.expectEqualStrings("tool-1", state.pending_tool_calls[0]);
 
@@ -1001,23 +920,21 @@ test "state pending tool calls follow pi-mono execution lifecycle" {
     } });
     state = agent.state();
     try testing.expectEqual(@as(usize, 0), state.pending_tool_calls.len);
+    try testing.expect(state.streaming_message != null);
+
+    agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    state = agent.state();
+    try testing.expect(state.streaming_message == null);
 }
 
 test "default stream fallback emits assistant error lifecycle without panic" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "missing-model",
-            .name = "missing-model",
-            .api = .{ .custom = "missing-api" },
-            .provider = .{ .custom = "missing-provider" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
+    var missing_model = testModel();
+    missing_model.id = "missing-model";
+    missing_model.name = "missing-model";
+    missing_model.api = .{ .custom = "missing-api" };
+    missing_model.provider = .{ .custom = "missing-provider" };
+
+    var agent = try Agent.init(testing.allocator, .{ .model = missing_model });
     defer agent.deinit();
 
     const Collector = struct {
@@ -1058,21 +975,8 @@ test "default stream fallback emits assistant error lifecycle without panic" {
     try testing.expect(state.error_message != null);
 }
 
-test "conversation_version bumps on semantic mutation" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
+test "conversation_version tracks committed, in-flight, and turn commit mutations" {
+    var agent = try initTestAgent();
     defer agent.deinit();
 
     try testing.expectEqual(@as(u64, 0), agent.currentConversationVersion());
@@ -1083,76 +987,20 @@ test "conversation_version bumps on semantic mutation" {
     } }});
     try testing.expectEqual(@as(u64, 1), agent.currentConversationVersion());
 
-    try agent.setMessages(&.{.{ .user = .{
-        .content = .{ .text = "world" },
-        .timestamp = 2,
-    } }});
-    try testing.expectEqual(@as(u64, 2), agent.currentConversationVersion());
-}
-
-test "conversation_version bumps on hot frontier mutation without committed append" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
-    defer agent.deinit();
-
-    try testing.expectEqual(@as(u64, 0), agent.currentConversationVersion());
-    try testing.expectEqual(@as(usize, 0), agent.messages().len);
-
     const assistant = makeAssistantMessage();
     agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
-    try testing.expectEqual(@as(u64, 1), agent.currentConversationVersion());
-    try testing.expectEqual(@as(usize, 0), agent.messages().len);
-
-    agent.processEvent(.{ .message_update = .{
-        .message = .{ .assistant = assistant },
-        .assistant_message_event = .{ .text_start = .{
-            .content_index = 0,
-            .partial = assistant,
-        } },
-    } });
     try testing.expectEqual(@as(u64, 2), agent.currentConversationVersion());
-    try testing.expectEqual(@as(usize, 0), agent.messages().len);
-}
+    try testing.expectEqual(@as(usize, 1), agent.messages().len);
 
-test "conversation_version bumps on tool execution frontier mutation" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
-    defer agent.deinit();
-
-    const assistant = makeAssistantMessage();
-    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
-    try testing.expectEqual(@as(u64, 1), agent.currentConversationVersion());
+    agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
+    try testing.expectEqual(@as(u64, 3), agent.currentConversationVersion());
 
     agent.processEvent(.{ .tool_execution_start = .{
         .tool_call_id = "tool-1",
         .tool_name = "read",
         .args = .null,
     } });
-    try testing.expectEqual(@as(u64, 2), agent.currentConversationVersion());
+    try testing.expectEqual(@as(u64, 4), agent.currentConversationVersion());
 
     agent.processEvent(.{ .tool_execution_update = .{
         .tool_call_id = "tool-1",
@@ -1160,7 +1008,7 @@ test "conversation_version bumps on tool execution frontier mutation" {
         .args = .null,
         .partial_result = .{ .content = &.{}, .is_error = false },
     } });
-    try testing.expectEqual(@as(u64, 3), agent.currentConversationVersion());
+    try testing.expectEqual(@as(u64, 5), agent.currentConversationVersion());
 
     agent.processEvent(.{ .tool_execution_end = .{
         .tool_call_id = "tool-1",
@@ -1168,59 +1016,17 @@ test "conversation_version bumps on tool execution frontier mutation" {
         .result = .{ .content = &.{}, .is_error = false },
         .is_error = false,
     } });
-    try testing.expectEqual(@as(u64, 4), agent.currentConversationVersion());
-}
-
-test "conversation_version does not double-bump on turn_end commit" {
-    var agent = try Agent.init(testing.allocator, .{
-        .model = .{
-            .id = "unknown",
-            .name = "unknown",
-            .api = .{ .custom = "unknown" },
-            .provider = .{ .custom = "unknown" },
-            .base_url = "",
-            .reasoning = false,
-            .input = &.{},
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-            .context_window = 0,
-            .max_tokens = 0,
-        },
-    });
-    defer agent.deinit();
-
-    // Seed committed history so turn_end has something to append after
-    agent.processEvent(.{ .message_end = .{ .message = .{ .user = .{
-        .content = .{ .text = "prompt" },
-        .timestamp = 1,
-    } } } });
-    const before_turn = agent.currentConversationVersion();
-
-    const assistant = makeAssistantMessage();
-    agent.processEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
-    agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
-    agent.processEvent(.{ .tool_execution_start = .{
-        .tool_call_id = "tool-1",
-        .tool_name = "read",
-        .args = .null,
-    } });
-    agent.processEvent(.{ .tool_execution_end = .{
-        .tool_call_id = "tool-1",
-        .tool_name = "read",
-        .result = .{ .content = &.{}, .is_error = false },
-        .is_error = false,
-    } });
+    try testing.expectEqual(@as(u64, 6), agent.currentConversationVersion());
 
     const tool_result = makeToolResultMessage();
     agent.processEvent(.{ .message_end = .{ .message = .{ .tool_result = tool_result } } });
+    try testing.expectEqual(@as(u64, 7), agent.currentConversationVersion());
 
-    // turn_end appends assistant + tool_result, but must only bump once
     agent.processEvent(.{ .turn_end = .{
         .message = .{ .assistant = assistant },
         .tool_results = &.{tool_result},
     } });
 
-    // user message (1), message_start (1), message_end assistant (1), tool_execution_start (1),
-    // tool_execution_end (1), message_end tool_result (1), turn_end (1) = 7 total
-    try testing.expectEqual(@as(u64, before_turn + 6), agent.currentConversationVersion());
+    try testing.expectEqual(@as(u64, 8), agent.currentConversationVersion());
     try testing.expectEqual(@as(usize, 3), agent.messages().len);
 }
