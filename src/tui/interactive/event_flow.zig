@@ -44,12 +44,13 @@ pub fn publishLifecycle(self: *Interactive, event: UiEvent) bool {
 }
 
 fn coalescePendingSnapshot(self: *Interactive, event: UiEvent) void {
-    switch (event) {
-        .conversation_snapshot => _ = self.snapshot_event_queue.dropMatching(isConversationSnapshot, null),
-        .queued_snapshot => _ = self.snapshot_event_queue.dropMatching(isQueuedSnapshot, null),
-        .status_snapshot => _ = self.snapshot_event_queue.dropMatching(isStatusSnapshot, null),
-        else => {},
-    }
+    const dropped = switch (event) {
+        .conversation_snapshot => self.snapshot_event_queue.dropMatching(isConversationSnapshot, null),
+        .queued_snapshot => self.snapshot_event_queue.dropMatching(isQueuedSnapshot, null),
+        .status_snapshot => self.snapshot_event_queue.dropMatching(isStatusSnapshot, null),
+        else => 0,
+    };
+    self.snapshot_coalesced_dropped += dropped;
 }
 
 fn isConversationSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {

@@ -268,7 +268,9 @@ pub const SessionStore = struct {
 
     pub fn buildContextAlloc(self: *SessionStore, allocator: std.mem.Allocator, selection: context_mod.LeafSelection) !context_mod.SessionContext {
         if (self.cached_entries) |entries| {
-            return context_mod.buildSessionContext(allocator, entries, selection);
+            const merged = try self.cachedEntriesWithAppends(allocator, entries);
+            defer if (merged.ptr != entries.ptr) allocator.free(merged);
+            return context_mod.buildSessionContext(allocator, merged, selection);
         }
         const data = try self.readIntoCache();
         return context_mod.buildSessionContext(allocator, data.entries, selection);
@@ -280,7 +282,9 @@ pub const SessionStore = struct {
 
     pub fn buildBranchEntriesAlloc(self: *SessionStore, allocator: std.mem.Allocator, selection: context_mod.LeafSelection) ![]const proto.SessionEntry {
         if (self.cached_entries) |entries| {
-            return context_mod.buildBranchEntries(allocator, entries, selection);
+            const merged = try self.cachedEntriesWithAppends(allocator, entries);
+            defer if (merged.ptr != entries.ptr) allocator.free(merged);
+            return context_mod.buildBranchEntries(allocator, merged, selection);
         }
         const data = try self.readIntoCache();
         return context_mod.buildBranchEntries(allocator, data.entries, selection);
@@ -357,7 +361,22 @@ pub const SessionStore = struct {
     }
 
     fn invalidateCache(self: *SessionStore) void {
+        // Once a resumed/flushed session has a parsed persisted cache, keep it.
+        // New entries appended by this writer are merged from writer.appended_entries
+        // in buildContext/buildBranchEntries, avoiding a full JSONL reparse on
+        // every interaction. Before the first flush, buffered entries can be
+        // rewritten wholesale, so the cache must still be dropped.
+        if (self.cached_entries != null and self.writer.persist and self.writer.flushed) return;
         self.clearCache();
+    }
+
+    fn cachedEntriesWithAppends(self: *SessionStore, allocator: std.mem.Allocator, entries: []proto.SessionEntry) ![]proto.SessionEntry {
+        const appended = self.writer.appended_entries.items;
+        if (appended.len == 0) return entries;
+        const merged = try allocator.alloc(proto.SessionEntry, entries.len + appended.len);
+        @memcpy(merged[0..entries.len], entries);
+        @memcpy(merged[entries.len..], appended);
+        return merged;
     }
 
     fn readIntoCache(self: *SessionStore) !reader_mod.SessionData {
@@ -913,9 +932,9 @@ test "open owns writer state and cache invalidation works with arena allocator" 
 
     store.appendSessionInfo("name");
 
-    try std.testing.expect(store.cached_entries == null);
-    try std.testing.expect(store.cached_header == null);
-    try std.testing.expect(store.cache_arena == null);
+    try std.testing.expect(store.cached_entries != null);
+    try std.testing.expect(store.cached_header != null);
+    try std.testing.expect(store.cache_arena != null);
     try std.testing.expectEqualStrings("abc", store.sessionId());
     try std.testing.expect(store.currentEntryId() != null);
 }

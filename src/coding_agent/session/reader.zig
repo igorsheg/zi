@@ -4,6 +4,40 @@ const agent = @import("../../agent/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
 
+pub const TelemetrySnapshot = struct {
+    read_count: u64 = 0,
+    last_bytes: usize = 0,
+    last_entries: usize = 0,
+    last_parse_ns: u64 = 0,
+    last_total_ns: u64 = 0,
+    total_bytes: u64 = 0,
+    total_parse_ns: u64 = 0,
+};
+
+const Telemetry = struct {
+    read_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    last_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    last_entries: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    last_parse_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    last_total_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total_parse_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+var telemetry: Telemetry = .{};
+
+pub fn telemetrySnapshot() TelemetrySnapshot {
+    return .{
+        .read_count = telemetry.read_count.load(.monotonic),
+        .last_bytes = telemetry.last_bytes.load(.monotonic),
+        .last_entries = telemetry.last_entries.load(.monotonic),
+        .last_parse_ns = telemetry.last_parse_ns.load(.monotonic),
+        .last_total_ns = telemetry.last_total_ns.load(.monotonic),
+        .total_bytes = telemetry.total_bytes.load(.monotonic),
+        .total_parse_ns = telemetry.total_parse_ns.load(.monotonic),
+    };
+}
+
 /// Result of reading a session file.
 pub const SessionData = struct {
     header: ?proto.SessionHeader,
@@ -64,13 +98,29 @@ fn parseLine(
 
 /// Read and parse a session file from disk.
 pub fn readSessionFile(allocator: std.mem.Allocator, path: []const u8) !SessionData {
+    const total_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
     const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{});
     defer file.close(std.Options.debug_io);
     var read_buf: [4096]u8 = undefined;
     var file_reader = file.reader(std.Options.debug_io, &read_buf);
     const content = try file_reader.interface.allocRemaining(allocator, .limited(100 * 1024 * 1024)); // 100MB max
     defer allocator.free(content);
-    return parseSessionContent(allocator, content);
+
+    const parse_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
+    const data = try parseSessionContent(allocator, content);
+    const parse_end = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
+    const total_end = parse_end;
+
+    const parse_ns: u64 = @intCast(@max(parse_end - parse_start, 0));
+    const total_ns: u64 = @intCast(@max(total_end - total_start, 0));
+    _ = telemetry.read_count.fetchAdd(1, .monotonic);
+    telemetry.last_bytes.store(content.len, .monotonic);
+    telemetry.last_entries.store(data.entries.len, .monotonic);
+    telemetry.last_parse_ns.store(parse_ns, .monotonic);
+    telemetry.last_total_ns.store(total_ns, .monotonic);
+    _ = telemetry.total_bytes.fetchAdd(content.len, .monotonic);
+    _ = telemetry.total_parse_ns.fetchAdd(parse_ns, .monotonic);
+    return data;
 }
 
 fn freeSessionHeader(allocator: std.mem.Allocator, header: proto.SessionHeader) void {

@@ -23,6 +23,10 @@ pub const SessionWriter = struct {
     flushed: bool,
     has_assistant: bool,
     buffered_entries: std.ArrayListUnmanaged(proto.FileEntry),
+    /// Flushed entries appended after this writer was opened. Kept so
+    /// SessionStore can extend an already-parsed resume cache without
+    /// reparsing the whole JSONL file after every interaction.
+    appended_entries: std.ArrayListUnmanaged(proto.SessionEntry),
     persist: bool,
 
     /// Construct a new writer. `session_dir` is the already-resolved directory
@@ -69,6 +73,7 @@ pub const SessionWriter = struct {
             .flushed = false,
             .has_assistant = false,
             .buffered_entries = buffered,
+            .appended_entries = .empty,
             .persist = true,
         };
     }
@@ -91,6 +96,7 @@ pub const SessionWriter = struct {
             .flushed = false,
             .has_assistant = false,
             .buffered_entries = .empty,
+            .appended_entries = .empty,
             .persist = false,
         };
     }
@@ -111,6 +117,7 @@ pub const SessionWriter = struct {
             .flushed = true,
             .has_assistant = true,
             .buffered_entries = .empty,
+            .appended_entries = .empty,
             .persist = true,
         };
     }
@@ -124,6 +131,8 @@ pub const SessionWriter = struct {
 
         for (self.buffered_entries.items) |entry| freeBufferedFileEntry(self.allocator, entry, self.session_id);
         self.buffered_entries.deinit(self.allocator);
+        for (self.appended_entries.items) |entry| freeAppendedEntry(self.allocator, entry);
+        self.appended_entries.deinit(self.allocator);
 
         if (self.leaf_id) |leaf_id| {
             if (!leaf_owned_by_ids) self.allocator.free(leaf_id);
@@ -302,21 +311,17 @@ pub const SessionWriter = struct {
     /// Append a single entry to the already-flushed file.
     fn appendToFile(self: *SessionWriter, entry: proto.SessionEntry) !void {
         if (!self.persist) return;
-        defer self.allocator.free(entry.timestamp);
-        defer if (entry.parent_id) |parent_id| self.allocator.free(parent_id);
-        defer switch (entry.entry) {
-            .label => |label| {
-                self.allocator.free(label.target_id);
-                if (label.label) |value| self.allocator.free(value);
-            },
-            else => {},
-        };
-
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         try json.writeEntry(&out.writer, entry);
         try out.writer.writeAll("\n");
         try zio_fs.appendFile(std.Options.debug_io, self.session_file, out.written());
+        self.appended_entries.append(self.allocator, entry) catch {
+            // Persistence already succeeded; if the in-memory append journal
+            // cannot grow, release per-entry fields and let SessionStore fall
+            // back to a future file read when its cache is invalidated.
+            freeAppendedEntry(self.allocator, entry);
+        };
     }
 
     /// Generate a unique 8-char hex ID, collision-checked.
@@ -359,6 +364,19 @@ fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, s
                 else => {},
             }
         },
+    }
+}
+
+fn freeAppendedEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) void {
+    allocator.free(entry.timestamp);
+    if (entry.parent_id) |parent_id| allocator.free(parent_id);
+    switch (entry.entry) {
+        .session_info => |info| if (info.name) |name| allocator.free(name),
+        .label => |label| {
+            allocator.free(label.target_id);
+            if (label.label) |value| allocator.free(value);
+        },
+        else => {},
     }
 }
 

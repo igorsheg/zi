@@ -48,6 +48,7 @@ const composer_flow = @import("interactive/composer_flow.zig");
 const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const status_flow = @import("interactive/status_flow.zig");
+const memory_telemetry = @import("interactive/memory_telemetry.zig");
 const overlay_flow = @import("interactive/overlay_flow.zig");
 const idle_request = @import("interactive/idle_request.zig");
 const runtime_loop = @import("interactive/runtime_loop.zig");
@@ -101,6 +102,12 @@ const RetryPolicy = coding_agent_mod.runtime_host.RetryPolicy;
 const CompactionPolicy = coding_agent_mod.runtime_host.CompactionPolicy;
 const CompactionExecutor = coding_agent_mod.runtime_host.CompactionExecutor;
 const log = std.log.scoped(.tui_interactive);
+
+fn deinitTranscriptText(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const text: *text_mod.Text = @ptrCast(@alignCast(ctx));
+    text.deinit();
+    allocator.destroy(text);
+}
 
 const MouseCapture = transcript_mouse.MouseCapture;
 const AgentSession = coding_agent_mod.AgentSession;
@@ -293,6 +300,9 @@ pub const Interactive = struct {
     request_in_flight: bool = false,
     startup_action: StartupAction = .none,
     last_ctrl_c_ns: i128 = 0,
+    memory_log_enabled: bool = false,
+    last_memory_log_ns: i128 = 0,
+    snapshot_coalesced_dropped: usize = 0,
     tool_output_expanded: bool = false,
     hide_thinking_block: bool = false,
     greeter_dismissed: bool = false,
@@ -350,6 +360,7 @@ pub const Interactive = struct {
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
             .model_catalog = &.{},
+            .memory_log_enabled = memory_telemetry.enabledFromEnv(),
         };
         self.job_manager = try job_manager_mod.JobManager.init(msg_allocator, io, &self.request_queue, null);
         self.ai_complete_worker = try ai_complete_worker_mod.AiCompleteWorker.init(msg_allocator);
@@ -559,6 +570,15 @@ pub const Interactive = struct {
 
     fn drainUiEvents(self: *Interactive) void {
         event_flow.drain(self);
+        self.maybeLogMemory("drain");
+    }
+
+    fn maybeLogMemory(self: *Interactive, label: []const u8) void {
+        if (!self.memory_log_enabled) return;
+        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds()));
+        if (self.last_memory_log_ns != 0 and now_ns - self.last_memory_log_ns < memory_telemetry.log_interval_ns) return;
+        self.last_memory_log_ns = now_ns;
+        memory_telemetry.log(self, label);
     }
 
     fn processTerminalInput(self: *Interactive) bool {
@@ -938,6 +958,7 @@ pub const Interactive = struct {
             .login => if (args.len > 0) self.startLogin(args) else self.showLoginPicker(),
             .settings => self.showSettingsPicker(),
             .hotkeys => self.showHotkeysOverlay(),
+            .memory => self.showMemoryTelemetry(),
         }
         return true;
     }
@@ -956,6 +977,38 @@ pub const Interactive = struct {
 
     fn showHotkeysOverlay(self: *Interactive) void {
         overlay_flow.showHotkeys(self);
+    }
+
+    fn showMemoryTelemetry(self: *Interactive) void {
+        const content = memory_telemetry.format(self.allocator, self) catch {
+            self.status_line.setPrimary("memory telemetry unavailable", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+            return;
+        };
+        defer self.allocator.free(content);
+
+        var row = self.allocator.create(text_mod.Text) catch {
+            self.status_line.setPrimary("memory telemetry allocation failed", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+            return;
+        };
+        row.* = text_mod.Text.init(self.allocator);
+        row.fg = self.theme.fg(.accent);
+        row.setContent(content);
+
+        const item: transcript_mod.TranscriptItem = .{
+            .renderable = transcript_mod.TranscriptRenderable.init(text_mod.Text, row),
+            .deinit_ctx = @ptrCast(row),
+            .deinit_fn = deinitTranscriptText,
+        };
+        if (!self.transcript.addItem(item)) {
+            deinitTranscriptText(@ptrCast(row), self.allocator);
+            self.status_line.setPrimary("memory telemetry unavailable", self.theme.fg(.@"error"));
+        } else {
+            self.status_line.setPrimary("memory telemetry added to transcript", self.theme.fg(.accent));
+        }
+        memory_telemetry.log(self, "slash");
+        self.tui.dirty = true;
     }
 
     pub fn configureSimplePicker(

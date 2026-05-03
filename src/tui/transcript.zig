@@ -1526,6 +1526,14 @@ pub const Transcript = struct {
         return self.layout.scrollOffset();
     }
 
+    pub fn restoreScrollOffset(self: *Transcript, offset: u32, follow_bottom: bool, width: u32, visible_height: u32) void {
+        self.last_visible_height = visible_height;
+        _ = self.totalHeight(width);
+        const max_scroll = self.layout.maxScrollOffset(visible_height);
+        self.layout.viewport_offset = @min(offset, max_scroll);
+        self.layout.follow_bottom = follow_bottom and self.layout.viewport_offset == max_scroll;
+    }
+
     /// Clamp scroll offset against content height after shrink/layout changes.
     fn clampScroll(self: *Transcript) void {
         _ = self.totalHeight(self.last_render_width);

@@ -102,6 +102,13 @@ const CachedCommittedItem = struct {
     semantic_version: transcript_mod.SemanticVersion,
 };
 
+const CommittedCacheReuse = enum {
+    hit,
+    no_cache,
+    committed_changed,
+    retry_changed,
+};
+
 /// Cached metadata for the committed portion of the last projected
 /// view snapshot. Reused by replaceViewSnapshot when the incoming
 /// snapshot points at the same *SharedCommitted and the cache key
@@ -132,6 +139,14 @@ pub const ProjectionState = struct {
     queued_snapshot: ?control_mod.QueuedMessageSnapshot = null,
     committed_cache: ?CommittedProjectionCache = null,
     committed_cache_hits: u32 = 0,
+    committed_cache_misses: u32 = 0,
+    committed_cache_fallbacks: u32 = 0,
+    full_rebuilds: u32 = 0,
+    transient_rebuilds: u32 = 0,
+    cache_miss_no_cache: u32 = 0,
+    cache_miss_committed_changed: u32 = 0,
+    cache_miss_retry_changed: u32 = 0,
+    queued_reconciles: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) ProjectionState {
         return .{ .allocator = allocator };
@@ -177,12 +192,12 @@ pub const ProjectionState = struct {
                 !committedUserHistoryIsPrefix(previous.view.committed.flat, owned.view.committed.flat)
         else
             false;
-        const can_reuse_committed_cache = self.canReuseCommittedCacheFor(owned.view.committed, options.retry_attempt);
+        const cache_reuse = self.committedCacheReuseFor(owned.view.committed, options.retry_attempt);
 
         if (self.view_snapshot) |*s| s.deinit(self.allocator);
         self.view_snapshot = owned;
 
-        self.reconcileView(transcript, editor, resolver, options, can_reuse_committed_cache);
+        self.reconcileView(transcript, editor, resolver, options, cache_reuse);
 
         if (must_reset_history) {
             editor.clearHistory();
@@ -192,18 +207,18 @@ pub const ProjectionState = struct {
 
     fn canReuseCommittedCache(self: *const ProjectionState, retry_attempt: u32) bool {
         const snapshot = self.view_snapshot orelse return false;
-        return self.canReuseCommittedCacheFor(snapshot.view.committed, retry_attempt);
+        return self.committedCacheReuseFor(snapshot.view.committed, retry_attempt) == .hit;
     }
 
-    fn canReuseCommittedCacheFor(
+    fn committedCacheReuseFor(
         self: *const ProjectionState,
         committed: *conversation_state_mod.SharedCommitted,
         retry_attempt: u32,
-    ) bool {
-        const cache = self.committed_cache orelse return false;
-        if (cache.committed != committed) return false;
-        if (cache.retry_attempt != retry_attempt) return false;
-        return true;
+    ) CommittedCacheReuse {
+        const cache = self.committed_cache orelse return .no_cache;
+        if (cache.committed != committed) return .committed_changed;
+        if (cache.retry_attempt != retry_attempt) return .retry_changed;
+        return .hit;
     }
 
     fn reconcileView(
@@ -212,11 +227,12 @@ pub const ProjectionState = struct {
         editor: EditorInterface,
         resolver: ToolRendererResolver,
         options: RebuildOptions,
-        use_committed_cache: bool,
+        cache_reuse: CommittedCacheReuse,
     ) void {
         const allocator = transcript.allocator;
 
-        if (use_committed_cache) {
+        if (cache_reuse == .hit) {
+            self.transient_rebuilds +%= 1;
             const cache = &self.committed_cache.?;
             var transient_items = buildTransientDesiredItems(
                 allocator,
@@ -237,8 +253,18 @@ pub const ProjectionState = struct {
             }
             // Cache key matched but transcript rows were externally cleared or
             // reordered. Fall through to the full rebuild path below.
+            self.committed_cache_fallbacks +%= 1;
+        } else {
+            self.committed_cache_misses +%= 1;
+            switch (cache_reuse) {
+                .hit => unreachable,
+                .no_cache => self.cache_miss_no_cache +%= 1,
+                .committed_changed => self.cache_miss_committed_changed +%= 1,
+                .retry_changed => self.cache_miss_retry_changed +%= 1,
+            }
         }
 
+        self.full_rebuilds +%= 1;
         var cache_builder: std.ArrayList(CachedCommittedItem) = .empty;
         var cache_ptr: ?*std.ArrayList(CachedCommittedItem) = null;
         const can_cache = if (self.view_snapshot) |v| blk: {
@@ -296,6 +322,7 @@ pub const ProjectionState = struct {
         }
         if (self.queued_snapshot) |*s| s.deinit(self.allocator);
         self.queued_snapshot = owned;
+        self.queued_reconciles +%= 1;
         reconcileFromSnapshots(transcript, editor, resolver, self.view_snapshot, self.queued_snapshot, options);
     }
 
@@ -373,6 +400,11 @@ fn reconcileTransientItemsAfterCommittedCache(
         if (desired.row == null) return false;
     }
 
+    const was_following_bottom = transcript.isFollowingBottom();
+    const scroll_before = transcript.scrollOffset();
+    const width_before = transcript.last_render_width;
+    const height_before = transcript.last_visible_height;
+
     transcript.truncateFrom(cache_items.len);
     var index = cache_items.len;
     for (transient_items.items, 0..) |desired, desired_idx| {
@@ -382,6 +414,9 @@ fn reconcileTransientItemsAfterCommittedCache(
             if (desired.history_text) |history_text| editor.addToHistory(history_text.slice());
         }
         index += 1;
+    }
+    if (!was_following_bottom) {
+        transcript.restoreScrollOffset(scroll_before, false, width_before, height_before);
     }
     transcript.clearPendingToolRouting();
     return true;
