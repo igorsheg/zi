@@ -369,11 +369,13 @@ fn reconcileTransientItemsAfterCommittedCache(
     transient_items: *std.ArrayList(DesiredItem),
 ) bool {
     if (!transcriptPrefixMatchesCommittedCache(transcript, cache_items)) return false;
+    for (transient_items.items) |desired| {
+        if (desired.row == null) return false;
+    }
 
     transcript.truncateFrom(cache_items.len);
     var index = cache_items.len;
     for (transient_items.items, 0..) |desired, desired_idx| {
-        std.debug.assert(desired.row != null);
         _ = transcript.insertItemAt(index, desired.row.?);
         disarmDesiredRow(&transient_items.items[desired_idx]);
         if (desired.seed_editor_history) {
