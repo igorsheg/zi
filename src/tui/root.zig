@@ -25,6 +25,7 @@ pub const autocomplete = @import("autocomplete.zig");
 pub const keybindings = @import("keybindings.zig");
 pub const interactive = @import("interactive.zig");
 pub const shuffle_text = @import("shuffle_text.zig");
+pub const property_tests = @import("property_tests.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

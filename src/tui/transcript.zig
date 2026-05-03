@@ -1120,20 +1120,12 @@ pub const Transcript = struct {
         }
     }
 
-    fn reindexMaps(self: *Transcript, start_index: usize) void {
-        var tool_iter = self.pending_tools.iterator();
-        while (tool_iter.next()) |entry| {
-            if (entry.value_ptr.* >= start_index) {
-                const tool_index = self.findToolExecutionIndex(entry.key_ptr.*) orelse continue;
-                entry.value_ptr.* = tool_index;
-            }
-        }
-        var retained_iter = self.retained_items.iterator();
-        while (retained_iter.next()) |entry| {
-            if (entry.value_ptr.* >= start_index) {
-                const retained_index = self.findRetainedItemIndex(entry.key_ptr.*) orelse continue;
-                entry.value_ptr.* = retained_index;
-            }
+    fn reindexMaps(self: *Transcript, _: usize) void {
+        self.pending_tools.clearRetainingCapacity();
+        self.retained_items.clearRetainingCapacity();
+        for (self.items.items, 0..) |item, index| {
+            if (item.tool_call_id) |tool_call_id| self.pending_tools.put(self.allocator, tool_call_id, index) catch {};
+            if (item.retained_item_id) |item_id| self.retained_items.put(self.allocator, item_id, index) catch {};
         }
     }
 
