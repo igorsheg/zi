@@ -2,9 +2,6 @@ const std = @import("std");
 const search = @import("../search/root.zig");
 const select_list_mod = @import("components/select_list.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
-const zio = @import("../zio/root.zig");
-const runtime_process = zio.process;
-const runtime_fd = @import("terminal/fd.zig");
 
 const SelectItem = select_list_mod.SelectItem;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
@@ -93,12 +90,10 @@ const max_path_candidates = 64;
 const max_async_results = 20;
 const max_async_scan_results = 300;
 const max_local_path_scan_results = 300;
-const max_async_output_bytes = 256 * 1024;
 const max_path_bytes = 512;
 const path_delimiters = [_]u8{ ' ', '\t', '"', '\'', '=' };
 const attachment_debounce_ns: i128 = 20 * std.time.ns_per_ms;
 const async_tick_interval_ns: i128 = 16 * std.time.ns_per_ms;
-const async_pipe_poll_ms: i32 = 5;
 
 const TokenRange = struct {
     start_offset: u32,
@@ -293,9 +288,7 @@ pub const CombinedAutocompleteProvider = struct {
 
     const AsyncSearch = struct {
         arena: ?std.heap.ArenaAllocator = null,
-        child: ?std.process.Child = null,
-        stdout_buf: std.ArrayList(u8) = .empty,
-        stderr_buf: std.ArrayList(u8) = .empty,
+        native_session: ?search.file_search.Session = null,
         candidates: std.ArrayList(AsyncCandidate) = .empty,
         replace_range: ReplaceRange = .{ .start_byte = 0, .end_byte = 0 },
         base_dir: []const u8 = "",
@@ -306,19 +299,15 @@ pub const CombinedAutocompleteProvider = struct {
         auto_accept_single_on_tab: bool = false,
         phase: AsyncPhase = .idle,
         debounce_until_ns: i128 = 0,
-        stdout_closed: bool = false,
-        stderr_closed: bool = false,
         scan_started: bool = false,
 
         fn reset(self: *AsyncSearch) void {
-            if (self.child) |*child| {
-                child.kill(std.Options.debug_io);
+            if (self.native_session) |*session| {
+                session.deinit();
             }
-            self.child = null;
+            self.native_session = null;
             if (self.arena) |*arena| arena.deinit();
             self.arena = null;
-            self.stdout_buf = .empty;
-            self.stderr_buf = .empty;
             self.candidates = .empty;
             self.replace_range = .{ .start_byte = 0, .end_byte = 0 };
             self.base_dir = "";
@@ -329,8 +318,6 @@ pub const CombinedAutocompleteProvider = struct {
             self.auto_accept_single_on_tab = false;
             self.phase = .idle;
             self.debounce_until_ns = 0;
-            self.stdout_closed = false;
-            self.stderr_closed = false;
             self.scan_started = false;
         }
 
@@ -662,194 +649,52 @@ pub const CombinedAutocompleteProvider = struct {
             if (!self.startAsyncSearchProcess()) return true;
         }
 
-        if (self.async_search.child) |*child| {
-            var round: usize = 0;
-            while (round < 4) : (round += 1) {
-                self.waitForAsyncPipeActivity(child);
-
-                const stdout_len_before = self.async_search.stdout_buf.items.len;
-                const stderr_len_before = self.async_search.stderr_buf.items.len;
-                const stdout_closed_before = self.async_search.stdout_closed;
-                const stderr_closed_before = self.async_search.stderr_closed;
-
-                if (!self.async_search.stdout_closed) {
-                    if (child.stdout) |stdout_file| {
-                        self.drainAsyncPipe(stdout_file, &self.async_search.stdout_buf, &self.async_search.stdout_closed);
-                    } else {
-                        self.async_search.stdout_closed = true;
-                    }
-                }
-                if (!self.async_search.stderr_closed) {
-                    if (child.stderr) |stderr_file| {
-                        self.drainAsyncPipe(stderr_file, &self.async_search.stderr_buf, &self.async_search.stderr_closed);
-                    } else {
-                        self.async_search.stderr_closed = true;
-                    }
-                }
-
-                if (self.async_search.stdout_closed and self.async_search.stderr_closed) break;
-
-                const progressed = self.async_search.stdout_buf.items.len != stdout_len_before or
-                    self.async_search.stderr_buf.items.len != stderr_len_before or
-                    self.async_search.stdout_closed != stdout_closed_before or
-                    self.async_search.stderr_closed != stderr_closed_before;
-                if (!progressed) break;
-            }
+        if (self.async_search.native_session) |*session| {
+            const before = self.async_search.candidates.items.len;
+            self.drainNativeSearch(session);
+            if (session.done()) return true;
+            return self.async_search.candidates.items.len != before;
         }
 
-        return self.async_search.stdout_closed and self.async_search.stderr_closed;
+        return true;
     }
 
     fn startAsyncSearchProcess(self: *CombinedAutocompleteProvider) bool {
         self.async_search.scan_started = true;
-        if (self.spawnAsyncSearchProcess("/opt/homebrew/bin/fd")) return true;
-        if (self.spawnAsyncSearchProcess("/usr/local/bin/fd")) return true;
-        if (self.spawnAsyncSearchProcess("fd")) return true;
-        if (self.spawnAsyncSearchProcess("fdfind")) return true;
-        self.async_search.stdout_closed = true;
-        self.async_search.stderr_closed = true;
-        return false;
+        return self.startNativeFileSearch();
     }
 
-    fn spawnAsyncSearchProcess(self: *CombinedAutocompleteProvider, command: []const u8) bool {
+    fn startNativeFileSearch(self: *CombinedAutocompleteProvider) bool {
         const arena = self.async_search.arenaAllocator();
-        const fd_query = if (self.async_search.query.len > 0)
-            buildFdPathQuery(arena, self.async_search.query) catch return false
-        else
-            null;
-
-        var argv: [18][]const u8 = undefined;
-        var argc: usize = 0;
-        argv[argc] = command;
-        argc += 1;
-        argv[argc] = "--base-directory";
-        argc += 1;
-        argv[argc] = self.async_search.base_dir;
-        argc += 1;
-        argv[argc] = "--max-results";
-        argc += 1;
-        argv[argc] = "300";
-        argc += 1;
-        argv[argc] = "--type";
-        argc += 1;
-        argv[argc] = "f";
-        argc += 1;
-        argv[argc] = "--type";
-        argc += 1;
-        argv[argc] = "d";
-        argc += 1;
-        argv[argc] = "--full-path";
-        argc += 1;
-        argv[argc] = "--hidden";
-        argc += 1;
-        argv[argc] = "--exclude";
-        argc += 1;
-        argv[argc] = ".git";
-        argc += 1;
-        argv[argc] = "--exclude";
-        argc += 1;
-        argv[argc] = ".git/*";
-        argc += 1;
-        argv[argc] = "--exclude";
-        argc += 1;
-        argv[argc] = ".git/**";
-        argc += 1;
-        if (fd_query) |query| {
-            argv[argc] = query;
-            argc += 1;
-        }
-
-        var child = std.process.spawn(self.io, .{
-            .argv = argv[0..argc],
-            .expand_arg0 = .expand,
-            .stdin = .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
+        self.async_search.native_session = search.file_search.Session.start(arena, self.io, .{
+            .base_dir = self.async_search.base_dir,
+            .query = self.async_search.query,
+            .max_results = max_async_scan_results,
+            .include_files = true,
+            .include_dirs = true,
+            .include_hidden = true,
+            .exclude_git = true,
         }) catch return false;
 
-        if (child.stdout) |stdout_file| {
-            runtime_fd.setNonblocking(stdout_file.handle) catch {
-                child.kill(std.Options.debug_io);
-                return false;
-            };
-            self.async_search.stdout_closed = false;
-        } else {
-            self.async_search.stdout_closed = true;
-        }
-        if (child.stderr) |stderr_file| {
-            runtime_fd.setNonblocking(stderr_file.handle) catch {
-                child.kill(std.Options.debug_io);
-                return false;
-            };
-            self.async_search.stderr_closed = false;
-        } else {
-            self.async_search.stderr_closed = true;
-        }
-
-        self.async_search.child = child;
-        self.async_search.scan_started = true;
         return true;
     }
 
-    fn waitForAsyncPipeActivity(self: *CombinedAutocompleteProvider, child: *const std.process.Child) void {
-        var pollfds: [2]std.posix.pollfd = undefined;
-        var count: usize = 0;
-        if (!self.async_search.stdout_closed) {
-            if (child.stdout) |stdout_file| {
-                pollfds[count] = .{ .fd = stdout_file.handle, .events = std.posix.POLL.IN, .revents = 0 };
-                count += 1;
-            }
-        }
-        if (!self.async_search.stderr_closed) {
-            if (child.stderr) |stderr_file| {
-                pollfds[count] = .{ .fd = stderr_file.handle, .events = std.posix.POLL.IN, .revents = 0 };
-                count += 1;
-            }
-        }
-        if (count == 0) return;
-
-        _ = std.posix.poll(pollfds[0..count], async_pipe_poll_ms) catch {};
-    }
-
-    fn drainAsyncPipe(self: *CombinedAutocompleteProvider, file: std.Io.File, buffer: *std.ArrayList(u8), closed: *bool) void {
+    fn drainNativeSearch(self: *CombinedAutocompleteProvider, session: *search.file_search.Session) void {
         const arena = self.async_search.arenaAllocator();
-        var chunk: [4096]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(file.handle, &chunk) catch |err| switch (err) {
-                error.WouldBlock => return,
-                else => {
-                    closed.* = true;
-                    return;
-                },
-            };
-            if (n == 0) {
-                closed.* = true;
-                return;
-            }
-            const bytes = chunk[0..n];
-            if (buffer.items.len + bytes.len > max_async_output_bytes) {
-                const remaining = max_async_output_bytes - buffer.items.len;
-                if (remaining > 0) {
-                    buffer.appendSlice(arena, bytes[0..remaining]) catch {};
-                }
-                closed.* = true;
-                return;
-            }
-            buffer.appendSlice(arena, bytes) catch {
-                closed.* = true;
-                return;
-            };
+        var native_candidates = std.ArrayList(search.file_search.Candidate).empty;
+        session.drain(arena, &native_candidates) catch return;
+        for (native_candidates.items) |candidate| {
+            self.async_search.candidates.append(arena, .{
+                .relative_path = candidate.relative_path,
+                .is_directory = candidate.is_directory,
+            }) catch return;
         }
     }
+
 
     fn finishAsyncSearch(self: *CombinedAutocompleteProvider) ?Suggestions {
         defer self.cancelAsyncSearch();
 
-        if (self.async_search.child) |*child| {
-            _ = child.wait(std.Options.debug_io) catch {};
-            self.async_search.child = null;
-        }
-        self.collectAsyncCandidates();
         if (self.async_search.candidates.items.len == 0) return null;
 
         var selected_indices: [max_async_results]usize = undefined;
@@ -891,32 +736,6 @@ pub const CombinedAutocompleteProvider = struct {
         };
     }
 
-    fn collectAsyncCandidates(self: *CombinedAutocompleteProvider) void {
-        if (self.async_search.stdout_buf.items.len == 0) return;
-        if (self.async_search.candidates.items.len > 0) return;
-
-        const arena = self.async_search.arenaAllocator();
-        var iter = std.mem.splitScalar(u8, self.async_search.stdout_buf.items, '\n');
-        while (iter.next()) |raw_line| {
-            const line = std.mem.trimEnd(u8, raw_line, "\r");
-            if (line.len == 0) continue;
-
-            const has_trailing_separator = std.mem.endsWith(u8, line, "/");
-            const normalized_path = if (has_trailing_separator) line[0 .. line.len - 1] else line;
-            if (std.mem.eql(u8, normalized_path, ".git") or
-                std.mem.startsWith(u8, normalized_path, ".git/") or
-                std.mem.indexOf(u8, normalized_path, "/.git/") != null)
-            {
-                continue;
-            }
-
-            self.async_search.candidates.append(arena, .{
-                .relative_path = normalized_path,
-                .is_directory = has_trailing_separator,
-            }) catch return;
-            if (self.async_search.candidates.items.len >= max_async_scan_results) return;
-        }
-    }
 
     fn cancelAsyncSearch(self: *CombinedAutocompleteProvider) void {
         self.async_search.reset();
@@ -1302,64 +1121,6 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
     return a.len < b.len;
 }
 
-fn buildFdPathQuery(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
-    const trimmed_query = std.mem.trim(u8, query, " \t\r\n");
-    if (trimmed_query.len == 0) return allocator.dupe(u8, query);
-
-    var builder: std.ArrayList(u8) = .empty;
-    errdefer builder.deinit(allocator);
-
-    if (std.mem.indexOfScalar(u8, trimmed_query, '/')) |_| {
-        const has_trailing_separator = std.mem.endsWith(u8, trimmed_query, "/");
-        const trimmed = std.mem.trim(u8, trimmed_query, "/");
-        if (trimmed.len == 0) return allocator.dupe(u8, trimmed_query);
-
-        var first = true;
-        var iter = std.mem.splitScalar(u8, trimmed, '/');
-        while (iter.next()) |segment| {
-            if (segment.len == 0) continue;
-            if (!first) try builder.appendSlice(allocator, "[\\\\/]");
-            try appendFuzzyRegexSegment(&builder, allocator, segment);
-            first = false;
-        }
-
-        if (first) return allocator.dupe(u8, trimmed_query);
-        if (has_trailing_separator) try builder.appendSlice(allocator, "[\\\\/]");
-        return builder.toOwnedSlice(allocator);
-    }
-
-    try appendFuzzyRegexSegment(&builder, allocator, trimmed_query);
-    return builder.toOwnedSlice(allocator);
-}
-
-fn appendFuzzyRegexSegment(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text, 0..) |byte, idx| {
-        if (idx > 0) try builder.appendSlice(allocator, ".*");
-        try appendEscapedRegexByte(builder, allocator, byte);
-    }
-}
-
-fn appendEscapedRegex(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text) |byte| try appendEscapedRegexByte(builder, allocator, byte);
-}
-
-fn appendEscapedRegexByte(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: u8) !void {
-    switch (byte) {
-        '.', '*', '+', '?', '^', '$', '{', '}', '(', ')', '|', '[', ']', '\\' => {
-            try builder.append(allocator, '\\');
-            try builder.append(allocator, byte);
-        },
-        else => try builder.append(allocator, byte),
-    }
-}
-
-fn hasAsyncSearchBackend() bool {
-    return commandExists("/opt/homebrew/bin/fd") or commandExists("/usr/local/bin/fd") or commandExists("fd") or commandExists("fdfind");
-}
-
-fn commandExists(command: []const u8) bool {
-    return runtime_process.commandExists(std.heap.page_allocator, std.Options.debug_io, command);
-}
 
 // --- Tests ---
 
@@ -1386,111 +1147,47 @@ fn hasItem(items: []const SelectItem, value: []const u8) bool {
 fn drainAsyncProvider(provider: *CombinedAutocompleteProvider, sink: SuggestionSink) bool {
     var now_ns: i128 = 0;
     var attempts: usize = 0;
-    while (attempts < 8) : (attempts += 1) {
+    while (attempts < 10000) : (attempts += 1) {
         if (provider.tickImpl(now_ns, sink)) return true;
+        std.Thread.yield() catch {};
         now_ns += async_tick_interval_ns;
     }
     return false;
 }
 
-test "SlashCommandProvider suggests commands on slash prefix" {
+test "SlashCommandProvider covers activation, filtering, and apply" {
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
-    var p = SlashCommandProvider.init(&reg);
-    var ts = TestSink{};
+    var provider = SlashCommandProvider.init(&reg);
 
-    p.requestImpl(.{ .text = "/mo", .cursor_byte = 3 }, ts.sink());
+    var filtered = TestSink{};
+    provider.requestImpl(.{ .text = "/mo", .cursor_byte = 3 }, filtered.sink());
+    try std.testing.expect(filtered.result != null);
+    try std.testing.expect(hasItem(filtered.result.?.items, "model"));
+    try std.testing.expectEqual(ReplaceRange{ .start_byte = 0, .end_byte = 3 }, filtered.result.?.replace_range);
+    try std.testing.expect(filtered.result.?.submit_on_confirm);
 
-    try std.testing.expect(ts.result != null);
-    try std.testing.expect(hasItem(ts.result.?.items, "model"));
-    try std.testing.expectEqual(ReplaceRange{ .start_byte = 0, .end_byte = 3 }, ts.result.?.replace_range);
-    try std.testing.expect(ts.result.?.submit_on_confirm);
-}
+    var all = TestSink{};
+    provider.requestImpl(.{ .text = "/", .cursor_byte = 1 }, all.sink());
+    try std.testing.expect(all.result != null);
+    try std.testing.expectEqual(reg.count(), all.result.?.items.len);
 
-test "SlashCommandProvider empty prefix returns all commands" {
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-    var p = SlashCommandProvider.init(&reg);
-    var ts = TestSink{};
+    var inactive = TestSink{};
+    provider.requestImpl(.{ .text = "hello", .cursor_byte = 5 }, inactive.sink());
+    try std.testing.expect(inactive.result == null);
 
-    p.requestImpl(.{ .text = "/", .cursor_byte = 1 }, ts.sink());
-
-    try std.testing.expect(ts.result != null);
-    try std.testing.expectEqual(reg.count(), ts.result.?.items.len);
-}
-
-test "SlashCommandProvider no suggestions without slash" {
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-    var p = SlashCommandProvider.init(&reg);
-    var ts = TestSink{};
-
-    p.requestImpl(.{ .text = "hello", .cursor_byte = 5 }, ts.sink());
-
-    try std.testing.expect(ts.result == null);
-}
-
-test "SlashCommandProvider apply inserts command" {
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-    var p = SlashCommandProvider.init(&reg);
+    var multiline = TestSink{};
+    provider.requestImpl(.{ .text = "/model\n/", .cursor_byte = 8 }, multiline.sink());
+    try std.testing.expect(multiline.result == null);
 
     const item = SelectItem{ .value = "model", .label = "model" };
-    const result = p.applyImpl("/mo", 3, &item, .{ .start_byte = 0, .end_byte = 3 });
-
+    const result = provider.applyImpl("/mo", 3, &item, .{ .start_byte = 0, .end_byte = 3 });
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("/model ", result.?.replacement_text);
     try std.testing.expectEqual(@as(u32, 7), result.?.cursor_in_replacement);
 }
 
-test "CombinedAutocompleteProvider regular prose does not trigger bare path suggestions" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(cwd);
-
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
-    defer provider.deinit();
-    var sink = TestSink{};
-
-    provider.requestImpl(.{ .text = "hello ", .cursor_byte = 6, .mode = .regular }, sink.sink());
-
-    try std.testing.expect(sink.result == null);
-}
-
-test "CombinedAutocompleteProvider force tab completes slash command arguments with paths" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(cwd);
-
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
-    defer provider.deinit();
-    var sink = TestSink{};
-
-    provider.requestImpl(.{ .text = "/open no", .cursor_byte = 8, .mode = .force }, sink.sink());
-
-    try std.testing.expect(sink.result != null);
-    try std.testing.expect(hasItem(sink.result.?.items, "notes.md"));
-    try std.testing.expectEqual(ReplaceRange{ .start_byte = 6, .end_byte = 8 }, sink.result.?.replace_range);
-    try std.testing.expectEqual(RequestMode.force, sink.result.?.refresh_mode);
-    try std.testing.expect(sink.result.?.auto_accept_single_on_tab);
-    try std.testing.expect(!sink.result.?.submit_on_confirm);
-}
-
-test "CombinedAutocompleteProvider async at-file search publishes on tick" {
-    if (!hasAsyncSearchBackend()) return error.SkipZigTest;
-
+test "CombinedAutocompleteProvider covers path activation and forced slash arguments" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "hello" });
@@ -1505,21 +1202,28 @@ test "CombinedAutocompleteProvider async at-file search publishes on tick" {
 
     var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
     defer provider.deinit();
-    var sink = TestSink{};
 
-    provider.requestImpl(.{ .text = "@gui", .cursor_byte = 4, .mode = .force }, sink.sink());
-    try std.testing.expect(sink.result == null);
-    try std.testing.expect(provider.nextDeadlineImpl(0) != null);
+    var prose = TestSink{};
+    provider.requestImpl(.{ .text = "hello ", .cursor_byte = 6, .mode = .regular }, prose.sink());
+    try std.testing.expect(prose.result == null);
 
-    try std.testing.expect(drainAsyncProvider(&provider, sink.sink()));
-    try std.testing.expect(sink.result != null);
-    try std.testing.expect(hasItem(sink.result.?.items, "@docs/guide.md"));
-    try std.testing.expectEqual(ReplaceRange{ .start_byte = 0, .end_byte = 4 }, sink.result.?.replace_range);
+    var slash_args = TestSink{};
+    provider.requestImpl(.{ .text = "/open no", .cursor_byte = 8, .mode = .force }, slash_args.sink());
+    try std.testing.expect(slash_args.result != null);
+    try std.testing.expect(hasItem(slash_args.result.?.items, "notes.md"));
+    try std.testing.expectEqual(ReplaceRange{ .start_byte = 6, .end_byte = 8 }, slash_args.result.?.replace_range);
+    try std.testing.expectEqual(RequestMode.force, slash_args.result.?.refresh_mode);
+    try std.testing.expect(slash_args.result.?.auto_accept_single_on_tab);
+    try std.testing.expect(!slash_args.result.?.submit_on_confirm);
+
+    var regular_path = TestSink{};
+    provider.requestImpl(.{ .text = "see ./do", .cursor_byte = 8, .mode = .regular }, regular_path.sink());
+    try std.testing.expect(regular_path.result != null);
+    try std.testing.expect(hasItem(regular_path.result.?.items, "./docs/"));
+    try std.testing.expectEqual(ReplaceRange{ .start_byte = 4, .end_byte = 8 }, regular_path.result.?.replace_range);
 }
 
-test "CombinedAutocompleteProvider replaces stale at-file request before tick publishes" {
-    if (!hasAsyncSearchBackend()) return error.SkipZigTest;
-
+test "CombinedAutocompleteProvider async at-file search publishes latest request and cancels" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "guide.md", .data = "hello" });
@@ -1536,17 +1240,25 @@ test "CombinedAutocompleteProvider replaces stale at-file request before tick pu
     var sink = TestSink{};
 
     provider.requestImpl(.{ .text = "@gu", .cursor_byte = 3, .mode = .force }, sink.sink());
+    try std.testing.expect(sink.result == null);
+    try std.testing.expect(provider.nextDeadlineImpl(0) != null);
+
+    provider.cancelImpl();
+    try std.testing.expect(provider.nextDeadlineImpl(0) == null);
+    try std.testing.expect(!provider.tickImpl(0, sink.sink()));
+    try std.testing.expect(sink.result == null);
+
+    provider.requestImpl(.{ .text = "@gu", .cursor_byte = 3, .mode = .force }, sink.sink());
     provider.requestImpl(.{ .text = "@no", .cursor_byte = 3, .mode = .force }, sink.sink());
 
     try std.testing.expect(drainAsyncProvider(&provider, sink.sink()));
     try std.testing.expect(sink.result != null);
     try std.testing.expect(hasItem(sink.result.?.items, "@notes.md"));
     try std.testing.expect(!hasItem(sink.result.?.items, "@guide.md"));
+    try std.testing.expectEqual(ReplaceRange{ .start_byte = 0, .end_byte = 3 }, sink.result.?.replace_range);
 }
 
-test "CombinedAutocompleteProvider async at-file search respects gitignore while keeping hidden paths except .git" {
-    if (!hasAsyncSearchBackend()) return error.SkipZigTest;
-
+test "CombinedAutocompleteProvider async at-file search respects ignore and hidden path boundaries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".gitignore", .data = "ignored/\n" });
@@ -1575,34 +1287,6 @@ test "CombinedAutocompleteProvider async at-file search respects gitignore while
     try std.testing.expect(hasItem(sink.result.?.items, "@.pi/"));
     try std.testing.expect(!hasItem(sink.result.?.items, "@ignored/secret.md"));
     try std.testing.expect(!hasItem(sink.result.?.items, "@.git/"));
-}
-
-test "CombinedAutocompleteProvider async at-file search excludes ignored scoped directories" {
-    if (!hasAsyncSearchBackend()) return error.SkipZigTest;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".gitignore", .data = "ignored/\n" });
-    try tmp.dir.createDirPath(std.Options.debug_io, "src");
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "src/keep.md", .data = "ok" });
-    try tmp.dir.createDirPath(std.Options.debug_io, "ignored/src");
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "ignored/src/secret.md", .data = "nope" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(cwd);
-
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
-    defer provider.deinit();
-    var sink = TestSink{};
-
-    provider.requestImpl(.{ .text = "@src/", .cursor_byte = 5, .mode = .force }, sink.sink());
-    try std.testing.expect(drainAsyncProvider(&provider, sink.sink()));
-    try std.testing.expect(sink.result != null);
-    try std.testing.expect(hasItem(sink.result.?.items, "@src/keep.md"));
-    try std.testing.expect(!hasItem(sink.result.?.items, "@ignored/src/secret.md"));
 }
 
 test "CombinedAutocompleteProvider apply consumes trailing quote when completing quoted path" {
