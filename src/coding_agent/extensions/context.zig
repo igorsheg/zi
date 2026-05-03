@@ -10,6 +10,17 @@ const request_mod = @import("../request.zig");
 const ai_provider = @import("../../ai/provider.zig");
 
 const c = lua_runtime.c;
+const limits = @import("limits.zig");
+
+const ui_id_bytes: usize = limits.ui_id_bytes;
+const ui_text_bytes: usize = limits.ui_text_bytes;
+const ui_title_bytes: usize = limits.ui_title_bytes;
+const report_body_bytes: usize = limits.report_body_bytes;
+const report_lines: usize = limits.report_lines;
+const report_line_bytes: usize = limits.report_line_bytes;
+const surface_frame_bytes: usize = limits.surface_frame_bytes;
+const truncated_marker = "\n... [extension UI text truncated] ...";
+const report_truncated_marker = "... [report truncated at 256KiB / 5000 lines] ...";
 
 /// Push the shared extension context table used by tool execution and
 /// event handlers. Tool-specific callers can add extra fields (e.g.
@@ -266,7 +277,7 @@ fn publishMessageFromArgs(L: *c.lua_State) !void {
         .generation = runner.generation,
         .kind = .message,
         .id = try readMessageId(aa, L, 2),
-        .text = try readOptionalArgString(aa, L, 1),
+        .text = try readOptionalArgStringLimit(aa, L, 1, ui_text_bytes),
         .classification = try readMessageKind(aa, L, 2),
         .lifetime = try readUiLifetime(L, 2),
     };
@@ -286,7 +297,7 @@ fn publishStatusFromArgs(L: *c.lua_State) !void {
     defer arena.deinit();
     const aa = arena.allocator();
     const spec_idx = c.lua_absindex(L, 1);
-    const id = try readStringField(aa, L, spec_idx, "id", "default");
+    const id = try readStringFieldLimit(aa, L, spec_idx, "id", "default", ui_id_bytes);
     const text = try readStatusText(aa, L, spec_idx);
     const update = extension_ui.UiPublication{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
@@ -312,8 +323,8 @@ fn publishProgressFromArgs(L: *c.lua_State) !void {
     defer arena.deinit();
     const aa = arena.allocator();
     const spec_idx = c.lua_absindex(L, 1);
-    const id = try readStringField(aa, L, spec_idx, "id", "progress");
-    const explicit_text = try readOptionalStringField(aa, L, spec_idx, "text");
+    const id = try readStringFieldLimit(aa, L, spec_idx, "id", "progress", ui_id_bytes);
+    const explicit_text = try readOptionalStringFieldLimit(aa, L, spec_idx, "text", ui_text_bytes);
     const update = extension_ui.UiPublication{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
@@ -321,8 +332,8 @@ fn publishProgressFromArgs(L: *c.lua_State) !void {
         .id = id,
         .text = explicit_text,
         .progress_status = try readProgressStatus(aa, L, spec_idx),
-        .title = try readOptionalStringField(aa, L, spec_idx, "title"),
-        .detail = try readOptionalStringField(aa, L, spec_idx, "detail"),
+        .title = try readOptionalStringFieldLimit(aa, L, spec_idx, "title", ui_title_bytes),
+        .detail = try readOptionalStringFieldLimit(aa, L, spec_idx, "detail", ui_text_bytes),
         .current = readOptionalNumberField(L, spec_idx, "current"),
         .total = readOptionalNumberField(L, spec_idx, "total"),
         .indeterminate = readBoolField(L, spec_idx, "indeterminate"),
@@ -368,17 +379,26 @@ fn publishSurfaceFrameFromArgs(L: *c.lua_State) !void {
     defer arena.deinit();
     const aa = arena.allocator();
     const spec_idx = c.lua_absindex(L, 1);
+    const width = readU32Field(L, spec_idx, "width", 1);
+    const height = readU32Field(L, spec_idx, "height", 1);
+    const format = readSurfaceFormat(L, spec_idx);
+    const expected_len = expectedSurfaceFrameBytes(width, height, format) orelse return;
+    if (expected_len > surface_frame_bytes) return;
+
     _ = c.lua_getfield(L, spec_idx, "data");
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return;
-    const data = try dupeLuaString(aa, L, -1);
+    var data_len: usize = 0;
+    const data_ptr = c.lua_tolstring(L, -1, &data_len) orelse return;
+    if (data_len != expected_len) return;
+    const data = try aa.dupe(u8, data_ptr[0..data_len]);
     const frame = extension_ui.SurfaceFrame{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
-        .id = try readStringField(aa, L, spec_idx, "id", "surface"),
-        .width = readU32Field(L, spec_idx, "width", 1),
-        .height = readU32Field(L, spec_idx, "height", 1),
-        .format = readSurfaceFormat(L, spec_idx),
+        .id = try readStringFieldLimit(aa, L, spec_idx, "id", "surface", ui_id_bytes),
+        .width = width,
+        .height = height,
+        .format = format,
         .data = data,
     };
     try callback(bound.session, .{ .frame = frame });
@@ -406,7 +426,7 @@ fn publishSurfaceCloseFromArgs(L: *c.lua_State) !void {
 
 fn readMessageId(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
     if (c.lua_type(L, idx) != c.LUA_TTABLE) return try arena.dupe(u8, "default");
-    return try readStringField(arena, L, idx, "id", "default");
+    return try readStringFieldLimit(arena, L, idx, "id", "default", ui_id_bytes);
 }
 
 fn readMessageKind(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
@@ -430,8 +450,8 @@ fn readProgressStatus(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !ex
 }
 
 fn readStatusText(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
-    if (try readOptionalStringField(arena, L, idx, "text")) |text| return text;
-    if (try readOptionalStringField(arena, L, idx, "value")) |value| return value;
+    if (try readOptionalStringFieldLimit(arena, L, idx, "text", ui_text_bytes)) |text| return text;
+    if (try readOptionalStringFieldLimit(arena, L, idx, "value", ui_text_bytes)) |value| return value;
     return null;
 }
 
@@ -460,6 +480,14 @@ fn readSurfaceFormat(L: *c.lua_State, idx: c_int) extension_ui.SurfaceFormat {
     const value = ptr[0..len];
     if (std.mem.eql(u8, value, "rgba8888")) return .rgba8888;
     return .rgba8888;
+}
+
+fn expectedSurfaceFrameBytes(width: u32, height: u32, format: extension_ui.SurfaceFormat) ?usize {
+    const bpp: usize = switch (format) {
+        .rgba8888 => 4,
+    };
+    const pixels = std.math.mul(usize, width, height) catch return null;
+    return std.math.mul(usize, pixels, bpp) catch null;
 }
 
 fn readInputKeyboard(L: *c.lua_State, idx: c_int) bool {
@@ -633,8 +661,12 @@ fn parsePrompt(
 }
 
 fn readOptionalArgString(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
+    return readOptionalArgStringLimit(arena, L, idx, ui_text_bytes);
+}
+
+fn readOptionalArgStringLimit(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, max_bytes: usize) !?[]const u8 {
     if (c.lua_type(L, idx) != c.LUA_TSTRING) return null;
-    return try dupeLuaString(arena, L, idx);
+    return try dupeLuaStringLimit(arena, L, idx, max_bytes);
 }
 
 fn readPromptTimeoutMs(L: *c.lua_State, idx: c_int) !?u64 {
@@ -747,8 +779,8 @@ fn parseReport(
     return .{
         .state_owner_id = try arena.dupe(u8, state_owner_id),
         .generation = generation,
-        .id = try readStringField(arena, L, abs_idx, "id", "report"),
-        .title = try readStringField(arena, L, abs_idx, "title", ""),
+        .id = try readStringFieldLimit(arena, L, abs_idx, "id", "report", ui_id_bytes),
+        .title = try readStringFieldLimit(arena, L, abs_idx, "title", "", ui_title_bytes),
         .lines = try readReportBody(arena, L, abs_idx),
         .transient = readBoolField(L, abs_idx, "transient"),
         .format = readReportFormat(L, abs_idx),
@@ -774,13 +806,14 @@ fn readReportBody(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]cons
 }
 
 fn readReportBodyLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const []const extension_ui.TextSpan {
-    const body = try dupeLuaString(arena, L, idx);
+    const body = try dupeLuaStringWithMarker(arena, L, idx, report_body_bytes, report_truncated_marker);
     var line_count: usize = 1;
     for (body) |byte| {
         if (byte == '\n') line_count += 1;
     }
     if (body.len > 0 and body[body.len - 1] == '\n') line_count -= 1;
     if (line_count == 0) line_count = 1;
+    line_count = @min(line_count, report_lines);
 
     const lines = try arena.alloc([]const extension_ui.TextSpan, line_count);
     var line_index: usize = 0;
@@ -789,7 +822,7 @@ fn readReportBodyLines(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![
     while (i <= body.len and line_index < line_count) : (i += 1) {
         if (i == body.len or body[i] == '\n') {
             const spans = try arena.alloc(extension_ui.TextSpan, 1);
-            spans[0] = .{ .text = body[start..i] };
+            spans[0] = .{ .text = body[start..@min(i, start + report_line_bytes)] };
             lines[line_index] = spans;
             line_index += 1;
             start = i + 1;
@@ -855,17 +888,25 @@ fn readReportSpan(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extens
 }
 
 fn readStringField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8, default: []const u8) ![]const u8 {
+    return readStringFieldLimit(arena, L, idx, field, default, ui_text_bytes);
+}
+
+fn readStringFieldLimit(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8, default: []const u8, max_bytes: usize) ![]const u8 {
     _ = c.lua_getfield(L, idx, field.ptr);
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return try arena.dupe(u8, default);
-    return try dupeLuaString(arena, L, -1);
+    return try dupeLuaStringLimit(arena, L, -1, max_bytes);
 }
 
 fn readOptionalStringField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8) !?[]const u8 {
+    return readOptionalStringFieldLimit(arena, L, idx, field, ui_text_bytes);
+}
+
+fn readOptionalStringFieldLimit(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8, max_bytes: usize) !?[]const u8 {
     _ = c.lua_getfield(L, idx, field.ptr);
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
-    return try dupeLuaString(arena, L, -1);
+    return try dupeLuaStringLimit(arena, L, -1, max_bytes);
 }
 
 fn readBoolField(L: *c.lua_State, idx: c_int, field: [:0]const u8) bool {
@@ -878,6 +919,25 @@ fn dupeLuaString(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const
     var len: usize = 0;
     const ptr = c.lua_tolstring(L, idx, &len) orelse return &.{};
     return try arena.dupe(u8, ptr[0..len]);
+}
+
+fn dupeLuaStringLimit(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, max_bytes: usize) ![]const u8 {
+    return dupeLuaStringWithMarker(arena, L, idx, max_bytes, truncated_marker);
+}
+
+fn dupeLuaStringWithMarker(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, max_bytes: usize, marker: []const u8) ![]const u8 {
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, idx, &len) orelse return &.{};
+    const value = ptr[0..len];
+    if (value.len <= max_bytes) return try arena.dupe(u8, value);
+    if (max_bytes == 0) return &.{};
+
+    const marker_len = @min(marker.len, max_bytes);
+    const prefix_len = max_bytes - marker_len;
+    const out = try arena.alloc(u8, max_bytes);
+    @memcpy(out[0..prefix_len], value[0..prefix_len]);
+    @memcpy(out[prefix_len..], marker[0..marker_len]);
+    return out;
 }
 
 fn pushStateApi(
@@ -966,7 +1026,8 @@ fn ctxStateSet(L_opt: ?*c.lua_State) callconv(.c) c_int {
     switch (runner.runtime) {
         .bound => |bound| {
             const setter = bound.session_state_set orelse return 0;
-            const value = lua_runtime.luaValueToJson(L, 2, runner.allocator) catch return 0;
+            var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+            const value = lua_runtime.luaValueToJsonLimited(L, 2, runner.allocator, &budget) catch return 0;
             defer json_util.freeJsonValue(runner.allocator, value);
             setter(bound.session, stateOwnerFromUpvalue(L), key, value) catch return 0;
         },

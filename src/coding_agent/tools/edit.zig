@@ -291,18 +291,34 @@ fn execute(
         return util.errorResult(allocator, "diff details serialize failed");
     errdefer json_value.freeJsonValue(allocator, details);
 
-    const unified = diff_unified.toUnified(allocator, doc.document) catch
+    var unified = diff_unified.toUnified(allocator, doc.document) catch
         return util.errorResult(allocator, "diff serialize failed");
     errdefer allocator.free(unified);
+    unified = tryTruncateOwnedText(allocator, unified) catch
+        return util.errorResult(allocator, "diff truncate failed");
 
-    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
+    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch {
+        json_value.freeJsonValue(allocator, details);
         return util.errorResult(allocator, "alloc failed");
+    };
     blocks[0] = .{ .text = .{ .text = unified } };
     return .{
         .content = blocks,
         .details = details,
         .is_error = false,
     };
+}
+
+fn tryTruncateOwnedText(allocator: std.mem.Allocator, owned: []u8) ![]u8 {
+    if (owned.len <= util.Limits.text_result_bytes) return owned;
+    const marker = "\n... [edit diff truncated at 64KiB safety cap] ...";
+    const marker_len = @min(marker.len, util.Limits.text_result_bytes);
+    const prefix_len = util.Limits.text_result_bytes - marker_len;
+    const truncated = try allocator.alloc(u8, util.Limits.text_result_bytes);
+    @memcpy(truncated[0..prefix_len], owned[0..prefix_len]);
+    @memcpy(truncated[prefix_len..], marker[0..marker_len]);
+    allocator.free(owned);
+    return truncated;
 }
 
 // ── line ending handling ────────────────────────────────────────────

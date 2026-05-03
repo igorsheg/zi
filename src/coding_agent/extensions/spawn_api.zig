@@ -5,9 +5,12 @@ const agent_protocol = @import("../../agent/types.zig");
 const spawn_types = @import("../../spawn/types.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const ai = @import("../../ai/root.zig");
+const limits = @import("limits.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
+
+const spawn_pending_events: usize = limits.spawn_pending_events;
 
 pub fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
@@ -199,6 +202,7 @@ const SpawnEventFanout = struct {
     allocator: std.mem.Allocator,
     lua: ?TrampolineCtx = null,
     events: std.ArrayList(PendingEvent) = .empty,
+    dropped_count: usize = 0,
     mutex: std.Io.Mutex = .init,
 
     fn callback(kind: []const u8, event: std.json.Value, ctx: ?*anyopaque) void {
@@ -206,11 +210,23 @@ const SpawnEventFanout = struct {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
 
+        if (self.events.items.len >= spawn_pending_events) {
+            self.dropped_count += 1;
+            return;
+        }
+
         const owned_kind = self.allocator.dupe(u8, kind) catch return;
         errdefer self.allocator.free(owned_kind);
-        const owned_event = ai.json_util.cloneJsonValue(self.allocator, event) catch return;
+        var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+        const owned_event = cloneJsonValueLimited(self.allocator, event, &budget) catch {
+            self.dropped_count += 1;
+            return;
+        };
         errdefer ai.json_util.freeJsonValue(self.allocator, owned_event);
-        self.events.append(self.allocator, .{ .kind = owned_kind, .event = owned_event }) catch return;
+        self.events.append(self.allocator, .{ .kind = owned_kind, .event = owned_event }) catch {
+            self.dropped_count += 1;
+            return;
+        };
     }
 
     fn drainCallback(ctx: ?*anyopaque) void {
@@ -220,13 +236,21 @@ const SpawnEventFanout = struct {
 
     fn drain(self: *SpawnEventFanout) !void {
         var drained: std.ArrayList(PendingEvent) = .empty;
+        var dropped: usize = 0;
         self.mutex.lockUncancelable(std.Options.debug_io);
         std.mem.swap(std.ArrayList(PendingEvent), &drained, &self.events);
+        dropped = self.dropped_count;
+        self.dropped_count = 0;
         self.mutex.unlock(std.Options.debug_io);
         defer freeEvents(self.allocator, &drained);
 
         for (drained.items) |entry| {
             if (self.lua) |*lua| eventTrampoline(entry.kind, entry.event, @ptrCast(lua));
+        }
+        if (dropped > 0) {
+            const event = try droppedEvent(self.allocator, dropped);
+            defer ai.json_util.freeJsonValue(self.allocator, event);
+            if (self.lua) |*lua| eventTrampoline("events_dropped", event, @ptrCast(lua));
         }
     }
 
@@ -242,6 +266,80 @@ const SpawnEventFanout = struct {
         events.deinit(allocator);
     }
 };
+
+fn droppedEvent(allocator: std.mem.Allocator, count: usize) !std.json.Value {
+    var obj: std.json.ObjectMap = .{};
+    errdefer ai.json_util.freeJsonValue(allocator, .{ .object = obj });
+    try obj.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "events_dropped") });
+    try obj.put(allocator, try allocator.dupe(u8, "count"), .{ .integer = @intCast(count) });
+    return .{ .object = obj };
+}
+
+fn cloneJsonValueLimited(allocator: std.mem.Allocator, value: std.json.Value, budget: *lua_runtime.JsonConvertBudget) !std.json.Value {
+    return switch (value) {
+        .null => .null,
+        .bool => |b| .{ .bool = b },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .number_string => |s| blk: {
+            try chargeString(s.len, budget);
+            break :blk .{ .number_string = try allocator.dupe(u8, s) };
+        },
+        .string => |s| blk: {
+            try chargeString(s.len, budget);
+            break :blk .{ .string = try allocator.dupe(u8, s) };
+        },
+        .array => |arr| blk: {
+            if (budget.depth >= budget.limits.max_depth) return error.LimitExceeded;
+            if (arr.items.len > budget.limits.max_items or budget.items > budget.limits.max_items - arr.items.len) return error.LimitExceeded;
+            budget.depth += 1;
+            defer budget.depth -= 1;
+            budget.items += arr.items.len;
+
+            var out = std.json.Array.init(allocator);
+            errdefer ai.json_util.freeJsonValue(allocator, .{ .array = out });
+            try out.ensureTotalCapacity(arr.items.len);
+            for (arr.items) |item| {
+                const cloned = try cloneJsonValueLimited(allocator, item, budget);
+                out.append(cloned) catch |err| {
+                    ai.json_util.freeJsonValue(allocator, cloned);
+                    return err;
+                };
+            }
+            break :blk .{ .array = out };
+        },
+        .object => |obj| blk: {
+            if (budget.depth >= budget.limits.max_depth) return error.LimitExceeded;
+            if (obj.count() > budget.limits.max_items or budget.items > budget.limits.max_items - obj.count()) return error.LimitExceeded;
+            budget.depth += 1;
+            defer budget.depth -= 1;
+            budget.items += obj.count();
+
+            var out: std.json.ObjectMap = .{};
+            errdefer ai.json_util.freeJsonValue(allocator, .{ .object = out });
+            var it = obj.iterator();
+            while (it.next()) |kv| {
+                const key = try allocator.dupe(u8, kv.key_ptr.*);
+                const cloned = cloneJsonValueLimited(allocator, kv.value_ptr.*, budget) catch |err| {
+                    allocator.free(key);
+                    return err;
+                };
+                out.put(allocator, key, cloned) catch |err| {
+                    allocator.free(key);
+                    ai.json_util.freeJsonValue(allocator, cloned);
+                    return err;
+                };
+            }
+            break :blk .{ .object = out };
+        },
+    };
+}
+
+fn chargeString(len: usize, budget: *lua_runtime.JsonConvertBudget) !void {
+    if (len > budget.limits.max_string_bytes) return error.LimitExceeded;
+    if (len > budget.limits.max_total_string_bytes or budget.total_string_bytes > budget.limits.max_total_string_bytes - len) return error.LimitExceeded;
+    budget.total_string_bytes += len;
+}
 
 pub fn eventTrampoline(
     kind: []const u8,
@@ -398,6 +496,20 @@ pub fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
     c.lua_pushinteger(L, @intCast(result.usage.turns));
     c.lua_setfield(L, -2, "turns");
     c.lua_setfield(L, -2, "usage");
+}
+
+test "spawn event fanout bounds pending events and tracks drops" {
+    var fanout = SpawnEventFanout{ .allocator = std.testing.allocator };
+    defer fanout.deinit();
+
+    const event = std.json.Value{ .string = "ok" };
+    var i: usize = 0;
+    while (i < spawn_pending_events + 5) : (i += 1) {
+        SpawnEventFanout.callback("message", event, @ptrCast(&fanout));
+    }
+
+    try std.testing.expectEqual(spawn_pending_events, fanout.events.items.len);
+    try std.testing.expectEqual(@as(usize, 5), fanout.dropped_count);
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {

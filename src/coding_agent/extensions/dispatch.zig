@@ -70,6 +70,7 @@ pub const DispatchError = error{
     LuaError,
     UnsupportedLuaType,
     InvalidUtf8,
+    LimitExceeded,
 };
 
 /// Result of a cancellable dispatch. `blocked` is true when any
@@ -239,7 +240,8 @@ pub fn dispatchTransformable(
         c.lua_replace(state.L, abs_payload);
     }
 
-    return lua_runtime.luaValueToJson(state.L, abs_payload, allocator);
+    var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+    return lua_runtime.luaValueToJsonLimited(state.L, abs_payload, allocator, &budget);
 }
 
 // =============================================================================

@@ -1,6 +1,7 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const limits = @import("limits.zig");
 
 const c = lua_runtime.c;
 
@@ -116,7 +117,7 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
                 .surface_id = surface_id,
                 .state_owner_id = state_owner_id,
                 .generation = runner.generation,
-                .max_frame_bytes = @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", 16 * 1024 * 1024)),
+                .max_frame_bytes = @min(@as(usize, @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", limits.surface_frame_bytes))), limits.surface_frame_bytes),
             } };
         } else if (!std.mem.eql(u8, mode, "events")) {
             return error.InvalidOptions;

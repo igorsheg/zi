@@ -132,7 +132,11 @@ fn buildExtensionTool(
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) == c.LUA_TNIL) return error.MissingParameters;
     if (c.lua_type(L, -1) != c.LUA_TTABLE) return error.InvalidParameters;
-    const parameters = try lua_runtime.luaValueToJson(L, -1, a);
+    var parameters_budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+    const parameters = lua_runtime.luaValueToJsonLimited(L, -1, a, &parameters_budget) catch |err| switch (err) {
+        error.LimitExceeded => return error.InvalidParameters,
+        else => |e| return e,
+    };
     errdefer lua_runtime.freeJsonValue(a, parameters);
 
     // Optional presentation-slot functions — validated type-only here.

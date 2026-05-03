@@ -1491,7 +1491,11 @@ pub const ExtensionRunner = struct {
             if (std.mem.eql(u8, key, "refresh") or std.mem.eql(u8, key, "access") or std.mem.eql(u8, key, "expires")) continue;
             const duped_key = try allocator.dupe(u8, key);
             errdefer allocator.free(duped_key);
-            const value = try lua_runtime.luaValueToJson(L, -1, allocator);
+            var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+            const value = lua_runtime.luaValueToJsonLimited(L, -1, allocator, &budget) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidOAuthCredential,
+            };
             try extras.put(allocator, duped_key, value);
         }
 

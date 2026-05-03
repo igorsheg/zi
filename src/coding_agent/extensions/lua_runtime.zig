@@ -25,6 +25,7 @@
 //! raises "attempt to yield across C-call boundary" at runtime.
 
 const std = @import("std");
+const limits = @import("limits.zig");
 
 pub const c = @cImport({
     @cInclude("lua.h");
@@ -244,6 +245,29 @@ pub const ConvertError = error{
     InvalidUtf8,
 };
 
+pub const LimitedConvertError = ConvertError || error{LimitExceeded};
+
+pub const JsonConvertLimits = struct {
+    max_depth: usize,
+    max_items: usize,
+    max_string_bytes: usize,
+    max_total_string_bytes: usize,
+};
+
+pub const JsonConvertBudget = struct {
+    limits: JsonConvertLimits,
+    depth: usize = 0,
+    items: usize = 0,
+    total_string_bytes: usize = 0,
+};
+
+pub const default_json_convert_limits = JsonConvertLimits{
+    .max_depth = limits.details_depth,
+    .max_items = limits.details_items,
+    .max_string_bytes = limits.details_string_bytes,
+    .max_total_string_bytes = limits.details_total_string_bytes,
+};
+
 /// Read a Lua-stack value at the given (absolute or negative) index
 /// and produce an owned `std.json.Value`. Recursively walks tables.
 ///
@@ -292,6 +316,132 @@ pub fn luaValueToJson(
         // here (it gets stored as a luaL_ref, not a value).
         else => error.UnsupportedLuaType,
     };
+}
+
+pub fn luaValueToJsonLimited(
+    L: *c.lua_State,
+    index: c_int,
+    allocator: std.mem.Allocator,
+    budget: *JsonConvertBudget,
+) LimitedConvertError!std.json.Value {
+    const abs_idx: c_int = if (index < 0) c.lua_gettop(L) + index + 1 else index;
+
+    return switch (c.lua_type(L, abs_idx)) {
+        c.LUA_TNIL, c.LUA_TNONE => .null,
+        c.LUA_TBOOLEAN => .{ .bool = c.lua_toboolean(L, abs_idx) != 0 },
+        c.LUA_TNUMBER => blk: {
+            if (c.lua_isinteger(L, abs_idx) != 0) {
+                break :blk .{ .integer = c.lua_tointegerx(L, abs_idx, null) };
+            }
+            break :blk .{ .float = c.lua_tonumberx(L, abs_idx, null) };
+        },
+        c.LUA_TSTRING => blk: {
+            var len: usize = 0;
+            const ptr = c.lua_tolstring(L, abs_idx, &len) orelse return error.InvalidUtf8;
+            if (len > budget.limits.max_string_bytes) return error.LimitExceeded;
+            if (len > budget.limits.max_total_string_bytes or budget.total_string_bytes > budget.limits.max_total_string_bytes - len) return error.LimitExceeded;
+            budget.total_string_bytes += len;
+            const dup = try allocator.dupe(u8, ptr[0..len]);
+            break :blk .{ .string = dup };
+        },
+        c.LUA_TTABLE => luaTableToJsonLimited(L, abs_idx, allocator, budget),
+        else => error.UnsupportedLuaType,
+    };
+}
+
+fn luaTableToJsonLimited(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+    budget: *JsonConvertBudget,
+) LimitedConvertError!std.json.Value {
+    if (budget.depth >= budget.limits.max_depth) return error.LimitExceeded;
+    budget.depth += 1;
+    defer budget.depth -= 1;
+
+    const seq_len = c.lua_rawlen(L, table_idx);
+    if (seq_len > 0 and isSequence(L, table_idx, seq_len)) {
+        if (seq_len > budget.limits.max_items or budget.items > budget.limits.max_items - seq_len) return error.LimitExceeded;
+        budget.items += seq_len;
+
+        var arr = std.json.Array.init(allocator);
+        errdefer freeJsonValue(allocator, .{ .array = arr });
+        try arr.ensureTotalCapacity(seq_len);
+
+        var i: c.lua_Integer = 1;
+        while (@as(usize, @intCast(i)) <= seq_len) : (i += 1) {
+            _ = c.lua_rawgeti(L, table_idx, i);
+            const elem = luaValueToJsonLimited(L, -1, allocator, budget) catch |err| {
+                c.lua_pop(L, 1);
+                return err;
+            };
+            c.lua_pop(L, 1);
+            try arr.append(elem);
+        }
+        return .{ .array = arr };
+    }
+
+    var obj: std.json.ObjectMap = .{};
+    errdefer freeJsonValue(allocator, .{ .object = obj });
+
+    c.lua_pushnil(L);
+    while (c.lua_next(L, table_idx) != 0) {
+        if (budget.items >= budget.limits.max_items) {
+            c.lua_pop(L, 2);
+            return error.LimitExceeded;
+        }
+        budget.items += 1;
+
+        var key_buf: [64]u8 = undefined;
+        const key_str: []const u8 = switch (c.lua_type(L, -2)) {
+            c.LUA_TSTRING => blk: {
+                var len: usize = 0;
+                const ptr = c.lua_tolstring(L, -2, &len) orelse {
+                    c.lua_pop(L, 2);
+                    return error.InvalidUtf8;
+                };
+                break :blk ptr[0..len];
+            },
+            c.LUA_TNUMBER => blk: {
+                if (c.lua_isinteger(L, -2) != 0) {
+                    const n = c.lua_tointegerx(L, -2, null);
+                    break :blk std.fmt.bufPrint(&key_buf, "{d}", .{n}) catch {
+                        c.lua_pop(L, 2);
+                        return error.OutOfMemory;
+                    };
+                }
+                const f = c.lua_tonumberx(L, -2, null);
+                break :blk std.fmt.bufPrint(&key_buf, "{d}", .{f}) catch {
+                    c.lua_pop(L, 2);
+                    return error.OutOfMemory;
+                };
+            },
+            else => {
+                c.lua_pop(L, 2);
+                return error.UnsupportedLuaType;
+            },
+        };
+
+        const key_dup = allocator.dupe(u8, key_str) catch |err| {
+            c.lua_pop(L, 2);
+            return err;
+        };
+
+        const value = luaValueToJsonLimited(L, -1, allocator, budget) catch |err| {
+            allocator.free(key_dup);
+            c.lua_pop(L, 2);
+            return err;
+        };
+        obj.put(allocator, key_dup, value) catch |err| {
+            allocator.free(key_dup);
+            freeJsonValue(allocator, value);
+            c.lua_pop(L, 2);
+            return err;
+        };
+        c.lua_pop(L, 1); // pop value, keep key for lua_next
+    }
+
+    return .{ .object = obj };
 }
 
 fn luaTableToJson(
@@ -543,6 +693,50 @@ fn consumeErrorMessage(L: *c.lua_State) void {
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "luaValueToJsonLimited enforces depth item and string budgets" {
+    var state = try LuaState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.doString(
+        \\deep = { a = { b = { c = 1 } } }
+        \\wide = { 1, 2, 3 }
+        \\huge = string.rep('x', 9)
+    , "limited_json_values");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    _ = c.lua_getglobal(state.L, "deep");
+    var depth_budget = JsonConvertBudget{ .limits = .{
+        .max_depth = 2,
+        .max_items = 10,
+        .max_string_bytes = 16,
+        .max_total_string_bytes = 64,
+    } };
+    try std.testing.expectError(error.LimitExceeded, luaValueToJsonLimited(state.L, -1, arena.allocator(), &depth_budget));
+    c.lua_pop(state.L, 1);
+
+    _ = c.lua_getglobal(state.L, "wide");
+    var item_budget = JsonConvertBudget{ .limits = .{
+        .max_depth = 8,
+        .max_items = 2,
+        .max_string_bytes = 16,
+        .max_total_string_bytes = 64,
+    } };
+    try std.testing.expectError(error.LimitExceeded, luaValueToJsonLimited(state.L, -1, arena.allocator(), &item_budget));
+    c.lua_pop(state.L, 1);
+
+    _ = c.lua_getglobal(state.L, "huge");
+    var string_budget = JsonConvertBudget{ .limits = .{
+        .max_depth = 8,
+        .max_items = 10,
+        .max_string_bytes = 8,
+        .max_total_string_bytes = 64,
+    } };
+    try std.testing.expectError(error.LimitExceeded, luaValueToJsonLimited(state.L, -1, arena.allocator(), &string_budget));
+    c.lua_pop(state.L, 1);
+}
 
 test "LuaState computes 42 = 40 + 2 in a coroutine" {
     var state = try LuaState.init(std.testing.allocator);

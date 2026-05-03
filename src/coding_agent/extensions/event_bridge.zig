@@ -913,11 +913,12 @@ fn beforeToolCallImpl(
     }
 
     // Read the (possibly mutated) `args` field back from the payload
-    // table at the top of the main stack. luaValueToJson allocates
+    // table at the top of the main stack. luaValueToJsonLimited allocates
     // into hook_alloc so the value lives until the runner is destroyed.
     _ = c.lua_getfield(state.L, -1, "args");
     defer c.lua_pop(state.L, 1);
-    const new_args = lua_runtime.luaValueToJson(state.L, -1, hook_alloc) catch |err| {
+    var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+    const new_args = lua_runtime.luaValueToJsonLimited(state.L, -1, hook_alloc, &budget) catch |err| {
         log.warn("beforeToolCall: failed to read mutated args: {s}", .{@errorName(err)});
         return null;
     };

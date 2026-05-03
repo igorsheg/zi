@@ -35,11 +35,34 @@ const extension_ui = @import("ui.zig");
 const request_mod = @import("../request.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
+const extension_limits = @import("limits.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_tool);
 
 const AgentToolResult = agent_protocol.AgentToolResult;
+
+const ToolResultLimits = struct {
+    max_text_bytes: usize,
+    max_blocks: usize,
+    details: lua_runtime.JsonConvertLimits,
+};
+
+const default_json_convert_limits = lua_runtime.default_json_convert_limits;
+
+const default_tool_result_limits = ToolResultLimits{
+    .max_text_bytes = extension_limits.tool_result_text_bytes,
+    .max_blocks = extension_limits.tool_result_blocks,
+    .details = default_json_convert_limits,
+};
+
+const partial_tool_result_limits = ToolResultLimits{
+    .max_text_bytes = extension_limits.tool_result_text_bytes,
+    .max_blocks = extension_limits.tool_result_blocks,
+    .details = default_json_convert_limits,
+};
+
+const tool_result_truncated_marker = "\n... [extension tool result truncated at 64KiB] ...";
 
 /// Per-tool execution context. The `AgentTool.ctx` slot is one
 /// pointer; we use it to find the runner (for the lua_state),
@@ -183,7 +206,7 @@ fn runHandler(
 
                 const top = c.lua_gettop(co.L);
                 defer c.lua_settop(co.L, top - r.nresults);
-                return parseReturn(allocator, co.L, top);
+                return parseReturn(allocator, co.L, top, default_tool_result_limits);
             },
         }
     }
@@ -331,11 +354,12 @@ fn parseReturn(
     allocator: std.mem.Allocator,
     L: *c.lua_State,
     idx: c_int,
+    limits: ToolResultLimits,
 ) !AgentToolResult {
     const ty = c.lua_type(L, idx);
 
     if (ty == c.LUA_TSTRING) {
-        return try textResult(allocator, lstring(L, idx), false);
+        return try boundedTextResult(allocator, lstring(L, idx), false, limits);
     }
 
     if (ty == c.LUA_TTABLE) {
@@ -352,7 +376,8 @@ fn parseReturn(
         var details: std.json.Value = .null;
         _ = c.lua_getfield(L, idx, "details");
         if (c.lua_type(L, -1) != c.LUA_TNIL) {
-            details = lua_runtime.luaValueToJson(L, -1, allocator) catch .null;
+            var budget = lua_runtime.JsonConvertBudget{ .limits = limits.details };
+            details = lua_runtime.luaValueToJsonLimited(L, -1, allocator, &budget) catch .null;
         }
         c.lua_pop(L, 1);
 
@@ -363,13 +388,13 @@ fn parseReturn(
         const content_ty = c.lua_type(L, -1);
 
         if (content_ty == c.LUA_TSTRING) {
-            var result = try textResult(allocator, lstring(L, -1), is_error);
+            var result = try boundedTextResult(allocator, lstring(L, -1), is_error, limits);
             result.details = details;
             return result;
         }
 
         if (content_ty == c.LUA_TTABLE) {
-            const blocks = try parseContentBlocks(allocator, L, -1);
+            const blocks = try parseContentBlocks(allocator, L, -1, limits);
             return .{ .content = blocks, .is_error = is_error, .details = details };
         }
 
@@ -389,15 +414,19 @@ fn parseContentBlocks(
     allocator: std.mem.Allocator,
     L: *c.lua_State,
     idx: c_int,
+    limits: ToolResultLimits,
 ) ![]const AgentToolResult.ContentBlock {
     const len = c.lua_rawlen(L, idx);
-    if (len == 0) return &.{};
+    if (len == 0 or limits.max_blocks == 0 or limits.max_text_bytes == 0) return &.{};
 
     var blocks: std.ArrayListUnmanaged(AgentToolResult.ContentBlock) = .empty;
     errdefer blocks.deinit(allocator);
 
+    var budget = TextBudget{ .remaining = limits.max_text_bytes };
     var i: c.lua_Integer = 1;
     while (i <= @as(c.lua_Integer, @intCast(len))) : (i += 1) {
+        if (blocks.items.len >= limits.max_blocks or budget.remaining == 0) break;
+
         _ = c.lua_rawgeti(L, idx, i);
         defer c.lua_pop(L, 1);
 
@@ -407,7 +436,7 @@ fn parseContentBlocks(
         defer c.lua_pop(L, 1);
         if (c.lua_type(L, -1) != c.LUA_TSTRING) continue;
 
-        const text = try allocator.dupe(u8, lstring(L, -1));
+        const text = try dupeTextWithBudget(allocator, lstring(L, -1), &budget);
         try blocks.append(allocator, .{ .text = .{ .text = text } });
     }
     return blocks.items;
@@ -422,10 +451,49 @@ fn textResult(
     text: []const u8,
     is_error: bool,
 ) !AgentToolResult {
-    const dup = try allocator.dupe(u8, text);
+    return boundedTextResult(allocator, text, is_error, .{
+        .max_text_bytes = text.len,
+        .max_blocks = 1,
+        .details = default_json_convert_limits,
+    });
+}
+
+fn boundedTextResult(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    is_error: bool,
+    limits: ToolResultLimits,
+) !AgentToolResult {
+    if (limits.max_blocks == 0 or limits.max_text_bytes == 0) {
+        return .{ .content = &.{}, .is_error = is_error };
+    }
+    var budget = TextBudget{ .remaining = limits.max_text_bytes };
+    const dup = try dupeTextWithBudget(allocator, text, &budget);
+    errdefer allocator.free(dup);
     const blocks = try allocator.alloc(AgentToolResult.ContentBlock, 1);
     blocks[0] = .{ .text = .{ .text = dup } };
     return .{ .content = blocks, .is_error = is_error };
+}
+
+const TextBudget = struct { remaining: usize };
+
+fn dupeTextWithBudget(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    budget: *TextBudget,
+) ![]const u8 {
+    if (text.len <= budget.remaining) {
+        budget.remaining -= text.len;
+        return try allocator.dupe(u8, text);
+    }
+
+    const marker_len = @min(tool_result_truncated_marker.len, budget.remaining);
+    const prefix_len = budget.remaining - marker_len;
+    const out = try allocator.alloc(u8, budget.remaining);
+    @memcpy(out[0..prefix_len], text[0..prefix_len]);
+    @memcpy(out[prefix_len..], tool_result_truncated_marker[0..marker_len]);
+    budget.remaining = 0;
+    return out;
 }
 
 fn emptyResult() AgentToolResult {
@@ -486,33 +554,7 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
     defer arena.deinit();
     const aa = arena.allocator();
 
-    // -- is_error --
-    var is_error = false;
-    _ = c.lua_getfield(L, 1, "is_error");
-    if (c.lua_type(L, -1) == c.LUA_TBOOLEAN) is_error = c.lua_toboolean(L, -1) != 0;
-    c.lua_pop(L, 1);
-
-    // -- content (optional, may be table or absent) --
-    var content_blocks: []const AgentToolResult.ContentBlock = &.{};
-    _ = c.lua_getfield(L, 1, "content");
-    if (c.lua_type(L, -1) == c.LUA_TTABLE) {
-        content_blocks = parseContentBlocks(aa, L, -1) catch &.{};
-    }
-    c.lua_pop(L, 1);
-
-    // -- details (optional json value, deep-cloned via luaValueToJson) --
-    var details: std.json.Value = .null;
-    _ = c.lua_getfield(L, 1, "details");
-    if (c.lua_type(L, -1) != c.LUA_TNIL) {
-        details = lua_runtime.luaValueToJson(L, -1, aa) catch .null;
-    }
-    c.lua_pop(L, 1);
-
-    const partial = AgentToolResult{
-        .content = content_blocks,
-        .details = details,
-        .is_error = is_error,
-    };
+    const partial = parseReturn(aa, L, 1, partial_tool_result_limits) catch emptyResult();
 
     // Fire the callback. The downstream consumer clones what it
     // needs synchronously, so when this returns the arena can
@@ -527,6 +569,65 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
 // =============================================================================
 
 const testing = std.testing;
+
+test "parseReturn caps raw string results" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    try state.doString("result = string.rep('a', 70000)", "huge_raw_result");
+    _ = c.lua_getglobal(state.L, "result");
+    defer c.lua_pop(state.L, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
+    try testing.expectEqual(@as(usize, 1), result.content.len);
+    try testing.expectEqual(default_tool_result_limits.max_text_bytes, result.content[0].text.text.len);
+    try testing.expect(std.mem.endsWith(u8, result.content[0].text.text, tool_result_truncated_marker));
+}
+
+test "parseReturn caps text block count" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    try state.doString(
+        \\result = { content = {} }
+        \\for i = 1, 40 do
+        \\  result.content[i] = { type = 'text', text = 'b' }
+        \\end
+    , "many_blocks_result");
+    _ = c.lua_getglobal(state.L, "result");
+    defer c.lua_pop(state.L, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
+    try testing.expectEqual(default_tool_result_limits.max_blocks, result.content.len);
+}
+
+test "parseReturn caps cumulative text bytes across blocks" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    try state.doString(
+        \\result = { content = {} }
+        \\for i = 1, 40 do
+        \\  result.content[i] = { type = 'text', text = string.rep('b', 4096) }
+        \\end
+    , "huge_blocks_result");
+    _ = c.lua_getglobal(state.L, "result");
+    defer c.lua_pop(state.L, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
+    var total: usize = 0;
+    for (result.content) |block| total += block.text.text.len;
+    try testing.expectEqual(default_tool_result_limits.max_text_bytes, total);
+}
 
 fn testGetModel(_: *anyopaque) agent_protocol.Model {
     return .{
@@ -1379,6 +1480,45 @@ test "extension command context publishes host-owned editor buffer actions" {
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
+}
+
+test "extension compact UI updates are bounded" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 14);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "huge_ui",
+        \\  description = "huge_ui",
+        \\  handler = function(_, ctx)
+        \\    ctx.ui.message(string.rep("m", 9000), { id = string.rep("i", 300) })
+        \\    ctx.ui.progress({ id = "p", title = string.rep("t", 2000), detail = string.rep("d", 9000) })
+        \\  end,
+        \\})
+    , "register_huge_ui_command");
+
+    try runner.dispatchCommand("huge_ui", "");
+
+    try testing.expectEqual(@as(usize, 2), store.ui_publications.items.len);
+    try testing.expectEqual(@as(usize, 256), store.ui_publications.items[0].id.len);
+    try testing.expectEqual(@as(usize, 8 * 1024), store.ui_publications.items[0].text.?.len);
+    try testing.expectEqual(@as(usize, 1024), store.ui_publications.items[1].title.?.len);
+    try testing.expectEqual(@as(usize, 8 * 1024), store.ui_publications.items[1].detail.?.len);
+
+    runner.unbindRuntime();
 }
 
 test "extension command context publishes semantic ui message status and progress" {

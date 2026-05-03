@@ -674,9 +674,12 @@ fn optionalProviderModelCompat(
 
     return switch (c.lua_type(L, -1)) {
         c.LUA_TNIL => null,
-        c.LUA_TTABLE => lua_runtime.luaValueToJson(L, -1, allocator) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.InvalidModelCompat,
+        c.LUA_TTABLE => blk: {
+            var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+            break :blk lua_runtime.luaValueToJsonLimited(L, -1, allocator, &budget) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidModelCompat,
+            };
         },
         else => error.InvalidModelCompat,
     };
