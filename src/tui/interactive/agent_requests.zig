@@ -62,7 +62,7 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                 .extension_command => |ec| {
                     idle_processed = true;
                     if (self.runtime_host.currentSession().extensionRunner()) |runner| {
-                        runner.async_dispatcher = .{ .ptr = @ptrCast(self), .submit = submitExtensionAsyncFromRunner };
+                        runner.async_dispatcher = submitExtensionAsyncFromRunner(self);
                     }
                     self.runtime_host.dispatchExtensionCommand(ec.name, ec.args) catch |err| {
                         const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
@@ -73,9 +73,31 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                 .extension_keybinding => |ek| {
                     idle_processed = true;
                     if (self.runtime_host.currentSession().extensionRunner()) |runner| {
-                        runner.async_dispatcher = .{ .ptr = @ptrCast(self), .submit = submitExtensionAsyncFromRunner };
+                        runner.async_dispatcher = submitExtensionAsyncFromRunner(self);
                     }
                     self.runtime_host.dispatchExtensionKeybinding(ek.id) catch |err| {
+                        const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
+                        _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
+                    };
+                    self.publishPendingExtensionUi();
+                },
+                .extension_surface_input => |input| {
+                    idle_processed = true;
+                    if (self.runtime_host.currentSession().extensionRunner()) |runner| {
+                        runner.async_dispatcher = submitExtensionAsyncFromRunner(self);
+                    }
+                    self.runtime_host.dispatchExtensionSurfaceInput(input) catch |err| {
+                        const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
+                        _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
+                    };
+                    self.publishPendingExtensionUi();
+                },
+                .extension_job_event => |event| {
+                    idle_processed = true;
+                    if (self.runtime_host.currentSession().extensionRunner()) |runner| {
+                        runner.async_dispatcher = submitExtensionAsyncFromRunner(self);
+                    }
+                    self.runtime_host.dispatchExtensionJobEvent(event) catch |err| {
                         const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
                         _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
                     };
@@ -110,7 +132,7 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                 .tool_expanded_changed => |event| {
                     idle_processed = true;
                     if (self.runtime_host.currentSession().extensionRunner()) |runner| {
-                        runner.async_dispatcher = .{ .ptr = @ptrCast(self), .submit = submitExtensionAsyncFromRunner };
+                        runner.async_dispatcher = submitExtensionAsyncFromRunner(self);
                     }
                     self.runtime_host.dispatchToolExpandedChanged(event.tool_name, event.tool_call_id, event.expanded) catch |err| {
                         const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;

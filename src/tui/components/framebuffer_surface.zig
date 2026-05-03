@@ -1,0 +1,161 @@
+const std = @import("std");
+
+const buffer_mod = @import("../buffer.zig");
+const cell_mod = @import("../cell.zig");
+const component_mod = @import("../component.zig");
+const extension_ui = @import("../../coding_agent/extensions/ui.zig");
+
+const Region = buffer_mod.Region;
+const Component = component_mod.Component;
+const Measurement = component_mod.Measurement;
+const Color = cell_mod.Color;
+const Attributes = cell_mod.Attributes;
+
+pub const FramebufferSurface = struct {
+    allocator: std.mem.Allocator,
+    open: ?extension_ui.SurfaceOpen = null,
+    frame: ?extension_ui.SurfaceFrame = null,
+    focused: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) FramebufferSurface {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *FramebufferSurface) void {
+        self.clearFrame();
+        self.clearOpen();
+    }
+
+    pub fn component(self: *FramebufferSurface) Component {
+        return Component.init(FramebufferSurface, self);
+    }
+
+    pub fn setFocused(self: *FramebufferSurface, focused: bool) void {
+        self.focused = focused;
+    }
+
+    pub fn handleInput(_: *FramebufferSurface, _: @import("../terminal/keys.zig").Key) bool {
+        return false;
+    }
+
+    pub fn keyboardSurfaceId(self: *const FramebufferSurface) ?[]const u8 {
+        const open = self.open orelse return null;
+        if (!open.wants_keyboard) return null;
+        return open.id;
+    }
+
+    pub fn apply(self: *FramebufferSurface, update: extension_ui.SurfaceUpdate) void {
+        switch (update) {
+            .open => |open| self.applyOpen(open),
+            .frame => |frame| self.applyFrame(frame),
+            .close => |close| self.applyClose(close),
+        }
+    }
+
+    fn applyOpen(self: *FramebufferSurface, open: extension_ui.SurfaceOpen) void {
+        self.clearOpen();
+        self.open = extension_ui.SurfaceOpen.clone(self.allocator, open) catch null;
+    }
+
+    fn applyFrame(self: *FramebufferSurface, frame: extension_ui.SurfaceFrame) void {
+        if (expectedBytes(frame.width, frame.height)) |needed| {
+            if (frame.data.len < needed) return;
+        } else return;
+        self.clearFrame();
+        self.frame = extension_ui.SurfaceFrame.clone(self.allocator, frame) catch null;
+        if (self.open == null) {
+            const synthetic = extension_ui.SurfaceOpen{
+                .state_owner_id = frame.state_owner_id,
+                .generation = frame.generation,
+                .id = frame.id,
+                .title = frame.id,
+                .width = frame.width,
+                .height = frame.height,
+                .format = frame.format,
+            };
+            self.open = extension_ui.SurfaceOpen.clone(self.allocator, synthetic) catch null;
+        }
+    }
+
+    fn applyClose(self: *FramebufferSurface, close: extension_ui.SurfaceClose) void {
+        if (self.open) |open| {
+            if (!std.mem.eql(u8, open.id, close.id)) return;
+        }
+        self.clearFrame();
+        self.clearOpen();
+        self.focused = false;
+    }
+
+    fn clearOpen(self: *FramebufferSurface) void {
+        if (self.open) |*open| open.deinit(self.allocator);
+        self.open = null;
+    }
+
+    fn clearFrame(self: *FramebufferSurface) void {
+        if (self.frame) |*frame| frame.deinit(self.allocator);
+        self.frame = null;
+    }
+
+    pub fn measure(self: *FramebufferSurface, width: u32) Measurement {
+        const frame = self.frame orelse return .{ .min_height = 0, .preferred_height = 0 };
+        if (width == 0 or frame.width == 0 or frame.height == 0) return .{ .min_height = 0, .preferred_height = 0 };
+        const rows = scaledRows(frame.width, frame.height, width);
+        return .{ .min_height = @min(rows, 1), .preferred_height = rows };
+    }
+
+    pub fn render(self: *FramebufferSurface, region: Region) void {
+        self.renderSlice(region, 0);
+    }
+
+    pub fn renderSlice(self: *FramebufferSurface, region: Region, first_row: u32) void {
+        const frame = self.frame orelse return;
+        if (region.width == 0 or region.height == 0) return;
+        if (expectedBytes(frame.width, frame.height)) |needed| {
+            if (frame.data.len < needed) return;
+        } else return;
+
+        const rows_total = scaledRows(frame.width, frame.height, region.width);
+        var y: u32 = 0;
+        while (y < region.height and first_row + y < rows_total) : (y += 1) {
+            var x: u32 = 0;
+            while (x < region.width) : (x += 1) {
+                const src_x = @min(frame.width - 1, (x * frame.width) / region.width);
+                const upper_y = @min(frame.height - 1, (((first_row + y) * 2) * frame.height) / (rows_total * 2));
+                const lower_y = @min(frame.height - 1, ((((first_row + y) * 2) + 1) * frame.height) / (rows_total * 2));
+                const upper = rgbaAt(frame.data, frame.width, src_x, upper_y);
+                const lower = rgbaAt(frame.data, frame.width, src_x, lower_y);
+                region.set(x, y, .{
+                    .grapheme = .{ .codepoint = '▀' },
+                    .fg = Color.rgb(upper.r, upper.g, upper.b),
+                    .bg = Color.rgb(lower.r, lower.g, lower.b),
+                    .attrs = Attributes.none,
+                });
+            }
+        }
+    }
+};
+
+const Rgb = struct { r: u8, g: u8, b: u8 };
+
+fn expectedBytes(width: u32, height: u32) ?usize {
+    const pixels = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
+    return std.math.mul(usize, pixels, 4) catch null;
+}
+
+fn scaledRows(src_width: u32, src_height: u32, target_cols: u32) u32 {
+    if (src_width == 0 or src_height == 0 or target_cols == 0) return 0;
+    const pixel_rows = std.math.divCeil(u64, @as(u64, target_cols) * src_height, src_width) catch 1;
+    const terminal_rows = std.math.divCeil(u64, pixel_rows, 2) catch 1;
+    return @intCast(@max(terminal_rows, 1));
+}
+
+fn rgbaAt(data: []const u8, width: u32, x: u32, y: u32) Rgb {
+    const offset: usize = (@as(usize, y) * @as(usize, width) + @as(usize, x)) * 4;
+    return .{ .r = data[offset], .g = data[offset + 1], .b = data[offset + 2] };
+}
+
+test "framebuffer surface measures half-block rows" {
+    var surface = FramebufferSurface.init(std.testing.allocator);
+    defer surface.deinit();
+    try std.testing.expectEqual(@as(u32, 0), surface.measure(80).preferred_height);
+}

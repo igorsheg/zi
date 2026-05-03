@@ -75,6 +75,10 @@ pub fn parseEventKind(name: []const u8) ?event_registry.EventKind {
         .{ .name = "session_compact", .kind = .session_compact },
         .{ .name = "session_before_tree", .kind = .session_before_tree },
         .{ .name = "session_tree", .kind = .session_tree },
+        .{ .name = "surface_input", .kind = .surface_input },
+        .{ .name = "job_stdout", .kind = .job_stdout },
+        .{ .name = "job_stderr", .kind = .job_stderr },
+        .{ .name = "job_exit", .kind = .job_exit },
         .{ .name = "model_select", .kind = .model_select },
     };
     for (table) |p| {

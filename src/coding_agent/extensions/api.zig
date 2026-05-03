@@ -45,6 +45,7 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const system_api = @import("system_api.zig");
+const job_api = @import("job_api.zig");
 const spawn_api = @import("spawn_api.zig");
 const provider_api = @import("provider_api.zig");
 const command_api = @import("command_api.zig");
@@ -113,6 +114,10 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     // zi.system
     state.pushCClosureWithUserdata(system_api.ziSystem, runner);
     c.lua_setfield(L, -2, "system");
+
+    // zi.job
+    job_api.install(state, runner);
+    c.lua_setfield(L, -2, "job");
 
     // Install as a global named "zi".
     c.lua_setglobal(L, "zi");

@@ -170,6 +170,7 @@ pub fn handle(self: anytype, ev: *UiEvent) void {
         .extension_keybindings_updated => |u| self.applyExtensionKeybindingsUpdate(u.keybindings),
         .extension_report_shown => |u| self.applyExtensionReport(u.report),
         .extension_ui_published => |u| self.applyExtensionUiPublications(u.updates),
+        .extension_surface_updated => |u| self.applyExtensionSurfaceUpdates(u.updates),
         .extension_editor_actions => |u| self.applyExtensionEditorActions(u.actions),
         .extension_prompt_requested => |u| self.showExtensionPrompt(u.prompt, u.response),
         .session_new_started => {

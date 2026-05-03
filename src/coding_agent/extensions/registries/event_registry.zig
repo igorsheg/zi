@@ -64,6 +64,12 @@ pub const EventKind = enum {
     session_before_tree,
     session_tree,
 
+    // Extension UI and host jobs
+    surface_input,
+    job_stdout,
+    job_stderr,
+    job_exit,
+
     // Meta
     model_select,
 
@@ -202,7 +208,7 @@ test "EventRegistry subscribes in order and dispatches correct chain" {
 }
 
 test "EventKind reserves the full v2 event surface" {
-    try testing.expectEqual(@as(usize, 29), @typeInfo(EventKind).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 33), @typeInfo(EventKind).@"enum".fields.len);
 }
 
 test "EventKind.semantics matches spec" {

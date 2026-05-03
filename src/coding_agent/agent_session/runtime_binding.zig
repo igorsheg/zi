@@ -55,6 +55,7 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .cancel_prompts = &runtime_ui.cancelPrompts,
         .publish_ui = &runtime_ui.publishUi,
         .revoke_ui = &runtime_ui.revokeUi,
+        .publish_surface_update = &runtime_ui.publishSurfaceUpdate,
         .publish_editor_action = &runtime_ui.publishEditorAction,
         .clear_editor_actions = &runtime_ui.clearEditorActions,
         .provider_projection_changed = &projection_runtime.providerProjectionChanged,

@@ -7,6 +7,7 @@ pub const PendingExtensionUi = struct {
     report: ?extension_ui.Report = null,
     prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
     ui_publications: std.ArrayListUnmanaged(extension_ui.UiPublication) = .empty,
+    surface_updates: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
     editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) PendingExtensionUi {
@@ -17,6 +18,7 @@ pub const PendingExtensionUi = struct {
         self.clearReport();
         self.clearPrompts();
         self.clearUiPublications();
+        self.clearSurfaceUpdates();
         self.clearEditorActions();
     }
 
@@ -77,6 +79,33 @@ pub const PendingExtensionUi = struct {
         for (self.ui_publications.items) |*update| update.deinit(self.allocator);
         self.ui_publications.deinit(self.allocator);
         self.ui_publications = .empty;
+    }
+
+    pub fn publishSurfaceUpdate(self: *PendingExtensionUi, update: extension_ui.SurfaceUpdate) !void {
+        var cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
+        errdefer cloned.deinit(self.allocator);
+        try self.surface_updates.append(self.allocator, cloned);
+    }
+
+    pub fn takeSurfaceUpdates(self: *PendingExtensionUi, allocator: std.mem.Allocator) ![]extension_ui.SurfaceUpdate {
+        const out = try allocator.alloc(extension_ui.SurfaceUpdate, self.surface_updates.items.len);
+        errdefer allocator.free(out);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*update| update.deinit(allocator);
+        }
+        for (self.surface_updates.items, 0..) |update, i| {
+            out[i] = try extension_ui.SurfaceUpdate.clone(allocator, update);
+            initialized += 1;
+        }
+        self.clearSurfaceUpdates();
+        return out;
+    }
+
+    pub fn clearSurfaceUpdates(self: *PendingExtensionUi) void {
+        for (self.surface_updates.items) |*update| update.deinit(self.allocator);
+        self.surface_updates.deinit(self.allocator);
+        self.surface_updates = .empty;
     }
 
     pub fn publishEditorAction(self: *PendingExtensionUi, action: extension_ui.EditorAction) !void {

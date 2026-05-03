@@ -51,6 +51,7 @@ const status_flow = @import("interactive/status_flow.zig");
 const overlay_flow = @import("interactive/overlay_flow.zig");
 const idle_request = @import("interactive/idle_request.zig");
 const runtime_loop = @import("interactive/runtime_loop.zig");
+const job_manager_mod = @import("interactive/job_manager.zig");
 const theme_flow = @import("interactive/theme_flow.zig");
 const terminal_input_flow = @import("interactive/terminal_input.zig");
 const event_flow = @import("interactive/event_flow.zig");
@@ -58,6 +59,7 @@ const run_setup = @import("interactive/run_setup.zig");
 const startup_flow = @import("interactive/startup_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
+const surface_input_flow = @import("interactive/surface_input.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("terminal/clipboard.zig");
 const agent_ui_event_mod = @import("interactive/agent_ui_event.zig");
@@ -282,6 +284,7 @@ pub const Interactive = struct {
     /// values; the long-lived agent thread wakes, drains, and dispatches
     /// them on the owner thread.
     request_queue: RequestQueue,
+    job_manager: job_manager_mod.JobManager,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
     session_event_token: ?RuntimeHost.EventSubscriptionToken = null,
     agent_thread: ?std.Thread = null,
@@ -342,11 +345,13 @@ pub const Interactive = struct {
             .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
             .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
+            .job_manager = undefined,
             .session_index_worker = try session_index_worker_mod.SessionIndexWorker.init(msg_allocator),
             .auth_storage = auth_storage,
             .settings_manager = settings_manager,
             .model_catalog = &.{},
         };
+        self.job_manager = try job_manager_mod.JobManager.init(msg_allocator, io, &self.request_queue, null);
         self.ai_complete_worker = try ai_complete_worker_mod.AiCompleteWorker.init(msg_allocator);
         self.system_worker = try system_worker_mod.SystemWorker.init(msg_allocator, io);
         self.pending_image_banner.setPadding(1, 0);
@@ -431,6 +436,7 @@ pub const Interactive = struct {
         self.ai_complete_worker = null;
         if (self.system_worker) |*worker| worker.deinit();
         self.system_worker = null;
+        self.job_manager.deinit();
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
         // Any unexpectedly undrained requests are mailbox-owned here;
@@ -493,6 +499,8 @@ pub const Interactive = struct {
 
         run_setup.bindAutocomplete(self);
         run_setup.mountInitialTree(self);
+
+        self.job_manager.setSurfaceSink(.{ .ptr = @ptrCast(self), .submit = &publishJobSurfaceFrame });
 
         // RuntimeHost emits extension `session_start` before the TUI tree exists.
         // Drain semantic UI publications once after slots are materialized so
@@ -576,6 +584,17 @@ pub const Interactive = struct {
 
     pub fn publishLifecycleUiEvent(self: *Interactive, event: UiEvent) bool {
         return event_flow.publishLifecycle(self, event);
+    }
+
+    fn publishJobSurfaceFrame(ptr: *anyopaque, frame: extension_ui.SurfaceFrame) bool {
+        const self: *Interactive = @ptrCast(@alignCast(ptr));
+        const updates = self.msg_allocator.alloc(extension_ui.SurfaceUpdate, 1) catch {
+            var failed = frame;
+            failed.deinit(self.msg_allocator);
+            return false;
+        };
+        updates[0] = .{ .frame = frame };
+        return self.publishSnapshotUiEvent(.{ .extension_surface_updated = .{ .updates = updates } });
     }
 
     pub fn handleKey(self: *Interactive, key: Key) void {
@@ -1156,6 +1175,10 @@ pub const Interactive = struct {
 
     pub fn applyExtensionUiPublications(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiPublication) void {
         extension_ui_flow.applyPublications(self, updates);
+    }
+
+    pub fn applyExtensionSurfaceUpdates(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
+        extension_ui_flow.applySurfaceUpdates(self, updates);
     }
 
     pub fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {

@@ -8,6 +8,7 @@ const ai = @import("../../ai/root.zig");
 const resource_types = @import("../resources/types.zig");
 const tool_def = @import("../tools/definition.zig");
 const context_mod = @import("context.zig");
+const dispatch_mod = @import("dispatch.zig");
 const oauth_mod = @import("../auth/oauth.zig");
 const auth_types = @import("../auth/types.zig");
 const request_mod = @import("../request.zig");
@@ -170,9 +171,79 @@ pub const AsyncStart = struct {
     }
 };
 
+pub const JobStdoutMode = union(enum) {
+    events,
+    surface_frame: struct {
+        surface_id: []const u8,
+        state_owner_id: []const u8,
+        generation: Generation,
+        max_frame_bytes: usize = 16 * 1024 * 1024,
+    },
+
+    pub fn clone(self: JobStdoutMode, allocator: std.mem.Allocator) !JobStdoutMode {
+        return switch (self) {
+            .events => .events,
+            .surface_frame => |frame| .{ .surface_frame = .{
+                .surface_id = try allocator.dupe(u8, frame.surface_id),
+                .state_owner_id = try allocator.dupe(u8, frame.state_owner_id),
+                .generation = frame.generation,
+                .max_frame_bytes = frame.max_frame_bytes,
+            } },
+        };
+    }
+
+    pub fn deinit(self: *JobStdoutMode, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .events => {},
+            .surface_frame => |frame| {
+                allocator.free(frame.surface_id);
+                allocator.free(frame.state_owner_id);
+            },
+        }
+        self.* = undefined;
+    }
+};
+
+pub const JobStartRequest = struct {
+    argv: []const []const u8,
+    cwd: ?[]const u8 = null,
+    stdout: JobStdoutMode = .events,
+
+    pub fn clone(self: JobStartRequest, allocator: std.mem.Allocator) !JobStartRequest {
+        const argv = try allocator.alloc([]const u8, self.argv.len);
+        errdefer allocator.free(argv);
+        var built: usize = 0;
+        errdefer for (argv[0..built]) |arg| allocator.free(arg);
+        for (self.argv, 0..) |arg, i| {
+            argv[i] = try allocator.dupe(u8, arg);
+            built += 1;
+        }
+        const cwd = if (self.cwd) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (cwd) |value| allocator.free(value);
+        var stdout = try self.stdout.clone(allocator);
+        errdefer stdout.deinit(allocator);
+        return .{
+            .argv = argv,
+            .cwd = cwd,
+            .stdout = stdout,
+        };
+    }
+
+    pub fn deinit(self: *JobStartRequest, allocator: std.mem.Allocator) void {
+        for (self.argv) |arg| allocator.free(arg);
+        allocator.free(self.argv);
+        if (self.cwd) |cwd| allocator.free(cwd);
+        self.stdout.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const AsyncDispatcher = struct {
     ptr: *anyopaque,
     submit: *const fn (ptr: *anyopaque, runner: *ExtensionRunner, start: AsyncStart) anyerror!void,
+    job_start: ?*const fn (ptr: *anyopaque, runner: *ExtensionRunner, id: u64, request: JobStartRequest) anyerror!void = null,
+    job_write: ?*const fn (ptr: *anyopaque, runner: *ExtensionRunner, id: u64, data: []const u8) anyerror!void = null,
+    job_stop: ?*const fn (ptr: *anyopaque, runner: *ExtensionRunner, id: u64) anyerror!void = null,
 };
 
 pub const AsyncResult = union(AsyncKind) {
@@ -275,6 +346,7 @@ pub const ExtensionRuntime = union(enum) {
         cancel_prompts: ?*const fn (session: *anyopaque) void = null,
         publish_ui: ?*const fn (session: *anyopaque, update: extension_ui.UiPublication) anyerror!void = null,
         revoke_ui: ?*const fn (session: *anyopaque) void = null,
+        publish_surface_update: ?*const fn (session: *anyopaque, update: extension_ui.SurfaceUpdate) anyerror!void = null,
         publish_editor_action: ?*const fn (session: *anyopaque, action: extension_ui.EditorAction) anyerror!void = null,
         clear_editor_actions: ?*const fn (session: *anyopaque) void = null,
         provider_projection_changed: ?*const fn (session: *anyopaque) void = null,
@@ -460,6 +532,7 @@ pub const ExtensionRunner = struct {
     current_spawn_result: ?SpawnOutcome = null,
 
     next_async_id: AsyncOpId = 1,
+    next_job_id: u64 = 1,
     current_async_start: ?AsyncStart = null,
     pending_async: std.AutoHashMapUnmanaged(AsyncOpId, PendingAsync) = .empty,
     completed_async: std.AutoHashMapUnmanaged(AsyncOpId, AsyncResult) = .empty,
@@ -932,6 +1005,35 @@ pub const ExtensionRunner = struct {
         }
     }
 
+    pub fn dispatchSurfaceInput(self: *ExtensionRunner, input: extension_ui.SurfaceInput) !void {
+        self.assertOnLuaThread();
+        if (self.event_registry.handlers(.surface_input).len == 0) return;
+        const state = self.lua_state orelse return error.MissingLuaState;
+        pushSurfaceInputPayload(state.L, input);
+        defer lua_runtime.c.lua_pop(state.L, 1);
+        try dispatch_mod.dispatchObserver(state, self, .surface_input, -1);
+    }
+
+    pub fn dispatchJobEvent(self: *ExtensionRunner, event: extension_ui.JobEvent) !void {
+        self.assertOnLuaThread();
+        const kind: registries.event.EventKind = switch (event.kind) {
+            .stdout => .job_stdout,
+            .stderr => .job_stderr,
+            .exit => .job_exit,
+        };
+        if (self.event_registry.handlers(kind).len == 0) return;
+        const state = self.lua_state orelse return error.MissingLuaState;
+        pushJobEventPayload(state.L, event);
+        defer lua_runtime.c.lua_pop(state.L, 1);
+        try dispatch_mod.dispatchObserver(state, self, kind, -1);
+    }
+
+    pub fn reserveJobId(self: *ExtensionRunner) u64 {
+        const id = self.next_job_id;
+        self.next_job_id += 1;
+        return id;
+    }
+
     pub fn dispatchToolExpandedChanged(self: *ExtensionRunner, tool_name: []const u8, tool_call_id: []const u8, expanded: bool) !void {
         self.assertOnLuaThread();
 
@@ -1044,9 +1146,11 @@ pub const ExtensionRunner = struct {
 
     fn submitAsyncStart(self: *ExtensionRunner, start: AsyncStart) !void {
         if (self.async_dispatcher) |dispatcher| {
+            // AsyncDispatcher.submit takes ownership of `start` in both success and
+            // error paths. The interactive dispatcher and test dispatchers clone or
+            // enqueue what they need, then deinit the original request. On failure
+            // we only unwind the suspended coroutine registration here.
             dispatcher.submit(dispatcher.ptr, self, start) catch |err| {
-                var failed_start = start;
-                failed_start.deinit(self.allocator);
                 if (self.pending_async.fetchRemove(start.id)) |kv| {
                     var pending = kv.value;
                     pending.deinit();
@@ -1459,6 +1563,41 @@ fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) !
 
     const dir = std.fs.path.dirname(path) orelse path;
     return try std.fs.path.join(allocator, &.{ dir, "lua" });
+}
+
+fn pushSurfaceInputPayload(L: *lua_runtime.c.lua_State, input: extension_ui.SurfaceInput) void {
+    const c = lua_runtime.c;
+    c.lua_createtable(L, 0, 8);
+    pushStringField(L, "id", input.id);
+    pushStringField(L, "kind", input.kind);
+    pushStringField(L, "action", input.action);
+    pushStringField(L, "key", input.key);
+    if (input.text) |text| pushStringField(L, "text", text);
+    c.lua_pushboolean(L, if (input.ctrl) 1 else 0);
+    c.lua_setfield(L, -2, "ctrl");
+    c.lua_pushboolean(L, if (input.alt) 1 else 0);
+    c.lua_setfield(L, -2, "alt");
+    c.lua_pushboolean(L, if (input.shift) 1 else 0);
+    c.lua_setfield(L, -2, "shift");
+}
+
+fn pushJobEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.JobEvent) void {
+    const c = lua_runtime.c;
+    c.lua_createtable(L, 0, 4);
+    c.lua_pushinteger(L, @intCast(event.id));
+    c.lua_setfield(L, -2, "id");
+    pushStringField(L, "kind", @tagName(event.kind));
+    if (event.data) |data| pushStringField(L, "data", data);
+    if (event.code) |code| {
+        c.lua_pushinteger(L, @intCast(code));
+        c.lua_setfield(L, -2, "code");
+    }
+}
+
+fn pushStringField(L: *lua_runtime.c.lua_State, comptime field: [:0]const u8, value: []const u8) void {
+    const c = lua_runtime.c;
+    _ = c.lua_pushlstring(L, value.ptr, value.len);
+    c.lua_setfield(L, -2, field.ptr);
 }
 
 // =============================================================================

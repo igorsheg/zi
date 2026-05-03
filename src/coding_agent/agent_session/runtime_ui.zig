@@ -32,6 +32,11 @@ pub fn revokeUi(session_ptr: *anyopaque) void {
     self.pending_extension_ui.clearUiPublications();
 }
 
+pub fn publishSurfaceUpdate(session_ptr: *anyopaque, update: extension_ui.SurfaceUpdate) !void {
+    const self = session(session_ptr);
+    try self.pending_extension_ui.publishSurfaceUpdate(update);
+}
+
 pub fn publishEditorAction(session_ptr: *anyopaque, action: extension_ui.EditorAction) !void {
     const self = session(session_ptr);
     try self.pending_extension_ui.publishEditorAction(action);

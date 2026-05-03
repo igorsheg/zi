@@ -68,6 +68,15 @@ The UI API publishes presentation intent. Extensions do not own terminal compone
 `ctx.ui.report({ id, title, body, format?, transient? })`
 : Publish a readable document/report. `format = "text"` is the default and current supported format. `body` is plain text; zi owns splitting, scrolling, rendering, and preserving report presentation state by `id` where supported.
 
+`ctx.ui.surface_open({ id, title?, width, height, format = "rgba8888", input? })`
+: Open or replace an ephemeral host-owned interactive surface. Surfaces are live UI state, not transcript content. `input.keyboard = true` asks zi to focus the surface and route scoped `surface_input` keyboard events to extensions; `Esc` returns focus to the editor.
+
+`ctx.ui.surface_frame({ id, width, height, format = "rgba8888", data })`
+: Publish the latest framebuffer for a surface. `data` is a Lua string containing `width * height * 4` RGBA bytes. The TUI keeps/renders the latest frame and may drop stale frames rather than queue unbounded updates.
+
+`ctx.ui.surface_close({ id })`
+: Close a previously opened surface.
+
 `ctx.ui.pick({ title, placeholder?, empty_text?, options|items, timeout_ms? })`
 : Request selection from stable options. Items may carry `value`, `label`, `description`, `search`, and static `preview`. Returns `{ status, value, item? }` when submitted.
 

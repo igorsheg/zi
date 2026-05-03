@@ -13,7 +13,7 @@ const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 
 pub const agentThread = agentThreadFn;
 pub const submitExtensionAsyncResult = submitExtensionAsyncResultFn;
-pub const submitExtensionAsyncFromRunner = submitExtensionAsyncFromRunnerFn;
+pub const submitExtensionAsyncFromRunner = extensionAsyncDispatcher;
 pub const dispatchExtensionOAuthRefresh = dispatchExtensionOAuthRefreshViaRequestQueue;
 
 pub fn enqueueShutdown(self: *Interactive) void {
@@ -37,7 +37,7 @@ pub fn discardQueuedRequests(self: *Interactive) void {
 }
 
 pub fn processRequests(self: *Interactive) bool {
-    return agent_requests_mod.processWithBuffer(self, AgentRequest, &submitExtensionAsyncFromRunnerFn);
+    return agent_requests_mod.processWithBuffer(self, AgentRequest, &extensionAsyncDispatcher);
 }
 
 fn dispatchExtensionOAuthRefreshViaRequestQueue(
@@ -113,6 +113,16 @@ fn submitExtensionAsyncResultFn(ptr: *anyopaque, id: extension_runner_mod.AsyncO
     }
 }
 
+pub fn extensionAsyncDispatcher(self: *@import("../interactive.zig").Interactive) extension_runner_mod.AsyncDispatcher {
+    return .{
+        .ptr = @ptrCast(self),
+        .submit = &submitExtensionAsyncFromRunnerFn,
+        .job_start = &startExtensionJobFromRunnerFn,
+        .job_write = &writeExtensionJobFromRunnerFn,
+        .job_stop = &stopExtensionJobFromRunnerFn,
+    };
+}
+
 fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, start: extension_runner_mod.AsyncStart) anyerror!void {
     const self: *Interactive = @ptrCast(@alignCast(ptr));
     var owned_start = start;
@@ -120,22 +130,44 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
     switch (owned_start.request) {
         .ai_complete => |request| {
             const worker_request = try self.runtime_host.currentSession().buildAiCompleteWorkerRequest(self.msg_allocator, owned_start.id, request);
-            errdefer {
+            var submitted = false;
+            errdefer if (!submitted) {
                 var failed = worker_request;
                 failed.deinit(self.msg_allocator);
-            }
+            };
             const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
+            submitted = true; // worker.submit consumes the request even when it rejects it.
             try worker.submit(worker_request);
         },
         .system => |request| {
             const cloned = try request.clone(self.msg_allocator);
-            errdefer {
+            var submitted = false;
+            errdefer if (!submitted) {
                 var failed = cloned;
                 failed.deinit(self.msg_allocator);
-            }
+            };
             const worker = if (self.system_worker) |*worker| worker else return error.SystemWorkerUnavailable;
+            submitted = true; // worker.submit consumes the request even when it rejects it.
             try worker.submit(.{ .id = owned_start.id, .system = cloned });
         },
         else => {},
     }
+}
+
+fn startExtensionJobFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, id: u64, request: extension_runner_mod.JobStartRequest) anyerror!void {
+    const self: *Interactive = @ptrCast(@alignCast(ptr));
+    var original = request;
+    defer original.deinit(runner.allocator);
+    const cloned = try request.clone(self.msg_allocator);
+    try self.job_manager.start(id, cloned);
+}
+
+fn writeExtensionJobFromRunnerFn(ptr: *anyopaque, _: *ExtensionRunner, id: u64, data: []const u8) anyerror!void {
+    const self: *Interactive = @ptrCast(@alignCast(ptr));
+    try self.job_manager.write(id, data);
+}
+
+fn stopExtensionJobFromRunnerFn(ptr: *anyopaque, _: *ExtensionRunner, id: u64) anyerror!void {
+    const self: *Interactive = @ptrCast(@alignCast(ptr));
+    self.job_manager.stop(id);
 }

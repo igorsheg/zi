@@ -123,6 +123,9 @@ pub const UiEvent = union(enum) {
     extension_ui_published: struct {
         updates: []extension_ui.UiPublication,
     },
+    extension_surface_updated: struct {
+        updates: []extension_ui.SurfaceUpdate,
+    },
     extension_editor_actions: struct {
         actions: []extension_ui.EditorAction,
     },
@@ -272,6 +275,10 @@ pub const UiEvent = union(enum) {
             },
             .extension_report_shown => |*u| u.report.deinit(allocator),
             .extension_ui_published => |u| {
+                for (u.updates) |*update| update.deinit(allocator);
+                allocator.free(u.updates);
+            },
+            .extension_surface_updated => |u| {
                 for (u.updates) |*update| update.deinit(allocator);
                 allocator.free(u.updates);
             },

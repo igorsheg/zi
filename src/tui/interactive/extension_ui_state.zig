@@ -2,6 +2,7 @@ const std = @import("std");
 
 const component_mod = @import("../component.zig");
 const text_mod = @import("../components/text.zig");
+const framebuffer_surface_mod = @import("../components/framebuffer_surface.zig");
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 
 const Component = component_mod.Component;
@@ -10,6 +11,7 @@ pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
     report_text: text_mod.Text,
     message_text: text_mod.Text,
+    surface: framebuffer_surface_mod.FramebufferSurface,
     report_id: ?[]const u8 = null,
     report_scroll_offsets: std.StringHashMapUnmanaged(u32) = .{},
 
@@ -18,10 +20,12 @@ pub const ExtensionUiState = struct {
             .allocator = allocator,
             .report_text = text_mod.Text.init(allocator),
             .message_text = text_mod.Text.init(allocator),
+            .surface = framebuffer_surface_mod.FramebufferSurface.init(allocator),
         };
     }
 
     pub fn deinit(self: *ExtensionUiState) void {
+        self.surface.deinit();
         self.message_text.deinit();
         self.clearReportScrollState();
         self.report_text.deinit();
@@ -33,6 +37,10 @@ pub const ExtensionUiState = struct {
 
     pub fn messageComponent(self: *ExtensionUiState) Component {
         return self.message_text.component();
+    }
+
+    pub fn surfaceComponent(self: *ExtensionUiState) Component {
+        return self.surface.component();
     }
 
     pub fn applyReport(self: *ExtensionUiState, report: extension_ui.Report) void {
@@ -57,6 +65,14 @@ pub const ExtensionUiState = struct {
         defer self.allocator.free(text);
         self.report_text.setContent(text);
         self.report_text.scroll_offset = 0;
+    }
+
+    pub fn applySurfaceUpdate(self: *ExtensionUiState, update: extension_ui.SurfaceUpdate) void {
+        self.surface.apply(update);
+    }
+
+    pub fn keyboardSurfaceId(self: *const ExtensionUiState) ?[]const u8 {
+        return self.surface.keyboardSurfaceId();
     }
 
     fn saveCurrentReportScrollOffset(self: *ExtensionUiState) void {

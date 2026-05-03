@@ -630,6 +630,10 @@ pub const AgentSession = struct {
         return self.pending_extension_ui.takeUiPublications(allocator);
     }
 
+    pub fn takePendingExtensionSurfaceUpdates(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.SurfaceUpdate {
+        return self.pending_extension_ui.takeSurfaceUpdates(allocator);
+    }
+
     pub fn takePendingExtensionEditorActions(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.EditorAction {
         return self.pending_extension_ui.takeEditorActions(allocator);
     }

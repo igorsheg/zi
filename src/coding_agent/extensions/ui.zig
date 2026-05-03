@@ -196,6 +196,178 @@ pub const UiPublication = struct {
     }
 };
 
+pub const SurfaceFormat = enum {
+    rgba8888,
+};
+
+pub const SurfaceOpen = struct {
+    state_owner_id: []const u8,
+    generation: u64,
+    id: []const u8,
+    title: []const u8,
+    width: u32,
+    height: u32,
+    format: SurfaceFormat = .rgba8888,
+    wants_keyboard: bool = false,
+
+    pub fn clone(allocator: std.mem.Allocator, open: SurfaceOpen) !SurfaceOpen {
+        return .{
+            .state_owner_id = try allocator.dupe(u8, open.state_owner_id),
+            .generation = open.generation,
+            .id = try allocator.dupe(u8, open.id),
+            .title = try allocator.dupe(u8, open.title),
+            .width = open.width,
+            .height = open.height,
+            .format = open.format,
+            .wants_keyboard = open.wants_keyboard,
+        };
+    }
+
+    pub fn deinit(self: *SurfaceOpen, allocator: std.mem.Allocator) void {
+        allocator.free(self.state_owner_id);
+        allocator.free(self.id);
+        allocator.free(self.title);
+        self.* = undefined;
+    }
+};
+
+pub const SurfaceFrame = struct {
+    state_owner_id: []const u8,
+    generation: u64,
+    id: []const u8,
+    width: u32,
+    height: u32,
+    format: SurfaceFormat = .rgba8888,
+    data: []const u8,
+
+    pub fn clone(allocator: std.mem.Allocator, frame: SurfaceFrame) !SurfaceFrame {
+        return .{
+            .state_owner_id = try allocator.dupe(u8, frame.state_owner_id),
+            .generation = frame.generation,
+            .id = try allocator.dupe(u8, frame.id),
+            .width = frame.width,
+            .height = frame.height,
+            .format = frame.format,
+            .data = try allocator.dupe(u8, frame.data),
+        };
+    }
+
+    pub fn deinit(self: *SurfaceFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.state_owner_id);
+        allocator.free(self.id);
+        allocator.free(self.data);
+        self.* = undefined;
+    }
+};
+
+pub const SurfaceClose = struct {
+    state_owner_id: []const u8,
+    generation: u64,
+    id: []const u8,
+
+    pub fn clone(allocator: std.mem.Allocator, close: SurfaceClose) !SurfaceClose {
+        return .{
+            .state_owner_id = try allocator.dupe(u8, close.state_owner_id),
+            .generation = close.generation,
+            .id = try allocator.dupe(u8, close.id),
+        };
+    }
+
+    pub fn deinit(self: *SurfaceClose, allocator: std.mem.Allocator) void {
+        allocator.free(self.state_owner_id);
+        allocator.free(self.id);
+        self.* = undefined;
+    }
+};
+
+pub const JobEventKind = enum { stdout, stderr, exit };
+
+pub const JobEvent = struct {
+    id: u64,
+    kind: JobEventKind,
+    data: ?[]const u8 = null,
+    code: ?i64 = null,
+
+    pub fn clone(allocator: std.mem.Allocator, event: JobEvent) !JobEvent {
+        return .{
+            .id = event.id,
+            .kind = event.kind,
+            .data = if (event.data) |data| try allocator.dupe(u8, data) else null,
+            .code = event.code,
+        };
+    }
+
+    pub fn deinit(self: *JobEvent, allocator: std.mem.Allocator) void {
+        if (self.data) |data| allocator.free(data);
+        self.* = undefined;
+    }
+};
+
+pub const SurfaceInput = struct {
+    id: []const u8,
+    kind: []const u8 = "key",
+    action: []const u8 = "press",
+    key: []const u8,
+    text: ?[]const u8 = null,
+    ctrl: bool = false,
+    alt: bool = false,
+    shift: bool = false,
+
+    pub fn clone(allocator: std.mem.Allocator, input: SurfaceInput) !SurfaceInput {
+        const id = try allocator.dupe(u8, input.id);
+        errdefer allocator.free(id);
+        const kind = try allocator.dupe(u8, input.kind);
+        errdefer allocator.free(kind);
+        const action = try allocator.dupe(u8, input.action);
+        errdefer allocator.free(action);
+        const key = try allocator.dupe(u8, input.key);
+        errdefer allocator.free(key);
+        const text = if (input.text) |value| try allocator.dupe(u8, value) else null;
+        return .{
+            .id = id,
+            .kind = kind,
+            .action = action,
+            .key = key,
+            .text = text,
+            .ctrl = input.ctrl,
+            .alt = input.alt,
+            .shift = input.shift,
+        };
+    }
+
+    pub fn deinit(self: *SurfaceInput, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.kind);
+        allocator.free(self.action);
+        allocator.free(self.key);
+        if (self.text) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const SurfaceUpdate = union(enum) {
+    open: SurfaceOpen,
+    frame: SurfaceFrame,
+    close: SurfaceClose,
+
+    pub fn clone(allocator: std.mem.Allocator, update: SurfaceUpdate) !SurfaceUpdate {
+        return switch (update) {
+            .open => |open| .{ .open = try SurfaceOpen.clone(allocator, open) },
+            .frame => |frame| .{ .frame = try SurfaceFrame.clone(allocator, frame) },
+            .close => |close| .{ .close = try SurfaceClose.clone(allocator, close) },
+        };
+    }
+
+    pub fn deinit(self: *SurfaceUpdate, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .open => |*open| open.deinit(allocator),
+            .frame => |*frame| frame.deinit(allocator),
+            .close => |*close| close.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const ReportFormat = enum {
     text,
 };

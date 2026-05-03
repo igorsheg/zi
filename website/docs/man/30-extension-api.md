@@ -26,6 +26,15 @@ Prefer small tools, explicit names, and behavior that will still make sense in a
 `zi.system(argv, opts?)`
 : Run an argv-style system command through the extension async scheduler. Captures bounded stdout/stderr and returns a structured result.
 
+`zi.job.start({ argv, cwd?, stdout? })`
+: Start a long-running host job and return `{ id }`. By default, job stdout/stderr/exit are delivered through `job_stdout`, `job_stderr`, and `job_exit` events. For framebuffer helpers, `stdout = { mode = "surface_frame", surface = "surface-id", max_frame_bytes? }` decodes `FRAME <width> <height> <byte_len>\n<rgba bytes>` records in the host and publishes complete RGBA frames directly to the named surface instead of emitting `job_stdout` chunks.
+
+`zi.job.write(id_or_job, data)`
+: Write a string to a job's stdin stream.
+
+`zi.job.stop(id_or_job)`
+: Request job termination.
+
 ## Tools
 
 Tools are definition-first. A tool definition is the unit zi exposes to the model. Keep each tool narrow: one clear name, one clear parameter shape, one readable result. Tool handlers receive the shared [context object](context.html#context-object).
@@ -215,6 +224,12 @@ Supported event names include:
 
 `session_before_tree`, `session_tree`
 : Pre/post tree navigation events.
+
+`surface_input`
+: Observe keyboard input routed to a focused extension surface. The payload includes `id`, `kind = "key"`, `action = "press"`, `key`, optional `text`, and modifier booleans. Input is scoped to the focused surface; zi keeps host-owned escape/unfocus behavior.
+
+`job_stdout`, `job_stderr`, `job_exit`
+: Observe output and exit lifecycle for jobs started with `zi.job.start`. Output events include `id`, `kind`, and `data`; exit events include `id`, `kind = "exit"`, and optional `code`.
 
 `model_select`
 : Observe model selection changes.

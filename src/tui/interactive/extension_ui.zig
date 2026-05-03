@@ -13,6 +13,12 @@ pub fn publishPending(self: *Interactive) void {
     } else {
         self.msg_allocator.free(updates);
     }
+    const surface_updates = self.runtime_host.takePendingExtensionSurfaceUpdates(self.msg_allocator);
+    if (surface_updates.len > 0) {
+        _ = self.publishLifecycleUiEvent(.{ .extension_surface_updated = .{ .updates = surface_updates } });
+    } else {
+        self.msg_allocator.free(surface_updates);
+    }
     const actions = self.runtime_host.takePendingExtensionEditorActions(self.msg_allocator);
     if (actions.len > 0) {
         _ = self.publishLifecycleUiEvent(.{ .extension_editor_actions = .{ .actions = actions } });
@@ -46,6 +52,29 @@ pub fn applyPublications(self: *Interactive, updates: []const extension_ui.UiPub
             .progress => self.extension_ui_state.applyProgress(update),
         }
     }
+    self.tui.dirty = true;
+}
+
+pub fn applySurfaceUpdates(self: *Interactive, updates: []const extension_ui.SurfaceUpdate) void {
+    var focus_surface = false;
+    var close_focused_surface = false;
+    const surface_component = self.extension_ui_state.surfaceComponent();
+    for (updates) |update| {
+        switch (update) {
+            .open => |open| {
+                if (open.wants_keyboard) focus_surface = true;
+            },
+            .close => {
+                if (self.tui.focus.current) |focused| {
+                    if (@import("../component.zig").Component.eql(focused, surface_component)) close_focused_surface = true;
+                }
+            },
+            .frame => {},
+        }
+        self.extension_ui_state.applySurfaceUpdate(update);
+    }
+    if (close_focused_surface) self.tui.setFocus(self.active_editor.component());
+    if (focus_surface) self.tui.setFocus(surface_component);
     self.tui.dirty = true;
 }
 

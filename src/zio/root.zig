@@ -15,6 +15,7 @@ pub const abort = struct {
 pub const mailbox = @import("mailbox.zig");
 pub const Mailbox = mailbox.Mailbox;
 pub const process = @import("process.zig");
+pub const job = @import("job.zig");
 pub const fs = @import("fs.zig");
 pub const worker = @import("worker.zig");
 pub const BlockingWorker = worker.BlockingWorker;

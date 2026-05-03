@@ -161,6 +161,16 @@ pub const RuntimeHost = struct {
         try runner.dispatchKeybinding(id);
     }
 
+    pub fn dispatchExtensionSurfaceInput(self: *RuntimeHost, input: extension_ui.SurfaceInput) !void {
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        try runner.dispatchSurfaceInput(input);
+    }
+
+    pub fn dispatchExtensionJobEvent(self: *RuntimeHost, event: extension_ui.JobEvent) !void {
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        try runner.dispatchJobEvent(event);
+    }
+
     pub fn dispatchToolExpandedChanged(self: *RuntimeHost, tool_name: []const u8, tool_call_id: []const u8, expanded: bool) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchToolExpandedChanged(tool_name, tool_call_id, expanded);
@@ -186,6 +196,10 @@ pub const RuntimeHost = struct {
 
     pub fn takePendingExtensionUiPublications(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.UiPublication {
         return self.session.takePendingExtensionUiPublications(allocator) catch allocator.alloc(extension_ui.UiPublication, 0) catch &.{};
+    }
+
+    pub fn takePendingExtensionSurfaceUpdates(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.SurfaceUpdate {
+        return self.session.takePendingExtensionSurfaceUpdates(allocator) catch allocator.alloc(extension_ui.SurfaceUpdate, 0) catch &.{};
     }
 
     pub fn takePendingExtensionEditorActions(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.EditorAction {

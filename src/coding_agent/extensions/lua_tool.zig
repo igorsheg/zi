@@ -1703,6 +1703,127 @@ test "extension command resumes after zi.system result" {
     try testing.expectEqualStrings("completed:7:out:err", ptr[0..len]);
 }
 
+test "extension job API starts writes and stops through dispatcher" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 41);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+
+    const Capture = struct {
+        started_id: ?u64 = null,
+        argv0: ?[]u8 = null,
+        cwd: ?[]u8 = null,
+        wrote_id: ?u64 = null,
+        wrote_data: ?[]u8 = null,
+        stopped_id: ?u64 = null,
+        stdout_surface: ?[]u8 = null,
+
+        fn submit(_: *anyopaque, _: *runner_mod.ExtensionRunner, async_start: runner_mod.AsyncStart) !void {
+            var owned = async_start;
+            defer owned.deinit(testing.allocator);
+        }
+        fn start(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, id: u64, request: runner_mod.JobStartRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var owned = request;
+            defer owned.deinit(testing.allocator);
+            self.started_id = id;
+            self.argv0 = try testing.allocator.dupe(u8, request.argv[0]);
+            if (request.cwd) |cwd| self.cwd = try testing.allocator.dupe(u8, cwd);
+            switch (request.stdout) {
+                .events => {},
+                .surface_frame => |frame| self.stdout_surface = try testing.allocator.dupe(u8, frame.surface_id),
+            }
+        }
+        fn write(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, id: u64, data: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.wrote_id = id;
+            self.wrote_data = try testing.allocator.dupe(u8, data);
+        }
+        fn stop(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, id: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stopped_id = id;
+        }
+    };
+    var capture = Capture{};
+    defer {
+        if (capture.argv0) |value| testing.allocator.free(value);
+        if (capture.cwd) |value| testing.allocator.free(value);
+        if (capture.wrote_data) |value| testing.allocator.free(value);
+        if (capture.stdout_surface) |value| testing.allocator.free(value);
+    }
+    runner.async_dispatcher = .{
+        .ptr = @ptrCast(&capture),
+        .submit = &Capture.submit,
+        .job_start = &Capture.start,
+        .job_write = &Capture.write,
+        .job_stop = &Capture.stop,
+    };
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    try state.doString(
+        \\zi.register_command({
+        \\  name = "job-api",
+        \\  handler = function(_, ctx)
+        \\    local job = zi.job.start({ argv = { "/bin/cat" }, cwd = ctx.cwd, stdout = { mode = "surface_frame", surface = "doom-demo" } })
+        \\    zi.job.write(job, "KEY left\n")
+        \\    zi.job.stop(job.id)
+        \\  end,
+        \\})
+    , "register_job_api_command");
+    runner.endLoadContext();
+
+    try runner.dispatchCommand("job-api", "");
+    try testing.expectEqual(@as(?u64, 1), capture.started_id);
+    try testing.expectEqualStrings("/bin/cat", capture.argv0 orelse return error.MissingJobArgv);
+    try testing.expectEqualStrings(".", capture.cwd orelse return error.MissingJobCwd);
+    try testing.expectEqualStrings("doom-demo", capture.stdout_surface orelse return error.MissingJobStdoutSurface);
+    try testing.expectEqual(@as(?u64, 1), capture.wrote_id);
+    try testing.expectEqualStrings("KEY left\n", capture.wrote_data orelse return error.MissingJobWrite);
+    try testing.expectEqual(@as(?u64, 1), capture.stopped_id);
+}
+
+test "extension job events dispatch to lua observers" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 42);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\job_seen = ""
+        \\zi.on("job_stdout", function(event) job_seen = job_seen .. event.id .. ":" .. event.data end)
+        \\zi.on("job_exit", function(event) job_seen = job_seen .. ":exit=" .. event.code end)
+    , "register_job_event_handlers");
+
+    try runner.dispatchJobEvent(.{ .id = 7, .kind = .stdout, .data = "hello" });
+    try runner.dispatchJobEvent(.{ .id = 7, .kind = .exit, .code = 0 });
+
+    _ = c.lua_getglobal(state.L, "job_seen");
+    defer c.lua_pop(state.L, 1);
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(state.L, -1, &len) orelse return error.MissingJobSeen;
+    try testing.expectEqualStrings("7:hello:exit=0", ptr[0..len]);
+}
+
 test "extension command resumes after ai completion result" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();

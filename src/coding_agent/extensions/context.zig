@@ -25,7 +25,7 @@ pub fn pushExtensionContext(
     c.lua_setfield(L, -2, "cwd");
 
     const has_ui = switch (runner.runtime) {
-        .bound => |bound| bound.ui != null or bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_editor_action != null,
+        .bound => |bound| bound.ui != null or bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_surface_update != null or bound.publish_editor_action != null,
         .stub => false,
     };
     c.lua_pushboolean(L, if (has_ui) 1 else 0);
@@ -111,7 +111,7 @@ fn pushUiApi(
     };
 
     const has_methods = switch (runner.runtime) {
-        .bound => |bound| bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_editor_action != null,
+        .bound => |bound| bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_surface_update != null or bound.publish_editor_action != null,
         .stub => false,
     };
     if (!has_methods) {
@@ -147,6 +147,14 @@ fn pushUiApi(
         c.lua_setfield(L, -2, "status");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiProgress);
         c.lua_setfield(L, -2, "progress");
+    }
+    if (runner.runtime.bound.publish_surface_update != null) {
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSurfaceOpen);
+        c.lua_setfield(L, -2, "surface_open");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSurfaceFrame);
+        c.lua_setfield(L, -2, "surface_frame");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSurfaceClose);
+        c.lua_setfield(L, -2, "surface_close");
     }
 }
 
@@ -221,6 +229,24 @@ fn ctxUiStatus(L_opt: ?*c.lua_State) callconv(.c) c_int {
 fn ctxUiProgress(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     publishProgressFromArgs(L) catch {};
+    return 0;
+}
+
+fn ctxUiSurfaceOpen(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    publishSurfaceOpenFromArgs(L) catch {};
+    return 0;
+}
+
+fn ctxUiSurfaceFrame(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    publishSurfaceFrameFromArgs(L) catch {};
+    return 0;
+}
+
+fn ctxUiSurfaceClose(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    publishSurfaceCloseFromArgs(L) catch {};
     return 0;
 }
 
@@ -305,6 +331,79 @@ fn publishProgressFromArgs(L: *c.lua_State) !void {
     try callback(bound.session, update);
 }
 
+fn publishSurfaceOpenFromArgs(L: *c.lua_State) !void {
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
+    const runner = stateRunnerFromUpvalue(L);
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
+    const callback = bound.publish_surface_update orelse return;
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const spec_idx = c.lua_absindex(L, 1);
+    const open = extension_ui.SurfaceOpen{
+        .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
+        .generation = runner.generation,
+        .id = try readStringField(aa, L, spec_idx, "id", "surface"),
+        .title = try readStringField(aa, L, spec_idx, "title", "surface"),
+        .width = readU32Field(L, spec_idx, "width", 1),
+        .height = readU32Field(L, spec_idx, "height", 1),
+        .format = readSurfaceFormat(L, spec_idx),
+        .wants_keyboard = readInputKeyboard(L, spec_idx),
+    };
+    try callback(bound.session, .{ .open = open });
+}
+
+fn publishSurfaceFrameFromArgs(L: *c.lua_State) !void {
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
+    const runner = stateRunnerFromUpvalue(L);
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
+    const callback = bound.publish_surface_update orelse return;
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const spec_idx = c.lua_absindex(L, 1);
+    _ = c.lua_getfield(L, spec_idx, "data");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return;
+    const data = try dupeLuaString(aa, L, -1);
+    const frame = extension_ui.SurfaceFrame{
+        .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
+        .generation = runner.generation,
+        .id = try readStringField(aa, L, spec_idx, "id", "surface"),
+        .width = readU32Field(L, spec_idx, "width", 1),
+        .height = readU32Field(L, spec_idx, "height", 1),
+        .format = readSurfaceFormat(L, spec_idx),
+        .data = data,
+    };
+    try callback(bound.session, .{ .frame = frame });
+}
+
+fn publishSurfaceCloseFromArgs(L: *c.lua_State) !void {
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
+    const runner = stateRunnerFromUpvalue(L);
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
+    const callback = bound.publish_surface_update orelse return;
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const spec_idx = c.lua_absindex(L, 1);
+    const close = extension_ui.SurfaceClose{
+        .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
+        .generation = runner.generation,
+        .id = try readStringField(aa, L, spec_idx, "id", "surface"),
+    };
+    try callback(bound.session, .{ .close = close });
+}
+
 fn readMessageId(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]const u8 {
     if (c.lua_type(L, idx) != c.LUA_TTABLE) return try arena.dupe(u8, "default");
     return try readStringField(arena, L, idx, "id", "default");
@@ -341,6 +440,35 @@ fn readOptionalNumberField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?i6
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TNUMBER) return null;
     return @intFromFloat(c.lua_tonumberx(L, -1, null));
+}
+
+fn readU32Field(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: u32) u32 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TNUMBER) return default;
+    const raw = c.lua_tointegerx(L, -1, null);
+    if (raw <= 0) return default;
+    return @intCast(@min(raw, 4096));
+}
+
+fn readSurfaceFormat(L: *c.lua_State, idx: c_int) extension_ui.SurfaceFormat {
+    _ = c.lua_getfield(L, idx, "format");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .rgba8888;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return .rgba8888;
+    const value = ptr[0..len];
+    if (std.mem.eql(u8, value, "rgba8888")) return .rgba8888;
+    return .rgba8888;
+}
+
+fn readInputKeyboard(L: *c.lua_State, idx: c_int) bool {
+    _ = c.lua_getfield(L, idx, "input");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) return false;
+    _ = c.lua_getfield(L, -1, "keyboard");
+    defer c.lua_pop(L, 1);
+    return c.lua_toboolean(L, -1) != 0;
 }
 
 fn readUiLifetime(L: *c.lua_State, idx: c_int) !extension_ui.UiLifetime {

@@ -225,6 +225,8 @@ pub const AgentRequest = union(enum) {
     extension_keybinding: struct {
         id: []const u8,
     },
+    extension_surface_input: extension_ui.SurfaceInput,
+    extension_job_event: extension_ui.JobEvent,
     extension_oauth_login: struct {
         provider_id: []const u8,
         callbacks: ExtensionOAuthLoginCallbacks,
@@ -263,6 +265,8 @@ pub const AgentRequest = union(enum) {
                 allocator.free(ec.args);
             },
             .extension_keybinding => |ek| allocator.free(ek.id),
+            .extension_surface_input => |*input| input.deinit(allocator),
+            .extension_job_event => |*event| event.deinit(allocator),
             .extension_oauth_login => |oauth| allocator.free(oauth.provider_id),
             .extension_oauth_refresh => |oauth| {
                 allocator.free(oauth.provider_id);
