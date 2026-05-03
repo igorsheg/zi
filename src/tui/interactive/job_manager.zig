@@ -200,19 +200,38 @@ const FrameDecoder = struct {
             _ = self.buffer.orderedRemove(0);
             return true;
         }
-        const width = std.fmt.parseInt(u32, parts.next() orelse return error.InvalidFrameHeader, 10) catch {
+        const width_text = parts.next() orelse {
             _ = self.buffer.orderedRemove(0);
             return true;
         };
-        const height = std.fmt.parseInt(u32, parts.next() orelse return error.InvalidFrameHeader, 10) catch {
+        const width = std.fmt.parseInt(u32, width_text, 10) catch {
             _ = self.buffer.orderedRemove(0);
             return true;
         };
-        const len = std.fmt.parseInt(usize, parts.next() orelse return error.InvalidFrameHeader, 10) catch {
+        const height_text = parts.next() orelse {
             _ = self.buffer.orderedRemove(0);
             return true;
         };
-        if (len > self.max_frame_bytes) return error.FrameTooLarge;
+        const height = std.fmt.parseInt(u32, height_text, 10) catch {
+            _ = self.buffer.orderedRemove(0);
+            return true;
+        };
+        const len_text = parts.next() orelse {
+            _ = self.buffer.orderedRemove(0);
+            return true;
+        };
+        const len = std.fmt.parseInt(usize, len_text, 10) catch {
+            _ = self.buffer.orderedRemove(0);
+            return true;
+        };
+        const expected_len = rgbaFrameBytes(width, height) orelse {
+            _ = self.buffer.orderedRemove(0);
+            return true;
+        };
+        if (len != expected_len or len > self.max_frame_bytes) {
+            _ = self.buffer.orderedRemove(0);
+            return true;
+        }
         if (self.buffer.items.len < newline + 1 + len) return false;
 
         const payload_start = newline + 1;
@@ -234,6 +253,12 @@ const FrameDecoder = struct {
         return true;
     }
 };
+
+fn rgbaFrameBytes(width: u32, height: u32) ?usize {
+    if (width == 0 or height == 0) return null;
+    const pixels = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
+    return std.math.mul(usize, pixels, 4) catch null;
+}
 
 const testing = std.testing;
 
@@ -287,6 +312,33 @@ test "surface frame stdout adapter preserves frames split across chunks" {
     try testing.expectEqual(@as(u32, 1), frame.height);
     try testing.expectEqualStrings("abcdefgh", frame.data);
     try testing.expectEqual(@as(usize, 0), queue.pendingDepth());
+}
+
+test "surface frame stdout adapter validates rgba byte length and resyncs" {
+    var queue = try request_mod.RequestQueue.init(testing.allocator);
+    defer queue.deinit();
+    var sink = TestSurfaceSink{ .allocator = testing.allocator };
+    defer sink.deinit();
+    var state = JobManager.State{
+        .allocator = testing.allocator,
+        .request_queue = &queue,
+        .surface_sink = .{ .ptr = @ptrCast(&sink), .submit = &TestSurfaceSink.submit },
+    };
+    defer state.deinit();
+    var decoder = try FrameDecoder.init(testing.allocator, .{
+        .surface_id = "doom-demo",
+        .state_owner_id = "extension.lua",
+        .generation = 9,
+        .max_frame_bytes = 32,
+    });
+    defer decoder.deinit(testing.allocator);
+
+    try decoder.accept(&state, 1, "FRAME 2 1 7\nbadbad!FRAME 1 1 4\ngood");
+
+    try testing.expectEqual(@as(usize, 1), sink.frames.items.len);
+    try testing.expectEqual(@as(u32, 1), sink.frames.items[0].width);
+    try testing.expectEqual(@as(u32, 1), sink.frames.items[0].height);
+    try testing.expectEqualStrings("good", sink.frames.items[0].data);
 }
 
 test "job manager routes configured stdout frames to the surface sink" {

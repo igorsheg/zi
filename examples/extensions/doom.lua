@@ -89,6 +89,7 @@ zi.register_command({
       cwd = ctx.cwd,
       stdout = {
         mode = "surface_frame",
+        protocol = "zi-rgba-frame-v1",
         surface = surface_id,
         max_frame_bytes = 96 * 54 * 4 + 64,
       },

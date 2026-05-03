@@ -103,6 +103,9 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
         const mode = try readStringField(allocator, L, stdout_idx, "mode", "events");
         defer allocator.free(mode);
         if (std.mem.eql(u8, mode, "surface_frame")) {
+            const protocol = try readStringField(allocator, L, stdout_idx, "protocol", "zi-rgba-frame-v1");
+            defer allocator.free(protocol);
+            if (!std.mem.eql(u8, protocol, "zi-rgba-frame-v1")) return error.InvalidOptions;
             const runner = runnerFromUpvalue(L);
             const source = runner.currentLoadSource();
             const surface_id = try readStringField(allocator, L, stdout_idx, "surface", "surface");
@@ -115,6 +118,8 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
                 .generation = runner.generation,
                 .max_frame_bytes = @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", 16 * 1024 * 1024)),
             } };
+        } else if (!std.mem.eql(u8, mode, "events")) {
+            return error.InvalidOptions;
         }
     }
     return request;

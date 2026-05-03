@@ -27,7 +27,7 @@ Prefer small tools, explicit names, and behavior that will still make sense in a
 : Run an argv-style system command through the extension async scheduler. Captures bounded stdout/stderr and returns a structured result.
 
 `zi.job.start({ argv, cwd?, stdout? })`
-: Start a long-running host job and return `{ id }`. By default, job stdout/stderr/exit are delivered through `job_stdout`, `job_stderr`, and `job_exit` events. For framebuffer helpers, `stdout = { mode = "surface_frame", surface = "surface-id", max_frame_bytes? }` decodes `FRAME <width> <height> <byte_len>\n<rgba bytes>` records in the host and publishes complete RGBA frames directly to the named surface instead of emitting `job_stdout` chunks.
+: Start a long-running host job and return `{ id }`. By default, job stdout/stderr/exit are delivered through `job_stdout`, `job_stderr`, and `job_exit` events. For framebuffer helpers, `stdout = { mode = "surface_frame", protocol = "zi-rgba-frame-v1", surface = "surface-id", max_frame_bytes? }` decodes `FRAME <width> <height> <byte_len>\n<rgba bytes>` records in the host and publishes complete RGBA frames directly to the named surface instead of emitting `job_stdout` chunks. `zi-rgba-frame-v1` requires non-zero dimensions and `byte_len == width * height * 4`; malformed records are skipped/resynchronized.
 
 `zi.job.write(id_or_job, data)`
 : Write a string to a job's stdin stream.
