@@ -173,7 +173,8 @@ pub const ProjectionState = struct {
         }
 
         const must_reset_history = if (self.view_snapshot) |previous|
-            !committedUserHistoryIsPrefix(previous.view.committed.flat, owned.view.committed.flat)
+            previous.view.committed != owned.view.committed and
+                !committedUserHistoryIsPrefix(previous.view.committed.flat, owned.view.committed.flat)
         else
             false;
         const can_reuse_committed_cache = self.canReuseCommittedCacheFor(owned.view.committed, options.retry_attempt);
@@ -217,7 +218,7 @@ pub const ProjectionState = struct {
 
         if (use_committed_cache) {
             const cache = &self.committed_cache.?;
-            var desired_items = buildDesiredItemsFromCommittedCache(
+            var transient_items = buildTransientDesiredItems(
                 allocator,
                 resolver,
                 transcript,
@@ -225,15 +226,17 @@ pub const ProjectionState = struct {
                 self.queued_snapshot,
                 options,
                 transcript.hide_thinking_block,
-                cache.items,
             ) catch return;
             defer {
-                for (desired_items.items) |*item| item.deinit(allocator);
-                desired_items.deinit(allocator);
+                for (transient_items.items) |*item| item.deinit(allocator);
+                transient_items.deinit(allocator);
             }
-            self.committed_cache_hits +%= 1;
-            reconcileDesiredItems(transcript, editor, &desired_items);
-            return;
+            if (reconcileTransientItemsAfterCommittedCache(transcript, editor, cache.items, &transient_items)) {
+                self.committed_cache_hits +%= 1;
+                return;
+            }
+            // Cache key matched but transcript rows were externally cleared or
+            // reordered. Fall through to the full rebuild path below.
         }
 
         var cache_builder: std.ArrayList(CachedCommittedItem) = .empty;
@@ -357,6 +360,39 @@ pub fn reconcileFromSnapshots(
     }
 
     reconcileDesiredItems(transcript, editor, &desired_items);
+}
+
+fn reconcileTransientItemsAfterCommittedCache(
+    transcript: *Transcript,
+    editor: EditorInterface,
+    cache_items: []const CachedCommittedItem,
+    transient_items: *std.ArrayList(DesiredItem),
+) bool {
+    if (!transcriptPrefixMatchesCommittedCache(transcript, cache_items)) return false;
+
+    transcript.truncateFrom(cache_items.len);
+    var index = cache_items.len;
+    for (transient_items.items, 0..) |desired, desired_idx| {
+        std.debug.assert(desired.row != null);
+        _ = transcript.insertItemAt(index, desired.row.?);
+        disarmDesiredRow(&transient_items.items[desired_idx]);
+        if (desired.seed_editor_history) {
+            if (desired.history_text) |history_text| editor.addToHistory(history_text.slice());
+        }
+        index += 1;
+    }
+    transcript.clearPendingToolRouting();
+    return true;
+}
+
+fn transcriptPrefixMatchesCommittedCache(transcript: *const Transcript, cache_items: []const CachedCommittedItem) bool {
+    if (transcript.items.items.len < cache_items.len) return false;
+    for (cache_items, 0..) |cached, idx| {
+        const item = transcript.items.items[idx];
+        if (item.retained_item_id == null or item.retained_item_id.? != cached.item_id) return false;
+        if (item.retained_semantic_version == null or item.retained_semantic_version.? != cached.semantic_version) return false;
+    }
+    return true;
 }
 
 fn reconcileDesiredItems(
@@ -499,10 +535,11 @@ fn buildDesiredItemsFull(
     return desired_items;
 }
 
-/// Fast path: seeds desired items from cached committed-prefix metadata
-/// (row = null, reconcile keeps the already-retained transcript row)
-/// and then appends transient items just like the full path.
-fn buildDesiredItemsFromCommittedCache(
+/// Fast path for unchanged committed snapshots: build only active/queued rows.
+/// The committed prefix is already retained in the transcript and represented
+/// by `CommittedProjectionCache.items`, so soft streaming updates avoid
+/// allocating one DesiredItem per historical row.
+fn buildTransientDesiredItems(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
     transcript: *Transcript,
@@ -510,7 +547,6 @@ fn buildDesiredItemsFromCommittedCache(
     queued: ?control_mod.QueuedMessageSnapshot,
     options: RebuildOptions,
     hide_thinking_block: bool,
-    cache_items: []const CachedCommittedItem,
 ) !std.ArrayList(DesiredItem) {
     var desired_items: std.ArrayList(DesiredItem) = .empty;
     errdefer {
@@ -525,14 +561,6 @@ fn buildDesiredItemsFromCommittedCache(
             try live_tool_ids.append(allocator, tool.tool_call_id);
         }
     };
-
-    try desired_items.ensureTotalCapacity(allocator, cache_items.len);
-    for (cache_items) |cached| {
-        desired_items.appendAssumeCapacity(.{
-            .item_id = cached.item_id,
-            .semantic_version = cached.semantic_version,
-        });
-    }
 
     try appendTransientDesiredItems(
         allocator,
@@ -581,7 +609,7 @@ fn appendCommittedDesiredItems(
                             tool_call,
                             assistant,
                             findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
-                            findRenderedToolRender(view.view.rendered_tool_renders, tool_call.id),
+                            view.view.rendered_tool_renders,
                             options,
                         ),
                     );
@@ -742,7 +770,7 @@ fn buildCommittedToolCallDesiredItem(
     tool_call: agent_protocol.ToolCall,
     assistant: agent_protocol.AssistantMessage,
     result_message: ?agent_protocol.ToolResultMessage,
-    rendered: RenderedToolRender,
+    rendered_entries: []conversation_state_mod.RenderedToolRenderEntry,
     options: RebuildOptions,
 ) !DesiredItem {
     const item_id = toolExecutionId(tool_call.id);
@@ -750,6 +778,7 @@ fn buildCommittedToolCallDesiredItem(
     if (transcript.hasRetainedMatch(item_id, semantic_version)) {
         return .{ .item_id = item_id, .semantic_version = semantic_version };
     }
+    const rendered = findRenderedToolRender(rendered_entries, tool_call.id);
     var row = try createCommittedToolCallRow(
         allocator,
         resolver,

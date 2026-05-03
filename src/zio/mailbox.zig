@@ -326,6 +326,45 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             self.reconcileStateAndWakeLocked();
         }
 
+        /// Drop queued items matching `predicate`, cleaning each dropped item.
+        /// Preserves FIFO order for the remaining items. Useful for latest-wins
+        /// semantic snapshots where queued stale states should not retain large
+        /// payloads while the consumer is busy. If temporary storage cannot be
+        /// allocated, leaves the mailbox unchanged and returns 0.
+        pub fn dropMatching(
+            self: *Self,
+            predicate: *const fn (item: *const T, ctx: ?*anyopaque) bool,
+            ctx: ?*anyopaque,
+        ) usize {
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
+
+            if (self.queue.len == 0) return 0;
+            const original_len = self.queue.len;
+            const snapshot = self.allocator.alloc(T, original_len) catch return 0;
+            defer self.allocator.free(snapshot);
+
+            for (0..original_len) |i| snapshot[i] = self.queue.itemPtr(i).*;
+
+            var kept: usize = 0;
+            var dropped: usize = 0;
+            for (snapshot) |item| {
+                if (predicate(&item, ctx)) {
+                    var mutable = item;
+                    Self.cleanupItem(&mutable, self.allocator);
+                    dropped += 1;
+                } else {
+                    self.queue.storage.items[kept] = item;
+                    kept += 1;
+                }
+            }
+            self.queue.head = 0;
+            self.queue.len = kept;
+            self.dropped_count += dropped;
+            self.reconcileStateAndWakeLocked();
+            return dropped;
+        }
+
         pub fn clear(self: *Self) void {
             self.mutex.lockUncancelable(std.Options.debug_io);
             defer self.mutex.unlock(std.Options.debug_io);
@@ -588,6 +627,46 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
     const n = drop_box.drainInto(&out);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u32, 11), out[0].value);
+}
+
+test "Mailbox dropMatching cleans matches and preserves FIFO order" {
+    const Msg = struct { value: u32 };
+    const CleanupState = struct {
+        var cleaned: usize = 0;
+        fn cleanup(item: *anyopaque, _: std.mem.Allocator) void {
+            const msg: *Msg = @ptrCast(@alignCast(item));
+            _ = msg;
+            cleaned += 1;
+        }
+        fn isEven(item: *const Msg, _: ?*anyopaque) bool {
+            return item.value % 2 == 0;
+        }
+    };
+
+    CleanupState.cleaned = 0;
+    var mailbox = try Mailbox(Msg, .{ .cleanup = .{ .custom = &CleanupState.cleanup } }).init(std.testing.allocator);
+    defer mailbox.deinit();
+
+    for (1..6) |i| try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = @intCast(i) }));
+    try std.testing.expectEqual(@as(usize, 2), mailbox.dropMatching(&CleanupState.isEven, null));
+    try std.testing.expectEqual(@as(usize, 2), CleanupState.cleaned);
+
+    var out: [4]Msg = undefined;
+    const n = mailbox.drainInto(&out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3, 5 }, &[_]u32{ out[0].value, out[1].value, out[2].value });
+
+    for (10..18) |i| try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = @intCast(i) }));
+    var partial: [3]Msg = undefined;
+    try std.testing.expectEqual(@as(usize, 3), mailbox.drainInto(&partial));
+    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 18 }));
+    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 19 }));
+    try std.testing.expectEqual(@as(usize, 3), mailbox.dropMatching(&CleanupState.isEven, null));
+
+    var wrapped_out: [8]Msg = undefined;
+    const wrapped_n = mailbox.drainInto(&wrapped_out);
+    try std.testing.expectEqual(@as(usize, 4), wrapped_n);
+    try std.testing.expectEqualSlices(u32, &.{ 13, 15, 17, 19 }, &[_]u32{ wrapped_out[0].value, wrapped_out[1].value, wrapped_out[2].value, wrapped_out[3].value });
 }
 
 test "Mailbox coalesces pipe wake readiness until the queue drains" {

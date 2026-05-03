@@ -105,7 +105,20 @@ pub const SharedCommitted = struct {
         old: *SharedCommitted,
         message: protocol.AgentMessage,
     ) !*SharedCommitted {
-        const new_seg = try CommittedSegment.init(parent_allocator, &[_]protocol.AgentMessage{message});
+        return appendMessages(parent_allocator, old, &[_]protocol.AgentMessage{message});
+    }
+
+    /// Append a batch of messages as one immutable segment and rebuild the
+    /// shallow flat view once. Long sessions pay O(history) per committed
+    /// batch instead of once per assistant/tool-result message.
+    pub fn appendMessages(
+        parent_allocator: std.mem.Allocator,
+        old: *SharedCommitted,
+        messages: []const protocol.AgentMessage,
+    ) !*SharedCommitted {
+        if (messages.len == 0) return old.retain();
+
+        const new_seg = try CommittedSegment.init(parent_allocator, messages);
         errdefer new_seg.release();
 
         const seg_count = old.segments.len + 1;

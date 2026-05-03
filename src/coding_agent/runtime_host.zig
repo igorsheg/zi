@@ -21,6 +21,13 @@ const event_bridge = @import("extensions/event_bridge.zig");
 const lua_renderer = @import("extensions/lua_renderer.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
 
+/// Conversation snapshots are high-frequency, cross-thread payloads. Keep
+/// extension-rendered committed tool rows bounded so a slow TUI cannot retain
+/// `queue_depth * full_session_render_output` bytes. Older committed rows fall
+/// back to built-in rendering if they need to be rebuilt; live/in-flight tool
+/// rows are still rendered normally.
+const max_committed_rendered_tool_entries_per_snapshot: usize = 16;
+
 pub const QueueKind = control_mod.QueueKind;
 pub const EnqueueResult = control_mod.EnqueueResult;
 pub const QueuedMessageText = control_mod.QueuedMessageText;
@@ -537,19 +544,29 @@ pub const RuntimeHost = struct {
             rendered.deinit(self.msg_allocator);
         }
 
-        for (view.committed.flat, 0..) |message, index| {
+        var remaining_committed_renders = max_committed_rendered_tool_entries_per_snapshot;
+        var message_index = view.committed.flat.len;
+        while (message_index > 0 and remaining_committed_renders > 0) {
+            message_index -= 1;
+            const message = view.committed.flat[message_index];
             if (message != .assistant) continue;
             const assistant = message.assistant;
-            for (assistant.content) |block| {
+
+            var block_index = assistant.content.len;
+            while (block_index > 0 and remaining_committed_renders > 0) {
+                block_index -= 1;
+                const block = assistant.content[block_index];
                 if (block != .tool_call) continue;
                 const call = block.tool_call;
-                const result_message = findCommittedToolResultMessage(view.committed.flat[index + 1 ..], call.id);
-                const rendered_call = lua_renderer.dispatchRenderCall(self.msg_allocator, runner, .{
+                const result_message = findCommittedToolResultMessage(view.committed.flat[message_index + 1 ..], call.id);
+                var rendered_call = lua_renderer.dispatchRenderCall(self.msg_allocator, runner, .{
                     .tool_name = call.name,
                     .args = call.arguments,
                     .width = 120,
                 });
-                const rendered_result = if (result_message) |tool_result| blk: {
+                errdefer if (rendered_call) |r| r.deinit(self.msg_allocator);
+
+                var rendered_result = if (result_message) |tool_result| blk: {
                     const agent_result = toolResultMessageAsAgentToolResult(tool_result);
                     break :blk lua_renderer.dispatchRenderResultFromResult(self.msg_allocator, runner, .{
                         .tool_name = tool_result.tool_name,
@@ -559,14 +576,20 @@ pub const RuntimeHost = struct {
                         .is_error = tool_result.is_error,
                     });
                 } else null;
-                if (rendered_call == null and rendered_result == null) continue;
-                errdefer if (rendered_call) |r| r.deinit(self.msg_allocator);
                 errdefer if (rendered_result) |r| r.deinit(self.msg_allocator);
+
+                if (rendered_call == null and rendered_result == null) continue;
+                const tool_call_id = try self.msg_allocator.dupe(u8, call.id);
+                errdefer self.msg_allocator.free(tool_call_id);
+
                 try rendered.append(self.msg_allocator, .{
-                    .tool_call_id = try self.msg_allocator.dupe(u8, call.id),
+                    .tool_call_id = tool_call_id,
                     .rendered_call = rendered_call,
                     .rendered_result = rendered_result,
                 });
+                rendered_call = null;
+                rendered_result = null;
+                remaining_committed_renders -= 1;
             }
         }
 

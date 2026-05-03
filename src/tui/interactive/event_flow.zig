@@ -18,6 +18,7 @@ pub fn publish(self: *Interactive, event: UiEvent) bool {
 }
 
 pub fn publishSnapshot(self: *Interactive, event: UiEvent) bool {
+    coalescePendingSnapshot(self, event);
     switch (self.snapshot_event_queue.trySend(event)) {
         .ok => return true,
         .dropped => return false,
@@ -40,6 +41,27 @@ pub fn publishLifecycle(self: *Interactive, event: UiEvent) bool {
             return false;
         },
     }
+}
+
+fn coalescePendingSnapshot(self: *Interactive, event: UiEvent) void {
+    switch (event) {
+        .conversation_snapshot => _ = self.snapshot_event_queue.dropMatching(isConversationSnapshot, null),
+        .queued_snapshot => _ = self.snapshot_event_queue.dropMatching(isQueuedSnapshot, null),
+        .status_snapshot => _ = self.snapshot_event_queue.dropMatching(isStatusSnapshot, null),
+        else => {},
+    }
+}
+
+fn isConversationSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
+    return item.* == .conversation_snapshot;
+}
+
+fn isQueuedSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
+    return item.* == .queued_snapshot;
+}
+
+fn isStatusSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
+    return item.* == .status_snapshot;
 }
 
 pub fn logStats(comptime label: []const u8, stats: anytype) void {

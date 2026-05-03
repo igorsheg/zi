@@ -505,6 +505,37 @@ pub const Agent = struct {
         old.release();
     }
 
+    fn appendCommittedTurn(self: *Agent, assistant: protocol.AssistantMessage, tool_results: []const protocol.ToolResultMessage) void {
+        var stack_messages: [16]protocol.AgentMessage = undefined;
+        const batch = if (tool_results.len + 1 <= stack_messages.len) blk: {
+            stack_messages[0] = .{ .assistant = assistant };
+            for (tool_results, 0..) |tool_result, i| {
+                stack_messages[i + 1] = .{ .tool_result = tool_result };
+            }
+            break :blk stack_messages[0 .. tool_results.len + 1];
+        } else blk: {
+            const allocated = self.runtime_arena.allocator().alloc(protocol.AgentMessage, tool_results.len + 1) catch {
+                self.appendCommittedMessage(.{ .assistant = assistant });
+                for (tool_results) |tool_result| self.appendCommittedMessage(.{ .tool_result = tool_result });
+                return;
+            };
+            allocated[0] = .{ .assistant = assistant };
+            for (tool_results, 0..) |tool_result, i| {
+                allocated[i + 1] = .{ .tool_result = tool_result };
+            }
+            break :blk allocated;
+        };
+
+        const new_shared = SharedCommitted.appendMessages(
+            self.allocator,
+            self.shared_committed,
+            batch,
+        ) catch return;
+        const old = self.shared_committed;
+        self.shared_committed = new_shared;
+        old.release();
+    }
+
     fn runWithLifecycle(self: *Agent, prompt_messages: ?[]const protocol.AgentMessage, is_continue: bool, skip_initial_steering_poll: bool) void {
         self.is_running.store(true, .release);
         self.is_streaming = true;
@@ -633,10 +664,7 @@ pub const Agent = struct {
             self.appendCommittedMessage(message);
         }
         if (effects.turn_commit) |turn| {
-            self.appendCommittedMessage(.{ .assistant = turn.assistant });
-            for (turn.tool_results) |tool_result| {
-                self.appendCommittedMessage(.{ .tool_result = tool_result });
-            }
+            self.appendCommittedTurn(turn.assistant, turn.tool_results);
             if (turn.error_message) |error_message| {
                 self.error_message = self.history_arena.allocator().dupe(u8, error_message) catch error_message;
             }

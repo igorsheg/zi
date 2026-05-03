@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const name = "zi";
 pub const version = "0.0.1";
@@ -25,12 +24,14 @@ test "version line uses app metadata" {
 /// Keep this module small: it owns process-boundary choices that should be
 /// consistent across startup, not subsystem behavior. Focused runtime modules
 /// (`fs`, `process`, `mailbox`, ...) own behavior.
-pub const use_debug_allocator = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+pub const use_debug_allocator = false;
 
 /// Main process heap policy.
 ///
-/// Debug/Safe builds keep DebugAllocator diagnostics. Fast/Small builds use the
-/// lean stdlib SMP allocator so release startup does not pay debug bookkeeping.
+/// zi's interactive mode is long-lived and multi-threaded; the default process
+/// heap must stay fast and thread-safe even for `zig build run`. Use external
+/// leak tools / focused tests for deep allocator diagnostics rather than
+/// putting the whole TUI behind DebugAllocator bookkeeping.
 pub const MainHeap = struct {
     debug_allocator: if (use_debug_allocator) std.heap.DebugAllocator(.{}) else void = if (use_debug_allocator) .init else {},
 
@@ -40,7 +41,10 @@ pub const MainHeap = struct {
 
     pub fn deinit(self: *MainHeap) void {
         if (use_debug_allocator) {
-            _ = self.debug_allocator.deinit();
+            switch (self.debug_allocator.deinit()) {
+                .ok => {},
+                .leak => @panic("memory leak detected"),
+            }
         }
     }
 };

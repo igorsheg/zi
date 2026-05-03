@@ -3,7 +3,7 @@ RELEASE_FLAGS := -Doptimize=ReleaseFast -Dstrip=true
 WEB_OUT ?= ../zig-out/web
 WEB_PORT ?= 8027
 
-.PHONY: release install-release web web-open web-serve web-clean
+.PHONY: release install-release memory-test memory-smoke memory-leaks web web-open web-serve web-clean
 
 release:
 	zig build $(RELEASE_FLAGS)
@@ -18,6 +18,23 @@ install-release: release
 		   echo "Add this to your shell profile:"; \
 		   echo "  export PATH=\"$(BINDIR):\$$PATH\"" ;; \
 	esac
+
+memory-test:
+	zig build test --summary all
+
+memory-smoke:
+	zig build --summary all
+	./zig-out/bin/zi --version
+
+memory-leaks: memory-smoke
+	@if command -v leaks >/dev/null 2>&1; then \
+		leaks --atExit -- ./zig-out/bin/zi --version; \
+	elif command -v valgrind >/dev/null 2>&1; then \
+		valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all --track-origins=yes ./zig-out/bin/zi --version; \
+	else \
+		echo "Install macOS leaks or Linux valgrind for external leak checks."; \
+		exit 1; \
+	fi
 
 web:
 	@command -v zine >/dev/null 2>&1 || { \

@@ -22,17 +22,12 @@ pub fn main(init: std.process.Init) !void {
 
     const heap_allocator = main_heap.allocator();
 
-    // zi-wub.12: dedicated arena owned by the agent thread. Single
-    // owner during steady state — TUI thread only touches it during
-    // pre-spawn init (auth, settings, ca creation) and post-join
-    // deinit, never concurrently with the agent thread. Cross-thread
-    // payloads route through msg_allocator (zi-wub.9/.10), while the
-    // TUI keeps local state on its own tracked allocator/backing
-    // tracker (zi-wub.11), so the ThreadSafeAllocator band-aid (.13)
-    // is no longer needed.
-    var agent_arena = std.heap.ArenaAllocator.init(heap_allocator);
-    defer agent_arena.deinit();
-    const allocator = agent_arena.allocator();
+    // Interactive zi is a long-lived process. Do not hide general app
+    // allocations behind a process-lifetime arena: deinit/free paths must
+    // return memory to the process heap while the TUI is still running.
+    // Short-lived scratch lifetimes should create explicit local arenas at
+    // their actual boundary (parse/run/turn/frame/tool/etc.).
+    const allocator = heap_allocator;
 
     // Dedicated thread-safe allocator for cross-thread mailbox payloads
     // and mailbox backing storage (event queue, request queue,

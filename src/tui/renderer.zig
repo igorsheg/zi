@@ -9,6 +9,9 @@ const Attributes = cell_mod.Attributes;
 const Buffer = buffer_mod.Buffer;
 const Region = buffer_mod.Region;
 
+const min_retained_output_capacity: usize = 2 * 1024 * 1024;
+const max_retained_output_capacity: usize = 8 * 1024 * 1024;
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     current: Buffer,
@@ -109,6 +112,7 @@ pub const Renderer = struct {
         appendStr(self, ansi.sync_disable);
 
         writeAll(self.fd, self.output.items);
+        self.releaseOversizedOutputBuffer();
 
         std.mem.swap(Buffer, &self.current, &self.next);
         self.force_redraw = false;
@@ -124,6 +128,15 @@ pub const Renderer = struct {
 
     pub fn forceRedraw(self: *Renderer) void {
         self.force_redraw = true;
+    }
+
+    fn releaseOversizedOutputBuffer(self: *Renderer) void {
+        const frame_floor = @as(usize, self.width) * @as(usize, self.height) * 8;
+        const retain_capacity = @max(min_retained_output_capacity, frame_floor);
+        if (self.output.capacity <= @max(retain_capacity, max_retained_output_capacity)) return;
+        self.output.deinit(self.allocator);
+        self.output = .empty;
+        self.output.ensureTotalCapacity(self.allocator, retain_capacity) catch {};
     }
 };
 
@@ -244,6 +257,19 @@ test "Renderer begin exposes a cleared full-frame region" {
 
     reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'Y' } });
     try std.testing.expectEqual(@as(u21, 'Y'), r.next.get(0, 0).grapheme.codepoint);
+}
+
+test "Renderer releases oversized retained output buffer" {
+    var r = try Renderer.init(std.testing.allocator, std.posix.STDOUT_FILENO, 10, 5);
+    defer r.deinit();
+
+    r.output.deinit(std.testing.allocator);
+    r.output = .empty;
+    try r.output.ensureTotalCapacity(std.testing.allocator, max_retained_output_capacity + 1024);
+    try std.testing.expect(r.output.capacity > max_retained_output_capacity);
+
+    r.releaseOversizedOutputBuffer();
+    try std.testing.expect(r.output.capacity <= max_retained_output_capacity);
 }
 
 test "Renderer end writes a frame and promotes it to current" {
