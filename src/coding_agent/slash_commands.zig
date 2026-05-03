@@ -54,6 +54,7 @@ pub const BUILTIN_COMMANDS = [_]SlashCommand{
     .{ .name = "name", .description = "Set session display name", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "session", .description = "Show session info and stats", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "hotkeys", .description = "Show all keyboard shortcuts", .source = .builtin, .action = .{ .builtin = &stubHandler } },
+    .{ .name = "memory", .description = "Show memory telemetry", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "settings", .description = "Open settings menu", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "login", .description = "Login with OAuth provider", .source = .builtin, .action = .{ .builtin = &stubHandler } },
     .{ .name = "logout", .description = "Logout from OAuth provider", .source = .builtin, .action = .{ .builtin = &stubHandler } },

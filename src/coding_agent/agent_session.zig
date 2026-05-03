@@ -443,6 +443,7 @@ pub const AgentSession = struct {
         self.session_store.deinit();
         self.resource_loader.deinit();
         if (self._builtin_ctx) |ctx| {
+            ctx.deinit(self.allocator);
             self.allocator.destroy(ctx);
             self._builtin_ctx = null;
         }

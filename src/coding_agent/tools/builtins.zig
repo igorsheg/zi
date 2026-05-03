@@ -22,6 +22,7 @@ pub const Bundle = struct {
 
     pub fn deinit(self: *Bundle) void {
         self.allocator.free(self.definitions);
+        self.ctx.deinit(self.allocator);
         self.allocator.destroy(self.ctx);
     }
 };
@@ -33,11 +34,14 @@ pub const BuildOptions = struct {
 
 /// Build the default tool definitions. Caller owns the returned
 /// `Bundle` and must call `deinit` on session teardown. The `cwd`
-/// slice is borrowed, not duped — the AgentSession's `options.cwd`
-/// outlives the bundle.
+/// is copied so worker-thread tool executions never depend on a borrowed
+/// session/bootstrap path slice staying alive.
 pub fn build(allocator: std.mem.Allocator, cwd: []const u8, options: BuildOptions) !Bundle {
     const ctx = try allocator.create(util.BuiltinCtx);
-    ctx.* = .{ .cwd = cwd, .io = options.io, .image_auto_resize = options.image_auto_resize };
+    errdefer allocator.destroy(ctx);
+    const owned_cwd = try allocator.dupe(u8, cwd);
+    errdefer allocator.free(owned_cwd);
+    ctx.* = .{ .cwd = owned_cwd, .owns_cwd = true, .io = options.io, .image_auto_resize = options.image_auto_resize };
 
     var definitions = try allocator.alloc(tool_def.ToolDefinition, 7);
     definitions[0] = bash_tool.definition(ctx);

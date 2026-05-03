@@ -16,6 +16,7 @@ pub const BuiltinInteractiveCommand = enum {
     login,
     settings,
     hotkeys,
+    memory,
 };
 
 pub fn parse(text: []const u8) ?ParsedSlashCommand {
@@ -39,6 +40,7 @@ pub fn builtinInteractiveCommand(name: []const u8) ?BuiltinInteractiveCommand {
     if (std.mem.eql(u8, name, "login")) return .login;
     if (std.mem.eql(u8, name, "settings")) return .settings;
     if (std.mem.eql(u8, name, "hotkeys")) return .hotkeys;
+    if (std.mem.eql(u8, name, "memory")) return .memory;
     return null;
 }
 

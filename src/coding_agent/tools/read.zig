@@ -18,9 +18,10 @@ const output_buffer = @import("output_buffer.zig");
 const image = @import("../../image/root.zig");
 
 const MAX_LINES: usize = 500;
-const MAX_FILE_BYTES: usize = 64 * 1024;
+const MAX_FILE_BYTES: usize = util.Limits.text_result_bytes;
 const MAX_LINE_BYTES: usize = 4096;
-const MAX_DIR_ENTRIES: usize = 1000;
+const MAX_DIR_ENTRIES: usize = util.Limits.listing_entries;
+const MAX_DIR_SCAN_ENTRIES: usize = util.Limits.listing_scan_entries;
 
 const SCHEMA =
     \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path to the file or directory (MUST be absolute, not relative)."},"read_range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2,"description":"An array of two integers specifying the start and end line numbers to view. Line numbers are 1-indexed. If not provided, defaults to [1, 500]. Examples: [500, 700], [700, 1400]"}},"required":["path"]}
@@ -176,7 +177,10 @@ fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentT
     }
 
     var it = dir.iterate();
+    var scanned: usize = 0;
     while (it.next(std.Options.debug_io) catch null) |entry| {
+        if (scanned >= MAX_DIR_SCAN_ENTRIES) break;
+        scanned += 1;
         const formatted = if (entry.kind == .directory)
             std.fmt.allocPrint(allocator, "{s}/", .{entry.name}) catch continue
         else
@@ -193,10 +197,13 @@ fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentT
     errdefer aw.deinit();
     output_buffer.appendHeadTail(&aw.writer, names.items, MAX_DIR_ENTRIES, "... [{d} more entries] ...") catch
         return util.errorResult(allocator, "directory listing failed");
+    if (scanned >= MAX_DIR_SCAN_ENTRIES) {
+        aw.writer.print("\n\n(stopped after {d} entries; narrow the path to inspect more.)", .{MAX_DIR_SCAN_ENTRIES}) catch {};
+    }
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "directory listing alloc failed");
-    return util.textResult(allocator, out);
+    return util.ownedTextResult(allocator, out, false);
 }
 
 fn lessThanStrings(_: void, a: []const u8, b: []const u8) bool {
@@ -220,13 +227,12 @@ fn readTextFile(
         return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
     defer allocator.free(raw);
 
-    // Split into lines (preserving empty trailing line for parity with
-    // String.split('\n') in pi).
-    var all_lines: std.ArrayList([]const u8) = .empty;
-    defer all_lines.deinit(allocator);
-    var line_it = std.mem.splitScalar(u8, raw, '\n');
-    while (line_it.next()) |line| all_lines.append(allocator, line) catch break;
-    const total_lines = all_lines.items.len;
+    // Count lines without retaining one slice per line. A file containing only
+    // newlines can have millions of logical lines even under the raw byte cap.
+    var total_lines: usize = 1;
+    for (raw) |byte| {
+        if (byte == '\n') total_lines += 1;
+    }
 
     const start: usize = blk: {
         const r0: i64 = if (range) |r| r[0] else 1;
@@ -239,46 +245,33 @@ fn readTextFile(
         break :blk @intCast(@max(@as(i64, @intCast(start)), clamped));
     };
 
-    var numbered: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (numbered.items) |line| allocator.free(line);
-        numbered.deinit(allocator);
-    }
-
-    var i: usize = if (start == 0) 0 else start - 1;
-    const end_idx: usize = end;
-    while (i < end_idx and i < total_lines) : (i += 1) {
-        const line = all_lines.items[i];
-        const truncated_line = if (line.len > MAX_LINE_BYTES) blk: {
-            const head_slice = line[0..MAX_LINE_BYTES];
-            break :blk std.fmt.allocPrint(allocator, "{d}: {s}... (line truncated)", .{ i + 1, head_slice }) catch continue;
-        } else std.fmt.allocPrint(allocator, "{d}: {s}", .{ i + 1, line }) catch continue;
-        numbered.append(allocator, truncated_line) catch {
-            allocator.free(truncated_line);
-            continue;
-        };
-    }
-
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
 
-    // First pass: try the un-truncated join. If it fits in the byte
-    // budget, ship it. Otherwise fall back to head+tail truncation.
-    var total_bytes: usize = 0;
-    for (numbered.items) |line| total_bytes += line.len + 1;
-
-    if (total_bytes <= MAX_FILE_BYTES) {
-        for (numbered.items, 0..) |line, idx| {
-            if (idx > 0) aw.writer.writeAll("\n") catch break;
-            aw.writer.writeAll(line) catch break;
+    var bytes_written: usize = 0;
+    var line_it = std.mem.splitScalar(u8, raw, '\n');
+    var line_no: usize = 1;
+    var first = true;
+    while (line_it.next()) |line| : (line_no += 1) {
+        if (line_no < start) continue;
+        if (line_no > end) break;
+        if (!first) {
+            aw.writer.writeAll("\n") catch break;
+            bytes_written += 1;
         }
-    } else {
-        output_buffer.appendHeadTail(
-            &aw.writer,
-            numbered.items,
-            MAX_LINES,
-            "... [{d} lines truncated, 64KB limit reached] ...",
-        ) catch {};
+        first = false;
+        if (line.len > MAX_LINE_BYTES) {
+            const kept = line[0..MAX_LINE_BYTES];
+            aw.writer.print("{d}: {s}... (line truncated)", .{ line_no, kept }) catch break;
+            bytes_written += std.fmt.count("{d}: ", .{line_no}) + kept.len + "... (line truncated)".len;
+        } else {
+            aw.writer.print("{d}: {s}", .{ line_no, line }) catch break;
+            bytes_written += std.fmt.count("{d}: ", .{line_no}) + line.len;
+        }
+        if (bytes_written >= MAX_FILE_BYTES) {
+            aw.writer.writeAll("\n... [output truncated, 64KB limit reached] ...") catch {};
+            break;
+        }
     }
 
     // Trailing notice if we showed only a window of the file.
@@ -291,7 +284,7 @@ fn readTextFile(
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "read alloc failed");
-    return util.textResult(allocator, out);
+    return util.ownedTextResult(allocator, out, false);
 }
 
 fn usizeFromI64(v: i64) usize {

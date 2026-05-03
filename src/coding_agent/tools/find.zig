@@ -13,6 +13,7 @@ const output_buffer = @import("output_buffer.zig");
 const runtime_process = @import("../../zio/root.zig").process;
 
 const DEFAULT_LIMIT: usize = 500;
+const MAX_LIMIT: usize = util.Limits.listing_entries;
 
 const SCHEMA =
     \\{"type":"object","properties":{
@@ -59,7 +60,8 @@ fn execute(
         return util.errorResult(allocator, "find tool: missing 'filePattern' argument");
     const limit_i = util.getI64(args, "limit") orelse @as(i64, @intCast(DEFAULT_LIMIT));
     const offset_i = util.getI64(args, "offset") orelse 0;
-    const limit: usize = if (limit_i < 1) 1 else @intCast(limit_i);
+    const requested_limit: usize = if (limit_i < 1) 1 else @intCast(limit_i);
+    const limit: usize = @min(requested_limit, MAX_LIMIT);
     const offset: usize = if (offset_i < 0) 0 else @intCast(offset_i);
 
     const argv = [_][]const u8{
@@ -74,7 +76,7 @@ fn execute(
 
     var proc_result = runtime_process.run(allocator, ctx.io, .{
         .argv = &argv,
-        .max_stdout_bytes = 8 * 1024 * 1024,
+        .max_stdout_bytes = util.Limits.process_stdout_bytes,
         .max_stderr_bytes = 0,
         .process_group = false,
     });
@@ -116,7 +118,7 @@ fn execute(
         if (code != 0 and code != 1) {
             return util.errorf(allocator, "find exited with code {d}", .{code});
         }
-        return util.textResult(allocator, allocator.dupe(u8, "no files found matching pattern") catch "no files found matching pattern");
+        return util.textResult(allocator, "no files found matching pattern");
     }
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -149,5 +151,5 @@ fn execute(
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "find alloc failed");
-    return util.textResult(allocator, out);
+    return util.ownedTextResult(allocator, out, false);
 }

@@ -8,7 +8,8 @@ const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("output_buffer.zig");
 
-const MAX_DIR_ENTRIES: usize = 1000;
+const MAX_DIR_ENTRIES: usize = util.Limits.listing_entries;
+const MAX_DIR_SCAN_ENTRIES: usize = util.Limits.listing_scan_entries;
 
 const SCHEMA =
     \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path to the directory to list. Defaults to cwd."}}}
@@ -56,7 +57,10 @@ fn execute(
         names.deinit(allocator);
     }
     var it = dir.iterate();
+    var scanned: usize = 0;
     while (it.next(std.Options.debug_io) catch null) |entry| {
+        if (scanned >= MAX_DIR_SCAN_ENTRIES) break;
+        scanned += 1;
         const formatted = if (entry.kind == .directory)
             std.fmt.allocPrint(allocator, "{s}/", .{entry.name}) catch continue
         else
@@ -80,9 +84,12 @@ fn execute(
         MAX_DIR_ENTRIES,
         "... [{d} more entries] ...",
     ) catch return util.errorResult(allocator, "ls alloc failed");
+    if (scanned >= MAX_DIR_SCAN_ENTRIES) {
+        aw.writer.print("\n\n(stopped after {d} entries; narrow the path to inspect more.)", .{MAX_DIR_SCAN_ENTRIES}) catch {};
+    }
     aw.writer.writeAll("\n\n(note: prefer the read tool for directory listing — it handles both files and directories.)") catch {};
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "ls alloc failed");
-    return util.textResult(allocator, out);
+    return util.ownedTextResult(allocator, out, false);
 }

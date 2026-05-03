@@ -96,5 +96,5 @@ fn execute(
         std.fs.path.basename(resolved),
         line_count,
     }) catch return util.errorResult(allocator, "write tool: alloc failed");
-    return util.textResult(allocator, msg);
+    return util.ownedTextResult(allocator, msg, false);
 }

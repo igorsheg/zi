@@ -109,7 +109,7 @@ fn execute(
 
     var proc_result = runtime_process.run(allocator, ctx.io, .{
         .argv = argv.items,
-        .max_stdout_bytes = 8 * 1024 * 1024,
+        .max_stdout_bytes = util.Limits.process_stdout_bytes,
         .max_stderr_bytes = 0,
         .process_group = false,
     });
@@ -198,11 +198,12 @@ fn parseRgJson(
         };
         const text_trimmed = std.mem.trimEnd(u8, text_str, "\r\n");
 
+        const kept_text = text_trimmed[0..@min(text_trimmed.len, MAX_LINE_CHARS + 1)];
         events.append(allocator, .{
             .kind = kind,
             .file_path = allocator.dupe(u8, path_str) catch continue,
             .line_number = ln,
-            .line_text = allocator.dupe(u8, text_trimmed) catch continue,
+            .line_text = allocator.dupe(u8, kept_text) catch continue,
         }) catch continue;
 
         if (kind == .match) total_matches += 1;
@@ -210,7 +211,7 @@ fn parseRgJson(
     }
 
     if (total_matches == 0) {
-        return util.textResult(allocator, allocator.dupe(u8, "no matches found") catch "no matches found");
+        return util.textResult(allocator, "no matches found");
     }
 
     // Walk events grouped by file. Per-file cap is enforced inline;
@@ -289,5 +290,5 @@ fn parseRgJson(
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "grep alloc failed");
-    return util.textResult(allocator, out);
+    return util.ownedTextResult(allocator, out, false);
 }

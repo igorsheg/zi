@@ -161,6 +161,7 @@ pub const ExtensionRuntimeBundle = struct {
             self.tools = &.{};
         }
         if (self.builtin_ctx) |ctx| {
+            ctx.deinit(allocator);
             allocator.destroy(ctx);
             self.builtin_ctx = null;
         }
@@ -199,6 +200,7 @@ const BuiltinDefinitions = struct {
     fn deinit(self: *BuiltinDefinitions, allocator: std.mem.Allocator) void {
         self.deinitDefinitionsOnly(allocator);
         if (self.ctx) |ctx| {
+            ctx.deinit(allocator);
             allocator.destroy(ctx);
             self.ctx = null;
         }

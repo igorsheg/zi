@@ -66,12 +66,17 @@ pub const FormatResult = struct {
 /// Streaming fixed-memory line buffer with first-N head lines and last-M tail lines.
 /// Intended for tool output capture so we never retain unbounded stdout/stderr.
 pub const LineOutputBuffer = struct {
+    const default_max_line_bytes: usize = 16 * 1024;
+    const line_truncated_marker = "... [line truncated]";
+
     allocator: std.mem.Allocator,
     max_head: usize,
     max_tail: usize,
+    max_line_bytes: usize = default_max_line_bytes,
     head: std.ArrayList([]u8) = .empty,
     tail: std.ArrayList([]u8) = .empty,
     pending: std.ArrayList(u8) = .empty,
+    pending_truncated: bool = false,
     total_lines: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, max_head: usize, max_tail: usize) LineOutputBuffer {
@@ -100,8 +105,8 @@ pub const LineOutputBuffer = struct {
         for (chunk, 0..) |byte, i| {
             if (byte != '\n') continue;
 
-            if (self.pending.items.len > 0) {
-                try self.pending.appendSlice(self.allocator, chunk[start..i]);
+            if (self.pending.items.len > 0 or self.pending_truncated) {
+                try self.appendPendingBounded(chunk[start..i]);
                 try self.commitPendingLine();
             } else {
                 try self.pushLine(chunk[start..i]);
@@ -110,7 +115,7 @@ pub const LineOutputBuffer = struct {
         }
 
         if (start < chunk.len) {
-            try self.pending.appendSlice(self.allocator, chunk[start..]);
+            try self.appendPendingBounded(chunk[start..]);
         }
     }
 
@@ -136,25 +141,53 @@ pub const LineOutputBuffer = struct {
         return self.snapshotAlloc(allocator, marker_fmt);
     }
 
+    fn appendPendingBounded(self: *LineOutputBuffer, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        const remaining = self.max_line_bytes -| self.pending.items.len;
+        if (remaining == 0) {
+            self.pending_truncated = true;
+            return;
+        }
+        const kept = @min(remaining, bytes.len);
+        try self.pending.appendSlice(self.allocator, bytes[0..kept]);
+        if (kept < bytes.len) self.pending_truncated = true;
+    }
+
     fn commitPendingLine(self: *LineOutputBuffer) !void {
-        try self.pushLine(self.pending.items);
+        try self.pushLineMaybeTruncated(self.pending.items, self.pending_truncated);
         self.pending.clearRetainingCapacity();
+        self.pending_truncated = false;
     }
 
     fn pushLine(self: *LineOutputBuffer, line: []const u8) !void {
+        try self.pushLineMaybeTruncated(line, line.len > self.max_line_bytes);
+    }
+
+    fn pushLineMaybeTruncated(self: *LineOutputBuffer, line: []const u8, truncated: bool) !void {
         self.total_lines += 1;
+        const owned = try self.dupeLine(line, truncated);
+        errdefer self.allocator.free(owned);
 
         if (self.head.items.len < self.max_head) {
-            try self.head.append(self.allocator, try self.allocator.dupe(u8, line));
+            try self.head.append(self.allocator, try self.allocator.dupe(u8, owned));
         }
 
-        if (self.max_tail == 0) return;
+        if (self.max_tail == 0) {
+            self.allocator.free(owned);
+            return;
+        }
 
-        try self.tail.append(self.allocator, try self.allocator.dupe(u8, line));
+        try self.tail.append(self.allocator, owned);
         if (self.tail.items.len > self.max_tail) {
             const evicted = self.tail.orderedRemove(0);
             self.allocator.free(evicted);
         }
+    }
+
+    fn dupeLine(self: *LineOutputBuffer, line: []const u8, truncated: bool) ![]u8 {
+        const kept = line[0..@min(line.len, self.max_line_bytes)];
+        if (!truncated) return self.allocator.dupe(u8, kept);
+        return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ kept, line_truncated_marker });
     }
 };
 
@@ -233,6 +266,19 @@ test "appendHeadTail inserts marker between head and tail" {
         "0\n1\n\n... [2 lines truncated] ...\n\n4\n5",
         out,
     );
+}
+
+test "LineOutputBuffer caps individual long lines" {
+    var buffer = LineOutputBuffer.init(testing.allocator, 2, 2);
+    defer buffer.deinit();
+    buffer.max_line_bytes = 8;
+
+    try buffer.addChunk("abcdefghijklmnop\nshort\npartial-very-long");
+    const result = try buffer.finishAlloc(testing.allocator, "... [{d} lines truncated] ...");
+    defer testing.allocator.free(result.text);
+
+    try testing.expect(std.mem.indexOf(u8, result.text, "abcdefgh... [line truncated]") != null);
+    try testing.expect(std.mem.indexOf(u8, result.text, "partial-... [line truncated]") != null);
 }
 
 test "LineOutputBuffer handles chunk boundaries and truncation" {

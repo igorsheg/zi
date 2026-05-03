@@ -16,11 +16,31 @@
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 
+pub const Limits = struct {
+    /// Normal textual tool-result payload budget. Individual tools should
+    /// truncate semantically before this point; this is the shared target for
+    /// model-facing text blocks.
+    pub const text_result_bytes: usize = 64 * 1024;
+    /// Directory/listing tools should never retain unbounded names just to sort
+    /// or format a response.
+    pub const listing_entries: usize = 1000;
+    pub const listing_scan_entries: usize = 10_000;
+    /// Search tools may ask external processes for more data than they return,
+    /// but their captured stdout must still be bounded.
+    pub const process_stdout_bytes: usize = 8 * 1024 * 1024;
+};
+
 pub const BuiltinCtx = struct {
     cwd: []const u8,
+    owns_cwd: bool = false,
     io: std.Io = std.Options.debug_io,
     session_id: []const u8 = "",
     image_auto_resize: bool = true,
+
+    pub fn deinit(self: *BuiltinCtx, allocator: std.mem.Allocator) void {
+        if (self.owns_cwd) allocator.free(self.cwd);
+        self.* = undefined;
+    }
 };
 
 /// Parse a JSON schema string at startup. Leaks into page_allocator —
@@ -47,9 +67,22 @@ fn singleTextResult(allocator: std.mem.Allocator, text: []const u8, is_error: bo
     return .{ .content = blocks, .is_error = is_error };
 }
 
-/// Build a single text content block result. Caller owns the allocation.
+/// Build a single text content block result by copying borrowed text.
 pub fn textResult(allocator: std.mem.Allocator, text: []const u8) protocol.AgentToolResult {
     return singleTextResult(allocator, text, false);
+}
+
+/// Build a single text content block result from an owned allocation.
+/// Takes ownership of `owned_text` on success and failure, avoiding an
+/// unnecessary duplicate for already-formatted tool output.
+pub fn ownedTextResult(allocator: std.mem.Allocator, owned_text: []u8, is_error: bool) protocol.AgentToolResult {
+    errdefer allocator.free(owned_text);
+    const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch {
+        allocator.free(owned_text);
+        return .{ .content = &.{}, .is_error = is_error };
+    };
+    blocks[0] = .{ .text = .{ .text = owned_text } };
+    return .{ .content = blocks, .is_error = is_error };
 }
 
 /// Build an error result with a single text block. Convenience for the
