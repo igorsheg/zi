@@ -240,6 +240,11 @@ pub const AgentRequest = union(enum) {
         id: extension_runner.AsyncOpId,
         result: extension_runner.AsyncResult,
     },
+    tool_expanded_changed: struct {
+        tool_name: []const u8,
+        tool_call_id: []const u8,
+        expanded: bool,
+    },
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
@@ -264,6 +269,10 @@ pub const AgentRequest = union(enum) {
                 auth_types.freeOAuthCredential(allocator, oauth.credential);
             },
             .extension_async_result => |*async_result| async_result.result.deinit(allocator),
+            .tool_expanded_changed => |event| {
+                allocator.free(event.tool_name);
+                allocator.free(event.tool_call_id);
+            },
             .shutdown => {},
         }
     }

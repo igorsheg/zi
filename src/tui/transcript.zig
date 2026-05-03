@@ -1253,6 +1253,11 @@ pub const Transcript = struct {
         self.pending_tools.clearRetainingCapacity();
     }
 
+    pub const ToolExpansionEvent = struct {
+        tool_name: []const u8,
+        tool_call_id: []const u8,
+    };
+
     /// Toggle expansion state on all tool executions.
     pub fn setToolOutputExpanded(self: *Transcript, expanded: bool) void {
         for (self.items.items, 0..) |*item, idx| {
@@ -1262,6 +1267,19 @@ pub const Transcript = struct {
                 self.noteItemMutated(idx);
             }
         }
+    }
+
+    pub fn collectToolExpansionEvents(self: *Transcript, allocator: std.mem.Allocator) ![]ToolExpansionEvent {
+        var events: std.ArrayList(ToolExpansionEvent) = .empty;
+        errdefer events.deinit(allocator);
+        for (self.items.items) |*item| {
+            if (item.kind != .tool_execution) continue;
+            const te: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
+            const tool_name = te.model.tool_name orelse continue;
+            const tool_call_id = te.model.tool_call_id orelse continue;
+            try events.append(allocator, .{ .tool_name = tool_name, .tool_call_id = tool_call_id });
+        }
+        return events.toOwnedSlice(allocator);
     }
 
     // ── Selection ────────────────────────────────────────────────

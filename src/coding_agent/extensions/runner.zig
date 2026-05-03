@@ -932,6 +932,54 @@ pub const ExtensionRunner = struct {
         }
     }
 
+    pub fn dispatchToolExpandedChanged(self: *ExtensionRunner, tool_name: []const u8, tool_call_id: []const u8, expanded: bool) !void {
+        self.assertOnLuaThread();
+
+        const state = self.lua_state orelse return error.MissingLuaState;
+        const tool = self.tool_registry.get(tool_name) orelse return;
+        const handler_ref = tool.on_expanded_changed_ref orelse return;
+
+        var co = try lua_runtime.Coroutine.init(state);
+        defer co.deinit();
+
+        _ = lua_runtime.c.lua_rawgeti(co.L, lua_runtime.c.LUA_REGISTRYINDEX, handler_ref);
+        if (lua_runtime.c.lua_type(co.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
+            lua_runtime.c.lua_pop(co.L, 1);
+            return error.InvalidHandlerRef;
+        }
+
+        lua_runtime.c.lua_createtable(co.L, 0, 4);
+        _ = lua_runtime.c.lua_pushlstring(co.L, tool_name.ptr, tool_name.len);
+        lua_runtime.c.lua_setfield(co.L, -2, "tool_name");
+        _ = lua_runtime.c.lua_pushlstring(co.L, tool_call_id.ptr, tool_call_id.len);
+        lua_runtime.c.lua_setfield(co.L, -2, "tool_call_id");
+        _ = lua_runtime.c.lua_pushlstring(co.L, tool_call_id.ptr, tool_call_id.len);
+        lua_runtime.c.lua_setfield(co.L, -2, "toolCallId");
+        lua_runtime.c.lua_pushboolean(co.L, if (expanded) 1 else 0);
+        lua_runtime.c.lua_setfield(co.L, -2, "expanded");
+
+        context_mod.pushExtensionContext(co.L, self, tool.source.provenance) catch {
+            lua_runtime.c.lua_pop(co.L, 2);
+            return error.ContextPushFailed;
+        };
+
+        self.setModuleContext(state, tool.source.provenance);
+        if (tool.source.provenance) |provenance| {
+            self.beginExecutionContext(self.sourceForProvenance(provenance));
+            defer self.endExecutionContext();
+        }
+
+        const r = try co.resumeWith(2);
+        switch (r.status) {
+            .yielded => return error.UnexpectedYield,
+            .ok, .finished => {},
+        }
+        if (r.nresults > 0) {
+            const top = lua_runtime.c.lua_gettop(co.L);
+            lua_runtime.c.lua_settop(co.L, top - r.nresults);
+        }
+    }
+
     pub fn dispatchCommand(self: *ExtensionRunner, name: []const u8, args: []const u8) !void {
         self.assertOnLuaThread();
 

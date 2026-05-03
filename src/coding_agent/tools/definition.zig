@@ -39,6 +39,7 @@ pub const ToolDefinition = struct {
     source: RegistrationSource,
     render_call_ref: ?c_int = null,
     render_result_ref: ?c_int = null,
+    on_expanded_changed_ref: ?c_int = null,
     owned: bool = false,
 };
 
@@ -88,6 +89,7 @@ pub fn cloneOwned(allocator: std.mem.Allocator, def: ToolDefinition) !ToolDefini
         .source = def.source,
         .render_call_ref = def.render_call_ref,
         .render_result_ref = def.render_result_ref,
+        .on_expanded_changed_ref = def.on_expanded_changed_ref,
         .owned = true,
     };
 }

@@ -28,6 +28,7 @@ pub fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidExecute => "register_tool: 'execute' must be a function",
             error.InvalidRenderCall => "register_tool: 'render_call' must be a function",
             error.InvalidRenderResult => "register_tool: 'render_result' must be a function",
+            error.InvalidExpandedChanged => "register_tool: 'on_expanded_changed' must be a function",
             error.InvalidName => "register_tool: 'name' must be a string",
             error.InvalidDescription => "register_tool: 'description' must be a string",
             error.InvalidLabel => "register_tool: 'label' must be a string",
@@ -59,6 +60,7 @@ pub fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
         if (built.impl == .lua) c.luaL_unref(L, c.LUA_REGISTRYINDEX, built.impl.lua);
         if (built.render_call_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
         if (built.render_result_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
+        if (built.on_expanded_changed_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
         freeBuiltTool(runner.allocator, &built);
         c.lua_pushboolean(L, 0);
         return 1;
@@ -84,6 +86,7 @@ const BuildError = error{
     InvalidExecute,
     InvalidRenderCall,
     InvalidRenderResult,
+    InvalidExpandedChanged,
     OutOfMemory,
     UnsupportedLuaType,
     InvalidUtf8,
@@ -152,6 +155,14 @@ fn buildExtensionTool(
         c.lua_pop(L, 2);
         return error.InvalidRenderResult;
     }
+    var has_on_expanded_changed = false;
+    _ = c.lua_getfield(L, 1, "on_expanded_changed");
+    if (c.lua_type(L, -1) == c.LUA_TFUNCTION) {
+        has_on_expanded_changed = true;
+    } else if (c.lua_type(L, -1) != c.LUA_TNIL) {
+        c.lua_pop(L, 3);
+        return error.InvalidExpandedChanged;
+    }
     // Leave on stack for now; we'll ref them after execute validates.
 
     // execute: required, must be a function. luaL_ref pops the
@@ -160,16 +171,22 @@ fn buildExtensionTool(
     // ref on a later failure.
     _ = c.lua_getfield(L, 1, "execute");
     if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 3); // execute (nil) + render_result + render_call
+        c.lua_pop(L, 4); // execute (nil) + on_expanded_changed + render_result + render_call
         return error.MissingExecute;
     }
     if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
-        c.lua_pop(L, 3);
+        c.lua_pop(L, 4);
         return error.InvalidExecute;
     }
     const execute_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
 
-    // Now ref render_result then render_call (still on stack if present).
+    // Now ref optional callbacks (still on stack if present).
+    const on_expanded_changed_ref: ?c_int = if (has_on_expanded_changed)
+        c.luaL_ref(L, c.LUA_REGISTRYINDEX)
+    else blk: {
+        c.lua_pop(L, 1); // the nil value we left on stack
+        break :blk null;
+    };
     const render_result_ref: ?c_int = if (has_render_result)
         c.luaL_ref(L, c.LUA_REGISTRYINDEX)
     else blk: {
@@ -194,6 +211,7 @@ fn buildExtensionTool(
         .source = currentRegistrationSource(runner),
         .render_call_ref = render_call_ref,
         .render_result_ref = render_result_ref,
+        .on_expanded_changed_ref = on_expanded_changed_ref,
         .owned = true,
     };
 }
