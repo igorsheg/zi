@@ -60,6 +60,8 @@ pub const SystemEnvPair = struct {
     }
 };
 
+pub const SystemStdio = enum { capture, terminal };
+
 pub const SystemRequest = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
@@ -70,6 +72,7 @@ pub const SystemRequest = struct {
     max_stdout_bytes: usize = system_command.default_max_output_bytes,
     max_stderr_bytes: usize = system_command.default_max_output_bytes,
     text: bool = true,
+    stdio: SystemStdio = .capture,
 
     pub fn clone(self: SystemRequest, allocator: std.mem.Allocator) !SystemRequest {
         const argv = try allocator.alloc([]const u8, self.argv.len);
@@ -103,6 +106,7 @@ pub const SystemRequest = struct {
             .max_stdout_bytes = self.max_stdout_bytes,
             .max_stderr_bytes = self.max_stderr_bytes,
             .text = self.text,
+            .stdio = self.stdio,
         };
     }
 

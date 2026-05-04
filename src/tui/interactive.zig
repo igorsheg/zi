@@ -16,6 +16,8 @@ const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
 const ui_event_mod = @import("ui_event.zig");
 const ai_complete_worker_mod = @import("../coding_agent/extensions/ai_complete_worker.zig");
 const system_worker_mod = @import("../coding_agent/extensions/system_worker.zig");
+const extension_runner_mod = @import("../coding_agent/extensions/runner.zig");
+const system_command_mod = @import("../coding_agent/extensions/system_command.zig");
 const transcript_mod = @import("transcript.zig");
 const conversation_projection_mod = @import("conversation_projection.zig");
 const container_mod = @import("container.zig");
@@ -27,6 +29,7 @@ const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor_iface.zig");
 const input_buffer_mod = @import("terminal/input_buffer.zig");
 const queues_mod = @import("interactive/queues.zig");
+const mailbox_mod = @import("../zio/root.zig").mailbox;
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const model_flow = @import("interactive/model_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
@@ -55,6 +58,7 @@ const runtime_loop = @import("interactive/runtime_loop.zig");
 const job_manager_mod = @import("interactive/job_manager.zig");
 const theme_flow = @import("interactive/theme_flow.zig");
 const terminal_input_flow = @import("interactive/terminal_input.zig");
+const external_editor_flow = @import("interactive/external_editor.zig");
 const event_flow = @import("interactive/event_flow.zig");
 const run_setup = @import("interactive/run_setup.zig");
 const startup_flow = @import("interactive/startup_flow.zig");
@@ -78,6 +82,17 @@ const select_list_mod = @import("components/select_list.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
+
+pub const TerminalSystemRequest = struct {
+    id: extension_runner_mod.AsyncOpId,
+    system: extension_runner_mod.SystemRequest,
+
+    pub fn deinit(self: *TerminalSystemRequest, allocator: std.mem.Allocator) void {
+        self.system.deinit(allocator);
+        self.* = undefined;
+    }
+};
+const TerminalSystemQueue = mailbox_mod.Mailbox(TerminalSystemRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } }, .wakeup = .pipe });
 const UiSnapshotQueue = queues_mod.UiSnapshotQueue;
 const UiLifecycleQueue = queues_mod.UiLifecycleQueue;
 const PublishedStatusSnapshot = status_snapshot_mod.PublishedStatusSnapshot;
@@ -252,6 +267,7 @@ pub const Interactive = struct {
     session_index_worker: session_index_worker_mod.SessionIndexWorker,
     ai_complete_worker: ?ai_complete_worker_mod.AiCompleteWorker = null,
     system_worker: ?system_worker_mod.SystemWorker = null,
+    terminal_system_queue: TerminalSystemQueue,
 
     // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
@@ -355,6 +371,7 @@ pub const Interactive = struct {
             .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
             .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
             .request_queue = try RequestQueue.init(msg_allocator),
+            .terminal_system_queue = try TerminalSystemQueue.init(msg_allocator),
             .job_manager = undefined,
             .session_index_worker = try session_index_worker_mod.SessionIndexWorker.init(msg_allocator),
             .auth_storage = auth_storage,
@@ -389,6 +406,7 @@ pub const Interactive = struct {
         self.session_index_worker.stop();
         if (self.ai_complete_worker) |*worker| worker.worker.stop();
         if (self.system_worker) |*worker| worker.worker.stop();
+        self.terminal_system_queue.clear();
 
         // Stop the long-lived agent owner thread. Abort first if a
         // prompt is mid-flight so the owner loop can reach its next
@@ -447,6 +465,7 @@ pub const Interactive = struct {
         self.ai_complete_worker = null;
         if (self.system_worker) |*worker| worker.deinit();
         self.system_worker = null;
+        self.terminal_system_queue.deinit();
         self.job_manager.deinit();
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
@@ -538,6 +557,8 @@ pub const Interactive = struct {
             self.drainUiEvents();
             if (!self.running) break;
 
+            if (self.processPendingTerminalSystem()) continue;
+
             if (input_ready and self.processTerminalInput()) continue;
 
             self.input.checkTimeout(&terminal_input_flow.onSequence, @ptrCast(self));
@@ -566,6 +587,69 @@ pub const Interactive = struct {
 
     fn bootstrapStatusSnapshot(self: *Interactive) void {
         startup_flow.bootstrapStatusSnapshot(self);
+    }
+
+    pub fn enqueueTerminalSystem(self: *Interactive, id: extension_runner_mod.AsyncOpId, request: extension_runner_mod.SystemRequest) !void {
+        const cloned = try request.clone(self.msg_allocator);
+        switch (self.terminal_system_queue.trySend(.{ .id = id, .system = cloned })) {
+            .ok => {},
+            .full, .closed, .oom => |rejected| {
+                var failed = rejected;
+                failed.deinit(self.msg_allocator);
+                return error.TerminalSystemQueueUnavailable;
+            },
+            .dropped => unreachable,
+        }
+    }
+
+    fn processPendingTerminalSystem(self: *Interactive) bool {
+        var buf: [1]TerminalSystemRequest = undefined;
+        const n = self.terminal_system_queue.drainInto(&buf);
+        if (n == 0) return false;
+        var request = buf[0];
+        defer request.deinit(self.msg_allocator);
+
+        const result = self.runTerminalSystem(request.system);
+        if (!runtime_loop.submitExtensionAsyncResult(@ptrCast(self), request.id, .{ .system = result })) {
+            var failed = result;
+            failed.deinit(self.msg_allocator);
+        }
+        self.tui.dirty = true;
+        return true;
+    }
+
+    fn runTerminalSystem(self: *Interactive, request: extension_runner_mod.SystemRequest) extension_runner_mod.SystemResult {
+        const env_pairs = self.msg_allocator.alloc(system_command_mod.EnvPair, request.env.len) catch {
+            return .{ .err = .{ .message = self.msg_allocator.dupe(u8, "failed to allocate env") catch &.{} } };
+        };
+        defer self.msg_allocator.free(env_pairs);
+        for (request.env, 0..) |pair, i| env_pairs[i] = .{ .key = pair.key, .value = pair.value };
+
+        run_setup.suspendTerminalForExternalProcess(self);
+        defer run_setup.resumeTerminalAfterExternalProcess(self) catch {};
+
+        return system_command_mod.run(self.msg_allocator, self.io, .{
+            .argv = request.argv,
+            .cwd = request.cwd,
+            .env = env_pairs,
+            .clear_env = request.clear_env,
+            .text = request.text,
+            .stdio = .terminal,
+        });
+    }
+
+    pub fn openPromptInExternalEditor(self: *Interactive) void {
+        var result = external_editor_flow.editText(self, self.editor.getExpandedText(), .{ .cwd = self.cwd, .suffix = ".md" });
+        defer result.deinit(self.msg_allocator);
+        switch (result) {
+            .submitted => |text| {
+                self.editor.setText(text);
+                self.refreshHeaderVisibility();
+            },
+            .cancelled => {},
+            .err => |msg| self.status_line.setPrimary(msg, self.theme.fg(.@"error")),
+        }
+        self.tui.dirty = true;
     }
 
     fn drainUiEvents(self: *Interactive) void {
@@ -793,7 +877,7 @@ pub const Interactive = struct {
         else
             idle_wait_timeout_ms;
 
-        var pfds = [3]posix.pollfd{
+        var pfds = [4]posix.pollfd{
             .{
                 .fd = self.tui.terminal.fd_in,
                 .events = posix.POLL.IN,
@@ -806,6 +890,11 @@ pub const Interactive = struct {
             },
             .{
                 .fd = self.lifecycle_event_queue.wakeReadFd().?,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = self.terminal_system_queue.wakeReadFd().?,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },

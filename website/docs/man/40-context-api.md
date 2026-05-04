@@ -209,7 +209,7 @@ The result shape is:
 
 ## System command helper
 
-`zi.system(argv, opts?)` runs an OS command directly from an argv array. It is yieldable and should be called from command/tool execution contexts, not extension load/register code. Prefer bounded, explicit commands over shell strings.
+`zi.system(argv, opts?)` runs an OS command directly from an argv array. It is yieldable and should be called from command/tool execution contexts, not extension load/register code. Prefer bounded, explicit commands over shell strings. By default it uses captured stdio; with `stdio = "terminal"` it runs an interactive command attached to the user's terminal.
 
 ```lua
 local result = zi.system({ "git", "status", "--short" }, {
@@ -246,6 +246,9 @@ Options:
 
 `text`
 : Boolean. Defaults true and normalizes CRLF to LF.
+
+`stdio`
+: `"capture"` or `"terminal"`. Defaults to `"capture"`. Capture mode returns bounded stdout/stderr. Terminal mode is TUI-only: zi suspends its terminal state, runs the child process attached to stdin/stdout/stderr, restores/redraws after exit, and returns empty stdout/stderr. Use terminal mode for interactive commands such as `$EDITOR`, `$PAGER`, `fzf`, `lazygit`, or login flows. `stdin`, `timeout_ms`, `max_stdout_bytes`, and `max_stderr_bytes` are invalid with terminal mode.
 
 Result shapes:
 

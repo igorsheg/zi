@@ -4,6 +4,8 @@ const process = @import("../../zio/root.zig").process;
 pub const default_max_output_bytes: usize = process.default_max_output_bytes;
 pub const EnvPair = process.EnvPair;
 
+pub const Stdio = enum { capture, terminal };
+
 pub const Request = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
@@ -14,6 +16,7 @@ pub const Request = struct {
     max_stdout_bytes: usize = default_max_output_bytes,
     max_stderr_bytes: usize = default_max_output_bytes,
     text: bool = true,
+    stdio: Stdio = .capture,
 };
 
 pub const Completed = struct {
@@ -83,6 +86,11 @@ pub const Result = union(enum) {
 };
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
+    if (request.stdio == .terminal) {
+        if (request.stdin != null) return errorResult(allocator, "stdin is invalid with terminal stdio");
+        if (request.timeout_ms != null) return errorResult(allocator, "timeout_ms is unsupported with terminal stdio");
+        return runTerminal(allocator, io, request);
+    }
     var proc_result = process.run(allocator, io, .{
         .argv = request.argv,
         .cwd = request.cwd,
@@ -93,6 +101,27 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
         .max_stdout_bytes = request.max_stdout_bytes,
         .max_stderr_bytes = request.max_stderr_bytes,
         .process_group = true,
+    });
+    defer proc_result.deinit(allocator);
+
+    return switch (proc_result) {
+        .completed => |completed| completedResult(allocator, completed, request.text),
+        .timeout => |timeout| timeoutResult(allocator, timeout, request.text),
+        .err => |err| .{ .err = .{
+            .message = allocator.dupe(u8, err.message) catch &.{},
+            .stdout = if (err.stdout.len > 0) allocator.dupe(u8, err.stdout) catch &.{} else &.{},
+            .stderr = if (err.stderr.len > 0) allocator.dupe(u8, err.stderr) catch &.{} else &.{},
+        } },
+    };
+}
+
+fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
+    var proc_result = process.runTerminal(allocator, io, .{
+        .argv = request.argv,
+        .cwd = request.cwd,
+        .env = request.env,
+        .clear_env = request.clear_env,
+        .process_group = false,
     });
     defer proc_result.deinit(allocator);
 

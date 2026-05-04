@@ -143,6 +143,11 @@ pub fn handle(self: anytype, key: Key) void {
         return;
     }
 
+    if (keybindings.matches(.app_editor_external, key)) {
+        self.openPromptInExternalEditor();
+        return;
+    }
+
     if (handleScroll(self, key)) return;
 
     if (self.tui.handleInput(key)) {

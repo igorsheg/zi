@@ -33,6 +33,7 @@ pub const Action = enum {
     app_queue_follow_up,
     app_restore_queued,
     app_paste_image,
+    app_editor_external,
     app_scroll_page_up,
     app_scroll_page_down,
     app_scroll_line_up,
@@ -78,6 +79,7 @@ const key_down = KeySpec{ .key = .{ .code = .down }, .display = "down" };
 const key_escape = KeySpec{ .key = .{ .code = .escape }, .display = "esc" };
 const key_ctrl_c = KeySpec{ .key = .{ .code = .char, .char = 'c', .ctrl = true }, .display = "ctrl+c" };
 const key_ctrl_d = KeySpec{ .key = .{ .code = .char, .char = 'd', .ctrl = true }, .display = "ctrl+d" };
+const key_ctrl_g = KeySpec{ .key = .{ .code = .char, .char = 'g', .ctrl = true }, .display = "ctrl+g" };
 const key_ctrl_o = KeySpec{ .key = .{ .code = .char, .char = 'o', .ctrl = true }, .display = "ctrl+o" };
 const key_ctrl_t = KeySpec{ .key = .{ .code = .char, .char = 't', .ctrl = true }, .display = "ctrl+t" };
 const key_ctrl_v = KeySpec{ .key = .{ .code = .char, .char = 'v', .ctrl = true }, .display = "ctrl+v" };
@@ -119,6 +121,7 @@ const app_toggle_thinking_bindings = [_]KeySpec{key_ctrl_t};
 const app_queue_follow_up_bindings = [_]KeySpec{key_alt_enter};
 const app_restore_queued_bindings = [_]KeySpec{key_alt_up};
 const app_paste_image_bindings = [_]KeySpec{if (builtin.os.tag == .windows) key_alt_v else key_ctrl_v};
+const app_editor_external_bindings = [_]KeySpec{key_ctrl_g};
 const app_scroll_page_up_bindings = [_]KeySpec{key_page_up};
 const app_scroll_page_down_bindings = [_]KeySpec{key_page_down};
 const app_scroll_line_up_bindings = [_]KeySpec{key_shift_up};
@@ -304,6 +307,13 @@ const definitions = [_]Definition{
         .section = .app,
         .description = "Paste image from clipboard",
         .bindings = &app_paste_image_bindings,
+    },
+    .{
+        .action = .app_editor_external,
+        .section = .app,
+        .description = "Open prompt in external editor",
+        .bindings = &app_editor_external_bindings,
+        .footer_label = "editor",
     },
     .{
         .action = .app_scroll_page_up,

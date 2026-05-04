@@ -140,15 +140,20 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
             try worker.submit(worker_request);
         },
         .system => |request| {
-            const cloned = try request.clone(self.msg_allocator);
-            var submitted = false;
-            errdefer if (!submitted) {
-                var failed = cloned;
-                failed.deinit(self.msg_allocator);
-            };
-            const worker = if (self.system_worker) |*worker| worker else return error.SystemWorkerUnavailable;
-            submitted = true; // worker.submit consumes the request even when it rejects it.
-            try worker.submit(.{ .id = owned_start.id, .system = cloned });
+            switch (request.stdio) {
+                .capture => {
+                    const cloned = try request.clone(self.msg_allocator);
+                    var submitted = false;
+                    errdefer if (!submitted) {
+                        var failed = cloned;
+                        failed.deinit(self.msg_allocator);
+                    };
+                    const worker = if (self.system_worker) |*worker| worker else return error.SystemWorkerUnavailable;
+                    submitted = true; // worker.submit consumes the request even when it rejects it.
+                    try worker.submit(.{ .id = owned_start.id, .system = cloned });
+                },
+                .terminal => try self.enqueueTerminalSystem(owned_start.id, request),
+            }
         },
         else => {},
     }

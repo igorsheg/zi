@@ -1822,6 +1822,7 @@ test "extension command resumes after zi.system result" {
         stdin: ?[]u8 = null,
         env_value: ?[]u8 = null,
         timeout_ms: ?u64 = null,
+        stdio: runner_mod.SystemStdio = .capture,
 
         fn submit(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, start: runner_mod.AsyncStart) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1836,6 +1837,7 @@ test "extension command resumes after zi.system result" {
                         self.env_value = try testing.allocator.dupe(u8, pair.value);
                     };
                     self.timeout_ms = request.timeout_ms;
+                    self.stdio = request.stdio;
                 },
                 else => {},
             }
@@ -1858,7 +1860,7 @@ test "extension command resumes after zi.system result" {
         \\  name = "system-test",
         \\  description = "system-test",
         \\  handler = function(_, ctx)
-        \\    local result = zi.system({ "/bin/sh", "-c", "cat" }, { cwd = ctx.cwd, stdin = "hello", env = { FOO = "bar" }, timeout_ms = 1234 })
+        \\    local result = zi.system({ "/bin/sh", "-c", "cat" }, { cwd = ctx.cwd, stdin = "hello", env = { FOO = "bar" }, timeout_ms = 1234, stdio = "capture" })
         \\    _system_result = result.status .. ":" .. result.code .. ":" .. result.stdout .. ":" .. result.stderr
         \\  end,
         \\})
@@ -1873,6 +1875,7 @@ test "extension command resumes after zi.system result" {
     try testing.expectEqualStrings("hello", capture.stdin orelse return error.MissingStdin);
     try testing.expectEqualStrings("bar", capture.env_value orelse return error.MissingEnv);
     try testing.expectEqual(@as(?u64, 1234), capture.timeout_ms);
+    try testing.expectEqual(runner_mod.SystemStdio.capture, capture.stdio);
     try runner.resumeAsync(1, .{ .system = .{ .completed = .{
         .code = 7,
         .stdout = try testing.allocator.dupe(u8, "out"),

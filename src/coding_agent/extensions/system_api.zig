@@ -68,8 +68,20 @@ fn parseSystemRequest(allocator: std.mem.Allocator, L: *c.lua_State) SystemParse
     request.max_stderr_bytes = optionalSystemUsizeField(L, opts_idx, "max_stderr_bytes", 1024 * 1024) catch return error.InvalidOptions;
     request.clear_env = optionalSystemBoolField(L, opts_idx, "clear_env", false) catch return error.InvalidOptions;
     request.text = optionalSystemBoolField(L, opts_idx, "text", true) catch return error.InvalidOptions;
+    request.stdio = optionalSystemStdioField(L, opts_idx, "stdio") catch return error.InvalidOptions;
+    if (request.stdio == .terminal) {
+        if (request.stdin != null) return error.InvalidOptions;
+        if (request.timeout_ms != null) return error.InvalidOptions;
+        if (hasField(L, opts_idx, "max_stdout_bytes") or hasField(L, opts_idx, "max_stderr_bytes")) return error.InvalidOptions;
+    }
     request.env = try optionalSystemEnv(allocator, L, opts_idx);
     return request;
+}
+
+fn hasField(L: *c.lua_State, table_idx: c_int, field: [:0]const u8) bool {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    return c.lua_type(L, -1) != c.LUA_TNIL;
 }
 
 fn optionalSystemStringField(allocator: std.mem.Allocator, L: *c.lua_State, table_idx: c_int, field: [:0]const u8) SystemParseError!?[]const u8 {
@@ -113,6 +125,19 @@ fn optionalSystemBoolField(L: *c.lua_State, table_idx: c_int, field: [:0]const u
     if (c.lua_type(L, -1) == c.LUA_TNIL) return default_value;
     if (c.lua_type(L, -1) != c.LUA_TBOOLEAN) return error.InvalidOptions;
     return c.lua_toboolean(L, -1) != 0;
+}
+
+fn optionalSystemStdioField(L: *c.lua_State, table_idx: c_int, field: [:0]const u8) !runner_mod.SystemStdio {
+    _ = c.lua_getfield(L, table_idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) == c.LUA_TNIL) return .capture;
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOptions;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return error.InvalidOptions;
+    const value = ptr[0..len];
+    if (std.mem.eql(u8, value, "capture")) return .capture;
+    if (std.mem.eql(u8, value, "terminal")) return .terminal;
+    return error.InvalidOptions;
 }
 
 fn optionalSystemEnv(allocator: std.mem.Allocator, L: *c.lua_State, table_idx: c_int) SystemParseError![]runner_mod.SystemEnvPair {

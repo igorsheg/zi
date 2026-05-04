@@ -124,6 +124,45 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
     return ctx.run();
 }
 
+pub const TerminalRequest = struct {
+    argv: []const []const u8,
+    cwd: ?[]const u8 = null,
+    env: []const EnvPair = &.{},
+    clear_env: bool = false,
+    process_group: bool = true,
+};
+
+pub fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: TerminalRequest) Result {
+    if (request.argv.len == 0) return errorResult(allocator, "empty argv");
+
+    var env_map_storage: ?std.process.Environ.Map = null;
+    defer if (env_map_storage) |*env_map| env_map.deinit();
+    if (request.env.len > 0 or request.clear_env) {
+        env_map_storage = std.process.Environ.Map.init(allocator);
+        for (request.env) |pair| {
+            env_map_storage.?.put(pair.key, pair.value) catch return errorResult(allocator, "failed to build environment");
+        }
+    }
+
+    var child = std.process.spawn(io, .{
+        .argv = request.argv,
+        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .environ_map = if (env_map_storage) |*env_map| env_map else null,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .pgid = if (request.process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    }) catch |err| return errorFmt(allocator, "spawn failed: {s}", .{@errorName(err)});
+
+    const term = child.wait(io) catch |err| return errorFmt(allocator, "wait failed: {s}", .{@errorName(err)});
+    const stdout = allocator.dupe(u8, "") catch return errorResult(allocator, "failed to allocate stdout");
+    const stderr = allocator.dupe(u8, "") catch {
+        allocator.free(stdout);
+        return errorResult(allocator, "failed to allocate stderr");
+    };
+    return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
+}
+
 const RunContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,

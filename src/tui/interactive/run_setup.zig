@@ -14,8 +14,33 @@ pub fn prepareTerminal(self: *Interactive) !void {
     self.tui.terminal.installSignalHandlers();
     self.tui.terminal.hideCursor();
     self.tui.terminal.enableBracketedPaste();
+    self.tui.terminal.enableModifyOtherKeys();
     self.tui.terminal.queryKittyProtocol();
     self.tui.terminal.enableMouseTracking();
+    self.kitty_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + 150_000_000;
+}
+
+pub fn suspendTerminalForExternalProcess(self: *Interactive) void {
+    self.tui.terminal.showCursor();
+    self.tui.terminal.disableMouseTracking();
+    self.tui.terminal.disableBracketedPaste();
+    if (self.tui.terminal.kitty_active) self.tui.terminal.disableKittyProtocol();
+    if (self.tui.terminal.modify_other_keys_active) self.tui.terminal.disableModifyOtherKeys();
+    self.tui.terminal.exitRawMode();
+}
+
+pub fn resumeTerminalAfterExternalProcess(self: *Interactive) !void {
+    try self.tui.terminal.enterRawMode();
+    self.tui.terminal.installSignalHandlers();
+    self.tui.terminal.hideCursor();
+    self.tui.terminal.enableBracketedPaste();
+    self.tui.terminal.enableModifyOtherKeys();
+    self.tui.terminal.queryKittyProtocol();
+    self.tui.terminal.enableMouseTracking();
+    self.tui.terminal.updateSize();
+    self.tui.terminal.clearScreen();
+    self.tui.renderer.forceRedraw();
+    self.tui.dirty = true;
     self.kitty_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + 150_000_000;
 }
 

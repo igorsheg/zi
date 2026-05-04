@@ -60,6 +60,10 @@ const Handler = struct {
             .max_stdout_bytes = request.max_stdout_bytes,
             .max_stderr_bytes = request.max_stderr_bytes,
             .text = request.text,
+            .stdio = switch (request.stdio) {
+                .capture => .capture,
+                .terminal => .terminal,
+            },
         });
     }
 };
