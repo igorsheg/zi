@@ -221,14 +221,16 @@ fn makeItems() [3]SelectItem {
     };
 }
 
+fn listWithItems(theme: *const Theme, items: []const SelectItem) SelectList {
+    var list = SelectList{ .theme = theme };
+    list.setItems(items);
+    return list;
+}
+
 test "SelectList up/down wraps around" {
     const theme = testTheme();
     var items = makeItems();
-
-    var sl = SelectList{
-        .theme = &theme,
-    };
-    sl.setItems(&items);
+    var sl = listWithItems(&theme, &items);
 
     // start at 0, go up -> wrap to 2
     const r1 = sl.processInput(.{ .code = .up });
@@ -249,21 +251,19 @@ test "SelectList up/down wraps around" {
 
 test "SelectList page home and end navigation clamp within items" {
     const theme = testTheme();
-
-    var many: [8]SelectItem = undefined;
-    for (&many, 0..) |*item, i| {
-        item.* = .{
-            .value = if (i == 0) "a" else if (i == 1) "b" else if (i == 2) "c" else if (i == 3) "d" else if (i == 4) "e" else if (i == 5) "f" else if (i == 6) "g" else "h",
-            .label = "Item",
-            .description = null,
-        };
-    }
-
-    var sl = SelectList{
-        .theme = &theme,
-        .max_visible = 3,
+    const many = [_]SelectItem{
+        .{ .value = "a", .label = "Item" },
+        .{ .value = "b", .label = "Item" },
+        .{ .value = "c", .label = "Item" },
+        .{ .value = "d", .label = "Item" },
+        .{ .value = "e", .label = "Item" },
+        .{ .value = "f", .label = "Item" },
+        .{ .value = "g", .label = "Item" },
+        .{ .value = "h", .label = "Item" },
     };
-    sl.setItems(&many);
+
+    var sl = listWithItems(&theme, &many);
+    sl.max_visible = 3;
 
     _ = sl.processInput(.{ .code = .page_down });
     try testing.expectEqual(@as(u32, 3), sl.selected_index);
@@ -292,8 +292,7 @@ test "SelectList preserves selection by value across setItems" {
         .{ .value = "beta", .label = "Beta" },
     };
 
-    var sl = SelectList{ .theme = &theme };
-    sl.setItems(&before);
+    var sl = listWithItems(&theme, &before);
     try testing.expect(sl.setSelectedByValue("beta"));
     sl.setItems(&after);
 
@@ -312,4 +311,3 @@ test "SelectList empty items have no selection and consume list actions" {
     try testing.expectEqual(InputResult.consumed, sl.processInput(.{ .code = .down }));
     try testing.expectEqual(@as(u32, 0), sl.selected_index);
 }
-

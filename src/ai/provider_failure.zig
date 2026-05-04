@@ -230,58 +230,151 @@ fn isOverflowNeedle(text: []const u8) bool {
 }
 
 const testing = std.testing;
+const FailureKind = protocol.NormalizedFailure.Kind;
 
-test "normalizeHttpFailure preserves provider metadata and user-facing message" {
+fn expectNormalizedHttpFailure(
+    status: std.http.Status,
+    body: []const u8,
+    expected_kind: FailureKind,
+    expected_message: []const u8,
+    expected_code: ?[]const u8,
+    expected_type: ?[]const u8,
+) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const allocator = arena.allocator();
 
-    const result = try normalizeHttpFailure(allocator, .bad_request, "{\"error\":{\"message\":\"context length exceeded\",\"code\":\"context_length_exceeded\",\"type\":\"invalid_request_error\"}}");
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, result.failure.kind);
-    try testing.expectEqual(@as(?u16, 400), result.failure.http_status);
-    try testing.expectEqualStrings("context_length_exceeded", result.failure.provider_code.?);
-    try testing.expectEqualStrings("invalid_request_error", result.failure.provider_type.?);
-    try testing.expectEqualStrings("HTTP 400 Bad Request: context length exceeded", result.display_message);
+    const result = try normalizeHttpFailure(arena.allocator(), status, body);
+    try testing.expectEqual(expected_kind, result.failure.kind);
+    try testing.expectEqual(@as(?u16, @intCast(@intFromEnum(status))), result.failure.http_status);
+    try testing.expectEqualStrings(expected_message, result.display_message);
+
+    if (expected_code) |code| {
+        try testing.expectEqualStrings(code, result.failure.provider_code.?);
+    } else {
+        try testing.expectEqual(@as(?[]const u8, null), result.failure.provider_code);
+    }
+
+    if (expected_type) |provider_type| {
+        try testing.expectEqualStrings(provider_type, result.failure.provider_type.?);
+    } else {
+        try testing.expectEqual(@as(?[]const u8, null), result.failure.provider_type);
+    }
 }
 
-test "normalizeHttpFailure formats empty and raw bodies for users" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const empty = try normalizeHttpFailure(allocator, .bad_request, "  \n ");
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, empty.failure.kind);
-    try testing.expectEqualStrings("HTTP 400 Bad Request (empty body)", empty.display_message);
-
-    const raw = try normalizeHttpFailure(allocator, .internal_server_error, "upstream exploded");
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, raw.failure.kind);
-    try testing.expectEqualStrings("HTTP 500 Internal Server Error: upstream exploded", raw.display_message);
+fn expectHttpKind(
+    expected: FailureKind,
+    status_code: u16,
+    provider_type: ?[]const u8,
+    provider_code: ?[]const u8,
+    provider_message: ?[]const u8,
+) !void {
+    try testing.expectEqual(expected, classifyHttpFailure(status_code, provider_type, provider_code, provider_message));
 }
 
-test "classifyHttpFailure honors status boundaries before provider text" {
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.auth, classifyHttpFailure(401, null, null, "rate limit exceeded"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.rate_limited, classifyHttpFailure(429, null, null, null));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, classifyHttpFailure(503, null, null, null));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, classifyHttpFailure(413, null, null, null));
-
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, classifyHttpFailure(400, null, null, "unknown bad request"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, classifyHttpFailure(400, null, "context_length_exceeded", null));
+fn expectProviderKind(
+    expected: FailureKind,
+    provider_type: ?[]const u8,
+    provider_code: ?[]const u8,
+    provider_message: ?[]const u8,
+) !void {
+    try testing.expectEqual(expected, classifyProviderFailure(provider_type, provider_code, provider_message));
 }
 
-test "classifyProviderFailure maps semantic categories without variant spray" {
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.auth, classifyProviderFailure("authentication_error", null, "bad key"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.invalid_request, classifyProviderFailure("invalid_request_error", null, "schema mismatch"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, classifyProviderFailure("overloaded_error", null, "try again"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.context_overflow, classifyProviderFailure(null, "context_length_exceeded", null));
+fn expectTransportKind(expected: FailureKind, message: []const u8) !void {
+    try testing.expectEqual(expected, classifyTransportFailure(message));
+}
 
-    try testing.expectEqual(
-        protocol.NormalizedFailure.Kind.rate_limited,
-        classifyProviderFailure("throttling_error", null, "Throttling error: Too many tokens, please wait before trying again."),
+test "normalizeHttpFailure preserves provider metadata and formats nested JSON error" {
+    try expectNormalizedHttpFailure(
+        .bad_request,
+        "{\"error\":{\"message\":\"context length exceeded\",\"code\":\"context_length_exceeded\",\"type\":\"invalid_request_error\"}}",
+        .context_overflow,
+        "HTTP 400 Bad Request: context length exceeded",
+        "context_length_exceeded",
+        "invalid_request_error",
     );
 }
 
+test "normalizeHttpFailure formats empty, raw, and top-level provider bodies" {
+    try expectNormalizedHttpFailure(
+        .bad_request,
+        "  \n ",
+        .invalid_request,
+        "HTTP 400 Bad Request (empty body)",
+        null,
+        null,
+    );
+
+    try expectNormalizedHttpFailure(
+        .internal_server_error,
+        "upstream exploded",
+        .transient,
+        "HTTP 500 Internal Server Error: upstream exploded",
+        null,
+        null,
+    );
+
+    try expectNormalizedHttpFailure(
+        .too_many_requests,
+        "{\"message\":\"Too many requests\",\"code\":\"rate_limit\",\"type\":\"rate_limit_error\"}",
+        .rate_limited,
+        "HTTP 429 Too Many Requests: Too many requests",
+        "rate_limit",
+        "rate_limit_error",
+    );
+}
+
+test "classifyHttpFailure lets HTTP status override misleading provider text" {
+    try expectHttpKind(.auth, 401, null, null, "rate limit exceeded");
+    try expectHttpKind(.rate_limited, 429, null, null, null);
+    try expectHttpKind(.transient, 503, null, null, null);
+    try expectHttpKind(.context_overflow, 413, null, null, null);
+}
+
+test "classifyHttpFailure refines bad requests with provider context" {
+    try expectHttpKind(.invalid_request, 400, null, null, "unknown bad request");
+    try expectHttpKind(.context_overflow, 400, null, "context_length_exceeded", null);
+    try expectHttpKind(.auth, 400, "authentication_error", null, null);
+    try expectHttpKind(.rate_limited, 400, null, null, "too many requests");
+    try expectHttpKind(.transient, 400, "overloaded_error", null, null);
+}
+
+test "classifyProviderFailure maps provider type categories" {
+    try expectProviderKind(.auth, "authentication_error", null, "bad key");
+    try expectProviderKind(.auth, "permission_error", null, null);
+    try expectProviderKind(.rate_limited, "rate_limit_error", null, null);
+    try expectProviderKind(.transient, "overloaded_error", null, "try again");
+    try expectProviderKind(.invalid_request, "invalid_request_error", null, "schema mismatch");
+}
+
+test "classifyProviderFailure detects rate limits before overflow wording" {
+    try expectProviderKind(
+        .rate_limited,
+        "throttling_error",
+        null,
+        "Throttling error: Too many tokens, please wait before trying again.",
+    );
+    try expectProviderKind(.rate_limited, null, "rate limit exceeded", null);
+}
+
+test "classifyProviderFailure detects context overflow from code or message" {
+    try expectProviderKind(.context_overflow, null, "context_length_exceeded", null);
+    try expectProviderKind(.context_overflow, null, "model_context_window_exceeded", null);
+    try expectProviderKind(.context_overflow, null, null, "maximum context length is 128000 tokens");
+    try expectProviderKind(.context_overflow, null, null, "input is too long for requested model");
+}
+
+test "classifyProviderFailure maps message-only retry and auth signals" {
+    try expectProviderKind(.rate_limited, null, null, "too many requests");
+    try expectProviderKind(.transient, null, null, "service unavailable, try again");
+    try expectProviderKind(.auth, null, null, "invalid api key");
+    try expectProviderKind(.fatal, null, null, "invalid response shape");
+}
+
 test "classifyTransportFailure separates auth, retryable transport, and fatal" {
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.auth, classifyTransportFailure("invalid api key"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, classifyTransportFailure("connection reset by peer"));
-    try testing.expectEqual(protocol.NormalizedFailure.Kind.fatal, classifyTransportFailure("invalid response shape"));
+    try expectTransportKind(.auth, "invalid api key");
+    try expectTransportKind(.auth, "missing AccountID");
+    try expectTransportKind(.transient, "connection reset by peer");
+    try expectTransportKind(.transient, "stream read error: timed out");
+    try expectTransportKind(.fatal, "invalid response shape");
 }

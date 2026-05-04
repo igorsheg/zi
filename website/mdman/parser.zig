@@ -341,136 +341,242 @@ const Parser = struct {
 
 // --- Tests ---
 
-test "parse bold" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+const testing = std.testing;
 
-    const doc = try parse(arena.allocator(), "This is **bold** text.\n");
-    const spans = doc.nodes[0].paragraph;
-    try std.testing.expectEqual(3, spans.len);
-    try std.testing.expectEqualStrings("This is ", spans[0].text);
-    try std.testing.expectEqualStrings("bold", spans[1].bold);
-    try std.testing.expectEqualStrings(" text.", spans[2].text);
+fn parseMarkdown(arena: *std.heap.ArenaAllocator, source: []const u8) !Document {
+    return parse(arena.allocator(), source);
 }
 
-test "parse italic" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const doc = try parse(arena.allocator(), "This is *italic* text.\n");
-    const spans = doc.nodes[0].paragraph;
-    try std.testing.expectEqual(3, spans.len);
-    try std.testing.expectEqualStrings("This is ", spans[0].text);
-    try std.testing.expectEqualStrings("italic", spans[1].italic);
-    try std.testing.expectEqualStrings(" text.", spans[2].text);
+fn expectNodeCount(doc: Document, expected: usize) !void {
+    try testing.expectEqual(expected, doc.nodes.len);
 }
 
-test "parse inline code" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const doc = try parse(arena.allocator(), "Run `prise serve` now.\n");
-    const spans = doc.nodes[0].paragraph;
-    try std.testing.expectEqual(3, spans.len);
-    try std.testing.expectEqualStrings("Run ", spans[0].text);
-    try std.testing.expectEqualStrings("prise serve", spans[1].code);
-    try std.testing.expectEqualStrings(" now.", spans[2].text);
+fn expectParagraph(node: Node) ![]const Span {
+    return switch (node) {
+        .paragraph => |spans| spans,
+        else => error.ExpectedParagraph,
+    };
 }
 
-test "parse link" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const doc = try parse(arena.allocator(), "See [the docs](https://example.com) here.\n");
-    const spans = doc.nodes[0].paragraph;
-    try std.testing.expectEqual(3, spans.len);
-    try std.testing.expectEqualStrings("See ", spans[0].text);
-    try std.testing.expectEqualStrings("the docs", spans[1].link.text);
-    try std.testing.expectEqualStrings("https://example.com", spans[1].link.url);
-    try std.testing.expectEqualStrings(" here.", spans[2].text);
+fn expectCodeBlock(node: Node) !Node.CodeBlock {
+    return switch (node) {
+        .code_block => |code_block| code_block,
+        else => error.ExpectedCodeBlock,
+    };
 }
 
-test "parse code block" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+fn expectBulletList(node: Node) ![]const []const Span {
+    return switch (node) {
+        .bullet_list => |items| items,
+        else => error.ExpectedBulletList,
+    };
+}
+
+fn expectDefinition(node: Node) !Node.Definition {
+    return switch (node) {
+        .definition => |definition| definition,
+        else => error.ExpectedDefinition,
+    };
+}
+
+fn expectHeading(node: Node, level: u8, text: []const u8) !void {
+    const heading = switch (node) {
+        .heading => |heading| heading,
+        else => return error.ExpectedHeading,
+    };
+    try testing.expectEqual(level, heading.level);
+    try testing.expectEqualStrings(text, heading.text);
+}
+
+fn expectText(span: Span, expected: []const u8) !void {
+    switch (span) {
+        .text => |actual| try testing.expectEqualStrings(expected, actual),
+        else => return error.ExpectedTextSpan,
+    }
+}
+
+fn expectBold(span: Span, expected: []const u8) !void {
+    switch (span) {
+        .bold => |actual| try testing.expectEqualStrings(expected, actual),
+        else => return error.ExpectedBoldSpan,
+    }
+}
+
+fn expectItalic(span: Span, expected: []const u8) !void {
+    switch (span) {
+        .italic => |actual| try testing.expectEqualStrings(expected, actual),
+        else => return error.ExpectedItalicSpan,
+    }
+}
+
+fn expectCode(span: Span, expected: []const u8) !void {
+    switch (span) {
+        .code => |actual| try testing.expectEqualStrings(expected, actual),
+        else => return error.ExpectedCodeSpan,
+    }
+}
+
+fn expectLink(span: Span, text: []const u8, url: []const u8) !void {
+    const link = switch (span) {
+        .link => |link| link,
+        else => return error.ExpectedLinkSpan,
+    };
+    try testing.expectEqualStrings(text, link.text);
+    try testing.expectEqualStrings(url, link.url);
+}
+
+test "parse bold keeps surrounding text as text spans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const doc = try parse(arena.allocator(),
+    const doc = try parseMarkdown(&arena, "This is **bold** text.\n");
+    try expectNodeCount(doc, 1);
+
+    const spans = try expectParagraph(doc.nodes[0]);
+    try testing.expectEqual(@as(usize, 3), spans.len);
+    try expectText(spans[0], "This is ");
+    try expectBold(spans[1], "bold");
+    try expectText(spans[2], " text.");
+}
+
+test "parse italic keeps surrounding text as text spans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const doc = try parseMarkdown(&arena, "This is *italic* text.\n");
+    try expectNodeCount(doc, 1);
+
+    const spans = try expectParagraph(doc.nodes[0]);
+    try testing.expectEqual(@as(usize, 3), spans.len);
+    try expectText(spans[0], "This is ");
+    try expectItalic(spans[1], "italic");
+    try expectText(spans[2], " text.");
+}
+
+test "parse inline code keeps surrounding text as text spans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const doc = try parseMarkdown(&arena, "Run `prise serve` now.\n");
+    try expectNodeCount(doc, 1);
+
+    const spans = try expectParagraph(doc.nodes[0]);
+    try testing.expectEqual(@as(usize, 3), spans.len);
+    try expectText(spans[0], "Run ");
+    try expectCode(spans[1], "prise serve");
+    try expectText(spans[2], " now.");
+}
+
+test "parse link captures text and URL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const doc = try parseMarkdown(&arena, "See [the docs](https://example.com) here.\n");
+    try expectNodeCount(doc, 1);
+
+    const spans = try expectParagraph(doc.nodes[0]);
+    try testing.expectEqual(@as(usize, 3), spans.len);
+    try expectText(spans[0], "See ");
+    try expectLink(spans[1], "the docs", "https://example.com");
+    try expectText(spans[2], " here.");
+}
+
+test "parse fenced code block preserves language and content" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const doc = try parseMarkdown(&arena,
         \\```bash
         \\prise serve
         \\```
         \\
     );
-    try std.testing.expectEqual(1, doc.nodes.len);
-    const cb = doc.nodes[0].code_block;
-    try std.testing.expectEqualStrings("bash", cb.language.?);
-    try std.testing.expectEqualStrings("prise serve", cb.content);
+    try expectNodeCount(doc, 1);
+
+    const code_block = try expectCodeBlock(doc.nodes[0]);
+    try testing.expectEqualStrings("bash", code_block.language.?);
+    try testing.expectEqualStrings("prise serve", code_block.content);
 }
 
-test "parse bullet list" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "parse consecutive bullet lines as one list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const doc = try parse(arena.allocator(),
+    const doc = try parseMarkdown(&arena,
         \\- First item
         \\- Second item
         \\- Third item
         \\
     );
-    try std.testing.expectEqual(1, doc.nodes.len);
-    const items = doc.nodes[0].bullet_list;
-    try std.testing.expectEqual(3, items.len);
-    try std.testing.expectEqualStrings("First item", items[0][0].text);
-    try std.testing.expectEqualStrings("Second item", items[1][0].text);
-    try std.testing.expectEqualStrings("Third item", items[2][0].text);
+    try expectNodeCount(doc, 1);
+
+    const items = try expectBulletList(doc.nodes[0]);
+    try testing.expectEqual(@as(usize, 3), items.len);
+    try expectText(items[0][0], "First item");
+    try expectText(items[1][0], "Second item");
+    try expectText(items[2][0], "Third item");
 }
 
-test "parse definition list" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "parse definition list term and description inline markup" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const doc = try parse(arena.allocator(),
+    const doc = try parseMarkdown(&arena,
         \\**-v**, **--verbose**
         \\:   Enable verbose output
         \\
     );
-    try std.testing.expectEqual(1, doc.nodes.len);
-    const def = doc.nodes[0].definition;
-    try std.testing.expectEqualStrings("-v", def.term[0].bold);
-    try std.testing.expectEqualStrings("Enable verbose output", def.description[0].text);
+    try expectNodeCount(doc, 1);
+
+    const definition = try expectDefinition(doc.nodes[0]);
+    try testing.expectEqual(@as(usize, 3), definition.term.len);
+    try expectBold(definition.term[0], "-v");
+    try expectText(definition.term[1], ", ");
+    try expectBold(definition.term[2], "--verbose");
+    try expectText(definition.description[0], "Enable verbose output");
 }
 
-test "parse mixed inline formatting" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "parse mixed inline formatting in source order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const doc = try parse(arena.allocator(), "Use **bold** and *italic* and `code` together.\n");
-    const spans = doc.nodes[0].paragraph;
-    try std.testing.expectEqual(7, spans.len);
-    try std.testing.expectEqualStrings("bold", spans[1].bold);
-    try std.testing.expectEqualStrings("italic", spans[3].italic);
-    try std.testing.expectEqualStrings("code", spans[5].code);
+    const doc = try parseMarkdown(&arena, "Use **bold** and *italic* and `code` together.\n");
+    try expectNodeCount(doc, 1);
+
+    const spans = try expectParagraph(doc.nodes[0]);
+    try testing.expectEqual(@as(usize, 7), spans.len);
+    try expectText(spans[0], "Use ");
+    try expectBold(spans[1], "bold");
+    try expectText(spans[2], " and ");
+    try expectItalic(spans[3], "italic");
+    try expectText(spans[4], " and ");
+    try expectCode(spans[5], "code");
+    try expectText(spans[6], " together.");
 }
 
-test "parse multiple paragraphs" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "parse blank line separates paragraphs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const doc = try parse(arena.allocator(),
+    const doc = try parseMarkdown(&arena,
         \\First paragraph.
         \\
         \\Second paragraph.
         \\
     );
-    try std.testing.expectEqual(2, doc.nodes.len);
-    try std.testing.expectEqualStrings("First paragraph.", doc.nodes[0].paragraph[0].text);
-    try std.testing.expectEqualStrings("Second paragraph.", doc.nodes[1].paragraph[0].text);
+    try expectNodeCount(doc, 2);
+
+    const first = try expectParagraph(doc.nodes[0]);
+    const second = try expectParagraph(doc.nodes[1]);
+    try expectText(first[0], "First paragraph.");
+    try expectText(second[0], "Second paragraph.");
 }
 
-test "parse full document" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "parse full manpage-shaped document structure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const doc = try parse(arena.allocator(),
+    const doc = try parseMarkdown(&arena,
         \\# NAME
         \\
         \\prise - terminal multiplexer
@@ -485,9 +591,11 @@ test "parse full document" {
         \\:   Show help message
         \\
     );
-    try std.testing.expectEqual(6, doc.nodes.len);
-    try std.testing.expectEqualStrings("NAME", doc.nodes[0].heading.text);
-    try std.testing.expectEqual(@as(u8, 1), doc.nodes[0].heading.level);
-    try std.testing.expectEqualStrings("SYNOPSIS", doc.nodes[2].heading.text);
-    try std.testing.expectEqual(@as(u8, 2), doc.nodes[2].heading.level);
+    try expectNodeCount(doc, 6);
+    try expectHeading(doc.nodes[0], 1, "NAME");
+    _ = try expectParagraph(doc.nodes[1]);
+    try expectHeading(doc.nodes[2], 2, "SYNOPSIS");
+    _ = try expectParagraph(doc.nodes[3]);
+    try expectHeading(doc.nodes[4], 2, "OPTIONS");
+    _ = try expectDefinition(doc.nodes[5]);
 }

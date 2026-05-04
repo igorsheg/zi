@@ -267,148 +267,160 @@ fn flushPendingLines(
 // Tests
 // =============================================================================
 
-test "SseParser dispatches event blocks with type id retry and multiline data semantics" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
+fn expectNoEvent(parser: *SseParser, line: []const u8) !void {
+    try std.testing.expectEqual(@as(?SseEvent, null), try parser.feedLine(line));
+}
 
-    try std.testing.expect((try p.feedLine("id: 42")) == null);
-    try std.testing.expect((try p.feedLine("retry: 3000")) == null);
-    try std.testing.expect((try p.feedLine("event: message_start")) == null);
-    try std.testing.expect((try p.feedLine("data: line1")) == null);
-    try std.testing.expect((try p.feedLine("data: line2")) == null);
-    const evt = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("42", evt.id.?);
-    try std.testing.expectEqualStrings("message_start", evt.event.?);
-    try std.testing.expectEqualStrings("line1\nline2", evt.data);
-    try std.testing.expectEqual(@as(u64, 3000), p.retry_ms.?);
+fn expectNextEvent(parser: *SseParser, expected_data: []const u8) !SseEvent {
+    const event = (try parser.feedLine("")) orelse return error.TestExpectedEvent;
+    try std.testing.expectEqualStrings(expected_data, event.data);
+    return event;
+}
 
-    _ = try p.feedLine("data: second");
-    const inherited = (try p.feedLine("")).?;
+fn feedDataLine(parser: *SseParser, data: []const u8) !void {
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(std.testing.allocator);
+    try line.appendSlice(std.testing.allocator, "data: ");
+    try line.appendSlice(std.testing.allocator, data);
+    try expectNoEvent(parser, line.items);
+}
+
+const CapturedEvents = struct {
+    count: usize = 0,
+    last_event: ?[]const u8 = null,
+    last_data: ?[]const u8 = null,
+
+    fn handler(event: SseEvent, ctx: ?*anyopaque) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.last_event = event.event;
+        self.last_data = event.data;
+    }
+
+    fn eventHandler(self: *@This()) EventHandler {
+        return .{ .func = &handler, .ctx = @ptrCast(self) };
+    }
+};
+
+const ChunkedSliceReader = struct {
+    input: []const u8,
+    pos: usize = 0,
+
+    fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+        if (self.pos >= self.input.len) return error.EndOfStream;
+        const remaining = self.input.len - self.pos;
+        const n = @min(limit.minInt(remaining), remaining);
+        try w.writeAll(self.input[self.pos .. self.pos + n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+test "SseParser emits complete event with id, type, retry, and joined data" {
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    try expectNoEvent(&parser, "id: 42");
+    try expectNoEvent(&parser, "retry: 3000");
+    try expectNoEvent(&parser, "event: message_start");
+    try expectNoEvent(&parser, "data: line1");
+    try expectNoEvent(&parser, "data: line2");
+
+    const event = try expectNextEvent(&parser, "line1\nline2");
+    try std.testing.expectEqualStrings("42", event.id.?);
+    try std.testing.expectEqualStrings("message_start", event.event.?);
+    try std.testing.expectEqual(@as(?u64, 3000), parser.retry_ms);
+}
+
+test "SseParser carries last event id and ignores malformed retry" {
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    try expectNoEvent(&parser, "id: 42");
+    try expectNoEvent(&parser, "retry: 3000");
+    try feedDataLine(&parser, "first");
+    _ = try expectNextEvent(&parser, "first");
+
+    try feedDataLine(&parser, "second");
+    const inherited = try expectNextEvent(&parser, "second");
     try std.testing.expectEqualStrings("42", inherited.id.?);
 
-    _ = try p.feedLine("retry: abc");
-    try std.testing.expectEqual(@as(u64, 3000), p.retry_ms.?);
+    try expectNoEvent(&parser, "retry: abc");
+    try std.testing.expectEqual(@as(?u64, 3000), parser.retry_ms);
 }
 
 test "SseParser ignores comments and event-only blocks while preserving empty data events" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
 
-    try std.testing.expect((try p.feedLine(": comment")) == null);
-    _ = try p.feedLine("event: ping");
-    try std.testing.expect((try p.feedLine("")) == null);
+    try expectNoEvent(&parser, ": comment");
+    try expectNoEvent(&parser, "event: ping");
+    try expectNoEvent(&parser, "");
 
-    _ = try p.feedLine("data:");
-    const empty = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("", empty.data);
+    try expectNoEvent(&parser, "data:");
+    _ = try expectNextEvent(&parser, "");
 }
 
-test "SseParser accepts wire-format value variants and multiple events" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
+test "SseParser accepts no-space values, CR-trimmed lines, and consecutive events" {
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
 
-    _ = try p.feedLine("data:no-space");
-    try std.testing.expectEqualStrings("no-space", (try p.feedLine("")).?.data);
+    try expectNoEvent(&parser, "data:no-space");
+    _ = try expectNextEvent(&parser, "no-space");
 
-    const line = std.mem.trimEnd(u8, "data: crlf\r", "\r");
-    _ = try p.feedLine(line);
-    try std.testing.expectEqualStrings("crlf", (try p.feedLine("")).?.data);
+    const crlf_line = std.mem.trimEnd(u8, "data: crlf\r", "\r");
+    try expectNoEvent(&parser, crlf_line);
+    _ = try expectNextEvent(&parser, "crlf");
 
-    _ = try p.feedLine("event: a");
-    _ = try p.feedLine("data: 1");
-    try std.testing.expectEqualStrings("a", (try p.feedLine("")).?.event.?);
+    try expectNoEvent(&parser, "event: a");
+    try feedDataLine(&parser, "1");
+    const first = try expectNextEvent(&parser, "1");
+    try std.testing.expectEqualStrings("a", first.event.?);
 
-    _ = try p.feedLine("event: b");
-    _ = try p.feedLine("data: 2");
-    const e2 = (try p.feedLine("")).?;
-    try std.testing.expectEqualStrings("b", e2.event.?);
-    try std.testing.expectEqualStrings("2", e2.data);
+    try expectNoEvent(&parser, "event: b");
+    try feedDataLine(&parser, "2");
+    const second = try expectNextEvent(&parser, "2");
+    try std.testing.expectEqualStrings("b", second.event.?);
 }
 
-test "event data larger than max fails instead of truncating" {
-    var p = SseParser.init(std.testing.allocator);
-    defer p.deinit();
+test "SseParser rejects event data beyond configured limit" {
+    var parser = SseParser.init(std.testing.allocator);
+    defer parser.deinit();
 
-    const big = try std.testing.allocator.alloc(u8, max_event_data_bytes - 7);
-    defer std.testing.allocator.free(big);
-    @memset(big, 'x');
+    const fitting_payload = try std.testing.allocator.alloc(u8, max_event_data_bytes - "data: ".len - 1);
+    defer std.testing.allocator.free(fitting_payload);
+    @memset(fitting_payload, 'x');
 
-    var line: std.ArrayListUnmanaged(u8) = .empty;
-    defer line.deinit(std.testing.allocator);
-    try line.ensureUnusedCapacity(std.testing.allocator, 6 + big.len);
-    line.appendSliceAssumeCapacity("data: ");
-    line.appendSliceAssumeCapacity(big);
-
-    _ = try p.feedLine(line.items);
-    try std.testing.expectError(error.EventDataTooLarge, p.feedLine("data: overflow"));
+    try feedDataLine(&parser, fitting_payload);
+    try std.testing.expectError(error.EventDataTooLarge, parser.feedLine("data: overflow"));
 }
 
 test "streamEvents feeds reader into parser" {
     const input = "event: test\ndata: hello\n\nevent: done\ndata: bye\n\n";
     var reader: std.Io.Reader = .fixed(input);
-
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
-    var count: usize = 0;
+    var captured = CapturedEvents{};
 
-    const Ctx = struct {
-        count: *usize,
+    try streamEvents(std.testing.allocator, &reader, &parser, 8, captured.eventHandler());
 
-        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
-            _ = evt;
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.count.* += 1;
-        }
-    };
-
-    var ctx = Ctx{ .count = &count };
-    try streamEvents(std.testing.allocator, &reader, &parser, 8, .{
-        .func = &Ctx.cb,
-        .ctx = @ptrCast(&ctx),
-    });
-    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(usize, 2), captured.count);
+    try std.testing.expectEqualStrings("done", captured.last_event.?);
+    try std.testing.expectEqualStrings("bye", captured.last_data.?);
 }
 
-test "streamEvents handles lines longer than chunk size" {
-    const SliceReader = struct {
-        input: []const u8,
-        pos: usize = 0,
-
-        fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
-            if (self.pos >= self.input.len) return error.EndOfStream;
-            const remaining = self.input.len - self.pos;
-            const n = @min(limit.minInt(remaining), remaining);
-            try w.writeAll(self.input[self.pos .. self.pos + n]);
-            self.pos += n;
-            return n;
-        }
-    };
-
+test "streamEvents emits a data line longer than the read chunk" {
     const long_json = "{\"type\":\"response.output_text.delta\",\"delta\":\"" ++ ("x" ** 20000) ++ "\"}";
     const input = "data: " ++ long_json ++ "\n\n";
-    var reader = SliceReader{ .input = input };
+    var reader = ChunkedSliceReader{ .input = input };
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
+    var captured = CapturedEvents{};
 
-    const Ctx = struct {
-        seen: bool = false,
-        data_len: usize = 0,
+    try streamEvents(std.testing.allocator, &reader, &parser, 64, captured.eventHandler());
 
-        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.seen = true;
-            self.data_len = evt.data.len;
-        }
-    };
-
-    var ctx = Ctx{};
-    try streamEvents(std.testing.allocator, &reader, &parser, 64, .{
-        .func = &Ctx.cb,
-        .ctx = @ptrCast(&ctx),
-    });
-
-    try std.testing.expect(ctx.seen);
-    try std.testing.expectEqual(long_json.len, ctx.data_len);
+    try std.testing.expectEqual(@as(usize, 1), captured.count);
+    try std.testing.expectEqualStrings(long_json, captured.last_data.?);
 }
 
 test "streamEvents retries after zero-byte read instead of treating it as EOF" {
@@ -435,26 +447,12 @@ test "streamEvents retries after zero-byte read instead of treating it as EOF" {
     var reader = ZeroThenMoreReader{};
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
+    var captured = CapturedEvents{};
 
-    const Ctx = struct {
-        seen: bool = false,
-        data: ?[]const u8 = null,
+    try streamEvents(std.testing.allocator, &reader, &parser, 64, captured.eventHandler());
 
-        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.seen = true;
-            self.data = evt.data;
-        }
-    };
-
-    var ctx = Ctx{};
-    try streamEvents(std.testing.allocator, &reader, &parser, 64, .{
-        .func = &Ctx.cb,
-        .ctx = @ptrCast(&ctx),
-    });
-
-    try std.testing.expect(ctx.seen);
-    try std.testing.expectEqualStrings("hello", ctx.data.?);
+    try std.testing.expectEqual(@as(usize, 1), captured.count);
+    try std.testing.expectEqualStrings("hello", captured.last_data.?);
 }
 
 test "streamEvents discards unterminated tail at EOF" {
@@ -482,23 +480,11 @@ test "streamEvents discards unterminated tail at EOF" {
     var reader = ZeroAtEndReader{ .input = "data: {\"type\":\"response.completed\"" };
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
+    var captured = CapturedEvents{};
 
-    const Ctx = struct {
-        count: usize = 0,
+    try streamEvents(std.testing.allocator, &reader, &parser, 64, captured.eventHandler());
 
-        fn cb(_: SseEvent, ctx: ?*anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.count += 1;
-        }
-    };
-
-    var ctx = Ctx{};
-    try streamEvents(std.testing.allocator, &reader, &parser, 64, .{
-        .func = &Ctx.cb,
-        .ctx = @ptrCast(&ctx),
-    });
-
-    try std.testing.expectEqual(@as(usize, 0), ctx.count);
+    try std.testing.expectEqual(@as(usize, 0), captured.count);
 }
 
 test "streamEvents makes forward progress when stream parks bytes in reader buffer" {
@@ -514,24 +500,10 @@ test "streamEvents makes forward progress when stream parks bytes in reader buff
 
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
+    var captured = CapturedEvents{};
 
-    const Ctx = struct {
-        seen: bool = false,
-        data: ?[]const u8 = null,
+    try streamEvents(std.testing.allocator, &indirect.interface, &parser, 16, captured.eventHandler());
 
-        fn cb(evt: SseEvent, ctx: ?*anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.seen = true;
-            self.data = evt.data;
-        }
-    };
-
-    var ctx = Ctx{};
-    try streamEvents(std.testing.allocator, &indirect.interface, &parser, 16, .{
-        .func = &Ctx.cb,
-        .ctx = @ptrCast(&ctx),
-    });
-
-    try std.testing.expect(ctx.seen);
-    try std.testing.expectEqualStrings("hello", ctx.data.?);
+    try std.testing.expectEqual(@as(usize, 1), captured.count);
+    try std.testing.expectEqualStrings("hello", captured.last_data.?);
 }

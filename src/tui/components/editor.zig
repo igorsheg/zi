@@ -1011,41 +1011,57 @@ fn submittedText(capture: *const SubmitCapture) []const u8 {
     return capture.last_text_buf[0..capture.last_text_len];
 }
 
-test "Editor undo coalesces typing by word boundaries" {
+fn expectEditorText(editor: *Editor, expected: []const u8) !void {
+    try testing.expectEqualStrings(expected, editor.getText());
+}
+
+fn press(editor: *Editor, key: Key) !void {
+    try testing.expect(editor.handleInput(key));
+}
+
+fn typeText(editor: *Editor, text: []const u8) !void {
+    for (text) |c| try press(editor, .{ .code = .char, .char = c });
+}
+
+fn undo(editor: *Editor) !void {
+    try press(editor, .{ .code = .char, .char = '-', .ctrl = true });
+}
+
+const LargeMultilinePaste = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+
+test "Editor undo groups continuous typing by word" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
 
-    for ("hi there") |c| {
-        try testing.expect(editor.handleInput(.{ .code = .char, .char = c }));
-    }
-    try testing.expectEqualStrings("hi there", editor.getText());
+    try typeText(&editor, "hi there");
+    try expectEditorText(&editor, "hi there");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("hi", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "hi");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "");
 }
 
-test "Editor undo restores destructive backspace and delete edits" {
+test "Editor undo restores backspace and delete edits" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
 
     editor.setText("abc");
-    try testing.expectEqualStrings("abc", editor.getText());
+    try expectEditorText(&editor, "abc");
 
-    try testing.expect(editor.handleInput(.{ .code = .backspace }));
+    try press(&editor, .{ .code = .backspace });
     try testing.expectEqualStrings("ab", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("abc", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "abc");
 
-    try testing.expect(editor.handleInput(.{ .code = .left }));
-    try testing.expect(editor.handleInput(.{ .code = .delete }));
+    try press(&editor, .{ .code = .left });
+    try press(&editor, .{ .code = .delete });
     try testing.expectEqualStrings("ab", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("abc", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "abc");
 }
 
 test "Editor undo restores autocomplete application as one edit" {
@@ -1062,14 +1078,14 @@ test "Editor undo restores autocomplete application as one edit" {
     editor.insertText("/mo");
     try testing.expect(editor.autocomplete.isActive());
 
-    try testing.expect(editor.handleInput(.{ .code = .tab }));
-    try testing.expectEqualStrings("/model ", editor.getText());
+    try press(&editor, .{ .code = .tab });
+    try expectEditorText(&editor, "/model ");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("/mo", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "/mo");
 }
 
-test "Editor submit actions preserve disable-submit and escaped newline semantics" {
+test "Editor submit respects disabled state and escaped newline" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
 
@@ -1078,19 +1094,19 @@ test "Editor submit actions preserve disable-submit and escaped newline semantic
     editor.setSubmitDisabled(true);
 
     editor.insertText("draft");
-    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try press(&editor, .{ .code = .enter });
     try testing.expectEqual(@as(u32, 0), capture.count);
-    try testing.expectEqualStrings("draft", editor.getText());
+    try expectEditorText(&editor, "draft");
 
     editor.setText("line\\");
-    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try press(&editor, .{ .code = .enter });
     try testing.expectEqual(@as(u32, 0), capture.count);
-    try testing.expectEqualStrings("line\n", editor.getText());
+    try expectEditorText(&editor, "line\n");
 
     editor.setSubmitDisabled(false);
     editor.setText("alpha");
-    try testing.expect(editor.handleInput(.{ .code = .enter, .shift = true }));
-    try testing.expectEqualStrings("alpha\n", editor.getText());
+    try press(&editor, .{ .code = .enter, .shift = true });
+    try expectEditorText(&editor, "alpha\n");
 }
 
 test "Editor autocomplete confirm respects disable-submit and stays undoable" {
@@ -1111,12 +1127,12 @@ test "Editor autocomplete confirm respects disable-submit and stays undoable" {
     editor.insertText("/mo");
     try testing.expect(editor.autocomplete.isActive());
 
-    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try press(&editor, .{ .code = .enter });
     try testing.expectEqual(@as(u32, 0), capture.count);
-    try testing.expectEqualStrings("/model ", editor.getText());
+    try expectEditorText(&editor, "/model ");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("/mo", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "/mo");
 }
 
 test "Editor history browsing snapshots the empty draft and submit clears undo state" {
@@ -1127,26 +1143,26 @@ test "Editor history browsing snapshots the empty draft and submit clears undo s
     editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
     editor.addToHistory("old prompt");
 
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("old prompt", editor.getText());
+    try press(&editor, .{ .code = .up });
+    try expectEditorText(&editor, "old prompt");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '!' }));
-    try testing.expectEqualStrings("old prompt!", editor.getText());
+    try press(&editor, .{ .code = .char, .char = '!' });
+    try expectEditorText(&editor, "old prompt!");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("old prompt", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "old prompt");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "");
 
     editor.insertText("draft");
-    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try press(&editor, .{ .code = .enter });
     try testing.expectEqual(@as(u32, 1), capture.count);
     try testing.expectEqualStrings("draft", submittedText(&capture));
-    try testing.expectEqualStrings("", editor.getText());
+    try expectEditorText(&editor, "");
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "");
 }
 
 test "Editor up/down handle prompt boundaries and history crossover" {
@@ -1156,20 +1172,20 @@ test "Editor up/down handle prompt boundaries and history crossover" {
     editor.setText("hello");
     editor.buffer.setCursorByte(3);
 
-    try testing.expect(editor.handleInput(.{ .code = .up }));
+    try press(&editor, .{ .code = .up });
     try testing.expectEqual(@as(u32, 0), editor.buffer.cursorByte());
 
-    try testing.expect(editor.handleInput(.{ .code = .down }));
+    try press(&editor, .{ .code = .down });
     try testing.expectEqual(@as(u32, 5), editor.buffer.cursorByte());
 
     editor.clear();
     editor.addToHistory("older");
 
-    try testing.expect(editor.handleInput(.{ .code = .up }));
-    try testing.expectEqualStrings("older", editor.getText());
+    try press(&editor, .{ .code = .up });
+    try expectEditorText(&editor, "older");
 
-    try testing.expect(editor.handleInput(.{ .code = .down }));
-    try testing.expectEqualStrings("", editor.getText());
+    try press(&editor, .{ .code = .down });
+    try expectEditorText(&editor, "");
 }
 
 test "Editor handlePaste normalizes content and undoes atomically" {
@@ -1180,13 +1196,12 @@ test "Editor handlePaste normalizes content and undoes atomically" {
     editor.handlePaste("/tmp\tfile\r\nnext\x01");
     try testing.expectEqualStrings("open /tmp    file\nnext", editor.getText());
 
-    try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
-    try testing.expectEqualStrings("open", editor.getText());
+    try undo(&editor);
+    try expectEditorText(&editor, "open");
 }
 
-test "Editor large multiline paste inserts marker and submits expanded content" {
-    const pasted =
-        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+test "Editor large multiline paste marker expands on submit" {
+    const pasted = LargeMultilinePaste;
 
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
@@ -1195,17 +1210,17 @@ test "Editor large multiline paste inserts marker and submits expanded content" 
     editor.setOnSubmit(&captureSubmit, @ptrCast(&capture));
 
     editor.handlePaste(pasted);
-    try testing.expectEqualStrings("[paste #1 +11 lines]", editor.getText());
+    try expectEditorText(&editor, "[paste #1 +11 lines]");
     try testing.expectEqualStrings(pasted, editor.getExpandedText());
 
-    try testing.expect(editor.handleInput(.{ .code = .enter }));
+    try press(&editor, .{ .code = .enter });
     try testing.expectEqual(@as(u32, 1), capture.count);
     try testing.expectEqualStrings(pasted, submittedText(&capture));
-    try testing.expectEqualStrings("", editor.getText());
+    try expectEditorText(&editor, "");
     try testing.expectEqualStrings("", editor.getExpandedText());
 }
 
-test "Editor large single-line paste inserts char-count marker" {
+test "Editor large single-line paste marker reports character count" {
     var editor = Editor.init(testing.allocator);
     defer editor.deinit();
 
@@ -1213,14 +1228,13 @@ test "Editor large single-line paste inserts char-count marker" {
     @memset(&pasted, 'a');
 
     editor.handlePaste(pasted[0..]);
-    try testing.expectEqualStrings("[paste #1 1001 chars]", editor.getText());
+    try expectEditorText(&editor, "[paste #1 1001 chars]");
     try testing.expectEqual(@as(usize, 1001), editor.getExpandedText().len);
     try testing.expectEqualStrings(pasted[0..], editor.getExpandedText());
 }
 
-test "Editor stored paste markers navigate, delete, and undo atomically" {
-    const pasted =
-        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
+test "Editor stored paste markers move and delete as one unit" {
+    const pasted = LargeMultilinePaste;
 
     {
         var editor = Editor.init(testing.allocator);
@@ -1232,13 +1246,13 @@ test "Editor stored paste markers navigate, delete, and undo atomically" {
         const original = try testing.allocator.dupe(u8, editor.getText());
         defer testing.allocator.free(original);
 
-        try testing.expect(editor.handleInput(.{ .code = .home }));
-        try testing.expect(editor.handleInput(.{ .code = .right }));
-        try testing.expect(editor.handleInput(.{ .code = .right }));
-        try testing.expect(editor.handleInput(.{ .code = .backspace }));
-        try testing.expectEqualStrings("AB", editor.getText());
+        try press(&editor, .{ .code = .home });
+        try press(&editor, .{ .code = .right });
+        try press(&editor, .{ .code = .right });
+        try press(&editor, .{ .code = .backspace });
+        try expectEditorText(&editor, "AB");
 
-        try testing.expect(editor.handleInput(.{ .code = .char, .char = '-', .ctrl = true }));
+        try undo(&editor);
         try testing.expectEqualStrings(original, editor.getText());
     }
 
@@ -1250,10 +1264,10 @@ test "Editor stored paste markers navigate, delete, and undo atomically" {
         editor.handlePaste(pasted);
         editor.insertText("B");
 
-        try testing.expect(editor.handleInput(.{ .code = .home }));
-        try testing.expect(editor.handleInput(.{ .code = .right }));
-        try testing.expect(editor.handleInput(.{ .code = .delete }));
-        try testing.expectEqualStrings("AB", editor.getText());
+        try press(&editor, .{ .code = .home });
+        try press(&editor, .{ .code = .right });
+        try press(&editor, .{ .code = .delete });
+        try expectEditorText(&editor, "AB");
     }
 }
 
@@ -1262,8 +1276,8 @@ test "Editor ignores manually typed marker-like text for atomic movement" {
     defer editor.deinit();
 
     editor.setText("[paste #99 +5 lines]");
-    try testing.expect(editor.handleInput(.{ .code = .home }));
-    try testing.expect(editor.handleInput(.{ .code = .right }));
+    try press(&editor, .{ .code = .home });
+    try press(&editor, .{ .code = .right });
     try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
 }
 
@@ -1285,14 +1299,14 @@ test "Editor arrow keys move by grapheme cluster for combining marks and emoji" 
         defer editor.deinit();
 
         editor.setText(case.text);
-        try testing.expect(editor.handleInput(.{ .code = .home }));
-        try testing.expect(editor.handleInput(.{ .code = .right }));
+        try press(&editor, .{ .code = .home });
+        try press(&editor, .{ .code = .right });
         try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
 
-        try testing.expect(editor.handleInput(.{ .code = .right }));
+        try press(&editor, .{ .code = .right });
         try testing.expectEqual(@as(u32, 1) + case.atomic_len, editor.buffer.cursorByte());
 
-        try testing.expect(editor.handleInput(.{ .code = .left }));
+        try press(&editor, .{ .code = .left });
         try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
     }
 }
@@ -1318,11 +1332,11 @@ test "Editor backspace and delete remove whole grapheme clusters" {
             defer testing.allocator.free(text);
             editor.setText(text);
 
-            try testing.expect(editor.handleInput(.{ .code = .home }));
-            try testing.expect(editor.handleInput(.{ .code = .right }));
-            try testing.expect(editor.handleInput(.{ .code = .right }));
-            try testing.expect(editor.handleInput(.{ .code = .backspace }));
-            try testing.expectEqualStrings("AB", editor.getText());
+            try press(&editor, .{ .code = .home });
+            try press(&editor, .{ .code = .right });
+            try press(&editor, .{ .code = .right });
+            try press(&editor, .{ .code = .backspace });
+            try expectEditorText(&editor, "AB");
             try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
         }
 
@@ -1334,10 +1348,10 @@ test "Editor backspace and delete remove whole grapheme clusters" {
             defer testing.allocator.free(text);
             editor.setText(text);
 
-            try testing.expect(editor.handleInput(.{ .code = .home }));
-            try testing.expect(editor.handleInput(.{ .code = .right }));
-            try testing.expect(editor.handleInput(.{ .code = .delete }));
-            try testing.expectEqualStrings("AB", editor.getText());
+            try press(&editor, .{ .code = .home });
+            try press(&editor, .{ .code = .right });
+            try press(&editor, .{ .code = .delete });
+            try expectEditorText(&editor, "AB");
             try testing.expectEqual(@as(u32, 1), editor.buffer.cursorByte());
         }
     }

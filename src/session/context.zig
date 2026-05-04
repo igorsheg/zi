@@ -281,6 +281,43 @@ fn getAssistantText(msg: agent.protocol.AgentMessage) ?[]const u8 {
     }
 }
 
+fn expectDefaultContext(ctx: SessionContext) !void {
+    try std.testing.expectEqual(@as(usize, 0), ctx.messages.len);
+    try std.testing.expectEqualStrings("off", ctx.thinking_level);
+    try std.testing.expect(ctx.model == null);
+}
+
+fn expectUserTextAt(ctx: SessionContext, index: usize, expected: []const u8) !void {
+    try std.testing.expect(index < ctx.messages.len);
+    const actual = getUserText(ctx.messages[index]) orelse return error.ExpectedUserMessage;
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+fn expectAssistantTextAt(ctx: SessionContext, index: usize, expected: []const u8) !void {
+    try std.testing.expect(index < ctx.messages.len);
+    const actual = getAssistantText(ctx.messages[index]) orelse return error.ExpectedAssistantMessage;
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+fn expectCompactionSummaryAt(ctx: SessionContext, index: usize, expected_summary: []const u8, expected_tokens: u64) !void {
+    try std.testing.expect(index < ctx.messages.len);
+    switch (ctx.messages[index]) {
+        .compaction_summary => |cs| {
+            try std.testing.expectEqualStrings(expected_summary, cs.summary);
+            try std.testing.expectEqual(expected_tokens, cs.tokens_before);
+        },
+        else => return error.ExpectedCompactionSummary,
+    }
+}
+
+fn expectBranchSummaryAt(ctx: SessionContext, index: usize, expected_summary: []const u8) !void {
+    try std.testing.expect(index < ctx.messages.len);
+    switch (ctx.messages[index]) {
+        .branch_summary => |bs| try std.testing.expectEqualStrings(expected_summary, bs.summary),
+        else => return error.ExpectedBranchSummary,
+    }
+}
+
 // ─── Conformance tests ported from pi-mono build-context.test.ts ────
 
 fn testArena() std.heap.ArenaAllocator {
@@ -293,15 +330,11 @@ test "empty and before_first selections produce default context" {
 
     var empty_entries = [_]proto.SessionEntry{};
     const empty_ctx = try buildSessionContext(arena.allocator(), &empty_entries, .current);
-    try std.testing.expectEqual(@as(usize, 0), empty_ctx.messages.len);
-    try std.testing.expectEqualStrings("off", empty_ctx.thinking_level);
-    try std.testing.expect(empty_ctx.model == null);
+    try expectDefaultContext(empty_ctx);
 
     var entries = [_]proto.SessionEntry{testMsg(arena.allocator(), "1", null, .user, "hello")};
     const before_first_ctx = try buildSessionContext(arena.allocator(), &entries, .before_first);
-    try std.testing.expectEqual(@as(usize, 0), before_first_ctx.messages.len);
-    try std.testing.expectEqualStrings("off", before_first_ctx.thinking_level);
-    try std.testing.expect(before_first_ctx.model == null);
+    try expectDefaultContext(before_first_ctx);
 }
 
 test "conversation context preserves path order and selected leaf" {
@@ -316,13 +349,13 @@ test "conversation context preserves path order and selected leaf" {
 
     const current_ctx = try buildSessionContext(arena.allocator(), &entries, .current);
     try std.testing.expectEqual(@as(usize, 3), current_ctx.messages.len);
-    try std.testing.expectEqualStrings("hello", getUserText(current_ctx.messages[0]).?);
-    try std.testing.expectEqualStrings("hi there", getAssistantText(current_ctx.messages[1]).?);
-    try std.testing.expectEqualStrings("branch B", getUserText(current_ctx.messages[2]).?);
+    try expectUserTextAt(current_ctx, 0, "hello");
+    try expectAssistantTextAt(current_ctx, 1, "hi there");
+    try expectUserTextAt(current_ctx, 2, "branch B");
 
     const branch_a_ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "3" });
     try std.testing.expectEqual(@as(usize, 3), branch_a_ctx.messages.len);
-    try std.testing.expectEqualStrings("branch A", getUserText(branch_a_ctx.messages[2]).?);
+    try expectUserTextAt(branch_a_ctx, 2, "branch A");
 }
 
 test "tracks user-visible thinking level and model state" {
@@ -359,17 +392,11 @@ test "compaction emits latest summary, kept messages, and later messages" {
 
     const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
     try std.testing.expectEqual(@as(usize, 5), ctx.messages.len);
-    switch (ctx.messages[0]) {
-        .compaction_summary => |cs| {
-            try std.testing.expectEqualStrings("Second summary", cs.summary);
-            try std.testing.expectEqual(@as(u64, 1000), cs.tokens_before);
-        },
-        else => return error.ExpectedCompactionSummary,
-    }
-    try std.testing.expectEqualStrings("second", getUserText(ctx.messages[1]).?);
-    try std.testing.expectEqualStrings("response2", getAssistantText(ctx.messages[2]).?);
-    try std.testing.expectEqualStrings("third", getUserText(ctx.messages[3]).?);
-    try std.testing.expectEqualStrings("response3", getAssistantText(ctx.messages[4]).?);
+    try expectCompactionSummaryAt(ctx, 0, "Second summary", 1000);
+    try expectUserTextAt(ctx, 1, "second");
+    try expectAssistantTextAt(ctx, 2, "response2");
+    try expectUserTextAt(ctx, 3, "third");
+    try expectAssistantTextAt(ctx, 4, "response3");
 }
 
 test "branch summary appears only on selected branch" {
@@ -386,15 +413,12 @@ test "branch summary appears only on selected branch" {
 
     const summary_branch = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "5" });
     try std.testing.expectEqual(@as(usize, 4), summary_branch.messages.len);
-    switch (summary_branch.messages[2]) {
-        .branch_summary => |bs| try std.testing.expectEqualStrings("Summary of abandoned work", bs.summary),
-        else => return error.ExpectedBranchSummary,
-    }
-    try std.testing.expectEqualStrings("new direction", getUserText(summary_branch.messages[3]).?);
+    try expectBranchSummaryAt(summary_branch, 2, "Summary of abandoned work");
+    try expectUserTextAt(summary_branch, 3, "new direction");
 
     const other_branch = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "6" });
     try std.testing.expectEqual(@as(usize, 3), other_branch.messages.len);
-    try std.testing.expectEqualStrings("other branch", getUserText(other_branch.messages[2]).?);
+    try expectUserTextAt(other_branch, 2, "other branch");
 }
 
 test "complex branch selection combines compaction and branch summaries" {
@@ -420,25 +444,19 @@ test "complex branch selection combines compaction and branch summaries" {
 
     const ctx_main = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "7" });
     try std.testing.expectEqual(@as(usize, 5), ctx_main.messages.len);
-    switch (ctx_main.messages[0]) {
-        .compaction_summary => |cs| try std.testing.expectEqualStrings("Compacted history", cs.summary),
-        else => return error.ExpectedCompactionSummary,
-    }
-    try std.testing.expectEqualStrings("q2", getUserText(ctx_main.messages[1]).?);
-    try std.testing.expectEqualStrings("r2", getAssistantText(ctx_main.messages[2]).?);
-    try std.testing.expectEqualStrings("q3", getUserText(ctx_main.messages[3]).?);
-    try std.testing.expectEqualStrings("r3", getAssistantText(ctx_main.messages[4]).?);
+    try expectCompactionSummaryAt(ctx_main, 0, "Compacted history", 1000);
+    try expectUserTextAt(ctx_main, 1, "q2");
+    try expectAssistantTextAt(ctx_main, 2, "r2");
+    try expectUserTextAt(ctx_main, 3, "q3");
+    try expectAssistantTextAt(ctx_main, 4, "r3");
 
     const ctx_branch = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "11" });
     try std.testing.expectEqual(@as(usize, 5), ctx_branch.messages.len);
-    try std.testing.expectEqualStrings("start", getUserText(ctx_branch.messages[0]).?);
-    try std.testing.expectEqualStrings("r1", getAssistantText(ctx_branch.messages[1]).?);
-    try std.testing.expectEqualStrings("q2", getUserText(ctx_branch.messages[2]).?);
-    switch (ctx_branch.messages[3]) {
-        .branch_summary => |bs| try std.testing.expectEqualStrings("Tried wrong approach", bs.summary),
-        else => return error.ExpectedBranchSummary,
-    }
-    try std.testing.expectEqualStrings("better approach", getUserText(ctx_branch.messages[4]).?);
+    try expectUserTextAt(ctx_branch, 0, "start");
+    try expectAssistantTextAt(ctx_branch, 1, "r1");
+    try expectUserTextAt(ctx_branch, 2, "q2");
+    try expectBranchSummaryAt(ctx_branch, 3, "Tried wrong approach");
+    try expectUserTextAt(ctx_branch, 4, "better approach");
 }
 
 test "unknown leaf falls back to current context" {
@@ -451,8 +469,8 @@ test "unknown leaf falls back to current context" {
 
     const ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "nonexistent" });
     try std.testing.expectEqual(@as(usize, 2), ctx.messages.len);
-    try std.testing.expectEqualStrings("hello", getUserText(ctx.messages[0]).?);
-    try std.testing.expectEqualStrings("hi", getAssistantText(ctx.messages[1]).?);
+    try expectUserTextAt(ctx, 0, "hello");
+    try expectAssistantTextAt(ctx, 1, "hi");
 }
 
 /// Convert provider union to string.

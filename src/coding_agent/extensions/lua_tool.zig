@@ -586,48 +586,63 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
 const testing = std.testing;
 
-test "parseReturn caps raw string results" {
+fn parseLuaGlobalResult(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    chunk_name: [:0]const u8,
+    limits: ToolResultLimits,
+) !AgentToolResult {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
-    try state.doString("result = string.rep('a', 70000)", "huge_raw_result");
+    try state.doString(source, chunk_name);
     _ = c.lua_getglobal(state.L, "result");
     defer c.lua_pop(state.L, 1);
 
+    return parseReturn(allocator, state.L, -1, limits);
+}
+
+fn parsedTextBytes(result: AgentToolResult) usize {
+    var total: usize = 0;
+    for (result.content) |block| total += block.text.text.len;
+    return total;
+}
+
+test "parseReturn enforces raw string text budget" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
+    const result = try parseLuaGlobalResult(
+        arena.allocator(),
+        "result = string.rep('a', 70000)",
+        "huge_raw_result",
+        default_tool_result_limits,
+    );
+
     try testing.expectEqual(@as(usize, 1), result.content.len);
     try testing.expectEqual(default_tool_result_limits.max_text_bytes, result.content[0].text.text.len);
     try testing.expect(std.mem.endsWith(u8, result.content[0].text.text, tool_result_truncated_marker));
 }
 
-test "parseReturn caps text block count" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+test "parseReturn enforces content block count limit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
-    try state.doString(
+    const result = try parseLuaGlobalResult(arena.allocator(),
         \\result = { content = {} }
         \\for i = 1, 40 do
         \\  result.content[i] = { type = 'text', text = 'b' }
         \\end
-    , "many_blocks_result");
-    _ = c.lua_getglobal(state.L, "result");
-    defer c.lua_pop(state.L, 1);
+    , "many_blocks_result", default_tool_result_limits);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
     try testing.expectEqual(default_tool_result_limits.max_blocks, result.content.len);
 }
 
-test "parseReturn preserves oversized presentation shape" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+test "parseReturn preserves presentation shape while bounding oversized strings" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
-    try state.doString(
+    const result = try parseLuaGlobalResult(arena.allocator(),
         \\result = {
         \\  content = { { type = 'text', text = 'ok' } },
         \\  presentation = {
@@ -635,14 +650,8 @@ test "parseReturn preserves oversized presentation shape" {
         \\    summary = string.rep('a', 200 * 1024),
         \\  },
         \\}
-    , "huge_presentation_result");
-    _ = c.lua_getglobal(state.L, "result");
-    defer c.lua_pop(state.L, 1);
+    , "huge_presentation_result", default_tool_result_limits);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
     try testing.expect(result.presentation == .object);
     const obj = result.presentation.object;
     try testing.expectEqualStrings("tree", obj.get("kind").?.string);
@@ -650,26 +659,18 @@ test "parseReturn preserves oversized presentation shape" {
     try testing.expectEqual(true, obj.get("__zi_truncated").?.bool);
 }
 
-test "parseReturn caps cumulative text bytes across blocks" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+test "parseReturn enforces cumulative text budget across blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
-    try state.doString(
+    const result = try parseLuaGlobalResult(arena.allocator(),
         \\result = { content = {} }
         \\for i = 1, 40 do
         \\  result.content[i] = { type = 'text', text = string.rep('b', 4096) }
         \\end
-    , "huge_blocks_result");
-    _ = c.lua_getglobal(state.L, "result");
-    defer c.lua_pop(state.L, 1);
+    , "huge_blocks_result", default_tool_result_limits);
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
-    var total: usize = 0;
-    for (result.content) |block| total += block.text.text.len;
-    try testing.expectEqual(default_tool_result_limits.max_text_bytes, total);
+    try testing.expectEqual(default_tool_result_limits.max_text_bytes, parsedTextBytes(result));
 }
 
 fn testGetModel(_: *anyopaque) agent_protocol.Model {

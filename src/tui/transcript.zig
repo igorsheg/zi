@@ -1668,6 +1668,80 @@ fn appendRowColumns(out: *std.ArrayList(u8), allocator: std.mem.Allocator, regio
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
 
+const TestLineRenderable = struct {
+    lines: []const []const u8,
+
+    pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
+        var row: u32 = 0;
+        var line_idx: usize = @intCast(first_row);
+        while (row < region.height and line_idx < self.lines.len) : ({
+            row += 1;
+            line_idx += 1;
+        }) {
+            _ = region.writeStr(0, row, self.lines[line_idx], Color.default, Color.default, .{});
+        }
+    }
+
+    pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
+        const h: u32 = @intCast(self.lines.len);
+        return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
+    }
+
+    pub fn renderable(self: *@This()) TranscriptRenderable {
+        return TranscriptRenderable.init(@This(), self);
+    }
+};
+
+const TestBoxRenderable = struct {
+    height: u32 = 1,
+    ch: u21,
+
+    pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
+        if (first_row >= self.height) return;
+        const rows = @min(region.height, self.height - first_row);
+        var row: u32 = 0;
+        while (row < rows) : (row += 1) {
+            region.set(0, row, .{ .grapheme = .{ .codepoint = self.ch } });
+        }
+    }
+
+    pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
+        return .{ .min_height = if (self.height > 0) 1 else 0, .preferred_height = self.height };
+    }
+
+    pub fn renderable(self: *@This()) TranscriptRenderable {
+        return TranscriptRenderable.init(@This(), self);
+    }
+};
+
+const IdentityRenderable = struct {
+    val: u8 = 0,
+
+    pub fn renderSlice(_: *@This(), _: Region, _: u32) void {}
+
+    pub fn measure(_: *@This(), _: u32) component_mod.Measurement {
+        return .{ .min_height = 1, .preferred_height = 1 };
+    }
+
+    pub fn renderable(self: *@This()) TranscriptRenderable {
+        return TranscriptRenderable.init(@This(), self);
+    }
+};
+
+fn renderedBufferText(allocator: std.mem.Allocator, buf: *const Buffer) ![]u8 {
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text.deinit(allocator);
+    for (0..buf.height) |row| {
+        if (row > 0) try text.append(allocator, '\n');
+        for (0..buf.width) |col| {
+            const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
+            if (cp == 0) continue;
+            try text.append(allocator, @intCast(cp));
+        }
+    }
+    return text.toOwnedSlice(allocator);
+}
+
 fn appendTestAssistantRow(transcript: *Transcript) !usize {
     const assistant = try transcript.allocator.create(assistant_message_mod.AssistantMessage);
     errdefer transcript.allocator.destroy(assistant);
@@ -1826,7 +1900,7 @@ fn appendTestUserRow(
     return transcript.items.items.len - 1;
 }
 
-test "Transcript renders assistant text and tool execution in order" {
+test "Transcript renders assistant response before tool execution" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1848,17 +1922,8 @@ test "Transcript renders assistant text and tool execution in order" {
     defer buf.deinit();
     transcript.render(buf.region());
 
-    var text: std.ArrayListUnmanaged(u8) = .empty;
-    defer text.deinit(testing.allocator);
-    for (0..buf.height) |row| {
-        if (row > 0) try text.append(testing.allocator, '\n');
-        for (0..buf.width) |col| {
-            const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
-            if (cp == 0) continue;
-            try text.append(testing.allocator, @intCast(cp));
-        }
-    }
-    const flat = text.items;
+    const flat = try renderedBufferText(testing.allocator, &buf);
+    defer testing.allocator.free(flat);
     const assistant_idx = std.mem.indexOf(u8, flat, "hello from assistant") orelse return error.TestUnexpectedResult;
     const tool_idx_text = std.mem.indexOf(u8, flat, "bash") orelse return error.TestUnexpectedResult;
     try testing.expect(assistant_idx < tool_idx_text);
@@ -1880,7 +1945,7 @@ test "tool execution model replacement preserves pending routing by tool_call_id
     try testing.expectEqual(tool_idx, transcript.findToolExecutionIndex("tool-1").?);
 }
 
-test "Transcript preserves manual scroll when assistant content grows" {
+test "Transcript keeps manual scroll anchored when assistant grows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1938,7 +2003,7 @@ test "ToolExecution does not invoke result renderers before any result exists" {
     try testing.expectEqual(@as(usize, 0), S.render_result_calls);
 }
 
-test "Transcript scrolls through tool output without repeating the first rows" {
+test "Transcript scroll window advances through tool output rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
@@ -1965,27 +2030,11 @@ test "Transcript scrolls through tool output without repeating the first rows" {
 }
 
 test "Transcript item gap is parent-owned spacing between children" {
-    const OneLine = struct {
-        ch: u21,
-
-        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
-            if (first_row > 0 or region.height == 0) return;
-            region.set(0, 0, .{ .grapheme = .{ .codepoint = self.ch } });
-        }
-
-        pub fn measure(_: *@This(), _: u32) component_mod.Measurement {
-            return .{ .min_height = 1, .preferred_height = 1 };
-        }
-
-        pub fn renderable(self: *@This()) TranscriptRenderable {
-            return TranscriptRenderable.init(@This(), self);
-        }
-    };
-
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
-    var first = OneLine{ .ch = 'A' };
-    var second = OneLine{ .ch = 'B' };
+
+    var first = TestBoxRenderable{ .ch = 'A' };
+    var second = TestBoxRenderable{ .ch = 'B' };
     transcript.addRenderable(first.renderable());
     transcript.addRenderable(second.renderable());
 
@@ -2001,33 +2050,11 @@ test "Transcript item gap is parent-owned spacing between children" {
 }
 
 test "Transcript preserves visible anchor when earlier items grow" {
-    const Box = struct {
-        height: u32,
-        ch: u21,
-
-        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
-            if (first_row >= self.height) return;
-            const rows = @min(region.height, self.height - first_row);
-            var row: u32 = 0;
-            while (row < rows) : (row += 1) {
-                region.set(0, row, .{ .grapheme = .{ .codepoint = self.ch } });
-            }
-        }
-
-        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
-            return .{ .min_height = if (self.height > 0) 1 else 0, .preferred_height = self.height };
-        }
-
-        pub fn renderable(self: *@This()) TranscriptRenderable {
-            return TranscriptRenderable.init(@This(), self);
-        }
-    };
-
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var first = Box{ .height = 3, .ch = 'A' };
-    var second = Box{ .height = 3, .ch = 'B' };
+    var first = TestBoxRenderable{ .height = 3, .ch = 'A' };
+    var second = TestBoxRenderable{ .height = 3, .ch = 'B' };
     transcript.addRenderable(first.renderable());
     transcript.addRenderable(second.renderable());
     transcript.scrollBy(10, 2, 4);
@@ -2071,21 +2098,9 @@ test "Transcript removeRenderable removes item by identity and fixes indices" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    // Use a simple renderable wrapper for identity testing
-    const Wrapper = struct {
-        val: u8 = 0,
-        pub fn renderSlice(_: *@This(), _: Region, _: u32) void {}
-        pub fn measure(_: *@This(), _: u32) component_mod.Measurement {
-            return .{ .min_height = 1, .preferred_height = 1 };
-        }
-        pub fn renderable(self: *@This()) TranscriptRenderable {
-            return TranscriptRenderable.init(@This(), self);
-        }
-    };
-
-    var w1 = Wrapper{ .val = 1 };
-    var w2 = Wrapper{ .val = 2 };
-    var w3 = Wrapper{ .val = 3 };
+    var w1 = IdentityRenderable{ .val = 1 };
+    var w2 = IdentityRenderable{ .val = 2 };
+    var w3 = IdentityRenderable{ .val = 3 };
 
     transcript.addRenderable(w1.renderable());
     transcript.addRenderable(w2.renderable());
@@ -2093,54 +2108,25 @@ test "Transcript removeRenderable removes item by identity and fixes indices" {
 
     try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
 
-    // Remove middle item
     transcript.removeRenderable(w2.renderable());
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 
-    // Remaining items should be w1 and w3
     try testing.expect(TranscriptRenderable.eql(transcript.items.items[0].renderable, w1.renderable()));
     try testing.expect(TranscriptRenderable.eql(transcript.items.items[1].renderable, w3.renderable()));
 
-    // Remove non-existent — no-op
     transcript.removeRenderable(w2.renderable());
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 
-    // Scroll clamp: set scroll past total, remove item, verify clamped
     transcript.scrollBy(80, 1, 100);
     transcript.removeRenderable(w3.renderable());
-    // total height is now 1 (just w1), so scroll offset should be clamped to ≤ 1
     try testing.expect(transcript.scrollOffset() <= 1);
 }
 
 test "Transcript selection copies across visual rows" {
-    const FixedLines = struct {
-        lines: []const []const u8,
-
-        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
-            var row: u32 = 0;
-            var line_idx: usize = @intCast(first_row);
-            while (row < region.height and line_idx < self.lines.len) : ({
-                row += 1;
-                line_idx += 1;
-            }) {
-                _ = region.writeStr(0, row, self.lines[line_idx], Color.default, Color.default, .{});
-            }
-        }
-
-        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
-            const h: u32 = @intCast(self.lines.len);
-            return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
-        }
-
-        pub fn renderable(self: *@This()) TranscriptRenderable {
-            return TranscriptRenderable.init(@This(), self);
-        }
-    };
-
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var lines = FixedLines{ .lines = &.{ "alpha", "bravo" } };
+    var lines = TestLineRenderable{ .lines = &.{ "alpha", "bravo" } };
     transcript.addRenderable(lines.renderable());
 
     try testing.expect(transcript.beginSelection(10, 2, 1, 0));
@@ -2152,34 +2138,10 @@ test "Transcript selection copies across visual rows" {
 }
 
 test "Transcript selection autoscroll advances viewport while dragging below" {
-    const FixedLines = struct {
-        lines: []const []const u8,
-
-        pub fn renderSlice(self: *@This(), region: Region, first_row: u32) void {
-            var row: u32 = 0;
-            var line_idx: usize = @intCast(first_row);
-            while (row < region.height and line_idx < self.lines.len) : ({
-                row += 1;
-                line_idx += 1;
-            }) {
-                _ = region.writeStr(0, row, self.lines[line_idx], Color.default, Color.default, .{});
-            }
-        }
-
-        pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
-            const h: u32 = @intCast(self.lines.len);
-            return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
-        }
-
-        pub fn renderable(self: *@This()) TranscriptRenderable {
-            return TranscriptRenderable.init(@This(), self);
-        }
-    };
-
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var lines = FixedLines{ .lines = &.{ "row0", "row1", "row2", "row3" } };
+    var lines = TestLineRenderable{ .lines = &.{ "row0", "row1", "row2", "row3" } };
     transcript.addRenderable(lines.renderable());
 
     try testing.expect(transcript.beginSelection(10, 2, 0, 1));
@@ -2196,7 +2158,7 @@ test "Transcript selection autoscroll advances viewport while dragging below" {
     try testing.expectEqual(@as(u21, '1'), buf.get(3, 0).grapheme.codepoint);
 }
 
-test "Transcript clearAll removes all items and resets state" {
+test "Transcript clearAll removes rows and resets scroll" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 

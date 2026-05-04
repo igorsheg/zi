@@ -738,6 +738,105 @@ fn parseCustomContent(allocator: std.mem.Allocator, val: std.json.Value) !agent.
 
 // ─── Tests ──────────────────────────────────────────────────────────
 
+fn testArena() std.heap.ArenaAllocator {
+    return std.heap.ArenaAllocator.init(std.testing.allocator);
+}
+
+fn expectJsonContains(json: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, json, needle) != null);
+}
+
+fn expectJsonOmits(json: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, json, needle) == null);
+}
+
+fn messageEntry(id: []const u8, parent_id: ?[]const u8, message: agent.protocol.AgentMessage) proto.SessionEntry {
+    return .{
+        .id = id,
+        .parent_id = parent_id,
+        .timestamp = "2025-01-01T00:00:00.000Z",
+        .entry = .{ .message = .{ .message = message } },
+    };
+}
+
+fn userTextFromMessage(message: agent.protocol.AgentMessage) ![]const u8 {
+    return switch (message) {
+        .user => |user| switch (user.content) {
+            .text => |text| text,
+            .blocks => |blocks| blk: {
+                try std.testing.expect(blocks.len > 0);
+                break :blk switch (blocks[0]) {
+                    .text => |text| text.text,
+                    else => error.ExpectedTextBlock,
+                };
+            },
+        },
+        else => error.ExpectedUserMessage,
+    };
+}
+
+fn expectUserText(message: agent.protocol.AgentMessage, expected: []const u8) !void {
+    try std.testing.expectEqualStrings(expected, try userTextFromMessage(message));
+}
+
+fn expectToolCall(message: agent.protocol.AgentMessage, expected_id: []const u8, expected_name: []const u8) !void {
+    switch (message) {
+        .assistant => |assistant| {
+            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+            switch (assistant.content[0]) {
+                .tool_call => |tool_call| {
+                    try std.testing.expectEqualStrings(expected_id, tool_call.id);
+                    try std.testing.expectEqualStrings(expected_name, tool_call.name);
+                },
+                else => return error.ExpectedToolCallBlock,
+            }
+        },
+        else => return error.ExpectedAssistantMessage,
+    }
+}
+
+fn expectToolResultText(message: agent.protocol.AgentMessage, expected_call_id: []const u8, expected_tool_name: []const u8, expected_text: []const u8) !void {
+    switch (message) {
+        .tool_result => |tool_result| {
+            try std.testing.expectEqualStrings(expected_call_id, tool_result.tool_call_id);
+            try std.testing.expectEqualStrings(expected_tool_name, tool_result.tool_name);
+            try std.testing.expect(!tool_result.is_error);
+            try std.testing.expectEqual(@as(usize, 1), tool_result.content.len);
+            switch (tool_result.content[0]) {
+                .text => |text| try std.testing.expectEqualStrings(expected_text, text.text),
+                else => return error.ExpectedTextBlock,
+            }
+        },
+        else => return error.ExpectedToolResultMessage,
+    }
+}
+
+fn assistantFailureEntry() proto.SessionEntry {
+    return messageEntry("ad000001", null, .{ .assistant = .{
+        .content = &.{},
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "gpt-test",
+        .usage = .{
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .@"error",
+        .error_message = "HTTP 429 Too Many Requests: rate limit exceeded",
+        .failure = .{
+            .kind = .rate_limited,
+            .http_status = 429,
+            .provider_code = "rate_limit_exceeded",
+            .provider_type = "invalid_request_error",
+        },
+        .timestamp = 1,
+    } });
+}
+
 test "header wire format round-trips parent session and version" {
     const allocator = std.testing.allocator;
     const header = proto.SessionHeader{
@@ -750,8 +849,8 @@ test "header wire format round-trips parent session and version" {
     const json_str = try json_write.toOwnedSlice(allocator, header, writeHeader);
     defer allocator.free(json_str);
 
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"type\":\"session\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"parentSession\":\"parent-uuid\"") != null);
+    try expectJsonContains(json_str, "\"type\":\"session\"");
+    try expectJsonContains(json_str, "\"parentSession\":\"parent-uuid\"");
 
     const parsed = try parseFileEntry(allocator, json_str);
     const h = parsed.header;
@@ -769,40 +868,11 @@ test "header wire format round-trips parent session and version" {
 }
 
 test "assistant message round-trips normalized failure metadata" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena = testArena();
     defer arena.deinit();
     const allocator = arena.allocator();
-    const entry = proto.SessionEntry{
-        .id = "ad000001",
-        .parent_id = null,
-        .timestamp = "2025-06-01T00:00:00.000Z",
-        .entry = .{ .message = .{ .message = .{ .assistant = .{
-            .content = &.{},
-            .api = .openai_responses,
-            .provider = .openai,
-            .model = "gpt-test",
-            .usage = .{
-                .input = 0,
-                .output = 0,
-                .cache_read = 0,
-                .cache_write = 0,
-                .total_tokens = 0,
-                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-            },
-            .stop_reason = .@"error",
-            .error_message = "HTTP 429 Too Many Requests: rate limit exceeded",
-            .failure = .{
-                .kind = .rate_limited,
-                .http_status = 429,
-                .provider_code = "rate_limit_exceeded",
-                .provider_type = "invalid_request_error",
-            },
-            .timestamp = 1,
-        } } } },
-    };
 
-    const json_str = try json_write.toOwnedSlice(allocator, entry, writeEntry);
-    defer allocator.free(json_str);
+    const json_str = try json_write.toOwnedSlice(allocator, assistantFailureEntry(), writeEntry);
     const parsed = try parseFileEntry(allocator, json_str);
     switch (parsed.entry.entry) {
         .message => |m| switch (m.message) {
@@ -817,8 +887,8 @@ test "assistant message round-trips normalized failure metadata" {
     }
 }
 
-test "serializeEntry works when caller allocator is an arena" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "entry serialization keeps owned JSON valid with arena allocator" {
+    var arena = testArena();
     defer arena.deinit();
     const allocator = arena.allocator();
 
@@ -850,8 +920,8 @@ test "serializeEntry works when caller allocator is an arena" {
     };
 
     const line = try json_write.toOwnedSlice(allocator, entry, writeEntry);
-    try std.testing.expect(std.mem.indexOf(u8, line, long_tool_call_id) != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, long_tool_name) != null);
+    try expectJsonContains(line, long_tool_call_id);
+    try expectJsonContains(line, long_tool_name);
 }
 
 test "tool-result text serializes invalid utf-8 as a json string" {
@@ -875,13 +945,13 @@ test "tool-result text serializes invalid utf-8 as a json string" {
     const line = try json_write.toOwnedSlice(allocator, entry, writeEntry);
     defer allocator.free(line);
 
-    try std.testing.expect(std.mem.indexOf(u8, line, "\"text\":\"bad") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "tail\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "\"text\":[") == null);
+    try expectJsonContains(line, "\"text\":\"bad");
+    try expectJsonContains(line, "tail\"");
+    try expectJsonOmits(line, "\"text\":[");
 }
 
-test "pi-mono compaction fixture round-trips parse serialize and buildContext" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "compaction fixture preserves persistence fields and context behavior" {
+    var arena = testArena();
     defer arena.deinit();
     const allocator = arena.allocator();
     const context = @import("context.zig");
@@ -913,8 +983,8 @@ test "pi-mono compaction fixture round-trips parse serialize and buildContext" {
 
     const serialized = try json_write.toOwnedSlice(std.testing.allocator, entries[3], writeEntry);
     defer std.testing.allocator.free(serialized);
-    try std.testing.expect(std.mem.indexOf(u8, serialized, "\"fromHook\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, serialized, "\"provider\":\"custom-compactor\"") != null);
+    try expectJsonContains(serialized, "\"fromHook\":true");
+    try expectJsonContains(serialized, "\"provider\":\"custom-compactor\"");
 
     const ctx = try context.buildSessionContext(allocator, &entries, .current);
     try std.testing.expectEqual(@as(usize, 3), ctx.messages.len);
@@ -925,20 +995,8 @@ test "pi-mono compaction fixture round-trips parse serialize and buildContext" {
         },
         else => return error.ExpectedCompactionSummary,
     }
-    switch (ctx.messages[1]) {
-        .user => |user| switch (user.content) {
-            .blocks => |blocks| try std.testing.expectEqualStrings("kept user", blocks[0].text.text),
-            .text => |text| try std.testing.expectEqualStrings("kept user", text),
-        },
-        else => return error.ExpectedUserMessage,
-    }
-    switch (ctx.messages[2]) {
-        .user => |user| switch (user.content) {
-            .blocks => |blocks| try std.testing.expectEqualStrings("after compaction", blocks[0].text.text),
-            .text => |text| try std.testing.expectEqualStrings("after compaction", text),
-        },
-        else => return error.ExpectedUserMessage,
-    }
+    try expectUserText(ctx.messages[1], "kept user");
+    try expectUserText(ctx.messages[2], "after compaction");
 }
 
 test "session write-read-buildContext round-trip" {
@@ -994,13 +1052,7 @@ test "session write-read-buildContext round-trip" {
 
     var json_lines: [3][]const u8 = undefined;
     for (entries_data, 0..) |ed, i| {
-        const entry = proto.SessionEntry{
-            .id = ed.id,
-            .parent_id = ed.parent,
-            .timestamp = "2025-01-01T00:00:00.000Z",
-            .entry = .{ .message = .{ .message = ed.msg } },
-        };
-        json_lines[i] = try json_write.toOwnedSlice(allocator, entry, writeEntry);
+        json_lines[i] = try json_write.toOwnedSlice(allocator, messageEntry(ed.id, ed.parent, ed.msg), writeEntry);
     }
     defer for (&json_lines) |jl| allocator.free(jl);
 
@@ -1018,49 +1070,14 @@ test "session write-read-buildContext round-trip" {
 
     try std.testing.expectEqual(@as(usize, 3), ctx.messages.len);
 
-    switch (ctx.messages[0]) {
-        .user => |u| {
-            switch (u.content) {
-                .blocks => |b| {
-                    try std.testing.expectEqual(@as(usize, 1), b.len);
-                    switch (b[0]) {
-                        .text => |tc| try std.testing.expectEqualStrings("what files are here?", tc.text),
-                        else => return error.UnexpectedBlock,
-                    }
-                },
-                .text => |t| try std.testing.expectEqualStrings("what files are here?", t),
-            }
-        },
-        else => return error.ExpectedUserMessage,
-    }
-
+    try expectUserText(ctx.messages[0], "what files are here?");
     switch (ctx.messages[1]) {
-        .assistant => |a| {
-            try std.testing.expectEqualStrings("claude-sonnet-4-5", a.model);
-            try std.testing.expectEqual(ai.protocol.StopReason.toolUse, a.stop_reason);
-            try std.testing.expectEqual(@as(usize, 1), a.content.len);
-            switch (a.content[0]) {
-                .tool_call => |tc| {
-                    try std.testing.expectEqualStrings("toolu_abc123", tc.id);
-                    try std.testing.expectEqualStrings("bash", tc.name);
-                },
-                else => return error.ExpectedToolCallBlock,
-            }
+        .assistant => |assistant| {
+            try std.testing.expectEqualStrings("claude-sonnet-4-5", assistant.model);
+            try std.testing.expectEqual(ai.protocol.StopReason.toolUse, assistant.stop_reason);
         },
         else => return error.ExpectedAssistantMessage,
     }
-
-    switch (ctx.messages[2]) {
-        .tool_result => |tr| {
-            try std.testing.expectEqualStrings("toolu_abc123", tr.tool_call_id);
-            try std.testing.expectEqualStrings("bash", tr.tool_name);
-            try std.testing.expect(!tr.is_error);
-            try std.testing.expectEqual(@as(usize, 1), tr.content.len);
-            switch (tr.content[0]) {
-                .text => |tc| try std.testing.expectEqualStrings("file1.txt\nfile2.txt", tc.text),
-                else => return error.ExpectedTextBlock,
-            }
-        },
-        else => return error.ExpectedToolResultMessage,
-    }
+    try expectToolCall(ctx.messages[1], "toolu_abc123", "bash");
+    try expectToolResultText(ctx.messages[2], "toolu_abc123", "bash", "file1.txt\nfile2.txt");
 }
