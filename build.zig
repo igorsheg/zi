@@ -18,7 +18,6 @@ pub fn build(b: *std.Build) void {
     generate_models_run.addArg(b.pathFromRoot("src/ai/models_generated.zig"));
     b.step("generate-models", "Generate AI model catalog").dependOn(&generate_models_run.step);
 
-    // ── executable ──────────────────────────────────────────────────────
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -26,16 +25,13 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
 
-    // ── lua 5.4 (vendored via build.zig.zon) ────────────────────────────
-    //
+    // Lua 5.4 is vendored via build.zig.zon.
     // Lua is compiled as a static library from upstream C sources and
     // linked into the exe module. The .zig.zon dependency pulls the
     // official 5.4.7 tarball; zig's fetcher verifies it by hash.
-    //
     // We compile every .c file in src/ EXCEPT `lua.c` and `luac.c`,
     // which contain `main()` for the standalone interpreter and
     // bytecode compiler respectively.
-    //
     // LUA_USE_POSIX enables POSIX-specific features (popen, tmpfile,
     // etc.); LUA_USE_DLOPEN enables `require` of C shared libs at
     // runtime on Linux/macOS. Both match upstream Makefile defaults
@@ -110,7 +106,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run zi").dependOn(&run_cmd.step);
 
-    // ── tests ───────────────────────────────────────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_root.zig"),
         .target = target,

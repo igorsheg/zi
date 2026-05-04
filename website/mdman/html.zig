@@ -199,7 +199,7 @@ fn renderLuaCode(writer: anytype, code: []const u8) !void {
     var i: usize = 0;
     while (i < code.len) {
         if (std.mem.startsWith(u8, code[i..], "--[[")) {
-            const end = std.mem.indexOf(u8, code[i + 4 ..], "]]" ) orelse code.len - i - 4;
+            const end = std.mem.indexOf(u8, code[i + 4 ..], "]]") orelse code.len - i - 4;
             const token = code[i .. i + 4 + end + @as(usize, if (i + 4 + end < code.len) 2 else 0)];
             try renderToken(writer, "tok-comment", token);
             i += token.len;
@@ -208,7 +208,7 @@ fn renderLuaCode(writer: anytype, code: []const u8) !void {
             try renderToken(writer, "tok-comment", code[i .. i + end]);
             i += end;
         } else if (std.mem.startsWith(u8, code[i..], "[[")) {
-            const end = std.mem.indexOf(u8, code[i + 2 ..], "]]" ) orelse code.len - i - 2;
+            const end = std.mem.indexOf(u8, code[i + 2 ..], "]]") orelse code.len - i - 2;
             const token = code[i .. i + 2 + end + @as(usize, if (i + 2 + end < code.len) 2 else 0)];
             try renderToken(writer, "tok-string", token);
             i += token.len;
@@ -259,8 +259,8 @@ fn renderToken(writer: anytype, class: []const u8, text: []const u8) !void {
 
 fn isLuaKeyword(word: []const u8) bool {
     const keywords = [_][]const u8{
-        "and", "break", "do", "else", "elseif", "end", "for", "function",
-        "goto", "if", "in", "local", "not", "or", "repeat", "return",
+        "and",  "break", "do",    "else",  "elseif", "end", "for",    "function",
+        "goto", "if",    "in",    "local", "not",    "or",  "repeat", "return",
         "then", "until", "while",
     };
     for (keywords) |keyword| {

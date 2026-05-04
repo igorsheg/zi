@@ -19,7 +19,7 @@ pub const Node = union(enum) {
     definition: Definition,
 
     pub const Heading = struct {
-        level: u8, // 1 or 2
+        level: u8,
         text: []const u8,
     };
 
@@ -82,7 +82,6 @@ const Parser = struct {
     fn parseNode(self: *Parser) !?Node {
         const line = self.peekLine();
 
-        // Heading: # or ##
         if (std.mem.startsWith(u8, line, "## ")) {
             _ = self.consumeLine();
             return .{ .heading = .{ .level = 2, .text = line[3..] } };
@@ -92,22 +91,18 @@ const Parser = struct {
             return .{ .heading = .{ .level = 1, .text = line[2..] } };
         }
 
-        // Code block: ```
         if (std.mem.startsWith(u8, line, "```")) {
             return self.parseCodeBlock();
         }
 
-        // Bullet list: - item
         if (std.mem.startsWith(u8, line, "- ")) {
             return try self.parseBulletList();
         }
 
-        // Definition list: next line starts with :
         if (self.isDefinitionStart()) {
             return try self.parseDefinition();
         }
 
-        // Default: paragraph
         return try self.parseParagraph();
     }
 
@@ -123,7 +118,7 @@ const Parser = struct {
                     self.source[start .. self.pos - 1] // exclude trailing newline
                 else
                     "";
-                _ = self.consumeLine(); // consume closing ```
+                _ = self.consumeLine();
                 return .{ .code_block = .{ .language = language, .content = content } };
             }
             _ = self.consumeLine();
@@ -159,10 +154,8 @@ const Parser = struct {
         var full_desc: std.ArrayListUnmanaged(u8) = .empty;
         try full_desc.appendSlice(self.allocator, desc_text);
 
-        // Continue consuming indented lines
         while (!self.isAtEnd()) {
             const next_line = self.peekLine();
-            // Stop at blank line or non-indented line
             if (next_line.len == 0) break;
             if (!std.mem.startsWith(u8, next_line, "    ")) break;
 
@@ -181,7 +174,6 @@ const Parser = struct {
 
         while (!self.isAtEnd()) {
             const line = self.peekLine();
-            // Stop at blank line or block-level construct
             if (line.len == 0 or
                 std.mem.startsWith(u8, line, "# ") or
                 std.mem.startsWith(u8, line, "## ") or
@@ -207,7 +199,6 @@ const Parser = struct {
         var text_start: usize = 0;
 
         while (i < text.len) {
-            // Bold: **text**
             if (i + 1 < text.len and std.mem.eql(u8, text[i .. i + 2], "**")) {
                 if (i > text_start) {
                     try spans.append(self.allocator, .{ .text = text[text_start..i] });
@@ -237,7 +228,6 @@ const Parser = struct {
                 continue;
             }
 
-            // Code: `text`
             if (text[i] == '`') {
                 if (i > text_start) {
                     try spans.append(self.allocator, .{ .text = text[text_start..i] });
@@ -252,7 +242,6 @@ const Parser = struct {
                 continue;
             }
 
-            // Link: [text](url)
             if (text[i] == '[') {
                 if (parseLink(text, i)) |result| {
                     if (i > text_start) {
@@ -295,8 +284,6 @@ const Parser = struct {
         };
     }
 
-    // --- Line utilities ---
-
     fn peekLine(self: *Parser) []const u8 {
         const end = std.mem.indexOf(u8, self.source[self.pos..], "\n") orelse self.source.len - self.pos;
         return self.source[self.pos .. self.pos + end];
@@ -322,12 +309,10 @@ const Parser = struct {
     }
 
     fn isDefinitionStart(self: *Parser) bool {
-        // Look for a non-blank line followed by a line starting with ':'
         const line = self.peekLine();
         if (line.len == 0) return false;
         if (std.mem.startsWith(u8, line, "- ")) return false;
 
-        // Find next line
         const next_pos = self.pos + line.len + 1;
         if (next_pos >= self.source.len) return false;
 
@@ -338,8 +323,6 @@ const Parser = struct {
         return std.mem.startsWith(u8, next_line, ":");
     }
 };
-
-// --- Tests ---
 
 const testing = std.testing;
 

@@ -14,7 +14,6 @@ pub fn build(b: *std.Build) void {
         b.fmt("--output={s}", .{b.install_prefix}),
     });
 
-    // mdman owns /man. It is intentionally local to the website project.
     const mdman = b.addExecutable(.{
         .name = "mdman",
         .root_module = b.createModule(.{

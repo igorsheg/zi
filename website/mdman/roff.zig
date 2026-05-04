@@ -12,7 +12,6 @@ pub fn render(allocator: std.mem.Allocator, doc: Document, name: []const u8, sec
     var buffer: std.ArrayListUnmanaged(u8) = .empty;
     const writer = buffer.writer(allocator);
 
-    // Header
     var upper_name: [64]u8 = undefined;
     const name_upper = std.ascii.upperString(&upper_name, name);
     try writer.print(".TH \"{s}\" \"{s}\"\n", .{ name_upper, section });
