@@ -148,6 +148,7 @@ fn execute(
     switch (before_outcome) {
         .cancel => return error.CompactionCancelled,
         .provide => |provided| {
+            if (!entryIdExists(path, provided.first_kept_entry_id)) return error.InvalidCompactionFirstKeptEntry;
             from_hook = true;
             composed_summary = provided.summary;
             first_kept_id_source = provided.first_kept_entry_id;
@@ -230,6 +231,13 @@ fn execute(
         .details = details_arg,
         .from_hook = from_hook,
     };
+}
+
+fn entryIdExists(entries: []const @import("../../session/protocol.zig").SessionEntry, id: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.id, id)) return true;
+    }
+    return false;
 }
 
 /// Build the persisted `details` JSON object — pi-mono shape

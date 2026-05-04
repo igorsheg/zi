@@ -177,9 +177,12 @@ fn isTurnStartEntry(entry: SessionEntry) bool {
 }
 
 fn isUserRoleCut(entry: SessionEntry) bool {
+    // pi-mono parity: split-turn detection treats only an actual user
+    // message as a clean boundary. branch_summary/custom_message can start
+    // a turn when searching backwards, but a cut that lands on one is still
+    // reported as split-turn metadata.
     return switch (entry.entry) {
         .message => |m| m.message == .user,
-        .branch_summary, .custom_message => true,
         else => false,
     };
 }
@@ -342,8 +345,6 @@ pub fn prepareCompaction(
             }
         }
     }
-
-    if (messages_to_summarize.items.len == 0 and turn_prefix_messages.items.len == 0) return null;
 
     var file_ops: FileOperations = .{};
     try collectCarriedFileOps(allocator, &file_ops, path_entries, prev_compaction_index);
@@ -618,6 +619,42 @@ fn testAssistantEntry(
     };
 }
 
+fn testBranchSummaryEntry(id: []const u8, parent_id: ?[]const u8, summary: []const u8) SessionEntry {
+    return .{
+        .id = id,
+        .parent_id = parent_id,
+        .timestamp = "2025-01-01T00:00:00Z",
+        .entry = .{ .branch_summary = .{ .from_id = parent_id orelse id, .summary = summary } },
+    };
+}
+
+fn testCustomMessageEntry(id: []const u8, parent_id: ?[]const u8, text: []const u8) SessionEntry {
+    return .{
+        .id = id,
+        .parent_id = parent_id,
+        .timestamp = "2025-01-01T00:00:00Z",
+        .entry = .{ .custom_message = .{
+            .custom_type = "test",
+            .content = .{ .text = text },
+            .display = true,
+        } },
+    };
+}
+
+fn testCompactionEntry(id: []const u8, parent_id: ?[]const u8, summary: []const u8, first_kept: []const u8, details: ?std.json.Value) SessionEntry {
+    return .{
+        .id = id,
+        .parent_id = parent_id,
+        .timestamp = "2025-01-01T00:00:00Z",
+        .entry = .{ .compaction = .{
+            .summary = summary,
+            .first_kept_entry_id = first_kept,
+            .tokens_before = 50,
+            .details = details,
+        } },
+    };
+}
+
 fn testAssistantToolCallEntry(
     allocator: std.mem.Allocator,
     id: []const u8,
@@ -656,6 +693,23 @@ fn testAssistantToolCallEntry(
             },
         } } },
     };
+}
+
+test "findCutPoint: keeps recent suffix at nearest valid non-tool boundary" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const entries = [_]SessionEntry{
+        testUserEntry("u1", null, "older prompt with enough text to summarize"),
+        try testAssistantEntry(allocator, "a1", "u1", "older answer"),
+        testUserEntry("u2", "a1", "recent prompt"),
+        try testAssistantEntry(allocator, "a2", "u2", "recent answer"),
+    };
+
+    const cut = findCutPoint(&entries, 0, entries.len, 5);
+    try testing.expectEqual(@as(usize, 2), cut.first_kept_entry_index);
+    try testing.expect(!cut.is_split_turn);
 }
 
 test "findCutPoint: assistant tail triggers split turn rather than blocking compaction" {
@@ -764,6 +818,84 @@ test "prepareCompaction: carries previous summary from last compaction" {
     const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 4 })).?;
     try testing.expect(prep.previous_summary != null);
     try testing.expectEqualStrings("earlier summary", prep.previous_summary.?);
+}
+
+test "prepareCompaction: missing previous first-kept id falls back after compaction entry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const entries = [_]SessionEntry{
+        testUserEntry("u0", null, "old"),
+        try testAssistantEntry(allocator, "a0", "u0", "old answer"),
+        testCompactionEntry("c1", "a0", "previous", "does-not-exist", null),
+        testUserEntry("u1", "c1", "new work that should be the boundary start"),
+        try testAssistantEntry(allocator, "a1", "u1", "new response long enough to be recent"),
+    };
+
+    const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 1 })).?;
+    try testing.expectEqualStrings("previous", prep.previous_summary.?);
+    try testing.expectEqual(@as(usize, 0), prep.messages_to_summarize.len);
+    try testing.expectEqualStrings("a1", prep.first_kept_entry_id);
+}
+
+test "prepareCompaction: carries file ops from previous pi-generated compaction details" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var obj: std.json.ObjectMap = .{};
+    var read_arr = std.json.Array.init(allocator);
+    try read_arr.append(.{ .string = "/tmp/old-read.txt" });
+    var mod_arr = std.json.Array.init(allocator);
+    try mod_arr.append(.{ .string = "/tmp/old-modified.txt" });
+    try obj.put(allocator, "readFiles", .{ .array = read_arr });
+    try obj.put(allocator, "modifiedFiles", .{ .array = mod_arr });
+
+    const entries = [_]SessionEntry{
+        testUserEntry("u0", null, "old"),
+        try testAssistantEntry(allocator, "a0", "u0", "old answer"),
+        testCompactionEntry("c1", "a0", "previous", "u0", .{ .object = obj }),
+        testUserEntry("u1", "c1", "new"),
+        try testAssistantToolCallEntry(allocator, "a1", "u1", "read", "/tmp/new-read.txt"),
+        testUserEntry("u2", "a1", "keep"),
+    };
+
+    const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 1 })).?;
+    const lists = try computeFileLists(allocator, &prep.file_ops);
+    try testing.expectEqual(@as(usize, 2), lists.read_files.len);
+    try testing.expectEqualStrings("/tmp/new-read.txt", lists.read_files[0]);
+    try testing.expectEqualStrings("/tmp/old-read.txt", lists.read_files[1]);
+    try testing.expectEqual(@as(usize, 1), lists.modified_files.len);
+    try testing.expectEqualStrings("/tmp/old-modified.txt", lists.modified_files[0]);
+}
+
+test "findCutPoint: branch and custom-message cuts match pi-mono split metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const branch_entries = [_]SessionEntry{
+        testUserEntry("u1", null, "old prompt"),
+        try testAssistantEntry(allocator, "a1", "u1", "old answer"),
+        testBranchSummaryEntry("b1", "a1", "branch context that is large enough to cross budget"),
+        try testAssistantEntry(allocator, "a2", "b1", "tail"),
+    };
+    const branch_cut = findCutPoint(&branch_entries, 2, branch_entries.len, 10_000);
+    try testing.expectEqual(@as(usize, 2), branch_cut.first_kept_entry_index);
+    try testing.expect(branch_cut.is_split_turn);
+    try testing.expectEqual(@as(?usize, 2), branch_cut.turn_start_index);
+
+    const custom_entries = [_]SessionEntry{
+        testUserEntry("u1", null, "old prompt"),
+        try testAssistantEntry(allocator, "a1", "u1", "old answer"),
+        testCustomMessageEntry("m1", "a1", "custom context that is large enough to cross budget"),
+        try testAssistantEntry(allocator, "a2", "m1", "tail"),
+    };
+    const custom_cut = findCutPoint(&custom_entries, 2, custom_entries.len, 10_000);
+    try testing.expectEqual(@as(usize, 2), custom_cut.first_kept_entry_index);
+    try testing.expect(custom_cut.is_split_turn);
+    try testing.expectEqual(@as(?usize, 2), custom_cut.turn_start_index);
 }
 
 test "file operations: extract, dedupe, classify, and format summary lists" {
