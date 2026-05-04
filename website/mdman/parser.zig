@@ -147,9 +147,8 @@ const Parser = struct {
         const term_line = self.consumeLine();
         const term = try self.parseInline(term_line);
 
-        // Consume : line and any continuation lines (indented with spaces)
         const desc_line = self.consumeLine();
-        const desc_text = std.mem.trimLeft(u8, desc_line[1..], " \t"); // skip ':' and whitespace
+        const desc_text = std.mem.trimLeft(u8, desc_line[1..], " \t");
 
         var full_desc: std.ArrayListUnmanaged(u8) = .empty;
         try full_desc.appendSlice(self.allocator, desc_text);
@@ -213,7 +212,6 @@ const Parser = struct {
                 continue;
             }
 
-            // Italic: *text* (but not **)
             if (text[i] == '*' and (i + 1 >= text.len or text[i + 1] != '*')) {
                 if (i > text_start) {
                     try spans.append(self.allocator, .{ .text = text[text_start..i] });

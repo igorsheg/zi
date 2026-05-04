@@ -154,22 +154,6 @@ fn pushStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void
 // synchronously inside the parent's stdout read loop. The result is
 // a Lua table; see `pushSpawnResult` for the shape.
 //
-// Why a host function instead of `io.popen` + parsing in Lua: io.popen
-// merges stderr, has no clean abort path, and the JSONL framing is
-// awkward to do correctly in Lua. The wrapper is also where we forward
-// the parent agent's abort signal into the child.
-//
-// Lua opts shape:
-//
-//   {
-//     task          = string,           -- required
-//     model         = string|nil,
-//     tools         = string|nil,       -- comma-separated, single arg
-//     system_append = string|nil,
-//     cwd           = string|nil,       -- defaults to "."
-//     on            = table|nil,        -- { event_name = function(event) ... }
-//   }
-//
 // Lifetime / safety notes:
 //
 //   1. All temp strings (task, model, tools, system_append, cwd) live

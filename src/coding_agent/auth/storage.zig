@@ -725,10 +725,6 @@ fn fallbackForTest(provider: []const u8) ?[]const u8 {
 }
 
 test "zi-m7q: repeated set on same provider keeps key valid (no UAF on serialize)" {
-    // Regression: pre-fix, the second set() freed the live map key
-    // because std.HashMap.fetchPut keeps the existing key on
-    // collision. The next serializeAuthJson then wrote 0xAA bytes
-    // (debug undefined fill) and bricked auth.json on reload.
     const allocator = std.testing.allocator;
 
     var storage = try AuthStorage.inMemory(allocator, null);

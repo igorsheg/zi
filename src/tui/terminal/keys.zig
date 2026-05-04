@@ -140,9 +140,8 @@ pub fn parseKey(data: []const u8, kitty_active: bool) ?ParseResult {
     if (data[0] == 0x09) return .{ .key = .{ .code = .tab }, .len = 1 };
     if (data[0] == 0x0D) return .{ .key = .{ .code = .enter }, .len = 1 };
 
-    // ctrl+a through ctrl+z (0x01-0x1A, excluding tab/enter/escape)
     if (data[0] >= 0x01 and data[0] <= 0x1A) {
-        const ch: u21 = @as(u21, data[0]) + 0x60; // 0x01 -> 'a', etc.
+        const ch: u21 = @as(u21, data[0]) + 0x60;
         return .{ .key = .{ .code = .char, .char = ch, .ctrl = true }, .len = 1 };
     }
 
@@ -156,7 +155,6 @@ pub fn parseKey(data: []const u8, kitty_active: bool) ?ParseResult {
 pub fn parseInput(data: []const u8, kitty_active: bool) ?InputEvent {
     if (data.len == 0) return null;
 
-    // Try SGR mouse first: ESC[<...M or ESC[<...m
     if (data.len >= 3 and data[0] == 0x1B and data[1] == '[' and data[2] == '<') {
         if (parseSgrMouse(data)) |m| return .{ .mouse = m };
     }
@@ -172,7 +170,6 @@ fn parseEscape(data: []const u8, kitty_active: bool) ?ParseResult {
     if (data[1] == '[') return parseCsi(data, kitty_active);
     if (data[1] == 'O') return parseSs3(data);
 
-    // alt+char: ESC followed by printable ASCII
     if (data[1] >= 0x20 and data[1] <= 0x7E) {
         return .{
             .key = .{ .code = .char, .char = @as(u21, data[1]), .alt = true },
@@ -315,7 +312,6 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
         };
     }
 
-    // letter-terminated with params: \x1b[1;5A = ctrl+up, etc.
     if (terminator >= 'A' and terminator <= 'Z') {
         const modifier = if (param_count > 1) params[1] else @as(u16, 0);
         const mods = decodeModifier(modifier);

@@ -73,7 +73,6 @@ pub fn build(b: *std.Build) void {
         .include_extensions = &.{".h"},
     });
 
-    // Expose Lua headers to zig code via `@cImport` in src/extensions/lua_runtime.zig.
     const env_mod = b.createModule(.{ .root_source_file = b.path("src/env.zig") });
     exe_mod.addImport("env", env_mod);
     exe_mod.addIncludePath(lua_dep.path("src"));

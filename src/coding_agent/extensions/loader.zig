@@ -195,7 +195,7 @@ fn scanDirectory(
 
     var iter = dir.iterate();
     while (try iter.next(std.Options.debug_io)) |entry| {
-        if (entry.name[0] == '.') continue; // skip dotfiles
+        if (entry.name[0] == '.') continue;
 
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
         defer allocator.free(full_path);
@@ -214,8 +214,7 @@ fn scanDirectory(
                 const init_path = try std.fs.path.join(allocator, &.{ full_path, "init.lua" });
                 defer allocator.free(init_path);
 
-                std.Io.Dir.accessAbsolute(std.Options.debug_io, init_path, .{}) catch continue; // no init.lua, skip
-
+                std.Io.Dir.accessAbsolute(std.Options.debug_io, init_path, .{}) catch continue;
                 if (seen.contains(entry.name)) {
                     log.debug("skipping duplicate extension id in {s}: {s}", .{ @tagName(root.source), entry.name });
                     continue;

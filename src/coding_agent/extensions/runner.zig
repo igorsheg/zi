@@ -768,12 +768,7 @@ pub const ExtensionRunner = struct {
         );
         const owner = prev orelse tid;
         if (owner != tid) {
-            // zi-wub.7: hard fatal in all build modes. Phase 2's
-            // explicit bind (.5/.6) + phase 4's request-queue routing
-            // (.14-.17) + shutdown variant (.28) close every known
-            // cross-thread touch. Surviving wrong-thread access is a
-            // GC-corrupting bug, not a warning. The check itself is
-            // a single cmpxchg on the happy path; cost is negligible.
+            // Wrong-thread Lua access corrupts GC; panic in all build modes.
             std.debug.panic(
                 "[zi-wub.7] lua_state touched from wrong thread: this={d} owner={d}",
                 .{ tid, owner },

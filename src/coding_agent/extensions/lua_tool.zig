@@ -353,11 +353,6 @@ fn parseReturn(
         const is_error = c.lua_toboolean(L, -1) != 0;
         c.lua_pop(L, 1);
 
-        // Read `details` (optional, deep-cloned via
-        // luaValueToJson). Tools like Task put their tree state
-        // here so render hooks can draw a rich display. Without
-        // this extraction the final render would see empty
-        // details and collapse to just the header row.
         var details: std.json.Value = .null;
         _ = c.lua_getfield(L, idx, "details");
         if (c.lua_type(L, -1) != c.LUA_TNIL) {

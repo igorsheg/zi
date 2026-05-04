@@ -814,11 +814,6 @@ fn pushMessageRoleField(L: *c.lua_State, message: agent_protocol.AgentMessage) v
 // from the runner's hook arena. That arena lives for the runner's
 // generation; v1 leaks within a session and resets at session end.
 // See `extensions/runner.zig` § hook_arena field doc.
-//
-// `signal` is currently unused — the cancellable chain doesn't poll
-// it because Lua handlers run synchronously to completion. If a
-// future host function yields (zi.spawn, ctx.ui.prompt), the
-// dispatcher will need to thread abort checks into its resume loop.
 
 /// Adapter matching `agent_protocol.BeforeToolCallHook.func`. Routes
 /// the agent's `tool_call` event through the cancellable dispatch

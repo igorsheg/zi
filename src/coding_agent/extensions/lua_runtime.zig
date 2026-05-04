@@ -38,7 +38,7 @@ pub const c = @cImport({
 /// `ptr != NULL`; we still need an aligned block, so we over-allocate by
 /// `header_align` bytes and stash the size in the slot immediately before
 /// the user pointer.
-const header_align: usize = @alignOf(usize) * 2; // 16 on 64-bit, 8 on 32-bit
+const header_align: usize = @alignOf(usize) * 2;
 const header_alignment: std.mem.Alignment = .fromByteUnits(header_align);
 
 const BlockHeader = extern struct {

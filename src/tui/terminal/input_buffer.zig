@@ -20,7 +20,7 @@ pub const InputBuffer = struct {
     /// null = no pending incomplete sequence.
     flush_deadline_ns: ?i128 = null,
     /// Timeout for incomplete escape sequences (nanoseconds).
-    timeout_ns: i128 = 10_000_000, // 10ms
+    timeout_ns: i128 = 10_000_000,
 
     in_paste: bool = false,
     paste_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -104,7 +104,6 @@ pub const InputBuffer = struct {
                 }
                 continue;
             }
-            // Partial paste start — could be split. Hold for more data.
             if (self.buf.items[0] == 0x1b and self.buf.items.len < 6) {
                 if (std.mem.startsWith(u8, "\x1b[200~", self.buf.items)) {
                     self.flush_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + self.timeout_ns;
@@ -137,7 +136,6 @@ pub const InputBuffer = struct {
         on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
         ctx: *anyopaque,
     ) void {
-        // A lone ESC after timeout = actual ESC keypress
         if (self.buf.items.len == 1 and self.buf.items[0] == 0x1b) {
             on_seq(self.buf.items[0..1], ctx);
             self.buf.items.len = 0;
@@ -229,14 +227,12 @@ fn classifyCsi(data: []const u8) SeqStatus {
         return .{ .complete = 6 };
     }
 
-    // Scan for final byte (0x40-0x7E)
     var i: usize = 2;
     while (i < data.len) : (i += 1) {
         const c = data[i];
         if (c >= 0x40 and c <= 0x7E) {
             return .{ .complete = i + 1 };
         }
-        // Intermediate bytes (0x20-0x3F) and parameter bytes are OK
         if (c < 0x20 or c > 0x7E) {
             // Invalid byte in CSI — treat as complete (malformed)
             return .{ .complete = i + 1 };

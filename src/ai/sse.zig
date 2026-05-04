@@ -96,7 +96,7 @@ pub const SseParser = struct {
         }
 
         if (std.mem.eql(u8, field, "data")) {
-            const needed = value.len + 1; // +1 for \n separator
+            const needed = value.len + 1;
             if (self.data_buf.items.len + needed > max_event_data_bytes) {
                 return error.EventDataTooLarge;
             }
