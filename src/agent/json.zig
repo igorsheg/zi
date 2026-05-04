@@ -237,6 +237,10 @@ fn writeAgentToolResult(jw: *Stringify, result: protocol.AgentToolResult) !void 
         try jw.objectField("details");
         try jw.write(result.details);
     }
+    if (result.presentation != .null) {
+        try jw.objectField("presentation");
+        try jw.write(result.presentation);
+    }
     try jw.endObject();
 }
 

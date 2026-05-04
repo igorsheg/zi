@@ -1271,6 +1271,7 @@ fn toolResultMessageAsAgentToolResult(
     return .{
         .content = blocks,
         .details = if (tool_result.details) |details| try json_util.cloneJsonValue(allocator, details) else .null,
+        .presentation = if (tool_result.presentation) |presentation| try json_util.cloneJsonValue(allocator, presentation) else .null,
         .is_error = tool_result.is_error,
     };
 }
@@ -1423,6 +1424,7 @@ fn hashAgentMessage(hasher: *std.hash.Wyhash, message: agent_protocol.AgentMessa
             std.hash.autoHash(hasher, tool_result.is_error);
             for (tool_result.content) |block| hashToolResultContentBlock(hasher, block);
             if (tool_result.details) |details| hashJsonValue(hasher, details) else hashJsonValue(hasher, .null);
+            if (tool_result.presentation) |presentation| hashJsonValue(hasher, presentation) else hashJsonValue(hasher, .null);
         },
         .compaction_summary => |summary| {
             hasher.update(summary.summary);
@@ -1504,6 +1506,7 @@ fn hashAgentToolResult(hasher: *std.hash.Wyhash, result: AgentToolResult) void {
     std.hash.autoHash(hasher, result.is_error);
     for (result.content) |block| hashAgentToolResultContentBlock(hasher, block);
     hashJsonValue(hasher, result.details);
+    hashJsonValue(hasher, result.presentation);
 }
 
 fn hashAgentToolResultContentBlock(hasher: *std.hash.Wyhash, block: AgentToolResult.ContentBlock) void {

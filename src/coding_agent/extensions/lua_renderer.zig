@@ -259,6 +259,11 @@ fn pushAgentToolResult(L: *c.lua_State, r: agent_protocol.AgentToolResult) void 
         c.lua_pushnil(L);
     };
     c.lua_setfield(L, -2, "details");
+
+    lua_runtime.pushJsonValue(L, r.presentation) catch {
+        c.lua_pushnil(L);
+    };
+    c.lua_setfield(L, -2, "presentation");
 }
 
 /// Run the render_result hook for `tool_name` if one exists, and

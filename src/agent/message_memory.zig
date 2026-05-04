@@ -349,12 +349,15 @@ pub fn cloneToolResultMessage(allocator: std.mem.Allocator, message: ai.protocol
     errdefer allocator.free(tool_name);
     const details = if (message.details) |details| try json_util.cloneJsonValue(allocator, details) else null;
     errdefer if (details) |value| json_util.freeJsonValue(allocator, value);
+    const presentation = if (message.presentation) |presentation| try json_util.cloneJsonValue(allocator, presentation) else null;
+    errdefer if (presentation) |value| json_util.freeJsonValue(allocator, value);
 
     return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = content,
         .details = details,
+        .presentation = presentation,
         .is_error = message.is_error,
         .timestamp = message.timestamp,
     };
@@ -373,6 +376,7 @@ pub fn freeToolResultMessage(allocator: std.mem.Allocator, message: *ai.protocol
     for (message.content) |block| freeToolResultContentBlock(allocator, block);
     allocator.free(message.content);
     if (message.details) |details| json_util.freeJsonValue(allocator, details);
+    if (message.presentation) |presentation| json_util.freeJsonValue(allocator, presentation);
 }
 
 fn cloneCustomMessage(allocator: std.mem.Allocator, message: protocol.AgentMessage.CustomMessage) !protocol.AgentMessage.CustomMessage {

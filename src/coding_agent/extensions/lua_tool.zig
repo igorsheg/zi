@@ -46,20 +46,24 @@ const ToolResultLimits = struct {
     max_text_bytes: usize,
     max_blocks: usize,
     details: lua_runtime.JsonConvertLimits,
+    presentation: lua_runtime.JsonConvertLimits,
 };
 
 const default_json_convert_limits = lua_runtime.default_json_convert_limits;
+const presentation_json_convert_limits = lua_runtime.presentation_json_convert_limits;
 
 const default_tool_result_limits = ToolResultLimits{
     .max_text_bytes = extension_limits.tool_result_text_bytes,
     .max_blocks = extension_limits.tool_result_blocks,
     .details = default_json_convert_limits,
+    .presentation = presentation_json_convert_limits,
 };
 
 const partial_tool_result_limits = ToolResultLimits{
     .max_text_bytes = extension_limits.tool_result_text_bytes,
     .max_blocks = extension_limits.tool_result_blocks,
     .details = default_json_convert_limits,
+    .presentation = presentation_json_convert_limits,
 };
 
 const tool_result_truncated_marker = "\n... [extension tool result truncated at 64KiB] ...";
@@ -381,6 +385,16 @@ fn parseReturn(
         }
         c.lua_pop(L, 1);
 
+        // Rich renderer state. This is presentation-only data, so it
+        // uses a bounded lossy conversion rather than the strict
+        // metadata converter above.
+        var presentation: std.json.Value = .null;
+        _ = c.lua_getfield(L, idx, "presentation");
+        if (c.lua_type(L, -1) != c.LUA_TNIL) {
+            presentation = lua_runtime.luaValueToPresentationJson(L, -1, allocator, limits.presentation) catch .null;
+        }
+        c.lua_pop(L, 1);
+
         // Inspect the content field.
         _ = c.lua_getfield(L, idx, "content");
         defer c.lua_pop(L, 1);
@@ -390,17 +404,18 @@ fn parseReturn(
         if (content_ty == c.LUA_TSTRING) {
             var result = try boundedTextResult(allocator, lstring(L, -1), is_error, limits);
             result.details = details;
+            result.presentation = presentation;
             return result;
         }
 
         if (content_ty == c.LUA_TTABLE) {
             const blocks = try parseContentBlocks(allocator, L, -1, limits);
-            return .{ .content = blocks, .is_error = is_error, .details = details };
+            return .{ .content = blocks, .is_error = is_error, .details = details, .presentation = presentation };
         }
 
         // Table with no content field → empty result with the
         // is_error flag and details honored.
-        return .{ .content = &.{}, .is_error = is_error, .details = details };
+        return .{ .content = &.{}, .is_error = is_error, .details = details, .presentation = presentation };
     }
 
     // Anything else (number, bool, nil): treat as empty success.
@@ -455,6 +470,7 @@ fn textResult(
         .max_text_bytes = text.len,
         .max_blocks = 1,
         .details = default_json_convert_limits,
+        .presentation = presentation_json_convert_limits,
     });
 }
 
@@ -605,6 +621,33 @@ test "parseReturn caps text block count" {
 
     const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
     try testing.expectEqual(default_tool_result_limits.max_blocks, result.content.len);
+}
+
+test "parseReturn preserves oversized presentation shape" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    try state.doString(
+        \\result = {
+        \\  content = { { type = 'text', text = 'ok' } },
+        \\  presentation = {
+        \\    kind = 'tree',
+        \\    summary = string.rep('a', 200 * 1024),
+        \\  },
+        \\}
+    , "huge_presentation_result");
+    _ = c.lua_getglobal(state.L, "result");
+    defer c.lua_pop(state.L, 1);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const result = try parseReturn(arena.allocator(), state.L, -1, default_tool_result_limits);
+    try testing.expect(result.presentation == .object);
+    const obj = result.presentation.object;
+    try testing.expectEqualStrings("tree", obj.get("kind").?.string);
+    try testing.expect(obj.get("summary").?.string.len <= default_tool_result_limits.presentation.max_string_bytes);
+    try testing.expectEqual(true, obj.get("__zi_truncated").?.bool);
 }
 
 test "parseReturn caps cumulative text bytes across blocks" {

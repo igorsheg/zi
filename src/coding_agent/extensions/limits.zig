@@ -6,6 +6,11 @@ pub const details_items: usize = 10_000;
 pub const details_string_bytes: usize = 64 * 1024;
 pub const details_total_string_bytes: usize = 256 * 1024;
 
+pub const presentation_depth: usize = 32;
+pub const presentation_items: usize = 20_000;
+pub const presentation_string_bytes: usize = 128 * 1024;
+pub const presentation_total_string_bytes: usize = 2 * 1024 * 1024;
+
 pub const ui_id_bytes: usize = 256;
 pub const ui_text_bytes: usize = 8 * 1024;
 pub const ui_title_bytes: usize = 1024;

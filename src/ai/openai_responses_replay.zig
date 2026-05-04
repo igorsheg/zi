@@ -557,6 +557,7 @@ fn transformToolResultMessage(
         .tool_name = try allocator.dupe(u8, tool_result.tool_name),
         .content = try content.toOwnedSlice(allocator),
         .details = if (tool_result.details) |details| try json_util.cloneJsonValue(allocator, details) else null,
+        .presentation = if (tool_result.presentation) |presentation| try json_util.cloneJsonValue(allocator, presentation) else null,
         .is_error = tool_result.is_error,
         .timestamp = tool_result.timestamp,
     };
@@ -901,6 +902,7 @@ fn deinitToolResultMessage(allocator: std.mem.Allocator, tool_result: protocol.T
     deinitToolResultContentList(allocator, tool_result.content);
     allocator.free(tool_result.content);
     if (tool_result.details) |details| json_util.freeJsonValue(allocator, details);
+    if (tool_result.presentation) |presentation| json_util.freeJsonValue(allocator, presentation);
 }
 
 fn deinitAssistantContentList(allocator: std.mem.Allocator, content: []const protocol.AssistantMessage.AssistantContentBlock) void {

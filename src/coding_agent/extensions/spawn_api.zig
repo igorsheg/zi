@@ -439,6 +439,10 @@ pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.Agent
         lua_runtime.pushJsonValue(L, result.details) catch c.lua_pushnil(L);
         c.lua_setfield(L, -2, "details");
     }
+    if (result.presentation != .null) {
+        lua_runtime.pushJsonValue(L, result.presentation) catch c.lua_pushnil(L);
+        c.lua_setfield(L, -2, "presentation");
+    }
 
     _ = c.lua_pushlstring(L, text.ptr, text.len);
     c.lua_setfield(L, -2, "output");

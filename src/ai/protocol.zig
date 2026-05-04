@@ -273,6 +273,7 @@ pub const ToolResultMessage = struct {
     tool_name: []const u8,
     content: []const ContentBlock,
     details: ?std.json.Value = null,
+    presentation: ?std.json.Value = null,
     is_error: bool,
     /// Unix timestamp in milliseconds
     timestamp: i64,

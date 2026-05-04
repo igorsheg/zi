@@ -268,6 +268,31 @@ pub const default_json_convert_limits = JsonConvertLimits{
     .max_total_string_bytes = limits.details_total_string_bytes,
 };
 
+pub const presentation_json_convert_limits = JsonConvertLimits{
+    .max_depth = limits.presentation_depth,
+    .max_items = limits.presentation_items,
+    .max_string_bytes = limits.presentation_string_bytes,
+    .max_total_string_bytes = limits.presentation_total_string_bytes,
+};
+
+pub const JsonLossyStats = struct {
+    truncated_strings: usize = 0,
+    omitted_items: usize = 0,
+    depth_limited: usize = 0,
+    unsupported_values: usize = 0,
+
+    pub fn any(self: JsonLossyStats) bool {
+        return self.truncated_strings != 0 or
+            self.omitted_items != 0 or
+            self.depth_limited != 0 or
+            self.unsupported_values != 0;
+    }
+};
+
+const presentation_truncated_marker = "... [truncated by zi presentation boundary] ...";
+const presentation_omitted_marker = "... [items omitted by zi presentation boundary] ...";
+const presentation_depth_marker = "... [depth limit reached by zi presentation boundary] ...";
+
 /// Read a Lua-stack value at the given (absolute or negative) index
 /// and produce an owned `std.json.Value`. Recursively walks tables.
 ///
@@ -442,6 +467,175 @@ fn luaTableToJsonLimited(
     }
 
     return .{ .object = obj };
+}
+
+pub fn luaValueToPresentationJson(
+    L: *c.lua_State,
+    index: c_int,
+    allocator: std.mem.Allocator,
+    limits_: JsonConvertLimits,
+) ConvertError!std.json.Value {
+    var budget = JsonConvertBudget{ .limits = limits_ };
+    var stats = JsonLossyStats{};
+    var value = try luaValueToPresentationJsonInner(L, index, allocator, &budget, &stats);
+    errdefer freeJsonValue(allocator, value);
+    if (stats.any()) try annotatePresentationRoot(allocator, &value, stats);
+    return value;
+}
+
+fn luaValueToPresentationJsonInner(
+    L: *c.lua_State,
+    index: c_int,
+    allocator: std.mem.Allocator,
+    budget: *JsonConvertBudget,
+    stats: *JsonLossyStats,
+) ConvertError!std.json.Value {
+    const abs_idx: c_int = if (index < 0) c.lua_gettop(L) + index + 1 else index;
+    return switch (c.lua_type(L, abs_idx)) {
+        c.LUA_TNIL, c.LUA_TNONE => .null,
+        c.LUA_TBOOLEAN => .{ .bool = c.lua_toboolean(L, abs_idx) != 0 },
+        c.LUA_TNUMBER => blk: {
+            if (c.lua_isinteger(L, abs_idx) != 0) break :blk .{ .integer = c.lua_tointegerx(L, abs_idx, null) };
+            break :blk .{ .float = c.lua_tonumberx(L, abs_idx, null) };
+        },
+        c.LUA_TSTRING => luaStringToPresentationJson(L, abs_idx, allocator, budget, stats),
+        c.LUA_TTABLE => luaTableToPresentationJson(L, abs_idx, allocator, budget, stats),
+        else => blk: {
+            stats.unsupported_values += 1;
+            break :blk .null;
+        },
+    };
+}
+
+fn luaStringToPresentationJson(
+    L: *c.lua_State,
+    abs_idx: c_int,
+    allocator: std.mem.Allocator,
+    budget: *JsonConvertBudget,
+    stats: *JsonLossyStats,
+) ConvertError!std.json.Value {
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, abs_idx, &len) orelse return error.InvalidUtf8;
+    const src = ptr[0..len];
+    if (budget.total_string_bytes >= budget.limits.max_total_string_bytes) {
+        stats.truncated_strings += 1;
+        return .{ .string = try allocator.dupe(u8, presentation_truncated_marker) };
+    }
+    const allowed = @min(budget.limits.max_string_bytes, budget.limits.max_total_string_bytes - budget.total_string_bytes);
+    if (src.len <= allowed) {
+        budget.total_string_bytes += src.len;
+        return .{ .string = try allocator.dupe(u8, src) };
+    }
+    stats.truncated_strings += 1;
+    const marker_len = @min(presentation_truncated_marker.len, allowed);
+    const prefix_len = allowed - marker_len;
+    const out = try allocator.alloc(u8, allowed);
+    @memcpy(out[0..prefix_len], src[0..prefix_len]);
+    @memcpy(out[prefix_len..], presentation_truncated_marker[0..marker_len]);
+    budget.total_string_bytes += out.len;
+    return .{ .string = out };
+}
+
+fn luaTableToPresentationJson(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+    budget: *JsonConvertBudget,
+    stats: *JsonLossyStats,
+) ConvertError!std.json.Value {
+    if (budget.depth >= budget.limits.max_depth) {
+        stats.depth_limited += 1;
+        return .{ .string = try allocator.dupe(u8, presentation_depth_marker) };
+    }
+    budget.depth += 1;
+    defer budget.depth -= 1;
+
+    const seq_len = c.lua_rawlen(L, table_idx);
+    if (seq_len > 0 and isSequence(L, table_idx, seq_len)) {
+        var arr = std.json.Array.init(allocator);
+        errdefer freeJsonValue(allocator, .{ .array = arr });
+        var i: c.lua_Integer = 1;
+        while (@as(usize, @intCast(i)) <= seq_len) : (i += 1) {
+            if (budget.items >= budget.limits.max_items) {
+                stats.omitted_items += seq_len - @as(usize, @intCast(i)) + 1;
+                try arr.append(.{ .string = try allocator.dupe(u8, presentation_omitted_marker) });
+                break;
+            }
+            budget.items += 1;
+            _ = c.lua_rawgeti(L, table_idx, i);
+            const elem = luaValueToPresentationJsonInner(L, -1, allocator, budget, stats) catch |err| {
+                c.lua_pop(L, 1);
+                return err;
+            };
+            c.lua_pop(L, 1);
+            try arr.append(elem);
+        }
+        return .{ .array = arr };
+    }
+
+    var obj: std.json.ObjectMap = .{};
+    errdefer freeJsonValue(allocator, .{ .object = obj });
+    c.lua_pushnil(L);
+    while (c.lua_next(L, table_idx) != 0) {
+        if (budget.items >= budget.limits.max_items) {
+            stats.omitted_items += 1;
+            c.lua_pop(L, 1);
+            continue;
+        }
+        budget.items += 1;
+
+        var key_buf: [64]u8 = undefined;
+        const key_str: []const u8 = switch (c.lua_type(L, -2)) {
+            c.LUA_TSTRING => blk: {
+                var len: usize = 0;
+                const ptr = c.lua_tolstring(L, -2, &len) orelse {
+                    c.lua_pop(L, 2);
+                    return error.InvalidUtf8;
+                };
+                break :blk ptr[0..len];
+            },
+            c.LUA_TNUMBER => blk: {
+                if (c.lua_isinteger(L, -2) != 0) break :blk std.fmt.bufPrint(&key_buf, "{d}", .{c.lua_tointegerx(L, -2, null)}) catch {
+                    c.lua_pop(L, 2);
+                    return error.OutOfMemory;
+                };
+                break :blk std.fmt.bufPrint(&key_buf, "{d}", .{c.lua_tonumberx(L, -2, null)}) catch {
+                    c.lua_pop(L, 2);
+                    return error.OutOfMemory;
+                };
+            },
+            else => {
+                stats.unsupported_values += 1;
+                c.lua_pop(L, 1);
+                continue;
+            },
+        };
+        const key_dup = try allocator.dupe(u8, key_str);
+        const value = luaValueToPresentationJsonInner(L, -1, allocator, budget, stats) catch |err| {
+            allocator.free(key_dup);
+            c.lua_pop(L, 2);
+            return err;
+        };
+        obj.put(allocator, key_dup, value) catch |err| {
+            allocator.free(key_dup);
+            freeJsonValue(allocator, value);
+            c.lua_pop(L, 2);
+            return err;
+        };
+        c.lua_pop(L, 1);
+    }
+    return .{ .object = obj };
+}
+
+fn annotatePresentationRoot(allocator: std.mem.Allocator, value: *std.json.Value, stats: JsonLossyStats) !void {
+    if (value.* != .object) return;
+    var obj = &value.object;
+    if (!obj.contains("__zi_truncated")) {
+        try obj.put(allocator, try allocator.dupe(u8, "__zi_truncated"), .{ .bool = true });
+    }
+    if (stats.omitted_items > 0 and !obj.contains("__zi_omitted")) {
+        try obj.put(allocator, try allocator.dupe(u8, "__zi_omitted"), .{ .integer = @intCast(stats.omitted_items) });
+    }
 }
 
 fn luaTableToJson(

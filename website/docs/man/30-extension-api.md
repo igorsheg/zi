@@ -75,10 +75,13 @@ A terminal tool result has this shape:
   content = {
     { type = "text", text = "..." },
   },
-  details = {},   -- optional open JSON-compatible envelope
+  details = {},       -- optional small exact JSON-compatible metadata
+  presentation = {},  -- optional rich render state for render_result
   is_error = false,
 }
 ```
+
+`content` is the model-visible answer and is tightly bounded. `details` is for small structured metadata and is converted with strict JSON limits. `presentation` is extension-owned UI state passed back to `render_result`; zi does not interpret its schema, but stores and transports it on a bounded best-effort basis. Oversized presentation strings/items may be truncated or omitted and the root object is marked with reserved `__zi_*` fields such as `__zi_truncated`.
 
 Tool names are unique. If a later extension registers a tool with an already-claimed name, the later registration is ignored and `zi.register_tool` returns `false`. This keeps ownership explicit.
 

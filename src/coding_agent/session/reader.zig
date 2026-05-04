@@ -255,6 +255,7 @@ fn freeToolResultMessage(allocator: std.mem.Allocator, msg: ai.protocol.ToolResu
     };
     allocator.free(msg.content);
     if (msg.details) |details| ai.json_util.freeJsonValue(allocator, details);
+    if (msg.presentation) |presentation| ai.json_util.freeJsonValue(allocator, presentation);
 }
 
 fn freeCustomContent(allocator: std.mem.Allocator, content: agent.protocol.AgentMessage.CustomContent) void {

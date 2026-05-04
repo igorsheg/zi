@@ -612,6 +612,7 @@ pub const RuntimeHost = struct {
         return .{
             .content = @ptrCast(tool_result.content),
             .details = tool_result.details orelse .null,
+            .presentation = tool_result.presentation orelse .null,
             .is_error = tool_result.is_error,
         };
     }

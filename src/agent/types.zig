@@ -161,6 +161,7 @@ pub const AgentMessage = union(enum) {
 pub const AgentToolResult = struct {
     content: []const ContentBlock,
     details: std.json.Value = .null,
+    presentation: std.json.Value = .null,
     is_error: bool = false,
 
     pub const ContentBlock = union(enum) {
@@ -201,10 +202,13 @@ pub const AgentToolResult = struct {
         }
 
         const details = try json_util.cloneJsonValue(allocator, self.details);
+        errdefer json_util.freeJsonValue(allocator, details);
+        const presentation = try json_util.cloneJsonValue(allocator, self.presentation);
 
         return .{
             .content = content,
             .details = details,
+            .presentation = presentation,
             .is_error = self.is_error,
         };
     }
@@ -223,6 +227,7 @@ pub const AgentToolResult = struct {
         };
         allocator.free(self.content);
         json_util.freeJsonValue(allocator, self.details);
+        json_util.freeJsonValue(allocator, self.presentation);
     }
 };
 

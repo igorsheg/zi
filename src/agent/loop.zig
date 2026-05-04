@@ -709,6 +709,7 @@ fn finalizePreparedToolCall(
 ) void {
     var final_content = result.content;
     var final_details = result.details;
+    const final_presentation = result.presentation;
     var final_is_error = result.is_error;
 
     if (config.after_tool_call) |hook| {
@@ -734,6 +735,7 @@ fn finalizePreparedToolCall(
     const final_agent_result = protocol.AgentToolResult{
         .content = final_content,
         .details = final_details,
+        .presentation = final_presentation,
         .is_error = final_is_error,
     };
 
@@ -750,6 +752,7 @@ fn finalizePreparedToolCall(
         .tool_name = prepared.tool_call.name,
         .content = trm_content.items,
         .details = final_details,
+        .presentation = final_presentation,
         .is_error = final_is_error,
         .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };

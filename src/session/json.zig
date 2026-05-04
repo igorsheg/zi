@@ -252,6 +252,10 @@ pub fn writeToolResultMessage(jw: *Stringify, msg: ai.protocol.ToolResultMessage
         try jw.objectField("details");
         try jw.write(d);
     }
+    if (msg.presentation) |p| {
+        try jw.objectField("presentation");
+        try jw.write(p);
+    }
     try jw.objectField("isError");
     try jw.write(msg.is_error);
     try jw.objectField("timestamp");
@@ -702,6 +706,7 @@ fn parseToolResultMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap)
         .tool_name = try allocator.dupe(u8, obj.get("toolName").?.string),
         .content = blocks,
         .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
+        .presentation = if (obj.get("presentation")) |p| try json_util.cloneJsonValue(allocator, p) else null,
         .is_error = obj.get("isError").?.bool,
         .timestamp = @intCast(obj.get("timestamp").?.integer),
     };
