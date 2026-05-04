@@ -34,10 +34,6 @@ pub const AnthropicProvider = struct {
         };
     }
 
-    // =================================================================
-    // VTable implementations
-    // =================================================================
-
     fn streamImplWrapper(ptr: *anyopaque, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
         self.streamImpl(allocator, model, context, options, null, null, callback, callback_ctx);
@@ -54,14 +50,9 @@ pub const AnthropicProvider = struct {
 
     fn deinitImpl(_: *anyopaque) void {}
 
-    // =================================================================
-    // Main streaming implementation
-    // =================================================================
-
     fn streamImpl(self: *AnthropicProvider, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
         _ = self;
 
-        // Build request payload
         var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer payload_buf.deinit(allocator);
 
@@ -105,11 +96,9 @@ pub const AnthropicProvider = struct {
             return;
         };
 
-        // Setup HTTP client
         var client: std.http.Client = .{ .allocator = allocator, .io = options.io };
         defer client.deinit();
 
-        // Build extra headers
         var extra_headers_buf: [16]std.http.Header = undefined;
         var n_extra: usize = 0;
 
@@ -120,7 +109,6 @@ pub const AnthropicProvider = struct {
         // API keys use x-api-key header.
         const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
 
-        // Stack buffer for Bearer auth header value
         var auth_buf: [4096]u8 = undefined;
         if (is_oauth) {
             const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
@@ -159,7 +147,6 @@ pub const AnthropicProvider = struct {
             }
         }
 
-        // Send request (zig 0.15 API) — disable compression so SSE arrives as plaintext
         var req = client.request(.POST, uri, .{
             .extra_headers = extra_headers_buf[0..n_extra],
             .headers = .{
@@ -213,17 +200,13 @@ pub const AnthropicProvider = struct {
             return;
         }
 
-        // Parse SSE stream line by line
         var parser = sse.SseParser.init(allocator);
         defer parser.deinit();
         const reader = response.reader(&transfer_buf);
 
-        // Per-delta scratch arena for partial-JSON reparses.
-        // See StreamState.scratch for rationale.
         var scratch_arena = std.heap.ArenaAllocator.init(allocator);
         defer scratch_arena.deinit();
 
-        // Streaming state
         var state = StreamState{
             .allocator = allocator,
             .scratch = &scratch_arena,
@@ -253,11 +236,8 @@ pub const AnthropicProvider = struct {
             state.content_blocks.deinit(allocator);
         }
 
-        // Emit start event
         callback(.{ .start = .{ .partial = state.partial } }, callback_ctx);
 
-        // Process SSE events with chunked reads so long lines don't depend on
-        // the HTTP reader's internal buffer size.
         const StreamCtx = struct {
             state: *StreamState,
             callback: ai_provider.EventCallback,
@@ -290,12 +270,8 @@ pub const AnthropicProvider = struct {
             }
         };
 
-        // Build final content blocks from accumulated streaming state.
-        // Allocations go through the caller's allocator (arena) so they survive
-        // after this function returns.
         state.partial.content = buildFinalContent(allocator, state.content_blocks.items) catch &.{};
 
-        // Emit final done event
         if (state.partial.stop_reason == .aborted) {
             callback(.{ .done = .{ .reason = .stop, .message = state.partial } }, callback_ctx);
         } else if (state.stop_reason) |sr| {
@@ -317,10 +293,6 @@ pub const AnthropicProvider = struct {
         }
     }
 };
-
-// =================================================================
-// Streaming state
-// =================================================================
 
 const ContentBlockState = struct {
     block_type: BlockType,
@@ -372,10 +344,6 @@ const StopReason = enum {
     sensitive,
 };
 
-// =================================================================
-// SSE event handling
-// =================================================================
-
 /// Handle a single Anthropic SSE event. The `data` payload is parsed
 /// once via `std.json.parseFromSliceLeaky` into `state.scratch` and
 /// walked structurally with the typed accessors in `json.value`.
@@ -414,12 +382,10 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
     const event_type = json_value.asString(obj.get("type")) orelse return;
 
     if (std.mem.eql(u8, event_type, "message_start")) {
-        // Shape: { message: { usage: { input_tokens, output_tokens, cache_read_input_tokens?, cache_creation_input_tokens? } } }
         const message = json_value.asObject(obj.get("message")) orelse return;
         const usage = json_value.asObject(message.get("usage")) orelse return;
         updateUsageFromObject(&state.partial.usage, usage);
     } else if (std.mem.eql(u8, event_type, "content_block_start")) {
-        // Shape: { index, content_block: { type, id?, name?, ... } }
         const block_json = json_value.asObject(obj.get("content_block")) orelse return;
         const block_type = json_value.asString(block_json.get("type")) orelse "text";
         const index = json_value.asU64(obj.get("index")) orelse state.content_blocks.items.len;
@@ -434,8 +400,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             callback(.{ .thinking_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
         } else if (std.mem.eql(u8, block_type, "tool_use")) {
             var block = ContentBlockState.init(.tool_call, index);
-            // id/name slices live in scratch — dupe into the turn
-            // arena before the next SSE event resets it.
             const tool_id = state.allocator.dupe(u8, json_value.asString(block_json.get("id")) orelse "") catch "";
             const tool_name = state.allocator.dupe(u8, json_value.asString(block_json.get("name")) orelse "") catch "";
             block.tool_call = .{
@@ -448,7 +412,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             callback(.{ .toolcall_start = .{ .content_index = state.content_blocks.items.len - 1, .partial = state.partial } }, callback_ctx);
         }
     } else if (std.mem.eql(u8, event_type, "content_block_delta")) {
-        // Shape: { index, delta: { type, text? | thinking? | partial_json? } }
         const delta_obj = json_value.asObject(obj.get("delta")) orelse return;
         const delta_type = json_value.asString(delta_obj.get("type")) orelse return;
         const index = json_value.asU64(obj.get("index")) orelse return;
@@ -457,9 +420,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
 
         if (std.mem.eql(u8, delta_type, "text_delta")) {
             const text = json_value.asString(delta_obj.get("text")) orelse return;
-            // Append to the block buffer (turn arena), then re-slice
-            // into the buffer to get a turn-arena-owned delta payload.
-            // No extra dupe needed.
             const old_len = block.text.items.len;
             block.text.appendSlice(state.allocator, text) catch return;
             const text_val = block.text.items[old_len..];
@@ -475,10 +435,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             if (block.tool_call) |*tc| {
                 const old_len = block.text.items.len;
                 block.text.appendSlice(state.allocator, partial) catch return;
-                // parseToolArgs resets state.scratch internally —
-                // safe because `partial` is already copied into
-                // block.text and we no longer need scratch's parse
-                // tree.
                 tc.arguments = parseToolArgs(state, block.text.items);
                 const json_delta = block.text.items[old_len..];
                 // Refresh live partial.content so downstream
@@ -503,8 +459,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             .tool_call => {
                 if (block.tool_call) |tc| {
                     var final_tc = tc;
-                    // Final parse: buffer should be complete, so
-                    // parseStreaming's strict-first fast path wins.
                     final_tc.arguments = parseToolArgs(state, block.text.items);
                     block.tool_call = final_tc;
                     callback(.{ .toolcall_end = .{ .content_index = index, .tool_call = final_tc, .partial = state.partial } }, callback_ctx);
@@ -512,7 +466,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             },
         }
     } else if (std.mem.eql(u8, event_type, "message_delta")) {
-        // Shape: { delta: { stop_reason, stop_sequence }, usage: { output_tokens, input_tokens?, cache_read_input_tokens?, cache_creation_input_tokens? } }
         if (json_value.asObject(obj.get("delta"))) |delta_obj| {
             if (json_value.asString(delta_obj.get("stop_reason"))) |reason| {
                 if (std.mem.eql(u8, reason, "end_turn")) {
@@ -528,7 +481,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
             updateUsageFromObject(&state.partial.usage, usage);
         }
     } else if (std.mem.eql(u8, event_type, "error")) {
-        // Shape: { error: { type, message } }
         const err_obj = json_value.asObject(obj.get("error")) orelse return;
         const err_type = json_value.asString(err_obj.get("type"));
         const err_msg = json_value.asString(err_obj.get("message")) orelse "unknown error";
@@ -548,10 +500,6 @@ fn updateUsageFromObject(usage: *protocol.Usage, obj: std.json.ObjectMap) void {
     if (json_value.asU64(obj.get("cache_creation_input_tokens"))) |n| usage.cache_write = n;
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
-
-// =================================================================
-// Final content building
-// =================================================================
 
 fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockState) ![]const protocol.AssistantMessage.AssistantContentBlock {
     const content = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, blocks.len);
@@ -651,10 +599,6 @@ fn addAnthropicMetadata(
     try payload.object.put(allocator, "metadata", .{ .object = metadata });
     return true;
 }
-
-// =================================================================
-// JSON request building — uses std.json.Stringify
-// =================================================================
 
 fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets) !void {
     var out = std.Io.Writer.Allocating.fromArrayList(allocator, buf);
@@ -960,8 +904,6 @@ fn parseToolArgs(state: *StreamState, json_str: []const u8) std.json.Value {
     _ = state.scratch.reset(.retain_capacity);
     const scratch = state.scratch.allocator();
     const parsed = partial_json.parseStreaming(scratch, json_str) catch {
-        // OutOfMemory in the scratch arena — fall back to an empty
-        // object in the turn arena. Better than crashing mid-stream.
         return emptyObject(state.allocator);
     };
     return json_util.cloneJsonValue(state.allocator, parsed) catch emptyObject(state.allocator);
@@ -996,10 +938,6 @@ fn buildLiveContent(allocator: std.mem.Allocator, blocks: []const ContentBlockSt
     }
     return content;
 }
-
-// =================================================================
-// Error handling
-// =================================================================
 
 fn emitError(
     allocator: std.mem.Allocator,
@@ -1045,10 +983,6 @@ fn emitFailure(
         .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     } } }, ctx);
 }
-
-// =================================================================
-// Tests
-// =================================================================
 
 const testing = std.testing;
 

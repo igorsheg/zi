@@ -29,8 +29,6 @@ pub const CompactionSettings = struct {
     keep_recent_tokens: u64 = 20_000,
 };
 
-// ─── file-op tracking ───────────────────────────────────────────────
-
 pub const FileOperations = struct {
     read: std.StringHashMapUnmanaged(void) = .{},
     written: std.StringHashMapUnmanaged(void) = .{},
@@ -143,8 +141,6 @@ pub fn formatFileOperations(
 fn strLessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
-
-// ─── cut-point semantics ─────────────────────────────────────────────
 
 pub const CutPointResult = struct {
     first_kept_entry_index: usize,
@@ -270,8 +266,6 @@ pub fn findCutPoint(
         .is_split_turn = !at_user_boundary and turn_start != null,
     };
 }
-
-// ─── preparation ────────────────────────────────────────────────────
 
 pub const CompactionPreparation = struct {
     first_kept_entry_id: []const u8,
@@ -414,8 +408,6 @@ fn collectCarriedFileOps(
         };
     }
 }
-
-// ─── summarization-input serialization ──────────────────────────────
 
 /// pi-mono utils.ts: serializeConversation
 ///
@@ -570,8 +562,6 @@ fn joinParts(allocator: std.mem.Allocator, parts: []const []u8, sep: []const u8)
     }
     return buf;
 }
-
-// ─── tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
 

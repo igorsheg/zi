@@ -21,13 +21,11 @@ pub fn runAgentLoop(
     event_ctx: ?*anyopaque,
     signal: AbortSignal,
 ) void {
-    // newMessages tracks only messages created during this run
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (prompts) |p| {
         new_messages.append(run_allocator, p) catch return;
     }
 
-    // Working context = existing messages + prompts
     var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (context.messages) |m| {
         ctx_messages.append(run_allocator, m) catch return;
@@ -39,7 +37,6 @@ pub fn runAgentLoop(
     event_sink(.agent_start, event_ctx);
     event_sink(.turn_start, event_ctx);
 
-    // Emit message_start/end for prompt messages
     for (prompts) |p| {
         event_sink(.{ .message_start = .{ .message = p } }, event_ctx);
         event_sink(.{ .message_end = .{ .message = p } }, event_ctx);
@@ -84,8 +81,6 @@ pub fn runAgentLoopContinue(
     event_sink(.agent_start, event_ctx);
     event_sink(.turn_start, event_ctx);
 
-    // No message_start/end for existing messages — that's the key difference from runAgentLoop
-
     runLoop(run_allocator, turn_allocator_parent, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
 }
 
@@ -109,7 +104,6 @@ fn runLoop(
 
     var first_turn = true;
 
-    // Convert AgentTools to LLM Tools once
     var llm_tools: std.ArrayListUnmanaged(ai.protocol.Tool) = .empty;
     if (context.tools) |tools| {
         for (tools) |t| {
@@ -121,8 +115,6 @@ fn runLoop(
         }
     }
 
-    // Initial steering poll (pi-mono agent-loop.ts:165)
-    // Skip when continue() already drained one steering message (skipInitialSteeringPoll).
     var pending_messages = if (config.skip_initial_steering_poll)
         @as([]const protocol.AgentMessage, &.{})
     else if (config.get_steering_messages) |hook|
@@ -130,17 +122,14 @@ fn runLoop(
     else
         @as([]const protocol.AgentMessage, &.{});
 
-    // Outer loop: continues when follow-up messages arrive
     outer: while (true) {
         var has_more_tool_calls = true;
 
-        // Inner loop: process tool calls and steering messages
         while (has_more_tool_calls or pending_messages.len > 0) {
             var turn_arena = std.heap.ArenaAllocator.init(turn_allocator_parent);
             defer turn_arena.deinit();
             const turn_allocator = turn_arena.allocator();
 
-            // Check abort before each turn (catches abort during tool execution)
             if (isAborted(signal)) {
                 traceWrite(trace, "EXIT: abort before turn\n", .{});
                 event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
@@ -153,7 +142,6 @@ fn runLoop(
                 first_turn = false;
             }
 
-            // Inject pending messages before next assistant response
             if (pending_messages.len > 0) {
                 for (pending_messages) |msg| {
                     event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
@@ -164,7 +152,6 @@ fn runLoop(
                 pending_messages = &.{};
             }
 
-            // Stream assistant response
             traceWrite(trace, "STREAM: start model={s}\n", .{config.model.id});
             const assistant_msg = streamAssistantResponse(run_allocator, turn_allocator, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
                 traceWrite(trace, "EXIT: stream returned null (no final message)\n", .{});
@@ -191,7 +178,6 @@ fn runLoop(
                 return;
             }
 
-            // Check for tool calls
             var tool_call_count: usize = 0;
             for (assistant_msg.content) |block| {
                 switch (block) {
@@ -207,7 +193,6 @@ fn runLoop(
                 executeToolCalls(run_allocator, turn_allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
                 traceWrite(trace, "TOOLS: executed results={d}\n", .{tool_results.items.len});
 
-                // Abort during tool execution — emit turn_end before agent_end
                 if (isAborted(signal)) {
                     traceWrite(trace, "EXIT: abort during tool execution\n", .{});
                     event_sink(.{ .turn_end = .{
@@ -224,7 +209,6 @@ fn runLoop(
                 .tool_results = tool_results.items,
             } }, event_ctx);
 
-            // Poll steering messages after tool execution
             pending_messages = if (config.get_steering_messages) |hook|
                 hook.call(run_allocator)
             else
@@ -232,7 +216,6 @@ fn runLoop(
             traceWrite(trace, "STEERING: pending={d}\n", .{pending_messages.len});
         }
 
-        // Agent would stop here. Check for follow-up messages.
         const follow_ups = if (config.get_follow_up_messages) |hook|
             hook.call(run_allocator)
         else
@@ -265,13 +248,11 @@ fn streamAssistantResponse(
     llm_tools: []const ai.protocol.Tool,
     system_prompt: []const u8,
 ) ?ai.protocol.AssistantMessage {
-    // Apply context transform if configured (AgentMessage[] → AgentMessage[])
     var messages: []const protocol.AgentMessage = ctx_messages.items;
     if (config.transform_context) |hook| {
         messages = hook.call(turn_allocator, messages, signal);
     }
 
-    // Convert to LLM messages (AgentMessage[] → Message[])
     const llm_messages = config.convert_to_llm.call(turn_allocator, messages);
 
     const llm_context = ai.protocol.Context{
@@ -289,7 +270,6 @@ fn streamAssistantResponse(
 
     // Resolve API key dynamically (pi-mono agent-loop.ts:264-265)
     // JS `||` treats empty string as falsy, so we must check len > 0.
-    //
     // zi-wub.27: dupe into the loop arena immediately. The slice
     // returned by the hook is BORROWED from AuthStorage's internal
     // map; AuthStorage.set() from the login thread can reallocate
@@ -315,7 +295,6 @@ fn streamAssistantResponse(
 
     const assistant_msg = bridge.final_message orelse return null;
 
-    // Add to context (pi-mono: context.messages.push or replace last)
     ctx_messages.append(run_allocator, .{ .assistant = assistant_msg }) catch {};
 
     return assistant_msg;
@@ -1258,8 +1237,6 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
     try std.testing.expectEqualStrings("call-1", collector.ends.items[0]);
     try std.testing.expectEqualStrings("call-2", collector.ends.items[1]);
 }
-
-// ── trace file (ZI_LOOP_TRACE) ──────────────────────────────────────
 
 fn openTraceFile() ?std.Io.File {
     const path = @import("env").get("ZI_LOOP_TRACE") orelse return null;

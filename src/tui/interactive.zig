@@ -195,7 +195,6 @@ pub const Interactive = struct {
     theme: *const theme_mod.Theme = undefined,
     cwd: []const u8 = "",
 
-    // ── Owned components ──────────────────────────────────────────
     editor: editor_mod.Editor,
     /// Active editor interface — routes paste/newline/ctrl+d/clear.
     /// Defaults to the built-in editor. Extensions can swap via setEditor().
@@ -218,7 +217,6 @@ pub const Interactive = struct {
     /// the TUI thread after all workers are joined.
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
 
-    // ── Conversation-publish coalescer (agent thread only) ────────
     // P1: soft events (token deltas, tool_execution_update) mark-dirty
     // and only publish if the cadence has elapsed. Hard events flush
     // immediately. See flushPendingConversationPublish /
@@ -246,7 +244,6 @@ pub const Interactive = struct {
     pending_images: std.ArrayListUnmanaged(PendingImageAttachment) = .empty,
     clipboard_image_reader: ClipboardImageReader = clipboard_mod.readImage,
 
-    // ── Container slots (pi-mono parity) ──────────────────────────
     header_container: container_mod.Container,
     pending_container: container_mod.Container,
     status_container: container_mod.Container,
@@ -254,14 +251,12 @@ pub const Interactive = struct {
     editor_container: container_mod.Container,
     composer_below_container: container_mod.Container,
 
-    // ── Slash commands ──────────────────────────────────────────
     command_registry: CommandRegistry,
     autocomplete_provider: CombinedAutocompleteProvider = undefined,
     autocomplete_provider_bound: bool = false,
     hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
     extension_keybindings: std.ArrayListUnmanaged(ui_event_mod.ExtensionKeybindingEntry) = .empty,
 
-    // ── Flow-owned transient pickers ────────────────────────────
     resume_picker_flow: ?ResumePickerFlow = null,
     resume_picker_generation: u64 = 0,
     session_index_worker: session_index_worker_mod.SessionIndexWorker,
@@ -269,7 +264,6 @@ pub const Interactive = struct {
     system_worker: ?system_worker_mod.SystemWorker = null,
     terminal_system_queue: TerminalSystemQueue,
 
-    // ── Model picker (for /model) ───────────────────────────────
     auth_storage: *auth_storage_mod.AuthStorage,
     settings_manager: *settings_manager_mod.SettingsManager,
     /// TUI-owned visible-model snapshot published from the agent
@@ -280,7 +274,6 @@ pub const Interactive = struct {
     extension_prompt_flow: ?ExtensionPromptFlow = null,
     extension_prompt_close_after_submit: bool = false,
 
-    // ── Settings pickers (/settings) ───────────────────────────────
     settings_picker: ListPicker = undefined,
     settings_picker_items: [16]SelectItem = undefined,
     settings_picker_actions: [16]SettingsAction = undefined,
@@ -292,7 +285,6 @@ pub const Interactive = struct {
     thinking_picker_count: usize = 0,
     thinking_picker_handle: ?tui_mod.OverlayHandle = null,
 
-    // ── Login state (/login) ────────────────────────────────────────
     login_picker: ListPicker = undefined,
     login_picker_items: [8]SelectItem = undefined,
     login_picker_entries: [8]oauth_mod.ProviderListEntry = undefined,
@@ -397,7 +389,6 @@ pub const Interactive = struct {
     }
 
     pub fn deinit(self: *Interactive) void {
-        // Cancel and join login thread if active
         if (self.login_thread != null) {
             self.login_cancelled.store(true, .release);
             if (self.login_thread) |t| t.join();
@@ -783,7 +774,6 @@ pub const Interactive = struct {
         const max_h = @max(3, h * 30 / 100);
         self.active_editor.setMaxVisibleLines(max_h);
 
-        // Sum all non-flex children's measured heights
         var fixed_total: u32 = 0;
         for (self.tui.root.children.items, 0..) |child, i| {
             if (self.tui.root.flex_child_index != null and i == self.tui.root.flex_child_index.?) continue;
@@ -920,11 +910,9 @@ pub const Interactive = struct {
             return;
         }
 
-        // Update editor max height before layout measures it
         const max_h = @max(3, h * 30 / 100);
         self.active_editor.setMaxVisibleLines(max_h);
 
-        // Render via TUI (root tree + overlays) and get cursor state
         if (self.tui.render()) |cs| {
             self.tui.terminal.showCursor();
             self.tui.terminal.setCursorPos(cs.x, cs.y);
@@ -932,8 +920,6 @@ pub const Interactive = struct {
             self.tui.terminal.hideCursor();
         }
     }
-
-    // --- Editor callbacks ---
 
     pub fn restoreQueuedInputsToEditor(self: *Interactive) void {
         composer_flow.restoreQueuedInputsToEditor(self);
@@ -959,7 +945,6 @@ pub const Interactive = struct {
         self.refreshHeaderVisibility();
         self.tui.dirty = true;
 
-        // Built-in commands with Interactive access
         if (cmd.source == .builtin) {
             if (self.dispatchInteractiveBuiltinCommand(name, args)) return true;
         }
@@ -1052,10 +1037,6 @@ pub const Interactive = struct {
         return true;
     }
 
-    // ── App-level overlay presets ──────────────────────────────
-    // These know about the Interactive layout (footer height, etc).
-    // Generic presets live in overlay.zig (OverlayPresets).
-
     pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
         return overlay_flow.bottomSheetOptions(self);
     }
@@ -1129,8 +1110,6 @@ pub const Interactive = struct {
         return idle_request.dispatch(self, req, options);
     }
 
-    // ── Session picker (/resume) ────────────────────────────────
-
     fn closeResumePickerFlow(self: *Interactive) void {
         session_flow.close(self);
     }
@@ -1138,8 +1117,6 @@ pub const Interactive = struct {
     pub fn showSessionPicker(self: *Interactive, restore_session_model: bool) void {
         session_flow.show(self, restore_session_model);
     }
-
-    // ── Model picker (/model) ───────────────────────────────────
 
     fn switchModelDirect(self: *Interactive, pattern: []const u8) void {
         model_flow.switchDirect(self, pattern);
@@ -1164,8 +1141,6 @@ pub const Interactive = struct {
     fn showModelPicker(self: *Interactive) void {
         model_flow.show(self);
     }
-
-    // ── Settings picker (/settings) ─────────────────────────────
 
     fn showSettingsPicker(self: *Interactive) void {
         settings_flow_mod.showSettings(self, &onSettingsSelected, &onSettingsPickerCancel);
@@ -1202,8 +1177,6 @@ pub const Interactive = struct {
             .spawn_failed_message = "failed to queue thinking-level change",
         });
     }
-
-    // ── Login picker (/login) ───────────────────────────────────
 
     fn clearLoginPickerEntries(self: *Interactive) void {
         login_flow.clearEntries(self);

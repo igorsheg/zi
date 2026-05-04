@@ -7,8 +7,6 @@ const json_write = @import("../json/write.zig");
 
 const Stringify = std.json.Stringify;
 
-// ─── Serialization ──────────────────────────────────────────────────
-
 pub fn writeHeader(writer: *std.Io.Writer, header: proto.SessionHeader) !void {
     var jw: Stringify = .{ .writer = writer };
 
@@ -142,8 +140,6 @@ pub fn writeEntry(writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
 
     try jw.endObject();
 }
-
-// ─── Message writers ────────────────────────────────────────────────
 
 pub fn writeAgentMessage(jw: *Stringify, msg: agent.protocol.AgentMessage) !void {
     switch (msg) {
@@ -324,14 +320,11 @@ pub fn writeCustomContent(jw: *Stringify, content: agent.protocol.AgentMessage.C
     }
 }
 
-// ─── Content block writers ──────────────────────────────────────────
-
 pub fn writeTextBlock(jw: *Stringify, tc: ai.protocol.TextContent) !void {
     try jw.beginObject();
     try jw.objectField("type");
     try jw.write("text");
     try jw.objectField("text");
-    // Tiny sanitization buffer, freed before the block writer returns.
     const sanitized = try json_util.utf8LossyAlloc(std.heap.page_allocator, tc.text);
     defer std.heap.page_allocator.free(sanitized);
     try jw.write(sanitized);
@@ -414,8 +407,6 @@ pub fn writeUsage(jw: *Stringify, usage: ai.protocol.Usage) !void {
     try jw.endObject();
     try jw.endObject();
 }
-
-// ─── Deserialization ────────────────────────────────────────────────
 
 pub fn parseFileEntry(allocator: std.mem.Allocator, line: []const u8) !proto.FileEntry {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{ .allocate = .alloc_always });
@@ -735,8 +726,6 @@ fn parseCustomContent(allocator: std.mem.Allocator, val: std.json.Value) !agent.
         else => error.InvalidCustomContent,
     };
 }
-
-// ─── Tests ──────────────────────────────────────────────────────────
 
 fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -705,8 +705,6 @@ fn parseThinkingFormat(
     return null;
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
-
 const testing = std.testing;
 
 const test_provider = struct {

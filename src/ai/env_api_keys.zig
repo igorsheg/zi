@@ -14,20 +14,17 @@ const std = @import("std");
 pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
     const eql = std.mem.eql;
 
-    // github-copilot: multiple token sources
     if (eql(u8, provider, "github-copilot")) {
         return @import("env").get("COPILOT_GITHUB_TOKEN") orelse
             @import("env").get("GH_TOKEN") orelse
             @import("env").get("GITHUB_TOKEN");
     }
 
-    // anthropic: oauth token takes precedence over api key
     if (eql(u8, provider, "anthropic")) {
         return @import("env").get("ANTHROPIC_OAUTH_TOKEN") orelse
             @import("env").get("ANTHROPIC_API_KEY");
     }
 
-    // google-vertex: explicit API key, or ADC env-var-based check
     if (eql(u8, provider, "google-vertex")) {
         if (@import("env").get("GOOGLE_CLOUD_API_KEY")) |key| return key;
 
@@ -41,7 +38,6 @@ pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
         return null;
     }
 
-    // amazon-bedrock: multiple credential sources
     if (eql(u8, provider, "amazon-bedrock")) {
         if (@import("env").get("AWS_PROFILE") != null) return "<authenticated>";
         if (@import("env").get("AWS_ACCESS_KEY_ID") != null and
@@ -53,7 +49,6 @@ pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
         return null;
     }
 
-    // Standard provider → env var map
     const env_var = envVarForProvider(provider) orelse return null;
     return @import("env").get(env_var);
 }
@@ -78,4 +73,3 @@ fn envVarForProvider(provider: []const u8) ?[:0]const u8 {
     if (eql(u8, provider, "kimi-coding")) return "KIMI_API_KEY";
     return null;
 }
-

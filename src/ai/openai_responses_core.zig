@@ -56,10 +56,6 @@ const zio_abort = @import("../zio/root.zig").abort;
 const AbortSignal = zio_abort.AbortSignal;
 const AbortGuard = zio_abort.AbortGuard;
 
-// =============================================================================
-// Public surface
-// =============================================================================
-
 /// Pluggable Authorization-header builder. The HTTP shell calls
 /// `build(ctx, scratch_buf, options.api_key)` and writes the result into
 /// the request's `authorization` header.
@@ -122,10 +118,6 @@ pub const CoreOptions = struct {
         reasoning_summary: ?[]const u8,
     ) anyerror!void = null,
 };
-
-// =============================================================================
-// HTTP outer shell
-// =============================================================================
 
 pub fn streamCore(
     allocator: std.mem.Allocator,
@@ -255,10 +247,6 @@ pub fn streamCore(
     processStreamMapped(allocator, &reader, model, options.signal, core.provider_label, core.event_mapper, callback, callback_ctx);
 }
 
-// =============================================================================
-// Pure SSE processor
-// =============================================================================
-
 const ItemKind = enum { reasoning, message, function_call };
 const MessagePartKind = enum { output_text, refusal };
 
@@ -269,18 +257,15 @@ const ItemState = struct {
     /// function_call: unused (args live in `tool_args_partial`).
     text_buf: std.ArrayListUnmanaged(u8) = .empty,
 
-    // reasoning fields
     summary_started: bool = false,
     thinking_signature: ?[]const u8 = null,
 
-    // message fields
     content_part_started: bool = false,
     message_part_kind: ?MessagePartKind = null,
     msg_id: []const u8 = "",
     msg_phase: ?[]const u8 = null,
     text_signature: ?[]const u8 = null,
 
-    // function_call fields
     tool_call_id: []const u8 = "",
     tool_item_id: []const u8 = "",
     tool_name: []const u8 = "",
@@ -488,7 +473,6 @@ fn handleEvent(
     }
     const t = mapped_type;
 
-    // ── lifecycle: response id capture ─────────────────────────────
     if (std.mem.eql(u8, t, "response.created")) {
         if (root.object.get("response")) |resp| if (resp == .object) {
             if (resp.object.get("id")) |id| if (id == .string and id.string.len > 0) {
@@ -499,7 +483,6 @@ fn handleEvent(
         return;
     }
 
-    // ── output_item.added: open a new content block ────────────────
     if (std.mem.eql(u8, t, "response.output_item.added")) {
         const item = root.object.get("item") orelse return;
         if (item != .object) return;
@@ -550,7 +533,6 @@ fn handleEvent(
         return;
     }
 
-    // ── reasoning summary lifecycle ────────────────────────────────
     if (std.mem.eql(u8, t, "response.reasoning_summary_part.added")) {
         if (state.current) |cur| {
             const it = &state.items.items[cur];
@@ -589,7 +571,6 @@ fn handleEvent(
         return;
     }
 
-    // ── message content lifecycle ──────────────────────────────────
     if (std.mem.eql(u8, t, "response.content_part.added")) {
         if (state.current) |cur| {
             const it = &state.items.items[cur];
@@ -630,7 +611,6 @@ fn handleEvent(
         return;
     }
 
-    // ── function call argument streaming ───────────────────────────
     if (std.mem.eql(u8, t, "response.function_call_arguments.delta")) {
         const cur = state.current orelse return;
         const it = &state.items.items[cur];
@@ -660,7 +640,6 @@ fn handleEvent(
         return;
     }
 
-    // ── output_item.done: close current block, emit terminal event ─
     if (std.mem.eql(u8, t, "response.output_item.done")) {
         const item = root.object.get("item") orelse return;
         if (item != .object) return;
@@ -722,8 +701,6 @@ fn handleEvent(
                 st.tool_args_partial.clearRetainingCapacity();
                 try st.tool_args_partial.appendSlice(allocator, arguments.string);
             };
-            // Final reparse via the caller's allocator so the value
-            // outlives the per-delta scratch arena.
             const final_args = partial_json.parseStreaming(allocator, st.tool_args_partial.items) catch .null;
             st.tool_args_parsed = final_args;
             st.tool_composite_id = "";
@@ -744,7 +721,6 @@ fn handleEvent(
         return;
     }
 
-    // ── terminal: usage + stop reason ──────────────────────────────
     if (std.mem.eql(u8, t, "response.completed") or
         std.mem.eql(u8, t, "response.done") or
         std.mem.eql(u8, t, "response.incomplete"))
@@ -781,10 +757,6 @@ fn handleEvent(
         return;
     }
 }
-
-// =============================================================================
-// Rendering helpers
-// =============================================================================
 
 fn clearAndSetText(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
     buf.clearRetainingCapacity();
@@ -1032,10 +1004,6 @@ pub fn emitFailure(
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
 }
 
-// =============================================================================
-// Request body builder
-// =============================================================================
-
 pub fn writeBaseFields(jw: *std.json.Stringify, model: protocol.Model) !void {
     try jw.objectField("model");
     try jw.write(model.id);
@@ -1144,7 +1112,6 @@ pub fn buildRequestJson(
 
     if (model.reasoning) {
         if (reasoning_effort) |effort| {
-            // pi-mono: openai-responses.ts:216-224
             try jw.objectField("reasoning");
             try jw.beginObject();
             try jw.objectField("effort");
@@ -1477,7 +1444,6 @@ fn writeAssistantMessage(
             try jw.objectField("name");
             try jw.write(tcall.name);
             try jw.objectField("arguments");
-            // Stringify the JSON arguments into a string field.
             var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
             var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
@@ -1613,10 +1579,6 @@ fn extractJsonErrorMessage(value: std.json.Value) ?[]const u8 {
     return null;
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 const testing = std.testing;
 
 const TestCollector = struct {
@@ -1735,9 +1697,6 @@ test "processStream maps reasoning summary deltas to a thinking block" {
     var col = TestCollector{ .allocator = testing.allocator };
     defer col.deinit();
 
-    // SSE trace: response.created → reasoning item open → summary part
-    // opened → two text deltas → item done (with encrypted_content) →
-    // response.completed.
     const sse_bytes =
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abc\"}}\n\n" ++
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n" ++
@@ -1752,7 +1711,6 @@ test "processStream maps reasoning summary deltas to a thinking block" {
     try testing.expectEqualStrings("Let me think carefully.", col.thinking.items);
     try testing.expectEqualStrings("resp_abc", col.final_response_id.?);
     try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.stop, col.done_reason.?);
-    // Verify event ordering: start, thinking_start, thinking_delta*, thinking_end, done.
     var saw_thinking_start = false;
     var saw_thinking_end = false;
     for (col.events.items) |e| {
@@ -1810,7 +1768,6 @@ test "processStream concatenates function_call argument chunks and overrides sto
     try testing.expectEqualStrings("call_abc|fc_1", col.final_tool_id);
     try testing.expectEqualStrings("bash", col.final_tool_name);
     try testing.expectEqualStrings("{\"cmd\":\"echo hi\"}", col.tool_args.items);
-    // Stop reason must override to toolUse when tool calls are present.
     try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.toolUse, col.done_reason.?);
 }
 

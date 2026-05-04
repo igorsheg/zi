@@ -872,7 +872,6 @@ fn seedHistoryFromCommittedMessages(editor: EditorInterface, messages: []const a
 }
 
 fn seedHistoryFromMessage(editor: EditorInterface, message: agent_protocol.AgentMessage) void {
-    // Tiny extraction buffer, freed immediately after the history append.
     const text = extractUserMessageText(std.heap.page_allocator, message) orelse return;
     defer text.deinit(std.heap.page_allocator);
     editor.addToHistory(text.slice());
@@ -2230,7 +2229,6 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
     errdefer shared.release();
 
-    // Accept fresh envelope (gen 1, version 1).
     var fresh = conversation_state_mod.ConversationSnapshotEnvelope{
         .session_generation = 1,
         .conversation_version = 1,
@@ -2240,7 +2238,6 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
-    // Reject older version within same generation.
     var stale_version = conversation_state_mod.ConversationSnapshotEnvelope{
         .session_generation = 1,
         .conversation_version = 0,
@@ -2250,7 +2247,6 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
-    // Reject older generation regardless of version.
     var stale_gen = conversation_state_mod.ConversationSnapshotEnvelope{
         .session_generation = 0,
         .conversation_version = 5,
@@ -2260,7 +2256,6 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
-    // Accept newer generation.
     var newer_gen = conversation_state_mod.ConversationSnapshotEnvelope{
         .session_generation = 2,
         .conversation_version = 0,
@@ -2286,7 +2281,6 @@ test "replaceViewSnapshot converges after dropped intermediate snapshot because 
     const shared = try conversation_state_mod.SharedCommitted.fromMessages(testing.allocator, &.{});
     errdefer shared.release();
 
-    // Initial authoritative snapshot (gen 1, version 1).
     var initial = conversation_state_mod.ConversationSnapshotEnvelope{
         .session_generation = 1,
         .conversation_version = 1,
@@ -2296,9 +2290,6 @@ test "replaceViewSnapshot converges after dropped intermediate snapshot because 
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
-    // Simulate a dropped intermediate snapshot (version 2 never arrives).
-    // Instead, version 3 arrives directly — the projection must converge
-    // to the latest authoritative state without needing the missing frame.
     var final = conversation_state_mod.ConversationSnapshotEnvelope{
         .session_generation = 1,
         .conversation_version = 3,

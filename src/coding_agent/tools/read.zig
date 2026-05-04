@@ -77,7 +77,6 @@ fn execute(
         );
     }
 
-    // Stat to disambiguate file vs directory.
     const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, resolved, .{}) catch |err| {
         return util.errorf(allocator, "read tool: {s}: {s}", .{ resolved, @errorName(err) });
     };
@@ -274,7 +273,6 @@ fn readTextFile(
         }
     }
 
-    // Trailing notice if we showed only a window of the file.
     if (end < total_lines) {
         aw.writer.print(
             "\n\n(showing lines {d}-{d} of {d}. use read_range to see more.)",

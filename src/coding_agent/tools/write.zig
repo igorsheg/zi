@@ -63,13 +63,11 @@ fn execute(
         return util.errorResult(allocator, "write tool: failed to acquire file lock");
     defer lock_registry.global().release(lock_entry);
 
-    // Detect new vs overwrite for the result message.
     var is_new = false;
     std.Io.Dir.cwd().access(std.Options.debug_io, resolved, .{}) catch {
         is_new = true;
     };
 
-    // mkdir -p on the parent directory.
     if (std.fs.path.dirname(resolved)) |parent| {
         std.Io.Dir.cwd().createDirPath(std.Options.debug_io, parent) catch |err|
             return util.errorf(allocator, "write tool: failed to create parent dir: {s}", .{@errorName(err)});

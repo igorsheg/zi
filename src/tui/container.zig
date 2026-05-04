@@ -51,7 +51,6 @@ pub const Container = struct {
     pub fn removeChildAt(self: *Container, index: usize) void {
         if (index >= self.children.items.len) return;
         _ = self.children.orderedRemove(index);
-        // Adjust flex/focus indices
         if (self.flex_child_index) |fi| {
             if (fi == index) {
                 self.flex_child_index = null;
@@ -111,8 +110,6 @@ pub const Container = struct {
         return null;
     }
 
-    // ── Component interface ────────────────────────────────────────
-
     pub fn render(self: *Container, region: Region) void {
         const w = region.width;
         const h = region.height;
@@ -120,7 +117,6 @@ pub const Container = struct {
         self.last_render_width = w;
         self.last_render_height = h;
 
-        // Measure fixed children, compute flex child height
         var fixed_total: u32 = 0;
         for (self.children.items, 0..) |child, i| {
             if (self.flex_child_index != null and i == self.flex_child_index.?) continue;
@@ -132,7 +128,6 @@ pub const Container = struct {
         else
             @as(u32, 0);
 
-        // Render children into sub-regions
         var y: u32 = 0;
         for (self.children.items, 0..) |child, i| {
             if (y >= h) break;
@@ -171,12 +166,8 @@ pub const Container = struct {
         if (fi >= self.children.items.len) return null;
         const cs = self.children.items[fi].cursorState() orelse return null;
 
-        // Translate cursor y by the focused child's y-offset in the layout
-        const w: u32 = 0; // Need width for measurement — use 0 as sentinel
+        const w: u32 = 0;
         _ = w;
-        // We need to compute the y-offset of the focused child.
-        // This requires knowing the render width, which we don't have here.
-        // Store it from the last render call.
         return .{
             .x = cs.x,
             .y = cs.y + self.computeChildYOffset(fi),
@@ -260,8 +251,6 @@ pub const Container = struct {
         return Component.init(Container, self);
     }
 
-    // ── Internal ───────────────────────────────────────────────────
-
     /// Compute the y-offset of a child at the given index,
     /// replicating the layout logic from render() using cached dimensions.
     fn computeChildYOffset(self: *const Container, target_idx: usize) u32 {
@@ -290,8 +279,6 @@ pub const Container = struct {
         return y;
     }
 };
-
-// ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
@@ -348,7 +335,6 @@ const AnimatedComp = struct {
         return Component.init(@This(), self);
     }
 };
-
 
 test "Container gives flex child remaining height and reports rendered geometry" {
     var container = Container.init(testing.allocator);
@@ -424,4 +410,3 @@ test "Container delegates input and cursor state to focused child" {
 
     try testing.expectEqualDeep(CursorState{ .x = 4, .y = 3, .style = .bar }, container.cursorState().?);
 }
-

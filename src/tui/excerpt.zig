@@ -33,7 +33,7 @@ pub const WindowResult = struct {
 
 const Range = struct {
     start: u32,
-    end: u32, // inclusive
+    end: u32,
 };
 
 pub fn windowExcerpts(allocator: std.mem.Allocator, total: u32, excerpts: []const Excerpt) !WindowResult {
@@ -69,7 +69,6 @@ pub fn windowExcerpts(allocator: std.mem.Allocator, total: u32, excerpts: []cons
         }
     }.cmp);
 
-    // Merge overlapping/adjacent ranges in-place.
     var merge_len: usize = 1;
     for (ranges[1..]) |r| {
         const last = &ranges[merge_len - 1];
@@ -82,7 +81,6 @@ pub fn windowExcerpts(allocator: std.mem.Allocator, total: u32, excerpts: []cons
     }
     const merged = ranges[0..merge_len];
 
-    // Count items: each range produces a span, gaps between ranges + possible leading/trailing.
     var item_count: usize = merged.len;
     if (merged[0].start > 0) item_count += 1;
     for (merged[0 .. merged.len - 1], merged[1..]) |prev, cur| {
@@ -110,7 +108,6 @@ pub fn windowExcerpts(allocator: std.mem.Allocator, total: u32, excerpts: []cons
 
     return .{ .items = items[0..idx], .allocator = allocator };
 }
-
 
 test "tail excerpt shows last N lines with gap" {
     var result = try windowExcerpts(testing.allocator, 100, &.{
@@ -143,4 +140,3 @@ test "head + tail excerpts with gap" {
     try testing.expectEqual(WindowItem{ .gap = 12 }, result.items[1]);
     try testing.expectEqual(WindowItem{ .span = .{ .start = 15, .end = 20 } }, result.items[2]);
 }
-

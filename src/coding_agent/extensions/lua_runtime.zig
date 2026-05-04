@@ -33,10 +33,6 @@ pub const c = @cImport({
     @cInclude("lualib.h");
 });
 
-// =============================================================================
-// Allocator bridge
-// =============================================================================
-
 /// Header prepended to every block so we can recover the original size on
 /// free / realloc. Lua's `lua_Alloc` contract gives us `osize` only when
 /// `ptr != NULL`; we still need an aligned block, so we over-allocate by
@@ -66,7 +62,6 @@ fn luaAlloc(
     const self: *AllocatorUd = @ptrCast(@alignCast(ud.?));
     const allocator = self.allocator;
 
-    // Recover the previous block (if any) so we can free or copy it.
     const old_total: usize = if (ptr != null) blk: {
         const user_ptr: [*]u8 = @ptrCast(ptr.?);
         const header_ptr: *BlockHeader = @ptrCast(@alignCast(user_ptr - @sizeOf(BlockHeader)));
@@ -78,7 +73,6 @@ fn luaAlloc(
     } else 0;
     _ = osize;
 
-    // Free path.
     if (nsize == 0) {
         if (ptr == null) return null;
         const user_ptr: [*]u8 = @ptrCast(ptr.?);
@@ -89,7 +83,6 @@ fn luaAlloc(
         return null;
     }
 
-    // Alloc / realloc path.
     const new_total = @sizeOf(BlockHeader) + nsize;
     const new_base = allocator.rawAlloc(new_total, header_alignment, @returnAddress()) orelse return null;
     const new_header: *BlockHeader = @ptrCast(@alignCast(new_base));
@@ -108,10 +101,6 @@ fn luaAlloc(
 
     return @ptrCast(new_user);
 }
-
-// =============================================================================
-// LuaState
-// =============================================================================
 
 pub const LuaError = error{
     OutOfMemory,
@@ -215,7 +204,6 @@ pub const LuaState = struct {
         }
         if (buf.items.len == 0) return;
 
-        // package.path = <buf>
         _ = c.lua_getglobal(self.L, "package");
         defer c.lua_pop(self.L, 1);
         if (c.lua_type(self.L, -1) != c.LUA_TTABLE) return;
@@ -234,10 +222,6 @@ pub const LuaState = struct {
         c.lua_setfield(self.L, -2, "path");
     }
 };
-
-// =============================================================================
-// Lua → zig value extraction
-// =============================================================================
 
 pub const ConvertError = error{
     OutOfMemory,
@@ -316,8 +300,6 @@ pub fn luaValueToJson(
     index: c_int,
     allocator: std.mem.Allocator,
 ) ConvertError!std.json.Value {
-    // Normalize negative indices once so recursive calls don't drift
-    // when they push intermediate values onto the stack.
     const abs_idx: c_int = if (index < 0) c.lua_gettop(L) + index + 1 else index;
 
     return switch (c.lua_type(L, abs_idx)) {
@@ -336,9 +318,6 @@ pub fn luaValueToJson(
             break :blk .{ .string = dup };
         },
         c.LUA_TTABLE => luaTableToJson(L, abs_idx, allocator),
-        // Functions, userdata, threads — none are JSON-representable.
-        // Caller should special-case execute=function before reaching
-        // here (it gets stored as a luaL_ref, not a value).
         else => error.UnsupportedLuaType,
     };
 }
@@ -702,9 +681,6 @@ fn luaTableToJson(
 }
 
 fn isSequence(L: *c.lua_State, table_idx: c_int, expected_len: usize) bool {
-    // A Lua "sequence" has exactly the integer keys 1..n with no
-    // gaps. We confirm by counting how many integer keys in 1..n
-    // exist. Cheaper than walking every key for the common case.
     var i: c.lua_Integer = 1;
     while (@as(usize, @intCast(i)) <= expected_len) : (i += 1) {
         const t = c.lua_rawgeti(L, table_idx, i);
@@ -748,7 +724,6 @@ pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
             c.lua_createtable(L, @intCast(arr.items.len), 0);
             for (arr.items, 0..) |item, i| {
                 try pushJsonValue(L, item);
-                // Lua arrays are 1-indexed.
                 c.lua_rawseti(L, -2, @intCast(i + 1));
             }
         },
@@ -777,10 +752,6 @@ pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
 /// Consumers historically imported this from `lua_runtime`; the
 /// re-export preserves their call sites.
 pub const freeJsonValue = @import("../../json/value.zig").freeJsonValue;
-
-// =============================================================================
-// Coroutines
-// =============================================================================
 
 /// A Lua thread (coroutine) pinned via the registry so the GC can't reap
 /// it while zig still needs to resume it. Tied to a parent `LuaState`;
@@ -848,10 +819,6 @@ pub const Coroutine = struct {
     }
 };
 
-// =============================================================================
-// Error helpers
-// =============================================================================
-
 pub fn mapLoadError(L: *c.lua_State, rc: c_int) LuaError {
     consumeErrorMessage(L);
     return switch (rc) {
@@ -883,10 +850,6 @@ fn mapError(L: *c.lua_State, err: LuaError) LuaError {
 fn consumeErrorMessage(L: *c.lua_State) void {
     if (c.lua_gettop(L) > 0) c.lua_pop(L, 1);
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "luaValueToJsonLimited enforces depth item and string budgets" {
     var state = try LuaState.init(std.testing.allocator);
@@ -936,14 +899,11 @@ test "LuaState computes 42 = 40 + 2 in a coroutine" {
     var state = try LuaState.init(std.testing.allocator);
     defer state.deinit();
 
-    // Define a global function `add` so the coroutine has something to call.
     try state.doString("function add(a, b) return a + b end", "test");
 
     var co = try Coroutine.init(&state);
     defer co.deinit();
 
-    // Push the function and its two arguments onto the coroutine's stack,
-    // not the parent's. Lua looks up `add` from the shared globals table.
     _ = c.lua_getglobal(co.L, "add");
     c.lua_pushinteger(co.L, 40);
     c.lua_pushinteger(co.L, 2);
@@ -954,26 +914,14 @@ test "LuaState computes 42 = 40 + 2 in a coroutine" {
     try std.testing.expectEqual(@as(c.lua_Integer, 42), c.lua_tointegerx(co.L, -1, null));
 }
 
-// --- yield-with-continuation smoke test ----------------------------------
-//
-// We register a tiny C host function `yield_one` that uses `lua_yieldk`
-// with a continuation. The continuation reads the value zig pushes on
-// resume and returns it as the function's result. This proves the
-// `lua_yieldk` plumbing actually suspends across the C boundary and
-// surfaces zig-supplied values back to Lua, which is the exact pattern
-// real `zi.spawn` and `ctx.ui.*` host functions will use in Phase D.
-
 fn yieldOneContinue(L: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) callconv(.c) c_int {
     _ = status;
     _ = ctx;
-    // Whatever zig passes to `lua_resume` is on top of L's stack now.
-    // Return it as `yield_one`'s single result.
     _ = L;
     return 1;
 }
 
 fn yieldOne(L: ?*c.lua_State) callconv(.c) c_int {
-    // Yield zero values; we expect to be resumed with exactly one.
     return c.lua_yieldk(L, 0, 0, yieldOneContinue);
 }
 
@@ -981,7 +929,6 @@ test "Coroutine suspends via lua_yieldk and resumes with a value" {
     var state = try LuaState.init(std.testing.allocator);
     defer state.deinit();
 
-    // Expose `yield_one` as a global so the coroutine body can call it.
     c.lua_pushcfunction(state.L, yieldOne);
     c.lua_setglobal(state.L, "yield_one");
 
@@ -999,7 +946,6 @@ test "Coroutine suspends via lua_yieldk and resumes with a value" {
     const first = try co.resumeWith(0);
     try std.testing.expectEqual(Coroutine.Status.yielded, first.status);
 
-    // Push the value the continuation will hand back to Lua, then resume.
     c.lua_pushinteger(co.L, 7);
     const second = try co.resumeWith(1);
     try std.testing.expectEqual(Coroutine.Status.finished, second.status);

@@ -48,7 +48,6 @@ pub const OAuthProvider = struct {
     refresh_token: *const fn (allocator: std.mem.Allocator, credential: auth_types.OAuthCredential) ExchangeResult,
 };
 
-/// State carried through a single login flow.
 pub const FlowContext = struct {
     verifier: []const u8,
     challenge: []const u8,
@@ -68,11 +67,8 @@ pub const ExchangeResult = union(enum) {
     err: []const u8,
 };
 
-/// Callbacks from login flow to UI.
 pub const LoginCallbacks = struct {
-    /// Called with authorization URL. UI should open browser + display URL.
     on_auth: *const fn (url: []const u8, ctx: ?*anyopaque) void,
-    /// Called with progress messages.
     on_progress: ?*const fn (msg: []const u8, ctx: ?*anyopaque) void = null,
     ctx: ?*anyopaque = null,
 };
@@ -83,16 +79,6 @@ pub const LoginResult = union(enum) {
     err: []const u8,
 };
 
-/// Run the full PKCE login flow for a provider.
-/// Blocks until complete — run on a worker thread.
-///
-/// Flow:
-/// 1. Generate PKCE verifier + challenge
-/// 2. Build authorization URL (provider-specific)
-/// 3. Notify UI (on_auth callback)
-/// 4. Start callback server, wait for redirect
-/// 5. Exchange authorization code for tokens (provider-specific)
-/// 6. Return credentials
 pub fn login(
     allocator: std.mem.Allocator,
     provider: OAuthProvider,
@@ -160,8 +146,6 @@ pub fn login(
     }
 }
 
-// ── Built-in providers + dynamic claim-backed registry ───────────────────
-
 pub const ProviderListEntry = struct {
     id: []const u8,
     name: []const u8,
@@ -206,7 +190,6 @@ const DynamicOAuthProvider = struct {
 var dynamic_provider_mutex: std.Io.Mutex = .init;
 var dynamic_providers: std.ArrayListUnmanaged(DynamicOAuthProvider) = .empty;
 
-// ── Anthropic (Claude Pro/Max) ──────────────────────────────────────────
 // pi-mono source: packages/ai/src/utils/oauth/anthropic.ts
 
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -261,7 +244,6 @@ fn anthropicRefreshToken(allocator: std.mem.Allocator, credential: auth_types.OA
     });
 }
 
-// ── OpenAI Codex (ChatGPT subscription) ─────────────────────────────────
 // pi-mono source: packages/ai/src/utils/oauth/openai-codex.ts
 
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -547,8 +529,6 @@ pub fn resetDynamicProvidersForTest() void {
     dynamic_providers = .empty;
 }
 
-// ── Shared token exchange (JSON POST) ───────────────────────────────────
-
 const JsonField = struct {
     key: []const u8,
     value: []const u8,
@@ -646,8 +626,6 @@ fn doTokenExchange(
     } };
 }
 
-/// Percent-encode a string into an ArrayList, encoding all non-unreserved chars.
-/// RFC 3986 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~"
 fn percentEncodeInto(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), input: []const u8) !void {
     for (input) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~') {

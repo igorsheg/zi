@@ -118,8 +118,6 @@ pub const OpenAICompletionsProvider = struct {
 
     fn deinitImpl(_: *anyopaque) void {}
 
-    // ── HTTP outer shell ─────────────────────────────────────────
-
     fn streamImpl(
         self: *OpenAICompletionsProvider,
         allocator: std.mem.Allocator,
@@ -132,7 +130,6 @@ pub const OpenAICompletionsProvider = struct {
     ) void {
         _ = self;
 
-        // Build payload.
         var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer payload_buf.deinit(allocator);
         buildRequestJson(allocator, &payload_buf, model, context, reasoning) catch |err| {
@@ -168,8 +165,6 @@ pub const OpenAICompletionsProvider = struct {
         var client: std.http.Client = .{ .allocator = allocator, .io = options.io };
         defer client.deinit();
 
-        // Bearer token in Authorization header. Stack buffer for
-        // formatting; api keys are well under 4KB.
         var auth_buf: [4096]u8 = undefined;
         const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
             emitError(allocator, callback, callback_ctx, model, "API key too long for auth buffer", .{});
@@ -181,8 +176,6 @@ pub const OpenAICompletionsProvider = struct {
         extra_headers_buf[n_extra] = .{ .name = "authorization", .value = auth_value };
         n_extra += 1;
 
-        // Caller-supplied extra headers (per-request) win over none;
-        // model.headers (catalog default) gets layered first.
         if (model.headers) |mh| {
             for (mh) |h| {
                 if (n_extra >= extra_headers_buf.len) break;
@@ -256,8 +249,6 @@ pub const OpenAICompletionsProvider = struct {
     }
 };
 
-// ── pure SSE processor ──────────────────────────────────────────────
-
 /// Drain a Reader of OpenAI chat/completions SSE bytes, emit
 /// `AssistantMessageEvent`s. Pure: no HTTP, no allocator escape, no
 /// global state. Tested in isolation via `std.io.fixedBufferStream`
@@ -272,8 +263,6 @@ pub fn processStream(
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
 ) void {
-    // Per-stream scratch arena for partial-JSON reparses on every
-    // tool-call delta. Reset between deltas to keep peak usage flat.
     var scratch_arena = std.heap.ArenaAllocator.init(allocator);
     defer scratch_arena.deinit();
 
@@ -321,8 +310,6 @@ pub fn processStream(
         }
     };
 
-    // Finalize any open block, materialize content into the partial
-    // message, emit terminal event.
     finishCurrentBlock(allocator, &state, callback, callback_ctx) catch {};
     state.partial.content = buildFinalContent(allocator, state.content_blocks.items) catch &.{};
 
@@ -341,8 +328,6 @@ pub fn processStream(
     }
 }
 
-// ── stream state ────────────────────────────────────────────────────
-
 const BlockKind = enum { text, thinking, tool_call };
 
 const ContentBlockState = struct {
@@ -351,7 +336,6 @@ const ContentBlockState = struct {
     /// (the partial JSON lives in `tool_args_partial`).
     text_buf: std.ArrayListUnmanaged(u8) = .empty,
 
-    // tool_call only
     tool_id: []const u8 = "",
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
@@ -417,8 +401,6 @@ const StreamState = struct {
     }
 };
 
-// ── SSE event handler ───────────────────────────────────────────────
-
 const HandleErr = error{OutOfMemory};
 
 fn handleSseEvent(
@@ -429,7 +411,6 @@ fn handleSseEvent(
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
 ) HandleErr!void {
-    // OpenAI uses `data: [DONE]` as a terminator with no event type.
     if (std.mem.eql(u8, evt.data, "[DONE]")) return;
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, evt.data, .{}) catch return;
@@ -437,8 +418,6 @@ fn handleSseEvent(
     const root = parsed.value;
     if (root != .object) return;
 
-    // Capture response id from chunk.id (every chunk carries the
-    // same id; we set on first non-empty).
     if (state.response_id == null) {
         if (root.object.get("id")) |id_val| {
             if (id_val == .string and id_val.string.len > 0) {
@@ -448,7 +427,6 @@ fn handleSseEvent(
         }
     }
 
-    // Top-level usage (preferred location).
     if (root.object.get("usage")) |usage_val| {
         if (usage_val == .object) parseUsage(usage_val, &state.partial);
     }
@@ -465,15 +443,12 @@ fn handleSseEvent(
     const choice = choices_val.array.items[0];
     if (choice != .object) return;
 
-    // Some providers (Moonshot) put usage on choice.usage.
     if (state.partial.usage.input == 0 and state.partial.usage.output == 0) {
         if (choice.object.get("usage")) |cu| {
             if (cu == .object) parseUsage(cu, &state.partial);
         }
     }
 
-    // finish_reason → stop_reason. Set as we see it; the terminal
-    // event happens after the loop.
     if (choice.object.get("finish_reason")) |fr| {
         if (fr == .string) {
             state.partial.stop_reason = mapFinishReason(fr.string);
@@ -487,7 +462,6 @@ fn handleSseEvent(
     const delta = choice.object.get("delta") orelse return;
     if (delta != .object) return;
 
-    // 1. text content.
     if (delta.object.get("content")) |c| {
         if (c == .string and c.string.len > 0) {
             try ensureBlock(allocator, state, .text, callback, callback_ctx);
@@ -502,8 +476,6 @@ fn handleSseEvent(
         }
     }
 
-    // 2. reasoning content. pi-mono walks `reasoning_content`,
-    //    `reasoning`, `reasoning_text` and uses the first non-empty.
     const reasoning_fields = [_][]const u8{ "reasoning_content", "reasoning", "reasoning_text" };
     var reasoning_field: ?[]const u8 = null;
     var reasoning_delta: []const u8 = "";
@@ -528,10 +500,6 @@ fn handleSseEvent(
         } }, callback_ctx);
     }
 
-    // 3. tool_calls. Each entry has an optional `id`, `function.name`,
-    //    `function.arguments`. Arguments come as concatenated string
-    //    chunks; we accumulate then re-parse on each delta so the
-    //    partial message reflects in-progress tool call args.
     if (delta.object.get("tool_calls")) |tcs_val| {
         if (tcs_val == .array) {
             for (tcs_val.array.items) |tc| {
@@ -541,9 +509,6 @@ fn handleSseEvent(
         }
     }
 
-    // 4. reasoning_details (openrouter encrypted thought sigs for
-    //    a specific tool call id). Attach the JSON-stringified detail
-    //    to the matching tool_call's thought_signature.
     if (delta.object.get("reasoning_details")) |rd| {
         if (rd == .array) {
             for (rd.array.items) |detail| {
@@ -575,11 +540,6 @@ fn handleToolCallDelta(
     else
         null;
 
-    // Decide whether this delta belongs to the current block or
-    // starts a new one. New tool call when:
-    //  - no current block, or
-    //  - current block is not a tool_call, or
-    //  - delta carries an id that differs from current.
     const start_new = blk: {
         const cur = state.current_index orelse break :blk true;
         const blk_state = &state.content_blocks.items[cur];
@@ -616,10 +576,6 @@ fn handleToolCallDelta(
                 if (av == .string) {
                     delta_str = av.string;
                     try blk_state.tool_args_partial.appendSlice(allocator, av.string);
-                    // Re-parse the partial json into the scratch
-                    // arena. parseStreaming returns `{}` on
-                    // unparseable input which is fine — that's the
-                    // pi-mono semantics for an in-flight tool call.
                     _ = scratch.reset(.retain_capacity);
                     const sa = scratch.allocator();
                     blk_state.tool_args_parsed = partial_json.parseStreaming(
@@ -691,8 +647,6 @@ fn finishCurrentBlock(
             } }, callback_ctx);
         },
         .tool_call => {
-            // Final reparse via the caller's allocator so the value
-            // outlives the per-delta scratch arena.
             const final_args = partial_json.parseStreaming(
                 allocator,
                 blk_state.tool_args_partial.items,
@@ -764,7 +718,6 @@ fn attachThoughtSignature(
     for (state.content_blocks.items) |*b| {
         if (b.kind != .tool_call) continue;
         if (!std.mem.eql(u8, b.tool_id, tool_id)) continue;
-        // Stringify the detail object via std.json.Stringify.
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
@@ -801,8 +754,6 @@ fn parseUsage(usage: std.json.Value, partial: *protocol.AssistantMessage) void {
     partial.usage.cache_read = cache_read;
     partial.usage.cache_write = 0;
     partial.usage.total_tokens = non_cached_input + total_output + cache_read;
-    // Cost is left zero in phase 3a; the agent loop computes it
-    // separately via models.calculateCost when it cares.
 }
 
 fn jsonU64(v: std.json.Value) u64 {
@@ -880,8 +831,6 @@ fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: std.json.Va
         },
     };
 }
-
-// ── payload builder ─────────────────────────────────────────────────
 
 /// Map a pi-ai thinking-level string through an optional provider-specific
 /// effort map. Falls through to the original string when the map is null or
@@ -1035,8 +984,6 @@ fn writeMessages(allocator: std.mem.Allocator, jw: *std.json.Stringify, model: p
                                     try jw.objectField("image_url");
                                     try jw.beginObject();
                                     try jw.objectField("url");
-                                    // Tiny helper allocation, freed before the field closes.
-                                    // data:<mime>;base64,<data>
                                     const data_url = try std.fmt.allocPrint(
                                         allocator,
                                         "data:{s};base64,{s}",
@@ -1064,8 +1011,6 @@ fn writeMessages(allocator: std.mem.Allocator, jw: *std.json.Stringify, model: p
                 try jw.objectField("tool_call_id");
                 try jw.write(tr.tool_call_id);
                 try jw.objectField("content");
-                // Concatenate text content blocks. Tiny scratch buffer,
-                // freed before return.
                 var concat: std.ArrayListUnmanaged(u8) = .empty;
                 defer concat.deinit(allocator);
                 for (tr.content) |cb| {
@@ -1091,9 +1036,6 @@ fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, 
     try jw.objectField("role");
     try jw.write("assistant");
 
-    // Concatenate non-empty text blocks. pi-mono uses
-    // join("") which is just byte concatenation. Tiny scratch buffer,
-    // freed before return.
     var text_concat: std.ArrayListUnmanaged(u8) = .empty;
     defer text_concat.deinit(allocator);
     for (a.content) |b| {
@@ -1110,7 +1052,6 @@ fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, 
         has_content = true;
     }
 
-    // Tool calls.
     var tool_count: usize = 0;
     for (a.content) |b| if (b == .tool_call) {
         tool_count += 1;
@@ -1131,8 +1072,6 @@ fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, 
             try jw.objectField("name");
             try jw.write(tc.name);
             try jw.objectField("arguments");
-            // Stringify the JSON value as a string field. Tiny scratch
-            // buffer, freed before return.
             var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
             var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
@@ -1146,14 +1085,11 @@ fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, 
     }
 
     if (!has_content) {
-        // Empty assistant — emit content: "" so the API doesn't reject.
         try jw.objectField("content");
         try jw.write("");
     }
     try jw.endObject();
 }
-
-// ── error helper ────────────────────────────────────────────────────
 
 fn emitError(
     allocator: std.mem.Allocator,
@@ -1195,8 +1131,6 @@ fn emitFailure(
     };
     callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
 }
-
-// ── tests ───────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -1279,7 +1213,6 @@ test "processStream emits text_delta then done for a simple text response" {
     var col = TestCollector{ .allocator = testing.allocator };
     defer col.deinit();
 
-    // Synthetic SSE following pi-mono's openai-codex-stream test pattern.
     const sse_bytes =
         "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n" ++
         "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n" ++
@@ -1289,13 +1222,11 @@ test "processStream emits text_delta then done for a simple text response" {
 
     runProcess(alloc, sse_bytes, &col);
 
-    // Required event ordering: start, text_start, text_delta, text_delta, text_end, done.
     try testing.expect(col.events.items.len >= 6);
     try testing.expectEqual(TestCollector.EventKind.start, col.events.items[0]);
     try testing.expectEqual(TestCollector.EventKind.text_start, col.events.items[1]);
     try testing.expectEqual(TestCollector.EventKind.text_delta, col.events.items[2]);
     try testing.expectEqual(TestCollector.EventKind.text_delta, col.events.items[3]);
-    // text_end comes from the finalize-on-stream-end path
     try testing.expectEqual(TestCollector.EventKind.text_end, col.events.items[col.events.items.len - 2]);
     try testing.expectEqual(TestCollector.EventKind.done, col.events.items[col.events.items.len - 1]);
     try testing.expectEqualStrings("Hello world", col.text.items);
@@ -1309,8 +1240,6 @@ test "processStream concatenates split tool-call argument chunks" {
     var col = TestCollector{ .allocator = testing.allocator };
     defer col.deinit();
 
-    // Tool call streaming: id arrives once, then arguments split across
-    // three chunks. Final finish_reason: tool_calls.
     const sse_bytes =
         "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"\"}}]}}]}\n\n" ++
         "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"echo hi\"}}]}}]}\n\n" ++
@@ -1320,7 +1249,6 @@ test "processStream concatenates split tool-call argument chunks" {
 
     runProcess(alloc, sse_bytes, &col);
 
-    // Find toolcall_end event
     var saw_end = false;
     for (col.events.items) |e| {
         if (e == .toolcall_end) saw_end = true;
@@ -1328,7 +1256,6 @@ test "processStream concatenates split tool-call argument chunks" {
     try testing.expect(saw_end);
     try testing.expectEqualStrings("t1", col.final_tool_id);
     try testing.expectEqualStrings("bash", col.final_tool_name);
-    // Concatenated arguments delta should be the full json string.
     try testing.expectEqualStrings("{\"cmd\":\"echo hi\"}", col.final_args.items);
 }
 
@@ -1387,8 +1314,6 @@ test "buildRequestJson emits stream:true and message round-trip" {
     defer out.deinit(alloc);
     try buildRequestJson(alloc, &out, test_model, ctx, null);
 
-    // Spot-check key fields. Full schema validation lives in the
-    // smoke test against a real openrouter response.
     try testing.expect(std.mem.indexOf(u8, out.items, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"role\":\"system\"") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"role\":\"user\"") != null);

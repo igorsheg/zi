@@ -146,7 +146,6 @@ pub fn parseKey(data: []const u8, kitty_active: bool) ?ParseResult {
         return .{ .key = .{ .code = .char, .char = ch, .ctrl = true }, .len = 1 };
     }
 
-    // regular printable or UTF-8 character
     if (data[0] >= 0x20) return parseUtf8Char(data);
 
     return null;
@@ -162,7 +161,6 @@ pub fn parseInput(data: []const u8, kitty_active: bool) ?InputEvent {
         if (parseSgrMouse(data)) |m| return .{ .mouse = m };
     }
 
-    // Fall back to key parsing
     if (parseKey(data, kitty_active)) |k| return .{ .key = k };
 
     return null;
@@ -206,10 +204,8 @@ fn parseSs3(data: []const u8) ?ParseResult {
 
 /// Parse CSI sequences: \x1b[ ...
 fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
-    // minimum: \x1b[X (3 bytes)
     if (data.len < 3) return .{ .key = .{ .code = .escape }, .len = 1 };
 
-    // find the terminating byte (letter or ~ or u)
     var i: usize = 2;
     while (i < data.len) : (i += 1) {
         const c = data[i];
@@ -223,7 +219,6 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
     const seq_len = i + 1;
     const params_slice = data[2..i];
 
-    // simple arrow/home/end with no params
     if (params_slice.len == 0) {
         const key: ?KeyCode = switch (terminator) {
             'A' => .up,
@@ -237,7 +232,6 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
         if (key) |k| return .{ .key = .{ .code = k }, .len = seq_len };
     }
 
-    // parse semicolon-separated numeric params (with colon sub-params)
     var params: [4]u16 = .{ 0, 0, 0, 0 };
     var param_count: usize = 0;
     {
@@ -406,10 +400,8 @@ fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
 /// Format: \"<codepoint>;<modifier>:<event>\" — event type is after the
 /// LAST colon in the second (modifier) param. Returns 0 if absent.
 fn extractEventType(params_slice: []const u8) u8 {
-    // Find the semicolon separating codepoint from modifier
     const semi = std.mem.indexOfScalar(u8, params_slice, ';') orelse return 0;
     const mod_part = params_slice[semi + 1 ..];
-    // Find the colon separating modifier value from event type
     const colon = std.mem.indexOfScalar(u8, mod_part, ':') orelse return 0;
     const event_str = mod_part[colon + 1 ..];
     if (event_str.len == 0) return 0;
@@ -430,13 +422,11 @@ fn parseNum(s: []const u8) u16 {
 
 /// Parse SGR mouse sequence: ESC[<button;x;yM or ESC[<button;x;ym
 fn parseSgrMouse(data: []const u8) ?MouseResult {
-    // ESC[< already confirmed by caller
-    // Find terminator M (press) or m (release)
     var i: usize = 3;
     while (i < data.len) : (i += 1) {
         if (data[i] == 'M' or data[i] == 'm') break;
     }
-    if (i >= data.len) return null; // incomplete
+    if (i >= data.len) return null;
 
     const is_release = data[i] == 'm';
     const seq_len = i + 1;
@@ -459,16 +449,15 @@ fn parseSgrMouse(data: []const u8) ?MouseResult {
         nums[num_idx] = parseNum(params[start..]);
         num_idx += 1;
     }
-    if (num_idx < 3) return null; // need all 3 params
+    if (num_idx < 3) return null;
 
     const button_code = nums[0];
-    const x = if (nums[1] > 0) nums[1] - 1 else 0; // 1-based to 0-based
+    const x = if (nums[1] > 0) nums[1] - 1 else 0;
     const y = if (nums[2] > 0) nums[2] - 1 else 0;
 
     const is_scroll = (button_code & 64) != 0;
     const is_motion = (button_code & 32) != 0;
 
-    // Decode modifiers from button code
     const ctrl = (button_code & 16) != 0;
     const alt_mod = (button_code & 8) != 0;
     const shift_mod = (button_code & 4) != 0;
@@ -517,8 +506,6 @@ fn parseUtf8Char(data: []const u8) ?ParseResult {
         .len = len,
     };
 }
-
-// --- tests ---
 
 test "parseKeySpec normalizes modifiers and named keys" {
     try std.testing.expect(Key.eql(try parseKeySpec("ctrl+f"), .{ .code = .char, .char = 'f', .ctrl = true }));
@@ -587,8 +574,8 @@ test "kitty CSI-u parses codepoints, modifiers, special keys, and releases" {
     try std.testing.expectEqual(KeyCode.enter, shift_enter.key.code);
     try std.testing.expect(shift_enter.key.shift);
 
-    try std.testing.expectEqual(KeyCode.left, parseKey("\x1b[57417u", true).?.key.code); // KP_LEFT
-    try std.testing.expect(parseKey("\x1b[97;1:3u", true) == null); // release event
+    try std.testing.expectEqual(KeyCode.left, parseKey("\x1b[57417u", true).?.key.code);
+    try std.testing.expect(parseKey("\x1b[97;1:3u", true) == null);
 }
 
 test "parseKey handles multi-byte UTF-8 characters" {

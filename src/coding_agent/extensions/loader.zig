@@ -211,7 +211,6 @@ fn scanDirectory(
                 try addExtension(allocator, id, full_path, root, results, seen);
             },
             .directory => {
-                // Check for <dir>/init.lua
                 const init_path = try std.fs.path.join(allocator, &.{ full_path, "init.lua" });
                 defer allocator.free(init_path);
 
@@ -257,8 +256,6 @@ fn addExtension(
     });
 }
 
-// ── Factory execution ───────────────────────────────────────────────
-//
 // v1 model matches the spec: an extension chunk returns a factory
 // function and the host calls `factory(zi)` against the shared Lua
 // state. Extensions are NOT sandboxed — they share one state — but
@@ -403,8 +400,6 @@ fn loadOne(
     };
     runner.setModuleContext(state, ext.provenance);
 
-    // Step 1: execute the chunk itself. Spec-shaped extensions return
-    // a factory function from top level.
     try state.loadChunk(src, chunk_name);
     const chunk_call_rc = lua_runtime.c.lua_pcallk(state.L, 0, 1, 0, 0, null);
     if (chunk_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, chunk_call_rc);
@@ -414,7 +409,6 @@ fn loadOne(
         return error.ExtensionFactoryExpectedFunction;
     }
 
-    // Step 2: call the returned factory with the shared `zi` table.
     _ = lua_runtime.c.lua_getglobal(state.L, "zi");
     if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TTABLE) {
         lua_runtime.c.lua_pop(state.L, 2);
@@ -436,8 +430,6 @@ fn sourceKindString(source: ExtensionSource) []const u8 {
         .builtin => "builtin",
     };
 }
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 const api = @import("api.zig");
 const dispatch_mod = @import("dispatch.zig");
@@ -676,7 +668,6 @@ test "shared lua root resolves before later root in canonical order" {
     defer runner.deinit();
     runner.attachLuaState(&state);
 
-    // Prime shared lua paths so the extension can resolve shared modules.
     const shared_path = try std.fs.path.join(allocator, &.{ tmp_path, "lua" });
     defer allocator.free(shared_path);
     var shared_buf: std.ArrayList(u8) = .empty;
@@ -736,7 +727,6 @@ test "event handler dispatch inherits extension module context for require" {
     const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
 
-    // Build a payload table on the main stack: { name = "ping" }
     lua_runtime.c.lua_createtable(state.L, 0, 1);
     _ = lua_runtime.c.lua_pushlstring(state.L, "ping", 4);
     lua_runtime.c.lua_setfield(state.L, -2, "name");
@@ -869,11 +859,9 @@ test "user extension wins precedence over builtin with same name" {
     api.installZiTable(&state, &runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 
-    // Load user extension first
     const user_stats = loadAll(allocator, &state, &runner, exts, builtin_defs);
     try std.testing.expectEqual(@as(u32, 1), user_stats.loaded);
 
-    // Load builtin extension after user
     const builtin_ext = LoadedExtension{
         .id = try allocator.dupe(u8, "builtins"),
         .path = try allocator.dupe(u8, "<builtin>"),
@@ -898,7 +886,6 @@ test "user extension wins precedence over builtin with same name" {
     try std.testing.expectEqual(@as(u32, 1), builtin_stats.loaded);
     try std.testing.expectEqual(@as(u32, 0), builtin_stats.failed);
 
-    // User version should win (first-registered-wins)
     const tool = runner.tool_registry.get("bash").?;
     try std.testing.expectEqualStrings("user", tool.source.kind);
 }

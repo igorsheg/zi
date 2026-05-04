@@ -78,54 +78,38 @@ pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.Extensio
     const L = state.L;
     c.lua_createtable(L, 0, 11);
 
-    // zi.register_tool
     state.pushCClosureWithUserdata(tool_api.ziRegisterTool, runner);
     c.lua_setfield(L, -2, "register_tool");
 
-    // zi.register_command
     state.pushCClosureWithUserdata(command_api.ziRegisterCommand, runner);
     c.lua_setfield(L, -2, "register_command");
 
-    // zi.register_keybinding
     state.pushCClosureWithUserdata(keybinding_api.ziRegisterKeybinding, runner);
     c.lua_setfield(L, -2, "register_keybinding");
 
-    // zi.register_provider
     state.pushCClosureWithUserdata(provider_api.ziRegisterProvider, runner);
     c.lua_setfield(L, -2, "register_provider");
 
-    // zi.unregister_provider
     state.pushCClosureWithUserdata(provider_api.ziUnregisterProvider, runner);
     c.lua_setfield(L, -2, "unregister_provider");
 
-    // host-private builtin bridge. builtin extension chunks may call
-    // this while their load context is active; user extensions may not.
     state.pushCClosureWithUserdata(ziRegisterBuiltinTools, runner);
     c.lua_setfield(L, -2, "__register_builtin_tools");
 
-    // zi.on
     state.pushCClosureWithUserdata(event_api.ziOn, runner);
     c.lua_setfield(L, -2, "on");
 
-    // zi.spawn
     state.pushCClosureWithUserdata(spawn_api.ziSpawn, runner);
     c.lua_setfield(L, -2, "spawn");
 
-    // zi.system
     state.pushCClosureWithUserdata(system_api.ziSystem, runner);
     c.lua_setfield(L, -2, "system");
 
-    // zi.job
     job_api.install(state, runner);
     c.lua_setfield(L, -2, "job");
 
-    // Install as a global named "zi".
     c.lua_setglobal(L, "zi");
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// zi.register_tool
-// ─────────────────────────────────────────────────────────────────────────
 
 fn ziRegisterBuiltinTools(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
@@ -165,10 +149,6 @@ fn pushStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void
     c.lua_setfield(L, -2, field.ptr);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// zi.spawn
-// ─────────────────────────────────────────────────────────────────────────
-//
 // `zi.spawn(opts)` runs a child `zi` process in `--mode json -p` and
 // blocks until it exits. Per-event observer callbacks fire
 // synchronously inside the parent's stdout read loop. The result is
@@ -229,10 +209,6 @@ fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
     return ptr[0..len];
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────
-
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
     const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
     return @ptrCast(@alignCast(ud.?));
@@ -270,10 +246,6 @@ fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
     _ = c.lua_error(L);
     return 0;
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 const testing = std.testing;
 
@@ -793,10 +765,6 @@ test "zi.register_tool registers a Lua-defined tool end-to-end" {
 
     installZiTable(&state, &runner);
 
-    // Run an extension that registers a single tool. Note we call
-    // the factory inline rather than going through a `return
-    // function(zi) ... end` wrapper — that wrapper is the loader's
-    // job (C2/C3 era), not E1's.
     try state.doString(
         \\zi.register_tool({
         \\  name = "finder",
@@ -825,8 +793,6 @@ test "zi.register_tool registers a Lua-defined tool end-to-end" {
     try testing.expectEqual(@as(usize, 2), tool.prompt_guidelines.len);
     try testing.expectEqualStrings("prefer over chained grep", tool.prompt_guidelines[0]);
 
-    // The schema must be deep-copied: even after we explicitly
-    // garbage-collect Lua, the registry's std.json.Value is intact.
     _ = c.lua_gc(state.L, c.LUA_GCCOLLECT, @as(c_int, 0));
 
     try testing.expect(tool.parameters == .object);
@@ -835,7 +801,6 @@ test "zi.register_tool registers a Lua-defined tool end-to-end" {
     try testing.expectEqualStrings("string", query_schema.get("type").?.string);
     try testing.expectEqualStrings("the search query", query_schema.get("description").?.string);
 
-    // The required array round-tripped as a JSON array of strings.
     const required = tool.parameters.object.get("required").?.array;
     try testing.expectEqual(@as(usize, 1), required.items.len);
     try testing.expectEqualStrings("query", required.items[0].string);
@@ -912,7 +877,6 @@ test "zi.on subscribes a Lua handler to the right event chain" {
         \\zi.on("tool_call", function(event, ctx) end)
     , "test_subscribe");
 
-    // message_end has 1 handler, tool_call has 2, total 3.
     try testing.expectEqual(@as(usize, 3), runner.event_registry.count());
 
     const tc = runner.event_registry.handlers(.tool_call);
@@ -971,11 +935,6 @@ test "zi.spawn validates required task and callback shapes" {
 }
 
 test "zi.spawn end-to-end: dispatches per-event callbacks via argv_override" {
-    // The Lua surface doesn't expose argv_override (test-only zig
-    // field). To exercise the trampoline + result table without a
-    // real model, we register a CFunction that runs ziSpawn directly
-    // with a canned `sh -c` script. The Lua side observes the result
-    // table and counts callbacks via a closure-captured upvalue.
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -984,21 +943,11 @@ test "zi.spawn end-to-end: dispatches per-event callbacks via argv_override" {
 
     installZiTable(&state, &runner);
 
-    // Helper: run ziSpawn directly so we can pass argv_override.
-    // We can't go through zi.spawn (no Lua override) but we CAN
-    // verify the trampoline by reusing it. Build cfg in zig and
-    // call ziSpawn, then poke the result back into Lua manually.
-    // For an end-to-end Lua test we instead push a custom global
-    // that wraps spawn_mod.ziSpawn with the override baked in.
-
     const Helper = struct {
         fn run(L_opt: ?*c.lua_State) callconv(.c) c_int {
             const L = L_opt.?;
-            // Pull the message_end callback from the first arg (a function).
             if (c.lua_type(L, 1) != c.LUA_TFUNCTION) return luaError(L, "expected fn");
 
-            // Capture as ref so the trampoline can find it via a one-key table.
-            // Build the same shape as ziSpawn would: a callbacks table.
             c.lua_createtable(L, 0, 1);
             c.lua_pushvalue(L, 1);
             c.lua_setfield(L, -2, "message_end");
@@ -1060,8 +1009,6 @@ test "zi.register_tool surfaces validation errors as Lua errors" {
 
     installZiTable(&state, &runner);
 
-    // Missing 'execute' field — should raise a Lua error which we
-    // catch via pcall and confirm the message contains "execute".
     try state.doString(
         \\local ok, err = pcall(function()
         \\  zi.register_tool({

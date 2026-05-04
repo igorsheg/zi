@@ -133,8 +133,6 @@ pub fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     }
 }
 
-// ── process-global singleton ───────────────────────────────────────
-
 // Process-lifetime singleton backing store; this registry is intentionally
 // immortal and matches the module-level map shape in pi-mono.
 var g_registry: Registry = .{ .gpa = std.heap.page_allocator };
@@ -144,8 +142,6 @@ var g_registry: Registry = .{ .gpa = std.heap.page_allocator };
 pub fn global() *Registry {
     return &g_registry;
 }
-
-// ── tests ──────────────────────────────────────────────────────────
 
 test "canonicalizePath resolves missing paths to absolute stable keys" {
     const testing = std.testing;
@@ -177,8 +173,6 @@ test "acquireKey serializes duplicate keys across threads" {
     var reg: Registry = .{ .gpa = testing.allocator };
     defer reg.deinit();
 
-    // Shared counter guarded only by the lock — if serialization
-    // works, max observed value stays ≤ 1.
     var in_critical: std.atomic.Value(i32) = .init(0);
     var max_seen: std.atomic.Value(i32) = .init(0);
 
@@ -193,7 +187,7 @@ test "acquireKey serializes duplicate keys across threads" {
                         prev = new_prev;
                     } else break;
                 }
-                std.Options.debug_io.sleep(.fromNanoseconds(@intCast(10_000)), .awake) catch {}; // 10us
+                std.Options.debug_io.sleep(.fromNanoseconds(@intCast(10_000)), .awake) catch {};
                 _ = ic.fetchSub(1, .acq_rel);
                 r.release(e);
             }
@@ -218,7 +212,6 @@ test "acquireKey permits distinct keys to be held simultaneously" {
 
     const a = try reg.acquireKey("key-a");
     const b = try reg.acquireKey("key-b");
-    // Both held simultaneously — if they mapped to the same entry this would deadlock.
     reg.release(b);
     reg.release(a);
     try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());

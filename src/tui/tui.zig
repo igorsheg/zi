@@ -58,8 +58,6 @@ pub const TUI = struct {
         self.terminal.deinit();
     }
 
-    // ── Focus ─────────────────────────────────────────────────────
-
     /// Set the focused component. Notifies old and new components via setFocused().
     /// Matches pi-mono TUI.setFocus().
     pub fn setFocus(self: *TUI, target: ?Component) void {
@@ -71,8 +69,6 @@ pub const TUI = struct {
     pub fn handleInput(self: *TUI, key: Key) bool {
         return self.focus.handleInput(key);
     }
-
-    // ── Overlays ──────────────────────────────────────────────────
 
     /// Show an overlay component. Saves current focus, sets focus to the overlay
     /// (unless non_capturing), returns a handle for controlling it.
@@ -114,8 +110,6 @@ pub const TUI = struct {
         return self.overlays.hasVisibleOverlays();
     }
 
-    // ── Layout ────────────────────────────────────────────────────
-
     pub fn addChild(self: *TUI, child: Component) void {
         self.root.addChild(child);
     }
@@ -127,8 +121,6 @@ pub const TUI = struct {
     pub fn height(self: *const TUI) u32 {
         return self.renderer.height;
     }
-
-    // ── Render ────────────────────────────────────────────────────
 
     pub fn requestRender(self: *TUI) void {
         self.dirty = true;
@@ -172,7 +164,6 @@ pub const TUI = struct {
             self.renderer.end() catch {};
         }
 
-        // Cursor: check overlay first, then container tree
         if (self.overlays.hasVisibleOverlays()) {
             if (self.overlayFocusCursor()) |cs| return cs;
         }
@@ -189,8 +180,6 @@ pub const TUI = struct {
         }
         return false;
     }
-
-    // ── Internal ──────────────────────────────────────────────────
 
     /// If the focused component lives in a visible overlay, compute its cursor
     /// from the overlay's resolved position + component-relative cursor.
@@ -260,7 +249,6 @@ pub const OverlayHandle = struct {
         const comp = entry.component;
         _ = self.tui.overlays.removeOverlay(self.id);
 
-        // Restore focus if this overlay had it
         if (self.tui.focus.current) |focused| {
             if (Component.eql(focused, comp)) {
                 const top_visible = self.tui.overlays.topmostCapturingComponent();
@@ -343,8 +331,6 @@ pub const OverlayHandle = struct {
     }
 };
 
-// ── Tests ─────────────────────────────────────────────────────────
-
 const testing = std.testing;
 
 const DummyComp = struct {
@@ -410,8 +396,6 @@ test "OverlayHandle hide restores focus" {
     var root = Container.init(testing.allocator);
     defer root.deinit();
 
-    // We can't construct a full TUI in tests (needs terminal fd), so test
-    // the OverlayManager methods directly that the handle delegates to.
     var editor = DummyComp{};
     var overlay_comp = DummyComp{};
 

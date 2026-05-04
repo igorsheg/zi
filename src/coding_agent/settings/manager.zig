@@ -29,8 +29,6 @@ pub const SettingsManager = struct {
     project_load_error: bool = false,
     errors: std.ArrayListUnmanaged(types.SettingsError),
 
-    // ── constructors ────────────────────────────────────────────────────
-
     /// File-backed settings manager.
     /// pi-mono: settings-manager.ts:232-240
     pub fn create(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) !SettingsManager {
@@ -99,8 +97,6 @@ pub const SettingsManager = struct {
         if (self.owns_storage) self.storage.deinit();
     }
 
-    // ── loading ─────────────────────────────────────────────────────────
-
     fn loadScope(self: *SettingsManager, scope: types.SettingsScope) void {
         var capture: ReadCapture = .{ .allocator = self.allocator };
         self.storage.withLock(scope, @ptrCast(&capture), ReadCapture.callback);
@@ -159,8 +155,6 @@ pub const SettingsManager = struct {
         self.settings = json.deepMergeSettings(self.global_settings, self.project_settings);
     }
 
-    // ── dirty tracking ──────────────────────────────────────────────────
-
     fn markModified(self: *SettingsManager, field: types.SettingsField, nested_key: ?[]const u8) void {
         self.modified_fields.insert(field);
         if (nested_key) |nk| {
@@ -179,8 +173,6 @@ pub const SettingsManager = struct {
         }
     }
 
-    // ── persistence ─────────────────────────────────────────────────────
-
     fn save(self: *SettingsManager) void {
         self.settings = json.deepMergeSettings(self.global_settings, self.project_settings);
         if (self.global_load_error) return;
@@ -194,15 +186,12 @@ pub const SettingsManager = struct {
     }
 
     fn persistScopedSettings(self: *SettingsManager, scope: types.SettingsScope) void {
-        // Step 1: read current file content (duped by ReadCapture, we must free)
         var capture: ReadCapture = .{ .allocator = self.allocator };
         self.storage.withLock(scope, @ptrCast(&capture), ReadCapture.callback);
 
-        // Step 2: merge modified fields into raw object
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        // Free the captured content after arena takes ownership of its parse
         defer if (capture.content) |c| self.allocator.free(c);
 
         var raw_obj: std.json.ObjectMap = if (capture.content) |c| blk: {
@@ -227,12 +216,10 @@ pub const SettingsManager = struct {
             }
         }
 
-        // Step 3: serialize and write back
         const new_json = json.serializeSettingsObject(a, raw_obj) catch return;
         var write_ctx: WriteCapture = .{ .content = new_json };
         self.storage.withLock(scope, @ptrCast(&write_ctx), WriteCapture.callback);
 
-        // Step 4: clear dirty state
         if (scope == .global) {
             self.modified_fields = std.EnumSet(types.SettingsField).initEmpty();
             clearNestedMap(self.allocator, &self.modified_nested);
@@ -241,8 +228,6 @@ pub const SettingsManager = struct {
             clearNestedMap(self.allocator, &self.modified_project_nested);
         }
     }
-
-    // ── simple string getters/setters ───────────────────────────────────
 
     pub fn getLastChangelogVersion(self: *const SettingsManager) ?[]const u8 {
         return self.settings.last_changelog_version;
@@ -320,8 +305,6 @@ pub const SettingsManager = struct {
         self.save();
     }
 
-    // ── enum getters/setters ────────────────────────────────────────────
-
     pub fn getSteeringMode(self: *const SettingsManager) types.SteeringMode {
         return self.settings.steering_mode orelse .one_at_a_time;
     }
@@ -382,8 +365,6 @@ pub const SettingsManager = struct {
         self.save();
     }
 
-    // ── simple bool getters/setters ─────────────────────────────────────
-
     pub fn getHideThinkingBlock(self: *const SettingsManager) bool {
         return self.settings.hide_thinking_block orelse false;
     }
@@ -423,8 +404,6 @@ pub const SettingsManager = struct {
         self.markModified(.enable_skill_commands, null);
         self.save();
     }
-
-    // ── nested getters/setters ──────────────────────────────────────────
 
     pub fn getCompactionEnabled(self: *const SettingsManager) bool {
         if (self.settings.compaction) |c| {
@@ -560,8 +539,6 @@ pub const SettingsManager = struct {
         self.save();
     }
 
-    // ── clamped setters ─────────────────────────────────────────────────
-
     pub fn getEditorPaddingX(self: *const SettingsManager) i64 {
         return self.settings.editor_padding_x orelse 0;
     }
@@ -582,8 +559,6 @@ pub const SettingsManager = struct {
         self.save();
     }
 
-    // ── env-fallback getters/setters ────────────────────────────────────
-
     pub fn getShowHardwareCursor(self: *const SettingsManager) bool {
         if (self.settings.show_hardware_cursor) |v| return v;
         if (@import("env").get("PI_HARDWARE_CURSOR")) |v| {
@@ -597,8 +572,6 @@ pub const SettingsManager = struct {
         self.markModified(.show_hardware_cursor, null);
         self.save();
     }
-
-    // ── other getters ───────────────────────────────────────────────────
 
     pub fn getThinkingBudgets(self: *const SettingsManager) ?types.ThinkingBudgetsSettings {
         return self.settings.thinking_budgets;
@@ -630,8 +603,6 @@ pub const SettingsManager = struct {
         self.markModified(.enabled_models, null);
         self.save();
     }
-
-    // ── array fields with dual-scope setters ────────────────────────────
 
     pub fn getPackages(self: *const SettingsManager) ?[]const types.PackageSource {
         return self.settings.packages;
@@ -729,8 +700,6 @@ pub const SettingsManager = struct {
         self.saveProjectSettings();
     }
 
-    // ── utility ─────────────────────────────────────────────────────────
-
     /// Apply overrides on top of current effective settings (non-persisted).
     /// pi-mono: settings-manager.ts:270-272
     pub fn applyOverrides(self: *SettingsManager, overrides: types.Settings) void {
@@ -750,8 +719,6 @@ pub const SettingsManager = struct {
         return items;
     }
 };
-
-// ── callback helpers for storage vtable ──────────────────────────────
 
 const ReadCapture = struct {
     content: ?[]const u8 = null,
@@ -774,15 +741,11 @@ const WriteCapture = struct {
     }
 };
 
-// ── internal helpers ────────────────────────────────────────────────
-
 fn clearNestedMap(_: std.mem.Allocator, map: *std.AutoHashMap(types.SettingsField, std.StringHashMap(void))) void {
     var it = map.valueIterator();
     while (it.next()) |v| v.deinit();
     map.clearRetainingCapacity();
 }
-
-// ── tests ───────────────────────────────────────────────────────────
 
 test "set persists and reload recovers the value" {
     const allocator = std.testing.allocator;
@@ -820,7 +783,6 @@ test "save preserves external edits to unrelated fields" {
         mem.deinit();
         allocator.destroy(mem);
     }
-    // Pre-populate with an "external" field we didn't set through SettingsManager
     const initial_json =
         \\{"defaultProvider":"anthropic","theme":"dark","unknownField":"preserved"}
     ;
@@ -832,12 +794,9 @@ test "save preserves external edits to unrelated fields" {
     try std.testing.expectEqualStrings("anthropic", mgr.getDefaultProvider().?);
     try std.testing.expectEqualStrings("dark", mgr.getTheme().?);
 
-    // Modify only defaultModel — should not destroy theme or unknownField
     mgr.setDefaultModel("gpt-5");
 
-    // Read back the raw JSON from storage
     const raw = mem.global orelse return error.TestUnexpectedResult;
-    // Verify theme and unknownField survived the merge-on-write
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"dark\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"preserved\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"gpt-5\"") != null);

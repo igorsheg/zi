@@ -63,11 +63,8 @@ pub const Loader = struct {
         return true;
     }
 
-    // ── Component interface ─────────────────────────────────────
-
     pub fn render(self: *Loader, region: Region) void {
         if (region.height < 2 or region.width < 2) return;
-        // Row 0: empty (top padding). Row 1: shimmered message.
         _ = shimmer_mod.writeSmooth(region, 1, 1, self.message(), self.shimmerConfig(), self.shimmer_phase, shimmer_floor);
     }
 

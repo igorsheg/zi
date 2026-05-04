@@ -56,7 +56,6 @@ pub const AuthStorage = struct {
     mutex: std.Io.Mutex = .init,
     io: std.Io = std.Options.debug_io,
 
-    /// Create a file-backed AuthStorage, loading from disk.
     /// pi-mono source: auth-storage.ts:195-197
     pub fn create(allocator: std.mem.Allocator, auth_path: ?[]const u8) !AuthStorage {
         return createWithIo(allocator, std.Options.debug_io, auth_path);
@@ -80,8 +79,6 @@ pub const AuthStorage = struct {
         return self;
     }
 
-    /// Create an in-memory AuthStorage for tests.
-    /// Optionally pre-populate with initial data by serializing it into the memory backend.
     /// pi-mono source: auth-storage.ts:203-207
     pub fn inMemory(allocator: std.mem.Allocator, initial_data: ?*const types.AuthStorageData) !AuthStorage {
         var backend: file_backend.Backend = .{ .memory = @import("../../storage.zig").MemoryFile.init(allocator) };
@@ -104,7 +101,6 @@ pub const AuthStorage = struct {
     }
 
     pub fn deinit(self: *AuthStorage) void {
-        // Free runtime overrides (we own the keys and values)
         var ov_it = self.runtime_overrides.iterator();
         while (ov_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -120,7 +116,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Reload credentials from backend.
     /// pi-mono source: auth-storage.ts:247-260
     pub fn reload(self: *AuthStorage) void {
         self.mutex.lockUncancelable(self.io);
@@ -154,7 +149,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Get credential for a provider.
     ///
     /// SLICE LIFETIME: the returned credential's strings are
     /// borrowed from `self.data` and only valid until the next
@@ -170,13 +164,10 @@ pub const AuthStorage = struct {
         return self.data.get(provider);
     }
 
-    /// Set credential for a provider. Updates in-memory and persists.
     /// pi-mono source: auth-storage.ts:293-296
     pub fn set(self: *AuthStorage, provider: []const u8, credential: types.AuthCredential) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-
-        // Update in-memory — need to dupe key and credential values
         const key_duped = self.allocator.dupe(u8, provider) catch return;
 
         const cred_duped = dupeCredential(self.allocator, credential) catch {
@@ -200,7 +191,6 @@ pub const AuthStorage = struct {
         self.persistProviderChange(provider, credential);
     }
 
-    /// Remove credential for a provider.
     /// pi-mono source: auth-storage.ts:301-304
     pub fn remove(self: *AuthStorage, provider: []const u8) void {
         self.mutex.lockUncancelable(self.io);
@@ -213,7 +203,6 @@ pub const AuthStorage = struct {
         self.persistProviderChange(provider, null);
     }
 
-    /// Check if credentials exist for a provider in storage.
     /// pi-mono source: auth-storage.ts:316-318
     pub fn has(self: *AuthStorage, provider: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
@@ -221,7 +210,6 @@ pub const AuthStorage = struct {
         return self.data.get(provider) != null;
     }
 
-    /// List all provider IDs with credentials. Caller owns returned slice and strings.
     /// pi-mono source: auth-storage.ts:309-311
     pub fn list(self: *AuthStorage, allocator: std.mem.Allocator) ![][]const u8 {
         self.mutex.lockUncancelable(self.io);
@@ -242,7 +230,6 @@ pub const AuthStorage = struct {
         return keys;
     }
 
-    /// Return reference to the full data map.
     ///
     /// CALLER CONTRACT: this returns a borrowed pointer; callers
     /// must not iterate it while another thread might mutate
@@ -255,7 +242,6 @@ pub const AuthStorage = struct {
         return &self.data;
     }
 
-    /// Set a runtime API key override (not persisted). Used for CLI --api-key.
     /// pi-mono source: auth-storage.ts:213-215
     pub fn setRuntimeApiKey(self: *AuthStorage, provider: []const u8, key: []const u8) void {
         self.mutex.lockUncancelable(self.io);
@@ -275,7 +261,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Remove a runtime API key override.
     /// pi-mono source: auth-storage.ts:220-222
     pub fn removeRuntimeApiKey(self: *AuthStorage, provider: []const u8) void {
         self.mutex.lockUncancelable(self.io);
@@ -287,7 +272,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Set fallback resolver for API keys not found via other tiers.
     /// pi-mono source: auth-storage.ts:228-230
     pub fn setFallbackResolver(self: *AuthStorage, resolver: *const fn (provider: []const u8) ?[]const u8) void {
         self.mutex.lockUncancelable(self.io);
@@ -301,7 +285,6 @@ pub const AuthStorage = struct {
         self.extension_oauth_refresh_hook = hook;
     }
 
-    /// Check if any form of auth is configured for a provider.
     /// Does NOT auto-refresh OAuth tokens — just checks availability.
     /// pi-mono source: auth-storage.ts:324-330
     pub fn hasAuth(self: *AuthStorage, provider: []const u8) bool {
@@ -333,11 +316,7 @@ pub const AuthStorage = struct {
     pub fn getApiKey(self: *AuthStorage, provider: []const u8) ?[]const u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-
-        // 1. Runtime override
         if (self.runtime_overrides.get(provider)) |key| return key;
-
-        // 2-3. auth.json credential
         if (self.data.get(provider)) |cred| {
             switch (cred) {
                 .api_key => |ak| return resolve_config_value.resolveConfigValue(ak.key),
@@ -360,11 +339,7 @@ pub const AuthStorage = struct {
                 },
             }
         }
-
-        // 4. Environment variable
         if (ai.env_api_keys.getEnvApiKey(provider)) |key| return key;
-
-        // 5. Fallback resolver
         if (self.fallback_resolver) |resolver| {
             if (resolver(provider)) |key| return key;
         }
@@ -531,37 +506,25 @@ pub const AuthStorage = struct {
 
         if (!self.backend.acquireLock()) return;
         defer self.backend.releaseLock();
-
-        // Use an arena for the temporary parse/serialize cycle
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
-
-        // Read current file content (may have changed from another process)
         const current_content = self.backend.readContent(arena_alloc);
-
-        // Parse current data (or start fresh)
         var current_data = if (current_content) |c|
             types.parseAuthJson(arena_alloc, c) catch return
         else
             types.AuthStorageData.init(arena_alloc);
-
-        // Apply change — arena-backed, no need for manual cleanup
         if (credential) |cred| {
             const key = arena_alloc.dupe(u8, provider) catch return;
             const duped_cred = dupeCredential(arena_alloc, cred) catch return;
             current_data.put(key, duped_cred) catch return;
         } else {
-            // Remove — fetchRemove to get the old entry (arena will clean up)
             _ = current_data.fetchRemove(provider);
         }
-
-        // Serialize and write
         const json = json_write.toOwnedSlice(arena_alloc, &current_data, types.writeAuthJson) catch return;
         self.backend.writeContent(json) catch return;
     }
 
-    /// Duplicate a credential, allocating all strings with the given allocator.
     fn dupeCredential(allocator: std.mem.Allocator, cred: types.AuthCredential) !types.AuthCredential {
         switch (cred) {
             .api_key => |ak| {
@@ -593,7 +556,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Free a credential's owned strings.
     fn freeCredential(allocator: std.mem.Allocator, cred: types.AuthCredential) void {
         switch (cred) {
             .api_key => |ak| allocator.free(ak.key),
@@ -612,12 +574,8 @@ pub const AuthStorage = struct {
     }
 };
 
-// ── tests ────────────────────────────────────────────────────────────────
-
 test "priority chain: runtime override wins over stored credential" {
     const allocator = std.testing.allocator;
-
-    // Set up initial data with an api_key credential
     var init_data = types.AuthStorageData.init(allocator);
     defer types.deinitAuthStorageData(&init_data);
     const key = try allocator.dupe(u8, "test-provider");
@@ -628,13 +586,9 @@ test "priority chain: runtime override wins over stored credential" {
 
     var storage = try AuthStorage.inMemory(allocator, &init_data);
     defer storage.deinit();
-
-    // Tier 2: stored api_key should resolve
     const from_storage = storage.getApiKey("test-provider");
     try std.testing.expect(from_storage != null);
     try std.testing.expectEqualStrings("stored-key", from_storage.?);
-
-    // Tier 1: runtime override wins
     storage.setRuntimeApiKey("test-provider", "runtime-key");
     const from_runtime = storage.getApiKey("test-provider");
     try std.testing.expect(from_runtime != null);
@@ -646,26 +600,16 @@ test "set/get round-trip with in-memory backend" {
 
     var storage = try AuthStorage.inMemory(allocator, null);
     defer storage.deinit();
-
-    // Initially empty
     try std.testing.expect(storage.get("anthropic") == null);
     try std.testing.expect(!storage.has("anthropic"));
-
-    // Set a credential
     storage.set("anthropic", .{ .api_key = .{ .key = "sk-test-123" } });
-
-    // Verify get returns it
     const cred = storage.get("anthropic") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(.api_key, std.meta.activeTag(cred));
     try std.testing.expectEqualStrings("sk-test-123", cred.api_key.key);
     try std.testing.expect(storage.has("anthropic"));
-
-    // Verify getApiKey resolves it
     const api_key = storage.getApiKey("anthropic");
     try std.testing.expect(api_key != null);
     try std.testing.expectEqualStrings("sk-test-123", api_key.?);
-
-    // Remove and verify gone
     storage.remove("anthropic");
     try std.testing.expect(storage.get("anthropic") == null);
     try std.testing.expect(!storage.has("anthropic"));
@@ -765,19 +709,11 @@ test "hasAuth checks all tiers" {
 
     var storage = try AuthStorage.inMemory(allocator, null);
     defer storage.deinit();
-
-    // Unknown provider — no auth
     try std.testing.expect(!storage.hasAuth("nonexistent-provider-xyz"));
-
-    // Tier 1: runtime override
     storage.setRuntimeApiKey("runtime-only", "key");
     try std.testing.expect(storage.hasAuth("runtime-only"));
-
-    // Tier 2: stored credential
     storage.set("stored-only", .{ .api_key = .{ .key = "sk-stored" } });
     try std.testing.expect(storage.hasAuth("stored-only"));
-
-    // Tier 5: fallback resolver
     storage.setFallbackResolver(&fallbackForTest);
     try std.testing.expect(storage.hasAuth("fallback-provider"));
     try std.testing.expect(!storage.hasAuth("still-unknown"));
@@ -803,8 +739,6 @@ test "zi-m7q: repeated set on same provider keeps key valid (no UAF on serialize
 
     const json = try json_write.toOwnedSlice(allocator, storage.getAll(), types.writeAuthJson);
     defer allocator.free(json);
-
-    // Pre-fix: this would be `"\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"`.
     try std.testing.expect(std.mem.indexOf(u8, json, "\"anthropic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"two\"") != null);
 }

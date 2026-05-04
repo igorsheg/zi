@@ -61,7 +61,6 @@ pub const ListPicker = struct {
     preferred_selection_value: ?[]const u8 = null,
     pending_selection_index: ?usize = null,
 
-    // ── Search state ────────────────────────────────────────────
     searchable: bool = false,
     /// Borrowed: all items from caller (unfiltered).
     all_items: []const SelectItem = &.{},
@@ -136,8 +135,6 @@ pub const ListPicker = struct {
         self.applyPreferredSelection();
     }
 
-    // ── Component interface ──────────────────────────────────────
-
     pub fn render(self: *ListPicker, region: Region) void {
         const w = region.width;
         const h = region.height;
@@ -147,9 +144,7 @@ pub const ListPicker = struct {
         const style = box_chrome.Style{ .chrome = border_color, .fg = border_color, .dim = border_color };
         const frame = box_chrome.closedFrame(region);
 
-        // Top border with title
         _ = frame.drawTop(if (self.title.len > 0) self.title else null, null, style);
-        // Bottom border
         _ = frame.drawBottom(style);
 
         const inner = frame.inner;
@@ -167,7 +162,6 @@ pub const ListPicker = struct {
         var body_height = content_h;
 
         if (self.searchable) {
-            // Row 0: search input "/ query_text"
             const prompt = "/ ";
             const prompt_w: u32 = @intCast(grapheme_mod.strWidth(prompt));
             _ = inner.writeStr(0, 0, prompt, self.theme.fg(.accent), Color.default, .{});
@@ -179,7 +173,7 @@ pub const ListPicker = struct {
             if (content_h > 1) {
                 var col: u32 = 0;
                 while (col < inner.width) : (col += 1) {
-                    inner.set(col, 1, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.theme.fg(.border_muted) }); // ─
+                    inner.set(col, 1, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.theme.fg(.border_muted) });
                 }
             }
             body_row = 2;
@@ -206,7 +200,6 @@ pub const ListPicker = struct {
     }
 
     pub fn handleInput(self: *ListPicker, key: Key) bool {
-        // Text editing → filter (search mode only)
         if (self.searchable) {
             if (key.code == .char and !key.ctrl and !key.alt) {
                 if (key.char) |cp| {
@@ -224,7 +217,6 @@ pub const ListPicker = struct {
             }
             if (key.code == .backspace and !key.ctrl and !key.alt) {
                 if (self.query_len > 0) {
-                    // Remove last UTF-8 char
                     var i = self.query_len - 1;
                     while (i > 0 and (self.query_buf[i] & 0xC0) == 0x80) : (i -= 1) {}
                     self.query_len = i;
@@ -234,7 +226,6 @@ pub const ListPicker = struct {
             }
         }
 
-        // Navigation/action → SelectList
         const result = self.list.processInput(key);
         switch (result) {
             .selected => {
@@ -259,11 +250,11 @@ pub const ListPicker = struct {
     pub fn measure(self: *ListPicker, width: u32) Measurement {
         const inner_w = if (width > 2) width - 2 else 1;
         const inner_m = self.list.measure(inner_w);
-        const search_rows: u32 = if (self.searchable) 2 else 0; // input + separator
+        const search_rows: u32 = if (self.searchable) 2 else 0;
         const status_rows: u32 = if (self.status != null) 1 else 0;
         return .{
             .min_height = 3,
-            .preferred_height = inner_m.preferred_height + 2 + search_rows + status_rows, // +2 borders
+            .preferred_height = inner_m.preferred_height + 2 + search_rows + status_rows,
         };
     }
 
@@ -272,8 +263,8 @@ pub const ListPicker = struct {
         const prompt_w: u32 = @intCast(grapheme_mod.strWidth("/ "));
         const query_w: u32 = @intCast(grapheme_mod.strWidth(self.query_buf[0..self.query_len]));
         return .{
-            .x = 1 + prompt_w + query_w, // 1 for left border
-            .y = 1, // first content row
+            .x = 1 + prompt_w + query_w,
+            .y = 1,
             .style = .bar,
         };
     }
@@ -285,8 +276,6 @@ pub const ListPicker = struct {
     pub fn component(self: *ListPicker) Component {
         return Component.init(ListPicker, self);
     }
-
-    // ── Internal ────────────────────────────────────────────────
 
     fn applyFilter(self: *ListPicker) void {
         const count = @min(self.all_items.len, MAX_ITEMS);
@@ -482,4 +471,3 @@ test "searchable picker preserves selected value across filter changes" {
     try testing.expect(picker.handleInput(.{ .code = .backspace }));
     try testing.expectEqualStrings("beta", picker.list.selectedValue().?);
 }
-

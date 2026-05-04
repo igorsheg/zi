@@ -47,21 +47,18 @@ pub const OverlayBackdrop = union(enum) {
 /// Overlay positioning and sizing options.
 /// Matches pi-mono's OverlayOptions interface.
 pub const OverlayOptions = struct {
-    // Sizing
     width: ?u32 = null,
-    width_percent: ?u8 = null, // 0-100
+    width_percent: ?u8 = null,
     min_width: ?u32 = null,
     max_height: ?u32 = null,
     max_height_percent: ?u8 = null,
 
-    // Positioning
     anchor: OverlayAnchor = .center,
     offset_x: i32 = 0,
     offset_y: i32 = 0,
     row: ?u32 = null,
     col: ?u32 = null,
 
-    // Margin from terminal edges
     margin_top: u32 = 0,
     margin_right: u32 = 0,
     margin_bottom: u32 = 0,
@@ -239,7 +236,6 @@ pub const OverlayManager = struct {
         const term_w = region.width;
         const term_h = region.height;
 
-        // Collect visible entries and sort by focus_order (ascending = back to front)
         var visible: [32]usize = undefined;
         var visible_count: usize = 0;
         for (self.stack.items, 0..) |*entry, i| {
@@ -249,7 +245,6 @@ pub const OverlayManager = struct {
             }
         }
 
-        // Insertion sort by focus_order (overlay stacks are small)
         for (1..visible_count) |i| {
             const key = visible[i];
             const key_order = self.stack.items[key].focus_order;
@@ -343,7 +338,6 @@ pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term
     const avail_w = if (term_w > margin_h) term_w - margin_h else 1;
     const avail_h = if (term_h > margin_v) term_h - margin_v else 1;
 
-    // Resolve width
     var width: u32 = if (options.width) |w| w else if (options.width_percent) |pct|
         @max(1, avail_w * pct / 100)
     else
@@ -352,10 +346,8 @@ pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term
     if (options.min_width) |mw| width = @max(width, mw);
     width = @min(width, avail_w);
 
-    // Measure component height at resolved width
     var comp_h = comp.measure(width).preferred_height;
 
-    // Apply max_height
     if (options.max_height) |mh| {
         comp_h = @min(comp_h, mh);
     } else if (options.max_height_percent) |pct| {
@@ -363,7 +355,6 @@ pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term
     }
     comp_h = @min(comp_h, avail_h);
 
-    // Resolve position
     var row: u32 = undefined;
     var col: u32 = undefined;
 
@@ -372,7 +363,6 @@ pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term
     } else if (options.col) |_| {
         row = options.margin_top;
     } else {
-        // Anchor-based positioning
         switch (options.anchor) {
             .center => {
                 row = options.margin_top + (if (avail_h > comp_h) (avail_h - comp_h) / 2 else 0);
@@ -404,7 +394,6 @@ pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term
         col = @min(c, if (term_w > width) term_w - width else 0);
     }
 
-    // Apply offsets
     const signed_row: i64 = @as(i64, @intCast(row)) + options.offset_y;
     const signed_col: i64 = @as(i64, @intCast(col)) + options.offset_x;
     row = @intCast(@max(0, @min(signed_row, @as(i64, @intCast(term_h -| comp_h)))));
@@ -412,8 +401,6 @@ pub fn resolveLayout(options: OverlayOptions, comp: Component, term_w: u32, term
 
     return .{ .row = row, .col = col, .width = width, .height = comp_h };
 }
-
-// ── Tests ─────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -464,7 +451,6 @@ test "OverlayManager stack lifecycle restores focus and removes by id" {
     try testing.expectEqual(second_id + 1, mgr.next_id);
     try testing.expectEqual(@as(usize, 0), mgr.stack.items.len);
 }
-
 
 test "renderOverlays renders visible overlays inside resolved layout bounds" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 20, 10);

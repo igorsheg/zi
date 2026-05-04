@@ -143,8 +143,6 @@ pub const SessionStore = struct {
         self.writer.deinit();
     }
 
-    // ── Accessors ────────────────────────────────────────────────
-
     pub fn sessionId(self: *const SessionStore) []const u8 {
         return self.writer.session_id;
     }
@@ -174,8 +172,6 @@ pub const SessionStore = struct {
         if (self.cached_header) |session_header| return session_header.cwd;
         return self.writer.cwd;
     }
-
-    // ── Append methods (delegate to writer) ──────────────────────
 
     pub fn appendMessage(self: *SessionStore, msg: agent_mod.protocol.AgentMessage) ?[]const u8 {
         self.invalidateCache();
@@ -234,8 +230,6 @@ pub const SessionStore = struct {
         self.appendModelChange(provider, model_id);
         self.appendThinkingLevelChange(thinking_level);
     }
-
-    // ── Context building ─────────────────────────────────────────
 
     /// Build the LLM context from this session's entries.
     /// If the session was opened, uses cached entries.
@@ -441,8 +435,6 @@ fn hasPostCompactionUsage(branch: []const proto.SessionEntry) bool {
     return false;
 }
 
-// ── Session discovery ────────────────────────────────────────────────
-
 /// Find the most recent valid session file for a cwd.
 /// Scans the session directory for .jsonl files, validates headers,
 /// returns the path of the most recently modified valid session.
@@ -506,7 +498,6 @@ fn isValidSessionFile(path: []const u8) bool {
     const first_line_end = std.mem.indexOfScalar(u8, first_chunk, '\n') orelse first_chunk.len;
     const first_line = first_chunk[0..first_line_end];
 
-    // Tiny parse helper allocation, freed immediately after header validation.
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, first_line, .{
         .allocate = .alloc_always,
     }) catch return false;
@@ -559,7 +550,6 @@ pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) 
         }
     }
 
-    // Sort by file mtime descending (most recent activity first).
     const items = results.items;
     if (items.len > 1) {
         for (1..items.len) |i| {
@@ -606,11 +596,9 @@ fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo 
 
         if (line.len == 0) continue;
 
-        // Quick check: find "type" field without full JSON parse
         if (std.mem.indexOf(u8, line, "\"type\":\"session\"") != null or
             std.mem.indexOf(u8, line, "\"type\": \"session\"") != null)
         {
-            // Parse header
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{
                 .allocate = .alloc_always,
             }) catch continue;
@@ -629,7 +617,6 @@ fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo 
         {
             message_count += 1;
 
-            // Extract first user message
             if (first_message == null) {
                 if (std.mem.indexOf(u8, line, "\"role\":\"user\"") != null or
                     std.mem.indexOf(u8, line, "\"role\": \"user\"") != null)
@@ -668,12 +655,10 @@ fn extractUserMessageText(allocator: std.mem.Allocator, line: []const u8) ?[]con
 
     const content_val = msg_obj.get("content") orelse return null;
 
-    // String content (simple user message)
     if (content_val == .string) {
         return truncatePreview(allocator, content_val.string);
     }
 
-    // Array content — find first text block
     if (content_val == .array) {
         for (content_val.array.items) |block| {
             if (block != .object) continue;
@@ -692,7 +677,7 @@ fn extractUserMessageText(allocator: std.mem.Allocator, line: []const u8) ?[]con
 fn truncatePreview(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
     const max_len = 200;
     const cap = @min(text.len, max_len) + 3;
-    const scratch = allocator.alloc(u8, cap) catch return null; // +3 for "..."
+    const scratch = allocator.alloc(u8, cap) catch return null;
     defer allocator.free(scratch);
 
     var pos: usize = 0;

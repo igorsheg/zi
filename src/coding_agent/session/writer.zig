@@ -43,7 +43,6 @@ pub const SessionWriter = struct {
         const owned_cwd = allocator.dupe(u8, cwd) catch @panic("OOM");
         const header_cwd = allocator.dupe(u8, owned_cwd) catch @panic("OOM");
 
-        // Ensure directory exists
         std.Io.Dir.cwd().createDirPath(std.Options.debug_io, session_dir) catch {};
 
         const file_ts = allocator.dupe(u8, timestamp) catch @panic("OOM");
@@ -53,7 +52,6 @@ pub const SessionWriter = struct {
         }
         const session_file = std.fmt.allocPrint(allocator, "{s}/{s}_{s}.jsonl", .{ session_dir, file_ts, session_id }) catch @panic("OOM");
 
-        // Buffer the header as first entry
         const header = proto.SessionHeader{
             .id = session_id,
             .timestamp = timestamp,
@@ -149,7 +147,6 @@ pub const SessionWriter = struct {
         const entry = self.createEntry(.{ .message = .{ .message = msg } }) orelse return null;
         const entry_id = entry.id;
 
-        // Track if we've seen an assistant message
         switch (msg) {
             .assistant => self.has_assistant = true,
             else => {},
@@ -162,19 +159,16 @@ pub const SessionWriter = struct {
         }
 
         if (!self.has_assistant) {
-            // Buffer until first assistant arrives
             self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return null;
             return entry_id;
         }
 
         if (!self.flushed) {
-            // First assistant seen — flush everything buffered + this entry
             self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return null;
             self.flushAll();
             return entry_id;
         }
 
-        // Already flushed — append incrementally
         self.appendToFile(entry) catch return null;
         return entry_id;
     }

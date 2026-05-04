@@ -72,22 +72,17 @@ pub fn cloneOAuthCredential(allocator: std.mem.Allocator, cred: OAuthCredential)
     };
 }
 
-/// Tagged credential union matching pi-mono's AuthCredential.
 /// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:31
 pub const AuthCredential = union(enum) {
     api_key: ApiKeyCredential,
     oauth: OAuthCredential,
 };
 
-/// The full auth.json data structure — a map from provider ID to credential.
 /// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:33
 pub const AuthStorageData = std.StringHashMap(AuthCredential);
 
 const log = std.log.scoped(.auth_storage);
 
-/// Parse auth.json content into AuthStorageData.
-/// Returns an owned hashmap — caller must call `deinitAuthStorageData`.
-///
 /// Resilience (zi-kfg): the OUTER `std.json.parseFromSlice` is the
 /// only operation that can fail this whole function — if the file
 /// is malformed JSON, there's nothing to recover. But once we have
@@ -194,10 +189,6 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.Value) !AuthCredential
     return error.UnexpectedToken;
 }
 
-/// Free a single credential's owned strings. Mirrors the cleanup
-/// done by deinitAuthStorageData per-entry, factored out so the
-/// skip-bad-entry path can free a partially-built credential
-/// without nuking the whole map.
 fn freeOneCredential(allocator: std.mem.Allocator, cred: AuthCredential) void {
     switch (cred) {
         .api_key => |c| allocator.free(c.key),
@@ -205,7 +196,6 @@ fn freeOneCredential(allocator: std.mem.Allocator, cred: AuthCredential) void {
     }
 }
 
-/// Write AuthStorageData as JSON matching pi-mono's format.
 /// Produces `JSON.stringify(data, null, 2)` output — 2-space indent.
 pub fn writeAuthJson(writer: *std.Io.Writer, data: *const AuthStorageData) !void {
     var jw: std.json.Stringify = .{
@@ -251,7 +241,6 @@ pub fn writeAuthJson(writer: *std.Io.Writer, data: *const AuthStorageData) !void
     try jw.endObject();
 }
 
-/// Free all allocations owned by an AuthStorageData map.
 pub fn deinitAuthStorageData(data: *AuthStorageData) void {
     const allocator = data.allocator;
     var it = data.iterator();
@@ -264,8 +253,6 @@ pub fn deinitAuthStorageData(data: *AuthStorageData) void {
     }
     data.deinit();
 }
-
-// ── tests ───────────────────────────────────────────────────────────────
 
 test "parse auth.json with api_key and oauth entries" {
     const input =
@@ -332,7 +319,6 @@ test "round-trip serialize then parse preserves data" {
 }
 
 test "zi-kfg: malformed entries are skipped, valid entries survive" {
-    // Mixed file with one good entry sandwiched between two bad ones.
     // Pre-fix, the first bad entry would abort the whole parse and
     // the user would lose ALL credentials. Post-fix, parseAuthJson
     // logs and skips the bad ones, returns a map with just "good".

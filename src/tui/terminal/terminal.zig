@@ -105,8 +105,6 @@ pub const Terminal = struct {
         }
     }
 
-    // --- Output helpers ---
-
     fn canControlOutput(self: *const Terminal) bool {
         const file: std.Io.File = .{ .handle = self.fd_out, .flags = .{ .nonblocking = false } };
         return file.isTty(std.Options.debug_io) catch false;
@@ -142,8 +140,6 @@ pub const Terminal = struct {
         self.write(title);
         self.write(ansi.title_suffix);
     }
-
-    // --- Keyboard protocol ---
 
     pub fn enableBracketedPaste(self: *Terminal) void {
         if (!self.bracketed_paste_active) self.write(ansi.bracketed_paste_enable);
@@ -247,8 +243,6 @@ fn writeAll(fd: posix.fd_t, data: []const u8) void {
     writer.interface.writeAll(data) catch return;
     writer.interface.flush() catch {};
 }
-
-// --- Tests ---
 
 fn testPipe() ![2]std.posix.fd_t {
     return runtime_fd.pipe();

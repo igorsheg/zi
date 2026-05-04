@@ -252,8 +252,6 @@ pub const EditorInterface = struct {
     }
 };
 
-// ── Tests ─────────────────────────────────────────────────────────
-
 const buffer_mod = @import("buffer.zig");
 const Region = buffer_mod.Region;
 

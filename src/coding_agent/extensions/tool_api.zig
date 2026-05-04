@@ -15,10 +15,6 @@ pub fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return luaError(L, "register_tool: expected a table argument");
     }
 
-    // Build the ToolDefinition incrementally so each errdefer in the
-    // builder reverses exactly the allocations made before the
-    // failure point. On success, ownership transfers wholesale into
-    // the registry.
     var built = buildExtensionTool(L, runner) catch |err| {
         return luaError(L, switch (err) {
             error.MissingName => "register_tool: missing required field 'name'",
@@ -42,21 +38,16 @@ pub fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
     };
 
     const accepted = runner.tool_registry.register(built) catch {
-        // OOM during registry insert: free what we built and bail.
         freeBuiltTool(runner.allocator, &built);
         return luaError(L, "register_tool: registry insert failed");
     };
 
     if (!accepted) {
-        // First-wins drop. Existing entry retains its source. We
-        // free the duped strings and ref, log a diagnostic, and
-        // return false to Lua so user code can branch on it.
         log.warn("tool '{s}' already registered (source: {s}); ignoring later registration from {s}", .{
             built.name,
             (runner.tool_registry.get(built.name) orelse unreachable).source.id,
             built.source.id,
         });
-        // Release the captured Lua function refs since we won't use them.
         if (built.impl == .lua) c.luaL_unref(L, c.LUA_REGISTRYINDEX, built.impl.lua);
         if (built.render_call_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
         if (built.render_result_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
@@ -112,8 +103,6 @@ fn buildExtensionTool(
     const description = try requireString(L, 1, "description", a, error.MissingDescription, error.InvalidDescription);
     errdefer a.free(description);
 
-    // Optional label defaults to name (deep-cloned so the registry
-    // never depends on the name slice's lifetime).
     const label = blk: {
         const opt = try optionalString(L, 1, "label", a, error.InvalidLabel);
         if (opt) |s| break :blk s;
@@ -127,7 +116,6 @@ fn buildExtensionTool(
     const prompt_guidelines = try optionalStringArray(L, 1, "prompt_guidelines", a, error.InvalidPromptGuidelines);
     errdefer freeStringArray(a, prompt_guidelines);
 
-    // parameters: required, must be a table, deep-cloned to JSON.
     _ = c.lua_getfield(L, 1, "parameters");
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) == c.LUA_TNIL) return error.MissingParameters;
@@ -139,9 +127,6 @@ fn buildExtensionTool(
     };
     errdefer lua_runtime.freeJsonValue(a, parameters);
 
-    // Optional presentation-slot functions — validated type-only here.
-    // We capture refs AFTER `execute` to keep ref-last discipline;
-    // taking them before execute would leak on `MissingExecute`.
     var has_render_call = false;
     _ = c.lua_getfield(L, 1, "render_call");
     if (c.lua_type(L, -1) == c.LUA_TFUNCTION) {
@@ -167,12 +152,7 @@ fn buildExtensionTool(
         c.lua_pop(L, 3);
         return error.InvalidExpandedChanged;
     }
-    // Leave on stack for now; we'll ref them after execute validates.
 
-    // execute: required, must be a function. luaL_ref pops the
-    // function from the stack and returns a registry slot. We do
-    // this LAST so the errdefers above don't accidentally leak the
-    // ref on a later failure.
     _ = c.lua_getfield(L, 1, "execute");
     if (c.lua_type(L, -1) == c.LUA_TNIL) {
         c.lua_pop(L, 4); // execute (nil) + on_expanded_changed + render_result + render_call
@@ -184,7 +164,6 @@ fn buildExtensionTool(
     }
     const execute_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
 
-    // Now ref optional callbacks (still on stack if present).
     const on_expanded_changed_ref: ?c_int = if (has_on_expanded_changed)
         c.luaL_ref(L, c.LUA_REGISTRYINDEX)
     else blk: {

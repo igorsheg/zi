@@ -31,9 +31,6 @@ pub const Bundle = struct {
     allocator: std.mem.Allocator,
     registry: *provider_mod.Registry,
 
-    // Each provider that needs persistent state lives here as a
-    // heap allocation. Adding a new built-in provider = one field
-    // here, one register() call in `init`, one destroy in `deinit`.
     anthropic_prov: *anthropic.AnthropicProvider,
     openai_completions_prov: *openai_completions.OpenAICompletionsProvider,
     openai_responses_prov: *openai_responses.OpenAIResponsesProvider,
@@ -60,25 +57,16 @@ pub const Bundle = struct {
         anth.* = anthropic.AnthropicProvider.init(allocator);
         try registry.register("anthropic-messages", anth.provider(), null);
 
-        // openai-completions: openrouter today, future custom
-        // OpenAI-compatible providers reuse this slot.
         const oac = try allocator.create(openai_completions.OpenAICompletionsProvider);
         errdefer allocator.destroy(oac);
         oac.* = openai_completions.OpenAICompletionsProvider.init(allocator);
         try registry.register("openai-completions", oac.provider(), null);
 
-        // openai-responses: api.openai.com/v1/responses today. Phase 3c
-        // adds a second registration (openai-codex-responses) that reuses
-        // the same shared core with a ChatGPT-oauth auth factory.
         const oar = try allocator.create(openai_responses.OpenAIResponsesProvider);
         errdefer allocator.destroy(oar);
         oar.* = openai_responses.OpenAIResponsesProvider.init(allocator);
         try registry.register("openai-responses", oar.provider(), null);
 
-        // openai-codex-responses: ChatGPT backend endpoint, shares the
-        // responses SSE core with a different base URL + path. Auth is
-        // bearer-via-api_key today; phase 4 plumbs oauth access tokens
-        // from AuthStorage into StreamOptions.api_key.
         const ocx = try allocator.create(openai_codex.OpenAICodexProvider);
         errdefer allocator.destroy(ocx);
         ocx.* = openai_codex.OpenAICodexProvider.init(allocator);
@@ -98,10 +86,6 @@ pub const Bundle = struct {
     pub fn deinit(self: *Bundle) void {
         self.registry.deinit();
         self.allocator.destroy(self.registry);
-        // Destroy in reverse registration order — providers don't
-        // currently have ordering dependencies on each other, but
-        // keeping the discipline now means future providers that DO
-        // (e.g. shared core wrappers) get correct teardown for free.
         self.allocator.destroy(self.openai_codex_prov);
         self.allocator.destroy(self.openai_responses_prov);
         self.allocator.destroy(self.openai_completions_prov);

@@ -24,9 +24,6 @@ pub const CallbackResult = union(enum) {
     }
 };
 
-/// Start a one-shot callback server and wait for the OAuth redirect.
-/// Blocks until callback received, cancelled, or timeout.
-/// Caller owns any allocated strings in the result (use `result.deinit(allocator)`).
 pub fn waitForCallback(
     allocator: std.mem.Allocator,
     port: u16,
@@ -57,7 +54,7 @@ pub fn waitForCallback(
         var reader = stream.reader(std.Options.debug_io, &read_buf);
         const request_bytes = reader.interface.allocRemaining(allocator, .limited(read_buf.len)) catch {
             sendResponse(stream, "400 Bad Request", error_html);
-            continue; // keep listening for the real callback
+            continue;
         };
         defer allocator.free(request_bytes);
         const request_line_end = std.mem.indexOfScalar(u8, request_bytes, '\n') orelse request_bytes.len;
@@ -72,7 +69,7 @@ pub fn waitForCallback(
             },
             .err => {
                 sendResponse(stream, "400 Bad Request", error_html);
-                continue; // keep listening — stray or malformed request
+                continue;
             },
             else => continue,
         }
@@ -94,8 +91,6 @@ fn sendResponse(stream: net.Stream, status: []const u8, body: []const u8) void {
     w.flush() catch return;
 }
 
-/// Parse a GET request line and extract code + state from query params.
-/// Returns `.success` with allocator-owned strings, or `.err` with a static message.
 pub fn parseCallbackRequest(
     allocator: std.mem.Allocator,
     request_line: []const u8,
@@ -177,8 +172,6 @@ const error_html =
     \\<body><main><h1>Authentication failed</h1>
     \\<p>Something went wrong. Please try again.</p></main></body></html>
 ;
-
-// --- Tests ---
 
 test "parseCallbackRequest extracts code and state" {
     const alloc = std.testing.allocator;

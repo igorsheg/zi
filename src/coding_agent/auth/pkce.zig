@@ -13,8 +13,6 @@ pub const PkceChallenge = struct {
     }
 };
 
-/// Generate PKCE verifier and S256 challenge.
-/// Uses cryptographic random + SHA-256. No allocation needed.
 pub fn generate() PkceChallenge {
     var result: PkceChallenge = undefined;
 

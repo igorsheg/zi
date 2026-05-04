@@ -26,8 +26,6 @@ const Model = protocol.Model;
 const ThinkingLevel = protocol.ThinkingLevel;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 
-// ── result types ────────────────────────────────────────────────────
-
 pub const ScopedModel = struct {
     model: Model,
     thinking_level: ?ThinkingLevel = null,
@@ -66,14 +64,11 @@ pub const RestoreResult = struct {
     fallback_message: ?[]u8,
 };
 
-// ── helpers ─────────────────────────────────────────────────────────
-
 /// pi-mono: model-resolver.ts:50-57
 /// Returns true if id ends with `-latest` or does NOT end with `-YYYYMMDD`.
 fn isAlias(id: []const u8) bool {
     if (std.mem.endsWith(u8, id, "-latest")) return true;
     if (id.len < 9) return true;
-    // Check trailing `-` followed by 8 ASCII digits.
     const tail = id[id.len - 9 ..];
     if (tail[0] != '-') return true;
     for (tail[1..]) |c| {
@@ -123,8 +118,6 @@ fn idDescLessThan(_: void, a: Model, b: Model) bool {
     return std.mem.order(u8, a.id, b.id) == .gt;
 }
 
-// ── findExactModelReferenceMatch ────────────────────────────────────
-
 /// pi-mono: model-resolver.ts:64-106
 /// Three-stage match: canonical `provider/id`, then `provider/id`
 /// split-exact, then bare id.
@@ -135,7 +128,6 @@ pub fn findExactModelReferenceMatch(
     const trimmed = std.mem.trim(u8, reference, " \t\r\n");
     if (trimmed.len == 0) return null;
 
-    // Stage 1: case-insensitive `provider/id` canonical form match.
     var stage1_hit: ?Model = null;
     var stage1_count: usize = 0;
     var canonical_buf: [256]u8 = undefined;
@@ -152,8 +144,6 @@ pub fn findExactModelReferenceMatch(
     }
     if (stage1_count == 1) return stage1_hit;
 
-    // Stage 2: if reference contains `/`, split on first `/` and try
-    // exact `(provider, id)` match.
     if (std.mem.indexOfScalar(u8, trimmed, '/')) |slash| {
         const prov = std.mem.trim(u8, trimmed[0..slash], " \t");
         const mid = std.mem.trim(u8, trimmed[slash + 1 ..], " \t");
@@ -173,7 +163,6 @@ pub fn findExactModelReferenceMatch(
         }
     }
 
-    // Stage 3: bare-id case-insensitive match across all providers.
     var stage3_hit: ?Model = null;
     var stage3_count: usize = 0;
     for (available_models) |m| {
@@ -185,8 +174,6 @@ pub fn findExactModelReferenceMatch(
     }
     return if (stage3_count == 1) stage3_hit else null;
 }
-
-// ── tryMatchModel ───────────────────────────────────────────────────
 
 /// pi-mono: model-resolver.ts:112-142
 /// Exact match first, then case-insensitive substring on id/name.
@@ -222,7 +209,6 @@ fn tryMatchModel(
 
     if (matches.items.len == 0) return null;
 
-    // Split into aliases vs dated versions.
     var aliases: std.ArrayListUnmanaged(Model) = .empty;
     defer aliases.deinit(allocator);
     var dated: std.ArrayListUnmanaged(Model) = .empty;
@@ -243,8 +229,6 @@ fn tryMatchModel(
     std.mem.sort(Model, dated.items, {}, idDescLessThan);
     return dated.items[0];
 }
-
-// ── parseModelPattern ───────────────────────────────────────────────
 
 pub const ParseOptions = struct {
     allow_invalid_thinking_level_fallback: bool = true,
@@ -315,8 +299,6 @@ pub fn parseModelPattern(
     return inner;
 }
 
-// ── buildFallbackModel ──────────────────────────────────────────────
-
 /// pi-mono: model-resolver.ts:151-165
 /// Used by `resolveCliModel` when `--provider` pins a provider but
 /// `--model` names an id we don't have. Returns a clone of the
@@ -327,8 +309,6 @@ fn buildFallbackModel(
     model_id: []const u8,
     available_models: []const Model,
 ) ?Model {
-    // Walk the provider's entries; remember the first as the pure
-    // fallback, prefer the provider's default-id match if present.
     var first: ?Model = null;
     var default_id: ?[]const u8 = null;
     for (defaults.default_model_per_provider) |entry| {
@@ -355,8 +335,6 @@ fn buildFallbackModel(
     out.name = model_id;
     return out;
 }
-
-// ── resolveCliModel ─────────────────────────────────────────────────
 
 pub const ResolveCliOptions = struct {
     cli_provider: ?[]const u8 = null,
@@ -420,7 +398,6 @@ pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
         }
     }
 
-    // No provider inferred: try exact id or provider/id match on full input.
     if (provider == null) {
         var full_buf: [256]u8 = undefined;
         for (available) |m| {
@@ -436,7 +413,6 @@ pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
         }
     }
 
-    // Both provider and model given: strip a `provider/` prefix.
     if (opts.cli_provider != null and provider != null) {
         const canon = providerCanonical(provider.?);
         if (cli_model.len > canon.len + 1 and
@@ -447,7 +423,6 @@ pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
         }
     }
 
-    // Filter candidates by provider if pinned.
     var candidates_buf: std.ArrayListUnmanaged(Model) = .empty;
     defer candidates_buf.deinit(opts.allocator);
     const candidates: []const Model = if (provider) |p| blk: {
@@ -502,8 +477,6 @@ pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
         }
     }
 
-    // Provider pinned but no pattern match: build a synthetic model
-    // with the supplied id under the provider's default transport.
     if (provider) |p| {
         if (buildFallbackModel(p, pattern, available)) |fm| {
             const msg = std.fmt.allocPrint(
@@ -515,7 +488,6 @@ pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
         }
     }
 
-    // Nothing matched — error.
     const display: []const u8 = if (provider) |p|
         std.fmt.allocPrint(opts.allocator, "{s}/{s}", .{ providerCanonical(p), pattern }) catch cli_model
     else
@@ -527,8 +499,6 @@ pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
     ) catch null;
     return .{ .model = null, .thinking_level = null, .warning = null, .err = err };
 }
-
-// ── findInitialModel ────────────────────────────────────────────────
 
 pub const FindInitialOptions = struct {
     cli_provider: ?[]const u8 = null,
@@ -551,7 +521,6 @@ pub const FindInitialOptions = struct {
 ///   5. First auth-configured model in catalog.
 ///   6. null.
 pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
-    // 1. CLI args.
     if (opts.cli_provider != null and opts.cli_model != null) {
         const resolved = resolveCliModel(.{
             .cli_provider = opts.cli_provider,
@@ -605,7 +574,6 @@ pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
         }
     }
 
-    // 2. Scoped models — phase 2 always empty.
     if (opts.scoped_models.len > 0 and !opts.is_continuing) {
         const first = opts.scoped_models[0];
         return .{
@@ -615,7 +583,6 @@ pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
         };
     }
 
-    // 3. settings default.
     if (opts.default_provider) |dp| if (opts.default_model_id) |dm| {
         const provider = json_util.parseProvider(dp);
         if (opts.registry.find(provider, dm)) |m| {
@@ -627,7 +594,6 @@ pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
         }
     };
 
-    // 4. Walk defaults_per_provider against the auth-filtered list.
     const available = try opts.registry.getAvailable(opts.allocator);
     defer opts.allocator.free(available);
 
@@ -645,7 +611,6 @@ pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
                 }
             }
         }
-        // 5. First authed model.
         return .{
             .model = available[0],
             .thinking_level = defaults.DEFAULT_THINKING_LEVEL,
@@ -653,15 +618,12 @@ pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
         };
     }
 
-    // 6. No model available.
     return .{
         .model = null,
         .thinking_level = defaults.DEFAULT_THINKING_LEVEL,
         .fallback_message = null,
     };
 }
-
-// ── restoreModelFromSession ─────────────────────────────────────────
 
 pub const RestoreOptions = struct {
     saved_provider: []const u8,
@@ -730,8 +692,6 @@ pub fn restoreModelFromSession(opts: RestoreOptions) !RestoreResult {
     return .{ .model = null, .fallback_message = null };
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
-
 const auth_storage_mod = @import("auth/storage.zig");
 const generated = @import("../ai/models_generated.zig");
 
@@ -747,8 +707,6 @@ test "parseModelPattern handles colon-thinking-level suffix" {
     try std.testing.expect(r1.thinking_level != null);
     try std.testing.expectEqual(ThinkingLevel.high, r1.thinking_level.?);
 
-    // OpenRouter-style id with a colon in it (if the catalog has one;
-    // fall back to verifying no crash on a bare colon pattern).
     const r2 = parseModelPattern(alloc, "claude-opus-4-6", reg.getAll(), .{});
     try std.testing.expect(r2.model != null);
     try std.testing.expect(r2.thinking_level == null);
@@ -758,9 +716,6 @@ test "findInitialModel walks defaults_per_provider in order" {
     const alloc = std.testing.allocator;
     var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
-    // Authenticate both anthropic and openai. Anthropic is listed
-    // first in `default_model_per_provider`, so the walk must pick
-    // claude-opus-4-6, not gpt-5.4.
     auth.setRuntimeApiKey("anthropic", "k");
     auth.setRuntimeApiKey("openai", "k");
 
@@ -805,7 +760,6 @@ test "restoreModelFromSession falls back when saved model lacks auth" {
     const alloc = std.testing.allocator;
     var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();
-    // Only openai is authed — saved anthropic model will fall back.
     auth.setRuntimeApiKey("openai", "k");
 
     var reg = try ModelRegistry.init(alloc, &auth, &.{});

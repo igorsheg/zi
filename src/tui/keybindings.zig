@@ -487,4 +487,3 @@ test "keybindings format footer from shared definitions" {
         text,
     );
 }
-

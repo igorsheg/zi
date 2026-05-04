@@ -1,7 +1,5 @@
 const std = @import("std");
 
-/// Render an OAuth success page.
-/// Caller owns returned slice.
 pub fn successHtml(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
     return renderPage(allocator, .{
         .title = "Authentication successful",
@@ -11,8 +9,6 @@ pub fn successHtml(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
     });
 }
 
-/// Render an OAuth error page.
-/// Caller owns returned slice.
 pub fn errorHtml(allocator: std.mem.Allocator, message: []const u8, details: ?[]const u8) ![]u8 {
     return renderPage(allocator, .{
         .title = "Authentication failed",

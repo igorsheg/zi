@@ -95,12 +95,6 @@ pub fn measureHeight(visible_lines: u32, gap_count: u32) u32 {
     return 1 + visible_lines + gap_count + 1;
 }
 
-
-// ── Closed variant (editor/overlay style) ─────────────────────────
-// ╭─ left text ────── right text ─╮
-// │ content                       │
-// ╰─ left text ────── right text ─╯
-
 const grapheme_mod = @import("grapheme.zig");
 
 /// Draw closed top border: ╭─ {left} ──── {right} ─╮
@@ -110,33 +104,28 @@ fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]co
     const w = region.width;
     var col: u32 = 0;
 
-    // ╭─
     col += region.writeStr(col, row, "╭─", style.chrome, Color.default, .{});
 
-    // left label with spacing
     var left_w: u32 = 0;
     if (left) |l| {
         if (l.len > 0) {
             col += region.writeStr(col, row, " ", Color.default, Color.default, .{});
             const wrote = region.writeStr(col, row, l, style.fg, Color.default, .{});
             col += wrote;
-            left_w = wrote + 1; // +1 for leading space
+            left_w = wrote + 1;
             col += region.writeStr(col, row, " ", Color.default, Color.default, .{});
-            left_w += 1; // trailing space
+            left_w += 1;
         }
     }
 
-    // right label — measure width for fill calculation
     var right_w: u32 = 0;
     if (right) |r| {
         if (r.len > 0) {
             right_w = @intCast(grapheme_mod.strWidth(r));
-            right_w += 2; // spaces around label
+            right_w += 2;
         }
     }
 
-    // ─ fill between left and right
-    // Budget: w - 2 (╭─) - left_w - right_w - 2 (─╮)
     const used = 2 + left_w + right_w + 2;
     if (w > used) {
         const fill = w - used;
@@ -146,7 +135,6 @@ fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]co
         }
     }
 
-    // right label
     if (right) |r| {
         if (r.len > 0) {
             col += region.writeStr(col, row, " ", Color.default, Color.default, .{});
@@ -155,7 +143,6 @@ fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]co
         }
     }
 
-    // ─╮
     col += region.writeStr(col, row, "─╮", style.chrome, Color.default, .{});
     return 1;
 }
@@ -241,5 +228,3 @@ pub const ClosedFrame = struct {
 pub fn closedFrame(region: Region) ClosedFrame {
     return ClosedFrame.init(region);
 }
-
-

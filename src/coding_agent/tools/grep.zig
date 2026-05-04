@@ -260,7 +260,6 @@ fn parseRgJson(
             }
         }
 
-        // Per-file match cap.
         if (ev.kind == .match) {
             const gop = per_file_count.getOrPut(ev.file_path) catch continue;
             if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -280,7 +279,6 @@ fn parseRgJson(
         w.print("{s}:{d}: {s}{s}\n", .{ current_display, ev.line_number, text_show, ellipsis }) catch break;
     }
 
-    // Trailing notices.
     if (total_matches >= MAX_TOTAL_MATCHES) {
         w.print("\n[stopped at {d} matches — refine pattern]\n", .{MAX_TOTAL_MATCHES}) catch {};
     }

@@ -76,21 +76,8 @@ pub fn handleAgentEvent(
 ) !void {
     const state = runner.lua_state orelse return error.NoState;
 
-    // Single-thread contract: agent thread owns lua_state. See
-    // `runner.zig` `lua_owner_thread` for the architecture.
     runner.assertOnLuaThread();
 
-    // Each branch:
-    //   1. Pushes a payload table onto the main stack (via the
-    //      pushPayloadFor* helper).
-    //   2. Calls dispatchObserver with payload at index -1.
-    //   3. Pops the payload.
-    //
-    // Errors during payload construction unwind via `try`; the
-    // partial table (if any) gets popped by the catch in
-    // `agentEventSink` via lua_settop on the next event. We could
-    // be more careful here but the alternative — leaking one
-    // table-shaped slot per failure — is bounded by the GC.
     switch (event) {
         .agent_start => try observe(state, runner, .agent_start, pushAgentStart),
         .agent_end => |e| try observeWith(state, runner, .agent_end, e, pushAgentEnd),
@@ -105,19 +92,12 @@ pub fn handleAgentEvent(
     }
 }
 
-// =============================================================================
-// Dispatch wrappers
-// =============================================================================
-
 fn observe(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
     kind: event_registry.EventKind,
     builder: *const fn (*c.lua_State) lua_runtime.ConvertError!void,
 ) !void {
-    // Skip the build entirely if no handler subscribes — the table
-    // is pure overhead in that case, and the early-out matters once
-    // we wire the runner into a hot agent loop.
     if (runner.event_registry.handlers(kind).len == 0) return;
 
     try builder(state.L);
@@ -730,10 +710,6 @@ fn sessionLifecycleReasonString(reason: SessionLifecycleReason) []const u8 {
     };
 }
 
-// =============================================================================
-// Per-variant payload builders
-// =============================================================================
-//
 // Each builder pushes ONE Lua table onto the stack. The table
 // shape mirrors the AgentEvent variant fields, exposing what an
 // extension actually needs. v1 keeps these MINIMAL — extensions
@@ -771,10 +747,6 @@ fn pushMessageStart(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!
 fn pushMessageUpdate(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
     c.lua_createtable(L, 0, 1);
     pushMessageRoleField(L, payload.message);
-    // assistant_message_event has many sub-variants. v1 surfaces
-    // just its tag name as `update_kind`; later phases can grow
-    // this when extensions need to introspect deltas vs starts vs
-    // tool-call pieces.
     _ = c.lua_pushstring(L, @tagName(payload.assistant_message_event));
     c.lua_setfield(L, -2, "update_kind");
 }
@@ -825,9 +797,6 @@ fn pushToolExecEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!v
     c.lua_pushboolean(L, if (payload.is_error) 1 else 0);
     c.lua_setfield(L, -2, "is_error");
 
-    // Extensions that need full result content can inspect the
-    // tool_result event (transformable) — v1 keeps the observer
-    // payload light and uses a single bool for the success flag.
     c.lua_pushinteger(L, @intCast(payload.result.content.len));
     c.lua_setfield(L, -2, "content_count");
 }
@@ -841,10 +810,6 @@ fn pushMessageRoleField(L: *c.lua_State, message: agent_protocol.AgentMessage) v
     c.lua_setfield(L, -2, "role");
 }
 
-// =============================================================================
-// Tool-call hooks (cancellable + transformable)
-// =============================================================================
-//
 // These two adapters plug into the agent's `BeforeToolCallHook` and
 // `AfterToolCallHook` slots. Unlike the observer path, they have a
 // return value that the agent loop consumes — block decisions, arg
@@ -966,8 +931,6 @@ fn afterToolCallImpl(
     const hook_alloc = runner.hookAllocator();
     const final = try dispatch.dispatchTransformable(state, runner, .tool_result, -1, hook_alloc);
 
-    // Parse content + is_error out of the final JSON. Anything
-    // unexpected → leave the original alone for that field.
     if (final != .object) return null;
     const obj = final.object;
 
@@ -1021,8 +984,6 @@ fn readOptionalStringFieldOwned(L: *c.lua_State, idx: c_int, field: [:0]const u8
     const ptr = c.lua_tolstring(L, -1, &len) orelse return null;
     return try allocator.dupe(u8, ptr[0..len]);
 }
-
-// -- payload builders ---------------------------------------------------------
 
 fn readPayloadSystemPrompt(L: *c.lua_State, idx: c_int, allocator: std.mem.Allocator) !?[]const u8 {
     return readOptionalStringFieldOwned(L, idx, "system_prompt", allocator);
@@ -1103,7 +1064,6 @@ fn pushToolCallPayload(
 ) lua_runtime.ConvertError!void {
     c.lua_createtable(L, 0, 3);
 
-    // Nested tool_call descriptor.
     c.lua_createtable(L, 0, 2);
     _ = c.lua_pushlstring(L, tool_call.id.ptr, tool_call.id.len);
     c.lua_setfield(L, -2, "id");
@@ -1111,13 +1071,9 @@ fn pushToolCallPayload(
     c.lua_setfield(L, -2, "name");
     c.lua_setfield(L, -2, "tool_call");
 
-    // Top-level tool_name for ergonomics — handlers usually only
-    // need the name, not the call id.
     _ = c.lua_pushlstring(L, tool_call.name.ptr, tool_call.name.len);
     c.lua_setfield(L, -2, "tool_name");
 
-    // Args as a Lua table. Handlers may mutate this in place; we
-    // read it back after the chain returns.
     try lua_runtime.pushJsonValue(L, args);
     c.lua_setfield(L, -2, "args");
 }
@@ -1140,7 +1096,6 @@ fn pushToolResultPayload(
     _ = c.lua_pushlstring(L, tool_call.name.ptr, tool_call.name.len);
     c.lua_setfield(L, -2, "tool_name");
 
-    // Content as an array of { type = "text", text = "..." } / image.
     c.lua_createtable(L, @intCast(result.content.len), 0);
     for (result.content, 0..) |block, i| {
         switch (block) {
@@ -1169,8 +1124,6 @@ fn pushToolResultPayload(
     c.lua_setfield(L, -2, "is_error");
 }
 
-// -- result parsers -----------------------------------------------------------
-
 /// Parse a JSON array of `{type, text}` (text only in v1) into
 /// owned ContentBlocks. Strings are duped from the supplied
 /// allocator (the hook arena in the live path).
@@ -1194,16 +1147,9 @@ fn parseContentArray(
             out[n] = .{ .text = .{ .text = try allocator.dupe(u8, txt.string) } };
             n += 1;
         }
-        // image left out of v1 — extensions transforming images
-        // would need a base64 round trip we don't want to enable
-        // by default.
     }
     return out[0..n];
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 const testing = std.testing;
 const api = @import("api.zig");
@@ -1248,8 +1194,6 @@ test "semantic message event exposes assistant text and tool calls" {
         \\assert(_semantic[2] == "entry-1:assistant:hello", _semantic[2])
     , "verify_semantic_message");
 }
-
-// -- D6: tool_call / tool_result hooks ----------------------------------------
 
 test "before_agent_start transforms system prompt and exposes options" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
@@ -1462,7 +1406,6 @@ test "lifecycle observer delivers null-provenance handler with nil binding" {
     defer runner.deinit();
     runner.attachLuaState(&state);
 
-    // Push a handler that records whether event.binding is nil.
     try state.doString(
         \\_received_binding = "UNSET"
         \\function handler(event, ctx)
@@ -1474,7 +1417,6 @@ test "lifecycle observer delivers null-provenance handler with nil binding" {
         \\end
     , "setup");
 
-    // Capture ref and subscribe with null provenance.
     _ = c.lua_getglobal(state.L, "handler");
     const ref = c.luaL_ref(state.L, c.LUA_REGISTRYINDEX);
 
@@ -1484,14 +1426,12 @@ test "lifecycle observer delivers null-provenance handler with nil binding" {
         .provenance = null,
     });
 
-    // Dispatch a session_start with no related peer.
     try dispatchSessionStart(.{
         .runner = &runner,
         .workspace_id = "ws",
         .session_id = "sess",
     }, null, .startup, null);
 
-    // Verify the handler ran and saw nil binding.
     try state.doString(
         \\assert(_received_binding == "NIL", "expected binding nil, got " .. tostring(_received_binding))
     , "verify");

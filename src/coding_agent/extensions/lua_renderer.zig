@@ -58,10 +58,6 @@ pub const RenderedToolResult = rendered_tool_result_view.RenderedToolResult;
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_renderer);
 
-// ─────────────────────────────────────────────────────────────────
-// Dispatch
-// ─────────────────────────────────────────────────────────────────
-
 pub const DispatchCallInput = struct {
     tool_name: []const u8,
     args: std.json.Value,
@@ -157,8 +153,6 @@ pub fn dispatchRenderResultFromResultOn(
 
     runner.assertOnLuaThread();
 
-    // Inherit the tool's module context so render hooks can `require`
-    // private helpers from the extension's module root.
     runner.setModuleContext(state_ptr, tool.source.provenance);
 
     const out_state = allocator.create(RenderedToolResult) catch return null;
@@ -198,10 +192,8 @@ fn runOneFromResult(
         return error.NotAFunction;
     }
 
-    // arg 1: result table — built by hand from AgentToolResult
     pushAgentToolResult(co.L, input.result);
 
-    // arg 2: ctx
     c.lua_createtable(co.L, 0, 4);
     c.lua_pushinteger(co.L, @intCast(input.width));
     c.lua_setfield(co.L, -2, "width");
@@ -231,7 +223,6 @@ fn runOneFromResult(
 fn pushAgentToolResult(L: *c.lua_State, r: agent_protocol.AgentToolResult) void {
     c.lua_createtable(L, 0, 3);
 
-    // content array
     c.lua_createtable(L, @intCast(r.content.len), 0);
     var i: c.lua_Integer = 1;
     for (r.content) |block| {
@@ -245,9 +236,7 @@ fn pushAgentToolResult(L: *c.lua_State, r: agent_protocol.AgentToolResult) void 
                 c.lua_rawseti(L, -2, i);
                 i += 1;
             },
-            .image => {
-                // skip images for now — renderers use details instead
-            },
+            .image => {},
         }
     }
     c.lua_setfield(L, -2, "content");
@@ -284,11 +273,8 @@ pub fn dispatchRenderResult(
 
     runner.assertOnLuaThread();
 
-    // Inherit the tool's module context so render hooks can `require`
-    // private helpers from the extension's module root.
     runner.setModuleContext(state_ptr, tool.source.provenance);
 
-    // Arena owns every string we produce for the returned state.
     const out_state = allocator.create(RenderedToolResult) catch return null;
     out_state.* = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
@@ -367,20 +353,17 @@ fn runOne(
     var co = lua_runtime.Coroutine.init(state) catch return error.CoroutineFailed;
     defer co.deinit();
 
-    // Push the render_result function.
     _ = c.lua_rawgeti(co.L, c.LUA_REGISTRYINDEX, ref);
     if (c.lua_type(co.L, -1) != c.LUA_TFUNCTION) {
         c.lua_pop(co.L, 1);
         return error.NotAFunction;
     }
 
-    // arg 1: result table ({ content, is_error, details }).
     lua_runtime.pushJsonValue(co.L, input.result) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.PushFailed,
     };
 
-    // arg 2: ctx table { width, expanded, is_error, args }.
     c.lua_createtable(co.L, 0, 4);
     c.lua_pushinteger(co.L, @intCast(input.width));
     c.lua_setfield(co.L, -2, "width");
@@ -398,9 +381,6 @@ fn runOne(
     }
     if (r.nresults == 0) return &.{};
 
-    // Parse return shape:
-    //   - string → single-line single-span
-    //   - table with .lines (array of line-arrays-of-spans)
     const top = c.lua_gettop(co.L);
     defer c.lua_settop(co.L, top - r.nresults);
 
@@ -410,8 +390,6 @@ fn runOne(
 fn parseReturnValue(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) RenderError![]const Line {
     const ty = c.lua_type(L, idx);
     if (ty == c.LUA_TSTRING) {
-        // shortcut: a non-empty string is a single plain line. An empty
-        // string is the minimal-mode convention for "no result rows".
         const text = try dupeLuaString(arena, L, idx);
         if (text.len == 0) return &.{};
         const spans = try arena.alloc(Span, 1);
@@ -444,8 +422,6 @@ fn parseReturnValue(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) Rende
 }
 
 fn parseLine(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) RenderError!Line {
-    // A line is either a table of spans OR a bare string (which we
-    // coerce to a single default-styled span for ergonomics).
     const ty = c.lua_type(L, idx);
     if (ty == c.LUA_TSTRING) {
         const text = try dupeLuaString(arena, L, idx);
@@ -525,10 +501,6 @@ fn dupeLuaString(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) RenderEr
     return arena.dupe(u8, p[0..len]) catch error.OutOfMemory;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Theme role mapping
-// ─────────────────────────────────────────────────────────────────
-
 fn parseFgColor(name: []const u8) ?theme_mod.FgColor {
     return theme_tokens.parseFgWireName(name);
 }
@@ -536,10 +508,6 @@ fn parseFgColor(name: []const u8) ?theme_mod.FgColor {
 fn parseBgColor(name: []const u8) ?theme_mod.BgColor {
     return theme_tokens.parseBgWireName(name);
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const api = @import("api.zig");

@@ -144,10 +144,6 @@ fn isBlank(src: []const u8) bool {
     return true;
 }
 
-// =================================================================
-// Parser
-// =================================================================
-
 const Parser = struct {
     src: []const u8,
     index: usize,
@@ -228,13 +224,11 @@ const Parser = struct {
         while (i < self.src.len) {
             const c = self.src[i];
             if (c == '"') {
-                // Complete string. Delegate full decode to stdlib.
                 const decoded = try self.decodeStringBody(self.src[body_start..i]);
                 self.index = i + 1;
                 return decoded;
             }
             if (c == '\\') {
-                // Need at least one more byte to know the escape.
                 if (i + 1 >= self.src.len) break;
                 const nxt = self.src[i + 1];
                 switch (nxt) {
@@ -281,7 +275,6 @@ const Parser = struct {
             safe_end = i;
         }
 
-        // EOF inside string.
         if (!self.allow.str) return ParseError.Partial;
         const decoded = try self.decodeStringBody(self.src[body_start..safe_end]);
         self.index = self.src.len;
@@ -331,7 +324,6 @@ const Parser = struct {
                 return .{ .object = obj };
             }
 
-            // Key must be a string; a bare key is malformed.
             if (self.src[self.index] != '"') {
                 if (self.allow.obj) return .{ .object = obj };
                 return ParseError.Malformed;
@@ -344,7 +336,6 @@ const Parser = struct {
                     return err;
                 },
             };
-            // Key is already owned by `self.arena` via decodeStringBody.
 
             self.skipBlank();
             if (self.index >= self.src.len or self.src[self.index] != ':') {
@@ -476,10 +467,6 @@ fn parseHex4(s: []const u8) u32 {
     return r;
 }
 
-// =================================================================
-// Tests
-// =================================================================
-
 const testing = std.testing;
 
 /// Canonicalize a `std.json.Value` to a byte string for structural
@@ -529,23 +516,19 @@ test "incomplete JSON returns the committed object/array prefix under Allow.all"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Mid-string value: the key/value pair is committed with the partial string.
     const mid_string = try parse(alloc, "{\"path\":\"/foo/ba", .all);
     try testing.expect(mid_string == .object);
     try testing.expectEqualStrings("/foo/ba", mid_string.object.get("path").?.string);
 
-    // After ':' no value has been committed yet.
     const after_colon = try parse(alloc, "{\"k\":", .all);
     try testing.expect(after_colon == .object);
     try testing.expectEqual(@as(usize, 0), after_colon.object.count());
 
-    // After ',' the previous value remains, but no empty element is invented.
     const after_comma = try parse(alloc, "[1,", .all);
     try testing.expect(after_comma == .array);
     try testing.expectEqual(@as(usize, 1), after_comma.array.items.len);
     try testing.expectEqual(@as(i64, 1), after_comma.array.items[0].integer);
 
-    // Truncated literal and number tokens complete only when their Allow bits are set.
     const literal = try parse(alloc, "{\"ok\":tru", .all);
     try testing.expect(literal.object.get("ok").?.bool);
     const number = try parse(alloc, "{\"n\":1.5e", .all);

@@ -163,7 +163,6 @@ fn execute(
         return util.errorResult(allocator, "edit tool: failed to acquire file lock");
     defer lock_registry.global().release(lock_entry);
 
-    // Build the EditBlock list from either single-mode args or `edits`.
     var edits: std.ArrayList(EditBlock) = .empty;
     defer edits.deinit(allocator);
 
@@ -192,7 +191,6 @@ fn execute(
     } else {
         return util.errorResult(allocator, "edit tool: input must be canonicalized to a non-empty edits array before execution.");
     }
-    // Free the per-edit allocs at the end.
     defer for (edits.items) |e| {
         allocator.free(e.old_str);
         allocator.free(e.new_str);
@@ -223,7 +221,6 @@ fn execute(
         allocator.dupe(u8, resolved) catch return util.errorResult(allocator, "alloc failed");
     defer allocator.free(io_path);
 
-    // Read file.
     const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, io_path, .{}) catch |err| {
         if (err == error.FileNotFound)
             return util.errorf(allocator, "file not found: {s}", .{resolved});
@@ -251,7 +248,6 @@ fn execute(
         return util.errorResult(allocator, "alloc failed");
     defer allocator.free(normalized);
 
-    // Apply edits. May allocate a fuzzy-normalized base + new content.
     var failure: ?EditFailure = null;
     const apply_result = applyEdits(allocator, normalized, edits.items, &failure) catch |err| {
         return formatEditError(allocator, err, failure, edits.items);
@@ -267,7 +263,6 @@ fn execute(
         return util.errorResult(allocator, "no changes made — replacement produced identical content.");
     }
 
-    // Write back, restoring CRLF if the file used it.
     const final_bytes = if (ending == .crlf)
         restoreCrlf(allocator, new_content) catch return util.errorResult(allocator, "alloc failed")
     else
@@ -321,8 +316,6 @@ fn tryTruncateOwnedText(allocator: std.mem.Allocator, owned: []u8) ![]u8 {
     return truncated;
 }
 
-// ── line ending handling ────────────────────────────────────────────
-
 const LineEnding = enum { lf, crlf };
 
 fn detectLineEnding(s: []const u8) LineEnding {
@@ -333,7 +326,6 @@ fn detectLineEnding(s: []const u8) LineEnding {
 }
 
 fn normalizeToLfDup(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    // Convert \r\n → \n and stray \r → \n.
     var out = try allocator.alloc(u8, s.len);
     var n: usize = 0;
     var i: usize = 0;
@@ -382,15 +374,12 @@ fn atomicWriteFile(path: []const u8, bytes: []const u8, permissions: std.Io.File
     try atomic_file.replace(std.Options.debug_io);
 }
 
-// ── tier-3 fuzzy normalization ──────────────────────────────────────
-//
 // pi-mono normalizes via NFKC + trailing-whitespace trim + smart-quote
 // normalization. We skip NFKC (no unicode tables in std) and do the
 // trim + the most common smart-quote / dash / nbsp substitutions, which
 // covers >95% of the cases the fuzzy tier exists for.
 
 fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    // Substitute multi-byte UTF-8 characters in-place into a writer.
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, s.len);
@@ -454,7 +443,6 @@ fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         i += 1;
     }
 
-    // Trim trailing whitespace per line.
     var trimmed: std.ArrayList(u8) = .empty;
     defer trimmed.deinit(allocator);
     try trimmed.ensureTotalCapacity(allocator, out.items.len);
@@ -471,8 +459,6 @@ fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     }
     return trimmed.toOwnedSlice(allocator);
 }
-
-// ── escape unescape (tier 2) ────────────────────────────────────────
 
 fn unescapeStrDup(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -499,8 +485,6 @@ fn unescapeStrDup(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     }
     return out.toOwnedSlice(allocator);
 }
-
-// ── matching engine ─────────────────────────────────────────────────
 
 const ApplyResult = struct {
     base: []const u8,
@@ -796,8 +780,6 @@ fn applyEdits(
     return .{ .base = base, .new_content = new_content };
 }
 
-// ── redaction guard ─────────────────────────────────────────────────
-
 const REDACTION_NEEDLES = [_][]const u8{
     "[REDACTED]",
     "// ... existing code",
@@ -822,13 +804,10 @@ fn findRedactionMarker(old_str: []const u8, new_str: []const u8) ?[]const u8 {
 // proper Myers algorithm, real hunks, shared with any future UI that
 // wants to display diffs.
 
-// ── error formatting ────────────────────────────────────────────────
-//
 // `applyEdits` raises bare error tags (NotFound / Ambiguous / Overlap).
 // The caller pairs each tag with the populated `EditFailure` to build
 // a message the model can ACT ON: which edit failed, why, and a
 // preview of the offending old_str so it can correct course.
-//
 // Without this the model just sees "NotFound" and retries the same
 // broken edit forever.
 

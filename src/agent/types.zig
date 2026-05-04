@@ -2,7 +2,6 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 
-// Re-export ai protocol for convenience
 pub const Message = ai.protocol.Message;
 pub const AssistantMessage = ai.protocol.AssistantMessage;
 pub const AssistantMessageEvent = ai.protocol.AssistantMessageEvent;
@@ -400,7 +399,6 @@ pub const AgentLoopConfig = struct {
     after_tool_call: ?AfterToolCallHook = null,
     on_payload: ?OnPayloadHook = null,
 
-    // StreamOptions fields inlined from SimpleStreamOptions
     io: std.Io = std.Options.debug_io,
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
@@ -449,10 +447,6 @@ pub const AgentEvent = union(enum) {
 /// Agent event callback.
 pub const AgentEventSink = *const fn (event: AgentEvent, ctx: ?*anyopaque) void;
 
-// -----------------------------------------------------------------------------
-// Tests: AgentToolResult.clone / free
-// -----------------------------------------------------------------------------
-
 test "AgentToolResult clone+free round-trip with text content" {
     const allocator = std.testing.allocator;
 
@@ -469,7 +463,6 @@ test "AgentToolResult clone+free round-trip with text content" {
     try std.testing.expectEqualStrings("hello world", cloned.content[0].text.text);
     try std.testing.expectEqualStrings("sig123", cloned.content[0].text.text_signature.?);
     try std.testing.expect(cloned.is_error);
-    // verify independence
     try std.testing.expect(cloned.content.ptr != original.content.ptr);
     try std.testing.expect(cloned.content[0].text.text.ptr != original.content[0].text.text.ptr);
 }
@@ -494,7 +487,6 @@ test "AgentToolResult clone+free round-trip with image content" {
 test "AgentToolResult clone+free with json details" {
     const allocator = std.testing.allocator;
 
-    // Build a json object for details
     var obj: std.json.ObjectMap = .{};
     try obj.put(allocator, "key", .{ .string = "value" });
     defer {
@@ -513,4 +505,3 @@ test "AgentToolResult clone+free with json details" {
     const val = cloned.details.object.get("key").?;
     try std.testing.expectEqualStrings("value", val.string);
 }
-

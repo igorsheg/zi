@@ -147,8 +147,6 @@ const FixedBuilder = struct {
     }
 };
 
-// --- SlashCommandProvider ---
-//
 // zi-wub.19: this provider runs on the TUI thread on every keystroke.
 // Today the registry it reads is TUI-owned and its `dynamic` arm is
 // empty (no extension registers a slash command yet), so the read is
@@ -691,7 +689,6 @@ pub const CombinedAutocompleteProvider = struct {
         }
     }
 
-
     fn finishAsyncSearch(self: *CombinedAutocompleteProvider) ?Suggestions {
         defer self.cancelAsyncSearch();
 
@@ -735,7 +732,6 @@ pub const CombinedAutocompleteProvider = struct {
             .auto_accept_single_on_tab = self.async_search.auto_accept_single_on_tab,
         };
     }
-
 
     fn cancelAsyncSearch(self: *CombinedAutocompleteProvider) void {
         self.async_search.reset();
@@ -1121,9 +1117,6 @@ fn asciiLessThanIgnoreCase(a: []const u8, b: []const u8) bool {
     return a.len < b.len;
 }
 
-
-// --- Tests ---
-
 const TestSink = struct {
     result: ?Suggestions = null,
 
@@ -1222,7 +1215,6 @@ test "CombinedAutocompleteProvider covers path activation and forced slash argum
     try std.testing.expect(hasItem(regular_path.result.?.items, "./docs/"));
     try std.testing.expectEqual(ReplaceRange{ .start_byte = 4, .end_byte = 8 }, regular_path.result.?.replace_range);
 }
-
 
 test "CombinedAutocompleteProvider async at-file search respects ignore and hidden path boundaries" {
     var tmp = std.testing.tmpDir(.{});

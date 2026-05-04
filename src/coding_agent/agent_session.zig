@@ -726,7 +726,6 @@ pub const AgentSession = struct {
 
         self.emitAgentEvent(event);
 
-        // Session persistence on message_end
         switch (event) {
             .message_end => |me| {
                 const entry_id = self.session_store.appendMessage(me.message) orelse return;
@@ -740,7 +739,6 @@ pub const AgentSession = struct {
         }
     }
 
-    // -- Stream hook wrapping provider registry + auth -----------------------
     // pi-mono injects auth in the streamFn closure (sdk.ts:274-283).
     // We do the same: capture registry + api_key so the Agent doesn't need
     // to thread auth through AgentLoopConfig.
@@ -748,8 +746,6 @@ pub const AgentSession = struct {
 };
 
 pub const convertToLlm = message_conversion.convertToLlm;
-
-// ── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -944,8 +940,6 @@ test "trySetModel rejects unauthed model without mutating state or session" {
     try testing.expectEqualStrings(initial.id, ca.agent.modelValue().id);
     try testing.expectEqual(@as(usize, 0), ca.session_store.writer.buffered_entries.items.len);
 }
-
-// ── AgentSession e2e tests (ported from pi-mono test-harness.test.ts) ───
 
 const faux = ai.faux;
 
@@ -1395,7 +1389,6 @@ test "AgentSession refreshes visible tools and prompt after runtime tool registr
     try testing.expect(found);
 }
 
-// pi-mono test-harness.test.ts: "error response"
 test "AgentSession: error response sets stop_reason" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1419,7 +1412,6 @@ test "AgentSession: error response sets stop_reason" {
     const assistant = ca.agent.messages()[1].assistant;
     try testing.expectEqual(ai.protocol.StopReason.@"error", assistant.stop_reason);
 }
-// pi-mono test-harness.test.ts: "response sequence"
 test "AgentSession: response sequence across multiple prompts" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1445,7 +1437,6 @@ test "AgentSession: response sequence across multiple prompts" {
 
     try testing.expectEqual(@as(usize, 2), fp.call_count);
     try testing.expectEqual(@as(usize, 4), ca.agent.messages().len);
-    // user, assistant("first"), user, assistant("second")
     const a1 = ca.agent.messages()[1].assistant;
     switch (a1.content[0]) {
         .text => |t| try testing.expectEqualStrings("first", t.text),
@@ -1458,7 +1449,6 @@ test "AgentSession: response sequence across multiple prompts" {
     }
 }
 
-// session persistence: prompt → JSONL written → read back → context matches
 test "AgentSession: session persistence round-trip" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1477,16 +1467,13 @@ test "AgentSession: session persistence round-trip" {
 
     try ca.run("persist me");
 
-    // Session should have been flushed (assistant message triggers flush)
     try testing.expect(ca.sessionFlushed());
     const session_file = ca.getSessionFile();
 
-    // Read back the session file
     var loaded = try SessionStore.openForResume(allocator, session_file);
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
-    // First message: user
     try testing.expect(loaded.messages[0] == .user);
     switch (loaded.messages[0].user.content) {
         .text => |t| try testing.expectEqualStrings("persist me", t),
@@ -1496,7 +1483,6 @@ test "AgentSession: session persistence round-trip" {
         },
     }
 
-    // Second message: assistant with correct text
     try testing.expect(loaded.messages[1] == .assistant);
     const a = loaded.messages[1].assistant;
     try testing.expectEqual(@as(usize, 1), a.content.len);
@@ -1505,11 +1491,9 @@ test "AgentSession: session persistence round-trip" {
         else => return error.ExpectedTextBlock,
     }
 
-    // Clean up the session file
     std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, session_file) catch {};
 }
 
-// tool call round-trip: faux returns tool_call → tool executes → faux called again
 test "AgentSession: tool call triggers execution and second LLM call" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1517,11 +1501,9 @@ test "AgentSession: tool call triggers execution and second LLM call" {
 
     var fp = faux.FauxProvider.init(allocator);
 
-    // First response: tool call
     const tc_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
         faux.fauxToolCall("echo", "tc-1", .null),
     };
-    // Second response: text after tool result
     const text_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("done after tool")};
     fp.setResponses(&.{
         faux.fauxAssistantMessage(allocator, &tc_content, .toolUse),
@@ -1531,7 +1513,6 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     var registry = ai.provider.Registry.init(allocator);
     try registry.register("faux", fp.provider(), null);
 
-    // Simple echo tool
     const echo_tool = tool_def.ToolDefinition{
         .name = "echo",
         .description = "echo",
@@ -1562,22 +1543,18 @@ test "AgentSession: tool call triggers execution and second LLM call" {
 
     try ca.run("use the tool");
 
-    // Faux called twice: once for tool call, once after tool result
     try testing.expectEqual(@as(usize, 2), fp.call_count);
 
-    // Messages: user, assistant(tool_call), tool_result, assistant(text)
     try testing.expectEqual(@as(usize, 4), ca.agent.messages().len);
     try testing.expect(ca.agent.messages()[0] == .user);
     try testing.expect(ca.agent.messages()[1] == .assistant);
     try testing.expect(ca.agent.messages()[2] == .tool_result);
     try testing.expect(ca.agent.messages()[3] == .assistant);
 
-    // Verify tool result content
     const tr = ca.agent.messages()[2].tool_result;
     try testing.expectEqualStrings("echo", tr.tool_name);
     try testing.expectEqual(@as(usize, 1), tr.content.len);
 
-    // Verify tool_execution events fired
     try testing.expect(collector.countType(.tool_execution_start) >= 1);
     try testing.expect(collector.countType(.tool_execution_end) >= 1);
 }
@@ -1634,13 +1611,11 @@ test "AgentSession: startNewSession switches ephemeral sessions onto normal pers
     try testing.expect(ca.session_store.sessionFile().len > 0);
 }
 
-// --continue round-trip: write session → load → continue → verify context sent to provider
 test "AgentSession: continue sends restored context to provider" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Phase 1: create a session with one exchange
     var fp1 = faux.FauxProvider.init(allocator);
     const c1 = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("first response")};
     fp1.setResponses(&.{faux.fauxAssistantMessage(allocator, &c1, .stop)});
@@ -1664,7 +1639,6 @@ test "AgentSession: continue sends restored context to provider" {
     try testing.expect(ca1.sessionFlushed());
     const session_file = ca1.getSessionFile();
 
-    // Phase 2: load the session and continue with a new user message
     var loaded = try SessionStore.openForResume(allocator, session_file);
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
@@ -1677,7 +1651,6 @@ test "AgentSession: continue sends restored context to provider" {
     try reg2.register("faux", fp2.provider(), null);
 
     var col2 = EventCollector.init(allocator);
-    // Seed with loaded messages + a new user prompt
     const new_user = protocol.AgentMessage{ .user = .{
         .content = .{ .text = "follow up" },
         .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
@@ -1699,22 +1672,17 @@ test "AgentSession: continue sends restored context to provider" {
     });
     defer ca2.deinit();
 
-    // Continue — should send the full context to the provider
     try ca2.continueSession();
 
     try testing.expectEqual(@as(usize, 1), fp2.call_count);
 
-    // Provider should have received context with restored messages
     try testing.expectEqual(@as(usize, 1), fp2.captured_contexts.items.len);
     const ctx = fp2.captured_contexts.items[0];
-    // Context should have at least 3 LLM messages: user("hello"), assistant("first response"), user("follow up")
     try testing.expect(ctx.messages.len >= 3);
 
-    // Clean up
     std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, session_file) catch {};
 }
 
-// convertToLlm through the loop: compaction_summary in initial state → provider receives wrapped text
 test "AgentSession: compaction_summary converted to user message for provider" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1729,7 +1697,6 @@ test "AgentSession: compaction_summary converted to user message for provider" {
 
     var collector = EventCollector.init(allocator);
 
-    // Seed with compaction_summary + user message
     const initial = [_]protocol.AgentMessage{
         .{ .compaction_summary = .{ .summary = "Previous work done", .tokens_before = 5000, .timestamp = 1 } },
         .{ .user = .{ .content = .{ .text = "next question" }, .timestamp = 2 } },
@@ -1747,20 +1714,16 @@ test "AgentSession: compaction_summary converted to user message for provider" {
     });
     defer ca.deinit();
 
-    // Continue from the seeded state (last message is user, so continue works)
     try ca.continueSession();
 
     try testing.expectEqual(@as(usize, 1), fp.call_count);
     try testing.expectEqual(@as(usize, 1), fp.captured_contexts.items.len);
 
     const ctx = fp.captured_contexts.items[0];
-    // convertToLlm should have converted compaction_summary → user message with <summary> tags
-    // So provider sees: user(compaction), user("next question") = 2 messages
     try testing.expectEqual(@as(usize, 2), ctx.messages.len);
     try testing.expect(ctx.messages[0] == .user);
     try testing.expect(ctx.messages[1] == .user);
 
-    // First message should contain the summary wrapped in tags
     const first_user = ctx.messages[0].user;
     switch (first_user.content) {
         .blocks => |blocks| {
@@ -1809,7 +1772,6 @@ test "AgentSession: runUserContent forwards text and image blocks to the provide
     }
 }
 
-// pi-mono test-harness.test.ts: "streams text deltas"
 test "AgentSession: text deltas reconstruct full response" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1831,7 +1793,6 @@ test "AgentSession: text deltas reconstruct full response" {
     const deltas = collector.getTextDeltas();
     try testing.expect(deltas.len > 0);
 
-    // Reconstruct — faux sends full text as one delta
     var total_len: usize = 0;
     for (deltas) |d| total_len += d.len;
     var buf = try allocator.alloc(u8, total_len);
@@ -1843,7 +1804,6 @@ test "AgentSession: text deltas reconstruct full response" {
     try testing.expectEqualStrings("hello world", buf);
 }
 
-// pi-mono test-harness.test.ts: "streams thinking deltas"
 test "AgentSession: thinking events emitted for thinking content" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1865,7 +1825,6 @@ test "AgentSession: thinking events emitted for thinking content" {
 
     try ca.run("hi");
 
-    // Check for thinking events in message_update
     var thinking_starts: usize = 0;
     var thinking_deltas: usize = 0;
     var thinking_ends: usize = 0;
@@ -1938,7 +1897,6 @@ pub const ExtensionCommandContext = struct {
     // (AgentSession, SessionStore, ExtensionRunner) that would create
     // circular deps. The ExtensionRunner binds real fn pointers into
     // these slots in bindRuntime() once the command registry is active.
-    //
     // v1: all null. v2: runner populates before dispatching commands.
 
     wait_for_idle: ?*const fn (ctx: *anyopaque) anyerror!void = null,

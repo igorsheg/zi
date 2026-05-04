@@ -18,8 +18,6 @@ pub const ParseResult = struct {
     }
 };
 
-// ─── Parsing ────────────────────────────────────────────────────────
-
 /// Parse a JSON string into typed Settings.
 /// All allocated memory (string array slices, packages) lives in the parsed
 /// arena — calling `ParseResult.deinit()` frees everything.
@@ -34,7 +32,6 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
     var settings: types.Settings = .{};
     const obj = &parsed.value.object;
 
-    // ── string fields ──
     if (obj.get("lastChangelogVersion")) |v| {
         if (v == .string) settings.last_changelog_version = v.string;
     }
@@ -57,7 +54,6 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
         if (v == .string) settings.session_dir = v.string;
     }
 
-    // ── enum fields ──
     if (obj.get("defaultThinkingLevel")) |v| {
         if (v == .string) settings.default_thinking_level = types.defaultThinkingLevelFromString(v.string);
     }
@@ -77,7 +73,6 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
         if (v == .string) settings.tree_filter_mode = types.treeFilterModeFromString(v.string);
     }
 
-    // ── bool fields ──
     if (obj.get("hideThinkingBlock")) |v| {
         if (v == .bool) settings.hide_thinking_block = v.bool;
     }
@@ -94,7 +89,6 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
         if (v == .bool) settings.show_hardware_cursor = v.bool;
     }
 
-    // ── integer fields ──
     if (obj.get("editorPaddingX")) |v| {
         if (v == .integer) settings.editor_padding_x = v.integer;
     }
@@ -102,7 +96,6 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
         if (v == .integer) settings.autocomplete_max_visible = v.integer;
     }
 
-    // ── nested struct fields ──
     if (obj.get("compaction")) |v| {
         if (v == .object) settings.compaction = parseCompaction(&v.object);
     }
@@ -125,7 +118,6 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
         if (v == .object) settings.markdown = parseMarkdown(&v.object);
     }
 
-    // ── string array fields ──
     if (obj.get("extensions")) |v| {
         settings.extensions = try parseStringArray(arena, v);
     }
@@ -145,20 +137,16 @@ pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8)
         settings.npm_command = try parseStringArray(arena, v);
     }
 
-    // ── packages (union array) ──
     if (obj.get("packages")) |v| {
         settings.packages = try parsePackages(arena, v);
     }
 
-    // ── custom models ──
     if (obj.get("models")) |v| {
         settings.models = try parseCustomModels(arena, v);
     }
 
     return .{ .settings = settings, .parsed = parsed };
 }
-
-// ─── Nested Struct Parsers ──────────────────────────────────────────
 
 fn parseCompaction(obj: *const ObjectMap) types.CompactionSettings {
     var c: types.CompactionSettings = .{};
@@ -319,7 +307,6 @@ fn parseCustomModels(arena: std.mem.Allocator, v: Value) !?[]const types.CustomM
         if (item != .object) continue;
         const obj = &item.object;
 
-        // Required string fields
         const id = if (obj.get("id")) |val| (if (val == .string) val.string else null) else null;
         const api = if (obj.get("api")) |val| (if (val == .string) val.string else null) else null;
         const provider = if (obj.get("provider")) |val| (if (val == .string) val.string else null) else null;
@@ -335,7 +322,6 @@ fn parseCustomModels(arena: std.mem.Allocator, v: Value) !?[]const types.CustomM
             .base_url = base_url.?,
         };
 
-        // Optional fields
         if (obj.get("reasoning")) |val| {
             if (val == .bool) model.reasoning = val.bool;
         }
@@ -349,7 +335,6 @@ fn parseCustomModels(arena: std.mem.Allocator, v: Value) !?[]const types.CustomM
             if (val == .integer) model.max_tokens = @intCast(val.integer);
         }
 
-        // Nested cost object
         if (obj.get("cost")) |cost_val| {
             if (cost_val == .object) {
                 const cost_obj = &cost_val.object;
@@ -376,8 +361,6 @@ fn jsonToFloat(v: Value) f64 {
     };
 }
 
-// ─── Deep Merge ─────────────────────────────────────────────────────
-
 /// Deep merge: overrides take precedence over base.
 /// For nested structs, sub-fields merge (override non-null fields only).
 /// For primitives and arrays, override replaces entirely.
@@ -386,7 +369,6 @@ fn jsonToFloat(v: Value) f64 {
 pub fn deepMergeSettings(base: types.Settings, overrides: types.Settings) types.Settings {
     var result = base;
 
-    // ── simple fields: override wins if non-null ──
     if (overrides.last_changelog_version) |v| result.last_changelog_version = v;
     if (overrides.default_provider) |v| result.default_provider = v;
     if (overrides.default_model) |v| result.default_model = v;
@@ -408,7 +390,6 @@ pub fn deepMergeSettings(base: types.Settings, overrides: types.Settings) types.
     if (overrides.show_hardware_cursor) |v| result.show_hardware_cursor = v;
     if (overrides.session_dir) |v| result.session_dir = v;
 
-    // ── array fields: override replaces entirely ──
     if (overrides.npm_command) |v| result.npm_command = v;
     if (overrides.packages) |v| result.packages = v;
     if (overrides.extensions) |v| result.extensions = v;
@@ -418,7 +399,6 @@ pub fn deepMergeSettings(base: types.Settings, overrides: types.Settings) types.
     if (overrides.enabled_models) |v| result.enabled_models = v;
     if (overrides.models) |v| result.models = v;
 
-    // ── nested structs: merge sub-fields ──
     if (overrides.compaction) |ov| {
         if (result.compaction) |base_c| {
             var merged = base_c;
@@ -497,8 +477,6 @@ pub fn deepMergeSettings(base: types.Settings, overrides: types.Settings) types.
     return result;
 }
 
-// ─── Serialization ──────────────────────────────────────────────────
-
 /// Serialize a raw JSON ObjectMap to a pretty-printed JSON string (2-space indent).
 pub fn serializeSettingsObject(allocator: std.mem.Allocator, object: ObjectMap) ![]const u8 {
     return std.json.Stringify.valueAlloc(
@@ -519,7 +497,6 @@ pub fn writeSettings(writer: *std.Io.Writer, settings: *const types.Settings) !v
 }
 
 fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
-    // ── string fields ──
     if (settings.last_changelog_version) |v| {
         try jw.objectField("lastChangelogVersion");
         try jw.write(v);
@@ -549,7 +526,6 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         try jw.write(v);
     }
 
-    // ── enum fields ──
     if (settings.default_thinking_level) |v| {
         try jw.objectField("defaultThinkingLevel");
         try jw.write(types.defaultThinkingLevelToString(v));
@@ -575,7 +551,6 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         try jw.write(types.treeFilterModeToString(v));
     }
 
-    // ── bool fields ──
     if (settings.hide_thinking_block) |v| {
         try jw.objectField("hideThinkingBlock");
         try jw.write(v);
@@ -597,7 +572,6 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         try jw.write(v);
     }
 
-    // ── integer fields ──
     if (settings.editor_padding_x) |v| {
         try jw.objectField("editorPaddingX");
         try jw.write(v);
@@ -607,7 +581,6 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         try jw.write(v);
     }
 
-    // ── nested struct fields ──
     if (settings.compaction) |c| {
         try jw.objectField("compaction");
         try jw.beginObject();
@@ -716,7 +689,6 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         try jw.endObject();
     }
 
-    // ── string array fields ──
     if (settings.extensions) |arr| {
         try jw.objectField("extensions");
         try writeStringArray(jw, arr);
@@ -742,7 +714,6 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         try writeStringArray(jw, arr);
     }
 
-    // ── packages ──
     if (settings.packages) |pkgs| {
         try jw.objectField("packages");
         try jw.beginArray();
@@ -776,7 +747,6 @@ fn writeSettingsFields(jw: *Stringify, settings: *const types.Settings) !void {
         try jw.endArray();
     }
 
-    // ── custom models ──
     if (settings.models) |models| {
         try jw.objectField("models");
         try jw.beginArray();
@@ -828,8 +798,6 @@ fn writeStringArray(jw: *Stringify, arr: []const []const u8) !void {
     for (arr) |s| try jw.write(s);
     try jw.endArray();
 }
-
-// ─── Apply Typed Field to Raw ───────────────────────────────────────
 
 /// Apply a typed settings field value to a raw JSON object.
 /// Used during merge-on-write: only modified fields get written back.
@@ -1003,8 +971,6 @@ pub fn applyTypedFieldToRaw(
     }
 }
 
-// ─── Apply Nested Field to Raw ──────────────────────────────────────
-
 /// Apply a single nested field within a settings struct to the raw object.
 /// e.g., field=compaction, nested_key="enabled" → sets raw["compaction"]["enabled"]
 /// pi-mono: settings-manager.ts:464-471 (nested merge in persistScopedSettings)
@@ -1100,8 +1066,6 @@ pub fn applyTypedNestedFieldToRaw(
     try object.put(allocator, json_key, .{ .object = nested });
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────
-
 fn putOptionalString(allocator: std.mem.Allocator, object: *ObjectMap, key: []const u8, value: ?[]const u8) !void {
     if (value) |v| try object.put(allocator, key, .{ .string = v });
 }
@@ -1125,8 +1089,6 @@ fn buildJsonStringArray(allocator: std.mem.Allocator, arr: []const []const u8) !
     for (arr) |s| try json_arr.append(.{ .string = s });
     return Value{ .array = json_arr };
 }
-
-// ─── Tests ──────────────────────────────────────────────────────────
 
 test "parseSettingsJson round-trips all field categories" {
     const testing = std.testing;

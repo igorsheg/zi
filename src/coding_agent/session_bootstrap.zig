@@ -606,7 +606,6 @@ fn buildExtensionRuntime(
         }
     }
 
-    // Build shared `lua/` search paths from the canonical ordered root list.
     const roots = resource_loader.getExtensionRoots();
     var lua_dirs: std.ArrayList([]const u8) = .empty;
     defer {

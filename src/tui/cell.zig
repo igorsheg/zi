@@ -107,19 +107,14 @@ pub const CursorStyle = enum {
     bar,
 };
 
-
 test "Cell equality distinguishes all fields" {
     const a = Cell.blank;
     try std.testing.expect(a.eql(Cell.blank));
 
-    // Different fg
     try std.testing.expect(!a.eql(Cell{ .fg = Color.rgb(255, 0, 0) }));
     try std.testing.expect(!a.eql(Cell{ .fg = Color.indexed(42) }));
-    // Different grapheme
     try std.testing.expect(!a.eql(Cell{ .grapheme = .{ .codepoint = 'X' } }));
-    // Grapheme union tags
     const pooled = Grapheme{ .pooled = 42 };
     try std.testing.expect(!pooled.eql(Grapheme{ .codepoint = 'A' }));
-    // Attributes are 1 byte packed
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(Attributes));
 }

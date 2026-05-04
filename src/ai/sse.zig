@@ -24,7 +24,6 @@ pub const max_event_data_bytes: usize = 1024 * 1024;
 
 pub const SseParser = struct {
     allocator: std.mem.Allocator,
-    // Per-event buffers (cleared on event dispatch)
     event_buf: [256]u8 = undefined,
     event_len: usize = 0,
     id_buf: [512]u8 = undefined,
@@ -33,7 +32,6 @@ pub const SseParser = struct {
     needs_reset: bool = false,
     data_buf: std.ArrayListUnmanaged(u8) = .empty,
 
-    // Persistent state (survives event boundaries)
     last_event_id_buf: [512]u8 = undefined,
     last_event_id_len: usize = 0,
     retry_ms: ?u64 = null,
@@ -56,7 +54,6 @@ pub const SseParser = struct {
     pub fn feedLine(self: *SseParser, line: []const u8) error{ OutOfMemory, EventDataTooLarge }!?SseEvent {
         if (self.needs_reset and line.len != 0) self.reset();
 
-        // Blank line → dispatch event if we have data
         if (line.len == 0) {
             if (self.data_buf.items.len == 0) {
                 self.reset();
@@ -75,7 +72,6 @@ pub const SseParser = struct {
                 .data = self.data_buf.items[0..dlen],
             };
 
-            // Persist id for subsequent events
             if (self.has_id) {
                 @memcpy(self.last_event_id_buf[0..self.id_len], self.id_buf[0..self.id_len]);
                 self.last_event_id_len = self.id_len;
@@ -85,10 +81,8 @@ pub const SseParser = struct {
             return evt;
         }
 
-        // Comment line
         if (line[0] == ':') return null;
 
-        // Parse field:value
         var field: []const u8 = "";
         var value: []const u8 = "";
 
@@ -98,7 +92,6 @@ pub const SseParser = struct {
             if (v.len > 0 and v[0] == ' ') v = v[1..];
             value = v;
         } else {
-            // Entire line is the field name, value is empty string
             field = line;
         }
 
@@ -262,10 +255,6 @@ fn flushPendingLines(
     std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[start..]);
     pending.items.len = remaining;
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 fn expectNoEvent(parser: *SseParser, line: []const u8) !void {
     try std.testing.expectEqual(@as(?SseEvent, null), try parser.feedLine(line));

@@ -633,11 +633,6 @@ pub const ExtensionRunner = struct {
     /// custom top-level tools instead of the default builtin set.
     builtin_tool_definitions: []const tool_def.ToolDefinition = &.{},
 
-    // Future fields documented as comments so the runner shape is
-    // visible without compiling unused state:
-    //
-    //   flag_values: std.StringHashMap(FlagValue) = .empty,  — v2
-
     pub fn init(allocator: std.mem.Allocator, generation: Generation) ExtensionRunner {
         return .{
             .allocator = allocator,
@@ -765,9 +760,6 @@ pub const ExtensionRunner = struct {
 
     pub fn assertOnLuaThread(self: *ExtensionRunner) void {
         const tid = std.Thread.getCurrentId();
-        // Try to claim ownership if it's still vacant. cmpxchgStrong
-        // is race-free: if two threads try to claim simultaneously,
-        // exactly one wins and the loser sees the winner's id.
         const prev = self.lua_owner_thread.cmpxchgStrong(
             0,
             tid,
@@ -790,14 +782,6 @@ pub const ExtensionRunner = struct {
     }
 
     pub fn deinit(self: *ExtensionRunner) void {
-        // Tear down in REVERSE construction order. The provider
-        // queue holds Lua registry refs that the lua_state (when
-        // we add it) will collect on close — destroying registries
-        // first then closing the state is correct because the refs
-        // are integers, not pointers, so order doesn't matter for
-        // memory safety. Order matters only when v2 adds tool ctx
-        // wrappers that hold zig pointers into runner state; D9
-        // will revisit this.
         self.clearAsyncState();
         self.provider_queue.deinit();
         self.keybinding_registry.deinit();
@@ -807,7 +791,6 @@ pub const ExtensionRunner = struct {
         self.loaded_extensions.deinit(self.allocator);
         self.hook_arena.deinit();
 
-        // Free module-context state.
         var it = self.module_roots.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -1102,10 +1085,8 @@ pub const ExtensionRunner = struct {
             return error.InvalidHandlerRef;
         }
 
-        // arg 1: args string
         _ = lua_runtime.c.lua_pushlstring(co.L, args.ptr, args.len);
 
-        // arg 2: command context
         context_mod.pushCommandContext(co.L, self, cmd.source.provenance) catch {
             lua_runtime.c.lua_pop(co.L, 2); // args + handler
             return error.ContextPushFailed;
@@ -1128,7 +1109,6 @@ pub const ExtensionRunner = struct {
             .ok, .finished => {},
         }
 
-        // Discard any return values.
         const top = lua_runtime.c.lua_gettop(co.L);
         if (r.nresults > 0) {
             lua_runtime.c.lua_settop(co.L, top - r.nresults);
@@ -1540,20 +1520,17 @@ pub const ExtensionRunner = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
-        // Private root first.
         if (provenance) |prov| {
             if (self.module_roots.get(prov.state_owner_id)) |private_root| {
                 buf.print(self.allocator, "{s}/?.lua;{s}/?/init.lua", .{ private_root, private_root }) catch {};
             }
         }
 
-        // Shared lua/ anchors from canonical roots.
         if (self.shared_lua_paths) |shared| {
             if (buf.items.len > 0) buf.append(self.allocator, ';') catch {};
             buf.appendSlice(self.allocator, shared) catch {};
         }
 
-        // Default Lua search paths (builtin libraries).
         if (self.base_package_path) |base| {
             if (buf.items.len > 0) buf.append(self.allocator, ';') catch {};
             buf.appendSlice(self.allocator, base) catch {};
@@ -1607,10 +1584,6 @@ fn pushStringField(L: *lua_runtime.c.lua_State, comptime field: [:0]const u8, va
     _ = c.lua_pushlstring(L, value.ptr, value.len);
     c.lua_setfield(L, -2, field.ptr);
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 test "ExtensionRunner lifecycle binds once and unbinds to stub" {
     const allocator = std.testing.allocator;

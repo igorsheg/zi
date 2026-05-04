@@ -82,7 +82,6 @@ pub fn buildSessionContext(
         return .{ .messages = &.{}, .thinking_level = "off", .model = null };
     }
 
-    // Extract settings and find compaction
     var thinking_level: []const u8 = "off";
     var model: ?SessionContext.ModelInfo = null;
     var compaction_path_pos: ?usize = null;
@@ -106,11 +105,9 @@ pub fn buildSessionContext(
         }
     }
 
-    // Build messages
     var messages: std.ArrayListUnmanaged(agent.protocol.AgentMessage) = .empty;
 
     if (compaction_data) |cd| {
-        // pi-mono: createCompactionSummaryMessage (messages.ts:109-119)
         try messages.append(allocator, .{ .compaction_summary = .{
             .summary = cd.summary,
             .tokens_before = cd.tokens_before,
@@ -119,7 +116,6 @@ pub fn buildSessionContext(
 
         const compaction_pos = compaction_path_pos.?;
 
-        // Emit kept messages (before compaction, starting from firstKeptEntryId)
         var found_first_kept = false;
         for (path[0..compaction_pos]) |entry| {
             if (std.mem.eql(u8, entry.id, cd.first_kept_entry_id)) {
@@ -130,7 +126,6 @@ pub fn buildSessionContext(
             }
         }
 
-        // Emit messages after compaction
         if (compaction_pos + 1 < path.len) {
             for (path[compaction_pos + 1 ..]) |entry| {
                 if (extractMessage(&entry)) |msg| try messages.append(allocator, msg);
@@ -167,7 +162,6 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
     switch (entry.entry) {
         .message => |m| return m.message,
         .custom_message => |cm| {
-            // pi-mono: createCustomMessage (messages.ts:122-137)
             return .{ .custom = .{
                 .custom_type = cm.custom_type,
                 .content = cm.content,
@@ -178,7 +172,6 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
         },
         .branch_summary => |bs| {
             if (bs.summary.len > 0) {
-                // pi-mono: createBranchSummaryMessage (messages.ts:100-107)
                 return .{ .branch_summary = .{
                     .summary = bs.summary,
                     .from_id = bs.from_id,
@@ -191,8 +184,6 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
     }
 }
 
-// ─── Test helpers (ported from pi-mono build-context.test.ts) ────────
-
 fn testMsg(allocator: std.mem.Allocator, id: []const u8, parent_id: ?[]const u8, role: enum { user, assistant }, text: []const u8) proto.SessionEntry {
     return .{
         .id = id,
@@ -203,7 +194,6 @@ fn testMsg(allocator: std.mem.Allocator, id: []const u8, parent_id: ?[]const u8,
                 .message = switch (role) {
                     .user => .{ .user = .{ .content = .{ .text = text }, .timestamp = 1 } },
                     .assistant => blk: {
-                        // Allocate content block on the arena
                         const content = allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1) catch unreachable;
                         content[0] = .{ .text = .{ .text = text } };
                         break :blk .{ .assistant = .{
@@ -318,8 +308,6 @@ fn expectBranchSummaryAt(ctx: SessionContext, index: usize, expected_summary: []
     }
 }
 
-// ─── Conformance tests ported from pi-mono build-context.test.ts ────
-
 fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(std.testing.allocator);
 }
@@ -371,7 +359,6 @@ test "tracks user-visible thinking level and model state" {
     const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
     try std.testing.expectEqualStrings("high", ctx.thinking_level);
     try std.testing.expectEqual(@as(usize, 2), ctx.messages.len);
-    // Assistant messages carry the actual model used and supersede prior model_change entries.
     try std.testing.expectEqualStrings("anthropic", ctx.model.?.provider);
     try std.testing.expectEqualStrings("claude-test", ctx.model.?.model_id);
 }
@@ -424,10 +411,6 @@ test "branch summary appears only on selected branch" {
 test "complex branch selection combines compaction and branch summaries" {
     var arena = testArena();
     defer arena.deinit();
-    // Tree:
-    //   1 -> 2 -> 3 -> 4 -> compaction(5) -> 6 -> 7 (main path)
-    //              \-> 8 -> 9 (abandoned)
-    //                    \-> branchSummary(10) -> 11 (resumed from 3)
     var entries = [_]proto.SessionEntry{
         testMsg(arena.allocator(), "1", null, .user, "start"),
         testMsg(arena.allocator(), "2", "1", .assistant, "r1"),

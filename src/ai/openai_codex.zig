@@ -56,7 +56,6 @@ pub const OpenAICodexProvider = struct {
         _ = ptr;
         if (!acceptCodexTransport(allocator, model, options.transport, callback, callback_ctx)) return;
 
-        // Scratch arena for JWT decode; outlives streamCore (synchronous).
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
@@ -173,13 +172,11 @@ fn buildCodexRequestJson(
 
     try core.writeBaseFields(&jw, model);
 
-    // System prompt as top-level `instructions` (NOT in input)
     if (context.system_prompt) |sys| {
         try jw.objectField("instructions");
         try jw.write(sys);
     }
 
-    // Messages WITHOUT system prompt
     try jw.objectField("input");
     try jw.beginArray();
     try core.writeInputOpts(allocator, &jw, model, context, false);

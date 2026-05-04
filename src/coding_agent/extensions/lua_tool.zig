@@ -116,10 +116,6 @@ pub fn buildAgentTool(
     };
 }
 
-// =============================================================================
-// AgentTool.execute adapter
-// =============================================================================
-
 fn execute(
     ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -172,19 +168,14 @@ fn runHandler(
     var co = try lua_runtime.Coroutine.init(state);
     defer co.deinit();
 
-    // Push the handler.
     _ = c.lua_rawgeti(co.L, c.LUA_REGISTRYINDEX, handler_ref);
     if (c.lua_type(co.L, -1) != c.LUA_TFUNCTION) {
         c.lua_pop(co.L, 1);
         return error.HandlerNotAFunction;
     }
 
-    // arg 1: tool args
     try lua_runtime.pushJsonValue(co.L, args);
 
-    // arg 2: ctx table.
-    // Base fields come from the bound extension runtime; tool
-    // execution adds the `update(partial)` helper on top.
     try context_mod.pushExtensionContext(co.L, runner, provenance);
     c.lua_pushlightuserdata(co.L, runner);
     c.lua_pushcclosure(co.L, &luaToolUpdate, 1);
@@ -350,10 +341,6 @@ fn spawnResultToToolResult(allocator: std.mem.Allocator, spawn_result: spawn_typ
     return result;
 }
 
-// =============================================================================
-// Return value parsing
-// =============================================================================
-
 fn parseReturn(
     allocator: std.mem.Allocator,
     L: *c.lua_State,
@@ -367,7 +354,6 @@ fn parseReturn(
     }
 
     if (ty == c.LUA_TTABLE) {
-        // Read is_error first so the early-out paths still set it.
         _ = c.lua_getfield(L, idx, "is_error");
         const is_error = c.lua_toboolean(L, -1) != 0;
         c.lua_pop(L, 1);
@@ -395,7 +381,6 @@ fn parseReturn(
         }
         c.lua_pop(L, 1);
 
-        // Inspect the content field.
         _ = c.lua_getfield(L, idx, "content");
         defer c.lua_pop(L, 1);
 
@@ -413,15 +398,9 @@ fn parseReturn(
             return .{ .content = blocks, .is_error = is_error, .details = details, .presentation = presentation };
         }
 
-        // Table with no content field → empty result with the
-        // is_error flag and details honored.
         return .{ .content = &.{}, .is_error = is_error, .details = details, .presentation = presentation };
     }
 
-    // Anything else (number, bool, nil): treat as empty success.
-    // Lua tools that return non-string non-table values are almost
-    // always tests or mistakes; we don't want to ui_publication a tool
-    // error for them.
     return emptyResult();
 }
 
@@ -456,10 +435,6 @@ fn parseContentBlocks(
     }
     return blocks.items;
 }
-
-// =============================================================================
-// Result helpers
-// =============================================================================
 
 fn textResult(
     allocator: std.mem.Allocator,
@@ -535,10 +510,6 @@ fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
     return ptr[0..len];
 }
 
-// =============================================================================
-// ctx.update host function
-// =============================================================================
-
 /// `ctx.update(partial)` — Lua-callable that forwards a partial
 /// tool result back through the agent loop. Used by long-running
 /// tools (Task, Oracle, anything that wraps `zi.spawn`) to ui_publication
@@ -579,10 +550,6 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
     return 0;
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 const testing = std.testing;
 

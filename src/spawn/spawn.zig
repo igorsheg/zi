@@ -15,8 +15,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     var result = types.SpawnResult.init();
     const allocator = config.allocator;
 
-    // -- optional trace file --
-    //
     // When `ZI_SPAWN_TRACE` is set, ziSpawn appends a framed
     // record of every spawn to that file. Each record contains
     // lifecycle markers, the full argv, every JSONL event the
@@ -32,10 +30,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     const trace_file: ?std.Io.File = openTraceFile(config.io);
     defer if (trace_file) |f| f.close(config.io);
 
-    // -- build argv --
-    //
-    // Production: self-exe + --mode json + flags + "Task: <task>".
-    // Test: caller supplies `argv_override` and we run that verbatim.
     var built = buildChildArgv(allocator, config) catch {
         result.exit_code = 1;
         result.error_message = allocator.dupe(u8, "failed to build child argv") catch null;
@@ -43,9 +37,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     };
     defer built.deinit(allocator);
 
-    // -- temp file for append-system-prompt --
-    // (only relevant when not overriding argv; the override path
-    //  doesn't touch system prompts)
     var tmp_dir_path: ?[]const u8 = null;
     var tmp_file_path: ?[]const u8 = null;
     defer {
@@ -60,7 +51,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
                 built.argv.appendSlice(allocator, &.{ "--append-system-prompt", tmp.path }) catch {};
             } else |_| {}
         }
-        // task as positional arg (pi-spawn convention prepends "Task: ")
         const task_arg = std.fmt.allocPrint(allocator, "Task: {s}", .{config.task}) catch {
             result.exit_code = 1;
             return result;
@@ -156,8 +146,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
 
     return result;
 }
-
-// -- stdout processing --
 
 const JsonlCtx = struct {
     allocator: std.mem.Allocator,
@@ -259,7 +247,6 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
 
     result.usage.turns += 1;
 
-    // extract text content (last assistant message's text wins)
     if (msg_obj.get("content")) |content_val| {
         switch (content_val) {
             .array => |arr| {
@@ -288,7 +275,6 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
         }
     }
 
-    // accumulate usage
     if (msg_obj.get("usage")) |usage_val| {
         switch (usage_val) {
             .object => |u| {
@@ -311,7 +297,6 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
         }
     }
 
-    // model (first one wins, matching pi-spawn)
     if (result.model == null) {
         if (msg_obj.get("model")) |m| {
             switch (m) {
@@ -323,7 +308,6 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
         }
     }
 
-    // stopReason (latest wins)
     if (msg_obj.get("stopReason")) |sr| {
         switch (sr) {
             .string => |s| {
@@ -334,7 +318,6 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
         }
     }
 
-    // errorMessage
     if (msg_obj.get("errorMessage")) |em| {
         switch (em) {
             .string => |s| {
@@ -345,8 +328,6 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
         }
     }
 }
-
-// -- helpers --
 
 fn jsonToU64(val: ?std.json.Value) u64 {
     const v = val orelse return 0;
@@ -365,8 +346,6 @@ fn jsonToF64(val: ?std.json.Value) f64 {
         else => 0,
     };
 }
-
-// -- trace file --
 
 /// Open the file referenced by `ZI_SPAWN_TRACE` for append. Returns
 /// null if the env var is unset, the path is invalid, or the file
@@ -400,12 +379,6 @@ fn traceLine(io: std.Io, f: std.Io.File, line: []const u8) void {
     writer.interface.writeAll("\n") catch return;
     writer.interface.flush() catch {};
 }
-
-// -- argv construction --
-//
-// Pulled out so tests can verify the production argv shape without
-// actually spawning, and so the override path is a single early
-// return rather than a fork in the middle of ziSpawn.
 
 const BuiltArgv = struct {
     /// Argv slices passed to std.process.Child.init. Some entries
@@ -472,10 +445,6 @@ fn writeTempPrompt(io: std.Io, allocator: std.mem.Allocator, content: []const u8
     return .{ .dir = dir_name, .path = file_path };
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 const testing = std.testing;
 
 const TestEventCounter = struct {
@@ -531,10 +500,6 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
 }
 
 test "ziSpawn fires on_event for each parsed JSONL line via argv_override" {
-    // Print three JSONL events. The first is shape garbage to verify
-    // we skip non-object/non-typed lines. The second is a valid
-    // message_end so the built-in extractor also runs. The third is
-    // an arbitrary type the extractor ignores but the callback sees.
     const script =
         \\printf '%s\n' '"not an object"'
         \\printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}'
@@ -557,9 +522,6 @@ test "ziSpawn fires on_event for each parsed JSONL line via argv_override" {
     defer result.deinit(testing.allocator);
 
     try testing.expectEqual(@as(u8, 0), result.exit_code);
-    // Two events parsed as objects with a `type` field; the bare
-    // string line is dropped before the callback fires.
     try testing.expectEqual(@as(usize, 2), counter.count);
-    // Built-in extractor saw the message_end → final_text populated.
     try testing.expectEqualStrings("hi", result.output.items);
 }

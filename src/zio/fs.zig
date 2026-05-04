@@ -6,7 +6,6 @@ const std = @import("std");
 /// module only centralizes byte-level file operations so callsites do not
 /// repeatedly hand-roll reader/writer setup, sentinel realpath handling, and
 /// atomic writes.
-
 pub fn readFileAlloc(
     io: std.Io,
     allocator: std.mem.Allocator,

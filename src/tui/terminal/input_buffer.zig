@@ -22,7 +22,6 @@ pub const InputBuffer = struct {
     /// Timeout for incomplete escape sequences (nanoseconds).
     timeout_ns: i128 = 10_000_000, // 10ms
 
-    // Paste state
     in_paste: bool = false,
     paste_buf: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -73,16 +72,12 @@ pub const InputBuffer = struct {
         ctx: *anyopaque,
     ) void {
         while (self.buf.items.len > 0) {
-            // Paste mode: accumulate until end marker
             if (self.in_paste) {
                 if (std.mem.indexOf(u8, self.buf.items, "\x1b[201~")) |end_pos| {
-                    // Append everything before end marker to paste buffer
                     self.paste_buf.appendSlice(self.allocator, self.buf.items[0..end_pos]) catch {};
-                    // Emit paste content
                     on_paste(self.paste_buf.items, ctx);
                     self.paste_buf.items.len = 0;
                     self.in_paste = false;
-                    // Remove paste content + end marker from buffer
                     const after = end_pos + 6;
                     if (after < self.buf.items.len) {
                         std.mem.copyForwards(u8, self.buf.items[0..], self.buf.items[after..]);
@@ -92,18 +87,15 @@ pub const InputBuffer = struct {
                     }
                     continue;
                 } else {
-                    // No end marker yet — move everything to paste buffer and wait
                     self.paste_buf.appendSlice(self.allocator, self.buf.items) catch {};
                     self.buf.items.len = 0;
                     return;
                 }
             }
 
-            // Check for paste start marker
             if (self.buf.items.len >= 6 and std.mem.eql(u8, self.buf.items[0..6], "\x1b[200~")) {
                 self.in_paste = true;
                 self.paste_buf.items.len = 0;
-                // Remove start marker
                 if (self.buf.items.len > 6) {
                     std.mem.copyForwards(u8, self.buf.items[0..], self.buf.items[6..]);
                     self.buf.items.len -= 6;
@@ -120,7 +112,6 @@ pub const InputBuffer = struct {
                 }
             }
 
-            // Not in paste mode — extract sequences
             if (self.buf.items[0] == 0x1b) {
                 const status = classifyEscapeSequence(self.buf.items);
                 switch (status) {
@@ -129,13 +120,11 @@ pub const InputBuffer = struct {
                         self.consume(len);
                     },
                     .incomplete => {
-                        // Wait for more data or timeout
                         self.flush_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + self.timeout_ns;
                         return;
                     },
                 }
             } else {
-                // Single non-escape byte
                 on_seq(self.buf.items[0..1], ctx);
                 self.consume(1);
             }
@@ -154,7 +143,6 @@ pub const InputBuffer = struct {
             self.buf.items.len = 0;
             return;
         }
-        // Multi-byte incomplete sequence — emit byte by byte
         while (self.buf.items.len > 0) {
             on_seq(self.buf.items[0..1], ctx);
             self.consume(1);
@@ -182,7 +170,6 @@ pub const InputBuffer = struct {
         while (i < self.buf.items.len and self.buf.items[i] >= '0' and self.buf.items[i] <= '9') : (i += 1) {}
         if (i >= self.buf.items.len or self.buf.items[i] != 'u') return false;
 
-        // Remove the response from the buffer
         const response_end = i + 1;
         if (response_end < self.buf.items.len) {
             std.mem.copyForwards(u8, self.buf.items[start..], self.buf.items[response_end..]);
@@ -196,8 +183,8 @@ pub const InputBuffer = struct {
 
 /// Classification result for an escape sequence at the start of a buffer.
 const SeqStatus = union(enum) {
-    complete: usize, // sequence length
-    incomplete, // need more bytes
+    complete: usize,
+    incomplete,
 };
 
 /// Classify an escape sequence starting at data[0] == ESC.
@@ -272,8 +259,6 @@ fn classifyStringTerminated(data: []const u8, start: usize, allow_bel: bool) Seq
     }
     return .incomplete;
 }
-
-// ── Tests ─────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -362,7 +347,7 @@ test "InputBuffer keeps mouse report boundaries" {
 test "InputBuffer emits lone ESC after timeout" {
     var buf = InputBuffer.init(testing.allocator);
     defer buf.deinit();
-    buf.timeout_ns = 0; // immediate timeout for testing
+    buf.timeout_ns = 0;
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
@@ -370,7 +355,6 @@ test "InputBuffer emits lone ESC after timeout" {
     try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
     try testing.expect(buf.flush_deadline_ns != null);
 
-    // Simulate timeout
     buf.flush_deadline_ns = 0;
     buf.checkTimeout(&TestCtx.onSeq, @ptrCast(&ctx));
     try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);

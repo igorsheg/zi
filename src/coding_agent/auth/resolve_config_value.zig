@@ -10,11 +10,6 @@ const allocator = std.heap.page_allocator;
 /// Key: full config string including "!" prefix. Value: owned result or null on failure.
 var command_cache: std.StringHashMap(?[]const u8) = std.StringHashMap(?[]const u8).init(allocator);
 
-/// Resolve a config value.
-/// - "!cmd" → execute shell command, cache result
-/// - env var name → look up in environment
-/// - otherwise → return as literal
-///
 /// pi-mono source: packages/coding-agent/src/core/resolve-config-value.ts:17-23
 pub fn resolveConfigValue(config: []const u8) ?[]const u8 {
     if (config.len > 0 and config[0] == '!') {
@@ -26,7 +21,6 @@ pub fn resolveConfigValue(config: []const u8) ?[]const u8 {
     return config;
 }
 
-/// Same as resolveConfigValue but bypasses cache for command execution.
 /// pi-mono source: resolve-config-value.ts:91-97
 pub fn resolveConfigValueUncached(config: []const u8) ?[]const u8 {
     if (config.len > 0 and config[0] == '!') {
@@ -38,13 +32,11 @@ pub fn resolveConfigValueUncached(config: []const u8) ?[]const u8 {
     return config;
 }
 
-/// Resolve a config value, returning an error on failure.
 /// pi-mono source: resolve-config-value.ts:99-110
 pub fn resolveConfigValueOrError(config: []const u8) error{ResolveFailed}![]const u8 {
     return resolveConfigValueUncached(config) orelse error.ResolveFailed;
 }
 
-/// Clear the command cache. For testing.
 pub fn clearCache() void {
     var it = command_cache.iterator();
     while (it.next()) |entry| {
@@ -56,7 +48,6 @@ pub fn clearCache() void {
     command_cache.clearRetainingCapacity();
 }
 
-/// Resolve all header values using the same resolution logic as API keys.
 /// pi-mono source: resolve-config-value.ts:115-125
 pub fn resolveHeaders(
     alloc: std.mem.Allocator,
@@ -79,8 +70,6 @@ pub fn resolveHeaders(
     return if (resolved.count() > 0) resolved else null;
 }
 
-// --- internal ---
-
 fn executeCommand(config: []const u8) ?[]const u8 {
     if (command_cache.get(config)) |cached| {
         return cached;
@@ -95,7 +84,7 @@ fn executeCommand(config: []const u8) ?[]const u8 {
 }
 
 fn executeCommandUncached(config: []const u8) ?[]const u8 {
-    const command = config[1..]; // strip "!"
+    const command = config[1..];
     if (command.len == 0) return null;
 
     var result = runtime_process.run(allocator, std.Options.debug_io, .{
@@ -122,8 +111,6 @@ fn executeCommandUncached(config: []const u8) ?[]const u8 {
 
     return trimmed;
 }
-
-// --- tests ---
 
 test "shell command returns trimmed stdout" {
     clearCache();

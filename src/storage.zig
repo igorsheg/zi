@@ -128,8 +128,6 @@ pub const MemoryFile = struct {
     pub fn releaseLock(_: *const MemoryFile) void {}
 };
 
-// ── Path resolution ─────────────────────────────────────────────────
-//
 // All zi persistent data lives under a single root:
 //   ~/.zi/agent/          (default, or ZI_CODING_AGENT_DIR override)
 //
@@ -228,8 +226,6 @@ fn expandTilde(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
     }
     return allocator.dupe(u8, dir);
 }
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 test "memory file round-trips content" {
     const allocator = std.testing.allocator;

@@ -246,7 +246,6 @@ fn joinRel(allocator: std.mem.Allocator, rel_dir: []const u8, name: []const u8) 
     return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_dir, name });
 }
 
-
 test "native file search excludes git and includes hidden" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

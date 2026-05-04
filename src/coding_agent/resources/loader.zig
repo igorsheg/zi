@@ -206,7 +206,6 @@ pub const ResourceLoader = struct {
         });
         defer extension_loader.freeExtensions(self.allocator, discovered);
 
-        // Replace old roots with new ones.
         freeStaticExtensionRoots(self.allocator, self.extension_roots);
         self.extension_roots = roots;
 

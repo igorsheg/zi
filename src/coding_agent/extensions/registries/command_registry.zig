@@ -103,7 +103,6 @@ pub const CommandRegistry = struct {
         defer new_names.deinit(self.allocator);
         errdefer for (new_names.items) |name| self.allocator.free(name);
 
-        // Count occurrences per canonical name.
         var counts = std.StringHashMap(usize).init(self.allocator);
         defer counts.deinit();
         for (self.entries.items) |entry| {
@@ -115,7 +114,6 @@ pub const CommandRegistry = struct {
             }
         }
 
-        // Track per-canonical occurrence index for suffix generation.
         var occurrence = std.StringHashMap(usize).init(self.allocator);
         defer occurrence.deinit();
 
@@ -158,10 +156,6 @@ pub const CommandRegistry = struct {
     }
 };
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 const testing = std.testing;
 
 test "CommandRegistry duplicate names resolve to visible invocation names" {
@@ -193,10 +187,8 @@ test "CommandRegistry duplicate names resolve to visible invocation names" {
     try testing.expectEqual(@as(usize, 3), reg.count());
     try testing.expectEqual(@as(usize, 3), reg.visibleCount());
 
-    // Bare name gone for duplicates.
     try testing.expect(reg.getByVisibleName("task") == null);
 
-    // Suffixes exist in registration order.
     const t1 = reg.getByVisibleName("task:1").?;
     try testing.expectEqualStrings("first task", t1.description);
     try testing.expectEqual(@as(c_int, 1), t1.lua_ref);
@@ -205,7 +197,6 @@ test "CommandRegistry duplicate names resolve to visible invocation names" {
     try testing.expectEqualStrings("second task", t2.description);
     try testing.expectEqual(@as(c_int, 2), t2.lua_ref);
 
-    // Unique name stays bare.
     const o = reg.getByVisibleName("other").?;
     try testing.expectEqualStrings("other cmd", o.description);
     try testing.expectEqual(@as(c_int, 3), o.lua_ref);

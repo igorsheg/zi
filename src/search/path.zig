@@ -506,10 +506,8 @@ fn adjustedCandidateScore(query: []const u8, candidate: Candidate, base_score: f
         score -= 15.0;
     }
 
-    // Direct children are less surprising than very deep matches for autocomplete.
     score += @as(f64, @floatFromInt(separatorCount(candidate.path))) * 0.75;
 
-    // Directories are useful continuation points in @file completion.
     if (candidate.is_directory) score -= 3.0;
 
     return score;

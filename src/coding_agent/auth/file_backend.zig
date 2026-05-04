@@ -1,7 +1,6 @@
 const std = @import("std");
 const storage = @import("../../storage.zig");
 
-/// Auth storage backend — dispatches to shared LockedFile or MemoryFile.
 pub const Backend = union(enum) {
     file: storage.LockedFile,
     memory: storage.MemoryFile,

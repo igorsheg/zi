@@ -87,10 +87,6 @@ pub const CancelResult = struct {
     }
 };
 
-// =============================================================================
-// Observer
-// =============================================================================
-
 /// Walk the chain for `kind`, calling each handler with the payload
 /// at `payload_idx` on the main state. Return values are discarded.
 /// On a Lua-side error, logs and continues — observer handlers must
@@ -106,15 +102,10 @@ pub fn dispatchObserver(
     for (handlers) |h| {
         runOneHandler(state, runner, h, payload_idx) catch |err| {
             log.warn("observer handler for {s} failed: {s}", .{ @tagName(kind), @errorName(err) });
-            // Observer chain continues even on individual failure.
             continue;
         };
     }
 }
-
-// =============================================================================
-// Cancellable
-// =============================================================================
 
 /// Walk the chain for `kind` until a handler returns
 /// `{ block = true, reason? = string }`. Returns `{ blocked = true,
@@ -147,8 +138,6 @@ pub fn dispatchCancellable(
 
         if (r.nresults == 0) continue; // nil-equivalent → no opinion
 
-        // Inspect the top return value. We expect either nil or a
-        // table with `block` field.
         const top = c.lua_gettop(co.L);
         defer c.lua_settop(co.L, top - r.nresults); // pop results
 
@@ -162,7 +151,6 @@ pub fn dispatchCancellable(
 
         if (!blocked) continue;
 
-        // Pull the reason if present.
         var reason: ?[]const u8 = null;
         _ = c.lua_getfield(co.L, top_idx, "reason");
         if (c.lua_type(co.L, -1) == c.LUA_TSTRING) {
@@ -176,10 +164,6 @@ pub fn dispatchCancellable(
     }
     return .{ .blocked = false };
 }
-
-// =============================================================================
-// Transformable
-// =============================================================================
 
 /// Walk the chain for `kind`, feeding each handler's non-nil return
 /// value as the payload for the next handler. Returns the final
@@ -204,8 +188,6 @@ pub fn dispatchTransformable(
 ) DispatchError!std.json.Value {
     const handlers = runner.event_registry.handlers(kind);
 
-    // Normalize payload_idx so subsequent operations don't drift if
-    // we push intermediate values onto the main stack.
     const abs_payload: c_int = if (payload_idx < 0)
         c.lua_gettop(state.L) + payload_idx + 1
     else
@@ -225,16 +207,12 @@ pub fn dispatchTransformable(
 
         if (r.nresults == 0) continue;
 
-        // If the handler returned nil, leave the payload as-is.
         const top_idx = c.lua_gettop(co.L);
         if (c.lua_type(co.L, top_idx) == c.LUA_TNIL) {
             c.lua_settop(co.L, top_idx - r.nresults);
             continue;
         }
 
-        // Move the new payload from the coroutine back to the main
-        // state and replace the slot at `abs_payload`. lua_xmove
-        // moves the top value (we discard any extra returns first).
         if (r.nresults > 1) c.lua_pop(co.L, r.nresults - 1);
         c.lua_xmove(co.L, state.L, 1);
         c.lua_replace(state.L, abs_payload);
@@ -243,10 +221,6 @@ pub fn dispatchTransformable(
     var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
     return lua_runtime.luaValueToJsonLimited(state.L, abs_payload, allocator, &budget);
 }
-
-// =============================================================================
-// Internals
-// =============================================================================
 
 pub fn dispatchObserverHandler(
     state: *lua_runtime.LuaState,
@@ -281,24 +255,17 @@ fn pushHandlerAndContext(
     provenance: ?resource_types.ExtensionProvenance,
     payload_idx: c_int,
 ) DispatchError!void {
-    // Resolve the handler. lua_rawgeti against LUA_REGISTRYINDEX
-    // works on any state of the same instance — main or coroutine —
-    // so we push directly onto the coroutine's stack.
     _ = c.lua_rawgeti(co.L, c.LUA_REGISTRYINDEX, handler_ref);
     if (c.lua_type(co.L, -1) != c.LUA_TFUNCTION) {
         c.lua_pop(co.L, 1);
         return error.HandlerError;
     }
 
-    // Duplicate the payload on the main stack, then xmove the dup.
     c.lua_pushvalue(state.L, payload_idx);
     c.lua_xmove(state.L, co.L, 1);
 
-    // Second arg: shared extension context.
     try context_mod.pushExtensionContext(co.L, runner, provenance);
 
-    // Ensure the handler sees the same private-root package.path
-    // that the extension had during load.
     runner.setModuleContext(state, provenance);
 }
 
@@ -327,10 +294,6 @@ fn runOneHandler(
     if (r.nresults > 0) c.lua_pop(co.L, r.nresults);
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 const testing = std.testing;
 const api = @import("api.zig");
 
@@ -339,7 +302,6 @@ const api = @import("api.zig");
 /// the chain ran in order.
 fn setupCounterChain(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner, kind_name: [:0]const u8) !void {
     api.installZiTable(state, runner);
-    // Initialize a global counter table.
     try state.doString(
         \\_test_counters = {}
     , "init_counters");
@@ -440,7 +402,6 @@ test "dispatchObserver runs handlers in order and continues after errors" {
         \\zi.on("message_end", function(event, ctx) table.insert(_test_counters, "c:" .. event.name) end)
     , "subscribe");
 
-    // Build a payload table on the main stack: { name = "ping" }
     c.lua_createtable(state.L, 0, 1);
     _ = c.lua_pushstring(state.L, "ping");
     c.lua_setfield(state.L, -2, "name");
@@ -449,7 +410,6 @@ test "dispatchObserver runs handlers in order and continues after errors" {
 
     c.lua_pop(state.L, 1); // pop the payload
 
-    // Verify the counters in order.
     try state.doString(
         \\assert(#_test_counters == 2, "expected 2 entries, got " .. #_test_counters)
         \\assert(_test_counters[1] == "a:ping", _test_counters[1])
@@ -586,9 +546,6 @@ test "dispatchTransformable feeds each handler's return into the next" {
 
     api.installZiTable(&state, &runner);
 
-    // Pipeline: each handler increments a counter field on the
-    // payload. The third handler returns nil (no change). Final
-    // value should have counter == 2.
     try state.doString(
         \\zi.on("tool_result", function(event, ctx)
         \\  return { counter = (event.counter or 0) + 1, label = event.label }
@@ -601,7 +558,6 @@ test "dispatchTransformable feeds each handler's return into the next" {
         \\end)
     , "subscribe");
 
-    // Initial payload: { counter = 0, label = "hi" }
     c.lua_createtable(state.L, 0, 2);
     c.lua_pushinteger(state.L, 0);
     c.lua_setfield(state.L, -2, "counter");

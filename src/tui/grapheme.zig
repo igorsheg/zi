@@ -421,19 +421,13 @@ fn isHangulLVT(cp: u21) bool {
     return ((cp - 0xAC00) % 28) != 0;
 }
 
-// --- tests ---
-
 test "charWidth covers ASCII, wide, zero-width, and control ranges" {
-    // ASCII
     try std.testing.expectEqual(@as(u2, 1), charWidth('A'));
     try std.testing.expectEqual(@as(u2, 1), charWidth(' '));
-    // CJK wide
     try std.testing.expectEqual(@as(u2, 2), charWidth(0x4E00));
     try std.testing.expectEqual(@as(u2, 2), charWidth(0x3042));
-    // Zero-width
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x0300));
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x200B));
-    // Control
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x00));
     try std.testing.expectEqual(@as(u2, 0), charWidth(0x1B));
 }
@@ -462,7 +456,6 @@ test "strWidth sums grapheme cluster widths" {
 
 test "sliceToWidth truncates at grapheme boundary" {
     try std.testing.expectEqualStrings("hel", sliceToWidth("hello", 3));
-    // Wide char: "一" = 2 cols, "二" would exceed 3
     const result = sliceToWidth("一二三", 3);
     try std.testing.expectEqual(@as(usize, 2), strWidth(result));
     try std.testing.expectEqualStrings("👩‍🚀", sliceToWidth("👩‍🚀x", 2));

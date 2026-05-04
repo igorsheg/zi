@@ -1,8 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
 
-// ── enums ──────────────────────────────────────────────────────────────
-
 /// pi-mono: settings-manager.ts:67 — includes "off" which ai.protocol.ThinkingLevel lacks
 pub const DefaultThinkingLevel = enum {
     off,
@@ -47,8 +45,6 @@ pub const SettingsScope = enum {
 };
 
 pub const TransportSetting = ai.protocol.Transport;
-
-// ── nested settings structs ────────────────────────────────────────────
 
 /// pi-mono: settings-manager.ts:7-11
 pub const CompactionSettings = struct {
@@ -111,7 +107,6 @@ pub const PackageSource = union(enum) {
     filtered: PackageSourceFilter,
 };
 
-
 /// User-defined model entry from settings.json `models[]`.
 /// All string fields borrow from the parsed JSON arena.
 /// Validated and converted to `protocol.Model` at session init.
@@ -131,8 +126,6 @@ pub const CustomModel = struct {
     context_window: u64 = 4096,
     max_tokens: u64 = 4096,
 };
-
-// ── main Settings struct ───────────────────────────────────────────────
 
 /// All user-configurable settings. Every field is optional.
 /// pi-mono: settings-manager.ts:63-98
@@ -174,8 +167,6 @@ pub const Settings = struct {
     models: ?[]const CustomModel = null,
 };
 
-// ── resolved settings (with defaults applied) ──────────────────────────
-
 /// pi-mono: settings-manager.ts:637-643
 pub const ResolvedCompactionSettings = struct {
     enabled: bool,
@@ -197,14 +188,10 @@ pub const ResolvedRetrySettings = struct {
     max_delay_ms: i64,
 };
 
-// ── error type ─────────────────────────────────────────────────────────
-
 pub const SettingsError = struct {
     scope: SettingsScope,
     message: []const u8,
 };
-
-// ── field enum for dirty tracking ──────────────────────────────────────
 
 pub const SettingsField = enum {
     last_changelog_version,
@@ -243,8 +230,6 @@ pub const SettingsField = enum {
     session_dir,
     models,
 };
-
-// ── string conversion helpers (camelCase wire format) ──────────────────
 
 pub fn defaultThinkingLevelToString(level: DefaultThinkingLevel) []const u8 {
     return switch (level) {
@@ -353,8 +338,6 @@ pub fn transportFromString(s: []const u8) ?TransportSetting {
     });
     return map.get(s);
 }
-
-// ── camelCase field name mapping for JSON keys ─────────────────────────
 
 pub fn settingsFieldToJsonKey(field: SettingsField) []const u8 {
     return switch (field) {

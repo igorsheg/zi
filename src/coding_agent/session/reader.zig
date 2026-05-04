@@ -68,7 +68,6 @@ pub fn parseSessionContent(allocator: std.mem.Allocator, content: []const u8) !S
             line_start = i + 1;
         }
     }
-    // Handle last line without trailing newline
     if (line_start < content.len) {
         const line = std.mem.trim(u8, content[line_start..], &std.ascii.whitespace);
         if (line.len > 0) {
@@ -76,7 +75,6 @@ pub fn parseSessionContent(allocator: std.mem.Allocator, content: []const u8) !S
         }
     }
 
-    // pi-mono: loadEntriesFromFile returns [] if no valid session header exists
     if (header == null) {
         return .{ .header = null, .entries = &.{} };
     }
@@ -103,7 +101,7 @@ pub fn readSessionFile(allocator: std.mem.Allocator, path: []const u8) !SessionD
     defer file.close(std.Options.debug_io);
     var read_buf: [4096]u8 = undefined;
     var file_reader = file.reader(std.Options.debug_io, &read_buf);
-    const content = try file_reader.interface.allocRemaining(allocator, .limited(100 * 1024 * 1024)); // 100MB max
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(100 * 1024 * 1024));
     defer allocator.free(content);
 
     const parse_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
@@ -290,8 +288,6 @@ fn freeProvider(allocator: std.mem.Allocator, provider: ai.protocol.Provider) vo
         else => {},
     }
 }
-
-// ─── Session reader behavior tests ──
 
 test "parse boundaries without a valid session header return empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

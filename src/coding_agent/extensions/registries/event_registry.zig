@@ -28,11 +28,9 @@ const resource_types = @import("../../resources/types.zig");
 ///
 /// Order in this enum is NOT semantic; treat it as a tag set.
 pub const EventKind = enum {
-    // Startup/resource interceptors
     session_directory,
     resources_discover,
 
-    // Agent lifecycle and prompt/provider interceptors
     agent_start,
     agent_end,
     before_agent_start,
@@ -46,7 +44,6 @@ pub const EventKind = enum {
     message_end,
     message,
 
-    // Tool and host command execution
     tool_execution_start,
     tool_execution_update,
     tool_execution_end,
@@ -54,7 +51,6 @@ pub const EventKind = enum {
     tool_result,
     user_bash,
 
-    // Session
     session_start,
     session_shutdown,
     session_before_switch,
@@ -64,13 +60,11 @@ pub const EventKind = enum {
     session_before_tree,
     session_tree,
 
-    // Extension UI and host jobs
     surface_input,
     job_stdout,
     job_stderr,
     job_exit,
 
-    // Meta
     model_select,
 
     /// Dispatch semantics for this kind. Used by D4's dispatcher to
@@ -180,10 +174,6 @@ pub const EventRegistry = struct {
         return total;
     }
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 const testing = std.testing;
 

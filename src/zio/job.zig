@@ -282,10 +282,14 @@ test "zio job streams stdout and reports exit" {
     try manager.start(1, .{ .argv = argv });
 
     try waitUntil(struct {
-        fn pred(s: *TestSink) bool { return s.contains(.stdout, "hello"); }
+        fn pred(s: *TestSink) bool {
+            return s.contains(.stdout, "hello");
+        }
     }.pred, &sink);
     try waitUntil(struct {
-        fn pred(s: *TestSink) bool { return s.exitCode(1) == 0; }
+        fn pred(s: *TestSink) bool {
+            return s.exitCode(1) == 0;
+        }
     }.pred, &sink);
 }
 
@@ -313,10 +317,14 @@ test "zio job write reaches child stdin" {
     if (attempts == 100) return error.Timeout;
 
     try waitUntil(struct {
-        fn pred(s: *TestSink) bool { return s.contains(.stdout, "got:doom"); }
+        fn pred(s: *TestSink) bool {
+            return s.contains(.stdout, "got:doom");
+        }
     }.pred, &sink);
     try waitUntil(struct {
-        fn pred(s: *TestSink) bool { return s.exitCode(2) == 0; }
+        fn pred(s: *TestSink) bool {
+            return s.exitCode(2) == 0;
+        }
     }.pred, &sink);
 }
 
@@ -332,7 +340,9 @@ test "zio job stop terminates a running child" {
     manager.stop(3);
 
     try waitUntil(struct {
-        fn pred(s: *TestSink) bool { return s.hasExit(3); }
+        fn pred(s: *TestSink) bool {
+            return s.hasExit(3);
+        }
     }.pred, &sink);
 }
 
@@ -351,6 +361,8 @@ test "zio job stop escalates children that ignore TERM" {
     manager.stop(4);
 
     try waitUntil(struct {
-        fn pred(s: *TestSink) bool { return s.hasExit(4); }
+        fn pred(s: *TestSink) bool {
+            return s.hasExit(4);
+        }
     }.pred, &sink);
 }

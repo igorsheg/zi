@@ -20,8 +20,6 @@ const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 
-// ── Transcript Item ───────────────────────────────────────────────
-
 /// Type-erased transcript row interface.
 ///
 /// Unlike the general TUI `Component` protocol, transcript rows MUST support
@@ -454,8 +452,6 @@ const TranscriptLayout = struct {
     }
 };
 
-// ── Tool Execution ────────────────────────────────────────────────
-
 pub const ToolExecutionRowModel = struct {
     tool_call_id: ?[]u8 = null,
     tool_name: ?[]u8 = null,
@@ -615,8 +611,6 @@ pub const ToolExecution = struct {
         }
     }
 
-    // ── Rendering ─────────────────────────────────────────────────
-
     fn bgColor(self: *ToolExecution) Color {
         _ = self;
         return Color.default;
@@ -631,10 +625,10 @@ pub const ToolExecution = struct {
         const result_h = self.measureResult(content_w);
         self.measured_content_width = content_w;
         self.measured_result_height = result_h;
-        var h: u32 = padding_y; // top padding
-        h += 1; // call line
+        var h: u32 = padding_y;
+        h += 1;
         h += result_h;
-        h += padding_y; // bottom padding
+        h += padding_y;
         return .{ .min_height = 1, .preferred_height = @max(1, h) };
     }
 
@@ -903,8 +897,6 @@ test "tool execution renderSlice starts inside a wrapped tool result" {
     try testing.expectEqual(@as(u21, 'X'), buffer.get(1, 1).grapheme.codepoint);
 }
 
-// ── Markdown wrapper deinit ───────────────────────────────────────
-
 fn deinitMarkdown(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     const md: *markdown_mod.Markdown = @ptrCast(@alignCast(ctx));
     md.deinit();
@@ -922,8 +914,6 @@ fn deinitUserMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     um.deinit();
     allocator.destroy(um);
 }
-
-// ── Transcript ────────────────────────────────────────────────────
 
 /// Scrollable retained transcript container with slice-native item storage.
 ///
@@ -1037,8 +1027,6 @@ pub const Transcript = struct {
         self.noteItemMutated(index);
     }
 
-    // ── External renderable API ───────────────────────────────────
-
     /// Append an arbitrary transcript item.
     pub fn addItem(self: *Transcript, item: TranscriptItem) bool {
         return self.appendTranscriptItem(item);
@@ -1055,7 +1043,7 @@ pub const Transcript = struct {
         while (i < self.items.items.len) {
             if (TranscriptRenderable.eql(self.items.items[i].renderable, renderable)) {
                 self.removeItemAt(i);
-                return; // remove first match only
+                return;
             }
             i += 1;
         }
@@ -1094,8 +1082,6 @@ pub const Transcript = struct {
         self.last_visible_height = 0;
         self.layout.clear();
     }
-
-    // ── Built-in retained row mutators ────────────────────────────
 
     pub fn assistantMessageAt(self: *Transcript, index: usize) ?*assistant_message_mod.AssistantMessage {
         if (index >= self.items.items.len) return null;
@@ -1273,8 +1259,6 @@ pub const Transcript = struct {
         }
         return events.toOwnedSlice(allocator);
     }
-
-    // ── Selection ────────────────────────────────────────────────
 
     pub fn beginSelection(self: *Transcript, width: u32, visible_height: u32, local_x: u32, local_y: u32) bool {
         if (visible_height == 0 or width == 0) return false;
@@ -1492,8 +1476,6 @@ pub const Transcript = struct {
         }
     }
 
-    // ── Layout / scroll ───────────────────────────────────────────
-
     /// Total height of all items at the given width.
     pub fn totalHeight(self: *Transcript, width: u32) u32 {
         if (width == 0) return 0;
@@ -1662,8 +1644,6 @@ fn appendRowColumns(out: *std.ArrayList(u8), allocator: std.mem.Allocator, regio
         }
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;

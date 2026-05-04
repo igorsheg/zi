@@ -122,4 +122,3 @@ pub const empty_resolver = ToolRendererResolver{
         }
     }.resolveNone,
 };
-

@@ -28,11 +28,9 @@ pub const ExtensionKeybindingEntry = struct {
 pub const UiEvent = union(enum) {
     consumed: void,
 
-    // --- conversation transport ---
     conversation_snapshot: conversation_state_mod.ConversationSnapshotEnvelope,
     queued_snapshot: runtime_host_mod.QueuedMessageSnapshot,
 
-    // --- errors / status side effects ---
     error_message: struct { message: []u8 },
     theme_changed: theme_mod.Theme,
     assistant_run_finished: struct {
@@ -44,7 +42,6 @@ pub const UiEvent = union(enum) {
         tool_name: []u8,
     },
 
-    // --- login lifecycle ---
     // zi-wub.17: login thread publishes progress/auth-url through the
     // event queue instead of mutating status_text directly. Single-owner
     // invariant restored for status_text — only the TUI thread writes.
@@ -58,7 +55,6 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    // --- retry lifecycle ---
     retry_start: struct {
         attempt: u32,
         max_attempts: u32,
@@ -73,26 +69,22 @@ pub const UiEvent = union(enum) {
         failure_kind: ?ai.protocol.NormalizedFailure.Kind = null,
     },
 
-    // --- compaction lifecycle ---
     compaction_start: struct {
         reason: runtime_host_mod.CompactionReason,
     },
     compaction_end: void,
 
-    // --- prompt lifecycle ---
     prompt_worker_finished: struct {
         outcome: RunOutcome,
         internal_error: ?[]u8 = null,
     },
 
-    // --- request drain lifecycle ---
     // Emitted by the long-lived agent owner thread after it finishes a
     // non-prompt AgentRequest drain. Separate from `prompt_worker_finished`
     // so the TUI can unwind request-mode loaders without stomping on
     // status_text or focus that the individual request handlers already set.
     request_worker_finished: void,
 
-    // --- /resume outcomes ---
     // Banner-only outcome. Transcript state now crosses separately via
     // `conversation_state` so resume no longer ships raw AgentMessage[]
     // through this event.
@@ -138,20 +130,17 @@ pub const UiEvent = union(enum) {
         models: []ai_protocol.Model,
     },
 
-    // --- /new outcomes ---
     session_new_started: void,
     session_fork_started: void,
     session_new_failed: struct {
         message: []u8,
     },
 
-    // --- /compact outcomes ---
     session_compacted: void,
     session_compaction_failed: struct {
         message: []u8,
     },
 
-    // --- shared status snapshot ---
     // Agent-thread owned model/thinking/context snapshot for the editor
     // border chips. Published whenever session state changes in a way the
     // TUI must render without reading agent-owned state directly.
@@ -165,7 +154,6 @@ pub const UiEvent = union(enum) {
         context_window: u64,
     },
 
-    // --- /model outcomes (zi-wub.16) ---
     // Published by the agent thread after processing a set_model
     // AgentRequest. Success is banner-only; semantic model state is
     // carried by the adjacent status_snapshot publication.
@@ -176,7 +164,6 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    // --- /settings thinking-level outcomes ---
     // Success is banner-only; semantic thinking state is carried by
     // the adjacent status_snapshot publication.
     thinking_level_changed: struct {

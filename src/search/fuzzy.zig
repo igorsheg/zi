@@ -157,7 +157,6 @@ pub fn positions(pattern: []const u8, text: []const u8, out_positions: []usize) 
     }
     const m = matchToken(tok, text);
     if (!m.matches) return &.{};
-    // Minimal fallback: exact positions are omitted until a renderer needs them.
     return &.{};
 }
 
@@ -257,7 +256,10 @@ fn indexOfSlice(haystack: []const u8, needle: []const u8, start: usize, ignore_c
     var i = start;
     while (i <= haystack.len - needle.len) : (i += 1) {
         var ok = true;
-        for (needle, 0..) |c, j| if (!eqChar(haystack[i + j], c, ignore_case)) { ok = false; break; };
+        for (needle, 0..) |c, j| if (!eqChar(haystack[i + j], c, ignore_case)) {
+            ok = false;
+            break;
+        };
         if (ok) return i;
     }
     return null;

@@ -43,7 +43,6 @@ fn initBuiltins() void {
 }
 
 fn loadBuiltin(bytes: []const u8) Theme {
-    // One-time bootstrap parse for process-lifetime builtin themes.
     const loaded = theme_json.loadFromSlice(std.heap.page_allocator, bytes) catch |err| {
         @panic(@errorName(err));
     };

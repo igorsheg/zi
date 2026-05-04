@@ -130,7 +130,6 @@ pub const FauxProvider = struct {
 
         const message = self.responses.orderedRemove(0);
 
-        // Build a growing content slice for the partial message.
         var partial_content = std.ArrayListUnmanaged(protocol.AssistantMessage.AssistantContentBlock).empty;
         defer partial_content.deinit(allocator);
 
@@ -146,18 +145,15 @@ pub const FauxProvider = struct {
             .timestamp = message.timestamp,
         };
 
-        // start event with empty content
         callback(.{ .start = .{ .partial = partial } }, callback_ctx);
 
         for (message.content, 0..) |block, idx| {
             switch (block) {
                 .text => |text_content| {
-                    // Add empty text block to partial
                     partial_content.append(allocator, .{ .text = .{ .text = "" } }) catch @panic("alloc failed");
                     partial.content = partial_content.items;
                     callback(.{ .text_start = .{ .content_index = idx, .partial = partial } }, callback_ctx);
 
-                    // Update partial with full text
                     partial_content.items[idx] = .{ .text = .{ .text = text_content.text } };
                     partial.content = partial_content.items;
                     callback(.{ .text_delta = .{ .content_index = idx, .delta = text_content.text, .partial = partial } }, callback_ctx);
@@ -189,7 +185,6 @@ pub const FauxProvider = struct {
             }
         }
 
-        // Terminal event
         if (message.stop_reason == .@"error" or message.stop_reason == .aborted) {
             const reason: protocol.AssistantMessageEvent.ErrorReason = if (message.stop_reason == .aborted) .aborted else .@"error";
             callback(.{ .@"error" = .{ .reason = reason, .@"error" = message } }, callback_ctx);
@@ -254,20 +249,15 @@ test "faux provider streams text response" {
     const p = faux.provider();
     p.stream(allocator, fauxModel(), .{ .messages = &.{} }, .{}, Collector.callback, &collector);
 
-    // Expected sequence: start, text_start, text_delta, text_end, done = 5 events
     try std.testing.expectEqual(@as(usize, 5), collector.events.items.len);
 
-    // Verify event types
     try std.testing.expect(collector.events.items[0] == .start);
     try std.testing.expect(collector.events.items[1] == .text_start);
     try std.testing.expect(collector.events.items[2] == .text_delta);
     try std.testing.expect(collector.events.items[3] == .text_end);
     try std.testing.expect(collector.events.items[4] == .done);
 
-    // Verify delta content
     try std.testing.expectEqualStrings("hello world", collector.events.items[2].text_delta.delta);
-    // Verify text_end content
     try std.testing.expectEqualStrings("hello world", collector.events.items[3].text_end.content);
-    // Verify call_count incremented
     try std.testing.expectEqual(@as(usize, 1), faux.call_count);
 }

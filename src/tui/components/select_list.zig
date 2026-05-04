@@ -128,19 +128,16 @@ pub const SelectList = struct {
         const len: u32 = @intCast(self.items.len);
         const visible = @min(self.max_visible, len);
 
-        // scroll window: center selection in visible area
         const half = visible / 2;
         const max_start = len -| visible;
         const start = @min(if (self.selected_index > half) self.selected_index - half else 0, max_start);
         const end = @min(start + visible, len);
 
-        // label column width for two-column layout
         var label_w: usize = 0;
         for (start..end) |i| {
             const w = grapheme_mod.strWidth(self.items[i].label);
             if (w > label_w) label_w = w;
         }
-        // +4 for prefix "→ " or "  " (2) + gap (2)
         const desc_threshold: u32 = 40;
 
         var row: u32 = 0;
@@ -155,7 +152,6 @@ pub const SelectList = struct {
 
             if (item.description) |desc| {
                 if (region.width > desc_threshold) {
-                    // pad to align descriptions
                     const current_label_w = grapheme_mod.strWidth(item.label);
                     const pad: u32 = @intCast(label_w - current_label_w + 2);
                     col += pad;
@@ -165,7 +161,6 @@ pub const SelectList = struct {
             row += 1;
         }
 
-        // scroll indicator
         if (len > self.max_visible) {
             var indicator_buf: [32]u8 = undefined;
             const indicator = std.fmt.bufPrint(&indicator_buf, "  ({d}/{d})", .{ self.selected_index + 1, len }) catch return;
@@ -206,8 +201,6 @@ pub const SelectList = struct {
     }
 };
 
-// ── Tests ──────────────────────────────────────────────────────────
-
 const testing = std.testing;
 fn testTheme() Theme {
     return themes_builtin.dark().*;
@@ -232,16 +225,13 @@ test "SelectList up/down wraps around" {
     var items = makeItems();
     var sl = listWithItems(&theme, &items);
 
-    // start at 0, go up -> wrap to 2
     const r1 = sl.processInput(.{ .code = .up });
     try testing.expectEqual(InputResult.consumed, r1);
     try testing.expectEqual(@as(u32, 2), sl.selected_index);
 
-    // go down -> wrap to 0
     _ = sl.processInput(.{ .code = .down });
     try testing.expectEqual(@as(u32, 0), sl.selected_index);
 
-    // go down twice -> index 2, then down -> wrap to 0
     _ = sl.processInput(.{ .code = .down });
     _ = sl.processInput(.{ .code = .down });
     try testing.expectEqual(@as(u32, 2), sl.selected_index);

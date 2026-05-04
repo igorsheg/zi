@@ -385,9 +385,7 @@ pub const OpenAICompletionsCompat = struct {
 };
 
 /// Compatibility settings for OpenAI Responses APIs
-pub const OpenAIResponsesCompat = struct {
-    // Reserved for future use
-};
+pub const OpenAIResponsesCompat = struct {};
 
 /// OpenRouter provider routing preferences
 pub const OpenRouterRouting = struct {

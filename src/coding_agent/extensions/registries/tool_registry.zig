@@ -111,10 +111,6 @@ pub const ToolRegistry = struct {
     }
 };
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 const testing = std.testing;
 
 fn dummyTool(allocator: std.mem.Allocator, name: []const u8, source_kind: []const u8) !ToolDefinition {
@@ -133,13 +129,10 @@ test "ToolRegistry first-registered-wins" {
     var reg = ToolRegistry.init(testing.allocator);
     defer reg.deinit();
 
-    // First registration accepted.
     const t1 = try dummyTool(testing.allocator, "task", "user");
     try testing.expect(try reg.register(t1));
     try testing.expectEqual(@as(usize, 1), reg.count());
 
-    // Second registration with same name dropped — but the caller
-    // still owns the rejected tool, so we must free it ourselves.
     const t2 = try dummyTool(testing.allocator, "task", "builtin");
     defer {
         testing.allocator.free(t2.name);
@@ -151,7 +144,6 @@ test "ToolRegistry first-registered-wins" {
     try testing.expect(!(try reg.register(t2)));
     try testing.expectEqual(@as(usize, 1), reg.count());
 
-    // The first one still wins, with its source preserved.
     const got = reg.get("task").?;
     try testing.expectEqualStrings("user", got.source.kind);
 }

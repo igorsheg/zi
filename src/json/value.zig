@@ -11,10 +11,6 @@
 
 const std = @import("std");
 
-// =================================================================
-// Deep clone / free
-// =================================================================
-
 /// Recursively clone a `std.json.Value` tree into `allocator`.
 /// Strings and object keys are duped — the returned tree has no
 /// borrowed references to the source. Safe to free the source
@@ -74,10 +70,6 @@ pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
-// =================================================================
-// Typed accessors
-// =================================================================
-
 /// Coerce a `std.json.Value` to an f64, treating ints as floats and
 /// anything else as 0. Used for deserializing cost/usage fields that
 /// stdlib may parse as either variant depending on the input form.
@@ -136,10 +128,6 @@ pub fn asArray(v: ?std.json.Value) ?std.json.Array {
         else => null,
     };
 }
-
-// =================================================================
-// Tests
-// =================================================================
 
 const testing = std.testing;
 

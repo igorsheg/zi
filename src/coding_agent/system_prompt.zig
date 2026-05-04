@@ -211,10 +211,6 @@ fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !v
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test "default prompt includes zi identity docs and cwd" {
     const result = try buildSystemPrompt(std.testing.allocator, .{
         .cwd = "/home/user/project",

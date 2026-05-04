@@ -136,7 +136,13 @@ fn isAllLower(s: []const u8) bool {
 
 fn tokenCost(t: Token) u32 {
     var cost: u32 = @intCast(@min(t.text.len, 255));
-    cost += switch (t.mode) { .fuzzy => 0, .exact => 20, .word => 30, .prefix => 25, .suffix => 25 };
+    cost += switch (t.mode) {
+        .fuzzy => 0,
+        .exact => 20,
+        .word => 30,
+        .prefix => 25,
+        .suffix => 25,
+    };
     if (t.inverse) cost += 40;
     return cost;
 }

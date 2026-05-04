@@ -61,7 +61,6 @@ pub fn readImage(allocator: std.mem.Allocator) ?[]u8 {
 }
 
 fn emitOsc52(text: []const u8) void {
-    // Tiny helper allocations, freed before return.
     const Encoder = std.base64.standard.Encoder;
     const encoded_len = Encoder.calcSize(text.len);
     const allocator = std.heap.page_allocator;
