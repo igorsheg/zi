@@ -737,8 +737,6 @@ fn handleEvent(
         if (resp.object.get("status")) |s| if (s == .string) {
             state.partial.stop_reason = mapResponseStatus(if (normalize_terminal_status) normalizeCodexStatus(s.string) else s.string);
         };
-        // pi-mono: if any tool_call block exists and stop is the default
-        // `stop`, override to `toolUse`.
         if (state.partial.stop_reason == .stop) {
             for (state.items.items) |it| if (it.kind == .function_call) {
                 state.partial.stop_reason = .toolUse;
@@ -1124,8 +1122,6 @@ pub fn buildRequestJson(
             try jw.write("reasoning.encrypted_content");
             try jw.endArray();
         } else if (model.provider != .github_copilot) {
-            // No reasoning requested — send effort: "none"
-            // pi-mono: openai-responses.ts:224
             try jw.objectField("reasoning");
             try jw.beginObject();
             try jw.objectField("effort");

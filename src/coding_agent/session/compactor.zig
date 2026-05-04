@@ -194,7 +194,6 @@ fn execute(
     else
         try prep.formatFileOperations(allocator, file_lists.read_files, file_lists.modified_files);
 
-    // Session-store-owned strings must survive the executor arena.
     const summary_owned = try std.fmt.allocPrint(session.allocator, "{s}{s}", .{ composed_summary, file_ops_suffix });
     const first_kept_id_owned = try session.allocator.dupe(u8, first_kept_id_source);
     const details_value: std.json.Value = if (from_hook)

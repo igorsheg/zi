@@ -311,9 +311,6 @@ pub const SessionWriter = struct {
         try out.writer.writeAll("\n");
         try zio_fs.appendFile(std.Options.debug_io, self.session_file, out.written());
         self.appended_entries.append(self.allocator, entry) catch {
-            // Persistence already succeeded; if the in-memory append journal
-            // cannot grow, release per-entry fields and let SessionStore fall
-            // back to a future file read when its cache is invalidated.
             freeAppendedEntry(self.allocator, entry);
         };
     }

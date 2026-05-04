@@ -4,7 +4,6 @@ const agent_mod = @import("../../agent/root.zig");
 
 const protocol = agent_mod.protocol;
 
-// pi-mono source: packages/coding-agent/src/core/messages.ts:148-195
 // The base agent's defaultConvertToLlm silently drops compaction_summary,
 // branch_summary, and custom. The coding agent's version converts them to
 // user messages with the proper prefix/suffix wrapping.

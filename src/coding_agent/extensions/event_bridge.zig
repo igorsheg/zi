@@ -710,14 +710,6 @@ fn sessionLifecycleReasonString(reason: SessionLifecycleReason) []const u8 {
     };
 }
 
-// Each builder pushes ONE Lua table onto the stack. The table
-// shape mirrors the AgentEvent variant fields, exposing what an
-// extension actually needs. v1 keeps these MINIMAL — extensions
-// reading deeper fields (e.g. assistant content blocks) get null
-// in v1 and a richer table in v2 once we know which fields
-// matter. Adding fields is backwards-compatible: handlers that
-// don't read them are unaffected.
-
 fn pushAgentStart(L: *c.lua_State) lua_runtime.ConvertError!void {
     c.lua_createtable(L, 0, 0);
 }
@@ -877,9 +869,6 @@ fn beforeToolCallImpl(
         return .{ .block = true, .reason = cancel.reason, .args = null };
     }
 
-    // Read the (possibly mutated) `args` field back from the payload
-    // table at the top of the main stack. luaValueToJsonLimited allocates
-    // into hook_alloc so the value lives until the runner is destroyed.
     _ = c.lua_getfield(state.L, -1, "args");
     defer c.lua_pop(state.L, 1);
     var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };

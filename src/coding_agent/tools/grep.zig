@@ -85,9 +85,6 @@ fn execute(
     const literal = util.getBool(args, "literal") orelse false;
     const glob = util.getString(args, "glob");
 
-    // Build the rg argv. We rely on rg being on PATH (same assumption pi
-    // makes — nix or system install). The agent will surface a "command
-    // not found" style error if it isn't.
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     argv.append(allocator, "rg") catch return util.errorResult(allocator, "alloc failed");
@@ -214,9 +211,6 @@ fn parseRgJson(
         return util.textResult(allocator, "no matches found");
     }
 
-    // Walk events grouped by file. Per-file cap is enforced inline;
-    // the relative-path display is cached per file-change to avoid the
-    // alloc-and-free per match the first version did (oracle review).
     var per_file_count = std.StringHashMap(usize).init(allocator);
     defer per_file_count.deinit();
 
@@ -240,8 +234,6 @@ fn parseRgJson(
             if (!first_file) w.writeAll("\n") catch break;
             first_file = false;
 
-            // Cache the display path for this file. Free the previous
-            // owned buffer (if any) before replacing.
             if (current_display_owned) |buf| {
                 allocator.free(buf);
                 current_display_owned = null;

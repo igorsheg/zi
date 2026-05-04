@@ -2,8 +2,6 @@ const std = @import("std");
 const string_util = @import("../../lib/string_util.zig");
 const runtime_process = @import("../../zio/root.zig").process;
 
-// Process-global cache/store backing. Entries own both key and value storage;
-// `clearCache()` frees those allocations in tests.
 const allocator = std.heap.page_allocator;
 
 /// Cache for shell command results. Process-lifetime cache matching pi-mono.

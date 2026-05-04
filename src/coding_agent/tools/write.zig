@@ -57,8 +57,6 @@ fn execute(
         return util.errorResult(allocator, "write tool: failed to resolve path");
     defer allocator.free(resolved);
 
-    // Per-path mutex: serialize concurrent writes to the same
-    // canonicalized file. Mirrors ts override `create-file.ts`.
     const lock_entry = lock_registry.global().acquirePath(allocator, resolved) catch
         return util.errorResult(allocator, "write tool: failed to acquire file lock");
     defer lock_registry.global().release(lock_entry);

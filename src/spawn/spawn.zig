@@ -15,18 +15,7 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     var result = types.SpawnResult.init();
     const allocator = config.allocator;
 
-    // When `ZI_SPAWN_TRACE` is set, ziSpawn appends a framed
-    // record of every spawn to that file. Each record contains
-    // lifecycle markers, the full argv, every JSONL event the
-    // child emits, the captured stderr block, and the exit code.
-    //
-    // Multi-spawn safe: each record is framed with `--- spawn ---`
-    // and `--- /spawn ---` markers, and writes are append-mode so
-    // concurrent parents on the same file interleave at record
-    // boundaries (the OS append guarantee covers our small writes).
-    //
-    // Run `tail -f $ZI_SPAWN_TRACE` in another terminal during a
-    // hang to see what the child is doing in real time.
+    // `ZI_SPAWN_TRACE` enables a best-effort framed process trace.
     const trace_file: ?std.Io.File = openTraceFile(config.io);
     defer if (trace_file) |f| f.close(config.io);
 
@@ -126,7 +115,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
         }
     }
 
-    // normalize: processes killed after end_turn are intentional
     if (result.exit_code != 0) {
         if (result.stop_reason) |sr| {
             if (std.mem.eql(u8, sr, "stop") or std.mem.eql(u8, sr, "end_turn")) {
@@ -361,10 +349,6 @@ fn openTraceFile(io: std.Io) ?std.Io.File {
 }
 
 fn traceWrite(io: std.Io, f: std.Io.File, comptime fmt: []const u8, args: anytype) void {
-    // Seek to end first so concurrent spawns don't clobber each
-    // other. Append mode would be cleaner but createFile doesn't
-    // expose O_APPEND directly; this is good enough for v1 since
-    // we don't expect interleaved writes within a record.
     var buf: [4096]u8 = undefined;
     var writer = f.writer(io, &buf);
     writer.interface.print(fmt, args) catch return;
@@ -381,13 +365,7 @@ fn traceLine(io: std.Io, f: std.Io.File, line: []const u8) void {
 }
 
 const BuiltArgv = struct {
-    /// Argv slices passed to std.process.Child.init. Some entries
-    /// borrow from `config` (model, tools), some are owned by
-    /// `owned_strings`.
     argv: std.ArrayList([]const u8) = .empty,
-    /// Strings whose lifetime must match `argv`. Freed in deinit.
-    /// Used for the dup'd self-exe path and the "Task: <task>"
-    /// formatted positional.
     owned_strings: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *BuiltArgv, allocator: std.mem.Allocator) void {
@@ -463,10 +441,6 @@ const TestEventCounter = struct {
 };
 
 test "ziSpawn watchdog aborts a quiet child within ~200ms" {
-    // Child sleeps for 30s with no stdout output. Without the
-    // watchdog, the parent's blocking read would also wait 30s.
-    // We fire the abort signal from a side thread after 100ms and
-    // assert ziSpawn returns promptly.
     const override = [_][]const u8{ "sh", "-c", "sleep 30" };
     var controller = @import("../zio/root.zig").AbortController{};
     const signal = controller.beginRun();
@@ -491,9 +465,6 @@ test "ziSpawn watchdog aborts a quiet child within ~200ms" {
     defer result.deinit(testing.allocator);
     const elapsed_ms = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() - start;
 
-    // Watchdog poll cadence is 100ms; killing + wait adds a little
-    // overhead. 2s gives a generous ceiling that still proves we
-    // didn't sit through the 30s sleep.
     try testing.expect(elapsed_ms < 2000);
     try testing.expect(result.exit_code != 0);
     try testing.expect(result.cancelled);

@@ -190,8 +190,6 @@ const DynamicOAuthProvider = struct {
 var dynamic_provider_mutex: std.Io.Mutex = .init;
 var dynamic_providers: std.ArrayListUnmanaged(DynamicOAuthProvider) = .empty;
 
-// pi-mono source: packages/ai/src/utils/oauth/anthropic.ts
-
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
@@ -208,7 +206,6 @@ pub const anthropic_provider = OAuthProvider{
 };
 
 fn anthropicBuildAuthorizeUrl(allocator: std.mem.Allocator, flow: *const FlowContext) ?[]u8 {
-    // pi-mono: anthropic.ts:244-253
     return std.fmt.allocPrint(
         allocator,
         "{s}?code=true&client_id={s}&response_type=code&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}",
@@ -224,7 +221,6 @@ fn anthropicBuildAuthorizeUrl(allocator: std.mem.Allocator, flow: *const FlowCon
 }
 
 fn anthropicExchangeCode(allocator: std.mem.Allocator, req: ExchangeRequest) ExchangeResult {
-    // pi-mono: anthropic.ts:189-224
     return tokenExchangeJson(allocator, ANTHROPIC_TOKEN_URL, &[_]JsonField{
         .{ .key = "grant_type", .value = "authorization_code" },
         .{ .key = "client_id", .value = ANTHROPIC_CLIENT_ID },
@@ -236,15 +232,12 @@ fn anthropicExchangeCode(allocator: std.mem.Allocator, req: ExchangeRequest) Exc
 }
 
 fn anthropicRefreshToken(allocator: std.mem.Allocator, credential: auth_types.OAuthCredential) ExchangeResult {
-    // pi-mono: anthropic.ts:348-378
     return tokenExchangeJson(allocator, ANTHROPIC_TOKEN_URL, &[_]JsonField{
         .{ .key = "grant_type", .value = "refresh_token" },
         .{ .key = "client_id", .value = ANTHROPIC_CLIENT_ID },
         .{ .key = "refresh_token", .value = credential.refresh },
     });
 }
-
-// pi-mono source: packages/ai/src/utils/oauth/openai-codex.ts
 
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
@@ -264,7 +257,6 @@ pub const openai_codex_provider = OAuthProvider{
 };
 
 fn codexBuildAuthorizeUrl(allocator: std.mem.Allocator, flow: *const FlowContext) ?[]u8 {
-    // pi-mono: openai-codex.ts:174-193
     return std.fmt.allocPrint(
         allocator,
         "{s}?response_type=code&client_id={s}&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=zi",
@@ -280,7 +272,6 @@ fn codexBuildAuthorizeUrl(allocator: std.mem.Allocator, flow: *const FlowContext
 }
 
 fn codexExchangeCode(allocator: std.mem.Allocator, req: ExchangeRequest) ExchangeResult {
-    // pi-mono: openai-codex.ts:91-131
     return tokenExchangeForm(allocator, CODEX_TOKEN_URL, &[_]JsonField{
         .{ .key = "grant_type", .value = "authorization_code" },
         .{ .key = "client_id", .value = CODEX_CLIENT_ID },
@@ -291,7 +282,6 @@ fn codexExchangeCode(allocator: std.mem.Allocator, req: ExchangeRequest) Exchang
 }
 
 fn codexRefreshToken(allocator: std.mem.Allocator, credential: auth_types.OAuthCredential) ExchangeResult {
-    // pi-mono: openai-codex.ts:133-172
     return tokenExchangeForm(allocator, CODEX_TOKEN_URL, &[_]JsonField{
         .{ .key = "grant_type", .value = "refresh_token" },
         .{ .key = "refresh_token", .value = credential.refresh },

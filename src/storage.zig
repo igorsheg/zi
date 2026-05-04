@@ -15,7 +15,6 @@ const retry_delay_ns: u64 = 20 * std.time.ns_per_ms;
 const max_file_size: usize = 1 * 1024 * 1024;
 
 /// A file with proper-lockfile-compatible directory locking.
-/// Shared by auth (auth.json) and settings (settings.json).
 pub const LockedFile = struct {
     path: []const u8,
     lock_path: []const u8,
@@ -97,7 +96,6 @@ pub const LockedFile = struct {
     }
 };
 
-/// In-memory file substitute for testing. No locking needed.
 pub const MemoryFile = struct {
     content: ?[]const u8 = null,
     allocator: std.mem.Allocator,

@@ -112,9 +112,6 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 fn idDescLessThan(_: void, a: Model, b: Model) bool {
-    // Descending byte-wise — mirrors pi-mono's
-    // `localeCompare(b.id, a.id)` reversal used to pick the highest-
-    // sorting id first.
     return std.mem.order(u8, a.id, b.id) == .gt;
 }
 
@@ -278,10 +275,6 @@ pub fn parseModelPattern(
 
     const inner = parseModelPattern(allocator, prefix, available_models, opts);
     if (inner.model != null) {
-        // pi-mono: `Invalid thinking level "<suffix>" in pattern
-        // "<pattern>". Using default instead.`
-        // (model-resolver.ts:228). Format only when the caller
-        // supplied a warning_allocator — phase 2 has no consumer.
         const warn: ?[]u8 = if (opts.warning_allocator) |wa|
             std.fmt.allocPrint(
                 wa,
@@ -448,8 +441,6 @@ pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
         };
     }
 
-    // Inferred-provider fallback: retry against ALL models (handles
-    // openrouter ids that contain slashes like "openai/gpt-4o:extended").
     if (inferred_provider) {
         var full_buf: [256]u8 = undefined;
         for (available) |m| {
@@ -529,10 +520,6 @@ pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
             .allocator = opts.allocator,
         });
         if (resolved.err) |msg| {
-            // Caller prints and exits. Convert to an errset by
-            // stashing the message via the result: main.zig logs it.
-            // We return null + fallback_message so main.zig has one
-            // rendering path regardless of origin.
             return .{
                 .model = null,
                 .thinking_level = defaults.DEFAULT_THINKING_LEVEL,
@@ -548,10 +535,6 @@ pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
         }
     }
 
-    // zi-only convenience: --model without --provider. pi-mono's
-    // resolveCliModel handles this via the `cliProvider && cliModel`
-    // guard; we relax it so zi's single-flag case still works. The
-    // behavior is otherwise identical.
     if (opts.cli_model != null) {
         const resolved = resolveCliModel(.{
             .cli_model = opts.cli_model,
@@ -732,11 +715,6 @@ test "findInitialModel walks defaults_per_provider in order" {
 }
 
 test "resolveCliModel infers provider from slash and strips the prefix" {
-    // pi-mono parity: `--model anthropic/claude-opus-4-6` should
-    // resolve to provider=anthropic, pattern=claude-opus-4-6. If the
-    // inference fails the full string would be retried against all
-    // providers and could mis-route. Tests `resolveCliModel`'s
-    // inferred-provider branch (model-resolver.ts:373-384).
     const alloc = std.testing.allocator;
     var auth = try auth_storage_mod.AuthStorage.inMemory(alloc, null);
     defer auth.deinit();

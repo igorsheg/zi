@@ -322,9 +322,6 @@ pub const AgentSession = struct {
         var new_store = try SessionStore.createForCwd(self.allocator, self.resource_loader.cwd, self.resource_loader.agent_dir);
         errdefer new_store.deinit();
 
-        // Reset the agent FIRST. If reset fails (OOM allocating the
-        // empty SharedCommitted), we avoid the half-applied state of
-        // "new session store installed but old conversation retained."
         try self.agent.reset();
         try self.replaceSessionStore(new_store);
         const current_model = self.agent.modelValue();
@@ -524,10 +521,6 @@ pub const AgentSession = struct {
     }
 
     fn wireSubscription(self: *AgentSession) void {
-        // Extension observers run before session listeners/persistence so
-        // event-time retained UI publications exist before RuntimeHost/TUI
-        // listeners drain them. This also matches the pi-mono ordering noted
-        // on eventListener below: extensions → listeners → persistence.
         if (self._extension_subscription_token == null) {
             if (self._extension_runner != null) {
                 self._extension_subscription_token = self.agent.subscribe(
@@ -738,11 +731,6 @@ pub const AgentSession = struct {
             else => {},
         }
     }
-
-    // pi-mono injects auth in the streamFn closure (sdk.ts:274-283).
-    // We do the same: capture registry + api_key so the Agent doesn't need
-    // to thread auth through AgentLoopConfig.
-
 };
 
 pub const convertToLlm = message_conversion.convertToLlm;
@@ -1891,13 +1879,6 @@ pub const ExtensionCommandContext = struct {
     /// Embedded base context — every command context IS an extension
     /// context with extra capabilities.
     base: ExtensionContext,
-
-    // v2 action method seats — left as anyopaque function pointers so
-    // the table can be populated without importing the concrete types
-    // (AgentSession, SessionStore, ExtensionRunner) that would create
-    // circular deps. The ExtensionRunner binds real fn pointers into
-    // these slots in bindRuntime() once the command registry is active.
-    // v1: all null. v2: runner populates before dispatching commands.
 
     wait_for_idle: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     new_session: ?*const fn (ctx: *anyopaque, opts: *const anyopaque) anyerror!void = null,

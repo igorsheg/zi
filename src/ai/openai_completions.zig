@@ -898,7 +898,6 @@ fn buildRequestJson(
         try jw.endArray();
     }
 
-    // reasoning_effort for reasoning models (pi-mono: openai-completions.ts:410-428)
     if (model.reasoning) {
         if (reasoning) |level| {
             const effort_str = protocol.thinkingLevelToString(level);
@@ -922,7 +921,6 @@ fn buildRequestJson(
                 }
             }
         } else {
-            // OpenRouter: no reasoning level → send effort: "none" (pi-mono:423-424)
             if (model.compat) |compat_union| {
                 switch (compat_union) {
                     .openai_completions => |compat| {

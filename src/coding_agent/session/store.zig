@@ -355,11 +355,6 @@ pub const SessionStore = struct {
     }
 
     fn invalidateCache(self: *SessionStore) void {
-        // Once a resumed/flushed session has a parsed persisted cache, keep it.
-        // New entries appended by this writer are merged from writer.appended_entries
-        // in buildContext/buildBranchEntries, avoiding a full JSONL reparse on
-        // every interaction. Before the first flush, buffered entries can be
-        // rewritten wholesale, so the cache must still be dropped.
         if (self.cached_entries != null and self.writer.persist and self.writer.flushed) return;
         self.clearCache();
     }

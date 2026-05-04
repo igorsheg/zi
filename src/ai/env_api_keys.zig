@@ -31,7 +31,6 @@ pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
         const has_project = @import("env").get("GOOGLE_CLOUD_PROJECT") != null or
             @import("env").get("GCLOUD_PROJECT") != null;
         const has_location = @import("env").get("GOOGLE_CLOUD_LOCATION") != null;
-        // NOTE: skipping ADC file check (would need fs access). only env-var sources.
         const has_creds = @import("env").get("GOOGLE_APPLICATION_CREDENTIALS") != null;
 
         if (has_creds and has_project and has_location) return "<authenticated>";

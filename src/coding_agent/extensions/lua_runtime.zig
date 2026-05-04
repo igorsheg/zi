@@ -641,12 +641,8 @@ fn luaTableToJson(
     var obj: std.json.ObjectMap = .{};
     errdefer freeJsonValue(allocator, .{ .object = obj });
 
-    // Iterate via lua_next: push nil, then each call replaces the key
-    // with key+value. We pop the value after extracting, leaving the
-    // key for the next iteration.
     c.lua_pushnil(L);
     while (c.lua_next(L, table_idx) != 0) {
-        // Stack now: ... key value
         // Stringify the key without coercing it on the actual stack
         // (lua_tostring on a non-string key would mutate it and break
         // lua_next's invariant). Use a sidecar push.
@@ -737,8 +733,6 @@ pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
                 // a JSON parse) and aren't guaranteed sentinel-
                 // terminated, so we use lua_pushlstring + lua_settable.
                 _ = c.lua_pushlstring(L, kv.key_ptr.*.ptr, kv.key_ptr.*.len);
-                // Stack: ... table value key
-                // We need: table key value, then settable
                 c.lua_insert(L, -2);
                 c.lua_settable(L, -3);
             }

@@ -191,7 +191,6 @@ const Parser = struct {
             self.index += lit.len;
             return value;
         }
-        // Partial: remaining is a strict prefix of lit.
         if (allow_bit and remaining.len < lit.len and std.mem.startsWith(u8, lit, remaining)) {
             self.index = self.src.len;
             return value;

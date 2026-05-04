@@ -133,8 +133,6 @@ pub fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     }
 }
 
-// Process-lifetime singleton backing store; this registry is intentionally
-// immortal and matches the module-level map shape in pi-mono.
 var g_registry: Registry = .{ .gpa = std.heap.page_allocator };
 
 /// Process-global registry. Never deinit'd; lives for the process

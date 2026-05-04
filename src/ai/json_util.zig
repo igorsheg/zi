@@ -8,8 +8,6 @@ const protocol = @import("protocol.zig");
 const json_value = @import("../json/value.zig");
 const string_util = @import("../lib/string_util.zig");
 
-// Re-exports of generic helpers — callers should prefer importing
-// from `src/json/value.zig` directly in new code.
 pub const cloneJsonValue = json_value.cloneJsonValue;
 pub const freeJsonValue = json_value.freeJsonValue;
 pub const jsonToFloat = json_value.jsonToFloat;

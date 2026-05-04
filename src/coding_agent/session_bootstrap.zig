@@ -592,8 +592,6 @@ fn buildExtensionRuntime(
     runner_ptr.attachLuaState(state_ptr);
     extension_api.installZiTable(state_ptr, runner_ptr);
 
-    // Capture the default Lua package.path before any extension
-    // overrides, so we can append it after private + shared roots.
     _ = c.lua_getglobal(state_ptr.L, "package");
     defer c.lua_pop(state_ptr.L, 1);
     if (c.lua_type(state_ptr.L, -1) == c.LUA_TTABLE) {
@@ -630,7 +628,6 @@ fn buildExtensionRuntime(
         runner_ptr.shared_lua_paths = allocator.dupe(u8, shared_buf.items) catch null;
     }
 
-    // Set the initial package.path = shared + default (no private root yet).
     runner_ptr.setModuleContext(state_ptr, null);
 
     runner_ptr.bindLuaOwnerThread(std.Thread.getCurrentId());
@@ -644,7 +641,6 @@ fn buildExtensionRuntime(
         .{ stats.loaded, stats.failed, stats.attempted },
     );
 
-    // If custom tools override builtins, register them directly.
     if (has_custom_tools) {
         for (builtin_definitions) |def| {
             var cloned = tool_def.cloneOwned(runner_ptr.allocator, def) catch |err| {

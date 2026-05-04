@@ -349,8 +349,6 @@ pub const Agent = struct {
     }
 
     pub fn setMessages(self: *Agent, new_messages: []const protocol.AgentMessage) !void {
-        // Build the new shared prefix BEFORE touching existing state, so
-        // any allocation failure leaves the agent untouched.
         const new_shared = try SharedCommitted.fromMessages(self.allocator, new_messages);
         errdefer new_shared.release();
 
@@ -368,10 +366,6 @@ pub const Agent = struct {
         std.debug.assert(new_len <= current.flat.len);
         if (new_len == current.flat.len) return;
 
-        // Cold path: rebuild a fresh shared prefix from the first
-        // new_len messages. Old shared stays alive in any outstanding
-        // published views until they drain. Propagates OOM so callers
-        // can avoid acting on a half-applied truncate.
         const new_shared = try SharedCommitted.fromMessages(self.allocator, current.flat[0..new_len]);
         self.shared_committed = new_shared;
         current.release();
@@ -379,10 +373,6 @@ pub const Agent = struct {
     }
 
     pub fn reset(self: *Agent) !void {
-        // Allocate the new empty prefix first so that a failure here
-        // leaves the agent untouched. Propagates OOM — callers must
-        // avoid mutating adjacent state (e.g. session store swap)
-        // before this succeeds.
         const empty_shared = try SharedCommitted.empty(self.allocator);
         const old = self.shared_committed;
         self.shared_committed = empty_shared;
@@ -471,10 +461,6 @@ pub const Agent = struct {
     }
 
     fn resetHistoryArena(self: *Agent) void {
-        // Resets the scratch arena used for fields that still live in it
-        // (currently just `self.error_message`). Committed history is
-        // owned by `self.shared_committed` and must be replaced
-        // separately — see setMessages / truncateCommitted / reset.
         self.history_arena.deinit();
         self.history_arena = std.heap.ArenaAllocator.init(self.allocator);
         self.error_message = null;
@@ -491,10 +477,6 @@ pub const Agent = struct {
     }
 
     fn appendCommittedMessage(self: *Agent, message: protocol.AgentMessage) void {
-        // P3 hot path: build a new SharedCommitted that appends a fresh
-        // segment holding the deep-copied message. The old handle is
-        // released — its segments stay alive via the new handle, plus
-        // any outstanding published views.
         const new_shared = SharedCommitted.appendMessage(
             self.allocator,
             self.shared_committed,

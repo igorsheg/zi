@@ -48,17 +48,11 @@ pub const ToolRegistry = struct {
     }
 
     pub fn deinit(self: *ToolRegistry) void {
-        // Free every entry's owned strings + JSON schema. The hash
-        // map's keys are dupes of the same `name` slices that the
-        // entries themselves own — we free them via the entry, then
-        // tear down the index without re-freeing.
         for (self.entries.items) |*entry| {
             self.freeEntry(entry);
         }
         self.entries.deinit(self.allocator);
 
-        // The index keys are independent dupes (so the map can outlive
-        // a hypothetical entry-by-value rewrite). Free them here.
         var it = self.index.iterator();
         while (it.next()) |kv| {
             self.allocator.free(kv.key_ptr.*);
@@ -107,7 +101,6 @@ pub const ToolRegistry = struct {
 
     fn freeEntry(self: *ToolRegistry, entry: *ToolDefinition) void {
         definition.freeOwned(self.allocator, entry);
-        // `source` strings are borrowed by contract — do not free.
     }
 };
 

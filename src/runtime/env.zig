@@ -14,8 +14,6 @@ pub fn setProcessEnvironment(environ_map: *const std.process.Environ.Map) void {
 pub fn get(name: []const u8) ?[]const u8 {
     if (process_environment) |environ_map| return environ_map.get(name);
 
-    // Tests and standalone helpers may call env.get without going through
-    // main(). Keep the fallback narrow and isolated in runtime/env.zig.
     return getenvFallback(name);
 }
 

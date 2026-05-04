@@ -199,10 +199,6 @@ fn drainReaderBufferInto(
     pending: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
 ) !bool {
-    // Call sites may pass a `*std.Io.Reader` directly or a pointer to a
-    // pointer (e.g. `&reader` where reader is itself `*std.Io.Reader`).
-    // Peel pointer levels until we land on the container type that owns
-    // `buffered` / `tossBuffered`.
     switch (comptime @typeInfo(@TypeOf(reader))) {
         .pointer => |info| switch (comptime @typeInfo(info.child)) {
             .pointer => return drainReaderBufferInto(reader.*, pending, allocator),

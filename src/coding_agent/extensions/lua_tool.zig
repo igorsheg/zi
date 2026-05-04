@@ -135,9 +135,6 @@ fn execute(
     // `lua_owner_thread` doc for the rationale.
     tctx.runner.assertOnLuaThread();
 
-    // Stash per-call state so host functions invoked from inside
-    // the Lua handler can forward abort and partial updates for the
-    // right tool. Cleared on return.
     tctx.runner.current_signal = signal;
     tctx.runner.current_update_callback = on_update;
     tctx.runner.current_update_ctx = update_ctx;
@@ -181,8 +178,6 @@ fn runHandler(
     c.lua_pushcclosure(co.L, &luaToolUpdate, 1);
     c.lua_setfield(co.L, -2, "update");
 
-    // Inherit the current tool's module context for nested host
-    // callbacks (e.g. `zi.spawn` on_event trampolines).
     runner.setModuleContext(state, provenance);
     if (provenance) |prov| {
         runner.beginExecutionContext(runner.sourceForProvenance(prov));
@@ -371,9 +366,6 @@ fn parseReturn(
         }
         c.lua_pop(L, 1);
 
-        // Rich renderer state. This is presentation-only data, so it
-        // uses a bounded lossy conversion rather than the strict
-        // metadata converter above.
         var presentation: std.json.Value = .null;
         _ = c.lua_getfield(L, idx, "presentation");
         if (c.lua_type(L, -1) != c.LUA_TNIL) {

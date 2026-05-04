@@ -1431,8 +1431,6 @@ test "runtime host runs threshold compaction after successful turn when context 
     var fp = faux.FauxProvider.init(allocator);
     const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
     content[0] = .{ .text = .{ .text = "ok" } };
-    // Heavy assistant usage (~112k tokens) clears the default threshold
-    // of context_window (128000) minus reserve_tokens (16384) = 111616.
     const heavy_msg: ai.protocol.AssistantMessage = .{
         .content = content,
         .api = .{ .custom = "faux" },

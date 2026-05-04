@@ -354,7 +354,6 @@ fn decodeModifier(value: u16) Modifiers {
 fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
     const mods = decodeModifier(modifier_raw);
 
-    // special kitty codepoints
     const key: ?struct { code: KeyCode, ch: ?u21 } = switch (codepoint) {
         27 => .{ .code = .escape, .ch = null },
         9 => .{ .code = .tab, .ch = null },
@@ -432,7 +431,6 @@ fn parseSgrMouse(data: []const u8) ?MouseResult {
     const seq_len = i + 1;
     const params = data[3..i];
 
-    // Parse three semicolon-separated numbers: button;x;y
     var nums: [3]u16 = .{ 0, 0, 0 };
     var num_idx: usize = 0;
     var start: usize = 0;

@@ -726,7 +726,6 @@ const ReadCapture = struct {
 
     fn callback(ctx: *anyopaque, current: ?[]const u8) ?[]const u8 {
         const self: *ReadCapture = @ptrCast(@alignCast(ctx));
-        // Dupe the content — file storage frees `current` after callback returns
         self.content = if (current) |c| self.allocator.dupe(u8, c) catch null else null;
         return null;
     }

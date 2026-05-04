@@ -437,9 +437,6 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.
                 block.text.appendSlice(state.allocator, partial) catch return;
                 tc.arguments = parseToolArgs(state, block.text.items);
                 const json_delta = block.text.items[old_len..];
-                // Refresh live partial.content so downstream
-                // subscribers see the in-progress tool_call with
-                // parsed partial args (pi-mono parity).
                 state.partial.content = buildLiveContent(state.allocator, state.content_blocks.items) catch state.partial.content;
                 callback(.{ .toolcall_delta = .{ .content_index = index, .delta = json_delta, .partial = state.partial } }, callback_ctx);
             }
@@ -702,7 +699,6 @@ fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
         }
     }
 
-    // Thinking configuration — pi-mono: anthropic.ts:659-677
     if (model.reasoning) {
         if (reasoning) |level| {
             if (supportsAdaptiveThinking(model.id)) {
@@ -1042,9 +1038,6 @@ test "SSE parse: braces inside string values survive a real Edit-tool payload" {
     const delta_obj = json_value.asObject(parsed.object.get("delta")).?;
     try testing.expectEqualStrings("input_json_delta", json_value.asString(delta_obj.get("type")).?);
     const partial = json_value.asString(delta_obj.get("partial_json")).?;
-    // After std.json's escape decoding, the embedded braces are
-    // literal characters in the result — no truncation, no lost
-    // closing brace.
     try testing.expectEqualStrings("{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}", partial);
 }
 

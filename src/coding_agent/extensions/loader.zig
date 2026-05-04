@@ -391,10 +391,6 @@ fn loadOne(
     runner.beginLoadContext(load_source);
     defer runner.endLoadContext();
 
-    // Record the private Lua module root before execution so that
-    // `require` in top-level code and the factory resolve truthfully.
-    // Only bundled extensions (`extensions/<id>/init.lua`) get a
-    // private root, and it is `extensions/<id>/lua`.
     runner.recordModuleRoot(ext.provenance.state_owner_id, ext.path) catch |err| {
         log.warn("failed to record module root for {s}: {s}", .{ ext.id, @errorName(err) });
     };

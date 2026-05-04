@@ -10,10 +10,7 @@ const Decoded = struct {
 /// 2 for CJK ideographs, fullwidth forms, wide emoji.
 /// 1 for everything else.
 pub fn charWidth(cp: u21) u2 {
-    // fast path: printable ASCII
     if (cp >= 0x20 and cp <= 0x7E) return 1;
-
-    // --- width 0 ---
 
     // C0 controls + DEL
     if (cp <= 0x1F or cp == 0x7F) return 0;
@@ -58,8 +55,6 @@ pub fn charWidth(cp: u21) u2 {
 
     // variation selectors supplement
     if (cp >= 0xE0100 and cp <= 0xE01EF) return 0;
-
-    // --- width 2 ---
 
     // hangul jamo
     if (cp >= 0x1100 and cp <= 0x115F) return 2;

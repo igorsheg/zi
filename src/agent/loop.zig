@@ -268,7 +268,6 @@ fn streamAssistantResponse(
         stream_options.base.on_payload_ctx = @constCast(&config);
     }
 
-    // Resolve API key dynamically (pi-mono agent-loop.ts:264-265)
     // JS `||` treats empty string as falsy, so we must check len > 0.
     // zi-wub.27: dupe into the loop arena immediately. The slice
     // returned by the hook is BORROWED from AuthStorage's internal

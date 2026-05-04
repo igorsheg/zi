@@ -176,7 +176,6 @@ pub const ProjectionState = struct {
         var owned = snapshot.*;
         snapshot.* = undefined;
 
-        // Reject stale snapshots by generation/version (authoritative ordering truth).
         if (self.view_snapshot) |previous| {
             if (owned.session_generation < previous.session_generation or
                 (owned.session_generation == previous.session_generation and
@@ -358,9 +357,6 @@ pub fn rebuildFromSnapshots(
     }
 
     for (desired_items.items, 0..) |desired, idx| {
-        // rebuildFromSnapshots cleared the transcript above, so every desired
-        // item MUST carry a freshly-built row (P2 retain path can't trigger
-        // against an empty transcript).
         std.debug.assert(desired.row != null);
         if (!transcript.addItem(desired.row.?)) return;
         disarmDesiredRow(&desired_items.items[idx]);
@@ -443,18 +439,15 @@ fn reconcileDesiredItems(
         const existing_index = transcript.findRetainedItemIndex(desired.item_id);
         if (existing_index) |current_index| {
             if (transcript.retainedItemSemanticVersionAt(current_index) == desired.semantic_version) {
-                // P2 contract: same version ⇒ row must be null (not built).
                 std.debug.assert(desired.row == null);
                 if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
             } else {
-                // Version changed ⇒ builder must have produced a fresh row.
                 std.debug.assert(desired.row != null);
                 _ = transcript.replaceItemAt(current_index, desired.row.?);
                 disarmDesiredRow(&desired_items.items[desired_index]);
                 if (current_index != desired_index) transcript.moveItem(current_index, desired_index);
             }
         } else {
-            // New item ⇒ builder must have produced a fresh row.
             std.debug.assert(desired.row != null);
             _ = transcript.insertItemAt(desired_index, desired.row.?);
             disarmDesiredRow(&desired_items.items[desired_index]);

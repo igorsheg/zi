@@ -108,9 +108,6 @@ pub fn parseAuthJson(allocator: std.mem.Allocator, json_content: []const u8) !Au
         };
 
         const provider_id = allocator.dupe(u8, entry.key_ptr.*) catch |err| {
-            // OOM cleaning up the entry we just built — free it then
-            // propagate. Out-of-memory is the one error we don't try
-            // to swallow because the caller's error path needs to know.
             freeOneCredential(allocator, credential);
             return err;
         };

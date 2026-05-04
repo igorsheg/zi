@@ -22,18 +22,7 @@ pub fn main(init: std.process.Init) !void {
 
     const heap_allocator = main_heap.allocator();
 
-    // Interactive zi is a long-lived process. Do not hide general app
-    // allocations behind a process-lifetime arena: deinit/free paths must
-    // return memory to the process heap while the TUI is still running.
-    // Short-lived scratch lifetimes should create explicit local arenas at
-    // their actual boundary (parse/run/turn/frame/tool/etc.).
     const allocator = heap_allocator;
-
-    // Dedicated thread-safe allocator for cross-thread mailbox payloads
-    // and mailbox backing storage (event queue, request queue,
-    // converted agent events, login callbacks). This is NOT the arena,
-    // so producer/consumer pairs can free individually and we don't pin
-    // growing payloads in the arena's lifetime.
     const msg_allocator = std.heap.smp_allocator;
 
     var raw_args: std.ArrayListUnmanaged([]const u8) = .empty;

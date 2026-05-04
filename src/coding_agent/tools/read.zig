@@ -114,7 +114,6 @@ fn readImage(
     const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{}) catch |err|
         return util.errorf(allocator, "failed to open image: {s}", .{@errorName(err)});
     defer file.close(std.Options.debug_io);
-    // 16MB cap on raw image bytes — generous but bounded.
     var image_read_buf: [4096]u8 = undefined;
     var image_reader = file.reader(std.Options.debug_io, &image_read_buf);
     const raw = image_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024)) catch |err|
@@ -217,17 +216,12 @@ fn readTextFile(
     const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{}) catch |err|
         return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
     defer file.close(std.Options.debug_io);
-    // Cap raw read at 4MB so a runaway file doesn't OOM us. Truncation
-    // happens after numbering — the per-line + per-output-byte limits
-    // pare it down further.
     var text_read_buf: [4096]u8 = undefined;
     var text_reader = file.reader(std.Options.debug_io, &text_read_buf);
     const raw = text_reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch |err|
         return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
     defer allocator.free(raw);
 
-    // Count lines without retaining one slice per line. A file containing only
-    // newlines can have millions of logical lines even under the raw byte cap.
     var total_lines: usize = 1;
     for (raw) |byte| {
         if (byte == '\n') total_lines += 1;

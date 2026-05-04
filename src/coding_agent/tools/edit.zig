@@ -157,8 +157,6 @@ fn execute(
         return util.errorResult(allocator, "edit tool: failed to resolve path");
     defer allocator.free(resolved);
 
-    // Per-path mutex over the whole read→apply→write window.
-    // Mirrors ts override `edit-file.ts`.
     const lock_entry = lock_registry.global().acquirePath(allocator, resolved) catch
         return util.errorResult(allocator, "edit tool: failed to acquire file lock");
     defer lock_registry.global().release(lock_entry);
@@ -799,10 +797,6 @@ fn findRedactionMarker(old_str: []const u8, new_str: []const u8) ?[]const u8 {
     }
     return null;
 }
-
-// Unified diff emission lives in `src/tui/components/diff.zig` now —
-// proper Myers algorithm, real hunks, shared with any future UI that
-// wants to display diffs.
 
 // `applyEdits` raises bare error tags (NotFound / Ambiguous / Overlap).
 // The caller pairs each tag with the populated `EditFailure` to build
