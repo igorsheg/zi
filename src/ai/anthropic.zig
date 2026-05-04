@@ -106,7 +106,6 @@ pub const AnthropicProvider = struct {
         n_extra += 1;
 
         // OAuth tokens (sk-ant-oat*) use Bearer auth + claude-code identity headers.
-        // API keys use x-api-key header.
         const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
 
         var auth_buf: [4096]u8 = undefined;

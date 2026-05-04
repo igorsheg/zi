@@ -15,7 +15,6 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     var result = types.SpawnResult.init();
     const allocator = config.allocator;
 
-    // `ZI_SPAWN_TRACE` enables a best-effort framed process trace.
     const trace_file: ?std.Io.File = openTraceFile(config.io);
     defer if (trace_file) |f| f.close(config.io);
 

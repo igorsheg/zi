@@ -535,9 +535,6 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
     const partial = parseReturn(aa, L, 1, partial_tool_result_limits) catch emptyResult();
 
-    // Fire the callback. The downstream consumer clones what it
-    // needs synchronously, so when this returns the arena can
-    // safely free everything.
     cb(partial, runner.current_update_ctx);
 
     return 0;
