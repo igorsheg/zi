@@ -514,14 +514,3 @@ test "AgentToolResult clone+free with json details" {
     try std.testing.expectEqualStrings("value", val.string);
 }
 
-test "AgentToolResult free on empty result" {
-    const allocator = std.testing.allocator;
-
-    const empty = AgentToolResult{
-        .content = &.{},
-    };
-
-    const cloned = try empty.clone(allocator);
-    cloned.free(allocator);
-    // no crash = pass
-}

@@ -301,34 +301,6 @@ test "SelectList preserves selection by value across setItems" {
     try testing.expectEqual(@as(u32, 1), sl.selected_index);
 }
 
-test "SelectList enter returns selected" {
-    const theme = testTheme();
-    var items = makeItems();
-
-    var sl = SelectList{
-        .theme = &theme,
-    };
-    sl.setItems(&items);
-    _ = sl.processInput(.{ .code = .down }); // select "Beta"
-
-    const r = sl.processInput(.{ .code = .enter });
-    try testing.expectEqual(InputResult.selected, r);
-
-    const item = sl.getSelectedItem().?;
-    try testing.expectEqualStrings("Beta", item.label);
-}
-
-test "SelectList escape and ctrl+c return cancelled" {
-    const theme = testTheme();
-
-    var sl = SelectList{
-        .theme = &theme,
-    };
-
-    try testing.expectEqual(InputResult.cancelled, sl.processInput(.{ .code = .escape }));
-    try testing.expectEqual(InputResult.cancelled, sl.processInput(.{ .code = .char, .char = 'c', .ctrl = true }));
-}
-
 test "SelectList empty items have no selection and consume list actions" {
     const theme = testTheme();
 

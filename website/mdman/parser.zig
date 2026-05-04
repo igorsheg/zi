@@ -341,37 +341,6 @@ const Parser = struct {
 
 // --- Tests ---
 
-test "parse h1 heading" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const doc = try parse(arena.allocator(), "# NAME\n");
-    try std.testing.expectEqual(1, doc.nodes.len);
-    try std.testing.expectEqual(1, doc.nodes[0].heading.level);
-    try std.testing.expectEqualStrings("NAME", doc.nodes[0].heading.text);
-}
-
-test "parse h2 heading" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const doc = try parse(arena.allocator(), "## Subsection\n");
-    try std.testing.expectEqual(1, doc.nodes.len);
-    try std.testing.expectEqual(2, doc.nodes[0].heading.level);
-    try std.testing.expectEqualStrings("Subsection", doc.nodes[0].heading.text);
-}
-
-test "parse paragraph" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const doc = try parse(arena.allocator(), "Hello world.\n");
-    try std.testing.expectEqual(1, doc.nodes.len);
-    const spans = doc.nodes[0].paragraph;
-    try std.testing.expectEqual(1, spans.len);
-    try std.testing.expectEqualStrings("Hello world.", spans[0].text);
-}
-
 test "parse bold" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

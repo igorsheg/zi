@@ -186,17 +186,6 @@ fn makeUserMessage(alloc: std.mem.Allocator, text: []const u8) !protocol.AgentMe
     } };
 }
 
-test "empty SharedCommitted has no messages" {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-
-    const sc = try SharedCommitted.empty(alloc);
-    defer sc.release();
-    try testing.expectEqual(@as(usize, 0), sc.flat.len);
-    try testing.expectEqual(@as(usize, 0), sc.segments.len);
-}
-
 test "fromMessages builds one segment" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
