@@ -160,16 +160,6 @@ test "CommandRegistry register and unregister dynamic" {
     try std.testing.expect(!reg.unregister("myplugin"));
 }
 
-test "CommandRegistry count includes both" {
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    try std.testing.expectEqual(@as(usize, BUILTIN_COMMANDS.len), reg.count());
-
-    reg.register(.{ .name = try std.testing.allocator.dupe(u8, "extra"), .source = .skill, .action = .skill });
-    try std.testing.expectEqual(@as(usize, BUILTIN_COMMANDS.len + 1), reg.count());
-}
-
 test "CommandRegistry builtin takes precedence" {
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();

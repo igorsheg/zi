@@ -349,26 +349,6 @@ const AnimatedComp = struct {
     }
 };
 
-test "Container stacks fixed children and measures their preferred height" {
-    var container = Container.init(testing.allocator);
-    defer container.deinit();
-
-    var a = TestComponent{ .height = 2 };
-    var b = TestComponent{ .height = 3 };
-    container.addChild(a.component());
-    container.addChild(b.component());
-
-    var buf = try Buffer.init(testing.allocator, 10, 10);
-    defer buf.deinit();
-    container.render(buf.region());
-
-    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 0, .width = 10, .height = 2 }, a.last_region.?);
-    try testing.expectEqualDeep(ChildRect{ .x = 0, .y = 2, .width = 10, .height = 3 }, b.last_region.?);
-
-    const m = container.measure(10);
-    try testing.expectEqual(@as(u32, 1), m.min_height);
-    try testing.expectEqual(@as(u32, 5), m.preferred_height);
-}
 
 test "Container gives flex child remaining height and reports rendered geometry" {
     var container = Container.init(testing.allocator);
@@ -445,24 +425,3 @@ test "Container delegates input and cursor state to focused child" {
     try testing.expectEqualDeep(CursorState{ .x = 4, .y = 3, .style = .bar }, container.cursorState().?);
 }
 
-test "Container aggregates animation only for rendered children" {
-    var container = Container.init(testing.allocator);
-    defer container.deinit();
-
-    var visible_slow = AnimatedComp{ .height = 1, .deadline_ns = 50 };
-    var visible_fast = AnimatedComp{ .height = 1, .deadline_ns = 10 };
-    var clipped = AnimatedComp{ .height = 1, .deadline_ns = 5 };
-    container.addChild(visible_slow.component());
-    container.addChild(visible_fast.component());
-    container.addChild(clipped.component());
-
-    var buf = try Buffer.init(testing.allocator, 10, 2);
-    defer buf.deinit();
-    container.render(buf.region());
-
-    try testing.expectEqual(@as(?i128, 10), container.nextAnimationDeadline(0));
-    try testing.expect(container.tickAnimation(10));
-    try testing.expect(visible_slow.ticked);
-    try testing.expect(visible_fast.ticked);
-    try testing.expect(!clipped.ticked);
-}

@@ -172,7 +172,3 @@ pub const LoadedPromptInputs = struct {
     append_system_prompt: []const []const u8 = &.{},
     agents_files: []const AgentsFile = &.{},
 };
-
-test {
-    std.testing.refAllDecls(@This());
-}

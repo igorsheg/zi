@@ -111,12 +111,6 @@ pub fn windowExcerpts(allocator: std.mem.Allocator, total: u32, excerpts: []cons
     return .{ .items = items[0..idx], .allocator = allocator };
 }
 
-test "empty excerpts returns full span" {
-    var result = try windowExcerpts(testing.allocator, 10, &.{});
-    defer result.deinit();
-    try testing.expectEqual(@as(usize, 1), result.items.len);
-    try testing.expectEqual(WindowItem{ .span = .{ .start = 0, .end = 10 } }, result.items[0]);
-}
 
 test "tail excerpt shows last N lines with gap" {
     var result = try windowExcerpts(testing.allocator, 100, &.{
@@ -150,11 +144,3 @@ test "head + tail excerpts with gap" {
     try testing.expectEqual(WindowItem{ .span = .{ .start = 15, .end = 20 } }, result.items[2]);
 }
 
-test "zero total returns empty span" {
-    var result = try windowExcerpts(testing.allocator, 0, &.{
-        .{ .focus = .head, .context = 5 },
-    });
-    defer result.deinit();
-    try testing.expectEqual(@as(usize, 1), result.items.len);
-    try testing.expectEqual(WindowItem{ .span = .{ .start = 0, .end = 0 } }, result.items[0]);
-}

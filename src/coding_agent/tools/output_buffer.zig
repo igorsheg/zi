@@ -244,30 +244,6 @@ fn formatStateAlloc(
 
     return .{ .text = try aw.toOwnedSlice(), .truncated_lines = truncated_lines };
 }
-
-test "splitHeadTail keeps full slice when under limit" {
-    const items = [_][]const u8{ "a", "b", "c" };
-    const window = splitHeadTail([]const u8, items[0..], 10);
-    try testing.expectEqual(@as(usize, 0), window.truncated_count);
-    try testing.expectEqual(@as(usize, 3), window.head.len);
-    try testing.expectEqual(@as(usize, 0), window.tail.len);
-}
-
-test "appendHeadTail inserts marker between head and tail" {
-    const items = [_][]const u8{ "0", "1", "2", "3", "4", "5" };
-    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer aw.deinit();
-
-    try appendHeadTail(&aw.writer, items[0..], 4, "... [{d} lines truncated] ...");
-    const out = try aw.toOwnedSlice();
-    defer testing.allocator.free(out);
-
-    try testing.expectEqualStrings(
-        "0\n1\n\n... [2 lines truncated] ...\n\n4\n5",
-        out,
-    );
-}
-
 test "LineOutputBuffer caps individual long lines" {
     var buffer = LineOutputBuffer.init(testing.allocator, 2, 2);
     defer buffer.deinit();

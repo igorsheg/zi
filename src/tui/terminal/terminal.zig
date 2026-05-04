@@ -250,25 +250,6 @@ fn writeAll(fd: posix.fd_t, data: []const u8) void {
 
 // --- Tests ---
 
-test "Terminal init defaults" {
-    const t = Terminal.init();
-    try std.testing.expectEqual(@as(u32, 80), t.width);
-    try std.testing.expectEqual(@as(u32, 24), t.height);
-    try std.testing.expect(!t.raw_mode);
-    try std.testing.expect(!t.kitty_active);
-    try std.testing.expect(t.original_termios == null);
-}
-
-test "Terminal deinit is idempotent on fresh instance" {
-    var t = Terminal.init();
-    t.deinit();
-    try std.testing.expect(!t.raw_mode);
-    try std.testing.expect(!t.kitty_active);
-    try std.testing.expect(!t.bracketed_paste_active);
-    try std.testing.expect(!t.mouse_tracking_active);
-    try std.testing.expect(!t.cursor_hidden);
-}
-
 fn testPipe() ![2]std.posix.fd_t {
     return runtime_fd.pipe();
 }

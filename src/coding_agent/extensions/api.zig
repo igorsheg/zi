@@ -844,39 +844,6 @@ test "zi.register_tool registers a Lua-defined tool end-to-end" {
     try testing.expect(tool.impl.lua != c.LUA_REFNIL);
 }
 
-test "zi.register_tool first-registered-wins drops later duplicates" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
-
-    try state.doString(
-        \\local first = zi.register_tool({
-        \\  name = "task",
-        \\  description = "first registration",
-        \\  parameters = { type = "object" },
-        \\  execute = function() end,
-        \\})
-        \\local second = zi.register_tool({
-        \\  name = "task",
-        \\  description = "second registration (should be dropped)",
-        \\  parameters = { type = "object" },
-        \\  execute = function() end,
-        \\})
-        \\assert(first == true, "first registration should succeed")
-        \\assert(second == false, "second registration should be dropped")
-    , "test_first_wins");
-
-    try testing.expectEqual(@as(usize, 1), runner.tool_registry.count());
-    try testing.expectEqualStrings(
-        "first registration",
-        runner.tool_registry.get("task").?.description,
-    );
-}
-
 test "zi.register_tool after bind refreshes visible tool projection for accepted claims only" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();

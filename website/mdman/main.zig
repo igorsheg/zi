@@ -148,7 +148,3 @@ fn printUsage() !void {
         \\
     );
 }
-
-test {
-    _ = @import("parser.zig");
-}

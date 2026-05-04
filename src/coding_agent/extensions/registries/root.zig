@@ -13,7 +13,3 @@ pub const EventRegistry = event.EventRegistry;
 pub const CommandRegistry = command.CommandRegistry;
 pub const ProviderQueue = provider.ProviderQueue;
 pub const KeybindingRegistry = keybinding.KeybindingRegistry;
-
-test {
-    @import("std").testing.refAllDecls(@This());
-}

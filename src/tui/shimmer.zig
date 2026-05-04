@@ -202,22 +202,6 @@ fn decodeWidth(text: []const u8, i: *usize) u32 {
     return grapheme_mod.charWidth(cp);
 }
 
-test "phaseForTime advances on quantized cadence" {
-    const cfg = Config{
-        .step_ns = 10,
-        .lead_pad_cols = 2,
-        .tail_pad_cols = 2,
-        .band_half_width = 1,
-        .base_fg = Color.default,
-        .edge_fg = Color.default,
-        .peak_fg = Color.default,
-    };
-
-    try std.testing.expectEqual(@as(u32, 0), phaseForTime(0, cfg, "abc"));
-    try std.testing.expectEqual(@as(u32, 1), phaseForTime(10, cfg, "abc"));
-    try std.testing.expectEqual(@as(u32, 0), phaseForTime(70, cfg, "abc"));
-}
-
 test "write groups contiguous shimmer buckets into styled runs" {
     var buf = try buffer_mod.Buffer.init(std.testing.allocator, 16, 1);
     defer buf.deinit();

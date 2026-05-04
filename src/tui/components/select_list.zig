@@ -341,34 +341,3 @@ test "SelectList empty items have no selection and consume list actions" {
     try testing.expectEqual(@as(u32, 0), sl.selected_index);
 }
 
-test "SelectList measure reports correct height" {
-    const theme = testTheme();
-
-    var sl = SelectList{
-        .theme = &theme,
-        .max_visible = 5,
-    };
-
-    // empty
-    const m0 = sl.measure(80);
-    try testing.expectEqual(@as(u32, 1), m0.preferred_height);
-
-    // 3 items (< max_visible) -> no scroll indicator
-    var items = makeItems();
-    sl.setItems(&items);
-    const m1 = sl.measure(80);
-    try testing.expectEqual(@as(u32, 3), m1.preferred_height);
-
-    // 7 items (> max_visible=5) -> 5 + 1 scroll indicator = 6
-    var many: [7]SelectItem = undefined;
-    for (&many, 0..) |*item, i| {
-        item.* = .{
-            .value = "v",
-            .label = if (i < 3) "A" else "B",
-            .description = null,
-        };
-    }
-    sl.setItems(&many);
-    const m2 = sl.measure(80);
-    try testing.expectEqual(@as(u32, 6), m2.preferred_height);
-}

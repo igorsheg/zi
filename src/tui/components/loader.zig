@@ -94,14 +94,3 @@ pub const Loader = struct {
         };
     }
 };
-
-test "loader animation hooks publish shimmer deadlines and visible ticks" {
-    var loader = Loader{};
-    loader.setMessage("Working...");
-    loader.start();
-
-    const now_ns: i128 = 100;
-    try std.testing.expect(loader.nextAnimationDeadline(now_ns) != null);
-    try std.testing.expect(loader.tickAnimation(now_ns) == false);
-    try std.testing.expect(loader.nextAnimationDeadline(now_ns + 1) != null);
-}

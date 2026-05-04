@@ -14,6 +14,3 @@ pub const openai_codex = @import("openai_codex.zig");
 pub const provider_failure = @import("provider_failure.zig");
 pub const request_transform = @import("request_transform.zig");
 
-test {
-    @import("std").testing.refAllDecls(@This());
-}

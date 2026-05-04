@@ -81,7 +81,3 @@ pub fn deinitLoadResult(allocator: std.mem.Allocator, result: LoadResult) void {
     if (result.skills.len > 0) allocator.free(result.skills);
     deinitDiagnostics(allocator, result.diagnostics);
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

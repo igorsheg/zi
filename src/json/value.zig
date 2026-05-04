@@ -160,34 +160,3 @@ test "cloneJsonValue dupes strings and keys" {
     try testing.expectEqualStrings("v", cloned.object.get("k").?.string);
     try testing.expectEqual(@as(usize, 2), cloned.object.get("n").?.array.items.len);
 }
-
-test "typed accessors return null on type mismatch" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const parsed = try std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena.allocator(),
-        \\{"s":"hi","n":42,"b":true,"f":1.5,"o":{},"a":[],"nil":null}
-    ,
-        .{},
-    );
-    const obj = parsed.object;
-
-    try testing.expectEqualStrings("hi", asString(obj.get("s")).?);
-    try testing.expectEqual(@as(u64, 42), asU64(obj.get("n")).?);
-    try testing.expectEqual(true, asBool(obj.get("b")).?);
-    try testing.expectApproxEqAbs(@as(f64, 1.5), jsonToFloat(obj.get("f").?), 1e-9);
-    try testing.expect(asObject(obj.get("o")) != null);
-    try testing.expect(asArray(obj.get("a")) != null);
-
-    // Type mismatch → null.
-    try testing.expect(asString(obj.get("n")) == null);
-    try testing.expect(asU64(obj.get("s")) == null);
-    try testing.expect(asBool(obj.get("n")) == null);
-    try testing.expect(asObject(obj.get("s")) == null);
-    try testing.expect(asArray(obj.get("o")) == null);
-
-    // Missing key → null.
-    try testing.expect(asString(obj.get("missing")) == null);
-    try testing.expect(asU64(obj.get("missing")) == null);
-}

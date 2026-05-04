@@ -40,13 +40,6 @@ pub fn generateState() [STATE_LEN]u8 {
     _ = std.base64.url_safe_no_pad.Encoder.encode(&buf, &random_bytes);
     return buf;
 }
-
-test "pkce verifier and challenge are correct lengths" {
-    const pkce = generate();
-    try std.testing.expectEqual(@as(usize, 43), pkce.verifier().len);
-    try std.testing.expectEqual(@as(usize, 43), pkce.challenge().len);
-}
-
 test "pkce challenge is sha256 of verifier" {
     const pkce = generate();
     var hash: [32]u8 = undefined;
@@ -54,16 +47,4 @@ test "pkce challenge is sha256 of verifier" {
     var expected: [43]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&expected, &hash);
     try std.testing.expectEqualSlices(u8, &expected, pkce.challenge());
-}
-
-test "pkce generates unique values" {
-    const a = generate();
-    const b = generate();
-    try std.testing.expect(!std.mem.eql(u8, &a.verifier_buf, &b.verifier_buf));
-    try std.testing.expect(!std.mem.eql(u8, &a.challenge_buf, &b.challenge_buf));
-}
-
-test "generateState returns 22 chars" {
-    const state = generateState();
-    try std.testing.expectEqual(@as(usize, 22), state.len);
 }

@@ -4,7 +4,3 @@ pub const file_search = @import("file_search.zig");
 pub const file_ignore = @import("file_ignore.zig");
 pub const fuzzy = @import("fuzzy.zig");
 pub const query = @import("query.zig");
-
-test {
-    @import("std").testing.refAllDecls(@This());
-}

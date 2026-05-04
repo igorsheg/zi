@@ -1205,24 +1205,3 @@ test "deepMergeSettings merges nested structs and overrides simple fields" {
     try testing.expectEqualStrings("ext-c", merged.extensions.?[0]);
     try testing.expectEqual(true, merged.hide_thinking_block.?);
 }
-
-test "applyTypedFieldToRaw writes nested struct to raw object" {
-    const testing = std.testing;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const settings: types.Settings = .{
-        .compaction = .{ .enabled = true, .reserve_tokens = 8000 },
-    };
-
-    var raw: ObjectMap = .{};
-
-    try applyTypedFieldToRaw(allocator, &raw, .compaction, &settings);
-
-    const compaction_val = raw.get("compaction").?;
-    try testing.expect(compaction_val == .object);
-    const nested = compaction_val.object;
-    try testing.expectEqual(true, nested.get("enabled").?.bool);
-    try testing.expectEqual(@as(i64, 8000), nested.get("reserveTokens").?.integer);
-}

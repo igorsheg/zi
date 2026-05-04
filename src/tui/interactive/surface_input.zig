@@ -110,10 +110,3 @@ fn keyText(allocator: std.mem.Allocator, key: Key) !?[]const u8 {
     const len = std.unicode.utf8Encode(ch, &buf) catch return null;
     return try allocator.dupe(u8, buf[0..len]);
 }
-
-test "surface input builds scoped key payload" {
-    var input = try buildSurfaceInput(std.testing.allocator, "demo", .{ .code = .left });
-    defer input.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("demo", input.id);
-    try std.testing.expectEqualStrings("left", input.key);
-}

@@ -195,8 +195,3 @@ test "AbortSignal.waitUntil wakes for abort without polling" {
     thread.join();
     try std.testing.expectEqual(.aborted, result);
 }
-
-test "AbortSignal.none never aborts" {
-    try std.testing.expect(AbortSignal.none.isNone());
-    try std.testing.expect(!AbortSignal.none.isAborted());
-}

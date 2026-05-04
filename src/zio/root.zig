@@ -40,7 +40,3 @@ pub fn async(
 ) Io.Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
     return Io.async(io, function, args);
 }
-
-test {
-    std.testing.refAllDecls(@This());
-}

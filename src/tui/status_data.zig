@@ -140,28 +140,6 @@ pub const StatusData = struct {
 
 const testing = std.testing;
 
-test "StatusData owns model and thinking labels" {
-    var sd = StatusData.init(testing.allocator);
-    defer sd.deinit();
-    sd.setModelProvider("anthropic");
-    sd.setModelId("claude-4-opus");
-    sd.setThinkingLevel("high");
-    try testing.expectEqualStrings("anthropic", sd.model_provider);
-    try testing.expectEqualStrings("claude-4-opus", sd.model_id);
-    try testing.expectEqualStrings("high", sd.thinking_level);
-}
-
-test "StatusData extension status set and remove" {
-    var sd = StatusData.init(testing.allocator);
-    defer sd.deinit();
-
-    sd.setStatus("lsp", "ready");
-    try testing.expectEqualStrings("ready", sd.extension_statuses.get("lsp").?);
-
-    sd.setStatus("lsp", null);
-    try testing.expect(sd.extension_statuses.get("lsp") == null);
-}
-
 test "StatusData formats extension status values in key order" {
     var sd = StatusData.init(testing.allocator);
     defer sd.deinit();

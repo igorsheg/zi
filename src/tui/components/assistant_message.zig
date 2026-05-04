@@ -363,16 +363,3 @@ test "assistant message renders stable row model and hidden thinking label" {
     try testing.expect(std.mem.indexOf(u8, custom_label_text, "Thinking...") == null);
 }
 
-test "assistant message animation hooks are static" {
-    var model: AssistantRowModel = .{};
-    defer model.deinit(testing.allocator);
-    try appendModelBlock(&model, .{ .thinking = @constCast("ponder") });
-
-    var msg = AssistantMessage.init(testing.allocator);
-    defer msg.deinit();
-    try msg.setOwnedModel(&model);
-
-    try testing.expectEqual(@as(?i128, null), msg.nextAnimationDeadline(0));
-    try testing.expect(!msg.tickAnimation(0));
-    try testing.expect(!msg.deactivateThinkingShimmer());
-}

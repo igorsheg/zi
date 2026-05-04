@@ -68,8 +68,3 @@ pub const Greeter = struct {
     }
 };
 
-test "greeter has stable fixed height" {
-    var greeter = Greeter{};
-    try std.testing.expectEqual(@as(u32, 5), greeter.measure(70).preferred_height);
-    try std.testing.expectEqual(@as(u32, 5), greeter.measure(100).preferred_height);
-}

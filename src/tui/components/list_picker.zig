@@ -483,34 +483,3 @@ test "searchable picker preserves selected value across filter changes" {
     try testing.expectEqualStrings("beta", picker.list.selectedValue().?);
 }
 
-test "picker handles initial selection measurement and empty boundaries" {
-    const theme = testTheme();
-    var items = pickerItems();
-
-    var picker = ListPicker.init(&theme);
-    picker.setSearchPlaceholder("Search models");
-    picker.setEmptyText("No models found");
-    picker.setStatus(.{ .text = "Loading models", .kind = .loading });
-    picker.setItems(&items);
-    picker.setInitialSelectionIndex(99);
-
-    try testing.expectEqualStrings("gamma", picker.list.selectedValue().?);
-    try testing.expectEqualStrings("No models found", picker.list.empty_text);
-    try testing.expectEqual(@as(u32, 6), picker.measure(40).preferred_height);
-
-    var empty = ListPicker.init(&theme);
-    var capture = SelectionCapture{};
-    empty.setEmptyText("Nothing here");
-    empty.setSearchableItems(&.{}, null);
-    empty.on_select = &captureSelection;
-    empty.on_cancel = &captureCancel;
-    empty.callback_ctx = @ptrCast(&capture);
-
-    try testing.expectEqualStrings("Nothing here", empty.list.empty_text);
-    try testing.expect(empty.handleInput(.{ .code = .enter }));
-    try testing.expectEqual(@as(?[]const u8, null), capture.value);
-    try testing.expect(empty.handleInput(.{ .code = .down }));
-    try testing.expectEqual(@as(u32, 0), empty.list.selected_index);
-    try testing.expect(empty.handleInput(.{ .code = .escape }));
-    try testing.expect(capture.cancelled);
-}

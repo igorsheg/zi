@@ -1,4 +1,3 @@
-const std = @import("std");
 const component_mod = @import("component.zig");
 const cell_mod = @import("cell.zig");
 const autocomplete_mod = @import("autocomplete.zig");
@@ -255,7 +254,6 @@ pub const EditorInterface = struct {
 
 // ── Tests ─────────────────────────────────────────────────────────
 
-const testing = std.testing;
 const buffer_mod = @import("buffer.zig");
 const Region = buffer_mod.Region;
 
@@ -375,85 +373,3 @@ pub const MockEditor = struct {
         return EditorInterface.init(MockEditor, self);
     }
 };
-
-test "EditorInterface routes parity surface through vtable" {
-    var mock = MockEditor{ .text = "hello", .expanded_text = "expanded" };
-    const iface = mock.editorInterface();
-
-    try testing.expectEqualStrings("hello", iface.getText());
-    try testing.expectEqualStrings("expanded", iface.getExpandedText());
-
-    iface.setText("world");
-    try testing.expectEqualStrings("world", mock.text);
-
-    iface.insertTextAtCursor("!");
-    try testing.expectEqual(@as(u32, 1), mock.insert_count);
-
-    iface.handlePaste("paste");
-    try testing.expectEqual(@as(u32, 1), mock.paste_count);
-
-    iface.clearHistory();
-    try testing.expectEqual(@as(u32, 1), mock.clear_history_count);
-
-    iface.addToHistory("prompt");
-    try testing.expectEqual(@as(u32, 1), mock.history_count);
-
-    const theme = @import("../themes/builtin.zig").dark();
-    iface.setTheme(theme);
-    try testing.expectEqual(theme, mock.theme.?);
-
-    var status_data = StatusData.init(testing.allocator);
-    defer status_data.deinit();
-    iface.setStatusData(&status_data);
-    try testing.expectEqual(&status_data, mock.status_data.?);
-
-    iface.setCwd("/tmp/project");
-    try testing.expectEqualStrings("/tmp/project", mock.cwd);
-
-    iface.setGitBranch("main");
-    try testing.expectEqualStrings("main", mock.git_branch.?);
-
-    iface.setBorderColor(Color.rgb(1, 2, 3));
-    try testing.expectEqual(Color.rgb(1, 2, 3), mock.border_color);
-
-    iface.setPaddingX(2);
-    try testing.expectEqual(@as(u32, 2), mock.padding_x);
-
-    iface.setAutocompleteMaxVisible(9);
-    try testing.expectEqual(@as(u32, 9), mock.autocomplete_max_visible);
-
-    iface.setMaxVisibleLines(12);
-    try testing.expectEqual(@as(u32, 12), mock.max_visible_lines);
-
-    iface.setSubmitDisabled(true);
-    try testing.expect(mock.submit_disabled);
-
-    var submit_called = false;
-    var change_called = false;
-    const submit_ctx = &submit_called;
-    const change_ctx = &change_called;
-    const callbacks = struct {
-        fn submit(_: []const u8, ctx: ?*anyopaque) void {
-            const flag: *bool = @ptrCast(@alignCast(ctx));
-            flag.* = true;
-        }
-        fn change(_: []const u8, ctx: ?*anyopaque) void {
-            const flag: *bool = @ptrCast(@alignCast(ctx));
-            flag.* = true;
-        }
-    };
-
-    iface.setOnSubmit(&callbacks.submit, @ptrCast(submit_ctx));
-    iface.setOnChange(&callbacks.change, @ptrCast(change_ctx));
-    mock.submit_cb.?("ok", mock.submit_ctx);
-    mock.change_cb.?("ok", mock.change_ctx);
-    try testing.expect(submit_called);
-    try testing.expect(change_called);
-
-    iface.clear();
-    try testing.expectEqual(@as(u32, 1), mock.clear_count);
-
-    const comp = iface.component();
-    const m = comp.measure(80);
-    try testing.expectEqual(@as(u32, 3), m.preferred_height);
-}

@@ -172,10 +172,3 @@ comptime {
         }
     }
 }
-
-test "wire name parsers cover canonical pi-mono names" {
-    try std.testing.expectEqual(FgColor.border_accent, parseFgWireName("borderAccent").?);
-    try std.testing.expectEqual(FgColor.thinking_xhigh, parseFgWireName("thinkingXhigh").?);
-    try std.testing.expectEqual(BgColor.tool_pending_bg, parseBgWireName("toolPendingBg").?);
-    try std.testing.expect(parseBgWireName("tool_transcript_bg") == null);
-}

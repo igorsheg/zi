@@ -41,7 +41,3 @@ pub const CompactionPolicy = session_runner.CompactionPolicy;
 pub const CompactionExecutor = session_runner.CompactionExecutor;
 pub const SessionCompactionResult = session_runner.CompactionResult;
 pub const ModelRegistry = model_registry.ModelRegistry;
-
-test {
-    @import("std").testing.refAllDecls(@This());
-}

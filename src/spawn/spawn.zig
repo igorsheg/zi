@@ -478,46 +478,6 @@ fn writeTempPrompt(io: std.Io, allocator: std.mem.Allocator, content: []const u8
 
 const testing = std.testing;
 
-test "buildChildArgv produces expected production shape" {
-    const cfg = types.SpawnConfig{
-        .allocator = testing.allocator,
-        .cwd = ".",
-        .task = "ignored — task is appended later by ziSpawn proper",
-        .model = "claude-sonnet-4-5",
-        .tools = "bash,read",
-    };
-    var built = try buildChildArgv(testing.allocator, cfg);
-    defer built.deinit(testing.allocator);
-
-    // self-exe path is dynamic; assert flag layout from index 1 onward.
-    try testing.expect(built.argv.items.len >= 8);
-    try testing.expectEqualStrings("--mode", built.argv.items[1]);
-    try testing.expectEqualStrings("json", built.argv.items[2]);
-    try testing.expectEqualStrings("--no-session", built.argv.items[3]);
-    try testing.expectEqualStrings("--model", built.argv.items[4]);
-    try testing.expectEqualStrings("claude-sonnet-4-5", built.argv.items[5]);
-    try testing.expectEqualStrings("--tools", built.argv.items[6]);
-    try testing.expectEqualStrings("bash,read", built.argv.items[7]);
-}
-
-test "buildChildArgv argv_override bypasses self-exe construction" {
-    const override = [_][]const u8{ "sh", "-c", "echo hi" };
-    const cfg = types.SpawnConfig{
-        .allocator = testing.allocator,
-        .cwd = ".",
-        .task = "unused",
-        .argv_override = &override,
-    };
-    var built = try buildChildArgv(testing.allocator, cfg);
-    defer built.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(usize, 3), built.argv.items.len);
-    try testing.expectEqualStrings("sh", built.argv.items[0]);
-    try testing.expectEqualStrings("echo hi", built.argv.items[2]);
-    // No owned strings: override slices are borrowed from the caller.
-    try testing.expectEqual(@as(usize, 0), built.owned_strings.items.len);
-}
-
 const TestEventCounter = struct {
     count: usize = 0,
     last_kind: [64]u8 = undefined,

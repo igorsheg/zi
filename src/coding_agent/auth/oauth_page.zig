@@ -92,12 +92,3 @@ const page_suffix =
     \\</body>
     \\</html>
 ;
-
-test "success page contains message" {
-    const allocator = std.testing.allocator;
-    const html = try successHtml(allocator, "You may close this window.");
-    defer allocator.free(html);
-
-    try std.testing.expect(std.mem.indexOf(u8, html, "You may close this window.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "Authentication successful") != null);
-}

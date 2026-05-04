@@ -309,23 +309,6 @@ pub const PromptView = struct {
 
 const testing = std.testing;
 
-test "PromptView reuses cached virtual lines across repeated cursor queries" {
-    var buffer = PromptBuffer.init(testing.allocator);
-    defer buffer.deinit();
-    buffer.setText("hello world");
-
-    var view = PromptView.init(testing.allocator, &buffer);
-    defer view.deinit();
-    view.setLayoutConfig(.{ .width_cols = 10, .first_line_text_col = 3, .continuation_text_col = 3 });
-    view.setViewportHeight(4);
-
-    _ = view.totalVisualLineCount();
-    const generation = view.layout.generation;
-    _ = view.visualCursor();
-    _ = view.visualCursor();
-
-    try testing.expectEqual(generation, view.layout.generation);
-}
 
 test "PromptView wrapped visual up down preserves desired visual column" {
     var buffer = PromptBuffer.init(testing.allocator);

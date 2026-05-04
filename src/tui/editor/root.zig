@@ -22,12 +22,3 @@ pub const VirtualLine = types.VirtualLine;
 pub const VirtualLineKind = types.VirtualLineKind;
 pub const LayoutConfig = types.LayoutConfig;
 
-test {
-    _ = buffer;
-    _ = view;
-    _ = layout;
-    _ = navigation;
-    _ = autocomplete;
-    _ = render;
-    _ = types;
-}

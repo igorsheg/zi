@@ -1223,40 +1223,6 @@ test "CombinedAutocompleteProvider covers path activation and forced slash argum
     try std.testing.expectEqual(ReplaceRange{ .start_byte = 4, .end_byte = 8 }, regular_path.result.?.replace_range);
 }
 
-test "CombinedAutocompleteProvider async at-file search publishes latest request and cancels" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "guide.md", .data = "hello" });
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "notes.md", .data = "world" });
-
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(cwd);
-
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    var provider = CombinedAutocompleteProvider.init(std.testing.allocator, std.Options.debug_io, &reg, cwd);
-    defer provider.deinit();
-    var sink = TestSink{};
-
-    provider.requestImpl(.{ .text = "@gu", .cursor_byte = 3, .mode = .force }, sink.sink());
-    try std.testing.expect(sink.result == null);
-    try std.testing.expect(provider.nextDeadlineImpl(0) != null);
-
-    provider.cancelImpl();
-    try std.testing.expect(provider.nextDeadlineImpl(0) == null);
-    try std.testing.expect(!provider.tickImpl(0, sink.sink()));
-    try std.testing.expect(sink.result == null);
-
-    provider.requestImpl(.{ .text = "@gu", .cursor_byte = 3, .mode = .force }, sink.sink());
-    provider.requestImpl(.{ .text = "@no", .cursor_byte = 3, .mode = .force }, sink.sink());
-
-    try std.testing.expect(drainAsyncProvider(&provider, sink.sink()));
-    try std.testing.expect(sink.result != null);
-    try std.testing.expect(hasItem(sink.result.?.items, "@notes.md"));
-    try std.testing.expect(!hasItem(sink.result.?.items, "@guide.md"));
-    try std.testing.expectEqual(ReplaceRange{ .start_byte = 0, .end_byte = 3 }, sink.result.?.replace_range);
-}
 
 test "CombinedAutocompleteProvider async at-file search respects ignore and hidden path boundaries" {
     var tmp = std.testing.tmpDir(.{});

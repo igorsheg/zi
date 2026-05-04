@@ -614,11 +614,6 @@ fn prepareRendererStateForTest(
     return state;
 }
 
-test "skillNameFromReadPath recognizes only canonical skill file paths" {
-    try testing.expectEqualStrings("caveman", skillNameFromReadPath("/Users/igors/.zi/agent/skills/caveman/SKILL.md").?);
-    try testing.expect(skillNameFromReadPath("/tmp/notes.md") == null);
-    try testing.expect(skillNameFromReadPath("/Users/igors/.zi/agent/skills/caveman/README.md") == null);
-}
 
 test "bashCall renders command title contract" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 64, 1);

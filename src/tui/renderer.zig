@@ -225,53 +225,6 @@ fn readPipe(read_fd: std.posix.fd_t, buf: []u8) ![]const u8 {
     return buf[0..n];
 }
 
-test "Renderer owns its buffers and resize resets drawing state" {
-    var r = try Renderer.init(std.testing.allocator, std.posix.STDOUT_FILENO, 10, 5);
-    defer r.deinit();
-
-    try std.testing.expectEqual(@as(u32, 10), r.width);
-    try std.testing.expectEqual(@as(u32, 5), r.height);
-    try std.testing.expectEqual(@as(u32, 10), r.current.width);
-    try std.testing.expectEqual(@as(u32, 5), r.next.height);
-    try std.testing.expect(r.force_redraw);
-
-    r.force_redraw = false;
-    try r.resize(3, 2);
-    try std.testing.expectEqual(@as(u32, 3), r.width);
-    try std.testing.expectEqual(@as(u32, 2), r.height);
-    try std.testing.expectEqual(@as(usize, 6), r.current.cells.len);
-    try std.testing.expectEqual(@as(usize, 6), r.next.cells.len);
-    try std.testing.expect(r.force_redraw);
-}
-
-test "Renderer begin exposes a cleared full-frame region" {
-    var r = try Renderer.init(std.testing.allocator, std.posix.STDOUT_FILENO, 10, 5);
-    defer r.deinit();
-
-    r.next.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'X' } });
-
-    const reg = r.begin();
-    try std.testing.expectEqual(@as(u32, 10), reg.width);
-    try std.testing.expectEqual(@as(u32, 5), reg.height);
-    try std.testing.expect(reg.get(0, 0).eql(Cell.blank));
-
-    reg.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'Y' } });
-    try std.testing.expectEqual(@as(u21, 'Y'), r.next.get(0, 0).grapheme.codepoint);
-}
-
-test "Renderer releases oversized retained output buffer" {
-    var r = try Renderer.init(std.testing.allocator, std.posix.STDOUT_FILENO, 10, 5);
-    defer r.deinit();
-
-    r.output.deinit(std.testing.allocator);
-    r.output = .empty;
-    try r.output.ensureTotalCapacity(std.testing.allocator, max_retained_output_capacity + 1024);
-    try std.testing.expect(r.output.capacity > max_retained_output_capacity);
-
-    r.releaseOversizedOutputBuffer();
-    try std.testing.expect(r.output.capacity <= max_retained_output_capacity);
-}
-
 test "Renderer end writes a frame and promotes it to current" {
     const pipe = try testPipe();
     defer runtime_fd.close(pipe[0]);

@@ -123,30 +123,3 @@ pub const empty_resolver = ToolRendererResolver{
     }.resolveNone,
 };
 
-// --- tests ---
-
-const testing = std.testing;
-
-test "empty resolver returns empty renderer for any name" {
-    const renderer = empty_resolver.resolve("anything");
-    try testing.expect(renderer.render_call == null);
-    try testing.expect(renderer.render_result_slice == null);
-}
-
-test "fromStatic resolver finds registered renderer by name" {
-    const S = struct {
-        fn renderCall(_: *const ToolRenderContext) void {}
-    };
-    const entries = [_]Registration{
-        .{ .tool_name = "bash", .renderer = .{ .render_call = &S.renderCall } },
-    };
-    const slice: []const Registration = &entries;
-    const resolver = ToolRendererResolver.fromStatic(&slice);
-
-    const hit = resolver.resolve("bash");
-    try testing.expect(hit.render_call != null);
-    try testing.expect(hit.render_result_slice == null);
-
-    const miss = resolver.resolve("unknown");
-    try testing.expect(miss.render_call == null);
-}

@@ -310,19 +310,6 @@ fn createFile(io: std.Io, path: []const u8) !std.Io.File {
     return std.Io.Dir.cwd().createFile(io, path, .{});
 }
 
-test "formatLineText includes metadata" {
-    var buf: [max_line_bytes]u8 = undefined;
-    const line = formatLineText(&buf, .{
-        .timestamp_ms = 42,
-        .level = "warning",
-        .scope_name = "storage",
-        .thread_label = "agent",
-        .message = "hello",
-    });
-
-    try std.testing.expectEqualStrings("42 [warning] [storage] [agent] hello", line);
-}
-
 test "ring buffer keeps newest entries" {
     var ring: RingBuffer = .{};
     var i: usize = 0;

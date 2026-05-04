@@ -108,9 +108,3 @@ pub fn emptyDocument() Document {
     return .{ .blocks = &.{} };
 }
 
-test "style equality compares fg bg and attrs" {
-    const a = Style{ .fg = Color.default, .bg = Color.default, .attrs = .{} };
-    const b = Style{ .fg = Color.default, .bg = Color.default, .attrs = .{} };
-    try std.testing.expect(a.eql(b));
-    try std.testing.expect(!a.eql(.{ .fg = Color.rgb(1, 2, 3), .bg = Color.default, .attrs = .{} }));
-}

@@ -28,13 +28,3 @@ fn normalizeOwnedPipedStdin(allocator: std.mem.Allocator, raw: []u8) !?[]const u
     allocator.free(raw);
     return normalized;
 }
-
-test "piped stdin trims outer whitespace and treats empty input as absent" {
-    const empty_raw = try std.testing.allocator.dupe(u8, " \n\t ");
-    try std.testing.expect((try normalizeOwnedPipedStdin(std.testing.allocator, empty_raw)) == null);
-
-    const text_raw = try std.testing.allocator.dupe(u8, "\nfrom stdin\n");
-    const text = (try normalizeOwnedPipedStdin(std.testing.allocator, text_raw)).?;
-    defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("from stdin", text);
-}

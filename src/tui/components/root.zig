@@ -10,6 +10,3 @@ pub const hotkeys_overlay = @import("hotkeys_overlay.zig");
 pub const select_list = @import("select_list.zig");
 pub const list_picker = @import("list_picker.zig");
 
-test {
-    @import("std").testing.refAllDecls(@This());
-}

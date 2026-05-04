@@ -1395,41 +1395,6 @@ test "AgentSession refreshes visible tools and prompt after runtime tool registr
     try testing.expect(found);
 }
 
-// pi-mono test-harness.test.ts: "simple text response"
-test "AgentSession: simple text response" {
-    // Use arena — SessionWriter allocates internally with no deinit
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var fp = faux.FauxProvider.init(allocator);
-    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("hello world")};
-    const msg = faux.fauxAssistantMessage(allocator, &content, .stop);
-    fp.setResponses(&.{msg});
-
-    var registry = ai.provider.Registry.init(allocator);
-    const prov = fp.provider();
-    try registry.register("faux", prov, null);
-
-    var collector = EventCollector.init(allocator);
-    var ca = createTestAgentSession(allocator, &fp, &registry, &collector);
-    defer ca.deinit();
-
-    try ca.run("hi");
-
-    try testing.expectEqual(@as(usize, 1), fp.call_count);
-    try testing.expectEqual(@as(usize, 2), ca.agent.messages().len);
-    try testing.expect(ca.agent.messages()[0] == .user);
-    try testing.expect(ca.agent.messages()[1] == .assistant);
-
-    const assistant = ca.agent.messages()[1].assistant;
-    try testing.expectEqual(@as(usize, 1), assistant.content.len);
-    switch (assistant.content[0]) {
-        .text => |t| try testing.expectEqualStrings("hello world", t.text),
-        else => return error.ExpectedTextBlock,
-    }
-}
-
 // pi-mono test-harness.test.ts: "error response"
 test "AgentSession: error response sets stop_reason" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

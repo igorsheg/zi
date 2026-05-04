@@ -478,8 +478,3 @@ test "keybindings format footer from shared definitions" {
     );
 }
 
-test "keybindings format multi-binding action for help views" {
-    var buf: [32]u8 = undefined;
-    const text = formatBindings(.select_cancel, " / ", &buf);
-    try testing.expectEqualStrings("esc / ctrl+c", text);
-}

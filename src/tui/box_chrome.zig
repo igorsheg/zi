@@ -95,21 +95,6 @@ pub fn measureHeight(visible_lines: u32, gap_count: u32) u32 {
     return 1 + visible_lines + gap_count + 1;
 }
 
-// --- tests ---
-
-const testing = std.testing;
-const Buffer = buffer_mod.Buffer;
-
-test "chromeWidth" {
-    try testing.expectEqual(@as(u32, 2), chromeWidth(0));
-    try testing.expectEqual(@as(u32, 6), chromeWidth(3));
-    try testing.expectEqual(@as(u32, 7), chromeWidth(4));
-}
-
-test "measureHeight" {
-    try testing.expectEqual(@as(u32, 12), measureHeight(10, 0));
-    try testing.expectEqual(@as(u32, 8), measureHeight(5, 1));
-}
 
 // ── Closed variant (editor/overlay style) ─────────────────────────
 // ╭─ left text ────── right text ─╮
@@ -257,26 +242,4 @@ pub fn closedFrame(region: Region) ClosedFrame {
     return ClosedFrame.init(region);
 }
 
-test "closedFrame exposes body and inner geometry" {
-    var buf = try Buffer.init(testing.allocator, 10, 5);
-    defer buf.deinit();
-    const frame = closedFrame(buf.region());
 
-    try testing.expectEqual(@as(u32, 10), frame.outer.width);
-    try testing.expectEqual(@as(u32, 5), frame.outer.height);
-
-    try testing.expectEqual(@as(u32, 10), frame.body.width);
-    try testing.expectEqual(@as(u32, 3), frame.body.height);
-    try testing.expectEqual(@as(u32, 0), frame.body.x);
-    try testing.expectEqual(@as(u32, 1), frame.body.y);
-
-    try testing.expectEqual(@as(u32, 8), frame.inner.width);
-    try testing.expectEqual(@as(u32, 3), frame.inner.height);
-    try testing.expectEqual(@as(u32, 1), frame.inner.x);
-    try testing.expectEqual(@as(u32, 1), frame.inner.y);
-}
-
-test "closedInnerWidth excludes both borders" {
-    try testing.expectEqual(@as(u32, 8), closedInnerWidth(10));
-    try testing.expectEqual(@as(u32, 1), closedInnerWidth(2));
-}

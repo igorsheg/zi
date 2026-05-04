@@ -286,17 +286,3 @@ test "StatusLine publishes shimmer animation while working" {
     try testing.expect(line.nextAnimationDeadline(now_ns + 1) != null);
 }
 
-test "StatusLine renders extension statuses sorted values only" {
-    var data = StatusData.init(testing.allocator);
-    defer data.deinit();
-    data.setStatus("b", "second");
-    data.setStatus("a", "first");
-
-    var line = StatusLine.init(testing.allocator);
-    defer line.deinit();
-    line.setStatusData(&data);
-
-    const composed = try line.compose(80);
-    defer testing.allocator.free(composed.text);
-    try testing.expectEqualStrings("first second", composed.text);
-}

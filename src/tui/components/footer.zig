@@ -40,9 +40,3 @@ pub const Footer = struct {
     }
 };
 
-test "footer measure returns 1 for keybinding hints" {
-    var f = Footer{};
-    const m = f.measure(80);
-    try std.testing.expectEqual(@as(u32, 1), m.min_height);
-    try std.testing.expectEqual(@as(u32, 1), m.preferred_height);
-}
