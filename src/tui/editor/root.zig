@@ -21,4 +21,3 @@ pub const Viewport = types.Viewport;
 pub const VirtualLine = types.VirtualLine;
 pub const VirtualLineKind = types.VirtualLineKind;
 pub const LayoutConfig = types.LayoutConfig;
-

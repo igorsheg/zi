@@ -14,7 +14,7 @@ fn signalCleanupHandler(_: std.posix.SIG) callconv(.c) void {
     // Re-raise with default handler to get correct exit code
     const default_act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.DFL },
-        .mask = 0,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
     posix.sigaction(posix.SIG.INT, &default_act, null);
@@ -204,7 +204,7 @@ pub const Terminal = struct {
         global_terminal = self;
         const act = posix.Sigaction{
             .handler = .{ .handler = signalCleanupHandler },
-            .mask = 0,
+            .mask = posix.sigemptyset(),
             .flags = 0,
         };
         posix.sigaction(posix.SIG.TERM, &act, null);

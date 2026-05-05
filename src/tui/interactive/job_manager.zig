@@ -113,7 +113,11 @@ pub const JobManager = struct {
     fn submitJobEvent(state: *State, event: zio_job.Event) bool {
         const ext_event = extension_ui.JobEvent{
             .id = event.id,
-            .kind = switch (event.kind) { .stdout => .stdout, .stderr => .stderr, .exit => .exit },
+            .kind = switch (event.kind) {
+                .stdout => .stdout,
+                .stderr => .stderr,
+                .exit => .exit,
+            },
             .data = event.data,
             .code = event.code,
         };

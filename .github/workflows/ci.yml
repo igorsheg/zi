@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test ${{ matrix.dist_target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig_target: x86_64-linux-musl
+            dist_target: x86_64-unknown-linux-musl
+          - os: macos-14
+            zig_target: aarch64-macos
+            dist_target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+      - name: Build debug
+        run: zig build
+
+      - name: Smoke-test debug binary
+        shell: bash
+        run: |
+          test "$(./zig-out/bin/zi --version)" = "zi 0.0.1-dev"
+          ./zig-out/bin/zi --help >/dev/null
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build release-safe
+        run: zig build -Doptimize=ReleaseSafe -Dstrip=true -Dtarget=${{ matrix.zig_target }} -Dversion=0.0.0-ci
+
+      - name: Smoke-test release-safe binary
+        shell: bash
+        run: |
+          test "$(./zig-out/bin/zi --version)" = "zi 0.0.0-ci"
+          ./zig-out/bin/zi --help >/dev/null
+
+      - name: Package release artifact
+        shell: bash
+        run: ./scripts/package-release.sh "0.0.0-ci" "${{ matrix.dist_target }}"
+
+      - name: Validate release artifact
+        shell: bash
+        run: |
+          archive="dist/zi-v0.0.0-ci-${{ matrix.dist_target }}.tar.gz"
+          tar -tzf "$archive" >/dev/null
+          ./scripts/checksums.sh "$archive" > dist/checksums.txt
+          test -s dist/checksums.txt

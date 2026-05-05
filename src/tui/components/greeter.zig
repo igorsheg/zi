@@ -67,4 +67,3 @@ pub const Greeter = struct {
         return Component.init(Greeter, self);
     }
 };
-

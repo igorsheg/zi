@@ -39,4 +39,3 @@ pub const Footer = struct {
         return Component.init(Footer, self);
     }
 };
-

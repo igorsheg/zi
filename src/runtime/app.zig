@@ -1,7 +1,8 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 pub const name = "zi";
-pub const version = "0.0.1";
+pub const version = build_options.version;
 pub const tagline = "AI coding agent";
 
 pub fn writeVersionLine(writer: anytype) !void {
@@ -16,7 +17,10 @@ test "version line uses app metadata" {
     const rendered = try out.toOwnedSlice();
     defer std.testing.allocator.free(rendered);
 
-    try std.testing.expectEqualStrings("zi 0.0.1\n", rendered);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s} {s}\n", .{ name, version });
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, rendered);
 }
 
 /// Process-level runtime policy for the zi executable.

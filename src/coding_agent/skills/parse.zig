@@ -126,7 +126,8 @@ fn findLineEnd(buf: []const u8, start: usize) ?usize {
 
 test "parse frontmatter extracts fields" {
     const allocator = std.testing.allocator;
-    const doc = try parseFrontmatter(allocator,
+    const doc = try parseFrontmatter(
+        allocator,
         "---\nname: test-skill\ndescription: sample\ndisable-model-invocation: true\n---\nbody\n",
     );
     defer deinitParsedSkillDocument(allocator, doc);

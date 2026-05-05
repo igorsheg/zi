@@ -121,10 +121,14 @@ fn isWsl() bool {
     if (@import("env").get("WSL_DISTRO_NAME") != null) return true;
     if (@import("env").get("WSLENV") != null) return true;
 
-    const file = std.fs.openFileAbsolute("/proc/version", .{}) catch return false;
-    defer file.close();
+    const io = std.Options.debug_io;
+    const file = std.Io.Dir.openFileAbsolute(io, "/proc/version", .{}) catch return false;
+    defer file.close(io);
     var buf: [512]u8 = undefined;
-    const n = file.read(&buf) catch return false;
+    const n = file.readStreaming(io, &.{&buf}) catch |err| switch (err) {
+        error.EndOfStream => return false,
+        else => return false,
+    };
     return std.ascii.indexOfIgnoreCase(buf[0..n], "microsoft") != null or
         std.ascii.indexOfIgnoreCase(buf[0..n], "wsl") != null;
 }

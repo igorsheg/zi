@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse (optimize != .Debug);
+    const app_version = b.option([]const u8, "version", "Application version") orelse "0.0.1-dev";
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", app_version);
 
     const generate_models = b.addExecutable(.{
         .name = "generate-models",
@@ -24,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
+    exe_mod.addOptions("build_options", build_options);
 
     // We compile every .c file in src/ EXCEPT `lua.c` and `luac.c`,
     // which contain `main()` for the standalone interpreter and
@@ -107,6 +112,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
+    test_mod.addOptions("build_options", build_options);
     test_mod.addImport("env", env_mod);
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);

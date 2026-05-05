@@ -107,4 +107,3 @@ pub const Link = struct {
 pub fn emptyDocument() Document {
     return .{ .blocks = &.{} };
 }
-

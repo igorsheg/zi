@@ -309,7 +309,6 @@ pub const PromptView = struct {
 
 const testing = std.testing;
 
-
 test "PromptView wrapped visual up down preserves desired visual column" {
     var buffer = PromptBuffer.init(testing.allocator);
     defer buffer.deinit();

@@ -106,9 +106,13 @@ fn renderFrame(out: []u8, width: u32, height: u32, frame: u32, player: PlayerSta
             const dy = @abs(@as(i32, @intCast(y)) - my);
             if (dx < 3 and dy < 3) {
                 if (player.flash > 0) {
-                    r = 255; g = 240; b = 80;
+                    r = 255;
+                    g = 240;
+                    b = 80;
                 } else {
-                    r = 80; g = 220; b = 80;
+                    r = 80;
+                    g = 220;
+                    b = 80;
                 }
             }
             out[idx] = r;

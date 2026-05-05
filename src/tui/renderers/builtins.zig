@@ -614,7 +614,6 @@ fn prepareRendererStateForTest(
     return state;
 }
 
-
 test "bashCall renders command title contract" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 64, 1);
     defer buf.deinit();
