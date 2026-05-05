@@ -7,7 +7,7 @@ local surface_id = "doom-demo"
 local current_job = nil
 
 local function helper_path(ctx)
-  return (ctx.cwd or ".") .. "/zig-out/bin/zi-doom-helper"
+  return (ctx.cwd or ".") .. "/examples/extensions/doom/helper/zig-out/bin/zi-doom-helper"
 end
 
 local function boot_frame(width, height)
