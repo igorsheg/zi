@@ -1,6 +1,14 @@
 @layer reset, tokens, base, layout, components, pages;
 
 @font-face {
+  font-family: "Crimson Pro";
+  src: url("/fonts/crimson-pro-wght.ttf") format("truetype");
+  font-weight: 200 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
   font-family: "Fragment Mono";
   src: url("/fonts/fragment-mono-400.ttf") format("truetype");
   font-weight: 400;
@@ -79,6 +87,7 @@
     --syntax-green: oklch(74% 0.045 var(--hue-green));
     --syntax-violet: oklch(70% 0.04 var(--hue-violet));
 
+    --font-title: "Crimson Pro", Georgia, "Times New Roman", serif;
     --font-mono:
       "Fragment Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
@@ -130,7 +139,7 @@
     --line-title: var(--line-tight);
     --text-logo: var(--step-logo);
     --line-logo-display: var(--line-logo);
-    --tracking-title: -0.08em;
+    --tracking-title: -0.04em;
     --tracking-logo: 0;
 
     /* semantic tokens */
@@ -363,6 +372,7 @@
 
   .title {
     max-inline-size: var(--measure-xs);
+    font-family: var(--font-title);
     font-size: var(--text-title);
     font-weight: 600;
     line-height: var(--line-title);

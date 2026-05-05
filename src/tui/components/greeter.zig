@@ -54,9 +54,7 @@ pub const Greeter = struct {
             _ = region.writeStr(col, text_y, self.version, theme.fg(.dim), Color.default, .{});
         }
         if (text_y + 1 >= h) return;
-        _ = region.writeStr(text_x, text_y + 1, "Gets out of the way. Gets things done.", theme.fg(.muted), Color.default, .{});
-        if (text_y + 2 >= h) return;
-        _ = region.writeStr(text_x, text_y + 2, "Type / for commands. Ask zi about zi if you get lost.", theme.fg(.dim), Color.default, .{});
+        _ = region.writeStr(text_x, text_y + 1, "Type / for commands. Ask zi about zi if you get lost.", theme.fg(.dim), Color.default, .{});
     }
 
     pub fn measure(_: *Greeter, _: u32) Measurement {
