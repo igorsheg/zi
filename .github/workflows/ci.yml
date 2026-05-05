@@ -33,6 +33,11 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Configure macOS SDK
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
       - name: Check formatting
         run: zig fmt --check .
 
