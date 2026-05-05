@@ -415,6 +415,9 @@ fn loadOne(
     runner.recordLoadedExtension(ext.provenance) catch |err| {
         log.warn("failed to record loaded extension provenance for {s}: {s}", .{ ext.id, @errorName(err) });
     };
+    runner.recordLoadedExtensionInfo(ext.provenance, ext.id, sourceKindString(ext.source), ext.path) catch |err| {
+        log.warn("failed to record loaded extension info for {s}: {s}", .{ ext.id, @errorName(err) });
+    };
 }
 
 fn sourceKindString(source: ExtensionSource) []const u8 {

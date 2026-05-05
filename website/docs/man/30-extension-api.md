@@ -35,6 +35,12 @@ Prefer small tools, explicit names, and behavior that will still make sense in a
 `zi.job.stop(id_or_job)`
 : Request job termination.
 
+`zi.json.encode(value)`
+: Encode a JSON-compatible Lua value as a JSON string. Tables encode as arrays when they are Lua sequences, otherwise as objects with string keys. Unsupported values or values exceeding host limits raise an error.
+
+`zi.json.decode(text)`
+: Decode a JSON string into Lua values. JSON objects become tables, arrays become sequence tables, booleans/numbers/strings map directly, and JSON null maps to nil.
+
 ## Tools
 
 Tools are definition-first. A tool definition is the unit zi exposes to the model. Keep each tool narrow: one clear name, one clear parameter shape, one readable result. Tool handlers receive the shared [context object](context.html#context-object).

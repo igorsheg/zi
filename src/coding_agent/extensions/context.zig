@@ -60,6 +60,9 @@ pub fn pushExtensionContext(
     pushContextBinding(L, runner, provenance);
     c.lua_setfield(L, -2, "binding");
 
+    pushExtensionInfo(L, runner, provenance);
+    c.lua_setfield(L, -2, "extension");
+
     if (runner.enable_test_async) {
         pushMethod(L, runner, &ctxTestAsync);
         c.lua_setfield(L, -2, "__test_async");
@@ -109,6 +112,32 @@ pub fn pushExtensionContext(
             c.lua_setfield(L, -2, "get_system_prompt");
         },
     }
+}
+
+fn pushExtensionInfo(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+    provenance: ?resource_types.ExtensionProvenance,
+) void {
+    const prov = provenance orelse {
+        c.lua_pushnil(L);
+        return;
+    };
+    const info = runner.findLoadedExtensionInfoByStateOwner(prov.state_owner_id) orelse {
+        c.lua_pushnil(L);
+        return;
+    };
+
+    c.lua_createtable(L, 0, 4);
+    pushContextStringField(L, "id", info.id);
+    pushContextStringField(L, "source", info.source);
+    pushContextStringField(L, "entry", info.entry_path);
+    pushContextStringField(L, "root", info.root_path);
+}
+
+fn pushContextStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void {
+    _ = c.lua_pushlstring(L, value.ptr, value.len);
+    c.lua_setfield(L, -2, field.ptr);
 }
 
 fn pushUiApi(

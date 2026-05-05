@@ -13,6 +13,9 @@ Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.ht
 `ctx.binding`
 : Session and extension identity information when available.
 
+`ctx.extension`
+: Current extension identity and bundled resource paths when the handler belongs to a loaded extension. Contains `id`, `source`, `entry`, and `root`. For bundled extensions, `root` is the extension directory containing `init.lua`; for flat extensions, `root` is the directory containing the `.lua` file.
+
 `ctx.ui`
 : Host-owned UI API, or `nil` when unavailable.
 

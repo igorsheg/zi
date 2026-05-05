@@ -433,6 +433,21 @@ pub const ExtensionLoadSource = struct {
     provenance: resource_types.ExtensionProvenance,
 };
 
+pub const LoadedExtensionInfo = struct {
+    provenance: resource_types.ExtensionProvenance,
+    id: []const u8,
+    source: []const u8,
+    entry_path: []const u8,
+    root_path: []const u8,
+
+    pub fn deinit(self: LoadedExtensionInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.source);
+        allocator.free(self.entry_path);
+        allocator.free(self.root_path);
+    }
+};
+
 pub const LoadContext = struct {
     source: ExtensionLoadSource,
 };
@@ -544,6 +559,7 @@ pub const ExtensionRunner = struct {
     enable_test_async: bool = false,
 
     loaded_extensions: std.ArrayListUnmanaged(resource_types.ExtensionProvenance) = .empty,
+    loaded_extension_infos: std.ArrayListUnmanaged(LoadedExtensionInfo) = .empty,
     load_context: ?LoadContext = null,
     execution_context: ?LoadContext = null,
     _provider_registry: ?*ai.provider.Registry = null,
@@ -705,6 +721,38 @@ pub const ExtensionRunner = struct {
         try self.loaded_extensions.append(self.allocator, provenance);
     }
 
+    pub fn recordLoadedExtensionInfo(
+        self: *ExtensionRunner,
+        provenance: resource_types.ExtensionProvenance,
+        id: []const u8,
+        source: []const u8,
+        entry_path: []const u8,
+    ) !void {
+        const owned_id = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(owned_id);
+        const owned_source = try self.allocator.dupe(u8, source);
+        errdefer self.allocator.free(owned_source);
+        const owned_entry_path = try self.allocator.dupe(u8, entry_path);
+        errdefer self.allocator.free(owned_entry_path);
+        const owned_root_path = try extensionRootFromEntryPath(self.allocator, entry_path);
+        errdefer self.allocator.free(owned_root_path);
+
+        try self.loaded_extension_infos.append(self.allocator, .{
+            .provenance = provenance,
+            .id = owned_id,
+            .source = owned_source,
+            .entry_path = owned_entry_path,
+            .root_path = owned_root_path,
+        });
+    }
+
+    pub fn findLoadedExtensionInfoByStateOwner(self: *const ExtensionRunner, state_owner_id: []const u8) ?LoadedExtensionInfo {
+        for (self.loaded_extension_infos.items) |info| {
+            if (std.mem.eql(u8, info.provenance.state_owner_id, state_owner_id)) return info;
+        }
+        return null;
+    }
+
     pub fn findLoadedExtensionByStateOwner(self: *const ExtensionRunner, state_owner_id: []const u8) ?resource_types.ExtensionProvenance {
         for (self.loaded_extensions.items) |provenance| {
             if (std.mem.eql(u8, provenance.state_owner_id, state_owner_id)) return provenance;
@@ -784,6 +832,8 @@ pub const ExtensionRunner = struct {
         self.event_registry.deinit();
         self.tool_registry.deinit();
         self.loaded_extensions.deinit(self.allocator);
+        for (self.loaded_extension_infos.items) |info| info.deinit(self.allocator);
+        self.loaded_extension_infos.deinit(self.allocator);
         self.hook_arena.deinit();
 
         var it = self.module_roots.iterator();
@@ -1536,6 +1586,11 @@ pub const ExtensionRunner = struct {
         }
     }
 };
+
+fn extensionRootFromEntryPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    return allocator.dupe(u8, dirname);
+}
 
 fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
     const basename = std.fs.path.basename(path);
