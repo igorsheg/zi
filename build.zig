@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addIncludePath(lua_dep.path("src"));
     exe_mod.linkLibrary(lua_lib);
     if (target.result.os.tag == .macos) {
+        addMacosSdkFrameworkPath(b, exe_mod);
         exe_mod.addCSourceFile(.{ .file = b.path("src/tui/terminal/clipboard_macos.m"), .flags = &.{"-fobjc-arc"} });
         exe_mod.linkFramework("AppKit", .{});
         exe_mod.linkFramework("Foundation", .{});
@@ -117,6 +118,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);
     if (target.result.os.tag == .macos) {
+        addMacosSdkFrameworkPath(b, test_mod);
         test_mod.addCSourceFile(.{ .file = b.path("src/tui/terminal/clipboard_macos.m"), .flags = &.{"-fobjc-arc"} });
         test_mod.linkFramework("AppKit", .{});
         test_mod.linkFramework("Foundation", .{});
@@ -124,4 +126,11 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = test_mod });
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+fn addMacosSdkFrameworkPath(b: *std.Build, module: *std.Build.Module) void {
+    const sdkroot = b.graph.environ_map.get("SDKROOT") orelse return;
+    const framework_path = std.fs.path.join(b.allocator, &.{ sdkroot, "System/Library/Frameworks" }) catch @panic("OOM");
+    module.addFrameworkPath(.{ .cwd_relative = framework_path });
+    module.addSystemFrameworkPath(.{ .cwd_relative = framework_path });
 }
