@@ -198,11 +198,7 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
         else => return,
     };
 
-    // Fire user observer FIRST, with the raw event. The callback
-    // sees every JSONL line the child emits, not just message_end.
-    // Lifetime contract: `parsed.value` is only valid for this call;
-    // the callback must copy out anything it wants to retain. The
-    // Lua trampoline does that via pushJsonValue, which deep-copies.
+    // `parsed.value` is only valid for this call; callback must copy retained data.
     if (config.on_event) |cb| {
         cb(type_str, parsed.value, config.on_event_ctx);
     }

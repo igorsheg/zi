@@ -127,12 +127,8 @@ pub const AnthropicProvider = struct {
         } else {
             extra_headers_buf[n_extra] = .{ .name = "x-api-key", .value = api_key };
             n_extra += 1;
-            // Match pi-mono: API-key auth also enables fine-grained
-            // tool streaming so the model can emit tool inputs in
-            // arbitrary partial chunks instead of being constrained
-            // to JSON sub-tree boundaries. Without this header,
-            // Anthropic falls back to stricter streaming and the
-            // streaming behavior diverges from what pi-mono ships.
+            // Fine-grained tool streaming permits arbitrary partial tool input chunks;
+            // without it Anthropic streams at JSON sub-tree boundaries.
             extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14" };
             n_extra += 1;
         }

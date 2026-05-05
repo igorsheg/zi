@@ -189,29 +189,22 @@ fn isGraphemeBreak(
     curr_cp: u21,
     regional_indicator_count: u32,
 ) bool {
-    // GB3: CR x LF
     if (prev_cp == '\r' and curr_cp == '\n') return false;
 
-    // GB4 / GB5: break around controls
     if (isControl(prev_cp) or isControl(curr_cp)) return true;
 
-    // GB6 / GB7 / GB8: Hangul syllable sequences.
     if (isHangulL(prev_cp) and (isHangulL(curr_cp) or isHangulV(curr_cp) or isHangulLV(curr_cp) or isHangulLVT(curr_cp))) return false;
     if ((isHangulLV(prev_cp) or isHangulV(prev_cp)) and (isHangulV(curr_cp) or isHangulT(curr_cp))) return false;
     if ((isHangulLVT(prev_cp) or isHangulT(prev_cp)) and isHangulT(curr_cp)) return false;
 
-    // GB9b: Prepend x
     if (isPrepend(prev_cp)) return false;
 
-    // GB9 / GB9a: x Extend / ZWJ / SpacingMark
     if (isExtend(curr_cp) or curr_cp == 0x200D or isSpacingMark(curr_cp)) return false;
 
-    // GB11: Extended_Pictographic Extend* ZWJ x Extended_Pictographic
     if (prev_cp == 0x200D and isExtendedPictographic(curr_cp) and hasExtendedPictographicBeforeZwj(text, cluster_start, prev_pos)) {
         return false;
     }
 
-    // GB12 / GB13: RI x RI in pairs
     if (isRegionalIndicator(prev_cp) and isRegionalIndicator(curr_cp) and (regional_indicator_count % 2 == 1)) {
         return false;
     }
@@ -263,7 +256,7 @@ fn isExtend(cp: u21) bool {
     if (cp >= 0xFE00 and cp <= 0xFE0F) return true;
     if (cp >= 0xFE20 and cp <= 0xFE2F) return true;
     if (cp >= 0xE0100 and cp <= 0xE01EF) return true;
-    if (cp >= 0x1F3FB and cp <= 0x1F3FF) return true; // emoji skin-tone modifiers
+    if (cp >= 0x1F3FB and cp <= 0x1F3FF) return true;
     return false;
 }
 

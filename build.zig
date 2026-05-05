@@ -25,10 +25,6 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
 
-    // Lua 5.4 is vendored via build.zig.zon.
-    // Lua is compiled as a static library from upstream C sources and
-    // linked into the exe module. The .zig.zon dependency pulls the
-    // official 5.4.7 tarball; zig's fetcher verifies it by hash.
     // We compile every .c file in src/ EXCEPT `lua.c` and `luac.c`,
     // which contain `main()` for the standalone interpreter and
     // bytecode compiler respectively.

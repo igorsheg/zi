@@ -4,9 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Zine owns the root site. The dependency is pinned in website/build.zig.zon,
-    // but the build uses the installed zine binary so zi's root build graph stays
-    // fully independent from website tooling.
     const zine_site = b.addSystemCommand(&.{
         "zine",
         "release",

@@ -384,34 +384,26 @@ fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
     var i: usize = 0;
     while (i < s.len) {
-        // U+2018..U+201B → '
-        // U+201C..U+201F → "
-        // U+2010..U+2015 / U+2212 → -
-        // U+00A0 / U+2002..U+200A / U+202F / U+205F / U+3000 → ' '
         const remaining = s[i..];
         if (remaining.len >= 3) {
             const a = remaining[0];
             const b = remaining[1];
             const c = remaining[2];
-            // U+2018..201F (e2 80 98..9f)
             if (a == 0xE2 and b == 0x80 and c >= 0x98 and c <= 0x9F) {
                 try out.append(allocator, if (c <= 0x9B) @as(u8, '\'') else @as(u8, '"'));
                 i += 3;
                 continue;
             }
-            // U+2010..2015 (e2 80 90..95) → '-'
             if (a == 0xE2 and b == 0x80 and c >= 0x90 and c <= 0x95) {
                 try out.append(allocator, '-');
                 i += 3;
                 continue;
             }
-            // U+2212 (e2 88 92) → '-'
             if (a == 0xE2 and b == 0x88 and c == 0x92) {
                 try out.append(allocator, '-');
                 i += 3;
                 continue;
             }
-            // U+2002..200A (e2 80 82..8a), U+202F (e2 80 af), U+205F (e2 81 9f)
             if (a == 0xE2 and b == 0x80 and ((c >= 0x82 and c <= 0x8A) or c == 0xAF)) {
                 try out.append(allocator, ' ');
                 i += 3;
@@ -422,7 +414,6 @@ fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
                 i += 3;
                 continue;
             }
-            // U+3000 (e3 80 80) → ' '
             if (a == 0xE3 and b == 0x80 and c == 0x80) {
                 try out.append(allocator, ' ');
                 i += 3;
@@ -430,7 +421,6 @@ fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
             }
         }
         if (remaining.len >= 2) {
-            // U+00A0 nbsp (c2 a0) → ' '
             if (remaining[0] == 0xC2 and remaining[1] == 0xA0) {
                 try out.append(allocator, ' ');
                 i += 2;
