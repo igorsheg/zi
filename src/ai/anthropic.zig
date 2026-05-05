@@ -1018,13 +1018,6 @@ test "Anthropic request transform maps metadata user_id" {
     try testing.expect(std.mem.indexOf(u8, transformed.?, "\"metadata\":{\"user_id\":\"user-123\"}") != null);
 }
 
-// Regression test for the streaming bug where Anthropic input_json_delta
-// events with embedded `{` / `}` inside their `partial_json` string
-// payload broke the old substring extractor's brace depth counter,
-// causing truncated extractions and lost tool arguments. The Edit
-// tool's args would silently end up empty {} → "missing 'path'" →
-// infinite retry. The fix was to parse SSE data via std.json instead
-// of substring scanning; this test pins that behavior.
 test "SSE parse: braces inside string values survive a real Edit-tool payload" {
     const data =
         \\{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}"}}

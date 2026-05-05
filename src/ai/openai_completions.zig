@@ -1014,7 +1014,7 @@ fn writeMessages(allocator: std.mem.Allocator, jw: *std.json.Stringify, model: p
                 for (tr.content) |cb| {
                     switch (cb) {
                         .text => |t| try concat.appendSlice(allocator, t.text),
-                        .image => {}, // skipped: phase 3a doesn't ship images-in-tool-results
+                        .image => {},
                     }
                 }
                 if (concat.items.len == 0) {

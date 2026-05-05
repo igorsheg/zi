@@ -356,24 +356,24 @@ fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
         13 => .{ .code = .enter, .ch = null },
         127 => .{ .code = .backspace, .ch = null },
         // Kitty functional codepoints (Private Use Area)
-        57399...57408 => .{ .code = .char, .ch = @as(u21, codepoint - 57399) + '0' }, // KP_0-KP_9
-        57409 => .{ .code = .char, .ch = '.' }, // KP_DECIMAL
-        57410 => .{ .code = .char, .ch = '/' }, // KP_DIVIDE
-        57411 => .{ .code = .char, .ch = '*' }, // KP_MULTIPLY
-        57412 => .{ .code = .char, .ch = '-' }, // KP_SUBTRACT
-        57413 => .{ .code = .char, .ch = '+' }, // KP_ADD
-        57414 => .{ .code = .enter, .ch = null }, // KP_ENTER
-        57415 => .{ .code = .char, .ch = '=' }, // KP_EQUAL
-        57417 => .{ .code = .left, .ch = null }, // KP_LEFT
-        57418 => .{ .code = .right, .ch = null }, // KP_RIGHT
-        57419 => .{ .code = .up, .ch = null }, // KP_UP
-        57420 => .{ .code = .down, .ch = null }, // KP_DOWN
-        57421 => .{ .code = .page_up, .ch = null }, // KP_PAGE_UP
-        57422 => .{ .code = .page_down, .ch = null }, // KP_PAGE_DOWN
-        57423 => .{ .code = .home, .ch = null }, // KP_HOME
-        57424 => .{ .code = .end, .ch = null }, // KP_END
-        57425 => .{ .code = .insert, .ch = null }, // KP_INSERT
-        57426 => .{ .code = .delete, .ch = null }, // KP_DELETE
+        57399...57408 => .{ .code = .char, .ch = @as(u21, codepoint - 57399) + '0' },
+        57409 => .{ .code = .char, .ch = '.' },
+        57410 => .{ .code = .char, .ch = '/' },
+        57411 => .{ .code = .char, .ch = '*' },
+        57412 => .{ .code = .char, .ch = '-' },
+        57413 => .{ .code = .char, .ch = '+' },
+        57414 => .{ .code = .enter, .ch = null },
+        57415 => .{ .code = .char, .ch = '=' },
+        57417 => .{ .code = .left, .ch = null },
+        57418 => .{ .code = .right, .ch = null },
+        57419 => .{ .code = .up, .ch = null },
+        57420 => .{ .code = .down, .ch = null },
+        57421 => .{ .code = .page_up, .ch = null },
+        57422 => .{ .code = .page_down, .ch = null },
+        57423 => .{ .code = .home, .ch = null },
+        57424 => .{ .code = .end, .ch = null },
+        57425 => .{ .code = .insert, .ch = null },
+        57426 => .{ .code = .delete, .ch = null },
         else => if (codepoint >= 32) .{ .code = .char, .ch = @as(u21, codepoint) } else null,
     };
 

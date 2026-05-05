@@ -250,8 +250,6 @@ pub const ProjectionState = struct {
                 self.committed_cache_hits +%= 1;
                 return;
             }
-            // Cache key matched but transcript rows were externally cleared or
-            // reordered. Fall through to the full rebuild path below.
             self.committed_cache_fallbacks +%= 1;
         } else {
             self.committed_cache_misses +%= 1;

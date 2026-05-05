@@ -288,9 +288,6 @@ pub const ListPicker = struct {
         const query = self.query_buf[0..self.query_len];
 
         if (query.len == 0) {
-            // No filter — preserve caller order. Some pickers pre-sort items
-            // intentionally (for example /resume wants most-recent-first), and
-            // empty-query fuzzy sorting would scramble that ordering.
             for (0..count) |i| {
                 self.filtered_source_indices[i] = i;
                 self.filtered_buf[i] = self.all_items[i];

@@ -115,7 +115,7 @@ const Parser = struct {
             const line = self.peekLine();
             if (std.mem.startsWith(u8, line, "```")) {
                 const content = if (self.pos > start)
-                    self.source[start .. self.pos - 1] // exclude trailing newline
+                    self.source[start .. self.pos - 1]
                 else
                     "";
                 _ = self.consumeLine();

@@ -1051,6 +1051,83 @@ fn syncMessagesFromStore(session: *AgentSession) !void {
     session.refreshContextUsageStateFromStore();
 }
 
+fn expectKnownContextUsage(usage: ContextUsage, expected_tokens: u64, context_window: u64) !void {
+    try testing.expectEqual(@as(?u64, expected_tokens), usage.tokens);
+    try testing.expectEqual(context_window, usage.context_window);
+    try testing.expect(usage.percent != null);
+    try testing.expectApproxEqRel((@as(f64, @floatFromInt(expected_tokens)) / @as(f64, @floatFromInt(context_window))) * 100.0, usage.percent.?, 1e-9);
+}
+
+fn expectUnknownContextUsage(usage: ContextUsage, context_window: u64) !void {
+    try testing.expectEqual(@as(?u64, null), usage.tokens);
+    try testing.expectEqual(@as(?f64, null), usage.percent);
+    try testing.expectEqual(context_window, usage.context_window);
+}
+
+fn expectMessageText(message: protocol.AgentMessage, expected: []const u8) !void {
+    switch (message) {
+        .assistant => |assistant| {
+            try testing.expectEqual(@as(usize, 1), assistant.content.len);
+            switch (assistant.content[0]) {
+                .text => |text| try testing.expectEqualStrings(expected, text.text),
+                else => return error.ExpectedTextBlock,
+            }
+        },
+        .user => |user| switch (user.content) {
+            .text => |text| try testing.expectEqualStrings(expected, text),
+            .blocks => |blocks| {
+                try testing.expectEqual(@as(usize, 1), blocks.len);
+                try testing.expectEqualStrings(expected, blocks[0].text.text);
+            },
+        },
+        else => return error.ExpectedTextMessage,
+    }
+}
+
+fn expectToolResultText(message: protocol.AgentMessage, tool_name: []const u8, expected_text: []const u8) !void {
+    try testing.expect(message == .tool_result);
+    const tool_result = message.tool_result;
+    try testing.expectEqualStrings(tool_name, tool_result.tool_name);
+    try testing.expectEqual(@as(usize, 1), tool_result.content.len);
+    switch (tool_result.content[0]) {
+        .text => |text| try testing.expectEqualStrings(expected_text, text.text),
+        else => return error.ExpectedTextBlock,
+    }
+}
+
+fn expectTextDeltasReconstruct(allocator: std.mem.Allocator, collector: *const EventCollector, expected: []const u8) !void {
+    const deltas = collector.getTextDeltas();
+    try testing.expect(deltas.len > 0);
+
+    var total_len: usize = 0;
+    for (deltas) |delta| total_len += delta.len;
+
+    const actual = try allocator.alloc(u8, total_len);
+    var pos: usize = 0;
+    for (deltas) |delta| {
+        @memcpy(actual[pos..][0..delta.len], delta);
+        pos += delta.len;
+    }
+    try testing.expectEqualStrings(expected, actual);
+}
+
+fn echoToolDefinition() tool_def.ToolDefinition {
+    return .{
+        .name = "echo",
+        .description = "echo",
+        .label = "echo",
+        .parameters = .null,
+        .impl = .{ .builtin = .{ .execute = &struct {
+            fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: protocol.AbortSignal, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
+                const c = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch return .{ .content = &.{} };
+                c[0] = .{ .text = .{ .text = "echoed" } };
+                return .{ .content = c };
+            }
+        }.exec } },
+        .source = .{ .kind = "test", .id = "echo" },
+    };
+}
+
 const EventCollector = struct {
     events: std.ArrayListUnmanaged(protocol.AgentEvent),
     alloc: std.mem.Allocator,
@@ -1112,7 +1189,7 @@ fn testToolDefinition(name: []const u8, label: []const u8) tool_def.ToolDefiniti
     };
 }
 
-test "AgentSession: getContextUsage reports current context from assistant usage" {
+test "AgentSession reports known context usage from latest assistant usage" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1131,14 +1208,10 @@ test "AgentSession: getContextUsage reports current context from assistant usage
     _ = session.session_store.appendMessage(testAssistantMessageWithUsage(allocator, "hi", 200, 2));
     try syncMessagesFromStore(&session);
 
-    const usage = session.getContextUsage().?;
-    try testing.expectEqual(@as(?u64, 200), usage.tokens);
-    try testing.expectEqual(faux.fauxModel().context_window, usage.context_window);
-    try testing.expect(usage.percent != null);
-    try testing.expectApproxEqRel((@as(f64, @floatFromInt(200)) / @as(f64, @floatFromInt(faux.fauxModel().context_window))) * 100.0, usage.percent.?, 1e-9);
+    try expectKnownContextUsage(session.getContextUsage().?, 200, faux.fauxModel().context_window);
 }
 
-test "AgentSession: getContextUsage is unknown immediately after compaction" {
+test "AgentSession reports unknown context usage between compaction and next assistant usage" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1162,10 +1235,7 @@ test "AgentSession: getContextUsage is unknown immediately after compaction" {
     _ = session.session_store.appendMessage(testUserMessage("third", 5));
     try syncMessagesFromStore(&session);
 
-    const usage = session.getContextUsage().?;
-    try testing.expectEqual(@as(?u64, null), usage.tokens);
-    try testing.expectEqual(@as(?f64, null), usage.percent);
-    try testing.expectEqual(faux.fauxModel().context_window, usage.context_window);
+    try expectUnknownContextUsage(session.getContextUsage().?, faux.fauxModel().context_window);
 }
 
 test "AgentSession: in-memory compaction state clears on the first successful post-compaction assistant" {
@@ -1199,9 +1269,7 @@ test "AgentSession: in-memory compaction state clears on the first successful po
     try session.agent.setMessages(&before);
     session.noteCompactionApplied();
 
-    const unknown_usage = session.getContextUsage().?;
-    try testing.expectEqual(@as(?u64, null), unknown_usage.tokens);
-    try testing.expectEqual(@as(?f64, null), unknown_usage.percent);
+    try expectUnknownContextUsage(session.getContextUsage().?, faux.fauxModel().context_window);
 
     const post = testAssistantMessageWithUsage(allocator, "response3", 25_000, 3);
     const after = [_]protocol.AgentMessage{
@@ -1212,15 +1280,9 @@ test "AgentSession: in-memory compaction state clears on the first successful po
     try session.agent.setMessages(&after);
     session.noteMessageForContextUsage(post);
 
-    const known_usage = session.getContextUsage().?;
-    try testing.expectEqual(@as(?u64, 25_000), known_usage.tokens);
-    try testing.expect(known_usage.percent != null);
+    try expectKnownContextUsage(session.getContextUsage().?, 25_000, faux.fauxModel().context_window);
 }
 
-// zi-1ry: `tool_allowlist` is a strict whitelist applied AFTER
-// precedence resolution. This keeps subagent spawns deterministic and
-// ensures an overriding extension still wins if its tool name is
-// allowlisted.
 test "AgentSession: tool_allowlist filters the post-precedence tool set" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1312,14 +1374,7 @@ test "AgentSession: user extension overrides builtin tool at execution time" {
 
     try testing.expectEqual(@as(usize, 2), fp.call_count);
     try testing.expectEqual(@as(usize, 4), ca.agent.messages().len);
-    try testing.expect(ca.agent.messages()[2] == .tool_result);
-    const tr = ca.agent.messages()[2].tool_result;
-    try testing.expectEqualStrings("read", tr.tool_name);
-    try testing.expectEqual(@as(usize, 1), tr.content.len);
-    switch (tr.content[0]) {
-        .text => |txt| try testing.expectEqualStrings("override read result", txt.text),
-        else => return error.ExpectedTextBlock,
-    }
+    try expectToolResultText(ca.agent.messages()[2], "read", "override read result");
 }
 
 test "AgentSession refreshes visible tools and prompt after runtime tool registration" {
@@ -1425,16 +1480,8 @@ test "AgentSession: response sequence across multiple prompts" {
 
     try testing.expectEqual(@as(usize, 2), fp.call_count);
     try testing.expectEqual(@as(usize, 4), ca.agent.messages().len);
-    const a1 = ca.agent.messages()[1].assistant;
-    switch (a1.content[0]) {
-        .text => |t| try testing.expectEqualStrings("first", t.text),
-        else => return error.ExpectedText,
-    }
-    const a2 = ca.agent.messages()[3].assistant;
-    switch (a2.content[0]) {
-        .text => |t| try testing.expectEqualStrings("second", t.text),
-        else => return error.ExpectedText,
-    }
+    try expectMessageText(ca.agent.messages()[1], "first");
+    try expectMessageText(ca.agent.messages()[3], "second");
 }
 
 test "AgentSession: session persistence round-trip" {
@@ -1462,22 +1509,8 @@ test "AgentSession: session persistence round-trip" {
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 2), loaded.messages.len);
 
-    try testing.expect(loaded.messages[0] == .user);
-    switch (loaded.messages[0].user.content) {
-        .text => |t| try testing.expectEqualStrings("persist me", t),
-        .blocks => |b| {
-            try testing.expectEqual(@as(usize, 1), b.len);
-            try testing.expectEqualStrings("persist me", b[0].text.text);
-        },
-    }
-
-    try testing.expect(loaded.messages[1] == .assistant);
-    const a = loaded.messages[1].assistant;
-    try testing.expectEqual(@as(usize, 1), a.content.len);
-    switch (a.content[0]) {
-        .text => |t| try testing.expectEqualStrings("persisted response", t.text),
-        else => return error.ExpectedTextBlock,
-    }
+    try expectMessageText(loaded.messages[0], "persist me");
+    try expectMessageText(loaded.messages[1], "persisted response");
 
     std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, session_file) catch {};
 }
@@ -1501,21 +1534,7 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     var registry = ai.provider.Registry.init(allocator);
     try registry.register("faux", fp.provider(), null);
 
-    const echo_tool = tool_def.ToolDefinition{
-        .name = "echo",
-        .description = "echo",
-        .label = "echo",
-        .parameters = .null,
-        .impl = .{ .builtin = .{ .execute = &struct {
-            fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: protocol.AbortSignal, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
-                const c = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch return .{ .content = &.{} };
-                c[0] = .{ .text = .{ .text = "echoed" } };
-                return .{ .content = c };
-            }
-        }.exec } },
-        .source = .{ .kind = "test", .id = "echo" },
-    };
-    const tools = [_]tool_def.ToolDefinition{echo_tool};
+    const tools = [_]tool_def.ToolDefinition{echoToolDefinition()};
 
     var collector = EventCollector.init(allocator);
     var ca = AgentSession.initTestSession(allocator, .{
@@ -1539,9 +1558,7 @@ test "AgentSession: tool call triggers execution and second LLM call" {
     try testing.expect(ca.agent.messages()[2] == .tool_result);
     try testing.expect(ca.agent.messages()[3] == .assistant);
 
-    const tr = ca.agent.messages()[2].tool_result;
-    try testing.expectEqualStrings("echo", tr.tool_name);
-    try testing.expectEqual(@as(usize, 1), tr.content.len);
+    try expectToolResultText(ca.agent.messages()[2], "echo", "echoed");
 
     try testing.expect(collector.countType(.tool_execution_start) >= 1);
     try testing.expect(collector.countType(.tool_execution_end) >= 1);
@@ -1778,18 +1795,7 @@ test "AgentSession: text deltas reconstruct full response" {
 
     try ca.run("hi");
 
-    const deltas = collector.getTextDeltas();
-    try testing.expect(deltas.len > 0);
-
-    var total_len: usize = 0;
-    for (deltas) |d| total_len += d.len;
-    var buf = try allocator.alloc(u8, total_len);
-    var pos: usize = 0;
-    for (deltas) |d| {
-        @memcpy(buf[pos..][0..d.len], d);
-        pos += d.len;
-    }
-    try testing.expectEqualStrings("hello world", buf);
+    try expectTextDeltasReconstruct(allocator, &collector, "hello world");
 }
 
 test "AgentSession: thinking events emitted for thinking content" {

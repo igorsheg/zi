@@ -136,8 +136,8 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
                 failed.deinit(self.msg_allocator);
             };
             const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
-            submitted = true; // worker.submit consumes the request even when it rejects it.
             try worker.submit(worker_request);
+            submitted = true;
         },
         .system => |request| {
             switch (request.stdio) {
@@ -149,8 +149,8 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
                         failed.deinit(self.msg_allocator);
                     };
                     const worker = if (self.system_worker) |*worker| worker else return error.SystemWorkerUnavailable;
-                    submitted = true; // worker.submit consumes the request even when it rejects it.
                     try worker.submit(.{ .id = owned_start.id, .system = cloned });
+                    submitted = true;
                 },
                 .terminal => try self.enqueueTerminalSystem(owned_start.id, request),
             }

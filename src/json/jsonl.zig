@@ -102,8 +102,13 @@ const Collector = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.errors += 1;
     }
-    fn sink(self: *@This()) Sink { return .{ .ptr = self, .emit = emit, .err = err }; }
-    fn deinit(self: *@This()) void { for (self.lines.items) |l| self.allocator.free(l); self.lines.deinit(self.allocator); }
+    fn sink(self: *@This()) Sink {
+        return .{ .ptr = self, .emit = emit, .err = err };
+    }
+    fn deinit(self: *@This()) void {
+        for (self.lines.items) |l| self.allocator.free(l);
+        self.lines.deinit(self.allocator);
+    }
 };
 
 test "jsonl decoder frames split lines crlf tail and oversize resync" {

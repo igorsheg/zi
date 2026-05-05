@@ -135,8 +135,6 @@ pub const StatusLine = struct {
     pub fn measure(self: *StatusLine, width: u32) Measurement {
         _ = self;
         _ = width;
-        // Reserve the status slot even when the line is empty so the transcript
-        // does not jump when transient working/status text disappears.
         return .{ .min_height = 1, .preferred_height = 1 };
     }
 
@@ -285,4 +283,3 @@ test "StatusLine publishes shimmer animation while working" {
     try testing.expect(!line.tickAnimation(now_ns));
     try testing.expect(line.nextAnimationDeadline(now_ns + 1) != null);
 }
-

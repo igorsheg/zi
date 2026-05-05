@@ -269,7 +269,7 @@ fn streamAssistantResponse(
     }
 
     // JS `||` treats empty string as falsy, so we must check len > 0.
-    // zi-wub.27: dupe into the loop arena immediately. The slice
+    // Dupe into the loop arena immediately. The slice
     // returned by the hook is BORROWED from AuthStorage's internal
     // map; AuthStorage.set() from the login thread can reallocate
     // or free that slice during the upcoming stream call. The

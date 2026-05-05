@@ -316,9 +316,6 @@ test "round-trip serialize then parse preserves data" {
 }
 
 test "zi-kfg: malformed entries are skipped, valid entries survive" {
-    // Pre-fix, the first bad entry would abort the whole parse and
-    // the user would lose ALL credentials. Post-fix, parseAuthJson
-    // logs and skips the bad ones, returns a map with just "good".
     const input =
         \\{
         \\  "missing-type": {

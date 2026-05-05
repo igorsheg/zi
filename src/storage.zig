@@ -126,18 +126,6 @@ pub const MemoryFile = struct {
     pub fn releaseLock(_: *const MemoryFile) void {}
 };
 
-// All zi persistent data lives under a single root:
-//   ~/.zi/agent/          (default, or ZI_CODING_AGENT_DIR override)
-//
-// Directory layout:
-//   ~/.zi/agent/auth.json
-//   ~/.zi/agent/settings.json
-//   ~/.zi/agent/models.json
-//   ~/.zi/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl
-//
-// Project-local:
-//   <cwd>/.zi/settings.json
-
 /// Get the agent directory. Honors ZI_CODING_AGENT_DIR env var.
 /// Default: ~/.zi/agent
 pub fn getAgentDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]const u8 {

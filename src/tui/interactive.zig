@@ -217,10 +217,6 @@ pub const Interactive = struct {
     /// the TUI thread after all workers are joined.
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
 
-    // P1: soft events (token deltas, tool_execution_update) mark-dirty
-    // and only publish if the cadence has elapsed. Hard events flush
-    // immediately. See flushPendingConversationPublish /
-    // maybePublishSoftConversation below.
     last_conversation_publish_ns: u64 = 0,
     conversation_publish_dirty: bool = false,
     /// Last queued-snapshot version we've published from the agent thread.
@@ -523,10 +519,6 @@ pub const Interactive = struct {
 
         self.job_manager.setSurfaceSink(.{ .ptr = @ptrCast(self), .submit = &publishJobSurfaceFrame });
 
-        // RuntimeHost emits extension `session_start` before the TUI tree exists.
-        // Drain semantic UI publications once after slots are materialized so
-        // lifecycle-time retained messages/status/progress are visible without
-        // waiting for an extension command.
         self.publishPendingExtensionUi();
 
         self.tui.dirty = true;
@@ -990,10 +982,6 @@ pub const Interactive = struct {
             },
             .clear => {
                 self.transcript.clearAll();
-                // Drop the projection snapshot/cache too — otherwise the
-                // next replaceViewSnapshot with the same committed ptr
-                // would take the cache-hit path and hand reconcile
-                // metadata-only items against a wiped transcript.
                 self.conversation_projection.clear();
                 self.status_line.clearPrimary();
                 self.tui.dirty = true;

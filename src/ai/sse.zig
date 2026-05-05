@@ -473,10 +473,6 @@ test "streamEvents discards unterminated tail at EOF" {
 }
 
 test "streamEvents makes forward progress when stream parks bytes in reader buffer" {
-    // Models the std.crypto.tls.Client pathology (ziglang/zig#25428) where
-    // `stream` returns 0 after moving bytes into the reader's own buffer.
-    // Before the drain fix this test would spin forever; after it the
-    // buffered bytes are consumed via `reader.buffered()` / `tossBuffered`.
     const input = "data: hello\n\n";
     var source_reader: std.Io.Reader = .fixed(input);
 

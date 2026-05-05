@@ -616,7 +616,6 @@ pub const ToolExecution = struct {
         return Color.default;
     }
 
-    // Transcript owns vertical spacing between rows; tools keep only horizontal content inset.
     const padding_y: u32 = 0;
 
     pub fn measure(self: *ToolExecution, width: u32) Measurement {
@@ -711,10 +710,6 @@ pub const ToolExecution = struct {
         const total_rows = self.ensureMeasuredResultHeight(region.width);
         if (skip_rows >= total_rows) return;
 
-        // pi-mono only invokes result renderers once a tool has
-        // actually produced a result. Keep the same contract here so
-        // pending tools do not render placeholder/malformed result
-        // states before projected args/results are complete.
         if (self.model.result == null) return;
 
         if (self.model.rendered_result) |rendered| {

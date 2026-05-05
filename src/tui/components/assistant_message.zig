@@ -187,8 +187,6 @@ pub const AssistantMessage = struct {
         deinitRenderBlocksList(&self.render_blocks, self.allocator);
     }
 
-    // Kept as no-op compatibility hooks so transcript animation plumbing can
-    // stay simple while thinking blocks render statically through Markdown.
     pub fn deactivateThinkingShimmer(_: *AssistantMessage) bool {
         return false;
     }
@@ -362,4 +360,3 @@ test "assistant message renders stable row model and hidden thinking label" {
     try testing.expect(std.mem.indexOf(u8, custom_label_text, "Pondering...") != null);
     try testing.expect(std.mem.indexOf(u8, custom_label_text, "Thinking...") == null);
 }
-
