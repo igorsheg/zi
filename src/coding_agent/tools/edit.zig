@@ -372,7 +372,6 @@ fn atomicWriteFile(path: []const u8, bytes: []const u8, permissions: std.Io.File
     try atomic_file.replace(std.Options.debug_io);
 }
 
-
 fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -783,7 +782,6 @@ fn findRedactionMarker(old_str: []const u8, new_str: []const u8) ?[]const u8 {
     }
     return null;
 }
-
 
 const PREVIEW_MAX: usize = 120;
 

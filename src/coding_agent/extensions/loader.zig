@@ -255,7 +255,6 @@ fn addExtension(
     });
 }
 
-
 pub const LoadStats = struct {
     attempted: u32 = 0,
     loaded: u32 = 0,

@@ -802,7 +802,6 @@ fn pushMessageRoleField(L: *c.lua_State, message: agent_protocol.AgentMessage) v
     c.lua_setfield(L, -2, "role");
 }
 
-
 /// Adapter matching `agent_protocol.BeforeToolCallHook.func`. Routes
 /// the agent's `tool_call` event through the cancellable dispatch
 /// chain. The runner pointer comes in as `hook_ctx`.

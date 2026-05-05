@@ -153,7 +153,6 @@ fn pushStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void
     c.lua_setfield(L, -2, field.ptr);
 }
 
-
 pub const TrampolineCtx = spawn_api.TrampolineCtx;
 pub const eventTrampoline = spawn_api.eventTrampoline;
 pub const pushToolResultAsSpawnResult = spawn_api.pushToolResultAsSpawnResult;
