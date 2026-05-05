@@ -31,6 +31,10 @@ pub fn build(b: *std.Build) void {
     const web = b.step("web", "Build the compound static website");
     web.dependOn(&zine_site.step);
 
+    const install_redirects = b.addInstallFileWithDir(b.path("_redirects"), .prefix, "_redirects");
+    install_redirects.step.dependOn(&zine_site.step);
+    web.dependOn(&install_redirects.step);
+
     inline for (man_pages) |entry| {
         const md_file, const html_file, const markdown_file, const page_title, const prev_label, const prev_url, const next_label, const next_url = entry;
 

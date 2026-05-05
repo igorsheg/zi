@@ -12,6 +12,7 @@ concurrency:
 
 env:
   WEBSITE_ZIG_VERSION: 0.15.2
+  WEBSITE_ZINE_VERSION: v0.11.2
   CLOUDFLARE_PAGES_PROJECT: withzi
   WEBSITE_OUT_DIR: zig-out/web
 
@@ -31,6 +32,8 @@ jobs:
 
       - name: Setup Zine
         uses: kristoff-it/setup-zine@v1
+        with:
+          version: ${{ env.WEBSITE_ZINE_VERSION }}
 
       - name: Build website
         working-directory: website
