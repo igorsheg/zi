@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     const zine_site = b.addSystemCommand(&.{
         "zine",
         "release",
+        "--force",
         b.fmt("--output={s}", .{b.install_prefix}),
     });
 
