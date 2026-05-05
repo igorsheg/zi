@@ -183,6 +183,9 @@ pub const JobStdoutMode = union(enum) {
         generation: Generation,
         max_frame_bytes: usize = 16 * 1024 * 1024,
     },
+    json_lines: struct {
+        max_line_bytes: usize = 1024 * 1024,
+    },
 
     pub fn clone(self: JobStdoutMode, allocator: std.mem.Allocator) !JobStdoutMode {
         return switch (self) {
@@ -193,6 +196,7 @@ pub const JobStdoutMode = union(enum) {
                 .generation = frame.generation,
                 .max_frame_bytes = frame.max_frame_bytes,
             } },
+            .json_lines => |cfg| .{ .json_lines = .{ .max_line_bytes = cfg.max_line_bytes } },
         };
     }
 
@@ -203,6 +207,7 @@ pub const JobStdoutMode = union(enum) {
                 allocator.free(frame.surface_id);
                 allocator.free(frame.state_owner_id);
             },
+            .json_lines => {},
         }
         self.* = undefined;
     }
@@ -1052,6 +1057,7 @@ pub const ExtensionRunner = struct {
             .stdout => .job_stdout,
             .stderr => .job_stderr,
             .exit => .job_exit,
+            .json => .job_json,
         };
         if (self.event_registry.handlers(kind).len == 0) return;
         const state = self.lua_state orelse return error.MissingLuaState;
@@ -1618,7 +1624,7 @@ fn pushSurfaceInputPayload(L: *lua_runtime.c.lua_State, input: extension_ui.Surf
 
 fn pushJobEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.JobEvent) void {
     const c = lua_runtime.c;
-    c.lua_createtable(L, 0, 4);
+    c.lua_createtable(L, 0, 8);
     c.lua_pushinteger(L, @intCast(event.id));
     c.lua_setfield(L, -2, "id");
     pushStringField(L, "kind", @tagName(event.kind));
@@ -1627,6 +1633,13 @@ fn pushJobEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.JobEvent
         c.lua_pushinteger(L, @intCast(code));
         c.lua_setfield(L, -2, "code");
     }
+    if (event.value) |value| {
+        lua_runtime.pushJsonValue(L, value) catch c.lua_pushnil(L);
+        c.lua_setfield(L, -2, "value");
+    }
+    c.lua_pushboolean(L, if (event.is_error) 1 else 0);
+    c.lua_setfield(L, -2, "is_error");
+    if (event.error_message) |msg| pushStringField(L, "error", msg);
 }
 
 fn pushStringField(L: *lua_runtime.c.lua_State, comptime field: [:0]const u8, value: []const u8) void {

@@ -1878,6 +1878,7 @@ test "extension job API starts writes and stops through dispatcher" {
             switch (request.stdout) {
                 .events => {},
                 .surface_frame => |frame| self.stdout_surface = try testing.allocator.dupe(u8, frame.surface_id),
+                .json_lines => {},
             }
         }
         fn write(ptr: *anyopaque, _: *runner_mod.ExtensionRunner, id: u64, data: []const u8) !void {

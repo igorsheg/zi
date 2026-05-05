@@ -8,6 +8,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const runtime_process = @import("../zio/root.zig").process;
+const jsonl = @import("../json/root.zig").jsonl;
 
 const log = std.log.scoped(.zi_spawn);
 
@@ -63,7 +64,9 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
         .config = config,
         .result = &result,
         .trace_file = trace_file,
+        .decoder = jsonl.Decoder.init(allocator, .{ .max_line_bytes = 16 * 1024 * 1024 }),
     };
+    defer line_ctx.decoder.deinit();
 
     var proc_result = runtime_process.run(allocator, config.io, .{
         .argv = built.argv.items,
@@ -139,7 +142,7 @@ const JsonlCtx = struct {
     config: types.SpawnConfig,
     result: *types.SpawnResult,
     trace_file: ?std.Io.File,
-    line_buf: std.ArrayList(u8) = .empty,
+    decoder: jsonl.Decoder,
     mutex: std.Io.Mutex = .init,
 
     fn onChunk(raw_ctx: ?*anyopaque, kind: runtime_process.StreamKind, bytes: []const u8) void {
@@ -147,40 +150,28 @@ const JsonlCtx = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
         self.mutex.lockUncancelable(self.config.io);
         defer self.mutex.unlock(self.config.io);
-        self.feed(bytes);
-    }
-
-    fn feed(self: *@This(), chunk: []const u8) void {
-        var start: usize = 0;
-        for (0..chunk.len) |i| {
-            if (chunk[i] == '\n') {
-                const segment = chunk[start..i];
-                if (self.line_buf.items.len > 0) {
-                    self.line_buf.appendSlice(self.allocator, segment) catch {};
-                    self.emitLine(self.line_buf.items);
-                    self.line_buf.clearRetainingCapacity();
-                } else {
-                    self.emitLine(segment);
-                }
-                start = i + 1;
-            }
-        }
-        if (start < chunk.len) self.line_buf.appendSlice(self.allocator, chunk[start..]) catch {};
+        self.decoder.feed(bytes, self.sink()) catch {};
     }
 
     fn flushTail(self: *@This()) void {
         self.mutex.lockUncancelable(self.config.io);
         defer self.mutex.unlock(self.config.io);
-        defer self.line_buf.deinit(self.allocator);
-        if (self.line_buf.items.len > 0) {
-            self.emitLine(self.line_buf.items);
-            self.line_buf.clearRetainingCapacity();
-        }
+        self.decoder.flush(self.sink());
     }
 
-    fn emitLine(self: *@This(), line: []const u8) void {
+    fn sink(self: *@This()) jsonl.Sink {
+        return .{ .ptr = self, .emit = emitLine, .err = jsonlError };
+    }
+
+    fn emitLine(ptr: *anyopaque, line: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.trace_file) |f| traceLine(self.config.io, f, line);
         processLine(line, self.result, self.config);
+    }
+
+    fn jsonlError(ptr: *anyopaque, _: jsonl.ErrorKind, _: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.result.error_message == null) self.result.error_message = self.allocator.dupe(u8, "child emitted an oversized JSONL line") catch null;
     }
 };
 

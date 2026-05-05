@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_value = @import("../../json/value.zig");
 
 pub const TextSpan = struct {
     text: []const u8,
@@ -280,13 +281,16 @@ pub const SurfaceClose = struct {
     }
 };
 
-pub const JobEventKind = enum { stdout, stderr, exit };
+pub const JobEventKind = enum { stdout, stderr, exit, json };
 
 pub const JobEvent = struct {
     id: u64,
     kind: JobEventKind,
     data: ?[]const u8 = null,
     code: ?i64 = null,
+    value: ?std.json.Value = null,
+    is_error: bool = false,
+    error_message: ?[]const u8 = null,
 
     pub fn clone(allocator: std.mem.Allocator, event: JobEvent) !JobEvent {
         return .{
@@ -294,11 +298,16 @@ pub const JobEvent = struct {
             .kind = event.kind,
             .data = if (event.data) |data| try allocator.dupe(u8, data) else null,
             .code = event.code,
+            .value = if (event.value) |value| try json_value.cloneJsonValue(allocator, value) else null,
+            .is_error = event.is_error,
+            .error_message = if (event.error_message) |msg| try allocator.dupe(u8, msg) else null,
         };
     }
 
     pub fn deinit(self: *JobEvent, allocator: std.mem.Allocator) void {
         if (self.data) |data| allocator.free(data);
+        if (self.value) |value| json_value.freeJsonValue(allocator, value);
+        if (self.error_message) |msg| allocator.free(msg);
         self.* = undefined;
     }
 };

@@ -119,6 +119,12 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
                 .generation = runner.generation,
                 .max_frame_bytes = @min(@as(usize, @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", limits.surface_frame_bytes))), limits.surface_frame_bytes),
             } };
+        } else if (std.mem.eql(u8, mode, "json_lines")) {
+            const raw_max_line_bytes = readIntegerField(L, stdout_idx, "max_line_bytes", 1024 * 1024);
+            if (raw_max_line_bytes <= 0) return error.InvalidOptions;
+            request.stdout = .{ .json_lines = .{
+                .max_line_bytes = @min(@as(usize, @intCast(raw_max_line_bytes)), 16 * 1024 * 1024),
+            } };
         } else if (!std.mem.eql(u8, mode, "events")) {
             return error.InvalidOptions;
         }

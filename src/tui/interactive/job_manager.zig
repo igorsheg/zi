@@ -4,6 +4,9 @@ const extension_runner = @import("../../coding_agent/extensions/runner.zig");
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const request_mod = @import("../../coding_agent/request.zig");
 const zio_job = @import("../../zio/root.zig").job;
+const json_root = @import("../../json/root.zig");
+const jsonl = json_root.jsonl;
+const json_value = json_root.value;
 
 /// Interactive wiring for zio.job.Manager.
 ///
@@ -64,6 +67,7 @@ pub const JobManager = struct {
         var adapter: ?OutputAdapter = switch (request.stdout) {
             .events => null,
             .surface_frame => |frame| try OutputAdapter.initSurfaceFrame(self.allocator, frame),
+            .json_lines => |cfg| OutputAdapter.initJsonLines(self.allocator, cfg),
         };
         errdefer if (adapter) |*a| a.deinit(self.allocator);
 
@@ -98,6 +102,7 @@ pub const JobManager = struct {
             state.mutex.lockUncancelable(std.Options.debug_io);
             if (state.adapters.fetchRemove(event.id)) |entry| {
                 var adapter = entry.value;
+                adapter.finish(state, event.id);
                 adapter.deinit(state.allocator);
             }
             state.mutex.unlock(std.Options.debug_io);
@@ -134,14 +139,20 @@ pub const JobManager = struct {
 
 const OutputAdapter = union(enum) {
     surface_frame: FrameDecoder,
+    json_lines: JsonLinesDecoder,
 
     fn initSurfaceFrame(allocator: std.mem.Allocator, cfg: anytype) !OutputAdapter {
         return .{ .surface_frame = try FrameDecoder.init(allocator, cfg) };
     }
 
+    fn initJsonLines(allocator: std.mem.Allocator, cfg: anytype) OutputAdapter {
+        return .{ .json_lines = JsonLinesDecoder.init(allocator, cfg) };
+    }
+
     fn deinit(self: *OutputAdapter, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .surface_frame => |*decoder| decoder.deinit(allocator),
+            .json_lines => |*decoder| decoder.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -149,6 +160,85 @@ const OutputAdapter = union(enum) {
     fn accept(self: *OutputAdapter, state: *JobManager.State, id: u64, data: []const u8) !void {
         switch (self.*) {
             .surface_frame => |*decoder| try decoder.accept(state, id, data),
+            .json_lines => |*decoder| try decoder.accept(state, id, data),
+        }
+    }
+
+    fn finish(self: *OutputAdapter, state: *JobManager.State, id: u64) void {
+        switch (self.*) {
+            .surface_frame => {},
+            .json_lines => |*decoder| decoder.finish(state, id),
+        }
+    }
+};
+
+const JsonLinesDecoder = struct {
+    decoder: jsonl.Decoder,
+
+    fn init(allocator: std.mem.Allocator, cfg: anytype) JsonLinesDecoder {
+        return .{ .decoder = jsonl.Decoder.init(allocator, .{ .max_line_bytes = cfg.max_line_bytes }) };
+    }
+
+    fn deinit(self: *JsonLinesDecoder, allocator: std.mem.Allocator) void {
+        self.decoder.deinit();
+        _ = allocator;
+    }
+
+    fn accept(self: *JsonLinesDecoder, state: *JobManager.State, id: u64, data: []const u8) !void {
+        var ctx = JsonLineCtx{ .state = state, .id = id };
+        try self.decoder.feed(data, ctx.sink());
+    }
+
+    fn finish(self: *JsonLinesDecoder, state: *JobManager.State, id: u64) void {
+        var ctx = JsonLineCtx{ .state = state, .id = id };
+        self.decoder.flush(ctx.sink());
+    }
+};
+
+const JsonLineCtx = struct {
+    state: *JobManager.State,
+    id: u64,
+
+    fn sink(self: *@This()) jsonl.Sink {
+        return .{ .ptr = self, .emit = emit, .err = err };
+    }
+
+    fn emit(ptr: *anyopaque, line: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const parsed = std.json.parseFromSlice(std.json.Value, self.state.allocator, line, .{ .allocate = .alloc_always }) catch |parse_err| {
+            submitJsonError(self.state, self.id, line, @errorName(parse_err));
+            return;
+        };
+        defer parsed.deinit();
+        const value = json_value.cloneJsonValue(self.state.request_queue.allocator, parsed.value) catch return;
+        const event = extension_ui.JobEvent{ .id = self.id, .kind = .json, .data = line, .value = value };
+        const cloned = extension_ui.JobEvent.clone(self.state.request_queue.allocator, event) catch {
+            json_value.freeJsonValue(self.state.request_queue.allocator, value);
+            return;
+        };
+        json_value.freeJsonValue(self.state.request_queue.allocator, value);
+        sendExtensionJobEvent(self.state, cloned);
+    }
+
+    fn err(ptr: *anyopaque, _: jsonl.ErrorKind, data: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        submitJsonError(self.state, self.id, data, "line too long");
+    }
+
+    fn submitJsonError(state: *JobManager.State, id: u64, data: []const u8, message: []const u8) void {
+        const event = extension_ui.JobEvent{ .id = id, .kind = .json, .data = data, .is_error = true, .error_message = message };
+        const cloned = extension_ui.JobEvent.clone(state.request_queue.allocator, event) catch return;
+        sendExtensionJobEvent(state, cloned);
+    }
+
+    fn sendExtensionJobEvent(state: *JobManager.State, event: extension_ui.JobEvent) void {
+        switch (state.request_queue.trySend(.{ .extension_job_event = event })) {
+            .ok => {},
+            .dropped => unreachable,
+            .full, .closed, .oom => |rejected| {
+                var failed = rejected;
+                failed.deinit(state.request_queue.allocator);
+            },
         }
     }
 };
