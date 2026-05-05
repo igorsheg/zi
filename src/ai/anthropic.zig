@@ -105,7 +105,6 @@ pub const AnthropicProvider = struct {
         const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
 
         var auth_buf: [4096]u8 = undefined;
-        // OAuth path mimics Claude Code headers; Anthropic rejects browser OAuth without them.
         if (is_oauth) {
             const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
                 emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "API key too long for auth buffer", .{});
@@ -310,7 +309,6 @@ const ContentBlockState = struct {
 };
 
 const StreamState = struct {
-    // Turn arena owns stream data; scratch is reset before every JSON parse.
     allocator: std.mem.Allocator,
     scratch: *std.heap.ArenaAllocator,
     content_blocks: std.ArrayListUnmanaged(ContentBlockState),
@@ -326,7 +324,6 @@ const StopReason = enum {
     sensitive,
 };
 
-// Scratch JSON dies on reset; dupe/append anything that survives this event.
 fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
     const data = evt.data;
     if (data.len == 0) return;
@@ -832,8 +829,7 @@ fn writeAnthropicImageBlock(jw: *std.json.Stringify, img: protocol.ImageContent)
     try jw.endObject();
 }
 
-// Anthropic rejects tool `input:null`; empty/malformed streamed args become `{}`.
-// Clone parsed args out of scratch before the next delta reset.
+// Anthropic rejects tool `input:null`.
 fn parseToolArgs(state: *StreamState, json_str: []const u8) std.json.Value {
     _ = state.scratch.reset(.retain_capacity);
     const scratch = state.scratch.allocator();
@@ -848,7 +844,6 @@ fn emptyObject(allocator: std.mem.Allocator) std.json.Value {
     return .{ .object = .{} };
 }
 
-// Live partial content borrows block buffers; final content duplicates them.
 fn buildLiveContent(allocator: std.mem.Allocator, blocks: []const ContentBlockState) ![]const protocol.AssistantMessage.AssistantContentBlock {
     const content = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, blocks.len);
     for (blocks, 0..) |block, i| {

@@ -15,8 +15,7 @@ pub const EventHandler = struct {
     }
 };
 
-// W3C SSE: join data lines with `\n`, strip one trailing newline on emit.
-// Event slices die on the next feedLine/reset; large provider events are bounded below.
+// W3C SSE: join data lines with `\n`, strip one trailing newline.
 pub const max_event_data_bytes: usize = 1024 * 1024;
 
 pub const SseParser = struct {
@@ -46,7 +45,6 @@ pub const SseParser = struct {
         return self.last_event_id_buf[0..self.last_event_id_len];
     }
 
-    // Feed one line without LF/CRLF; blank line emits if data was present.
     pub fn feedLine(self: *SseParser, line: []const u8) error{ OutOfMemory, EventDataTooLarge }!?SseEvent {
         if (self.needs_reset and line.len != 0) self.reset();
 
@@ -118,7 +116,6 @@ pub const SseParser = struct {
         return null;
     }
 
-    // Keep last_event_id and retry across event resets.
     pub fn reset(self: *SseParser) void {
         self.event_len = 0;
         self.id_len = 0;
@@ -128,7 +125,6 @@ pub const SseParser = struct {
     }
 };
 
-// Chunk the stream; never rely on reader line-size limits.
 pub fn streamEvents(
     allocator: std.mem.Allocator,
     reader: anytype,

@@ -207,9 +207,8 @@ const ItemState = struct {
     tool_item_id: []const u8 = "",
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
-    // Live parsed args live in scratch; final args are reparsed into the turn arena.
     tool_args_parsed: std.json.Value = .null,
-    // Responses has both call_id and item id; keep both to avoid history collisions.
+    // Responses has both call_id and item id.
     tool_composite_id: []const u8 = "",
 
     fn deinit(self: *ItemState, allocator: std.mem.Allocator) void {
@@ -825,7 +824,6 @@ pub fn codexEventMapper(
         return .{ .fail = try allocator.dupe(u8, "Codex response failed") };
     }
 
-    // Codex terminal events vary; normalize them to Responses `response.completed`.
     if (std.mem.eql(u8, event_type, "response.done") or
         std.mem.eql(u8, event_type, "response.completed") or
         std.mem.eql(u8, event_type, "response.incomplete"))

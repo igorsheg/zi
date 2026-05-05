@@ -71,7 +71,6 @@ fn parseSystemRequest(allocator: std.mem.Allocator, L: *c.lua_State) SystemParse
     request.text = optionalSystemBoolField(L, opts_idx, "text", true) catch return error.InvalidOptions;
     request.stdio = optionalSystemStdioField(L, opts_idx, "stdio") catch return error.InvalidOptions;
     if (request.stdio == .terminal) {
-        // Terminal stdio is interactive; capture-only knobs cannot apply.
         if (request.stdin != null) return error.InvalidOptions;
         if (request.timeout_ms != null) return error.InvalidOptions;
         if (hasField(L, opts_idx, "max_stdout_bytes") or hasField(L, opts_idx, "max_stderr_bytes")) return error.InvalidOptions;

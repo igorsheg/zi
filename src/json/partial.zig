@@ -3,7 +3,6 @@
 
 const std = @import("std");
 
-// Bit order matches promplate Allow; fixtures compare numeric masks.
 pub const Allow = packed struct(u8) {
     str: bool = false,
     num: bool = false,
@@ -35,7 +34,6 @@ pub const ParseError = error{
 
 const max_depth: u16 = 256;
 
-// Returned Value owns children in `allocator`; this parser has no deinit walker.
 pub fn parse(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -54,7 +52,7 @@ pub fn parse(
     return value;
 }
 
-// Do not swallow OOM as `{}`; bogus tool args are worse than failing loud.
+// OOM is not partial JSON.
 pub fn parseStreaming(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -145,7 +143,6 @@ const Parser = struct {
         return ParseError.Malformed;
     }
 
-    // Decode strings via std.json so escapes/surrogates stay stdlib-correct.
     fn parseStr(self: *Parser) ParseError![]const u8 {
         std.debug.assert(self.src[self.index] == '"');
         const body_start = self.index + 1;

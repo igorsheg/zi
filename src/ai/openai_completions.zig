@@ -280,10 +280,9 @@ const ContentBlockState = struct {
     tool_id: []const u8 = "",
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
-    // Live parsed args live in scratch; final args are reparsed into the turn arena.
     tool_args_parsed: std.json.Value = .null,
 
-    // OpenRouter sends encrypted reasoning as `reasoning_details`; preserve it on tool calls.
+    // OpenRouter encrypts reasoning in `reasoning_details`.
     thought_signature: ?[]const u8 = null,
 
     fn deinit(self: *ContentBlockState, allocator: std.mem.Allocator) void {
@@ -595,7 +594,6 @@ fn finishCurrentBlock(
     state.current_index = null;
 }
 
-// Partial-content snapshots leak into the turn arena; reset reclaims them.
 fn updatePartialContent(
     allocator: std.mem.Allocator,
     state: *StreamState,
@@ -819,7 +817,6 @@ fn buildRequestJson(
                     .openai_completions => |compat| {
                         if (compat.thinking_format) |fmt| {
                             if (fmt == .openrouter) {
-                                // OpenRouter wants nested `reasoning.effort`, not `reasoning_effort`.
                                 try jw.objectField("reasoning");
                                 try jw.beginObject();
                                 try jw.objectField("effort");
@@ -840,7 +837,7 @@ fn buildRequestJson(
                     .openai_completions => |compat| {
                         if (compat.thinking_format) |fmt| {
                             if (fmt == .openrouter) {
-                                // Default to `none`; omitting reasoning can enable provider defaults.
+                                // Omission lets providers choose reasoning.
                                 try jw.objectField("reasoning");
                                 try jw.beginObject();
                                 try jw.objectField("effort");
