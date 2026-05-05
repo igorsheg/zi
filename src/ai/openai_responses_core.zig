@@ -1,47 +1,5 @@
-//! OpenAI Responses API core — pi-mono parity for `/v1/responses` event vocab.
-//!
-//! pi-mono sources:
-//!   - packages/ai/src/providers/openai-responses.ts (251 LOC)
-//!   - packages/ai/src/providers/openai-responses-shared.ts (513 LOC)
-//!
-//! ## Architecture (mirrors openai_completions.zig phase 3a split)
-//!
-//!   1. `processStream(allocator, reader, model, abort, callback, ctx)` —
-//!      pure SSE consumer for the responses-API event vocabulary. No HTTP,
-//!      no globals. Tested in isolation via `std.io.fixedBufferStream`.
-//!   2. `streamCore(...)` — HTTP shell parametrized by `AuthFactory` +
-//!      `base_url` + `path` so phase 3c (`openai-codex-responses`) can
-//!      reuse the core with a ChatGPT-oauth auth flow and a different
-//!      endpoint, without copy-pasting the SSE processor.
-//!   3. `buildRequestJson(...)` — request body via `std.json.Stringify`.
-//!
-//! ## Phase 3b scope
-//!
-//! Live registered model: gpt-5.4 family on api.openai.com via
-//! `openai-responses`. Smoke test deferred to phase 3c (the user only has
-//! ChatGPT subscription auth, not a raw OPENAI_API_KEY).
-//!
-//! Explicitly NOT ported (mirrors phase 3a doctrine — no speculative compat
-//! for providers we don't register):
-//!
-//!   - `reasoning_effort` + `reasoning_summary` plumbing through
-//!     StreamOptions. Default `effort=none` matches pi-mono's behavior when
-//!     no options are set. Dedicated follow-up wires it.
-//!   - `service_tier` pricing multiplier
-//!   - `prompt_cache_key` / `prompt_cache_retention` (needs session_id wiring)
-//!   - foreign tool-call-id `fc_<hash>` normalization for cross-provider
-//!     history (`openai-codex` ↔ `openai` round-trip)
-//!   - github-copilot dynamic headers / vision detection
-//!   - image-bearing tool results
-//!
-//! ## Lifetime contract (mirrors openai_completions.zig)
-//!
-//!   - Per-stream growable buffers (`text_buf`, `tool_args_partial`) own
-//!     their capacity and are explicitly deinit'd.
-//!   - All other strings (item ids, msg ids, tool ids/names, signatures)
-//!     are duped INTO the turn arena and BORROWED by emitted events. They
-//!     must outlive the agent loop's reference, which the turn-arena reset
-//!     guarantees. Don't free them in deinit.
+//! OpenAI Responses SSE core.
+//! Codex wrappers normalize their dialect before shared parsing.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -56,9 +14,6 @@ const zio_abort = @import("../zio/root.zig").abort;
 const AbortSignal = zio_abort.AbortSignal;
 const AbortGuard = zio_abort.AbortGuard;
 
-/// Pluggable Authorization-header builder. The HTTP shell calls
-/// `build(ctx, scratch_buf, options.api_key)` and writes the result into
-/// the request's `authorization` header.
 pub const AuthFactory = struct {
     ctx: ?*anyopaque = null,
     build: *const fn (
@@ -68,7 +23,6 @@ pub const AuthFactory = struct {
     ) error{ NoApiKey, BufferTooSmall }![]u8,
 };
 
-/// Per-call configuration injected by the wrapping provider.
 pub const EventMapOutcome = union(enum) {
     pass_through,
     normalized: struct {
@@ -85,29 +39,14 @@ pub const EventMapper = struct {
 };
 
 pub const CoreOptions = struct {
-    /// Override base URL. If null, `model.base_url` is used. Phase 3c
-    /// (openai-codex) will pass a hard-coded chatgpt.com URL here.
     base_url: ?[]const u8 = null,
-    /// Endpoint path joined to the base URL. Examples:
-    /// `/v1/responses`, `/backend-api/codex/responses`.
     path: []const u8,
     auth: AuthFactory,
-    /// Static extra headers contributed by the wrapper (e.g. `OpenAI-Beta`
-    /// for openai-codex). Layered between `model.headers` and
-    /// `options.headers`.
     extra_headers: []const protocol.Header = &.{},
-    /// Provider label for diagnostics in error messages.
     provider_label: []const u8 = "openai-responses",
-    /// Codex-specific normalization seam before shared responses processing.
     event_mapper: EventMapper = .{ .map = identityEventMapper },
-    /// Reasoning effort string (e.g. "low", "medium", "high").
-    /// Null means the caller didn't set a level — provider defaults apply.
     reasoning_effort: ?[]const u8 = null,
-    /// Reasoning summary preference (e.g. "auto", "concise", "detailed").
     reasoning_summary: ?[]const u8 = null,
-    /// Custom request body builder. When non-null, replaces the
-    /// default `buildRequestJson`. Codex uses this to emit
-    /// `instructions` + codex-specific fields.
     build_request: ?*const fn (
         allocator: std.mem.Allocator,
         out: *std.ArrayListUnmanaged(u8),
@@ -253,8 +192,6 @@ const MessagePartKind = enum { output_text, refusal };
 const ItemState = struct {
     kind: ItemKind,
     block_idx: usize,
-    /// reasoning: accumulated summary text. message: accumulated output_text.
-    /// function_call: unused (args live in `tool_args_partial`).
     text_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     summary_started: bool = false,
@@ -270,12 +207,9 @@ const ItemState = struct {
     tool_item_id: []const u8 = "",
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
-    /// Currently parsed JSON of `tool_args_partial`. Owned by the per-delta
-    /// scratch arena during streaming, swapped to the caller allocator on
-    /// finalization.
+    // Live parsed args live in scratch; final args are reparsed into the turn arena.
     tool_args_parsed: std.json.Value = .null,
-    /// Composite "call_id|item_id" id used in `ToolCall.id`. Built at
-    /// finalization, lives in the turn arena, BORROWED by `toolcall_end`.
+    // Responses has both call_id and item id; keep both to avoid history collisions.
     tool_composite_id: []const u8 = "",
 
     fn deinit(self: *ItemState, allocator: std.mem.Allocator) void {
@@ -287,7 +221,6 @@ const ItemState = struct {
 const StreamState = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayListUnmanaged(ItemState),
-    /// Index in `items` of the currently-open output item, or null between items.
     current: ?usize = null,
     partial: protocol.AssistantMessage,
     response_id: ?[]const u8 = null,
@@ -328,10 +261,6 @@ fn assistantHasToolCalls(msg: protocol.AssistantMessage) bool {
     return false;
 }
 
-/// Drain a Reader of openai-responses SSE bytes, emit
-/// `AssistantMessageEvent`s through `callback`. Pure: no HTTP, no globals.
-/// Tested in isolation via `std.io.fixedBufferStream` over hand-built bytes
-/// (mirrors phase 3a's pattern from `openai_completions.zig`).
 pub fn processStream(
     allocator: std.mem.Allocator,
     reader: anytype,
@@ -896,6 +825,7 @@ pub fn codexEventMapper(
         return .{ .fail = try allocator.dupe(u8, "Codex response failed") };
     }
 
+    // Codex terminal events vary; normalize them to Responses `response.completed`.
     if (std.mem.eql(u8, event_type, "response.done") or
         std.mem.eql(u8, event_type, "response.completed") or
         std.mem.eql(u8, event_type, "response.incomplete"))
@@ -1655,8 +1585,6 @@ const test_model: protocol.Model = .{
     .max_tokens = 1024,
 };
 
-/// Test helper: run the shared SSE processor against a fixed reader so
-/// the unit tests exercise the same `std.Io.Reader` semantics as live HTTP.
 fn runProcessWithMapper(
     arena: std.mem.Allocator,
     sse_bytes: []const u8,

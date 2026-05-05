@@ -12,8 +12,6 @@ const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
 
-/// Anthropic Messages API provider implementation.
-/// Streams to `{model.base_url}/v1/messages` with SSE parsing.
 pub const AnthropicProvider = struct {
     allocator: std.mem.Allocator,
 
@@ -21,7 +19,6 @@ pub const AnthropicProvider = struct {
         return .{ .allocator = allocator };
     }
 
-    /// Returns a vtable-wrapped Provider interface.
     pub fn provider(self: *AnthropicProvider) ai_provider.Provider {
         return .{
             .ptr = self,
@@ -108,6 +105,7 @@ pub const AnthropicProvider = struct {
         const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
 
         var auth_buf: [4096]u8 = undefined;
+        // OAuth path mimics Claude Code headers; Anthropic rejects browser OAuth without them.
         if (is_oauth) {
             const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
                 emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "API key too long for auth buffer", .{});
@@ -312,16 +310,8 @@ const ContentBlockState = struct {
 };
 
 const StreamState = struct {
-    /// Turn arena: lives for the full stream. All durable allocations
-    /// (content block buffers, cloned tool-call args, partial.content
-    /// slices) go here. Caller owns and resets it between turns.
+    // Turn arena owns stream data; scratch is reset before every JSON parse.
     allocator: std.mem.Allocator,
-    /// Per-delta scratch arena, reset with `retain_capacity` before
-    /// every partial-JSON reparse. Bounds memory growth during tool
-    /// argument streaming: the old std.json.Value tree is dropped on
-    /// reset instead of accumulating in the turn arena. Lives for
-    /// the same lifetime as `allocator`; backed by the turn arena's
-    /// underlying allocator.
     scratch: *std.heap.ArenaAllocator,
     content_blocks: std.ArrayListUnmanaged(ContentBlockState),
     partial: protocol.AssistantMessage,
@@ -336,26 +326,7 @@ const StopReason = enum {
     sensitive,
 };
 
-/// Handle a single Anthropic SSE event. The `data` payload is parsed
-/// once via `std.json.parseFromSliceLeaky` into `state.scratch` and
-/// walked structurally with the typed accessors in `json.value`.
-///
-/// Lifetime contract:
-///   - `state.scratch` is reset before parse, so any prior tree
-///     (including the previous tool-arg parse from `parseToolArgs`)
-///     is dropped here. This is safe because everything we needed
-///     from the previous event was either copied into the turn arena
-///     (block buffers, cloned tc.arguments) or already consumed by
-///     the callback.
-///   - String/object fields read from the parsed value are slices
-///     into scratch memory. Anything that must survive past this
-///     function (or past a subsequent `state.scratch.reset` inside
-///     `parseToolArgs`) MUST be copied into `state.allocator` (the
-///     turn arena) before that point. We copy via `appendSlice` /
-///     `dupe`, never store raw scratch slices.
-///
-/// Errors during parse or shape mismatch are silently dropped — SSE
-/// is best-effort and the next event will reset and retry.
+// Scratch JSON dies on reset; dupe/append anything that survives this event.
 fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, callback: ai_provider.EventCallback, callback_ctx: ?*anyopaque) void {
     const data = evt.data;
     if (data.len == 0) return;
@@ -510,7 +481,6 @@ fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockS
     return content;
 }
 
-/// pi-mono: anthropic.ts:446-454
 fn supportsAdaptiveThinking(model_id: []const u8) bool {
     if (std.mem.indexOf(u8, model_id, "opus-4-6") != null) return true;
     if (std.mem.indexOf(u8, model_id, "opus-4.6") != null) return true;
@@ -519,7 +489,6 @@ fn supportsAdaptiveThinking(model_id: []const u8) bool {
     return false;
 }
 
-/// pi-mono: anthropic.ts:460-474
 fn mapThinkingLevelToEffort(level: protocol.ThinkingLevel, model_id: []const u8) []const u8 {
     return switch (level) {
         .minimal, .low => "low",
@@ -530,7 +499,6 @@ fn mapThinkingLevelToEffort(level: protocol.ThinkingLevel, model_id: []const u8)
     };
 }
 
-/// pi-mono: simple-options.ts:22-46
 fn adjustMaxTokensForThinking(
     base_max_tokens: u64,
     model_max_tokens: u64,
@@ -864,23 +832,8 @@ fn writeAnthropicImageBlock(jw: *std.json.Stringify, img: protocol.ImageContent)
     try jw.endObject();
 }
 
-/// Parse a (possibly incomplete) tool-argument JSON buffer and
-/// return a std.json.Value owned by the turn arena.
-///
-/// Arena split:
-///   - `state.scratch` is reset with `retain_capacity` and the
-///     partial JSON parser allocates into it. Old scratch trees
-///     (from the previous delta) are dropped in bulk on reset, so
-///     per-turn memory is bounded by the single largest tool-args
-///     snapshot, not the sum of every intermediate parse.
-///   - The parsed value is then deep-cloned into the turn arena
-///     (`state.allocator`) which owns `tc.arguments`. The clone is
-///     the only durable allocation per delta.
-///
-/// Empty/malformed input → `{}`. A tool call with no arguments is
-/// `{}`, not `.null`: Anthropic's next request rejects `"input":null`
-/// with HTTP 400, and downstream tool-arg extraction reports a
-/// misleading "missing field" when the model simply emitted no args.
+// Anthropic rejects tool `input:null`; empty/malformed streamed args become `{}`.
+// Clone parsed args out of scratch before the next delta reset.
 fn parseToolArgs(state: *StreamState, json_str: []const u8) std.json.Value {
     _ = state.scratch.reset(.retain_capacity);
     const scratch = state.scratch.allocator();
@@ -895,15 +848,7 @@ fn emptyObject(allocator: std.mem.Allocator) std.json.Value {
     return .{ .object = .{} };
 }
 
-/// Build a snapshot of `state.partial.content` for mid-stream
-/// subscribers. Unlike `buildFinalContent`, this BORROWS the text /
-/// thinking byte slices from `ContentBlockState` storage instead of
-/// duping them — those buffers live in the turn arena and are
-/// mutation-stable for the lifetime of the delta callback (the next
-/// delta runs after the callback returns synchronously on the same
-/// thread). Downstream consumers that need to retain the content
-/// past the callback must deep-clone it themselves — which
-/// `convertAgentEvent` in the TUI already does via `cloneJsonValue`.
+// Live partial content borrows block buffers; final content duplicates them.
 fn buildLiveContent(allocator: std.mem.Allocator, blocks: []const ContentBlockState) ![]const protocol.AssistantMessage.AssistantContentBlock {
     const content = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, blocks.len);
     for (blocks, 0..) |block, i| {

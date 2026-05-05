@@ -37,15 +37,7 @@ pub const ContextUsage = session_core.context_usage.ContextUsage;
 const PendingExtensionUi = pending_extension_ui_mod.PendingExtensionUi;
 const session_proto = session_core.protocol;
 
-/// Composition root: wires Agent + SessionStore + tools + model resolution.
-///
-///
-/// Owns:
-/// - Agent (dual-loop, tool pipeline, event system)
-/// - SessionStore (JSONL persistence + context building)
-/// - Tool registry (bash + future tools)
-/// - convertToLlm that handles compaction_summary, branch_summary, custom
-/// - Stream hook wrapping provider registry
+/// Composition root: agent runtime + store + tools + extension seams.
 pub const AgentSession = struct {
     agent: Agent,
     session_store: SessionStore,
@@ -59,56 +51,29 @@ pub const AgentSession = struct {
     auth_storage: ?*auth_storage_mod.AuthStorage,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
     resource_loader: resources.ResourceLoader,
-    /// Borrowed visible-model registry. Lifetime stays caller-owned,
-    /// but AgentSession is the rebuild owner on the agent thread. Used
-    /// for model resolution, restore, and TUI snapshot publication.
+    /// Borrowed; mutate only on the agent thread.
     model_registry: ?*model_registry_mod.ModelRegistry = null,
 
-    /// Owned ExtensionRunner — current generation. Populated by the
-    /// sdk factory in Phase A3+; nil in v1 bootstraps until the runner
-    /// construction path is wired. Reload replaces this pointer
-    /// atomically with a new generation (see `docs/extensions.md`). When set,
-    /// `deinit` takes it down before
-    /// the agent so any final event observers can still fire against
-    /// a live session.
+    /// Current extension generation; swapped only on the agent thread.
     _extension_runner: ?*ExtensionRunner = null,
     _extension_runner_ref: *ExtensionRunnerRef,
 
-    /// Owned Lua state, paired 1:1 with `_extension_runner`. The
-    /// runner BORROWS this — see `extensions/runner.zig` field doc.
-    /// AgentSession owns the lifetime so the SDK bootstrap order
-    /// (state → runner → install zi.* → attach) lines up with the
-    /// teardown order (unsubscribe → runner.deinit → state.deinit).
-    /// Both fields are nil when Lua init fails; the agent still runs.
+    /// Lua state owner; runner borrows it, so destroy runner first.
     _extension_lua_state: ?*lua_runtime.LuaState = null,
     pending_extension_ui: PendingExtensionUi,
     pending_tool_projection_refresh: bool = false,
 
-    /// Subscription token for the extension event bridge. Separate
-    /// from `_subscription_token` (session persistence) so the two
-    /// can be torn down independently.
+    /// Separate from persistence subscription; teardown order matters.
     _extension_subscription_token: ?SubscriptionToken = null,
 
-    /// Owned built-in provider bundle. Set when the sdk factory created
-    /// the registry on the caller's behalf (the common path); null when
-    /// the caller passed their own pre-built `Options.registry` (tests,
-    /// embedders that want a custom provider set). When set, `deinit`
-    /// drops it AFTER the agent — provider structs and the registry
-    /// must outlive any in-flight stream that might still hold them.
+    /// Providers outlive Agent: streams may borrow registry entries.
     _owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
     _owned_system_prompt: []const u8 = "",
     _builtin_ctx: ?*builtin_util.BuiltinCtx = null,
-    /// Mirrors pi-mono's post-compaction semantics without re-reading the
-    /// session file on every status render. True means the latest compaction
-    /// on the active branch has not yet been followed by a successful
-    /// assistant response with non-zero usage.
+    /// True until first post-compaction assistant usage lands.
     context_usage_unknown_after_compaction: bool = false,
 
-    /// Compaction extension seam (zi-v3j.10.7). Extensions register a
-    /// pair of function pointers here to observe preparation, cancel,
-    /// provide alternate compaction content, and observe the persisted
-    /// result. Nil when no extension participates, in which case the
-    /// executor runs zi's default summarization pass.
+    /// Agent-thread compaction seam; callbacks must not cross-block.
     compaction_hooks: @import("session/compaction_hooks.zig").CompactionHooks = .{},
 
     pub const RawEventHandler = struct {
@@ -206,12 +171,7 @@ pub const AgentSession = struct {
         };
     }
 
-    /// Test-only convenience wrapper around the shared bootstrap path.
-    ///
-    /// Production construction flows through `sdk.createAgentSession`.
-    /// In-file tests call the same bootstrap assembler via
-    /// `session_bootstrap.prepareSessionDeps`, then hand the prepared
-    /// deps to `AgentSession.init`.
+    /// Test-only wrapper around the production bootstrap path.
     const TestInitOptions = struct {
         model: ai.protocol.Model,
         api_key: []const u8 = "",
@@ -259,24 +219,12 @@ pub const AgentSession = struct {
         });
     }
 
-    /// Tear down the extension runner + lua_State on whichever thread
-    /// owns the lua_State. This MUST run on the agent thread (the
-    /// owner per zi-wub.5/.6) so `lua_close` happens on the bound
-    /// thread. Called by the long-lived agent owner loop after
-    /// `Interactive.deinit` closes the request inbox (zi-wub.28);
-    /// after this runs, `AgentSession.deinit` sees null fields and
-    /// skips the blocks.
-    ///
-    /// Idempotent. Unsubscribes the extension bridge and unbinds the
-    /// runtime. Replacement flows snapshot provenance before calling
-    /// this so `session_start` payloads remain truthful.
+    /// Agent-thread teardown: lua_close must run on the owner thread.
     pub fn deactivateLifecycleOnAgentThread(self: *AgentSession) void {
         self.deactivateLifecycle();
     }
 
-    /// Idempotent. Unsubscribes the extension bridge first so no
-    /// in-flight agent event can re-enter the runner mid-teardown,
-    /// then explicitly unbinds the runtime before destroy.
+    /// Unsubscribe before destroy; events can re-enter extensions.
     pub fn shutdownLifecycleOnAgentThread(self: *AgentSession) void {
         self.deactivateLifecycleOnAgentThread();
         self.destroyExtensionRuntime();
@@ -305,16 +253,7 @@ pub const AgentSession = struct {
         self.refreshContextUsageStateFromStore();
     }
 
-    /// Reset the active session to a fresh header-only session while
-    /// preserving the current model + thinking defaults for future resume.
-    ///
-    /// Contract: this always creates a normal persisted session, even if the
-    /// current session was launched with `--no-session`. This matches
-    /// pi-mono's startup-only `--no-session` behavior: `/resume` can switch
-    /// into a persisted session, and `/new` is not an ephemeral-mode toggle.
-    ///
-    /// Ownership: agent-thread only. Mutates `session_store` and
-    /// `agent.state`, both owned by the agent thread per doctrine.
+    /// Agent-thread only. `/new` always switches to persisted storage.
     pub fn startNewSession(self: *AgentSession) !void {
         var new_store = try SessionStore.createForCwd(self.allocator, self.resource_loader.cwd, self.resource_loader.agent_dir);
         errdefer new_store.deinit();
@@ -329,18 +268,7 @@ pub const AgentSession = struct {
         );
     }
 
-    /// Current context usage for the active model.
-    ///
-    /// Mirrors pi-mono's `AgentSession.getContextUsage()` semantics:
-    /// - no model / zero context window → null
-    /// - after compaction, usage stays unknown until the first successful
-    ///   post-compaction assistant response lands
-    /// - otherwise use the last assistant usage plus heuristic estimates for
-    ///   trailing messages
-    ///
-    /// Unlike the earlier zi implementation, this hot path does NOT reread the
-    /// session file. The compaction boundary is tracked on the agent thread and
-    /// refreshed only when the active session store changes.
+    /// Hot path: do not reread JSONL for post-compaction state.
     pub fn getContextUsage(self: *const AgentSession) ?ContextUsage {
         const model = self.agent.modelValue();
         if (model.context_window == 0) return null;
@@ -378,9 +306,7 @@ pub const AgentSession = struct {
         self.context_usage_unknown_after_compaction = true;
     }
 
-    /// Extension entry point for registering compaction hook callbacks.
-    /// Hook functions run on the agent thread, inside the executor's
-    /// compaction flow. Callbacks must not block on cross-thread I/O.
+    /// Agent-thread callbacks; must not wait on the TUI thread.
     pub fn setCompactionHooks(
         self: *AgentSession,
         hooks: @import("session/compaction_hooks.zig").CompactionHooks,
@@ -1820,53 +1746,23 @@ test "AgentSession: thinking events emitted for thinking content" {
     try testing.expectEqual(@as(usize, 1), thinking_ends);
 }
 
-/// Context passed to extension tool `execute` functions and event handlers.
-///
-/// v1 shape — read-only session access + basic actions. Populated by the
-/// ExtensionRunner when dispatching to a Lua handler (or a builtin tool
-/// with the same signature). `signal` is non-null only inside an active
-/// turn; `ui` is non-null only when the runner was bound with a TUI
-/// context (interactive mode).
-///
-/// Ownership: the context is stack-allocated by the runner per call and
-/// never escapes the handler. All pointers are borrowed.
+/// Per-call extension context; stack-owned, all pointers borrowed.
 pub const ExtensionContext = struct {
-    /// Opaque back-pointer to the owning AgentSession. Handlers that need
-    /// session state go through action methods on the runtime, not this
-    /// pointer — the field exists so action methods can resolve it
-    /// without another parameter.
     session: *anyopaque,
 
-    /// Current working directory for this turn.
     cwd: []const u8,
 
-    /// True when bound in interactive mode. Gates access to `ui`.
     has_ui: bool,
 
-    /// Abort signal for the current in-flight operation, or null when idle.
-    /// Yieldable host functions (zi.spawn, ctx.ui.*) check this to
-    /// short-circuit into a cancelled result instead of blocking.
+    /// Non-null only mid-turn; yieldable host calls must poll it.
     signal: ?*anyopaque = null,
 
-    /// UI primitive bag, non-null only when `has_ui`. Opaque here to
-    /// avoid a cycle between tui/ and extensions/; the real type is
-    /// bound by the runner in interactive mode.
+    /// Opaque to avoid tui/extensions import cycles.
     ui: ?*anyopaque = null,
 };
 
-/// Context passed to slash command handlers (v2). Extends ExtensionContext
-/// with session-control methods that are only safe inside a user-initiated
-/// command — never inside a tool execute() or an event observer, because
-/// those run mid-turn and can't legally fork / switch / reload.
-///
-/// The internal seam exists from v1: ExtensionRuntime.Bound.command_actions
-/// is typed as *anyopaque and stays null until the command registry gains
-/// entries in v2. Reserving the type here means v2 is pure wiring, not a
-/// struct reshuffle.
-///
+/// Command-only context; unsafe for tool/event mid-turn callbacks.
 pub const ExtensionCommandContext = struct {
-    /// Embedded base context — every command context IS an extension
-    /// context with extra capabilities.
     base: ExtensionContext,
 
     wait_for_idle: ?*const fn (ctx: *anyopaque) anyerror!void = null,

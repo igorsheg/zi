@@ -1,25 +1,12 @@
 const std = @import("std");
 const keys_mod = @import("keys.zig");
 
-/// Input sequence buffer — accumulates raw terminal bytes and emits
-/// complete escape sequences. Handles partial sequences that arrive
-/// split across read boundaries.
-///
-/// Sits between Terminal.readInput() and key parsing:
-///   terminal → InputBuffer.feed() → onSequence callback → parseKey
-///
-/// Matches pi-mono's StdinBuffer (packages/tui/src/stdin-buffer.ts).
-///
-/// Escape sequence boundaries are detected by checking the final byte
-/// of CSI/SS3/OSC/DCS/APC sequences per ECMA-48. Incomplete sequences
-/// are held until more data arrives or the timeout fires.
+/// Terminal byte reassembler: split ESC protocols wait or time out.
 pub const InputBuffer = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     allocator: std.mem.Allocator,
-    /// Nanosecond timestamp when incomplete data should be flushed.
-    /// null = no pending incomplete sequence.
+    /// Deadline for lone/partial ESC; null means no pending protocol.
     flush_deadline_ns: ?i128 = null,
-    /// Timeout for incomplete escape sequences (nanoseconds).
     timeout_ns: i128 = 10_000_000,
 
     in_paste: bool = false,
@@ -34,9 +21,6 @@ pub const InputBuffer = struct {
         self.paste_buf.deinit(self.allocator);
     }
 
-    /// Feed raw bytes from terminal. Emits complete sequences via callbacks.
-    /// `on_seq`: called for each complete key sequence (escape seq or single byte)
-    /// `on_paste`: called with paste content (between bracketed paste markers)
     pub fn feed(
         self: *InputBuffer,
         data: []const u8,
@@ -49,7 +33,6 @@ pub const InputBuffer = struct {
         self.drain(on_seq, on_paste, ctx);
     }
 
-    /// Check timeout — call from the event loop to flush incomplete sequences.
     pub fn checkTimeout(
         self: *InputBuffer,
         on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
@@ -130,7 +113,7 @@ pub const InputBuffer = struct {
         }
     }
 
-    /// Flush remaining buffer as raw bytes (on timeout).
+    /// Timeout path: prefer a real Escape over deadlocking on Alt.
     fn flushRaw(
         self: *InputBuffer,
         on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
@@ -156,8 +139,7 @@ pub const InputBuffer = struct {
         }
     }
 
-    /// Check for kitty protocol query response (\x1b[?<digits>u) in the buffer.
-    /// If found, removes it and returns true. Remaining data stays in the buffer.
+    /// Consume kitty negotiation without stealing neighboring input bytes.
     pub fn consumeKittyResponse(self: *InputBuffer) bool {
         const prefix = "\x1b[?";
         const start = std.mem.indexOf(u8, self.buf.items, prefix) orelse return false;
@@ -179,14 +161,11 @@ pub const InputBuffer = struct {
     }
 };
 
-/// Classification result for an escape sequence at the start of a buffer.
 const SeqStatus = union(enum) {
     complete: usize,
     incomplete,
 };
 
-/// Classify an escape sequence starting at data[0] == ESC.
-/// Returns the length if complete, or .incomplete if more bytes needed.
 fn classifyEscapeSequence(data: []const u8) SeqStatus {
     if (data.len < 2) return .incomplete;
 
@@ -211,8 +190,7 @@ fn classifyEscapeSequence(data: []const u8) SeqStatus {
     }
 }
 
-/// Classify a CSI sequence (ESC [ ...).
-/// CSI sequences end with a byte in 0x40-0x7E range (@ through ~).
+/// CSI final bytes are broad; do not wait for semantic recognition.
 fn classifyCsi(data: []const u8) SeqStatus {
     if (data.len < 3) return .incomplete;
 
@@ -234,8 +212,7 @@ fn classifyCsi(data: []const u8) SeqStatus {
     return .incomplete;
 }
 
-/// Classify a string-terminated sequence (OSC, DCS, APC).
-/// Ends with ESC \ (ST) or BEL (0x07, OSC only).
+/// OSC may BEL-terminate; DCS/APC must use ST.
 fn classifyStringTerminated(data: []const u8, start: usize, allow_bel: bool) SeqStatus {
     var i = start;
     while (i < data.len) : (i += 1) {

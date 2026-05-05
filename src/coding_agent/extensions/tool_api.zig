@@ -7,6 +7,7 @@ const tool_def = @import("../tools/definition.zig");
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
 
+/// Lua `zi.register_tool(def)`: first registration for a name wins; duplicates return `false`.
 pub fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);

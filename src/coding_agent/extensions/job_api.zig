@@ -5,6 +5,7 @@ const limits = @import("limits.zig");
 
 const c = lua_runtime.c;
 
+/// Pushes `zi.job` onto the stack; caller owns the field/global assignment.
 pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
     c.lua_createtable(L, 0, 3);
@@ -16,6 +17,7 @@ pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner
     c.lua_setfield(L, -2, "stop");
 }
 
+/// Lua `zi.job.start(opts)`: interactive-only; returns an id table for later write/stop.
 pub fn ziJobStart(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
@@ -40,6 +42,7 @@ pub fn ziJobStart(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// Lua `zi.job.write(id_or_job, data)`: accepts the raw id or the table returned by `start`.
 pub fn ziJobWrite(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
@@ -52,6 +55,7 @@ pub fn ziJobWrite(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// Lua `zi.job.stop(id_or_job)`: accepts the raw id or the table returned by `start`.
 pub fn ziJobStop(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);

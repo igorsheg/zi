@@ -1,35 +1,9 @@
-//! Partial JSON parser — parses possibly-incomplete JSON generated
-//! by LLMs during streaming. Port of promplate/partial-json-parser-js
-//! (the npm `partial-json` package pi-mono uses for tool-argument
-//! streaming), targeting `std.json.Value` as the output type.
-//!
-//! Design notes in zi-wub.N / oracle review:
-//!   - Output is `std.json.Value` so every existing consumer works
-//!     unchanged (cloneJsonValue, freeJsonValue, lua render hooks).
-//!   - `Allow` is a packed-struct bitmask; `toInt`/`fromInt` lock
-//!     wire order for fixture compatibility with pi-mono's numeric
-//!     Allow values.
-//!   - Escape decoding is delegated to `std.json.parseFromSliceLeaky`
-//!     via a synthesized `"..."` slice — correct by construction
-//!     (handles `\uXXXX`, surrogate pairs, all C escapes).
-//!   - Numbers round-trip through `Value.parseFromNumberSlice` to
-//!     match stdlib's .integer / .float / .number_string discipline.
-//!   - Arena lifetime model: caller passes an allocator (typically
-//!     a short-lived scratch arena). Returned Value's nested strings
-//!     / keys / children all live there. No deinit walker.
-//!   - `parseStreaming` mirrors pi-mono's parseStreamingJson:
-//!     strict-first, fall back to partial with Allow.all, swallow
-//!     syntax failures into `{}`. OOM is propagated, not hidden.
-//!   - Recursion depth is capped to protect against adversarial
-//!     nesting; stdlib's dynamic parser uses an explicit stack,
-//!     we use recursion bounded by `max_depth`.
+//! Partial JSON for streamed tool arguments.
+//! Mirrors npm `partial-json`: strict first, then best-effort partial.
 
 const std = @import("std");
 
-/// Bit flags controlling which value kinds may remain partial
-/// without erroring. Matches promplate's `Allow` enum semantics;
-/// bit layout is stable — `toInt` produces values compatible with
-/// pi-mono fixtures captured via the npm package.
+// Bit order matches promplate Allow; fixtures compare numeric masks.
 pub const Allow = packed struct(u8) {
     str: bool = false,
     num: bool = false,
@@ -42,8 +16,6 @@ pub const Allow = packed struct(u8) {
 
     pub const none: Allow = .{};
     pub const all: Allow = @bitCast(@as(u8, 0xff));
-    /// What `parseStreaming` uses internally — matches pi-mono's
-    /// `parseStreamingJson`, which passes `Allow.ALL`.
     pub const streaming: Allow = all;
 
     pub fn fromInt(bits: u8) Allow {
@@ -55,27 +27,15 @@ pub const Allow = packed struct(u8) {
 };
 
 pub const ParseError = error{
-    /// Input was truncated at a position where the current `Allow`
-    /// flags did not permit a partial return.
     Partial,
-    /// Input was syntactically invalid (not merely truncated).
     Malformed,
-    /// Recursion depth exceeded `max_depth`. Guards against
-    /// adversarial deeply-nested JSON blowing the call stack.
     TooDeep,
     OutOfMemory,
 };
 
 const max_depth: u16 = 256;
 
-/// Parse possibly-incomplete JSON with explicit allowance flags.
-/// Returns whatever structure is complete so far; partial kinds
-/// selected by `allow` are completed best-effort.
-///
-/// All nested allocations (object keys, string payloads, child
-/// containers) live in `allocator`. Caller owns the tree — free it
-/// by dropping the arena, or via a structural walker if using a
-/// general-purpose allocator.
+// Returned Value owns children in `allocator`; this parser has no deinit walker.
 pub fn parse(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -94,18 +54,7 @@ pub fn parse(
     return value;
 }
 
-/// Strict-first streaming wrapper. Mirrors pi-mono's
-/// `parseStreamingJson`:
-///
-///   - blank input            → `{}`
-///   - strict parse success   → the value
-///   - strict syntax failure  → retry as partial with `Allow.all`
-///   - partial parse failure  → `{}`
-///   - OutOfMemory anywhere   → propagated
-///
-/// OOM is intentionally NOT hidden behind `{}` — swallowing it
-/// would turn a real allocator failure into bogus tool arguments,
-/// which is strictly worse than failing loud.
+// Do not swallow OOM as `{}`; bogus tool args are worse than failing loud.
 pub fn parseStreaming(
     allocator: std.mem.Allocator,
     src: []const u8,
@@ -178,8 +127,6 @@ const Parser = struct {
         }
     }
 
-    /// Matches a fixed literal or, if truncated and `allow_bit` is
-    /// set, treats a valid prefix as the full literal.
     fn parseLiteral(
         self: *Parser,
         lit: []const u8,
@@ -198,14 +145,7 @@ const Parser = struct {
         return ParseError.Malformed;
     }
 
-    /// Parse a JSON string. Returns an owned slice in `self.arena`.
-    ///
-    /// Strategy: scan the raw source to find either the closing
-    /// quote or the last position where the content forms a valid
-    /// decoded prefix, then synthesize a `"..."` document and
-    /// delegate to `std.json.parseFromSliceLeaky`. This inherits
-    /// stdlib's escape handling (`\uXXXX`, surrogate pairs, all C
-    /// escapes) correctly by construction.
+    // Decode strings via std.json so escapes/surrogates stay stdlib-correct.
     fn parseStr(self: *Parser) ParseError![]const u8 {
         std.debug.assert(self.src[self.index] == '"');
         const body_start = self.index + 1;
@@ -266,8 +206,6 @@ const Parser = struct {
         return decoded;
     }
 
-    /// Decode a raw string body (WITHOUT surrounding quotes) into
-    /// an owned slice via stdlib's string parser.
     fn decodeStringBody(self: *Parser, body: []const u8) ParseError![]const u8 {
         var buf = try self.arena.alloc(u8, body.len + 2);
         buf[0] = '"';
@@ -447,12 +385,6 @@ fn parseHex4(s: []const u8) u32 {
 
 const testing = std.testing;
 
-/// Canonicalize a `std.json.Value` to a byte string for structural
-/// equality comparison. Deterministic regardless of internal map
-/// insertion order — key order is preserved from the source because
-/// `ObjectMap` is an ArrayHashMap, so this also doubles as an
-/// order-sensitive check, which is what we want for LLM streaming
-/// (key-emission order matters).
 fn canonicalize(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();

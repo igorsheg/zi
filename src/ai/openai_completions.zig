@@ -1,56 +1,5 @@
-//! OpenAI chat/completions provider — `POST /chat/completions` with
-//! SSE streaming. Used by openrouter today; future custom OpenAI-
-//! compatible providers can use the same `api = .openai_completions`
-//! tag and reuse this implementation.
-//!
-//! pi-mono source: packages/ai/src/providers/openai-completions.ts (871 LOC)
-//!
-//! ## Phase 3a scope
-//!
-//! Focused port. The full pi-mono provider handles ~10 different
-//! upstream variants (zai, qwen, groq, xai, github-copilot, vercel
-//! gateway, openrouter, etc.) with a `detectCompat` switchboard. zi
-//! only registers openrouter under this api in the phase 3a catalog,
-//! so this file ports:
-//!
-//!   - openrouter compat path (thinking_format = openrouter, nested
-//!     `reasoning: { effort }` field, no `store`, default
-//!     `max_completion_tokens`)
-//!   - openai api-key path with `Authorization: Bearer ...`
-//!   - text + image content for user messages
-//!   - assistant messages with text and tool_calls
-//!   - tool result messages
-//!   - SSE chunk parsing: text deltas, reasoning deltas, tool-call
-//!     deltas with split-arg concatenation, finish_reason mapping,
-//!     usage capture
-//!
-//! Explicitly NOT ported (will land when zi registers a model that
-//! needs them, per the doctrine "DO NOT skip the compat field — but
-//! also DO NOT speculatively implement compat for providers we don't
-//! support"):
-//!
-//!   - zai / qwen / qwen-chat-template thinking formats
-//!   - github-copilot dynamic headers
-//!   - vercel-ai-gateway routing
-//!   - cerebras / xai / chutes / deepseek non-standard quirks
-//!   - cache_control insertion for anthropic-via-openrouter
-//!   - cross-provider tool-call-id normalization (pipe-stripped /
-//!     truncated ids from openai-codex / opencode)
-//!
-//! ## Architecture
-//!
-//! Two layers, threaded together by `streamImpl`:
-//!
-//!   1. `processStream(allocator, reader, model, callback, ctx)` —
-//!      pure SSE event consumer. Takes any `std.io.Reader`, drains
-//!      it, emits `AssistantMessageEvent`s through `callback`. NO
-//!      HTTP code. Tested in isolation against synthetic SSE bytes
-//!      (mirrors pi-mono's `openai-codex-stream.test.ts` pattern).
-//!
-//!   2. `streamImpl(...)` — opens an HTTP request, builds the body
-//!      via `buildRequestJson`, hands the response reader to
-//!      `processStream`. NOT unit-tested; smoke-tested via the
-//!      live openrouter call.
+//! OpenAI chat/completions SSE provider.
+//! OpenRouter quirks live here; do not generalize without a registered model.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -249,12 +198,6 @@ pub const OpenAICompletionsProvider = struct {
     }
 };
 
-/// Drain a Reader of OpenAI chat/completions SSE bytes, emit
-/// `AssistantMessageEvent`s. Pure: no HTTP, no allocator escape, no
-/// global state. Tested in isolation via `std.io.fixedBufferStream`
-/// over hand-built byte sequences. The `reader` parameter is
-/// `anytype` so we can swap in either an `std.http.Response.Reader`
-/// or a fixed buffer reader.
 pub fn processStream(
     allocator: std.mem.Allocator,
     reader: anytype,
@@ -332,20 +275,15 @@ const BlockKind = enum { text, thinking, tool_call };
 
 const ContentBlockState = struct {
     kind: BlockKind,
-    /// For text/thinking: accumulated chars. For tool_call: empty
-    /// (the partial JSON lives in `tool_args_partial`).
     text_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     tool_id: []const u8 = "",
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
-    /// Currently parsed JSON value of `tool_args_partial`. Owned by
-    /// the per-delta scratch arena, NOT by the allocator.
+    // Live parsed args live in scratch; final args are reparsed into the turn arena.
     tool_args_parsed: std.json.Value = .null,
 
-    /// Optional reasoning_details thoughtSignature payload (json
-    /// stringified) attached to a tool call when openrouter sends a
-    /// `reasoning.encrypted` block referring to it.
+    // OpenRouter sends encrypted reasoning as `reasoning_details`; preserve it on tool calls.
     thought_signature: ?[]const u8 = null,
 
     fn deinit(self: *ContentBlockState, allocator: std.mem.Allocator) void {
@@ -357,7 +295,6 @@ const ContentBlockState = struct {
 const StreamState = struct {
     allocator: std.mem.Allocator,
     content_blocks: std.ArrayListUnmanaged(ContentBlockState),
-    /// Index of the currently-streaming block, or null if none.
     current_index: ?usize = null,
     partial: protocol.AssistantMessage,
     response_id: ?[]const u8 = null,
@@ -586,7 +523,6 @@ fn handleToolCallDelta(
     } }, callback_ctx);
 }
 
-/// Open a new content block of `kind`, finalizing any current block.
 fn ensureBlock(
     allocator: std.mem.Allocator,
     state: *StreamState,
@@ -659,12 +595,7 @@ fn finishCurrentBlock(
     state.current_index = null;
 }
 
-/// Rebuild `state.partial.content` to reflect the current set of
-/// blocks. Allocates a fresh slice on every call — pi-mono does the
-/// same effective thing by mutating in place. The slice lifetime is
-/// the caller's allocator (the streaming arena), and we never free
-/// the previous slice; it leaks into the arena and dies on arena
-/// reset. Acceptable for the duration of one stream.
+// Partial-content snapshots leak into the turn arena; reset reclaims them.
 fn updatePartialContent(
     allocator: std.mem.Allocator,
     state: *StreamState,
@@ -820,9 +751,6 @@ fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: std.json.Va
     };
 }
 
-/// Map a pi-ai thinking-level string through an optional provider-specific
-/// effort map. Falls through to the original string when the map is null or
-/// the level has no override. (pi-mono: openai-completions.ts mapReasoningEffort)
 fn mapReasoningEffort(effort: []const u8, map: ?protocol.OpenAICompletionsCompat.ReasoningEffortMap) []const u8 {
     const m = map orelse return effort;
     if (std.mem.eql(u8, effort, "minimal")) return m.minimal orelse effort;
@@ -833,9 +761,6 @@ fn mapReasoningEffort(effort: []const u8, map: ?protocol.OpenAICompletionsCompat
     return effort;
 }
 
-/// Build the JSON request body for chat/completions. Writes into
-/// `out`, which must be empty on entry. Mirrors pi-mono's
-/// `buildParams` + `convertMessages` for the openrouter compat path.
 fn buildRequestJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -894,6 +819,7 @@ fn buildRequestJson(
                     .openai_completions => |compat| {
                         if (compat.thinking_format) |fmt| {
                             if (fmt == .openrouter) {
+                                // OpenRouter wants nested `reasoning.effort`, not `reasoning_effort`.
                                 try jw.objectField("reasoning");
                                 try jw.beginObject();
                                 try jw.objectField("effort");
@@ -914,6 +840,7 @@ fn buildRequestJson(
                     .openai_completions => |compat| {
                         if (compat.thinking_format) |fmt| {
                             if (fmt == .openrouter) {
+                                // Default to `none`; omitting reasoning can enable provider defaults.
                                 try jw.objectField("reasoning");
                                 try jw.beginObject();
                                 try jw.objectField("effort");

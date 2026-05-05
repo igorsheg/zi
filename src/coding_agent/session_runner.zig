@@ -34,8 +34,7 @@ pub const CompactionPolicy = struct {
     keep_recent_tokens: u64 = 20000,
 };
 
-/// Per-call context for a compaction run. Lives only for the duration of
-/// one `runCompaction` invocation — strings are borrows from the caller.
+/// Per-call compaction borrows; executor must not retain them.
 pub const CompactionRunContext = struct {
     custom_instructions: ?[]const u8 = null,
 };
@@ -69,9 +68,7 @@ pub const EventEmitter = struct {
     }
 };
 
-/// Owns retry, overflow, and compaction recovery around a replaceable
-/// AgentSession. Callers pass the current session for each run so the
-/// runner never retains a stale runtime pointer across replacement.
+/// Recovery coordinator; never retain AgentSession across replacement.
 pub const SessionRunner = struct {
     retry_policy: RetryPolicy,
     compaction_policy: CompactionPolicy,
@@ -359,9 +356,7 @@ pub const SessionRunner = struct {
         if (self.lifecycle_hooks.on_retry_end) |cb| cb(event, self.lifecycle_hooks.ctx);
     }
 
-    /// policy. Stale pre-compaction usage is filtered via
-    /// `contextUsageUnknownAfterCompaction` so a fresh post-compaction turn
-    /// never retriggers based on old usage.
+    /// Ignore stale pre-compaction usage after summary writes.
     fn shouldRunThresholdCompaction(self: *SessionRunner, session: *AgentSession) bool {
         if (!self.compaction_policy.enabled) return false;
         if (session.session_store.contextUsageUnknownAfterCompaction(session.allocator)) return false;

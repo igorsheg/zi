@@ -15,11 +15,8 @@ pub const EventHandler = struct {
     }
 };
 
-/// Line-oriented SSE parser following W3C Server-Sent Events spec (§9.2).
-/// Event data is buffered in a retained-capacity growable buffer so large
-/// provider payloads (for example Codex terminal events) don't get silently
-/// truncated. Emitted slices are valid until the next call to feedLine() or
-/// reset().
+// W3C SSE: join data lines with `\n`, strip one trailing newline on emit.
+// Event slices die on the next feedLine/reset; large provider events are bounded below.
 pub const max_event_data_bytes: usize = 1024 * 1024;
 
 pub const SseParser = struct {
@@ -49,8 +46,7 @@ pub const SseParser = struct {
         return self.last_event_id_buf[0..self.last_event_id_len];
     }
 
-    /// Feed a single line (without trailing \n or \r\n).
-    /// Returns SseEvent on event boundary (blank line) if data was present.
+    // Feed one line without LF/CRLF; blank line emits if data was present.
     pub fn feedLine(self: *SseParser, line: []const u8) error{ OutOfMemory, EventDataTooLarge }!?SseEvent {
         if (self.needs_reset and line.len != 0) self.reset();
 
@@ -122,7 +118,7 @@ pub const SseParser = struct {
         return null;
     }
 
-    /// Reset per-event state. Does NOT clear last_event_id or retry_ms.
+    // Keep last_event_id and retry across event resets.
     pub fn reset(self: *SseParser) void {
         self.event_len = 0;
         self.id_len = 0;
@@ -132,8 +128,7 @@ pub const SseParser = struct {
     }
 };
 
-/// Feed a reader into the parser with chunked reads, calling the handler for
-/// each completed event. This avoids per-line reader capacity limits.
+// Chunk the stream; never rely on reader line-size limits.
 pub fn streamEvents(
     allocator: std.mem.Allocator,
     reader: anytype,

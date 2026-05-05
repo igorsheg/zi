@@ -9,9 +9,7 @@ const oauth_mod = @import("oauth.zig");
 
 const log = std.log.scoped(.auth_storage);
 
-/// Credential storage for API keys and OAuth tokens.
-/// Zig port of pi-mono's AuthStorage class.
-/// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:184
+/// Credential store: memory mutex + backend file lock.
 pub const AuthStorage = struct {
     pub const ExtensionOAuthRefreshHook = struct {
         func: *const fn (
@@ -30,33 +28,11 @@ pub const AuthStorage = struct {
     fallback_resolver: ?*const fn (provider: []const u8) ?[]const u8 = null,
     extension_oauth_refresh_hook: ?ExtensionOAuthRefreshHook = null,
     load_error: bool = false,
-    /// In-process mutex protecting `data`, `runtime_overrides`,
-    /// `fallback_resolver`, and `load_error` (zi-wub.27).
-    ///
-    /// AuthStorage is touched from at least three threads in zi:
-    ///   - main/TUI thread: startup hasAuth, model picker filtering
-    ///   - login worker thread: set() after OAuth completes
-    ///   - agent thread: getApiKey() via the get_api_key_hook
-    ///
-    /// The backend has its own cross-process file lock, but the
-    /// in-memory map needed an in-process equivalent — without it,
-    /// login set() racing agent getApiKey() can cause torn reads
-    /// or freed-slice access.
-    ///
-    /// Held through the entire public method including any OAuth
-    /// network exchange in `refreshOAuthLocked` (a few seconds
-    /// worst case). Concurrency cost is acceptable because login
-    /// and refresh are both rare events; the common path is
-    /// uncontended cmpxchg-fast.
-    ///
-    /// Internal helpers (refreshOAuthLocked, installRefreshedCredential,
-    /// persistInsideLock, persistProviderChange) MUST NOT acquire
-    /// the mutex themselves — they run inside an already-locked
-    /// public method. std.Thread.Mutex is non-recursive.
+    /// Guards in-memory creds across TUI/login/agent threads.
+    /// Locked helpers must not relock; std.Io.Mutex is non-recursive.
     mutex: std.Io.Mutex = .init,
     io: std.Io = std.Options.debug_io,
 
-    /// pi-mono source: auth-storage.ts:195-197
     pub fn create(allocator: std.mem.Allocator, auth_path: ?[]const u8) !AuthStorage {
         return createWithIo(allocator, std.Options.debug_io, auth_path);
     }
@@ -79,7 +55,6 @@ pub const AuthStorage = struct {
         return self;
     }
 
-    /// pi-mono source: auth-storage.ts:203-207
     pub fn inMemory(allocator: std.mem.Allocator, initial_data: ?*const types.AuthStorageData) !AuthStorage {
         var backend: file_backend.Backend = .{ .memory = @import("../../storage.zig").MemoryFile.init(allocator) };
 
@@ -116,16 +91,13 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// pi-mono source: auth-storage.ts:247-260
     pub fn reload(self: *AuthStorage) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.reloadLocked();
     }
 
-    /// Mutex-free reload, called from `reload()` (which acquires)
-    /// and from `create`/`inMemory` (which don't need to acquire
-    /// because the storage isn't shared yet).
+    /// Caller holds mutex, or storage is not shared yet.
     fn reloadLocked(self: *AuthStorage) void {
         const content = self.backend.readContent(self.allocator);
         defer if (content) |c| self.allocator.free(c);
@@ -145,22 +117,13 @@ pub const AuthStorage = struct {
         }
     }
 
-    ///
-    /// SLICE LIFETIME: the returned credential's strings are
-    /// borrowed from `self.data` and only valid until the next
-    /// mutation (set/remove/reload/getApiKey-with-refresh). Callers
-    /// that need to hold the value across a critical section MUST
-    /// dupe immediately. The mutex protects this call from racing,
-    /// but the slice itself is not refcounted.
-    ///
-    /// pi-mono source: auth-storage.ts:286-288
+    /// Borrowed slices; dupe before the next mutation/refresh.
     pub fn get(self: *AuthStorage, provider: []const u8) ?types.AuthCredential {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.data.get(provider);
     }
 
-    /// pi-mono source: auth-storage.ts:293-296
     pub fn set(self: *AuthStorage, provider: []const u8, credential: types.AuthCredential) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -179,7 +142,6 @@ pub const AuthStorage = struct {
         self.persistProviderChange(provider, credential);
     }
 
-    /// pi-mono source: auth-storage.ts:301-304
     pub fn remove(self: *AuthStorage, provider: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -191,14 +153,12 @@ pub const AuthStorage = struct {
         self.persistProviderChange(provider, null);
     }
 
-    /// pi-mono source: auth-storage.ts:316-318
     pub fn has(self: *AuthStorage, provider: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.data.get(provider) != null;
     }
 
-    /// pi-mono source: auth-storage.ts:309-311
     pub fn list(self: *AuthStorage, allocator: std.mem.Allocator) ![][]const u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -218,19 +178,11 @@ pub const AuthStorage = struct {
         return keys;
     }
 
-    ///
-    /// CALLER CONTRACT: this returns a borrowed pointer; callers
-    /// must not iterate it while another thread might mutate
-    /// AuthStorage. Used by serializeAuthJson under the in-process
-    /// mutex (e.g. inside set's persist path) and by tests where
-    /// the storage is single-threaded.
-    ///
-    /// pi-mono source: auth-storage.ts:335-337
+    /// Borrowed map; only inspect while mutation is impossible.
     pub fn getAll(self: *const AuthStorage) *const types.AuthStorageData {
         return &self.data;
     }
 
-    /// pi-mono source: auth-storage.ts:213-215
     pub fn setRuntimeApiKey(self: *AuthStorage, provider: []const u8, key: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -247,7 +199,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// pi-mono source: auth-storage.ts:220-222
     pub fn removeRuntimeApiKey(self: *AuthStorage, provider: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -258,7 +209,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// pi-mono source: auth-storage.ts:228-230
     pub fn setFallbackResolver(self: *AuthStorage, resolver: *const fn (provider: []const u8) ?[]const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -271,8 +221,7 @@ pub const AuthStorage = struct {
         self.extension_oauth_refresh_hook = hook;
     }
 
-    /// Does NOT auto-refresh OAuth tokens — just checks availability.
-    /// pi-mono source: auth-storage.ts:324-330
+    /// Availability check only; no OAuth refresh.
     pub fn hasAuth(self: *AuthStorage, provider: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -286,19 +235,7 @@ pub const AuthStorage = struct {
         return false;
     }
 
-    /// Get API key for a provider. 5-tier priority:
-    /// 1. Runtime override (CLI --api-key)
-    /// 2. API key from auth.json (resolved via resolveConfigValue)
-    /// 3. OAuth token from auth.json — auto-refreshed under a backend
-    ///    lock when expired
-    /// 4. Environment variable (via ai.env_api_keys.getEnvApiKey)
-    /// 5. Fallback resolver
-    ///
-    /// Mutates self when an OAuth token is refreshed: the new credential
-    /// is written into both `data` and the on-disk auth.json under the
-    /// existing backend lock. Receiver is non-const for that reason.
-    ///
-    /// pi-mono source: auth-storage.ts:424-485
+    /// May refresh OAuth; returned slice is borrowed from storage.
     pub fn getApiKey(self: *AuthStorage, provider: []const u8) ?[]const u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -324,18 +261,7 @@ pub const AuthStorage = struct {
         return null;
     }
 
-    /// Refresh an expired OAuth token under the backend lock. Returns
-    /// the new access token on success, null on failure (provider
-    /// unknown, network error, lock contention, persist failure).
-    ///
-    /// Race protection mirrors pi-mono auth-storage.ts:369-413: we
-    /// take the lock, reload from disk, and re-check expiry. If a
-    /// peer process refreshed in the lock-acquisition window, we use
-    /// their credential and skip the refresh exchange.
-    ///
-    /// On success the new credential is written to both in-memory
-    /// `data` and the on-disk file BEFORE releasing the lock so the
-    /// next reader sees a consistent view.
+    /// Backend lock spans reload → exchange → write; avoids peer refresh races.
     fn refreshOAuthLocked(self: *AuthStorage, provider: []const u8) ?[]const u8 {
         const oauth_provider = oauth_mod.findProvider(provider) orelse {
             log.warn("oauth refresh requested for unknown provider '{s}'", .{provider});
@@ -413,11 +339,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Install a refreshed OAuth credential into in-memory `data`,
-    /// freeing any previous entry for the same provider. The new
-    /// credential MUST already own its strings via `self.allocator`
-    /// (i.e. came from oauth.refresh_token or was deep-cloned from
-    /// arena memory before calling this).
     fn installRefreshedCredential(
         self: *AuthStorage,
         provider: []const u8,
@@ -437,18 +358,12 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Write the current in-memory `data` to the backend. Caller
-    /// MUST already hold the backend lock — this skips the acquire
-    /// step that `persistProviderChange` does. Used by the refresh
-    /// path which needs the read+exchange+write to be atomic.
+    /// Caller already holds backend lock.
     fn persistInsideLock(self: *AuthStorage, arena_alloc: std.mem.Allocator) !void {
         const json = try json_write.toOwnedSlice(arena_alloc, &self.data, types.writeAuthJson);
         try self.backend.writeContent(json);
     }
 
-    /// Persist a provider change to the backend with locking.
-    /// Reads current file, merges our change, writes back.
-    /// pi-mono source: auth-storage.ts:262-281
     fn persistProviderChange(self: *AuthStorage, provider: []const u8, credential: ?types.AuthCredential) void {
         if (self.load_error) return;
 

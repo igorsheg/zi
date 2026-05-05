@@ -12,6 +12,7 @@ const log = std.log.scoped(.zi_api);
 
 const spawn_pending_events: usize = limits.spawn_pending_events;
 
+/// Lua `zi.spawn(opts)`: `on` callbacks are best-effort and never fail the spawn.
 pub fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
@@ -71,6 +72,7 @@ fn ziSpawnContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) cal
     return 1;
 }
 
+/// Resume helper for tool-call based spawns; normal `zi.spawn` returns synchronously.
 pub fn ziSpawnContinueWrapper(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return ziSpawnContinue(L_opt, c.LUA_YIELD, 0);
 }
@@ -188,6 +190,7 @@ fn readOptionalSpawnString(
     };
 }
 
+/// Lua callback table ref used by spawn event trampolines.
 pub const TrampolineCtx = struct {
     L: *c.lua_State,
     callbacks_ref: c_int,
@@ -341,6 +344,7 @@ fn chargeString(len: usize, budget: *lua_runtime.JsonConvertBudget) !void {
     budget.total_string_bytes += len;
 }
 
+/// Call one `zi.spawn({ on = { [kind] = fn } })` handler; errors are logged and swallowed.
 pub fn eventTrampoline(
     kind: []const u8,
     event: std.json.Value,
@@ -380,6 +384,7 @@ pub fn eventTrampoline(
     c.lua_pop(L, 1);
 }
 
+/// Shape a tool-call resume result like a `zi.spawn` Lua result table.
 pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.AgentToolResult) void {
     c.lua_createtable(L, 0, 11);
 
@@ -456,6 +461,7 @@ pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.Agent
     }
 }
 
+/// Push the public Lua result shape returned by `zi.spawn`.
 pub fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
     c.lua_createtable(L, 0, 11);
 

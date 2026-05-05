@@ -55,6 +55,7 @@ const RegisterProviderError = error{
     OutOfMemory,
 };
 
+/// Lua `zi.register_provider(name, config)`: returns `false` when another owner already claimed the provider.
 pub fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
@@ -119,6 +120,7 @@ pub fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// Lua `zi.unregister_provider(name)`: only removes claims owned by the current extension load source.
 pub fn ziUnregisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);

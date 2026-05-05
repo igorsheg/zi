@@ -169,25 +169,11 @@ const StartupAction = union(enum) {
     },
 };
 
-/// Interactive mode — wires AgentSession (blocking on its thread)
-/// to the TUI (main thread) via thread-safe snapshot and lifecycle queues.
-///
-/// Uses UiEvent (deep-copied) instead of raw AgentEvent to ensure
-/// no borrowed pointers cross the thread boundary.
-///
-/// Composes TUI (reusable rendering/focus/overlay infrastructure)
-/// with domain-specific state (editor, transcript, agent, containers).
+/// Composition root: main-thread TUI + agent-thread runtime queues.
 pub const Interactive = struct {
-    /// TUI-local tracked allocator for widget/component state and other
-    /// heap data that never crosses threads. Use this (or a short-lived
-    /// arena backed by it) for local scratch.
+    /// TUI-thread allocator; do not free mailbox payloads with it.
     allocator: std.mem.Allocator,
-    /// Thread-safe GPA-backed allocator for cross-thread mailbox
-    /// payloads and mailbox backing storage. This is NOT the same as
-    /// `allocator` (which is TUI-local tracked state storage) — it wraps
-    /// the root GPA directly so producer/consumer free paths stay
-    /// allocator-correct.
-    /// See `docs/runtime.md` doctrine R3.
+    /// Cross-thread mailbox allocator; producer/consumer frees must match.
     msg_allocator: std.mem.Allocator,
     io: std.Io,
     tui: TUI,
@@ -196,9 +182,6 @@ pub const Interactive = struct {
     cwd: []const u8 = "",
 
     editor: editor_mod.Editor,
-    /// Active editor interface — routes paste/newline/ctrl+d/clear.
-    /// Defaults to the built-in editor. Extensions can swap via setEditor().
-    /// Initialized in run() after self.editor is set up.
     active_editor: EditorInterface = undefined,
     active_editor_bound: bool = false,
     status_line: StatusLine,
@@ -212,19 +195,12 @@ pub const Interactive = struct {
     conversation_projection: conversation_projection_mod.ProjectionState,
     resolver: ToolRendererResolver,
     status_data: StatusData,
-    /// Agent-thread dedupe cache for semantic status publication.
-    /// Owned storage lives in `msg_allocator` so teardown can free it on
-    /// the TUI thread after all workers are joined.
+    /// Agent-written, TUI-freed; allocate with msg_allocator.
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
 
     last_conversation_publish_ns: u64 = 0,
     conversation_publish_dirty: bool = false,
-    /// Last queued-snapshot version we've published from the agent thread.
-    /// Used by `publishQueuedSnapshotIfChanged` to skip redundant publishes
-    /// when the run-control queue hasn't mutated since our last send. The
-    /// TUI-thread direct publish path does **not** update this field; stale
-    /// deliveries from race conditions are handled downstream by
-    /// `ProjectionState.replaceQueuedSnapshot` version filtering.
+    /// Agent-thread dedupe only; TUI path is version-filtered downstream.
     last_published_queued_version: u64 = 0,
     runtime_host: RuntimeHost,
     loader_active: bool = false,
@@ -262,9 +238,7 @@ pub const Interactive = struct {
 
     auth_storage: *auth_storage_mod.AuthStorage,
     settings_manager: *settings_manager_mod.SettingsManager,
-    /// TUI-owned visible-model snapshot published from the agent
-    /// thread. `/model` UI reads only this slice, never the session
-    /// registry directly. Allocated with `msg_allocator`.
+    /// TUI-owned snapshot; never read agent registry from the TUI thread.
     model_catalog: []ai_protocol.Model = &.{},
     model_picker_flow: ?ModelPickerFlow = null,
     extension_prompt_flow: ?ExtensionPromptFlow = null,
@@ -291,9 +265,7 @@ pub const Interactive = struct {
 
     snapshot_event_queue: UiSnapshotQueue,
     lifecycle_event_queue: UiLifecycleQueue,
-    /// TUI → agent owner inbox. The TUI enqueues `AgentRequest`
-    /// values; the long-lived agent thread wakes, drains, and dispatches
-    /// them on the owner thread.
+    /// TUI → agent owner inbox; close before joining agent thread.
     request_queue: RequestQueue,
     job_manager: job_manager_mod.JobManager,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
@@ -310,10 +282,9 @@ pub const Interactive = struct {
     tool_output_expanded: bool = false,
     hide_thinking_block: bool = false,
     greeter_dismissed: bool = false,
-    /// Input sequence buffer — handles split escape sequences, paste, kitty negotiation.
+    /// Buffers split terminal protocols; ESC timeout drives Alt vs Escape.
     input: input_buffer_mod.InputBuffer,
-    /// Kitty protocol negotiation: deadline (ns timestamp) for query response.
-    /// null = negotiation complete.
+    /// Kitty query deadline; null after negotiation settles.
     kitty_deadline_ns: ?i128 = null,
     mouse_capture: MouseCapture = .none,
 
@@ -482,7 +453,7 @@ pub const Interactive = struct {
         return self.publishLifecycleUiEvent(event);
     }
 
-    /// Main loop — runs on the main thread.
+    /// Main thread owns terminal state and all rendering.
     pub fn run(self: *Interactive) !void {
         try run_setup.prepareTerminal(self);
         run_setup.bindEditor(self);
@@ -913,7 +884,6 @@ pub const Interactive = struct {
         composer_flow.handleFollowUpShortcut(self);
     }
 
-    /// Dispatch a slash command. Returns true if handled (caller should not send to agent).
     pub fn dispatchSlashCommand(self: *Interactive, text: []const u8) bool {
         const parsed = slash_command_mod.parse(text) orelse return false;
         const name = parsed.name;

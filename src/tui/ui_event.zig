@@ -23,8 +23,7 @@ pub const ExtensionKeybindingEntry = struct {
     display: []u8,
 };
 
-/// TUI-owned event type. All cross-thread payloads are deep-copied and
-/// mailbox-owned. Conversation changes cross as authoritative mailbox snapshots.
+/// Mailbox-owned TUI event; no borrowed agent pointers cross threads.
 pub const UiEvent = union(enum) {
     consumed: void,
 
@@ -196,7 +195,7 @@ pub const UiEvent = union(enum) {
         };
     }
 
-    /// Free all owned memory.
+    /// Free with the same allocator that built the mailbox payload.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .consumed => {},

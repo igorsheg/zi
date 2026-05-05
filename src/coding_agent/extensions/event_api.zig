@@ -5,6 +5,7 @@ const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
 
+/// Lua `zi.on(name, handler)`: observer handlers return no value.
 pub fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
@@ -44,6 +45,7 @@ pub fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// Map Lua event names to registry kinds. Unknown names are rejected at registration time.
 pub fn parseEventKind(name: []const u8) ?event_registry.EventKind {
     const Pair = struct { name: []const u8, kind: event_registry.EventKind };
     const table = [_]Pair{

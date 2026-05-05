@@ -1,3 +1,4 @@
+// GENERATED: run `zig build generate-models`; do not edit.
 const protocol = @import("protocol.zig");
 
 pub const models = [_]protocol.Model{
