@@ -105,7 +105,6 @@ pub const AnthropicProvider = struct {
         extra_headers_buf[n_extra] = .{ .name = "anthropic-version", .value = "2023-06-01" };
         n_extra += 1;
 
-        // OAuth tokens (sk-ant-oat*) use Bearer auth + claude-code identity headers.
         const is_oauth = std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
 
         var auth_buf: [4096]u8 = undefined;
@@ -127,8 +126,6 @@ pub const AnthropicProvider = struct {
         } else {
             extra_headers_buf[n_extra] = .{ .name = "x-api-key", .value = api_key };
             n_extra += 1;
-            // Fine-grained tool streaming permits arbitrary partial tool input chunks;
-            // without it Anthropic streams at JSON sub-tree boundaries.
             extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14" };
             n_extra += 1;
         }
@@ -686,7 +683,6 @@ fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u
         }
     }
 
-    // Temperature is incompatible with extended thinking
     if (options.temperature) |temp| {
         if (reasoning == null) {
             try jw.objectField("temperature");
@@ -799,12 +795,6 @@ fn writeMessageJson(jw: *std.json.Stringify, msg: protocol.Message) !void {
                         try jw.objectField("name");
                         try jw.write(tc.name);
                         try jw.objectField("input");
-                        // Anthropic requires `input` to be a JSON object
-                        // (it 400s on null or scalars). Coerce defensively
-                        // here so any future code path that produces null
-                        // arguments can't break the round-trip; the real
-                        // upstream fix is in `parsePartialJson` but this
-                        // is cheap insurance.
                         if (tc.arguments == .null) {
                             try jw.beginObject();
                             try jw.endObject();

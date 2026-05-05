@@ -821,7 +821,6 @@ pub const ExtensionRunner = struct {
         );
         const owner = prev orelse tid;
         if (owner != tid) {
-            // Wrong-thread Lua access corrupts GC; panic in all build modes.
             std.debug.panic(
                 "[zi-wub.7] lua_state touched from wrong thread: this={d} owner={d}",
                 .{ tid, owner },
@@ -1139,7 +1138,7 @@ pub const ExtensionRunner = struct {
         _ = lua_runtime.c.lua_pushlstring(co.L, args.ptr, args.len);
 
         context_mod.pushCommandContext(co.L, self, cmd.source.provenance) catch {
-            lua_runtime.c.lua_pop(co.L, 2); // args + handler
+            lua_runtime.c.lua_pop(co.L, 2);
             return error.ContextPushFailed;
         };
 
@@ -1181,10 +1180,6 @@ pub const ExtensionRunner = struct {
 
     fn submitAsyncStart(self: *ExtensionRunner, start: AsyncStart) !void {
         if (self.async_dispatcher) |dispatcher| {
-            // AsyncDispatcher.submit takes ownership of `start` in both success and
-            // error paths. The interactive dispatcher and test dispatchers clone or
-            // enqueue what they need, then deinit the original request. On failure
-            // we only unwind the suspended coroutine registration here.
             dispatcher.submit(dispatcher.ptr, self, start) catch |err| {
                 if (self.pending_async.fetchRemove(start.id)) |kv| {
                     var pending = kv.value;

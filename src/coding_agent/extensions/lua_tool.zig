@@ -130,9 +130,6 @@ fn execute(
         return errorResult(allocator, "lua state not attached");
     };
 
-    // Single-thread contract: only the agent thread should ever
-    // call into Lua. Panics if violated. See `runner.zig`
-    // `lua_owner_thread` doc for the rationale.
     tctx.runner.assertOnLuaThread();
 
     tctx.runner.current_signal = signal;

@@ -374,9 +374,6 @@ pub const Interactive = struct {
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
         self.applyTranscriptHideThinkingBlock();
-        // NOTE: active_editor is bound in run() where self is at its final
-        // address. Binding it here would capture a pointer to the local `self`
-        // that becomes dangling after the by-value return.
         return self;
     }
 
@@ -395,10 +392,6 @@ pub const Interactive = struct {
         if (self.system_worker) |*worker| worker.worker.stop();
         self.terminal_system_queue.clear();
 
-        // Stop the long-lived agent owner thread. Abort first if a
-        // prompt is mid-flight so the owner loop can reach its next
-        // request boundary, then enqueue an ordered shutdown, close the
-        // transport, and join.
         if (self.agent_thread) |t| {
             if (self.is_streaming) self.runtime_host.abortCurrentRun();
             self.enqueueAgentShutdown();
@@ -456,8 +449,6 @@ pub const Interactive = struct {
         self.job_manager.deinit();
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
-        // Any unexpectedly undrained requests are mailbox-owned here;
-        // deinit cleans them with AgentRequest.deinit.
         self.request_queue.deinit();
         self.composer_below_container.deinit();
         self.editor_container.deinit();
@@ -509,9 +500,6 @@ pub const Interactive = struct {
             try worker.start();
         }
 
-        // Prime the status chips via the agent-owned snapshot path before the
-        // first frame. This keeps model/thinking/context reads off the TUI
-        // thread even during startup.
         self.bootstrapStatusSnapshot();
 
         run_setup.bindAutocomplete(self);

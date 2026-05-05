@@ -210,14 +210,7 @@ const Parser = struct {
         std.debug.assert(self.src[self.index] == '"');
         const body_start = self.index + 1;
         var i = body_start;
-        // `safe_end` = exclusive end of the last prefix of the body
-        // that forms a valid JSON string when re-quoted. Advanced
-        // only after completing a full escape or safe literal byte.
         var safe_end: usize = body_start;
-        // Tracks an orphan high-surrogate `\uD8xx-\uDBxx` awaiting
-        // its low surrogate half. While pending, `safe_end` must
-        // NOT advance past the high surrogate because a re-quote
-        // truncated there would be an unpaired surrogate.
         var pending_high_surrogate: bool = false;
 
         while (i < self.src.len) {
@@ -244,13 +237,9 @@ const Parser = struct {
                         const cp = parseHex4(self.src[i + 2 .. i + 6]);
                         i += 6;
                         if (cp >= 0xD800 and cp <= 0xDBFF) {
-                            // High surrogate — do NOT advance
-                            // safe_end; wait for the low half.
                             pending_high_surrogate = true;
                         } else if (cp >= 0xDC00 and cp <= 0xDFFF) {
                             if (!pending_high_surrogate) {
-                                // Unpaired low surrogate. stdlib
-                                // will reject; surface as Malformed.
                                 return ParseError.Malformed;
                             }
                             pending_high_surrogate = false;
@@ -265,9 +254,6 @@ const Parser = struct {
             }
             if (c < 0x20) return ParseError.Malformed;
             if (pending_high_surrogate) {
-                // High surrogate must be immediately followed by a
-                // `\u` low-surrogate escape; any other byte is an
-                // unpaired high surrogate.
                 return ParseError.Malformed;
             }
             i += 1;
@@ -416,12 +402,6 @@ const Parser = struct {
 
         if (!at_eof or !self.allow.num) return ParseError.Malformed;
 
-        // Partial: progressively trim trailing junk characters
-        // until the remainder is a valid number. Matches the broad
-        // heuristic decision: trim `e`, `E`, `+`, `-`, `.` — these
-        // are the only chars stdlib accepts mid-number that can
-        // also appear truncated. Works for every provider, not just
-        // Anthropic.
         var s = raw;
         while (s.len > 0) {
             const last = s[s.len - 1];
@@ -439,7 +419,6 @@ fn validateNumberSlice(s: []const u8) bool {
     if (s.len == 0) return false;
     if (std.json.Scanner.isNumberFormattedLikeAnInteger(s)) {
         _ = std.fmt.parseInt(i64, s, 10) catch |e| switch (e) {
-            // Overflow still parses (→ .number_string), but InvalidCharacter doesn't.
             error.Overflow => return true,
             error.InvalidCharacter => return false,
         };

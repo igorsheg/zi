@@ -169,7 +169,6 @@ fn combineParagraphLines(lines: []const []const u8, arena: std.mem.Allocator) st
             const prev_trimmed = prev[0..prev_trimmed_len];
             if (endsWithHardBreak(prev)) {
                 if (prev_trimmed.len > 0 and prev_trimmed[prev_trimmed.len - 1] == '\\') {
-                    // previous iteration already emitted the raw text, so trim the backslash now
                     if (out.items.len > 0) out.items.len -= 1;
                 }
                 try out.append(arena, '\n');

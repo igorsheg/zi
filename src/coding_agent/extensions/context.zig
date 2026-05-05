@@ -1940,9 +1940,6 @@ pub fn pushCommandContext(
 ) !void {
     try pushExtensionContext(L, runner, provenance);
 
-    // Fields are explicitly present as nil so extension code that probes
-    // `ctx.new_session` gets "attempt to call a nil value" instead of a
-    // missing-key diagnostic.
     c.lua_pushnil(L);
     c.lua_setfield(L, -2, "wait_for_idle");
     c.lua_pushnil(L);

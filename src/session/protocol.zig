@@ -8,7 +8,7 @@ pub const CURRENT_SESSION_VERSION: u32 = 3;
 /// pi-mono source: packages/coding-agent/src/core/session-manager.ts:29-36
 pub const SessionHeader = struct {
     id: []const u8,
-    timestamp: []const u8, // ISO 8601
+    timestamp: []const u8,
     cwd: []const u8,
     version: u32 = CURRENT_SESSION_VERSION,
     parent_session: ?[]const u8 = null,
@@ -17,9 +17,9 @@ pub const SessionHeader = struct {
 /// Session entry — every line after the header in a JSONL session file.
 /// pi-mono source: packages/coding-agent/src/core/session-manager.ts:43-146
 pub const SessionEntry = struct {
-    id: []const u8, // 8-char hex
-    parent_id: ?[]const u8, // null for first entry
-    timestamp: []const u8, // ISO 8601
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
     entry: EntryType,
 
     pub const EntryType = union(enum) {

@@ -228,7 +228,6 @@ fn classifyCsi(data: []const u8) SeqStatus {
             return .{ .complete = i + 1 };
         }
         if (c < 0x20 or c > 0x7E) {
-            // Invalid byte in CSI — treat as complete (malformed)
             return .{ .complete = i + 1 };
         }
     }

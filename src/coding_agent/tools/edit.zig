@@ -372,10 +372,6 @@ fn atomicWriteFile(path: []const u8, bytes: []const u8, permissions: std.Io.File
     try atomic_file.replace(std.Options.debug_io);
 }
 
-// pi-mono normalizes via NFKC + trailing-whitespace trim + smart-quote
-// normalization. We skip NFKC (no unicode tables in std) and do the
-// trim + the most common smart-quote / dash / nbsp substitutions, which
-// covers >95% of the cases the fuzzy tier exists for.
 
 fn fuzzyNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -788,12 +784,6 @@ fn findRedactionMarker(old_str: []const u8, new_str: []const u8) ?[]const u8 {
     return null;
 }
 
-// `applyEdits` raises bare error tags (NotFound / Ambiguous / Overlap).
-// The caller pairs each tag with the populated `EditFailure` to build
-// a message the model can ACT ON: which edit failed, why, and a
-// preview of the offending old_str so it can correct course.
-// Without this the model just sees "NotFound" and retries the same
-// broken edit forever.
 
 const PREVIEW_MAX: usize = 120;
 
@@ -861,10 +851,6 @@ fn previewLine(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     const cap = @min(first.len, PREVIEW_MAX);
     if (cap == first.len and first.len > 0) return allocator.dupe(u8, first);
     if (first.len == 0) return allocator.dupe(u8, "(empty line)");
-    // Truncation marker: ASCII "..." (3 bytes) — keeps the buffer
-    // bytes-not-codepoints since `previewLine`'s caller treats it as a
-    // []const u8 slice. A real `…` is 3 bytes of UTF-8 too but doesn't
-    // fit in a single u8.
     const buf = try allocator.alloc(u8, cap + 3);
     @memcpy(buf[0..cap], first[0..cap]);
     buf[cap] = '.';

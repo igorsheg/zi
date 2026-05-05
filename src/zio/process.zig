@@ -468,9 +468,6 @@ const Capture = struct {
 
     fn readAll(self: *Capture, io: std.Io, file: std.Io.File, kind: StreamKind, on_chunk: ?ChunkCallback) void {
         defer self.done.store(true, .release);
-        // Fallback path: dedicated threads perform blocking OS pipe reads. This
-        // stays isolated here so higher layers keep using zio.process while the
-        // preferred TaskGroup/std.Io capture path matures across backends.
         var local_buf: [4096]u8 = undefined;
         while (true) {
             const n = std.posix.read(file.handle, &local_buf) catch |err| switch (err) {

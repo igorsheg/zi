@@ -5,10 +5,6 @@ pub var std_options_debug_threaded_io_storage: std.Io.Threaded = .init(std.heap.
 pub const std_options_debug_threaded_io: *std.Io.Threaded = &std_options_debug_threaded_io_storage;
 
 test {
-    // Zig's default test runner logs warnings to stderr, which makes `zig build`
-    // render the test step as a scary warning even when every test passed. Many
-    // zi tests intentionally exercise warning paths, so keep routine test output
-    // quiet while preserving error logs.
     std.testing.log_level = .err;
 
     std.Io.Threaded.global_single_threaded.allocator = std.heap.smp_allocator;

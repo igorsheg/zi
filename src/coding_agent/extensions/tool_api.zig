@@ -155,7 +155,7 @@ fn buildExtensionTool(
 
     _ = c.lua_getfield(L, 1, "execute");
     if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 4); // execute (nil) + on_expanded_changed + render_result + render_call
+        c.lua_pop(L, 4);
         return error.MissingExecute;
     }
     if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
@@ -167,19 +167,19 @@ fn buildExtensionTool(
     const on_expanded_changed_ref: ?c_int = if (has_on_expanded_changed)
         c.luaL_ref(L, c.LUA_REGISTRYINDEX)
     else blk: {
-        c.lua_pop(L, 1); // the nil value we left on stack
+        c.lua_pop(L, 1);
         break :blk null;
     };
     const render_result_ref: ?c_int = if (has_render_result)
         c.luaL_ref(L, c.LUA_REGISTRYINDEX)
     else blk: {
-        c.lua_pop(L, 1); // the nil value we left on stack
+        c.lua_pop(L, 1);
         break :blk null;
     };
     const render_call_ref: ?c_int = if (has_render_call)
         c.luaL_ref(L, c.LUA_REGISTRYINDEX)
     else blk: {
-        c.lua_pop(L, 1); // the nil value we left on stack
+        c.lua_pop(L, 1);
         break :blk null;
     };
 

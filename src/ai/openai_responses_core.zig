@@ -655,10 +655,6 @@ fn handleEvent(
                 defer allocator.free(text);
                 try clearAndSetText(&st.text_buf, allocator, text);
             }
-            // Stringify the entire item as the thinking signature so
-            // multi-turn pairing preserves `encrypted_content` and any
-            // future fields the responses API adds (matches pi-mono's
-            // `JSON.stringify(item)`).
             st.thinking_signature = stringifyJsonValue(allocator, item) catch null;
             try updatePartialContent(allocator, state);
             callback(.{ .thinking_end = .{
@@ -933,7 +929,6 @@ fn parseUsage(usage: std.json.Value, partial: *protocol.AssistantMessage) void {
     if (usage.object.get("input_tokens_details")) |d| if (d == .object) {
         if (d.object.get("cached_tokens")) |c| cache_read = jsonU64(c);
     };
-    // pi-mono: OpenAI counts cached tokens inside input_tokens, so subtract.
     const non_cached_input = if (input > cache_read) input - cache_read else 0;
     partial.usage.input = non_cached_input;
     partial.usage.output = output;
@@ -1345,11 +1340,6 @@ fn writeAssistantMessage(
 ) !void {
     for (a.content) |b| switch (b) {
         .thinking => |th| {
-            // pi-mono: if `thinking_signature` carries the original
-            // ResponseReasoningItem JSON, write it back verbatim so the
-            // responses API re-pairs subsequent function_calls against the
-            // same rs_xxx reasoning item. Without a signature there's no
-            // way to reconstruct the item — skip, matching pi-mono.
             if (th.thinking_signature) |sig| {
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, sig, .{}) catch continue;
                 defer parsed.deinit();
@@ -1357,10 +1347,6 @@ fn writeAssistantMessage(
             }
         },
         .text => |tc| {
-            // Derive id + phase from text_signature (TextSignatureV1 JSON),
-            // falling back to `msg_<index>` when absent. pi-mono parity:
-            // responses API requires a stable id on assistant messages and
-            // codex follow-ups expect the phase to round-trip too.
             var msg_id: []const u8 = "";
             var msg_id_alloc: ?[]const u8 = null;
             var msg_phase: ?[]const u8 = null;

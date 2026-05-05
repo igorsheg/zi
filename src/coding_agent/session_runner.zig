@@ -113,10 +113,6 @@ pub const SessionRunner = struct {
         emitter: EventEmitter,
         content: ai.protocol.UserMessage.UserMessageContent,
     ) !RunOutcome {
-        // pi-mono sendPrompt() → _checkCompaction(lastAssistant, false):
-        // a pre-prompt policy check catches oversized contexts that were
-        // left in place by aborted or failed turns. Labeled .threshold to
-        // match pi-mono's observable contract.
         if (self.shouldRunThresholdCompaction(session)) {
             _ = self.runCompaction(session, emitter, .threshold, false, .{}) catch {};
         }
@@ -215,9 +211,6 @@ pub const SessionRunner = struct {
                         .attempt = self.retry_attempt,
                     });
                 }
-                // threshold policy. No retry — distinct from bounded
-                // overflow recovery. Gated so a fresh post-compaction
-                // turn does not retrigger.
                 if (outcome == .success and self.shouldRunThresholdCompaction(session)) {
                     _ = self.runCompaction(session, emitter, .threshold, false, .{}) catch {};
                 }
@@ -263,13 +256,6 @@ pub const SessionRunner = struct {
                     self.overflow_recovery_attempted = true;
                     pruneTransientAssistantError(session);
                     _ = self.runCompaction(session, emitter, .overflow, true, .{}) catch return outcome;
-                    // pi-mono's _runAutoCompaction(willRetry=true) prunes the
-                    // retained overflow assistant after rebuilding context from
-                    // the session file (agent-session.ts:1977-1982). The first
-                    // prune above only affects in-memory agent state; the
-                    // persisted error can be kept by compaction and reappear via
-                    // setMessages(), which makes continueTurn() report
-                    // NeedsPrompt instead of retrying.
                     pruneTransientAssistantError(session);
                     mode = .continue_turn;
                 },
@@ -354,9 +340,6 @@ pub const SessionRunner = struct {
         const last = messages[messages.len - 1];
         if (last != .assistant) return;
         if (last.assistant.stop_reason != .@"error") return;
-        // Only clear the error flag if we actually removed the message
-        // — otherwise the error-bearing message stays committed while
-        // the flag says "no error," which is a control-flow lie.
         session.agent.truncateCommitted(messages.len - 1) catch return;
         session.agent.clearError();
     }

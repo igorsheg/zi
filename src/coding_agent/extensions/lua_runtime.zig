@@ -43,7 +43,7 @@ const header_alignment: std.mem.Alignment = .fromByteUnits(header_align);
 
 const BlockHeader = extern struct {
     size: usize,
-    _pad: usize = 0, // keep payload aligned to header_align
+    _pad: usize = 0,
 };
 
 /// Userdata passed to `lua_newstate`. We need a stable pointer to the
@@ -66,10 +66,6 @@ fn luaAlloc(
         const user_ptr: [*]u8 = @ptrCast(ptr.?);
         const header_ptr: *BlockHeader = @ptrCast(@alignCast(user_ptr - @sizeOf(BlockHeader)));
         break :blk header_ptr.size;
-        // `osize` carries a type tag when ptr is NULL, so we ignore
-        // it on the alloc path. When ptr != NULL the Lua manual says
-        // osize equals the previously requested user size — we trust the
-        // header instead, which avoids any drift.
     } else 0;
     _ = osize;
 
@@ -442,7 +438,7 @@ fn luaTableToJsonLimited(
             c.lua_pop(L, 2);
             return err;
         };
-        c.lua_pop(L, 1); // pop value, keep key for lua_next
+        c.lua_pop(L, 1);
     }
 
     return .{ .object = obj };
@@ -643,9 +639,6 @@ fn luaTableToJson(
 
     c.lua_pushnil(L);
     while (c.lua_next(L, table_idx) != 0) {
-        // Stringify the key without coercing it on the actual stack
-        // (lua_tostring on a non-string key would mutate it and break
-        // lua_next's invariant). Use a sidecar push.
         var key_buf: [64]u8 = undefined;
         const key_str: []const u8 = switch (c.lua_type(L, -2)) {
             c.LUA_TSTRING => blk: {
@@ -670,7 +663,7 @@ fn luaTableToJson(
         const value = try luaValueToJson(L, -1, allocator);
         try obj.put(allocator, key_dup, value);
 
-        c.lua_pop(L, 1); // pop value, keep key for next iteration
+        c.lua_pop(L, 1);
     }
 
     return .{ .object = obj };
@@ -708,9 +701,6 @@ pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
         .integer => |i| c.lua_pushinteger(L, i),
         .float => |f| c.lua_pushnumber(L, f),
         .number_string => |s| {
-            // JSON's "number_string" only appears for numbers that
-            // overflow i64. Pass them through as Lua strings; the
-            // handler can re-parse if it cares.
             _ = c.lua_pushlstring(L, s.ptr, s.len);
         },
         .string => |s| {
@@ -728,10 +718,6 @@ pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
             var it = obj.iterator();
             while (it.next()) |kv| {
                 try pushJsonValue(L, kv.value_ptr.*);
-                // lua_setfield needs a null-terminated key. Object
-                // keys come from `luaValueToJson`'s allocator (or
-                // a JSON parse) and aren't guaranteed sentinel-
-                // terminated, so we use lua_pushlstring + lua_settable.
                 _ = c.lua_pushlstring(L, kv.key_ptr.*.ptr, kv.key_ptr.*.len);
                 c.lua_insert(L, -2);
                 c.lua_settable(L, -3);
@@ -778,8 +764,6 @@ pub const Coroutine = struct {
     /// shared global_State, so any thread works).
     pub fn initFrom(parent: *LuaState, from_L: *c.lua_State) LuaError!Coroutine {
         const L = c.lua_newthread(from_L) orelse return error.OutOfMemory;
-        // The new thread sits on top of `from_L`'s stack. Pop it into
-        // the registry so it stays alive across `resume` calls.
         const ref = c.luaL_ref(from_L, c.LUA_REGISTRYINDEX);
         if (ref == c.LUA_REFNIL or ref == c.LUA_NOREF) return error.InvalidCoroutineState;
         return .{ .parent = parent, .ref = ref, .L = L };

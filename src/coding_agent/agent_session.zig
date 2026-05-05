@@ -416,11 +416,6 @@ pub const AgentSession = struct {
     }
 
     pub fn deinit(self: *AgentSession) void {
-        // zi-wub.28: in interactive mode the lifecycle teardown may
-        // already have run on the agent thread via
-        // shutdownLifecycleOnAgentThread() — the helpers are
-        // idempotent, so direct/non-interactive callers still use the
-        // same path here on whatever thread owns lua.
         self.deactivateLifecycle();
         self.destroyExtensionRuntime();
         self.pending_extension_ui.deinit();
@@ -441,9 +436,6 @@ pub const AgentSession = struct {
             self.allocator.destroy(ctx);
             self._builtin_ctx = null;
         }
-        // Provider bundle goes last — the agent's stream closure may
-        // still hold references into the registry until agent.deinit
-        // returns. Destroying earlier is a use-after-free risk.
         if (self._owned_provider_bundle) |bundle| {
             bundle.deinit();
             self._owned_provider_bundle = null;

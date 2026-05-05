@@ -349,15 +349,6 @@ const ContentBlockState = struct {
     thought_signature: ?[]const u8 = null,
 
     fn deinit(self: *ContentBlockState, allocator: std.mem.Allocator) void {
-        // Lifetime contract (mirrors anthropic.zig): only the
-        // growable buffers (`text_buf`, `tool_args_partial`) get
-        // explicit frees because they're ArrayLists that manage
-        // their own capacity. `tool_id`, `tool_name`, and
-        // `thought_signature` are duped INTO the turn arena; they
-        // are BORROWED by the emitted `toolcall_end` event and
-        // must survive until the agent loop drops its reference,
-        // which outlives this deinit. Turn-arena reset at end of
-        // the agent call reclaims them.
         self.text_buf.deinit(allocator);
         self.tool_args_partial.deinit(allocator);
     }
@@ -744,9 +735,6 @@ fn parseUsage(usage: std.json.Value, partial: *protocol.AssistantMessage) void {
             if (d.object.get("reasoning_tokens")) |r| reasoning = jsonU64(r);
         }
     }
-    // pi-mono parity: cached tokens are subtracted from prompt
-    // because OpenAI counts them in both buckets, and reasoning
-    // tokens are added to output because some providers don't.
     const non_cached_input = if (input > cache_read) input - cache_read else 0;
     const total_output = output + reasoning;
     partial.usage.input = non_cached_input;

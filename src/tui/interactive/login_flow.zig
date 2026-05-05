@@ -197,8 +197,6 @@ fn threadFn(ctx: *Context) void {
     }
 }
 
-// These run on the login thread. They must not touch TUI-owned state directly;
-// publish UI events for the TUI thread to consume instead.
 fn onAuth(url: []const u8, ctx: ?*anyopaque) void {
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
 

@@ -248,9 +248,7 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
         }
     }
 
-    // kitty CSI u format: \x1b[<codepoint>u or \x1b[<codepoint>;<modifier>u
     if (terminator == 'u' and kitty_active) {
-        // Filter release events (event type 3, encoded as :<event> after modifier)
         if (param_count > 1) {
             const event_type = extractEventType(params_slice);
             if (event_type == 3) return null;
@@ -258,8 +256,6 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
         return parseKittyU(params[0], if (param_count > 1) params[1] else 0, seq_len);
     }
 
-    // xterm modifyOtherKeys: \x1b[27;<modifier>;<keycode>~
-    // Sent when modifyOtherKeys mode 2 is active and kitty protocol is not.
     if (terminator == '~' and param_count >= 3 and params[0] == 27) {
         const mods = decodeModifier(params[1]);
         const keycode = params[2];
@@ -354,7 +350,6 @@ fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
         9 => .{ .code = .tab, .ch = null },
         13 => .{ .code = .enter, .ch = null },
         127 => .{ .code = .backspace, .ch = null },
-        // Kitty functional codepoints (Private Use Area)
         57399...57408 => .{ .code = .char, .ch = @as(u21, codepoint - 57399) + '0' },
         57409 => .{ .code = .char, .ch = '.' },
         57410 => .{ .code = .char, .ch = '/' },
@@ -407,7 +402,7 @@ fn extractEventType(params_slice: []const u8) u8 {
 fn parseNum(s: []const u8) u16 {
     var result: u16 = 0;
     for (s) |c| {
-        if (c == ':') break; // ignore colon sub-parameters (kitty event type)
+        if (c == ':') break;
         if (c < '0' or c > '9') return 0;
         result = result *| 10 +| (c - '0');
     }

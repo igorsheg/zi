@@ -122,7 +122,6 @@ fn execute(
         else => 2,
     };
     const stdout = completed.stdout;
-    // rg exits 1 on no matches, 0 on matches, 2+ on error.
     if (exited_code != 0 and exited_code != 1) {
         return util.errorf(allocator, "ripgrep exited with code {d}", .{exited_code});
     }

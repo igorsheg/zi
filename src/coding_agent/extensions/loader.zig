@@ -21,8 +21,8 @@ pub const StaticExtensionRoot = resource_types.StaticExtensionRoot;
 
 /// Discovered extension descriptor. Strings owned by the allocator passed to discover().
 pub const LoadedExtension = struct {
-    id: []const u8, // basename without .lua, or dir name for init.lua
-    path: []const u8, // absolute path to the .lua file to load
+    id: []const u8,
+    path: []const u8,
     source: ExtensionSource,
     provenance: resource_types.ExtensionProvenance,
 };
@@ -185,7 +185,7 @@ fn scanDirectory(
     seen: *SeenIds,
 ) !void {
     var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return, // graceful: missing dir = no extensions
+        error.FileNotFound => return,
         else => {
             log.warn("failed to open extension dir {s}: {s}", .{ dir_path, @errorName(err) });
             return;
@@ -255,17 +255,6 @@ fn addExtension(
     });
 }
 
-// v1 model matches the spec: an extension chunk returns a factory
-// function and the host calls `factory(zi)` against the shared Lua
-// state. Extensions are NOT sandboxed — they share one state — but
-// registrations are attributed to the extension currently being loaded
-// via the runner's temporary load context.
-//
-// Ordering matches `discover` output: explicit → user → project. The
-// tool/command registries are first-registered-wins, so a user override
-// of a project tool arrives at registration BEFORE the project version
-// and silently drops it. Event handlers are additive and run in
-// registration order.
 
 pub const LoadStats = struct {
     attempted: u32 = 0,

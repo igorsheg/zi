@@ -198,7 +198,6 @@ fn processLine(line: []const u8, result: *types.SpawnResult, config: types.Spawn
         else => return,
     };
 
-    // `parsed.value` is only valid for this call; callback must copy retained data.
     if (config.on_event) |cb| {
         cb(type_str, parsed.value, config.on_event_ctx);
     }

@@ -11,7 +11,6 @@ fn signalCleanupHandler(_: std.posix.SIG) callconv(.c) void {
     if (global_terminal) |t| {
         t.emergencyRestore();
     }
-    // Re-raise with default handler to get correct exit code
     const default_act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.DFL },
         .mask = posix.sigemptyset(),

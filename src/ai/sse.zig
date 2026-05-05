@@ -60,7 +60,6 @@ pub const SseParser = struct {
                 return null;
             }
 
-            // Strip trailing \n from multi-line data join (W3C §9.2.6)
             var dlen = self.data_buf.items.len;
             if (dlen > 0 and self.data_buf.items[dlen - 1] == '\n') {
                 dlen -= 1;
@@ -108,7 +107,6 @@ pub const SseParser = struct {
             @memcpy(self.event_buf[0..len], value[0..len]);
             self.event_len = len;
         } else if (std.mem.eql(u8, field, "id")) {
-            // W3C: if value contains U+0000, ignore the field
             if (std.mem.indexOfScalar(u8, value, 0) == null) {
                 const len = @min(value.len, self.id_buf.len);
                 @memcpy(self.id_buf[0..len], value[0..len]);
@@ -118,7 +116,7 @@ pub const SseParser = struct {
         } else if (std.mem.eql(u8, field, "retry")) {
             if (std.fmt.parseUnsigned(u64, value, 10)) |ms| {
                 self.retry_ms = ms;
-            } else |_| {} // W3C: ignore malformed retry values
+            } else |_| {}
         }
 
         return null;
@@ -169,14 +167,6 @@ pub fn streamEvents(
             progressed = true;
         }
 
-        // The std.Io.Reader VTable contract permits `stream` to store bytes in
-        // the reader's own buffer (modifying seek/end) instead of — or in
-        // addition to — writing to `w`. When we pass a `.fixed` writer we
-        // never see those bytes, so we must consume them directly. Without
-        // this drain, readers that ever take that branch (e.g., std.crypto.tls
-        // under certain record boundaries, see ziglang/zig#25428) turn this
-        // loop into a 99% CPU spin because `stream` keeps returning 0 while
-        // bytes pile up in the reader's buffer.
         if (try drainReaderBufferInto(reader, &pending, allocator)) progressed = true;
 
         if (!progressed) continue;

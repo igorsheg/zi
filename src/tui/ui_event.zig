@@ -42,9 +42,6 @@ pub const UiEvent = union(enum) {
         tool_name: []u8,
     },
 
-    // zi-wub.17: login thread publishes progress/auth-url through the
-    // event queue instead of mutating status_text directly. Single-owner
-    // invariant restored for status_text — only the TUI thread writes.
     login_progress: struct {
         message: []u8,
         kind: enum { info, auth_url },
@@ -79,15 +76,8 @@ pub const UiEvent = union(enum) {
         internal_error: ?[]u8 = null,
     },
 
-    // Emitted by the long-lived agent owner thread after it finishes a
-    // non-prompt AgentRequest drain. Separate from `prompt_worker_finished`
-    // so the TUI can unwind request-mode loaders without stomping on
-    // status_text or focus that the individual request handlers already set.
     request_worker_finished: void,
 
-    // Banner-only outcome. Transcript state now crosses separately via
-    // `conversation_state` so resume no longer ships raw AgentMessage[]
-    // through this event.
     session_resumed: struct {
         restore_warning: ?[]u8 = null,
     },
@@ -141,11 +131,6 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    // Agent-thread owned model/thinking/context snapshot for the editor
-    // border chips. Published whenever session state changes in a way the
-    // TUI must render without reading agent-owned state directly.
-    // Semantic state crosses the boundary; chip formatting/layout stays
-    // TUI-owned rather than becoming part of the mailbox payload.
     status_snapshot: struct {
         model_provider: []u8,
         model_id: []u8,
@@ -154,9 +139,6 @@ pub const UiEvent = union(enum) {
         context_window: u64,
     },
 
-    // Published by the agent thread after processing a set_model
-    // AgentRequest. Success is banner-only; semantic model state is
-    // carried by the adjacent status_snapshot publication.
     model_switched: struct {
         model_id: []u8,
     },
@@ -164,8 +146,6 @@ pub const UiEvent = union(enum) {
         message: []u8,
     },
 
-    // Success is banner-only; semantic thinking state is carried by
-    // the adjacent status_snapshot publication.
     thinking_level_changed: struct {
         level: []u8,
     },

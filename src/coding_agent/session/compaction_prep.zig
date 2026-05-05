@@ -173,10 +173,6 @@ fn isTurnStartEntry(entry: SessionEntry) bool {
 }
 
 fn isUserRoleCut(entry: SessionEntry) bool {
-    // pi-mono parity: split-turn detection treats only an actual user
-    // message as a clean boundary. branch_summary/custom_message can start
-    // a turn when searching backwards, but a cut that lands on one is still
-    // reported as split-turn metadata.
     return switch (entry.entry) {
         .message => |m| m.message == .user,
         else => false,

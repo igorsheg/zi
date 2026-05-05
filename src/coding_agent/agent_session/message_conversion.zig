@@ -4,9 +4,6 @@ const agent_mod = @import("../../agent/root.zig");
 
 const protocol = agent_mod.protocol;
 
-// The base agent's defaultConvertToLlm silently drops compaction_summary,
-// branch_summary, and custom. The coding agent's version converts them to
-// user messages with the proper prefix/suffix wrapping.
 const COMPACTION_SUMMARY_PREFIX =
     "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";

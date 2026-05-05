@@ -142,11 +142,6 @@ pub const EventRegistry = struct {
     }
 
     pub fn deinit(self: *EventRegistry) void {
-        // The lua_ref values are NOT released here — that's the
-        // runner's job during its own deinit, after `lua_close`
-        // (closing the state collects all refs at once, so unref'ing
-        // individually would be redundant work). The registry only
-        // owns the slot storage.
         for (&self.chains) |*chain| {
             chain.deinit(self.allocator);
         }

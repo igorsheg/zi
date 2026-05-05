@@ -153,37 +153,6 @@ fn pushStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void
     c.lua_setfield(L, -2, field.ptr);
 }
 
-// `zi.spawn(opts)` runs a child `zi` process in `--mode json -p` and
-// blocks until it exits. Per-event observer callbacks fire
-// synchronously inside the parent's stdout read loop. The result is
-// a Lua table; see `pushSpawnResult` for the shape.
-//
-// Lifetime / safety notes:
-//
-//   1. All temp strings (task, model, tools, system_append, cwd) live
-//      in a function-scoped arena that resets on return. NOT the
-//      runner's hook arena (which never resets within a generation).
-//
-//   2. The `on` table is captured as a SINGLE Lua registry ref over
-//      the whole table — not one ref per callback. This collapses
-//      cleanup to one `luaL_unref` call site and means a partial
-//      validation failure can't leak refs. Validation walks the
-//      table BEFORE the ref is taken.
-//
-//   3. Abort: forwarded via `runner.current_signal`, set by
-//      `lua_tool.execute` when this spawn happens inside a Lua tool
-//      handler. If `current_signal` is null (e.g. spawn from an
-//      event handler), the child runs uninterruptible. ziSpawn
-//      runs a watchdog thread that shuts down the child's stdout
-//      and SIGKILLs it within ~100ms of the signal firing, so even
-//      a silent child responds promptly.
-//
-//   4. The trampoline pcalls observer callbacks on the same `lua_State`
-//      the C function was invoked on (typically a coroutine `co.L`).
-//      Observer callbacks MUST NOT yield: `lua_pcallk` does not
-//      survive a yield across the C boundary. If a future variant
-//      needs yieldable callbacks, it has to spawn a fresh Coroutine
-//      and use `resumeWith`.
 
 pub const TrampolineCtx = spawn_api.TrampolineCtx;
 pub const eventTrampoline = spawn_api.eventTrampoline;

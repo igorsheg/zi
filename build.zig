@@ -30,13 +30,6 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addOptions("build_options", build_options);
 
-    // We compile every .c file in src/ EXCEPT `lua.c` and `luac.c`,
-    // which contain `main()` for the standalone interpreter and
-    // bytecode compiler respectively.
-    // LUA_USE_POSIX enables POSIX-specific features (popen, tmpfile,
-    // etc.); LUA_USE_DLOPEN enables `require` of C shared libs at
-    // runtime on Linux/macOS. Both match upstream Makefile defaults
-    // for the `posix` / `macosx` targets.
     const lua_dep = b.dependency("lua", .{});
     const lua_lib = b.addLibrary(.{
         .name = "lua",

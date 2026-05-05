@@ -136,12 +136,12 @@ pub fn dispatchCancellable(
             .ok, .finished => {},
         }
 
-        if (r.nresults == 0) continue; // nil-equivalent → no opinion
+        if (r.nresults == 0) continue;
 
         const top = c.lua_gettop(co.L);
-        defer c.lua_settop(co.L, top - r.nresults); // pop results
+        defer c.lua_settop(co.L, top - r.nresults);
 
-        const top_idx = top; // last result is at top
+        const top_idx = top;
         if (c.lua_type(co.L, top_idx) == c.LUA_TNIL) continue;
         if (c.lua_type(co.L, top_idx) != c.LUA_TTABLE) continue;
 
@@ -408,7 +408,7 @@ test "dispatchObserver runs handlers in order and continues after errors" {
 
     try dispatchObserver(&state, &runner, .message_end, -1);
 
-    c.lua_pop(state.L, 1); // pop the payload
+    c.lua_pop(state.L, 1);
 
     try state.doString(
         \\assert(#_test_counters == 2, "expected 2 entries, got " .. #_test_counters)
@@ -567,7 +567,7 @@ test "dispatchTransformable feeds each handler's return into the next" {
     var result = try dispatchTransformable(&state, &runner, .tool_result, -1, testing.allocator);
     defer lua_runtime.freeJsonValue(testing.allocator, result);
 
-    c.lua_pop(state.L, 1); // pop the (now-replaced) payload slot
+    c.lua_pop(state.L, 1);
 
     try testing.expect(result == .object);
     const counter = result.object.get("counter").?;

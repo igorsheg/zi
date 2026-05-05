@@ -123,11 +123,6 @@ fn execute(
 
     const preparation = (try prep.prepareCompaction(allocator, path, settings)) orelse return error.NothingToCompact;
 
-    // Extension seam: session_before_compact may proceed, cancel, or
-    // provide an alternate compaction result. Canceling propagates as
-    // error.CompactionCancelled. Providing still flows through the
-    // canonical persistence path below so resumed sessions treat the
-    // artifact uniformly (from_hook = true).
     const hook_reason: hooks_mod.BeforeCompactPayload.Reason = switch (reason) {
         .manual => .manual,
         .threshold => .threshold,

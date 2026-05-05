@@ -124,7 +124,6 @@ const Parser = struct {
             _ = self.consumeLine();
         }
 
-        // Unclosed code block - treat rest as content
         return .{ .code_block = .{ .language = language, .content = self.source[start..] } };
     }
 

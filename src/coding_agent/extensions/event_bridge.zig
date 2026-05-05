@@ -802,18 +802,6 @@ fn pushMessageRoleField(L: *c.lua_State, message: agent_protocol.AgentMessage) v
     c.lua_setfield(L, -2, "role");
 }
 
-// These two adapters plug into the agent's `BeforeToolCallHook` and
-// `AfterToolCallHook` slots. Unlike the observer path, they have a
-// return value that the agent loop consumes — block decisions, arg
-// replacements, content rewrites — so the dispatch primitive used
-// MUST match the event's semantics() (cancellable for tool_call,
-// transformable for tool_result).
-//
-// Ownership: any memory the loop must hold past the hook return
-// (replacement args, replacement content, block reasons) is allocated
-// from the runner's hook arena. That arena lives for the runner's
-// generation; v1 leaks within a session and resets at session end.
-// See `extensions/runner.zig` § hook_arena field doc.
 
 /// Adapter matching `agent_protocol.BeforeToolCallHook.func`. Routes
 /// the agent's `tool_call` event through the cancellable dispatch
@@ -858,9 +846,6 @@ fn beforeToolCallImpl(
     const cancel = try dispatch.dispatchCancellable(state, runner, .tool_call, -1, hook_alloc);
 
     if (cancel.blocked) {
-        // Reason already lives in hook_arena (dispatchCancellable
-        // allocated it via hook_alloc). Don't deinit — we hand the
-        // pointer to the loop and the arena owns its lifetime.
         return .{ .block = true, .reason = cancel.reason, .args = null };
     }
 

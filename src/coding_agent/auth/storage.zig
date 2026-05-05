@@ -139,10 +139,6 @@ pub const AuthStorage = struct {
             self.data = new_data;
             self.load_error = false;
         } else {
-            // No content — could be missing file (ok) or read error.
-            // pi-mono treats missing file as empty data, errors set loadError.
-            // Our backend returns null for both — keep existing data on first load,
-            // reset on explicit reload.
             types.deinitAuthStorageData(&self.data);
             self.data = types.AuthStorageData.init(self.allocator);
             self.load_error = false;
@@ -175,14 +171,6 @@ pub const AuthStorage = struct {
             return;
         };
 
-        // On collision, std.HashMap.fetchPut KEEPS the existing key
-        // and only replaces the value (verified against zig stdlib
-        // hash_map.zig:902-912 + 1099-1104). The map never adopts
-        // `key_duped` when found_existing == true, so we MUST free
-        // the fresh dup, NOT `old.key` — freeing old.key would
-        // dangle the live key still in the map and the next
-        // serialize would write whatever the GPA filled the freed
-        // bytes with (0xAA in Debug). zi-m7q.
         if (self.data.fetchPut(key_duped, cred_duped) catch null) |old| {
             freeCredential(self.allocator, old.value);
             self.allocator.free(key_duped);
@@ -253,8 +241,6 @@ pub const AuthStorage = struct {
             return;
         };
 
-        // See zi-m7q note in `set()` — fetchPut keeps the existing
-        // key on collision; we MUST free the fresh dup, not old.key.
         if (self.runtime_overrides.fetchPut(key_duped, val_duped) catch null) |old| {
             self.allocator.free(key_duped);
             self.allocator.free(old.value);
@@ -321,18 +307,9 @@ pub const AuthStorage = struct {
             switch (cred) {
                 .api_key => |ak| return resolve_config_value.resolveConfigValue(ak.key),
                 .oauth => |oa| {
-                    // Fast path: token still valid. The 5-minute safety
-                    // buffer is baked into `expires` at refresh time
-                    // (oauth.zig: now + expires_in*1000 - 5*60*1000), so
-                    // any expired check here doesn't need its own slack.
                     const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
                     if (now_ms < oa.expires) return oa.access;
 
-                    // Slow path: refresh under lock. On failure, fall
-                    // through and let the rest of the priority chain
-                    // try (env var, fallback resolver) — the user can
-                    // /login to re-authenticate without losing the
-                    // stale credential, which is preserved on disk.
                     if (self.refreshOAuthLocked(provider)) |refreshed| {
                         return refreshed;
                     }
@@ -372,9 +349,6 @@ pub const AuthStorage = struct {
         }
         defer self.backend.releaseLock();
 
-        // Re-read from disk inside the lock — another process may
-        // have refreshed for us already. We use a scratch arena for
-        // the parsed file so we don't leak when discarding it.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
@@ -385,9 +359,6 @@ pub const AuthStorage = struct {
         else
             null;
 
-        // Pick the credential to base the refresh on: prefer the
-        // re-read disk copy (most recent), fall back to the in-memory
-        // copy if the file is missing or corrupt.
         var base_cred: types.OAuthCredential = undefined;
         var base_from_disk = false;
         if (fresh_data_opt) |fd| {
@@ -407,23 +378,15 @@ pub const AuthStorage = struct {
             };
         }
 
-        // Race-window check: did the disk copy already get refreshed
-        // by a peer? If so, install it in-memory and return.
         const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
         if (base_from_disk and now_ms < base_cred.expires) {
             self.installRefreshedCredential(provider, base_cred) catch return null;
-            // Look up the just-installed credential — installRefreshedCredential
-            // dupes into self.allocator, so the slice we return is owned by
-            // self.data, not by the arena that's about to die.
             return switch (self.data.get(provider) orelse return null) {
                 .oauth => |oa| oa.access,
                 else => null,
             };
         }
 
-        // Actually exchange. The refresh helper allocates the new
-        // credential strings with `self.allocator` so they survive
-        // arena teardown — we hand them straight to data + persist.
         const exchange = if (oauth_provider.kind.usesExtensionRefresh()) blk: {
             const hook = self.extension_oauth_refresh_hook orelse {
                 log.warn("oauth refresh requested for extension-owned provider '{s}' without an agent-thread refresh hook", .{provider});
@@ -437,13 +400,8 @@ pub const AuthStorage = struct {
                 return null;
             },
             .success => |new_cred| {
-                // installRefreshedCredential clones into self.allocator,
-                // so we always free the original `new_cred` (allocated
-                // by oauth_provider.refresh_token with self.allocator)
-                // after install regardless of outcome.
                 defer freeCredential(self.allocator, .{ .oauth = new_cred });
                 self.installRefreshedCredential(provider, new_cred) catch return null;
-                // Persist the new state to disk while still under lock.
                 self.persistInsideLock(arena_alloc) catch |e| {
                     log.warn("oauth refresh persisted in-memory but disk write failed for '{s}': {s}", .{ provider, @errorName(e) });
                 };
@@ -465,22 +423,12 @@ pub const AuthStorage = struct {
         provider: []const u8,
         new_cred: types.OAuthCredential,
     ) !void {
-        // Deep-clone via the existing helper so the entry is owned by
-        // self.allocator regardless of where `new_cred`'s strings came
-        // from (arena vs the success path's allocator). Caller is
-        // responsible for freeing the original on rollback.
         const cloned = try dupeCredential(self.allocator, .{ .oauth = new_cred });
         errdefer freeCredential(self.allocator, cloned);
 
         const key_dup = try self.allocator.dupe(u8, provider);
         errdefer self.allocator.free(key_dup);
 
-        // See zi-m7q note in `set()` — on collision the map keeps
-        // the existing key, so free `key_dup` (the fresh dup), NOT
-        // old.key. Freeing old.key dangles the live key still in
-        // the map; the next serializeAuthJson writes garbage and
-        // bricks parseAuthJson on the next reload. This path is
-        // hot because every expired-oauth getApiKey() lands here.
         if (self.data.fetchPut(key_dup, cloned) catch |e| {
             return e;
         }) |old| {
