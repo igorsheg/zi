@@ -20,7 +20,7 @@ jobs:
             zig_target: x86_64-linux-musl
             dist_target: x86_64-unknown-linux-musl
           - os: macos-14
-            zig_target: aarch64-macos
+            zig_target: native
             dist_target: aarch64-apple-darwin
 
     runs-on: ${{ matrix.os }}
@@ -32,11 +32,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-
-      - name: Configure macOS SDK
-        if: runner.os == 'macOS'
-        shell: bash
-        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
 
       - name: Check formatting
         run: zig fmt --check .
@@ -54,7 +49,13 @@ jobs:
         run: zig build test --summary all
 
       - name: Build release-safe
-        run: zig build -Doptimize=ReleaseSafe -Dstrip=true -Dtarget=${{ matrix.zig_target }} -Dversion=0.0.0-ci
+        shell: bash
+        run: |
+          args=(-Doptimize=ReleaseSafe -Dstrip=true -Dversion=0.0.0-ci)
+          if [ "${{ matrix.zig_target }}" != "native" ]; then
+            args+=("-Dtarget=${{ matrix.zig_target }}")
+          fi
+          zig build "${args[@]}"
 
       - name: Smoke-test release-safe binary
         shell: bash

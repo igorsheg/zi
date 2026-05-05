@@ -30,11 +30,11 @@ jobs:
             dist_target: aarch64-unknown-linux-musl
             archive_kind: tar.gz
           - os: macos-14
-            zig_target: aarch64-macos
+            zig_target: native
             dist_target: aarch64-apple-darwin
             archive_kind: tar.gz
           - os: macos-13
-            zig_target: x86_64-macos
+            zig_target: native
             dist_target: x86_64-apple-darwin
             archive_kind: tar.gz
 
@@ -47,11 +47,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-
-      - name: Configure macOS SDK
-        if: runner.os == 'macOS'
-        shell: bash
-        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
 
       - name: Derive version
         shell: bash
@@ -77,11 +72,11 @@ jobs:
       - name: Build zi
         shell: bash
         run: |
-          zig build \
-            -Doptimize=ReleaseSafe \
-            -Dstrip=true \
-            -Dtarget=${{ matrix.zig_target }} \
-            -Dversion="$VERSION"
+          args=(-Doptimize=ReleaseSafe -Dstrip=true -Dversion="$VERSION")
+          if [ "${{ matrix.zig_target }}" != "native" ]; then
+            args+=("-Dtarget=${{ matrix.zig_target }}")
+          fi
+          zig build "${args[@]}"
 
       - name: Package artifact
         shell: bash
