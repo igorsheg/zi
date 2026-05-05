@@ -275,6 +275,28 @@ const TestCtx = struct {
         for (self.pastes.items) |p| self.allocator.free(p);
         self.pastes.deinit(self.allocator);
     }
+
+    fn feed(self: *TestCtx, buf: *InputBuffer, data: []const u8) void {
+        buf.feed(data, &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(self));
+    }
+
+    fn drain(self: *TestCtx, buf: *InputBuffer) void {
+        buf.drain(&TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(self));
+    }
+
+    fn checkTimeout(self: *TestCtx, buf: *InputBuffer) void {
+        buf.checkTimeout(&TestCtx.onSeq, @ptrCast(self));
+    }
+
+    fn expectSequences(self: *const TestCtx, expected: []const []const u8) !void {
+        try testing.expectEqual(expected.len, self.sequences.items.len);
+        for (expected, 0..) |seq, i| try testing.expectEqualStrings(seq, self.sequences.items[i]);
+    }
+
+    fn expectPastes(self: *const TestCtx, expected: []const []const u8) !void {
+        try testing.expectEqual(expected.len, self.pastes.items.len);
+        for (expected, 0..) |paste, i| try testing.expectEqualStrings(paste, self.pastes.items[i]);
+    }
 };
 
 test "InputBuffer preserves key sequence boundaries within a feed" {
@@ -283,15 +305,10 @@ test "InputBuffer preserves key sequence boundaries within a feed" {
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("a\x1b[13;2ub\x1bOA\x1ba", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
+    ctx.feed(&buf, "a\x1b[13;2ub\x1bOA\x1ba");
 
-    try testing.expectEqual(@as(usize, 5), ctx.sequences.items.len);
-    try testing.expectEqualStrings("a", ctx.sequences.items[0]);
-    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[1]);
-    try testing.expectEqualStrings("b", ctx.sequences.items[2]);
-    try testing.expectEqualStrings("\x1bOA", ctx.sequences.items[3]);
-    try testing.expectEqualStrings("\x1ba", ctx.sequences.items[4]);
-    try testing.expectEqual(@as(usize, 0), ctx.pastes.items.len);
+    try ctx.expectSequences(&.{ "a", "\x1b[13;2u", "b", "\x1bOA", "\x1ba" });
+    try ctx.expectPastes(&.{});
 }
 
 test "InputBuffer waits for partial escape sequences across feeds" {
@@ -300,19 +317,17 @@ test "InputBuffer waits for partial escape sequences across feeds" {
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("\x1b[13", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
+    ctx.feed(&buf, "\x1b[13");
+    try ctx.expectSequences(&.{});
 
-    buf.feed(";2u", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
-    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[0]);
+    ctx.feed(&buf, ";2u");
+    try ctx.expectSequences(&.{"\x1b[13;2u"});
 
-    buf.feed("\x1b]0;title", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
+    ctx.feed(&buf, "\x1b]0;title");
+    try ctx.expectSequences(&.{"\x1b[13;2u"});
 
-    buf.feed("\x07", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
-    try testing.expectEqualStrings("\x1b]0;title\x07", ctx.sequences.items[1]);
+    ctx.feed(&buf, "\x07");
+    try ctx.expectSequences(&.{ "\x1b[13;2u", "\x1b]0;title\x07" });
 }
 
 test "InputBuffer keeps mouse report boundaries" {
@@ -321,17 +336,14 @@ test "InputBuffer keeps mouse report boundaries" {
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("\x1b[M", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
+    ctx.feed(&buf, "\x1b[M");
+    try ctx.expectSequences(&.{});
 
-    buf.feed(" !!x\x1b[<0;10", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
-    try testing.expectEqualStrings("\x1b[M !!", ctx.sequences.items[0]);
-    try testing.expectEqualStrings("x", ctx.sequences.items[1]);
+    ctx.feed(&buf, " !!x\x1b[<0;10");
+    try ctx.expectSequences(&.{ "\x1b[M !!", "x" });
 
-    buf.feed(";20M", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 3), ctx.sequences.items.len);
-    try testing.expectEqualStrings("\x1b[<0;10;20M", ctx.sequences.items[2]);
+    ctx.feed(&buf, ";20M");
+    try ctx.expectSequences(&.{ "\x1b[M !!", "x", "\x1b[<0;10;20M" });
 }
 
 test "InputBuffer emits lone ESC after timeout" {
@@ -341,14 +353,13 @@ test "InputBuffer emits lone ESC after timeout" {
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("\x1b", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 0), ctx.sequences.items.len);
+    ctx.feed(&buf, "\x1b");
+    try ctx.expectSequences(&.{});
     try testing.expect(buf.flush_deadline_ns != null);
 
     buf.flush_deadline_ns = 0;
-    buf.checkTimeout(&TestCtx.onSeq, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
-    try testing.expectEqualStrings("\x1b", ctx.sequences.items[0]);
+    ctx.checkTimeout(&buf);
+    try ctx.expectSequences(&.{"\x1b"});
 }
 
 test "InputBuffer handles bracketed paste split across key boundaries" {
@@ -357,16 +368,13 @@ test "InputBuffer handles bracketed paste split across key boundaries" {
     var ctx = TestCtx{ .allocator = testing.allocator };
     defer ctx.deinit();
 
-    buf.feed("a\x1b[200~hello", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 1), ctx.sequences.items.len);
-    try testing.expectEqualStrings("a", ctx.sequences.items[0]);
-    try testing.expectEqual(@as(usize, 0), ctx.pastes.items.len);
+    ctx.feed(&buf, "a\x1b[200~hello");
+    try ctx.expectSequences(&.{"a"});
+    try ctx.expectPastes(&.{});
 
-    buf.feed(" world\x1b[201~\x1b[13;2u", &TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
-    try testing.expectEqualStrings("\x1b[13;2u", ctx.sequences.items[1]);
-    try testing.expectEqual(@as(usize, 1), ctx.pastes.items.len);
-    try testing.expectEqualStrings("hello world", ctx.pastes.items[0]);
+    ctx.feed(&buf, " world\x1b[201~\x1b[13;2u");
+    try ctx.expectSequences(&.{ "a", "\x1b[13;2u" });
+    try ctx.expectPastes(&.{"hello world"});
 }
 
 test "InputBuffer consumes kitty response without taking surrounding input" {
@@ -378,8 +386,6 @@ test "InputBuffer consumes kitty response without taking surrounding input" {
     try buf.buf.appendSlice(testing.allocator, "a\x1b[?0ub");
     try testing.expect(buf.consumeKittyResponse());
 
-    buf.drain(&TestCtx.onSeq, &TestCtx.onPaste, @ptrCast(&ctx));
-    try testing.expectEqual(@as(usize, 2), ctx.sequences.items.len);
-    try testing.expectEqualStrings("a", ctx.sequences.items[0]);
-    try testing.expectEqualStrings("b", ctx.sequences.items[1]);
+    ctx.drain(&buf);
+    try ctx.expectSequences(&.{ "a", "b" });
 }

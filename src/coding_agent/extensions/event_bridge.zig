@@ -1138,14 +1138,53 @@ fn parseContentArray(
 const testing = std.testing;
 const api = @import("api.zig");
 
-test "semantic message event exposes assistant text and tool calls" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+const BridgeTestHost = struct {
+    state: lua_runtime.LuaState,
+    runner: runner_mod.ExtensionRunner,
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    fn init(allocator: std.mem.Allocator) !BridgeTestHost {
+        return .{
+            .state = try lua_runtime.LuaState.init(allocator),
+            .runner = runner_mod.ExtensionRunner.init(allocator, 0),
+        };
+    }
+
+    fn deinit(self: *BridgeTestHost) void {
+        self.runner.deinit();
+        self.state.deinit();
+    }
+
+    fn attachAndInstallZi(self: *BridgeTestHost) void {
+        self.runner.attachLuaState(&self.state);
+        api.installZiTable(&self.state, &self.runner);
+    }
+};
+
+fn expectTextTransform(result: InputMiddlewareResult, expected: []const u8) !void {
+    switch (result) {
+        .transform => |text| {
+            defer testing.allocator.free(text);
+            try testing.expectEqualStrings(expected, text);
+        },
+        else => return error.ExpectedTransform,
+    }
+}
+
+fn bashToolCall(args_obj: std.json.ObjectMap) ai_protocol.ToolCall {
+    return .{
+        .id = "tool-call",
+        .name = "Bash",
+        .arguments = .{ .object = args_obj },
+    };
+}
+
+test "semantic message event exposes assistant text and tool calls" {
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
+
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\_semantic = {}
@@ -1170,7 +1209,7 @@ test "semantic message event exposes assistant text and tool calls" {
         .timestamp = 0,
     } };
 
-    try dispatchSemanticMessage(&runner, fake_assistant, "entry-1");
+    try dispatchSemanticMessage(runner, fake_assistant, "entry-1");
 
     try state.doString(
         \\assert(#_semantic == 2, "expected 2 semantic messages, got " .. #_semantic)
@@ -1180,13 +1219,12 @@ test "semantic message event exposes assistant text and tool calls" {
 }
 
 test "before_agent_start transforms system prompt and exposes options" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.on("before_agent_start", function(event, ctx)
@@ -1200,19 +1238,18 @@ test "before_agent_start transforms system prompt and exposes options" {
 
     const tool_names = [_][]const u8{"bash"};
     const skill_list = [_]resource_types.Skill{.{ .name = "zig", .description = "zig skill", .file_path = "zig.md", .base_dir = ".", .source_info = .{ .path = "zig.md", .source = "test" } }};
-    const result = try dispatchBeforeAgentStart(&runner, "base", .{ .cwd = ".", .selected_tools = &tool_names, .skills = &skill_list, .append_system_prompt = &.{} }, testing.allocator);
+    const result = try dispatchBeforeAgentStart(runner, "base", .{ .cwd = ".", .selected_tools = &tool_names, .skills = &skill_list, .append_system_prompt = &.{} }, testing.allocator);
     defer testing.allocator.free(result);
     try testing.expectEqualStrings("base bash zig marker", result);
 }
 
 test "input middleware transforms text before agent submission" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.on("input", function(event, ctx)
@@ -1222,24 +1259,16 @@ test "input middleware transforms text before agent submission" {
         \\end)
     , "subscribe_input_transform");
 
-    const result = try dispatchInput(&runner, "?quick hello", null, testing.allocator);
-    switch (result) {
-        .transform => |text| {
-            defer testing.allocator.free(text);
-            try testing.expectEqualStrings("Brief: hello", text);
-        },
-        else => return error.ExpectedTransform,
-    }
+    try expectTextTransform(try dispatchInput(runner, "?quick hello", null, testing.allocator), "Brief: hello");
 }
 
 test "input middleware handled action stops agent submission" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.on("input", function(event, ctx)
@@ -1247,18 +1276,17 @@ test "input middleware handled action stops agent submission" {
         \\end)
     , "subscribe_input_handled");
 
-    const result = try dispatchInput(&runner, "ping", null, testing.allocator);
+    const result = try dispatchInput(runner, "ping", null, testing.allocator);
     try testing.expect(result == .handled);
 }
 
 test "beforeToolCall blocks tool execution when handler returns block=true" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.on("tool_call", function(event, ctx)
@@ -1272,11 +1300,7 @@ test "beforeToolCall blocks tool execution when handler returns block=true" {
     defer args_obj.deinit(testing.allocator);
     try args_obj.put(testing.allocator, "command", .{ .string = "rm -rf /" });
 
-    const tc = ai_protocol.ToolCall{
-        .id = "id-1",
-        .name = "Bash",
-        .arguments = .{ .object = args_obj },
-    };
+    const tc = bashToolCall(args_obj);
     const ctx = agent_protocol.BeforeToolCallContext{
         .assistant_message = undefined,
         .tool_call = tc,
@@ -1284,20 +1308,19 @@ test "beforeToolCall blocks tool execution when handler returns block=true" {
         .context = .{ .system_prompt = "", .messages = &.{} },
     };
 
-    const result = beforeToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(&runner));
+    const result = beforeToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(runner));
     try testing.expect(result != null);
     try testing.expect(result.?.block);
     try testing.expectEqualStrings("nope", result.?.reason.?);
 }
 
 test "beforeToolCall returns mutated args when handler rewrites them" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.on("tool_call", function(event, ctx)
@@ -1309,11 +1332,7 @@ test "beforeToolCall returns mutated args when handler rewrites them" {
     defer args_obj.deinit(testing.allocator);
     try args_obj.put(testing.allocator, "command", .{ .string = "rm -rf /" });
 
-    const tc = ai_protocol.ToolCall{
-        .id = "id-2",
-        .name = "Bash",
-        .arguments = .{ .object = args_obj },
-    };
+    const tc = bashToolCall(args_obj);
     const ctx = agent_protocol.BeforeToolCallContext{
         .assistant_message = undefined,
         .tool_call = tc,
@@ -1321,7 +1340,7 @@ test "beforeToolCall returns mutated args when handler rewrites them" {
         .context = .{ .system_prompt = "", .messages = &.{} },
     };
 
-    const result = beforeToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(&runner));
+    const result = beforeToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(runner));
     try testing.expect(result != null);
     try testing.expect(!result.?.block);
 
@@ -1332,13 +1351,12 @@ test "beforeToolCall returns mutated args when handler rewrites them" {
 }
 
 test "afterToolCall transforms result content via transformable chain" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.on("tool_result", function(event, ctx)
@@ -1373,7 +1391,7 @@ test "afterToolCall transforms result content via transformable chain" {
         .context = .{ .system_prompt = "", .messages = &.{} },
     };
 
-    const result = afterToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(&runner));
+    const result = afterToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(runner));
     try testing.expect(result != null);
     try testing.expect(result.?.content != null);
 
@@ -1383,12 +1401,12 @@ test "afterToolCall transforms result content via transformable chain" {
 }
 
 test "lifecycle observer delivers null-provenance handler with nil binding" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.runner.attachLuaState(&host.state);
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\_received_binding = "UNSET"
@@ -1411,7 +1429,7 @@ test "lifecycle observer delivers null-provenance handler with nil binding" {
     });
 
     try dispatchSessionStart(.{
-        .runner = &runner,
+        .runner = runner,
         .workspace_id = "ws",
         .session_id = "sess",
     }, null, .startup, null);
@@ -1422,14 +1440,12 @@ test "lifecycle observer delivers null-provenance handler with nil binding" {
 }
 
 test "dispatchModelSelect exposes model, previous_model, and source" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try BridgeTestHost.init(testing.allocator);
+    defer host.deinit();
+    host.attachAndInstallZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-
-    api.installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\_seen_model = nil
@@ -1468,7 +1484,7 @@ test "dispatchModelSelect exposes model, previous_model, and source" {
         .max_tokens = 200,
     };
 
-    dispatchModelSelect(&runner, next_model, prev_model, "set");
+    dispatchModelSelect(runner, next_model, prev_model, "set");
 
     try state.doString(
         \\assert(_seen_model == "next-model", "model: " .. tostring(_seen_model))

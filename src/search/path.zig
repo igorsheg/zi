@@ -615,22 +615,35 @@ fn deduplicateMatches(matches: []usize) []usize {
     return matches[0..end];
 }
 
-test "path filter prefers filename matches over path-only matches" {
+fn expectPathMatch(query: []const u8, candidate: []const u8) !void {
+    try testing.expect(rank(query, candidate).matches);
+}
+
+fn expectPathMiss(query: []const u8, candidate: []const u8) !void {
+    try testing.expect(!rank(query, candidate).matches);
+}
+
+fn expectFirstIndex(expected: usize, actual: []const usize) !void {
+    try testing.expect(actual.len > 0);
+    try testing.expectEqual(expected, actual[0]);
+}
+
+test "path filter ranks filename matches ahead of path-only matches" {
     const paths = [_][]const u8{
         "source/blender/makesdna/DNA_genfile.h",
         "GNUmakefile",
     };
-    var out: [2]usize = undefined;
+    var out: [paths.len]usize = undefined;
 
     const n = filter("make", &paths, &out);
 
     try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqual(@as(usize, 1), out[0]);
+    try expectFirstIndex(1, out[0..n]);
 }
 
-test "path rank treats slash-containing query as strict path" {
-    try testing.expect(!rank("mod/barbaz", "app/models/foo/bar/baz.rb").matches);
-    try testing.expect(rank("mod/baz.rb", "app/models/foo/bar/baz.rb").matches);
+test "path rank treats separator-containing queries as strict path segments" {
+    try expectPathMiss("mod/barbaz", "app/models/foo/bar/baz.rb");
+    try expectPathMatch("mod/baz.rb", "app/models/foo/bar/baz.rb");
 }
 
 test "path highlight returns basename match indices" {
@@ -651,7 +664,7 @@ test "path candidate filter boosts exact and prefix basename matches" {
     const n = filterCandidates("main", &candidates, &out);
 
     try testing.expectEqual(@as(usize, 3), n);
-    try testing.expectEqual(@as(usize, 1), out[0]);
+    try expectFirstIndex(1, out[0..n]);
 }
 
 test "path candidate filter prefers directory continuation on tie" {
@@ -664,5 +677,5 @@ test "path candidate filter prefers directory continuation on tie" {
     const n = filterCandidates("src", &candidates, &out);
 
     try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqual(@as(usize, 1), out[0]);
+    try expectFirstIndex(1, out[0..n]);
 }

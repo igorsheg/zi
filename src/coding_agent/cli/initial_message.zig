@@ -207,7 +207,28 @@ fn pngHeader(width: u32, height: u32) [24]u8 {
     };
 }
 
-test "prepareBatchInput merges stdin file text and prompt in pi order" {
+fn expectPreparedBatch(result_value: PrepareBatchResult) !PreparedInitialMessage {
+    return switch (result_value) {
+        .ok => |input| input,
+        .err => error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectNoInitialMessage(result_value: PrepareInitialResult) !void {
+    return switch (result_value) {
+        .ok => |input| try std.testing.expect(input == null),
+        .err => error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectBatchDiagnostic(result_value: PrepareBatchResult) !result.ExecutionDiagnostic {
+    return switch (result_value) {
+        .err => |diag| diag,
+        .ok => error.ExpectedDiagnostic,
+    };
+}
+
+test "prepareBatchInput preserves stdin file prompt ordering" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -219,24 +240,19 @@ test "prepareBatchInput merges stdin file text and prompt in pi order" {
     const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
-    const prepared = try prepareBatchInput(allocator, cwd, .{
+    const input = try expectPreparedBatch(try prepareBatchInput(allocator, cwd, .{
         .stdin_text = "from stdin\n",
         .file_args = &.{"notes.txt"},
         .prompt_text = "and prompt",
-    }, .{});
-    switch (prepared) {
-        .ok => |input| {
-            const expected = try std.fmt.allocPrint(
-                allocator,
-                "from stdin\n<file name=\"{s}/notes.txt\">\nhello from file\n</file>\nand prompt",
-                .{cwd},
-            );
-            defer allocator.free(expected);
-            try std.testing.expectEqualStrings(expected, input.text);
-            try std.testing.expectEqual(@as(usize, 0), input.images.len);
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    }, .{}));
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "from stdin\n<file name=\"{s}/notes.txt\">\nhello from file\n</file>\nand prompt",
+        .{cwd},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, input.text);
+    try std.testing.expectEqual(@as(usize, 0), input.images.len);
 }
 
 test "prepareBatchInput attaches image files and skips empty files" {
@@ -253,25 +269,20 @@ test "prepareBatchInput attaches image files and skips empty files" {
     const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
-    const prepared = try prepareBatchInput(allocator, cwd, .{
+    const input = try expectPreparedBatch(try prepareBatchInput(allocator, cwd, .{
         .file_args = &.{ "empty.txt", "shot.bin" },
-    }, .{});
-    switch (prepared) {
-        .ok => |input| {
-            try std.testing.expectEqual(@as(usize, 1), input.images.len);
-            try std.testing.expectEqualStrings("image/png", input.images[0].mime_type);
-            try std.testing.expect(std.mem.indexOf(u8, input.text, "empty.txt") == null);
-            try std.testing.expect(std.mem.indexOf(u8, input.text, "shot.bin") != null);
-            const content = try input.toUserContent(allocator);
-            switch (content) {
-                .blocks => |blocks| {
-                    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-                    try std.testing.expect(blocks[1] == .image);
-                },
-                .text => return error.ExpectedBlocks,
-            }
+    }, .{}));
+    try std.testing.expectEqual(@as(usize, 1), input.images.len);
+    try std.testing.expectEqualStrings("image/png", input.images[0].mime_type);
+    try std.testing.expect(std.mem.indexOf(u8, input.text, "empty.txt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, input.text, "shot.bin") != null);
+    const content = try input.toUserContent(allocator);
+    switch (content) {
+        .blocks => |blocks| {
+            try std.testing.expectEqual(@as(usize, 2), blocks.len);
+            try std.testing.expect(blocks[1] == .image);
         },
-        .err => return error.UnexpectedDiagnostic,
+        .text => return error.ExpectedBlocks,
     }
 }
 
@@ -288,21 +299,16 @@ test "prepareBatchInput omits oversized images when auto-resize is enabled" {
     const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
-    const prepared = try prepareBatchInput(allocator, cwd, .{
+    const input = try expectPreparedBatch(try prepareBatchInput(allocator, cwd, .{
         .file_args = &.{"large.bin"},
     }, .{ .inline_image_policy = .{
         .auto_resize = true,
         .max_width = 100,
         .max_height = 100,
         .max_base64_bytes = 1024,
-    } });
-    switch (prepared) {
-        .ok => |input| {
-            try std.testing.expectEqual(@as(usize, 0), input.images.len);
-            try std.testing.expect(std.mem.indexOf(u8, input.text, image_mod.omittedInlineNote()) != null);
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    } }));
+    try std.testing.expectEqual(@as(usize, 0), input.images.len);
+    try std.testing.expect(std.mem.indexOf(u8, input.text, image_mod.omittedInlineNote()) != null);
 }
 
 test "prepareInitialMessage treats empty interactive file inputs as no startup content" {
@@ -317,13 +323,9 @@ test "prepareInitialMessage treats empty interactive file inputs as no startup c
     const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
-    const prepared = try prepareInitialMessage(allocator, cwd, .{
+    try expectNoInitialMessage(try prepareInitialMessage(allocator, cwd, .{
         .file_args = &.{"empty.txt"},
-    }, .{});
-    switch (prepared) {
-        .ok => |input| try std.testing.expect(input == null),
-        .err => return error.UnexpectedDiagnostic,
-    }
+    }, .{}));
 }
 
 test "prepareBatchInput reports missing file arguments" {
@@ -337,14 +339,11 @@ test "prepareBatchInput reports missing file arguments" {
     const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(cwd);
 
-    const prepared = try prepareBatchInput(allocator, cwd, .{
+    const diag = try expectBatchDiagnostic(try prepareBatchInput(allocator, cwd, .{
         .file_args = &.{"missing.txt"},
-    }, .{});
-    switch (prepared) {
-        .err => |diag| switch (diag) {
-            .batch_file_not_found => |path| try std.testing.expect(std.mem.endsWith(u8, path, "/missing.txt")),
-            else => return error.UnexpectedDiagnostic,
-        },
-        .ok => return error.ExpectedDiagnostic,
+    }, .{}));
+    switch (diag) {
+        .batch_file_not_found => |path| try std.testing.expect(std.mem.endsWith(u8, path, "/missing.txt")),
+        else => return error.UnexpectedDiagnostic,
     }
 }

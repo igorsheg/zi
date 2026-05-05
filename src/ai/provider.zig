@@ -644,6 +644,43 @@ fn testModelWithProvider(base_url: []const u8, api: protocol.Api, provider: prot
 
 fn noopEvent(_: protocol.AssistantMessageEvent, _: ?*anyopaque) void {}
 
+fn ownedTestModelRegistration(id: []const u8, name: []const u8) ![]ClaimModelRegistration {
+    const models = try testing.allocator.alloc(ClaimModelRegistration, 1);
+    models[0] = .{
+        .id = try testing.allocator.dupe(u8, id),
+        .name = try testing.allocator.dupe(u8, name),
+        .reasoning = true,
+        .input = try testing.allocator.dupe(protocol.Model.InputType, &.{ .text, .image }),
+        .cost = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    return models;
+}
+
+const TestClaimOptions = struct {
+    name: []const u8,
+    api: []const u8 = "anthropic-messages",
+    base_url: []const u8,
+    owner_id: []const u8,
+    generation: u64 = 1,
+    oauth_name: ?[]const u8 = null,
+    models: []ClaimModelRegistration = &.{},
+};
+
+fn ownedTestClaim(options: TestClaimOptions) !ClaimRegistration {
+    return .{
+        .name = try testing.allocator.dupe(u8, options.name),
+        .api = try testing.allocator.dupe(u8, options.api),
+        .base_url = try testing.allocator.dupe(u8, options.base_url),
+        .oauth_enabled = options.oauth_name != null,
+        .oauth_name = if (options.oauth_name) |name| try testing.allocator.dupe(u8, name) else null,
+        .owner_id = try testing.allocator.dupe(u8, options.owner_id),
+        .generation = options.generation,
+        .models = options.models,
+    };
+}
+
 test "Registry reapplies surviving provider claims and restores the baseline" {
     var reg = Registry.init(testing.allocator);
     defer reg.deinit();
@@ -651,40 +688,20 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
     const baseline = try RecordingProvider.create(testing.allocator, "baseline");
     try reg.register("anthropic-messages", baseline.provider(), null);
 
-    const first_models = blk: {
-        const models = try testing.allocator.alloc(ClaimModelRegistration, 1);
-        models[0] = .{
-            .id = try testing.allocator.dupe(u8, "claude-sonnet-4-20250514"),
-            .name = try testing.allocator.dupe(u8, "Claude 4 Sonnet"),
-            .reasoning = true,
-            .input = try testing.allocator.dupe(protocol.Model.InputType, &.{ .text, .image }),
-            .cost = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 },
-            .context_window = 200000,
-            .max_tokens = 16384,
-        };
-        break :blk models;
-    };
-
-    const first = ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "proxy-a"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://proxy-a.example"),
-        .oauth_enabled = true,
-        .oauth_name = try testing.allocator.dupe(u8, "Proxy Login"),
-        .owner_id = try testing.allocator.dupe(u8, "ext-a"),
-        .generation = 1,
+    const first_models = try ownedTestModelRegistration("claude-sonnet-4-20250514", "Claude 4 Sonnet");
+    try testing.expect(try reg.registerClaim(try ownedTestClaim(.{
+        .name = "proxy-a",
+        .base_url = "https://proxy-a.example",
+        .owner_id = "ext-a",
+        .oauth_name = "Proxy Login",
         .models = first_models,
-    };
-    try testing.expect(try reg.registerClaim(first));
+    })));
 
-    const second = ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "proxy-b"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://proxy-b.example"),
-        .owner_id = try testing.allocator.dupe(u8, "ext-b"),
-        .generation = 1,
-    };
-    try testing.expect(try reg.registerClaim(second));
+    try testing.expect(try reg.registerClaim(try ownedTestClaim(.{
+        .name = "proxy-b",
+        .base_url = "https://proxy-b.example",
+        .owner_id = "ext-b",
+    })));
 
     try testing.expectEqual(@as(usize, 2), reg.activeClaimCount());
     const active_first = reg.activeClaimRegistrationAt(0);
@@ -774,13 +791,11 @@ test "Registry clear frees owned baseline and claim metadata" {
     defer baseline.provider().deinit();
     try reg.register("anthropic-messages", baseline.provider(), "builtin-test");
 
-    try testing.expect(try reg.registerClaim(.{
-        .name = try testing.allocator.dupe(u8, "proxy-clear"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://clear.example"),
-        .owner_id = try testing.allocator.dupe(u8, "ext-clear"),
-        .generation = 1,
-    }));
+    try testing.expect(try reg.registerClaim(try ownedTestClaim(.{
+        .name = "proxy-clear",
+        .base_url = "https://clear.example",
+        .owner_id = "ext-clear",
+    })));
     try testing.expectEqual(@as(usize, 1), reg.activeClaimCount());
 
     reg.clear();
@@ -796,14 +811,12 @@ test "Registry resolves provider claims by provider name before api projection" 
     const baseline = try RecordingProvider.create(testing.allocator, "baseline");
     try reg.register("openai-responses", baseline.provider(), null);
 
-    const claim = ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "openai"),
-        .api = try testing.allocator.dupe(u8, "openai-responses"),
-        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
-        .owner_id = try testing.allocator.dupe(u8, "ext-openai"),
-        .generation = 1,
-    };
-    try testing.expect(try reg.registerClaim(claim));
+    try testing.expect(try reg.registerClaim(try ownedTestClaim(.{
+        .name = "openai",
+        .api = "openai-responses",
+        .base_url = "https://proxy.example",
+        .owner_id = "ext-openai",
+    })));
     try testing.expectEqualStrings("openai", reg.get("openai-responses").?.getName());
 
     reg.getForModel("openai-responses", "openai").?.streamSimple(
@@ -836,23 +849,19 @@ test "Registry teardown drops one generation and restores surviving same-name cl
     const baseline = try RecordingProvider.create(testing.allocator, "baseline");
     try reg.register("anthropic-messages", baseline.provider(), null);
 
-    const first = ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "anthropic"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://gen1.example"),
-        .owner_id = try testing.allocator.dupe(u8, "ext-gen1"),
+    try testing.expect(try reg.registerClaim(try ownedTestClaim(.{
+        .name = "anthropic",
+        .base_url = "https://gen1.example",
+        .owner_id = "ext-gen1",
         .generation = 1,
-    };
-    try testing.expect(try reg.registerClaim(first));
+    })));
 
-    const second = ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "anthropic"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://gen2.example"),
-        .owner_id = try testing.allocator.dupe(u8, "ext-gen1"),
+    try testing.expect(try reg.registerClaim(try ownedTestClaim(.{
+        .name = "anthropic",
+        .base_url = "https://gen2.example",
+        .owner_id = "ext-gen1",
         .generation = 2,
-    };
-    try testing.expect(try reg.registerClaim(second));
+    })));
 
     try testing.expectEqual(@as(usize, 2), reg.activeClaimCount());
     try testing.expectEqualStrings("https://gen1.example", reg.activeClaimRegistrationByName("anthropic").?.base_url);

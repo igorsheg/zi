@@ -540,7 +540,7 @@ fn validateConfig(comptime T: type, comptime config: Config) void {
     }
 }
 
-test "Mailbox ring storage preserves FIFO across partial drains and wraparound growth" {
+test "Mailbox ring storage preserves FIFO across partial drains and wraparound" {
     const Msg = struct { value: u32 };
 
     var mailbox = try Mailbox(Msg, .{ .policy = .unbounded, .wakeup = .none }).init(std.testing.allocator);
@@ -604,6 +604,7 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
         else => return error.UnexpectedResult,
     }
     const reject_stats = reject_box.stats();
+    try std.testing.expectEqual(@as(usize, 1), reject_stats.pending_depth);
     try std.testing.expectEqual(@as(usize, 1), reject_stats.rejected_count);
     try std.testing.expectEqual(@as(usize, 1), reject_stats.high_water_depth);
     try std.testing.expectEqual(@as(usize, 1), reject_stats.send_count);
@@ -618,6 +619,7 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
     try std.testing.expectEqual(.ok, drop_box.trySend(.{ .value = 11 }));
     try std.testing.expectEqual(.dropped, drop_box.trySend(.{ .value = 12 }));
     const drop_stats = drop_box.stats();
+    try std.testing.expectEqual(@as(usize, 1), drop_stats.pending_depth);
     try std.testing.expectEqual(@as(usize, 1), drop_stats.dropped_count);
     try std.testing.expectEqual(@as(usize, 1), drop_stats.high_water_depth);
     try std.testing.expectEqual(@as(usize, 1), drop_stats.send_count);

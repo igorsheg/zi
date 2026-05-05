@@ -1203,6 +1203,23 @@ fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestC
     processStream(arena, &reader, test_model, AbortSignal.none, TestCollector.callback, collector);
 }
 
+fn expectEventAt(col: TestCollector, index: usize, kind: TestCollector.EventKind) !void {
+    try testing.expect(index < col.events.items.len);
+    try testing.expectEqual(kind, col.events.items[index]);
+}
+
+fn expectLastEvent(col: TestCollector, kind: TestCollector.EventKind) !void {
+    try testing.expect(col.events.items.len > 0);
+    try testing.expectEqual(kind, col.events.items[col.events.items.len - 1]);
+}
+
+fn expectContainsEvent(col: TestCollector, kind: TestCollector.EventKind) !void {
+    for (col.events.items) |event| {
+        if (event == kind) return;
+    }
+    return error.TestExpectedEqual;
+}
+
 test "processStream emits text_delta then done for a simple text response" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1220,13 +1237,12 @@ test "processStream emits text_delta then done for a simple text response" {
 
     runProcess(alloc, sse_bytes, &col);
 
-    try testing.expect(col.events.items.len >= 6);
-    try testing.expectEqual(TestCollector.EventKind.start, col.events.items[0]);
-    try testing.expectEqual(TestCollector.EventKind.text_start, col.events.items[1]);
-    try testing.expectEqual(TestCollector.EventKind.text_delta, col.events.items[2]);
-    try testing.expectEqual(TestCollector.EventKind.text_delta, col.events.items[3]);
+    try expectEventAt(col, 0, .start);
+    try expectEventAt(col, 1, .text_start);
+    try expectEventAt(col, 2, .text_delta);
+    try expectEventAt(col, 3, .text_delta);
     try testing.expectEqual(TestCollector.EventKind.text_end, col.events.items[col.events.items.len - 2]);
-    try testing.expectEqual(TestCollector.EventKind.done, col.events.items[col.events.items.len - 1]);
+    try expectLastEvent(col, .done);
     try testing.expectEqualStrings("Hello world", col.text.items);
 }
 
@@ -1247,11 +1263,7 @@ test "processStream concatenates split tool-call argument chunks" {
 
     runProcess(alloc, sse_bytes, &col);
 
-    var saw_end = false;
-    for (col.events.items) |e| {
-        if (e == .toolcall_end) saw_end = true;
-    }
-    try testing.expect(saw_end);
+    try expectContainsEvent(col, .toolcall_end);
     try testing.expectEqualStrings("t1", col.final_tool_id);
     try testing.expectEqualStrings("bash", col.final_tool_name);
     try testing.expectEqualStrings("{\"cmd\":\"echo hi\"}", col.final_args.items);
@@ -1271,7 +1283,7 @@ test "processStream normalizes openrouter error events carried in a 200 stream" 
 
     runProcess(alloc, sse_bytes, &col);
 
-    try testing.expectEqual(TestCollector.EventKind.err, col.events.items[col.events.items.len - 1]);
+    try expectLastEvent(col, .err);
     try testing.expectEqual(protocol.NormalizedFailure.Kind.rate_limited, col.final_failure_kind.?);
     try testing.expectEqualStrings("Rate limit exceeded\nprovider overload", col.final_error_message.?);
 }
@@ -1290,7 +1302,7 @@ test "processStream maps network_error finish_reason to transient failure" {
 
     runProcess(alloc, sse_bytes, &col);
 
-    try testing.expectEqual(TestCollector.EventKind.err, col.events.items[col.events.items.len - 1]);
+    try expectLastEvent(col, .err);
     try testing.expectEqual(protocol.NormalizedFailure.Kind.transient, col.final_failure_kind.?);
     try testing.expectEqualStrings("Provider finish_reason: network_error", col.final_error_message.?);
 }

@@ -341,21 +341,34 @@ fn sortIndicesByScore(indices: []usize, scores: []i32) void {
     }
 }
 
-test "fuzzyMatch accepts case-insensitive ordered subsequences and rejects misses" {
-    try std.testing.expect(fuzzyMatch("abc", "ABC").matches);
-    try std.testing.expect(fuzzyMatch("ac", "abc").matches);
-    try std.testing.expect(!fuzzyMatch("z", "abc").matches);
+fn expectFuzzyMatches(query: []const u8, text: []const u8) !void {
+    try std.testing.expect(fuzzyMatch(query, text).matches);
 }
 
-test "fuzzy ranks boundaries, camelcase and consecutive chunks" {
-    try std.testing.expect(match("fb", "foo-bar").score > match("fb", "fxxbxx").score);
-    try std.testing.expect(match("fb", "FooBar").score > match("fb", "f very long b").score);
-    try std.testing.expect(match("abc", "abcdef").score > match("abc", "axbxcx").score);
+fn expectFuzzyMiss(query: []const u8, text: []const u8) !void {
+    try std.testing.expect(!fuzzyMatch(query, text).matches);
 }
 
-test "filter supports AND OR inverse exact prefix suffix" {
+fn expectRanksAbove(query: []const u8, better: []const u8, worse: []const u8) !void {
+    try std.testing.expect(match(query, better).score > match(query, worse).score);
+}
+
+test "fuzzy matching is case-insensitive and ordered by default" {
+    try expectFuzzyMatches("abc", "ABC");
+    try expectFuzzyMatches("ac", "abc");
+    try expectFuzzyMiss("z", "abc");
+}
+
+test "fuzzy scoring rewards boundaries, camelcase, and consecutive chunks" {
+    try expectRanksAbove("fb", "foo-bar", "fxxbxx");
+    try expectRanksAbove("fb", "FooBar", "f very long b");
+    try expectRanksAbove("abc", "abcdef", "axbxcx");
+}
+
+test "filter query operators compose across AND OR inverse exact prefix suffix" {
     const items = [_][]const u8{ "foo_test", "bar_prod", "baz_prod", "prelude", "the end" };
     var out: [items.len]usize = undefined;
+
     try std.testing.expectEqual(@as(usize, 2), filter("^foo | ^bar", &items, &out));
     try std.testing.expectEqual(@as(usize, 2), filter("prod !foo", &items, &out));
     try std.testing.expectEqual(@as(usize, 1), filter("^pre", &items, &out));

@@ -328,32 +328,33 @@ fn osRelease() []const u8 {
 /// so `streamCore` emits a clean error event instead of a silent no-op.
 const testing = std.testing;
 
+const codex_account_token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
+
+fn expectHeader(header: protocol.Header, key: []const u8, value: []const u8) !void {
+    try testing.expectEqualStrings(key, header.key);
+    try testing.expectEqualStrings(value, header.value);
+}
+
 test "auth helpers extract ChatGPT account and build Codex headers" {
     const allocator = testing.allocator;
-    const token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
-    const account_id = try extractAccountId(allocator, token);
+    const account_id = try extractAccountId(allocator, codex_account_token);
     defer allocator.free(account_id);
     try testing.expectEqualStrings("acct_123", account_id);
 
     var auth_buf: [256]u8 = undefined;
-    const auth = try buildBearerAuth(null, &auth_buf, token);
-    try testing.expectEqualStrings("Bearer " ++ token, auth);
+    const auth = try buildBearerAuth(null, &auth_buf, codex_account_token);
+    try testing.expectEqualStrings("Bearer " ++ codex_account_token, auth);
     try testing.expectError(error.NoApiKey, buildBearerAuth(null, &auth_buf, null));
 
     var headers: [6]protocol.Header = undefined;
     const count = fillCodexHeaders(&headers, account_id, "pi (darwin darwin; aarch64)", "session-abc");
     try testing.expectEqual(@as(usize, 6), count);
-    try testing.expectEqualStrings("chatgpt-account-id", headers[0].key);
-    try testing.expectEqualStrings("acct_123", headers[0].value);
-    try testing.expectEqualStrings("originator", headers[1].key);
-    try testing.expectEqualStrings("pi", headers[1].value);
+    try expectHeader(headers[0], "chatgpt-account-id", "acct_123");
+    try expectHeader(headers[1], "originator", "pi");
     try testing.expectEqualStrings("user-agent", headers[2].key);
-    try testing.expectEqualStrings("OpenAI-Beta", headers[3].key);
-    try testing.expectEqualStrings("responses=experimental", headers[3].value);
-    try testing.expectEqualStrings("accept", headers[4].key);
-    try testing.expectEqualStrings("text/event-stream", headers[4].value);
-    try testing.expectEqualStrings("session_id", headers[5].key);
-    try testing.expectEqualStrings("session-abc", headers[5].value);
+    try expectHeader(headers[3], "OpenAI-Beta", "responses=experimental");
+    try expectHeader(headers[4], "accept", "text/event-stream");
+    try expectHeader(headers[5], "session_id", "session-abc");
 }
 
 test "clampCodexReasoningEffort matches codex model/API boundaries" {

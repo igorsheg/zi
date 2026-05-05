@@ -631,19 +631,48 @@ fn percentEncodeInto(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
 
 const testing = std.testing;
 
+const TestClaimOptions = struct {
+    name: []const u8,
+    label: []const u8,
+    owner_id: []const u8,
+    generation: u64,
+    login_ref: ?c_int = null,
+    refresh_ref: ?c_int = null,
+};
+
+fn initAnthropicTestClaim(allocator: std.mem.Allocator, options: TestClaimOptions) !provider_mod.ClaimRegistration {
+    return .{
+        .name = try allocator.dupe(u8, options.name),
+        .api = try allocator.dupe(u8, "anthropic-messages"),
+        .base_url = try allocator.dupe(u8, "https://proxy.example"),
+        .oauth_enabled = true,
+        .oauth_name = try allocator.dupe(u8, options.label),
+        .oauth_login_ref = options.login_ref,
+        .oauth_refresh_token_ref = options.refresh_ref,
+        .owner_id = try allocator.dupe(u8, options.owner_id),
+        .generation = options.generation,
+    };
+}
+
+test "oauth form encoding percent-escapes reserved bytes and keeps unreserved bytes" {
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(testing.allocator);
+
+    try percentEncodeInto(testing.allocator, &encoded, "azAZ09-._~ /?&=");
+
+    try testing.expectEqualStrings("azAZ09-._~%20%2F%3F%26%3D", encoded.items);
+}
+
 test "dynamic oauth providers list claim-visible ids and labels" {
     resetDynamicProvidersForTest();
     defer resetDynamicProvidersForTest();
 
-    var claim = provider_mod.ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "corp-ai"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
-        .oauth_enabled = true,
-        .oauth_name = try testing.allocator.dupe(u8, "Corporate Claude"),
-        .owner_id = try testing.allocator.dupe(u8, "state-123"),
+    var claim = try initAnthropicTestClaim(testing.allocator, .{
+        .name = "corp-ai",
+        .label = "Corporate Claude",
+        .owner_id = "state-123",
         .generation = 5,
-    };
+    });
     defer claim.deinit(testing.allocator);
 
     try syncClaimProvider(testing.allocator, &claim);
@@ -670,16 +699,13 @@ test "dynamic oauth providers mark extension-login execution separately" {
     resetDynamicProvidersForTest();
     defer resetDynamicProvidersForTest();
 
-    var claim = provider_mod.ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "corp-login"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
-        .oauth_enabled = true,
-        .oauth_name = try testing.allocator.dupe(u8, "Corporate Login"),
-        .oauth_login_ref = 17,
-        .owner_id = try testing.allocator.dupe(u8, "state-456"),
+    var claim = try initAnthropicTestClaim(testing.allocator, .{
+        .name = "corp-login",
+        .label = "Corporate Login",
+        .owner_id = "state-456",
         .generation = 6,
-    };
+        .login_ref = 17,
+    });
     defer claim.deinit(testing.allocator);
 
     try syncClaimProvider(testing.allocator, &claim);
@@ -692,16 +718,13 @@ test "dynamic oauth providers mark extension-refresh execution separately" {
     resetDynamicProvidersForTest();
     defer resetDynamicProvidersForTest();
 
-    var claim = provider_mod.ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "corp-refresh"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
-        .oauth_enabled = true,
-        .oauth_name = try testing.allocator.dupe(u8, "Corporate Refresh"),
-        .oauth_refresh_token_ref = 23,
-        .owner_id = try testing.allocator.dupe(u8, "state-789"),
+    var claim = try initAnthropicTestClaim(testing.allocator, .{
+        .name = "corp-refresh",
+        .label = "Corporate Refresh",
+        .owner_id = "state-789",
         .generation = 7,
-    };
+        .refresh_ref = 23,
+    });
     defer claim.deinit(testing.allocator);
 
     try syncClaimProvider(testing.allocator, &claim);
@@ -716,17 +739,14 @@ test "dynamic oauth providers mark extension login and refresh execution separat
     resetDynamicProvidersForTest();
     defer resetDynamicProvidersForTest();
 
-    var claim = provider_mod.ClaimRegistration{
-        .name = try testing.allocator.dupe(u8, "corp-both"),
-        .api = try testing.allocator.dupe(u8, "anthropic-messages"),
-        .base_url = try testing.allocator.dupe(u8, "https://proxy.example"),
-        .oauth_enabled = true,
-        .oauth_name = try testing.allocator.dupe(u8, "Corporate Both"),
-        .oauth_login_ref = 17,
-        .oauth_refresh_token_ref = 29,
-        .owner_id = try testing.allocator.dupe(u8, "state-101"),
+    var claim = try initAnthropicTestClaim(testing.allocator, .{
+        .name = "corp-both",
+        .label = "Corporate Both",
+        .owner_id = "state-101",
         .generation = 8,
-    };
+        .login_ref = 17,
+        .refresh_ref = 29,
+    });
     defer claim.deinit(testing.allocator);
 
     try syncClaimProvider(testing.allocator, &claim);

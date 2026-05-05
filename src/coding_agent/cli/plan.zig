@@ -208,185 +208,147 @@ fn selectSessionTarget(raw: RawRunArgs) SessionSelectionResult {
     return .{ .ok = .{ .target = target, .flag = flag } };
 }
 
+fn expectInteractivePlan(result: PlanResult) !InteractivePlan {
+    return switch (result) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run| switch (run) {
+                .interactive => |interactive| interactive,
+                else => error.ExpectedInteractivePlan,
+            },
+            else => error.ExpectedRunPlan,
+        },
+        .err => error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectBatchPlan(result: PlanResult) !BatchPlan {
+    return switch (result) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run| switch (run) {
+                .batch => |batch| batch,
+                else => error.ExpectedBatchPlan,
+            },
+            else => error.ExpectedRunPlan,
+        },
+        .err => error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectListModelsPlan(result: PlanResult) !ListModelsPlan {
+    return switch (result) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .list_models => |list_models| list_models,
+            else => error.ExpectedListModelsPlan,
+        },
+        .err => error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectPlanDiagnostic(result: PlanResult) !PlanDiagnostic {
+    return switch (result) {
+        .err => |diag| diag,
+        .ok => error.ExpectedDiagnostic,
+    };
+}
+
 test "default run plan is interactive without initial prompt or session target" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const result = try build(arena.allocator(), .{ .run = .{} }, .{});
-    switch (result) {
-        .ok => |plan| switch (plan) {
-            .run => |run| switch (run) {
-                .interactive => |interactive| {
-                    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
-                    try std.testing.expectEqual(@as(usize, 0), interactive.prompt_sources.file_args.len);
-                    try std.testing.expect(interactive.session_target == .none);
-                },
-                else => return error.UnexpectedPlan,
-            },
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    const interactive = try expectInteractivePlan(try build(arena.allocator(), .{ .run = .{} }, .{}));
+    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
+    try std.testing.expectEqual(@as(usize, 0), interactive.prompt_sources.file_args.len);
+    try std.testing.expect(interactive.session_target == .none);
 }
 
 test "planner builds explicit interactive and batch plans from the chosen selectors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const continue_result = try build(arena.allocator(), .{ .run = .{
+    const continue_plan = try expectInteractivePlan(try build(arena.allocator(), .{ .run = .{
         .continue_session = true,
-    } }, .{});
-    switch (continue_result) {
-        .ok => |plan| switch (plan) {
-            .run => |run| switch (run) {
-                .interactive => |interactive| try std.testing.expect(interactive.session_target == .most_recent),
-                else => return error.UnexpectedPlan,
-            },
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    } }, .{}));
+    try std.testing.expect(continue_plan.session_target == .most_recent);
 
-    const session_result = try build(arena.allocator(), .{ .run = .{
+    const session_plan = try expectInteractivePlan(try build(arena.allocator(), .{ .run = .{
         .session_ref = "session-1234",
-    } }, .{});
-    switch (session_result) {
-        .ok => |plan| switch (plan) {
-            .run => |run| switch (run) {
-                .interactive => |interactive| switch (interactive.session_target) {
-                    .reference => |ref| try std.testing.expectEqualStrings("session-1234", ref),
-                    else => return error.UnexpectedPlan,
-                },
-                else => return error.UnexpectedPlan,
-            },
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
+    } }, .{}));
+    switch (session_plan.session_target) {
+        .reference => |ref| try std.testing.expectEqualStrings("session-1234", ref),
+        else => return error.UnexpectedPlan,
     }
 
-    const batch_result = try build(arena.allocator(), .{ .run = .{
+    const batch = try expectBatchPlan(try build(arena.allocator(), .{ .run = .{
         .mode = .json,
         .positionals = &.{"hello"},
-    } }, .{});
-    switch (batch_result) {
-        .ok => |plan| switch (plan) {
-            .run => |run| switch (run) {
-                .batch => |batch| {
-                    try std.testing.expectEqual(OutputMode.json, batch.output);
-                    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
-                    try std.testing.expect(batch.prompt_sources.stdin_text == null);
-                    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
-                },
-                else => return error.UnexpectedPlan,
-            },
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    } }, .{}));
+    try std.testing.expectEqual(OutputMode.json, batch.output);
+    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
+    try std.testing.expect(batch.prompt_sources.stdin_text == null);
+    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
 }
 
 test "list-models plan carries optional search and rejects extra positionals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const default_result = try build(arena.allocator(), .{ .list_models = .{} }, .{});
-    switch (default_result) {
-        .ok => |plan| switch (plan) {
-            .list_models => |list_models| try std.testing.expect(list_models.search == null),
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    const default_plan = try expectListModelsPlan(try build(arena.allocator(), .{ .list_models = .{} }, .{}));
+    try std.testing.expect(default_plan.search == null);
 
-    const search_result = try build(arena.allocator(), .{ .list_models = .{ .positionals = &.{"claude"} } }, .{});
-    switch (search_result) {
-        .ok => |plan| switch (plan) {
-            .list_models => |list_models| try std.testing.expectEqualStrings("claude", list_models.search.?),
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    const search_plan = try expectListModelsPlan(try build(arena.allocator(), .{ .list_models = .{ .positionals = &.{"claude"} } }, .{}));
+    try std.testing.expectEqualStrings("claude", search_plan.search.?);
 
-    const too_many = try build(arena.allocator(), .{ .list_models = .{ .positionals = &.{ "claude", "sonnet" } } }, .{});
-    switch (too_many) {
-        .err => |diag| switch (diag) {
-            .too_many_list_models_positionals => {},
-            else => return error.UnexpectedDiagnostic,
-        },
-        .ok => return error.ExpectedDiagnostic,
-    }
+    const diag = try expectPlanDiagnostic(try build(arena.allocator(), .{ .list_models = .{ .positionals = &.{ "claude", "sonnet" } } }, .{}));
+    try std.testing.expectEqual(PlanDiagnostic.too_many_list_models_positionals, diag);
 }
 
 test "planner allows interactive file inputs and rejects session-target collisions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const conflicting_selectors = try build(arena.allocator(), .{ .run = .{
+    const conflicting_selectors = try expectPlanDiagnostic(try build(arena.allocator(), .{ .run = .{
         .continue_session = true,
         .resume_picker = true,
-    } }, .{});
+    } }, .{}));
     switch (conflicting_selectors) {
-        .err => |diag| switch (diag) {
-            .conflicting_session_selectors => |combo| {
-                try std.testing.expectEqualStrings("--continue", combo.first);
-                try std.testing.expectEqualStrings("--resume", combo.second);
-            },
-            else => return error.UnexpectedDiagnostic,
+        .conflicting_session_selectors => |combo| {
+            try std.testing.expectEqualStrings("--continue", combo.first);
+            try std.testing.expectEqualStrings("--resume", combo.second);
         },
-        .ok => return error.ExpectedDiagnostic,
+        else => return error.UnexpectedDiagnostic,
     }
 
-    const prompt_and_target = try build(arena.allocator(), .{ .run = .{
+    const prompt_and_target = try expectPlanDiagnostic(try build(arena.allocator(), .{ .run = .{
         .session_ref = "session-1234",
         .positionals = &.{"hello"},
-    } }, .{});
+    } }, .{}));
     switch (prompt_and_target) {
-        .err => |diag| switch (diag) {
-            .prompt_not_allowed_for_session_target => |flag| try std.testing.expectEqualStrings("--session", flag),
-            else => return error.UnexpectedDiagnostic,
-        },
-        .ok => return error.ExpectedDiagnostic,
+        .prompt_not_allowed_for_session_target => |flag| try std.testing.expectEqualStrings("--session", flag),
+        else => return error.UnexpectedDiagnostic,
     }
 
-    const file_args_in_interactive = try build(arena.allocator(), .{ .run = .{
+    const file_args_in_interactive = try expectInteractivePlan(try build(arena.allocator(), .{ .run = .{
         .file_args = &.{"docs/README.md"},
-    } }, .{});
-    switch (file_args_in_interactive) {
-        .ok => |execution_plan| switch (execution_plan) {
-            .run => |run| switch (run) {
-                .interactive => |interactive| {
-                    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
-                    try std.testing.expectEqual(@as(usize, 1), interactive.prompt_sources.file_args.len);
-                    try std.testing.expectEqualStrings("docs/README.md", interactive.prompt_sources.file_args[0]);
-                },
-                else => return error.UnexpectedPlan,
-            },
-            else => return error.UnexpectedPlan,
-        },
-        .err => return error.UnexpectedDiagnostic,
-    }
+    } }, .{}));
+    try std.testing.expect(file_args_in_interactive.prompt_sources.prompt_text == null);
+    try std.testing.expectEqual(@as(usize, 1), file_args_in_interactive.prompt_sources.file_args.len);
+    try std.testing.expectEqualStrings("docs/README.md", file_args_in_interactive.prompt_sources.file_args[0]);
 
-    const file_args_and_target = try build(arena.allocator(), .{ .run = .{
+    const file_args_and_target = try expectPlanDiagnostic(try build(arena.allocator(), .{ .run = .{
         .continue_session = true,
         .file_args = &.{"docs/README.md"},
-    } }, .{});
+    } }, .{}));
     switch (file_args_and_target) {
-        .err => |diag| switch (diag) {
-            .prompt_not_allowed_for_session_target => |flag| try std.testing.expectEqualStrings("--continue", flag),
-            else => return error.UnexpectedDiagnostic,
-        },
-        .ok => return error.ExpectedDiagnostic,
+        .prompt_not_allowed_for_session_target => |flag| try std.testing.expectEqualStrings("--continue", flag),
+        else => return error.UnexpectedDiagnostic,
     }
 
-    const batch_and_target = try build(arena.allocator(), .{ .run = .{
+    const batch_and_target = try expectPlanDiagnostic(try build(arena.allocator(), .{ .run = .{
         .print_mode = true,
         .continue_session = true,
-    } }, .{});
+    } }, .{}));
     switch (batch_and_target) {
-        .err => |diag| switch (diag) {
-            .session_target_requires_interactive => |flag| try std.testing.expectEqualStrings("--continue", flag),
-            else => return error.UnexpectedDiagnostic,
-        },
-        .ok => return error.ExpectedDiagnostic,
+        .session_target_requires_interactive => |flag| try std.testing.expectEqualStrings("--continue", flag),
+        else => return error.UnexpectedDiagnostic,
     }
 }

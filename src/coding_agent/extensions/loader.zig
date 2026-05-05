@@ -432,6 +432,38 @@ fn sourceKindString(source: ExtensionSource) []const u8 {
 const api = @import("api.zig");
 const dispatch_mod = @import("dispatch.zig");
 
+fn runtimeRoot(source: ExtensionSource, path: []const u8) StaticExtensionRoot {
+    return .{
+        .source = source,
+        .path = path,
+        .kind = .runtime_root,
+        .runtime_root_id = path,
+        .state_owner_id = path,
+    };
+}
+
+fn syntheticRoot(source: ExtensionSource, path: []const u8) StaticExtensionRoot {
+    return .{
+        .source = source,
+        .path = path,
+        .kind = .synthetic_extension,
+        .runtime_root_id = path,
+        .state_owner_id = path,
+    };
+}
+
+fn expectLoadStats(stats: LoadStats, attempted: u32, loaded: u32, failed: u32) !void {
+    try std.testing.expectEqual(attempted, stats.attempted);
+    try std.testing.expectEqual(loaded, stats.loaded);
+    try std.testing.expectEqual(failed, stats.failed);
+}
+
+fn installLoaderTestRuntime(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    runner.attachLuaState(state);
+    api.installZiTable(state, runner);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+}
+
 test "discover finds runtime extensions and preserves explicit-before-runtime precedence" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -451,7 +483,7 @@ test "discover finds runtime extensions and preserves explicit-before-runtime pr
     defer allocator.free(explicit_path);
 
     const roots = [_]StaticExtensionRoot{
-        .{ .source = .explicit, .path = explicit_path, .kind = .synthetic_extension, .runtime_root_id = explicit_path, .state_owner_id = explicit_path },
+        syntheticRoot(.explicit, explicit_path),
         .{ .source = .user, .path = tmp_path, .kind = .runtime_root, .runtime_root_id = tmp_path, .state_owner_id = tmp_path },
     };
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
@@ -483,7 +515,7 @@ test "discover maps synthetic bundled extensions to init.lua with parent directo
 
     const bundle_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "bundle_ext", allocator);
     defer allocator.free(bundle_path);
-    const roots = [_]StaticExtensionRoot{.{ .source = .explicit, .path = bundle_path, .kind = .synthetic_extension, .runtime_root_id = bundle_path, .state_owner_id = bundle_path }};
+    const roots = [_]StaticExtensionRoot{syntheticRoot(.explicit, bundle_path)};
 
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
@@ -510,13 +542,7 @@ test "loadAll isolates extension errors and loads healthy siblings" {
     const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
+    const roots = [_]StaticExtensionRoot{runtimeRoot(.user, tmp_path)};
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
@@ -525,14 +551,9 @@ test "loadAll isolates extension errors and loads healthy siblings" {
 
     var runner = runner_mod.ExtensionRunner.init(allocator, 0);
     defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    installLoaderTestRuntime(&state, &runner);
     const stats = loadAll(allocator, &state, &runner, exts, &.{});
-    try std.testing.expectEqual(@as(u32, 3), stats.attempted);
-    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
-    try std.testing.expectEqual(@as(u32, 2), stats.failed);
+    try expectLoadStats(stats, 3, 1, 2);
 
     try state.doString("assert(_good == 42)", "verify");
 }
@@ -553,13 +574,7 @@ test "loadAll stamps provenance on top-level registrations outside factory" {
     const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
+    const roots = [_]StaticExtensionRoot{runtimeRoot(.user, tmp_path)};
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
@@ -568,9 +583,7 @@ test "loadAll stamps provenance on top-level registrations outside factory" {
 
     var runner = runner_mod.ExtensionRunner.init(allocator, 0);
     defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    api.installZiTable(&state, &runner);
+    installLoaderTestRuntime(&state, &runner);
 
     const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
@@ -604,13 +617,7 @@ test "bundled extension requires private helper resolved from directory module r
     const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
+    const roots = [_]StaticExtensionRoot{runtimeRoot(.user, tmp_path)};
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
@@ -619,9 +626,7 @@ test "bundled extension requires private helper resolved from directory module r
 
     var runner = runner_mod.ExtensionRunner.init(allocator, 0);
     defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    installLoaderTestRuntime(&state, &runner);
 
     const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
@@ -649,13 +654,7 @@ test "shared lua root resolves before later root in canonical order" {
     const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
+    const roots = [_]StaticExtensionRoot{runtimeRoot(.user, tmp_path)};
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
@@ -703,13 +702,7 @@ test "event handler dispatch inherits extension module context for require" {
     const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
+    const roots = [_]StaticExtensionRoot{runtimeRoot(.user, tmp_path)};
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
@@ -718,9 +711,7 @@ test "event handler dispatch inherits extension module context for require" {
 
     var runner = runner_mod.ExtensionRunner.init(allocator, 0);
     defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    installLoaderTestRuntime(&state, &runner);
 
     const stats = loadAll(allocator, &state, &runner, exts, &.{});
     try std.testing.expectEqual(@as(u32, 1), stats.loaded);
@@ -763,9 +754,7 @@ test "builtin tools register with builtin source through extension loader" {
     var runner = runner_mod.ExtensionRunner.init(allocator, 0);
     defer runner.deinit();
     runner.builtin_tool_definitions = builtin_defs;
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    installLoaderTestRuntime(&state, &runner);
 
     const ext = LoadedExtension{
         .id = try allocator.dupe(u8, "builtins"),
@@ -787,9 +776,7 @@ test "builtin tools register with builtin source through extension loader" {
     }
 
     const stats = loadAll(allocator, &state, &runner, &.{ext}, builtin_defs);
-    try std.testing.expectEqual(@as(u32, 1), stats.attempted);
-    try std.testing.expectEqual(@as(u32, 1), stats.loaded);
-    try std.testing.expectEqual(@as(u32, 0), stats.failed);
+    try expectLoadStats(stats, 1, 1, 0);
 
     const tool = runner.tool_registry.get("bash").?;
     try std.testing.expectEqualStrings("builtin", tool.source.kind);
@@ -818,13 +805,7 @@ test "user extension wins precedence over builtin with same name" {
     const tmp_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const roots = [_]StaticExtensionRoot{.{
-        .source = .user,
-        .path = tmp_path,
-        .kind = .runtime_root,
-        .runtime_root_id = tmp_path,
-        .state_owner_id = tmp_path,
-    }};
+    const roots = [_]StaticExtensionRoot{runtimeRoot(.user, tmp_path)};
     const exts = try discover(.{ .allocator = allocator, .roots = &roots });
     defer freeExtensions(allocator, exts);
 
@@ -853,9 +834,7 @@ test "user extension wins precedence over builtin with same name" {
     var runner = runner_mod.ExtensionRunner.init(allocator, 0);
     defer runner.deinit();
     runner.builtin_tool_definitions = builtin_defs;
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    installLoaderTestRuntime(&state, &runner);
 
     const user_stats = loadAll(allocator, &state, &runner, exts, builtin_defs);
     try std.testing.expectEqual(@as(u32, 1), user_stats.loaded);
@@ -880,9 +859,7 @@ test "user extension wins precedence over builtin with same name" {
     }
 
     const builtin_stats = loadAll(allocator, &state, &runner, &.{builtin_ext}, builtin_defs);
-    try std.testing.expectEqual(@as(u32, 1), builtin_stats.attempted);
-    try std.testing.expectEqual(@as(u32, 1), builtin_stats.loaded);
-    try std.testing.expectEqual(@as(u32, 0), builtin_stats.failed);
+    try expectLoadStats(builtin_stats, 1, 1, 0);
 
     const tool = runner.tool_registry.get("bash").?;
     try std.testing.expectEqualStrings("user", tool.source.kind);
@@ -896,9 +873,7 @@ test "builtin registration bridge rejects calls outside builtin load context" {
 
     var runner = runner_mod.ExtensionRunner.init(allocator, 0);
     defer runner.deinit();
-    runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    installLoaderTestRuntime(&state, &runner);
 
     try state.doString(
         \\local ok = pcall(function()

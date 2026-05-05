@@ -292,6 +292,45 @@ fn pngHeader(width: u32, height: u32) [24]u8 {
     };
 }
 
+fn tmpPath(allocator: std.mem.Allocator, tmp: anytype, sub_path: []const u8) ![]u8 {
+    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, sub_path });
+}
+
+fn expectOnlyText(result: protocol.AgentToolResult) ![]const u8 {
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    return switch (result.content[0]) {
+        .text => |text| text.text,
+        else => error.ExpectedTextBlock,
+    };
+}
+
+test "readTextFile numbers requested ranges and caps oversized lines" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const long_line = try allocator.alloc(u8, MAX_LINE_BYTES + 8);
+    defer allocator.free(long_line);
+    @memset(long_line, 'x');
+
+    const data = try std.fmt.allocPrint(allocator, "first\n{s}\nthird\nfourth\n", .{long_line});
+    defer allocator.free(data);
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "story.txt", .data = data });
+
+    const path = try tmpPath(allocator, &tmp, "story.txt");
+    defer allocator.free(path);
+
+    const result = readTextFile(allocator, path, .{ 2, 3 });
+    defer result.free(allocator);
+    const text = try expectOnlyText(result);
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "2: "));
+    try std.testing.expect(std.mem.indexOf(u8, text, "... (line truncated)\n3: third") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "showing lines 2-3 of 5") != null);
+}
+
 test "sniffImageMime detects supported image bytes regardless of extension" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -300,9 +339,7 @@ test "sniffImageMime detects supported image bytes regardless of extension" {
     const png = pngHeader(16, 32);
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "mystery.txt", .data = &png });
 
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(cwd);
-    const path = try std.fs.path.join(allocator, &.{ cwd, "mystery.txt" });
+    const path = try tmpPath(allocator, &tmp, "mystery.txt");
     defer allocator.free(path);
 
     try std.testing.expectEqual(image.Mime.png, (try sniffImageMime(path)).?);
@@ -316,9 +353,7 @@ test "readImage omits oversized inline images when auto-resize is enabled" {
     const png = pngHeader(300, 200);
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "large.png", .data = &png });
 
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(cwd);
-    const path = try std.fs.path.join(allocator, &.{ cwd, "large.png" });
+    const path = try tmpPath(allocator, &tmp, "large.png");
     defer allocator.free(path);
 
     const result = readImage(allocator, path, .png, .{
@@ -329,14 +364,10 @@ test "readImage omits oversized inline images when auto-resize is enabled" {
     });
     defer result.free(allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), result.content.len);
-    switch (result.content[0]) {
-        .text => |text| try std.testing.expectEqualStrings(
-            "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]",
-            text.text,
-        ),
-        else => return error.ExpectedTextBlock,
-    }
+    try std.testing.expectEqualStrings(
+        "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]",
+        try expectOnlyText(result),
+    );
 }
 
 test "readImage attaches original when auto-resize is disabled" {
@@ -347,9 +378,7 @@ test "readImage attaches original when auto-resize is disabled" {
     const png = pngHeader(300, 200);
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "large.png", .data = &png });
 
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(cwd);
-    const path = try std.fs.path.join(allocator, &.{ cwd, "large.png" });
+    const path = try tmpPath(allocator, &tmp, "large.png");
     defer allocator.free(path);
 
     const result = readImage(allocator, path, .png, .{

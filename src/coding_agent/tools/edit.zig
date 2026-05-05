@@ -873,6 +873,98 @@ fn previewLine(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     return buf;
 }
 
+fn freeApplyResult(allocator: std.mem.Allocator, original: []const u8, result: ApplyResult) void {
+    if (result.base.ptr != original.ptr) allocator.free(result.base);
+    allocator.free(result.new_content);
+}
+
+fn expectApplyEdits(
+    original: []const u8,
+    edits: []const EditBlock,
+    expected_base: []const u8,
+    expected_new_content: []const u8,
+) !void {
+    var failure: ?EditFailure = null;
+    const result = try applyEdits(std.testing.allocator, original, edits, &failure);
+    defer freeApplyResult(std.testing.allocator, original, result);
+
+    try std.testing.expect(failure == null);
+    try std.testing.expectEqualStrings(expected_base, result.base);
+    try std.testing.expectEqualStrings(expected_new_content, result.new_content);
+}
+
+fn expectApplyEditError(
+    expected_err: EditError,
+    expected_failure: EditFailure,
+    original: []const u8,
+    edits: []const EditBlock,
+) !void {
+    var failure: ?EditFailure = null;
+    const result = applyEdits(std.testing.allocator, original, edits, &failure);
+    if (result) |success| {
+        freeApplyResult(std.testing.allocator, original, success);
+        return error.ExpectedApplyEditError;
+    } else |err| {
+        try std.testing.expectEqual(expected_err, err);
+        const actual = failure orelse return error.ExpectedFailureContext;
+        try std.testing.expectEqual(expected_failure.edit_index, actual.edit_index);
+        try std.testing.expectEqual(expected_failure.kind, actual.kind);
+        try std.testing.expectEqual(expected_failure.occurrences, actual.occurrences);
+    }
+}
+
+test "applyEdits supports exact, escaped, fuzzy, and batch replacements" {
+    try expectApplyEdits(
+        "one\ntwo\n",
+        &.{.{ .old_str = "two\n", .new_str = "TWO\n", .replace_all = false }},
+        "one\ntwo\n",
+        "one\nTWO\n",
+    );
+
+    try expectApplyEdits(
+        "line one\nline two\n",
+        &.{.{ .old_str = "line one\\nline two\\n", .new_str = "joined\\n", .replace_all = false }},
+        "line one\nline two\n",
+        "joined\n",
+    );
+
+    try expectApplyEdits(
+        "let title = “old”;  \n",
+        &.{.{ .old_str = "let title = \"old\";\n", .new_str = "let title = \"new\";\n", .replace_all = false }},
+        "let title = \"old\";\n",
+        "let title = \"new\";\n",
+    );
+
+    try expectApplyEdits(
+        "alpha\nbeta\ngamma\n",
+        &.{
+            .{ .old_str = "gamma", .new_str = "GAMMA", .replace_all = false },
+            .{ .old_str = "alpha", .new_str = "ALPHA", .replace_all = false },
+        },
+        "alpha\nbeta\ngamma\n",
+        "ALPHA\nbeta\nGAMMA\n",
+    );
+}
+
+test "applyEdits reports ambiguous and overlapping edit context" {
+    try expectApplyEditError(
+        error.Ambiguous,
+        .{ .edit_index = 0, .kind = .ambiguous, .occurrences = 2 },
+        "same\nsame\n",
+        &.{.{ .old_str = "same", .new_str = "changed", .replace_all = false }},
+    );
+
+    try expectApplyEditError(
+        error.Overlap,
+        .{ .edit_index = 1, .kind = .overlap },
+        "abcd",
+        &.{
+            .{ .old_str = "abc", .new_str = "ABC", .replace_all = false },
+            .{ .old_str = "bc", .new_str = "BC", .replace_all = false },
+        },
+    );
+}
+
 test "prepareArguments folds top-level single edit into canonical edits array" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

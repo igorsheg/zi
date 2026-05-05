@@ -489,6 +489,21 @@ fn expectEqualJson(a: std.json.Value, b: std.json.Value) !void {
     try testing.expectEqualStrings(ca, cb);
 }
 
+fn expectObjectCount(value: std.json.Value, expected: usize) !void {
+    try testing.expect(value == .object);
+    try testing.expectEqual(expected, value.object.count());
+}
+
+fn expectObjectString(value: std.json.Value, key: []const u8, expected: []const u8) !void {
+    try testing.expect(value == .object);
+    try testing.expectEqualStrings(expected, value.object.get(key).?.string);
+}
+
+fn expectObjectInteger(value: std.json.Value, key: []const u8, expected: i64) !void {
+    try testing.expect(value == .object);
+    try testing.expectEqual(expected, value.object.get(key).?.integer);
+}
+
 test "complete JSON matches std.json at parser boundaries" {
     const corpus = [_][]const u8{
         \\{"a":1,"b":2.5,"c":"hello","d":true,"e":null,"f":[1,2,3],"g":{"nested":"yes"}}
@@ -516,12 +531,10 @@ test "incomplete JSON returns the committed object/array prefix under Allow.all"
     const alloc = arena.allocator();
 
     const mid_string = try parse(alloc, "{\"path\":\"/foo/ba", .all);
-    try testing.expect(mid_string == .object);
-    try testing.expectEqualStrings("/foo/ba", mid_string.object.get("path").?.string);
+    try expectObjectString(mid_string, "path", "/foo/ba");
 
     const after_colon = try parse(alloc, "{\"k\":", .all);
-    try testing.expect(after_colon == .object);
-    try testing.expectEqual(@as(usize, 0), after_colon.object.count());
+    try expectObjectCount(after_colon, 0);
 
     const after_comma = try parse(alloc, "[1,", .all);
     try testing.expect(after_comma == .array);
@@ -578,14 +591,11 @@ test "parseStreaming is strict-first, partial-second, empty-object fallback" {
     try testing.expectEqual(@as(usize, 0), blank.object.count());
 
     const strict = try parseStreaming(alloc, "{\"a\":1}");
-    try testing.expect(strict == .object);
-    try testing.expectEqual(@as(i64, 1), strict.object.get("a").?.integer);
+    try expectObjectInteger(strict, "a", 1);
 
     const partial = try parseStreaming(alloc, "{\"a\":1,\"b\":\"hel");
-    try testing.expect(partial == .object);
-    try testing.expectEqualStrings("hel", partial.object.get("b").?.string);
+    try expectObjectString(partial, "b", "hel");
 
     const garbage = try parseStreaming(alloc, "@@@not json@@@");
-    try testing.expect(garbage == .object);
-    try testing.expectEqual(@as(usize, 0), garbage.object.count());
+    try expectObjectCount(garbage, 0);
 }

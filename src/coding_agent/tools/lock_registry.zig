@@ -141,6 +141,14 @@ pub fn global() *Registry {
     return &g_registry;
 }
 
+fn initTestRegistry() Registry {
+    return .{ .gpa = std.testing.allocator };
+}
+
+fn expectRegistryDrained(reg: *Registry) !void {
+    try std.testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
+}
+
 test "canonicalizePath resolves missing paths to absolute stable keys" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -152,23 +160,21 @@ test "canonicalizePath resolves missing paths to absolute stable keys" {
     try testing.expect(std.mem.endsWith(u8, canon, "xyz123"));
 }
 
-test "acquireKey release removes stale entries and permits reacquire" {
-    const testing = std.testing;
-    var reg: Registry = .{ .gpa = testing.allocator };
+test "acquireKey removes entries after each release so future acquires are fresh" {
+    var reg = initTestRegistry();
     defer reg.deinit();
 
     const first = try reg.acquireKey("foo");
     reg.release(first);
-    try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
+    try expectRegistryDrained(&reg);
 
     const second = try reg.acquireKey("foo");
     reg.release(second);
-    try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
+    try expectRegistryDrained(&reg);
 }
 
-test "acquireKey serializes duplicate keys across threads" {
-    const testing = std.testing;
-    var reg: Registry = .{ .gpa = testing.allocator };
+test "acquireKey permits only one holder per key across threads" {
+    var reg = initTestRegistry();
     defer reg.deinit();
 
     var in_critical: std.atomic.Value(i32) = .init(0);
@@ -199,23 +205,22 @@ test "acquireKey serializes duplicate keys across threads" {
     t2.join();
     t3.join();
 
-    try testing.expectEqual(@as(i32, 1), max_seen.load(.acquire));
-    try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
+    try std.testing.expectEqual(@as(i32, 1), max_seen.load(.acquire));
+    try expectRegistryDrained(&reg);
 }
 
-test "acquireKey permits distinct keys to be held simultaneously" {
-    const testing = std.testing;
-    var reg: Registry = .{ .gpa = testing.allocator };
+test "acquireKey permits distinct keys to be held at the same time" {
+    var reg = initTestRegistry();
     defer reg.deinit();
 
     const a = try reg.acquireKey("key-a");
     const b = try reg.acquireKey("key-b");
     reg.release(b);
     reg.release(a);
-    try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
+    try expectRegistryDrained(&reg);
 }
 
-test "acquirePath serializes lexical aliases of the same missing file" {
+test "acquirePath canonicalizes lexical aliases before locking" {
     const testing = std.testing;
     const alloc = testing.allocator;
     var reg: Registry = .{ .gpa = alloc };
@@ -251,5 +256,5 @@ test "acquirePath serializes lexical aliases of the same missing file" {
     t.join();
 
     try testing.expect(acquired.load(.acquire));
-    try testing.expectEqual(@as(usize, 0), reg.liveEntryCount());
+    try expectRegistryDrained(&reg);
 }

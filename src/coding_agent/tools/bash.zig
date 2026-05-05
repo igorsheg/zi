@@ -302,6 +302,41 @@ const StreamingCapture = struct {
     }
 };
 
+fn expectTextBlockContains(result: protocol.AgentToolResult, needle_text: []const u8) !void {
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expect(result.content[0] == .text);
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, needle_text) != null);
+}
+
+test "command preprocessing is explicit about cd, background, and git trailers" {
+    try std.testing.expectEqualStrings("sleep 1", stripBackground("sleep 1 &  "));
+    try std.testing.expectEqualStrings("printf '&'", stripBackground("printf '&'"));
+
+    const cd_split = splitCdCommand(" cd '/tmp/my dir' && printf ok ") orelse return error.ExpectedCdSplit;
+    try std.testing.expectEqualStrings("/tmp/my dir", cd_split.cwd);
+    try std.testing.expectEqualStrings("printf ok", cd_split.command);
+
+    const injected = try injectGitTrailers(std.testing.allocator, "git commit -m hi", "session-123");
+    defer std.testing.allocator.free(injected);
+    try std.testing.expectEqualStrings("git commit --trailer \"Session-Id: session-123\" -m hi", injected);
+}
+
+test "permission evaluation uses the first matching Bash rule" {
+    const reject_patterns = [_][]const u8{"rm *"};
+    const rules = [_]PermissionRule{
+        .{ .tool = "Read", .action = .reject },
+        .{ .tool = "Bash", .cmd_patterns = &reject_patterns, .action = .reject, .message = "too destructive" },
+        .{ .tool = "Bash", .action = .allow },
+    };
+
+    const rejected = evaluatePermission("rm -rf tmp", &rules);
+    try std.testing.expectEqual(PermissionAction.reject, rejected.action);
+    try std.testing.expectEqualStrings("too destructive", rejected.message.?);
+
+    const allowed = evaluatePermission("printf safe", &rules);
+    try std.testing.expectEqual(PermissionAction.allow, allowed.action);
+}
+
 test "oneText sanitizes invalid utf-8" {
     const allocator = std.testing.allocator;
     const blocks = oneText(allocator, "bad\xaa\xfftail");
@@ -333,11 +368,9 @@ test "runCommand handles concurrent mixed output without assuming cross-stream o
         const result = runCommand(arena.allocator(), std.Options.debug_io, cmd, "/tmp", 5, protocol.AbortSignal.none, null, null);
 
         try testing.expect(!result.is_error);
-        try testing.expectEqual(@as(usize, 1), result.content.len);
-        try testing.expect(result.content[0] == .text);
-        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "out") != null);
-        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "err") != null);
-        try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "lines truncated") != null);
+        try expectTextBlockContains(result, "out");
+        try expectTextBlockContains(result, "err");
+        try expectTextBlockContains(result, "lines truncated");
     }
 }
 
@@ -386,7 +419,7 @@ test "runCommand emits partial updates while command is still running" {
     try testing.expect(!result.is_error);
     try testing.expect(state.count >= 1);
     try testing.expect(state.saw_partial);
-    try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "second") != null);
+    try expectTextBlockContains(result, "second");
 }
 
 test "runCommand abort kills the spawned process group, not just the shell pid" {
@@ -423,9 +456,7 @@ test "runCommand abort kills the spawned process group, not just the shell pid" 
     const result = runCommand(arena.allocator(), std.Options.debug_io, cmd, "/tmp", 5, signal, null, null);
 
     try testing.expect(result.is_error);
-    try testing.expectEqual(@as(usize, 1), result.content.len);
-    try testing.expect(result.content[0] == .text);
-    try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "command aborted") != null);
+    try expectTextBlockContains(result, "command aborted");
 
     var file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, pid_file, .{});
     defer file.close(std.Options.debug_io);

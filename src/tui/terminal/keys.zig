@@ -500,9 +500,27 @@ fn parseUtf8Char(data: []const u8) ?ParseResult {
     };
 }
 
+fn expectKey(actual: Key, expected: Key) !void {
+    try std.testing.expectEqual(expected.code, actual.code);
+    try std.testing.expectEqual(expected.char, actual.char);
+    try std.testing.expectEqual(expected.ctrl, actual.ctrl);
+    try std.testing.expectEqual(expected.alt, actual.alt);
+    try std.testing.expectEqual(expected.shift, actual.shift);
+}
+
+fn expectParsedKey(data: []const u8, kitty_active: bool, expected: Key) !ParseResult {
+    const result = parseKey(data, kitty_active) orelse return error.ExpectedParsedKey;
+    try expectKey(result.key, expected);
+    return result;
+}
+
+fn expectParsedKeyCode(data: []const u8, expected: KeyCode) !void {
+    _ = try expectParsedKey(data, false, .{ .code = expected });
+}
+
 test "parseKeySpec normalizes modifiers and named keys" {
-    try std.testing.expect(Key.eql(try parseKeySpec("ctrl+f"), .{ .code = .char, .char = 'f', .ctrl = true }));
-    try std.testing.expect(Key.eql(try parseKeySpec("shift+enter"), .{ .code = .enter, .shift = true }));
+    try expectKey(try parseKeySpec("ctrl+f"), .{ .code = .char, .char = 'f', .ctrl = true });
+    try expectKey(try parseKeySpec("shift+enter"), .{ .code = .enter, .shift = true });
     try std.testing.expectError(error.InvalidKeySpec, parseKeySpec("ctrl+"));
 }
 
@@ -572,9 +590,7 @@ test "kitty CSI-u parses codepoints, modifiers, special keys, and releases" {
 }
 
 test "parseKey handles multi-byte UTF-8 characters" {
-    const result = parseKey("é", false).?;
-    try std.testing.expectEqual(KeyCode.char, result.key.code);
-    try std.testing.expectEqual(@as(?u21, 0xE9), result.key.char);
+    const result = try expectParsedKey("é", false, .{ .code = .char, .char = 0xE9 });
     try std.testing.expectEqual(@as(usize, 2), result.len);
 }
 

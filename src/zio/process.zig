@@ -596,25 +596,48 @@ const shell_argv: []const []const u8 = if (builtin.os.tag == .windows)
 else
     &.{ "/bin/sh", "-c" };
 
-test "process.run captures stdout and stderr concurrently" {
+fn skipShellProcessTestsIfUnsupported() !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const argv = [_][]const u8{ shell_argv[0], shell_argv[1], "printf out; printf err >&2" };
+}
 
-    var result = run(allocator, std.Options.debug_io, .{ .argv = &argv });
-    defer result.deinit(allocator);
+fn runShell(script: []const u8, request: Request) Result {
+    var argv = [_][]const u8{ shell_argv[0], shell_argv[1], script };
+    var with_argv = request;
+    with_argv.argv = &argv;
+    return run(std.testing.allocator, std.Options.debug_io, with_argv);
+}
 
-    const completed = switch (result) {
+fn expectCompleted(result: Result) !Completed {
+    return switch (result) {
         .completed => |completed| completed,
-        else => return error.UnexpectedResult,
+        .timeout => error.UnexpectedTimeout,
+        .err => error.UnexpectedProcessError,
     };
+}
+
+fn expectTimeout(result: Result) !TimedOut {
+    return switch (result) {
+        .timeout => |timeout| timeout,
+        .completed => error.UnexpectedProcessCompletion,
+        .err => error.UnexpectedProcessError,
+    };
+}
+
+test "process.run captures both output streams without mixing them" {
+    try skipShellProcessTestsIfUnsupported();
+
+    var result = runShell("printf out; printf err >&2", .{ .argv = &.{} });
+    defer result.deinit(std.testing.allocator);
+
+    const completed = try expectCompleted(result);
     try std.testing.expectEqualSlices(u8, "out", completed.stdout);
     try std.testing.expectEqualSlices(u8, "err", completed.stderr);
 }
 
 test "process.run drains large stdout and stderr concurrently" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
+    try skipShellProcessTestsIfUnsupported();
+    const repeats = 2048;
+    const chunk_len = 64;
     const script =
         "i=0; " ++
         "while [ $i -lt 2048 ]; do " ++
@@ -622,46 +645,32 @@ test "process.run drains large stdout and stderr concurrently" {
         "printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' >&2; " ++
         "i=$((i+1)); " ++
         "done";
-    const argv = [_][]const u8{ shell_argv[0], shell_argv[1], script };
 
-    var result = run(allocator, std.Options.debug_io, .{ .argv = &argv, .timeout_ms = 5000 });
-    defer result.deinit(allocator);
+    var result = runShell(script, .{ .argv = &.{}, .timeout_ms = 5000 });
+    defer result.deinit(std.testing.allocator);
 
-    const completed = switch (result) {
-        .completed => |completed| completed,
-        else => return error.UnexpectedResult,
-    };
-    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stdout.len);
-    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stderr.len);
+    const completed = try expectCompleted(result);
+    try std.testing.expectEqual(@as(usize, repeats * chunk_len), completed.stdout.len);
+    try std.testing.expectEqual(@as(usize, repeats * chunk_len), completed.stderr.len);
 }
 
-test "process.run writes stdin and closes the pipe" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const argv = [_][]const u8{ shell_argv[0], shell_argv[1], "cat" };
+test "process.run writes stdin then closes the child pipe" {
+    try skipShellProcessTestsIfUnsupported();
 
-    var result = run(allocator, std.Options.debug_io, .{ .argv = &argv, .stdin = "hello stdin" });
-    defer result.deinit(allocator);
+    var result = runShell("cat", .{ .argv = &.{}, .stdin = "hello stdin" });
+    defer result.deinit(std.testing.allocator);
 
-    const completed = switch (result) {
-        .completed => |completed| completed,
-        else => return error.UnexpectedResult,
-    };
+    const completed = try expectCompleted(result);
     try std.testing.expectEqualSlices(u8, "hello stdin", completed.stdout);
 }
 
-test "process.run timeout returns partial output" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const argv = [_][]const u8{ shell_argv[0], shell_argv[1], "printf before; sleep 5; printf after" };
+test "process.run timeout preserves output emitted before termination" {
+    try skipShellProcessTestsIfUnsupported();
 
-    var result = run(allocator, std.Options.debug_io, .{ .argv = &argv, .timeout_ms = 100 });
-    defer result.deinit(allocator);
+    var result = runShell("printf before; sleep 5; printf after", .{ .argv = &.{}, .timeout_ms = 100 });
+    defer result.deinit(std.testing.allocator);
 
-    const timed_out = switch (result) {
-        .timeout => |timeout| timeout,
-        else => return error.UnexpectedResult,
-    };
+    const timed_out = try expectTimeout(result);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "before") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "after") == null);
 }

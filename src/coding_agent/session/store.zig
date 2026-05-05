@@ -731,11 +731,36 @@ fn testAssistantMessageWithUsage(allocator: std.mem.Allocator, text: []const u8,
     } };
 }
 
-test "current visible branch includes buffered session metadata before flush" {
+const test_session_json = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n";
+
+fn testSessionDir(tmp: *std.testing.TmpDir) ![:0]u8 {
+    return try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
+}
+
+fn writeTestSession(tmp: *std.testing.TmpDir, data: []const u8) ![:0]u8 {
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "session.jsonl", .data = data });
+    return try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
+}
+
+fn appendMessageOrFail(store: *SessionStore, msg: agent_mod.protocol.AgentMessage) ![]const u8 {
+    return store.appendMessage(msg) orelse error.MissingAppendedEntry;
+}
+
+fn expectUserText(msg: agent_mod.protocol.AgentMessage, expected: []const u8) !void {
+    try std.testing.expect(msg == .user);
+    try std.testing.expectEqualStrings(expected, msg.user.content.text);
+}
+
+fn expectAssistantText(msg: agent_mod.protocol.AgentMessage, expected: []const u8) !void {
+    try std.testing.expect(msg == .assistant);
+    try std.testing.expectEqualStrings(expected, msg.assistant.content[0].text.text);
+}
+
+test "visible branch includes buffered metadata before first flush" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const session_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
+    const session_dir = try testSessionDir(&tmp);
     defer std.testing.allocator.free(session_dir);
 
     var store = SessionStore.create(std.testing.allocator, session_dir, "/tmp/project");
@@ -751,19 +776,14 @@ test "current visible branch includes buffered session metadata before flush" {
     try std.testing.expectEqualStrings("test1", branch[0].entry.session_info.name.?);
 }
 
-test "openForResume returns resume context and transfers store ownership" {
+test "openForResume builds context and lets caller take the store" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = "session.jsonl",
-        .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
-            "{\"type\":\"model_change\",\"id\":\"m0\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:00Z\",\"provider\":\"anthropic\",\"modelId\":\"claude\"}\n" ++
-            "{\"type\":\"thinking_level_change\",\"id\":\"t0\",\"parentId\":\"m0\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"thinkingLevel\":\"high\"}\n" ++
-            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":\"t0\",\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
-    });
-
-    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
+    const path = try writeTestSession(&tmp, test_session_json ++
+        "{\"type\":\"model_change\",\"id\":\"m0\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:00Z\",\"provider\":\"anthropic\",\"modelId\":\"claude\"}\n" ++
+        "{\"type\":\"thinking_level_change\",\"id\":\"t0\",\"parentId\":\"m0\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"thinkingLevel\":\"high\"}\n" ++
+        "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":\"t0\",\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n");
     defer std.testing.allocator.free(path);
 
     var opened = try SessionStore.openForResume(std.testing.allocator, path);
@@ -774,7 +794,7 @@ test "openForResume returns resume context and transfers store ownership" {
     try std.testing.expect(opened.model != null);
     try std.testing.expectEqualStrings("anthropic", opened.model.?.provider);
     try std.testing.expectEqualStrings("claude", opened.model.?.model_id);
-    try std.testing.expectEqualStrings("hi", opened.messages[0].user.content.text);
+    try expectUserText(opened.messages[0], "hi");
 
     var resumed_store = opened.takeStore();
     defer resumed_store.deinit();
@@ -782,21 +802,21 @@ test "openForResume returns resume context and transfers store ownership" {
     try std.testing.expectEqualStrings("u1", resumed_store.currentEntryId().?);
 }
 
-test "append after flush persists entries larger than fixed scratch buffer" {
+test "flushed sessions persist large appended messages" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const session_dir = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", std.testing.allocator);
+    const session_dir = try testSessionDir(&tmp);
     defer std.testing.allocator.free(session_dir);
 
     var store = SessionStore.create(std.testing.allocator, session_dir, "/tmp/project");
     errdefer store.deinit();
 
-    _ = store.appendMessage(testUserMessage("first", 1)) orelse return error.MissingUserEntry;
+    _ = try appendMessageOrFail(&store, testUserMessage("first", 1));
 
     const first_assistant = try testAssistantMessageWithUsage(std.testing.allocator, "ok", 10, 2);
     defer std.testing.allocator.free(first_assistant.assistant.content);
-    _ = store.appendMessage(first_assistant) orelse return error.MissingAssistantEntry;
+    _ = try appendMessageOrFail(&store, first_assistant);
 
     const large_text = try std.testing.allocator.alloc(u8, 8192);
     defer std.testing.allocator.free(large_text);
@@ -804,11 +824,11 @@ test "append after flush persists entries larger than fixed scratch buffer" {
 
     const large_assistant = try testAssistantMessageWithUsage(std.testing.allocator, large_text, 20, 3);
     defer std.testing.allocator.free(large_assistant.assistant.content);
-    const large_id = store.appendMessage(large_assistant) orelse return error.MissingLargeAssistantEntry;
+    const large_id = try appendMessageOrFail(&store, large_assistant);
     const large_id_copy = try std.testing.allocator.dupe(u8, large_id);
     defer std.testing.allocator.free(large_id_copy);
 
-    _ = store.appendMessage(testUserMessage("after large", 4)) orelse return error.MissingTrailingUserEntry;
+    _ = try appendMessageOrFail(&store, testUserMessage("after large", 4));
 
     const path = try std.testing.allocator.dupe(u8, store.sessionFile());
     defer std.testing.allocator.free(path);
@@ -818,10 +838,10 @@ test "append after flush persists entries larger than fixed scratch buffer" {
     defer opened.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), opened.messages.len);
-    try std.testing.expectEqualStrings("first", opened.messages[0].user.content.text);
-    try std.testing.expectEqualStrings("ok", opened.messages[1].assistant.content[0].text.text);
+    try expectUserText(opened.messages[0], "first");
+    try expectAssistantText(opened.messages[1], "ok");
     try std.testing.expectEqual(@as(usize, large_text.len), opened.messages[2].assistant.content[0].text.text.len);
-    try std.testing.expectEqualStrings("after large", opened.messages[3].user.content.text);
+    try expectUserText(opened.messages[3], "after large");
 
     const branch = try opened.store.?.buildCurrentBranchAlloc(std.testing.allocator);
     defer std.testing.allocator.free(branch);
@@ -829,7 +849,7 @@ test "append after flush persists entries larger than fixed scratch buffer" {
     try std.testing.expectEqualStrings(large_id_copy, branch[branch.len - 1].parent_id.?);
 }
 
-test "applyCompaction preserves artifact fields and rebuilds current context" {
+test "applyCompaction stores artifact fields and rebuilds compacted context" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -865,7 +885,7 @@ test "applyCompaction preserves artifact fields and rebuilds current context" {
     try std.testing.expectEqualStrings("third", rebuilt_with_later.messages[2].user.content.text);
 }
 
-test "contextUsageUnknownAfterCompaction tracks post-compaction assistant usage" {
+test "contextUsageUnknownAfterCompaction is true until assistant reports usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -887,17 +907,12 @@ test "contextUsageUnknownAfterCompaction tracks post-compaction assistant usage"
     try std.testing.expect(!store.contextUsageUnknownAfterCompaction(allocator));
 }
 
-test "open owns writer state and cache invalidation works with arena allocator" {
+test "open keeps cache and writer state alive after caller arena changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.Options.debug_io, .{
-        .sub_path = "session.jsonl",
-        .data = "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n" ++
-            "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
-    });
-
-    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
+    const path = try writeTestSession(&tmp, test_session_json ++
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n");
     defer std.testing.allocator.free(path);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -1056,7 +1056,105 @@ fn makeLifecycleLoggerSource(
     return std.fmt.allocPrint(allocator, template, .{ log_path, extension_name });
 }
 
-test "runtime host rejects self-resume and only replaces with a different persisted session" {
+const LifecycleLogLine = struct { fields: [13][]const u8 };
+
+fn readNonEmptyLines(allocator: std.mem.Allocator, path: []const u8) !std.ArrayListUnmanaged([]u8) {
+    const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{});
+    defer file.close(std.Options.debug_io);
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(std.Options.debug_io, &read_buf);
+    const raw = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    defer allocator.free(raw);
+
+    var lines: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        deinitLines(allocator, &lines);
+    }
+
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try lines.append(allocator, try allocator.dupe(u8, line));
+    }
+    return lines;
+}
+
+fn deinitLines(allocator: std.mem.Allocator, lines: *std.ArrayListUnmanaged([]u8)) void {
+    for (lines.items) |line| allocator.free(line);
+    lines.deinit(allocator);
+}
+
+fn parseLifecycleLogLine(input: []const u8) !LifecycleLogLine {
+    var out: [13][]const u8 = undefined;
+    var i: usize = 0;
+    var it = std.mem.splitScalar(u8, input, '|');
+    while (it.next()) |field| {
+        if (i >= out.len) return error.TooManyFields;
+        out[i] = field;
+        i += 1;
+    }
+    if (i != out.len) return error.NotEnoughFields;
+    return .{ .fields = out };
+}
+
+fn expectLifecycleLogLine(parsed: LifecycleLogLine, expected: struct {
+    ext: []const u8,
+    event_type: []const u8,
+    reason: []const u8,
+    runtime_root: []const u8,
+    workspace: []const u8,
+    generation: []const u8,
+    related_kind: []const u8,
+    related_workspace: []const u8,
+}) !void {
+    try testing.expectEqualStrings(expected.ext, parsed.fields[0]);
+    try testing.expectEqualStrings(expected.event_type, parsed.fields[1]);
+    try testing.expectEqualStrings(expected.reason, parsed.fields[2]);
+    try testing.expectEqualStrings("1", parsed.fields[3]);
+    try testing.expectEqualStrings(expected.runtime_root, parsed.fields[4]);
+
+    const expected_state_owner = try std.fmt.allocPrint(testing.allocator, "{s}::{s}", .{ expected.runtime_root, expected.ext });
+    defer testing.allocator.free(expected_state_owner);
+    try testing.expectEqualStrings(expected_state_owner, parsed.fields[5]);
+    try testing.expectEqualStrings(expected.workspace, parsed.fields[6]);
+
+    const expected_namespace = try std.fmt.allocPrint(testing.allocator, "{s}::{s}", .{ expected_state_owner, expected.generation });
+    defer testing.allocator.free(expected_namespace);
+    try testing.expectEqualStrings(expected_namespace, parsed.fields[7]);
+
+    try testing.expectEqualStrings(expected.generation, parsed.fields[8]);
+    try testing.expect(parsed.fields[9].len > 0);
+    try testing.expectEqualStrings("1", parsed.fields[10]);
+    try testing.expectEqualStrings(expected.related_kind, parsed.fields[11]);
+    try testing.expectEqualStrings(expected.related_workspace, parsed.fields[12]);
+}
+
+fn expectSuccessfulCompaction(
+    collector: *const LifecycleCollector,
+    spy: *const CompactionSpy,
+    reason: CompactionReason,
+    will_retry: bool,
+) !void {
+    try testing.expectEqual(@as(usize, 1), spy.calls.items.len);
+    try testing.expectEqual(reason, spy.calls.items[0]);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
+    try testing.expectEqual(reason, collector.compaction_starts.items[0].reason);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts_seen_before_first_end);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
+    try testing.expectEqual(reason, collector.compaction_ends.items[0].reason);
+    try testing.expect(collector.compaction_ends.items[0].success);
+    try testing.expect(!collector.compaction_ends.items[0].aborted);
+    try testing.expect(collector.compaction_ends.items[0].result != null);
+    try testing.expectEqual(will_retry, collector.compaction_ends.items[0].will_retry);
+}
+
+fn expectAssistantText(session: *const AgentSession, expected: []const u8) !void {
+    try testing.expectEqual(@as(usize, 2), session.agent.messages().len);
+    try testing.expectEqualStrings(expected, session.agent.messages()[1].assistant.content[0].text.text);
+}
+
+test "runtime host keeps current session on self-resume and replaces with different session" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
@@ -1103,7 +1201,7 @@ test "runtime host rejects self-resume and only replaces with a different persis
     try testing.expectEqualStrings(initial_session_id, host.currentSession().session_store.sessionId());
 }
 
-test "runtime host emits truthful session lifecycle events across startup new resume and exit" {
+test "runtime host lifecycle events include truthful workspace generation and relation metadata" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1142,34 +1240,9 @@ test "runtime host emits truthful session lifecycle events across startup new re
 
     try host.newSession();
 
-    const readLines = struct {
-        fn run(alloc: std.mem.Allocator, path_: []const u8) !std.ArrayListUnmanaged([]u8) {
-            const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, path_, .{});
-            defer file.close(std.Options.debug_io);
-            var read_buf: [4096]u8 = undefined;
-            var reader = file.reader(std.Options.debug_io, &read_buf);
-            const raw = try reader.interface.allocRemaining(alloc, .limited(1024 * 1024));
-            defer alloc.free(raw);
-
-            var lines: std.ArrayListUnmanaged([]u8) = .empty;
-            errdefer {
-                for (lines.items) |line| alloc.free(line);
-                lines.deinit(alloc);
-            }
-
-            var it = std.mem.splitScalar(u8, raw, '\n');
-            while (it.next()) |line| {
-                if (line.len == 0) continue;
-                try lines.append(alloc, try alloc.dupe(u8, line));
-            }
-            return lines;
-        }
-    };
-
-    var lines_before_failed_resume = try readLines.run(allocator, log_path);
+    var lines_before_failed_resume = try readNonEmptyLines(allocator, log_path);
     defer {
-        for (lines_before_failed_resume.items) |line| allocator.free(line);
-        lines_before_failed_resume.deinit(allocator);
+        deinitLines(allocator, &lines_before_failed_resume);
     }
     try testing.expectEqual(@as(usize, 6), lines_before_failed_resume.items.len);
 
@@ -1177,10 +1250,9 @@ test "runtime host emits truthful session lifecycle events across startup new re
     defer allocator.free(missing_resume);
     try testing.expectError(error.FileNotFound, host.resumeSession(missing_resume, false));
 
-    var lines_after_failed_resume = try readLines.run(allocator, log_path);
+    var lines_after_failed_resume = try readNonEmptyLines(allocator, log_path);
     defer {
-        for (lines_after_failed_resume.items) |line| allocator.free(line);
-        lines_after_failed_resume.deinit(allocator);
+        deinitLines(allocator, &lines_after_failed_resume);
     }
     try testing.expectEqual(lines_before_failed_resume.items.len, lines_after_failed_resume.items.len);
 
@@ -1193,72 +1265,24 @@ test "runtime host emits truthful session lifecycle events across startup new re
     _ = try host.resumeSession(resume_path, false);
     host.deinit();
 
-    var lines = try readLines.run(allocator, log_path);
+    var lines = try readNonEmptyLines(allocator, log_path);
     defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
+        deinitLines(allocator, &lines);
     }
     try testing.expectEqual(@as(usize, 12), lines.items.len);
 
-    const Parsed = struct { fields: [13][]const u8 };
-    const parse = struct {
-        fn line(input: []const u8) !Parsed {
-            var out: [13][]const u8 = undefined;
-            var i: usize = 0;
-            var it = std.mem.splitScalar(u8, input, '|');
-            while (it.next()) |field| {
-                if (i >= out.len) return error.TooManyFields;
-                out[i] = field;
-                i += 1;
-            }
-            if (i != out.len) return error.NotEnoughFields;
-            return .{ .fields = out };
-        }
-    };
-
-    const expectLine = struct {
-        fn run(parsed: Parsed, expected: struct {
-            ext: []const u8,
-            event_type: []const u8,
-            reason: []const u8,
-            runtime_root: []const u8,
-            workspace: []const u8,
-            generation: []const u8,
-            related_kind: []const u8,
-            related_workspace: []const u8,
-        }) !void {
-            try testing.expectEqualStrings(expected.ext, parsed.fields[0]);
-            try testing.expectEqualStrings(expected.event_type, parsed.fields[1]);
-            try testing.expectEqualStrings(expected.reason, parsed.fields[2]);
-            try testing.expectEqualStrings("1", parsed.fields[3]);
-            try testing.expectEqualStrings(expected.runtime_root, parsed.fields[4]);
-            const expected_state_owner = try std.fmt.allocPrint(testing.allocator, "{s}::{s}", .{ expected.runtime_root, expected.ext });
-            defer testing.allocator.free(expected_state_owner);
-            try testing.expectEqualStrings(expected_state_owner, parsed.fields[5]);
-            try testing.expectEqualStrings(expected.workspace, parsed.fields[6]);
-            const expected_namespace = try std.fmt.allocPrint(testing.allocator, "{s}::{s}", .{ expected_state_owner, expected.generation });
-            defer testing.allocator.free(expected_namespace);
-            try testing.expectEqualStrings(expected_namespace, parsed.fields[7]);
-            try testing.expectEqualStrings(expected.generation, parsed.fields[8]);
-            try testing.expect(parsed.fields[9].len > 0);
-            try testing.expectEqualStrings("1", parsed.fields[10]);
-            try testing.expectEqualStrings(expected.related_kind, parsed.fields[11]);
-            try testing.expectEqualStrings(expected.related_workspace, parsed.fields[12]);
-        }
-    };
-
-    try expectLine.run(try parse.line(lines.items[0]), .{ .ext = "explicit", .event_type = "session_start", .reason = "startup", .runtime_root = shared_root, .workspace = workspace_a, .generation = "0", .related_kind = "previous", .related_workspace = "" });
-    try expectLine.run(try parse.line(lines.items[1]), .{ .ext = "project", .event_type = "session_start", .reason = "startup", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "0", .related_kind = "previous", .related_workspace = "" });
-    try expectLine.run(try parse.line(lines.items[2]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "new", .runtime_root = shared_root, .workspace = workspace_a, .generation = "0", .related_kind = "next", .related_workspace = workspace_a });
-    try expectLine.run(try parse.line(lines.items[3]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "new", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "0", .related_kind = "next", .related_workspace = workspace_a });
-    try expectLine.run(try parse.line(lines.items[4]), .{ .ext = "explicit", .event_type = "session_start", .reason = "new", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
-    try expectLine.run(try parse.line(lines.items[5]), .{ .ext = "project", .event_type = "session_start", .reason = "new", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
-    try expectLine.run(try parse.line(lines.items[6]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = workspace_b });
-    try expectLine.run(try parse.line(lines.items[7]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "resume", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = workspace_b });
-    try expectLine.run(try parse.line(lines.items[8]), .{ .ext = "explicit", .event_type = "session_start", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = workspace_a });
-    try expectLine.run(try parse.line(lines.items[9]), .{ .ext = "project", .event_type = "session_start", .reason = "resume", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = workspace_a });
-    try expectLine.run(try parse.line(lines.items[10]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "exit", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
-    try expectLine.run(try parse.line(lines.items[11]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "exit", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[0]), .{ .ext = "explicit", .event_type = "session_start", .reason = "startup", .runtime_root = shared_root, .workspace = workspace_a, .generation = "0", .related_kind = "previous", .related_workspace = "" });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[1]), .{ .ext = "project", .event_type = "session_start", .reason = "startup", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "0", .related_kind = "previous", .related_workspace = "" });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[2]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "new", .runtime_root = shared_root, .workspace = workspace_a, .generation = "0", .related_kind = "next", .related_workspace = workspace_a });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[3]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "new", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "0", .related_kind = "next", .related_workspace = workspace_a });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[4]), .{ .ext = "explicit", .event_type = "session_start", .reason = "new", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[5]), .{ .ext = "project", .event_type = "session_start", .reason = "new", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "previous", .related_workspace = workspace_a });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[6]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = workspace_b });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[7]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "resume", .runtime_root = project_root_a, .workspace = workspace_a, .generation = "1", .related_kind = "next", .related_workspace = workspace_b });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[8]), .{ .ext = "explicit", .event_type = "session_start", .reason = "resume", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = workspace_a });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[9]), .{ .ext = "project", .event_type = "session_start", .reason = "resume", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "previous", .related_workspace = workspace_a });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[10]), .{ .ext = "explicit", .event_type = "session_shutdown", .reason = "exit", .runtime_root = shared_root, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
+    try expectLifecycleLogLine(try parseLifecycleLogLine(lines.items[11]), .{ .ext = "project", .event_type = "session_shutdown", .reason = "exit", .runtime_root = project_root_b, .workspace = workspace_b, .generation = "2", .related_kind = "next", .related_workspace = "" });
 }
 
 test "runtime host publishes committed view and queued snapshots independently" {
@@ -1363,8 +1387,7 @@ test "runtime host retries transient assistant failures and prunes the failed as
     try testing.expectEqual(@as(u32, 1), collector.retry_starts.items[0].attempt);
     try testing.expectEqual(@as(u32, 1), collector.retry_ends.items[0].attempt);
     try testing.expect(collector.retry_ends.items[0].success);
-    try testing.expectEqual(@as(usize, 2), host.currentSession().agent.messages().len);
-    try testing.expectEqualStrings("recovered", host.currentSession().agent.messages()[1].assistant.content[0].text.text);
+    try expectAssistantText(host.currentSession(), "recovered");
 }
 
 test "runtime host recovers overflow with one compaction pass before retrying continue" {
@@ -1408,19 +1431,9 @@ test "runtime host recovers overflow with one compaction pass before retrying co
 
     try testing.expectEqual(RunOutcome.success, outcome);
     try testing.expectEqual(@as(usize, 2), fp.call_count);
-    try testing.expectEqual(@as(usize, 1), compaction_spy.calls.items.len);
-    try testing.expectEqual(CompactionReason.overflow, compaction_spy.calls.items[0]);
-    try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
-    try testing.expectEqual(CompactionReason.overflow, collector.compaction_starts.items[0].reason);
-    try testing.expectEqual(@as(usize, 1), collector.compaction_starts_seen_before_first_end);
-    try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
-    try testing.expect(collector.compaction_ends.items[0].success);
-    try testing.expect(!collector.compaction_ends.items[0].aborted);
-    try testing.expect(collector.compaction_ends.items[0].result != null);
-    try testing.expect(collector.compaction_ends.items[0].will_retry);
+    try expectSuccessfulCompaction(&collector, &compaction_spy, .overflow, true);
     try testing.expectEqual(@as(usize, 0), collector.retry_starts.items.len);
-    try testing.expectEqual(@as(usize, 2), host.currentSession().agent.messages().len);
-    try testing.expectEqualStrings("after compaction", host.currentSession().agent.messages()[1].assistant.content[0].text.text);
+    try expectAssistantText(host.currentSession(), "after compaction");
 }
 
 test "runtime host runs threshold compaction after successful turn when context exceeds threshold" {
@@ -1475,17 +1488,7 @@ test "runtime host runs threshold compaction after successful turn when context 
     const outcome = try host.runUserContent(.{ .text = "hi" });
 
     try testing.expectEqual(RunOutcome.success, outcome);
-    try testing.expectEqual(@as(usize, 1), compaction_spy.calls.items.len);
-    try testing.expectEqual(CompactionReason.threshold, compaction_spy.calls.items[0]);
-    try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
-    try testing.expectEqual(CompactionReason.threshold, collector.compaction_starts.items[0].reason);
-    try testing.expectEqual(@as(usize, 1), collector.compaction_starts_seen_before_first_end);
-    try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
-    try testing.expectEqual(CompactionReason.threshold, collector.compaction_ends.items[0].reason);
-    try testing.expect(collector.compaction_ends.items[0].success);
-    try testing.expect(!collector.compaction_ends.items[0].aborted);
-    try testing.expect(collector.compaction_ends.items[0].result != null);
-    try testing.expect(!collector.compaction_ends.items[0].will_retry);
+    try expectSuccessfulCompaction(&collector, &compaction_spy, .threshold, false);
 }
 
 test "runtime host runs pre-prompt threshold compaction before sending next prompt" {

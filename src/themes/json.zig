@@ -199,6 +199,12 @@ fn formatVariableErrorForValue(
     return formatVariableErrorForValue(allocator, next, vars, visited_vars);
 }
 
+fn expectLoadErrorContains(bytes: []const u8, err: anyerror, needle: []const u8) !void {
+    const msg = try formatLoadError(std.testing.allocator, bytes, err);
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, needle) != null);
+}
+
 test "theme json parses builtin pi-mono dark theme format" {
     const loaded = try loadFromSlice(std.testing.allocator, @embedFile("builtin/dark.json"));
     defer loaded.deinit(std.testing.allocator);
@@ -242,20 +248,14 @@ test "theme json formats invalid theme diagnostics with repair detail" {
         \\  "colors": { "accent": "#010203" }
         \\}
     ;
-    const missing_msg = try formatLoadError(std.testing.allocator, missing, error.MissingColor);
-    defer std.testing.allocator.free(missing_msg);
-    try std.testing.expect(std.mem.indexOf(u8, missing_msg, "missing required foreground color token 'border'") != null);
+    try expectLoadErrorContains(missing, error.MissingColor, "missing required foreground color token 'border'");
 
     const source = @embedFile("builtin/dark.json");
     const unknown_var = try std.mem.replaceOwned(u8, std.testing.allocator, source, "\"accent\": \"accent\"", "\"accent\": \"ghostAccent\"");
     defer std.testing.allocator.free(unknown_var);
-    const unknown_msg = try formatLoadError(std.testing.allocator, unknown_var, error.UnknownVariable);
-    defer std.testing.allocator.free(unknown_msg);
-    try std.testing.expect(std.mem.indexOf(u8, unknown_msg, "unknown variable 'ghostAccent'") != null);
+    try expectLoadErrorContains(unknown_var, error.UnknownVariable, "unknown variable 'ghostAccent'");
 
     const circular = try std.mem.replaceOwned(u8, std.testing.allocator, source, "\"accent\": \"#8abeb7\",\n    \"selectedBg\": \"#3a3a4a\"", "\"accent\": \"selectedBg\",\n    \"selectedBg\": \"accent\"");
     defer std.testing.allocator.free(circular);
-    const circular_msg = try formatLoadError(std.testing.allocator, circular, error.CircularVariableReference);
-    defer std.testing.allocator.free(circular_msg);
-    try std.testing.expect(std.mem.indexOf(u8, circular_msg, "circular variable reference involving 'accent'") != null);
+    try expectLoadErrorContains(circular, error.CircularVariableReference, "circular variable reference involving 'accent'");
 }

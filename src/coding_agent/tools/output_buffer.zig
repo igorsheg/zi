@@ -244,51 +244,65 @@ fn formatStateAlloc(
 
     return .{ .text = try aw.toOwnedSlice(), .truncated_lines = truncated_lines };
 }
-test "LineOutputBuffer caps individual long lines" {
-    var buffer = LineOutputBuffer.init(testing.allocator, 2, 2);
+const TEST_MARKER = "... [{d} lines truncated] ...";
+
+fn expectBufferFinish(
+    chunks: []const []const u8,
+    max_head: usize,
+    max_tail: usize,
+    max_line_bytes: ?usize,
+    expected_text: []const u8,
+    expected_truncated_lines: usize,
+) !void {
+    var buffer = LineOutputBuffer.init(testing.allocator, max_head, max_tail);
     defer buffer.deinit();
-    buffer.max_line_bytes = 8;
+    if (max_line_bytes) |limit| buffer.max_line_bytes = limit;
 
-    try buffer.addChunk("abcdefghijklmnop\nshort\npartial-very-long");
-    const result = try buffer.finishAlloc(testing.allocator, "... [{d} lines truncated] ...");
-    defer testing.allocator.free(result.text);
+    for (chunks) |chunk| try buffer.addChunk(chunk);
 
-    try testing.expect(std.mem.indexOf(u8, result.text, "abcdefgh... [line truncated]") != null);
-    try testing.expect(std.mem.indexOf(u8, result.text, "partial-... [line truncated]") != null);
+    const out = try buffer.finishAlloc(testing.allocator, TEST_MARKER);
+    defer testing.allocator.free(out.text);
+    try testing.expectEqual(expected_truncated_lines, out.truncated_lines);
+    try testing.expectEqualStrings(expected_text, out.text);
 }
 
-test "LineOutputBuffer handles chunk boundaries and truncation" {
+test "LineOutputBuffer caps complete and pending lines independently" {
+    try expectBufferFinish(
+        &.{"abcdefghijklmnop\nshort\npartial-very-long"},
+        2,
+        2,
+        8,
+        "abcdefgh... [line truncated]\nshort\npartial-... [line truncated]",
+        0,
+    );
+}
+
+test "LineOutputBuffer snapshots only committed lines and finish adds pending tail" {
     var buffer = LineOutputBuffer.init(testing.allocator, 2, 2);
     defer buffer.deinit();
 
     try buffer.addChunk("a\nb");
     try buffer.addChunk("\nc\nd\n");
 
-    const snapshot = try buffer.snapshotAlloc(testing.allocator, "... [{d} lines truncated] ...");
+    const snapshot = try buffer.snapshotAlloc(testing.allocator, TEST_MARKER);
     defer testing.allocator.free(snapshot.text);
-
     try testing.expectEqual(@as(usize, 0), snapshot.truncated_lines);
     try testing.expectEqualStrings("a\nb\nc\nd", snapshot.text);
 
-    try buffer.addChunk("e\n");
-    const final = try buffer.finishAlloc(testing.allocator, "... [{d} lines truncated] ...");
+    try buffer.addChunk("e");
+    const final = try buffer.finishAlloc(testing.allocator, TEST_MARKER);
     defer testing.allocator.free(final.text);
-
     try testing.expectEqual(@as(usize, 1), final.truncated_lines);
-    try testing.expectEqualStrings(
-        "a\nb\n\n... [1 lines truncated] ...\n\nd\ne",
-        final.text,
-    );
+    try testing.expectEqualStrings("a\nb\n\n... [1 lines truncated] ...\n\nd\ne", final.text);
 }
 
-test "LineOutputBuffer dedupes small-output head tail overlap by count" {
-    var buffer = LineOutputBuffer.init(testing.allocator, 5, 5);
-    defer buffer.deinit();
-
-    try buffer.addChunk("same\nsame\nsame\n");
-    const out = try buffer.finishAlloc(testing.allocator, "... [{d} lines truncated] ...");
-    defer testing.allocator.free(out.text);
-
-    try testing.expectEqual(@as(usize, 0), out.truncated_lines);
-    try testing.expectEqualStrings("same\nsame\nsame", out.text);
+test "LineOutputBuffer emits duplicate text lines once when head and tail overlap" {
+    try expectBufferFinish(
+        &.{"same\nsame\nsame\n"},
+        5,
+        5,
+        null,
+        "same\nsame\nsame",
+        0,
+    );
 }

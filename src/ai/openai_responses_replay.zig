@@ -994,6 +994,27 @@ fn apisEqual(a: protocol.Api, b: protocol.Api) bool {
 
 const testing = std.testing;
 
+fn responsesReplayModel(api: protocol.Api, provider: protocol.Provider, id: []const u8) protocol.Model {
+    return .{
+        .id = id,
+        .name = id,
+        .api = api,
+        .provider = provider,
+        .base_url = if (provider == .openai_codex) "https://chatgpt.com/backend-api" else "https://api.openai.com",
+        .reasoning = true,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+}
+
+fn expectSingleAssistantMessage(input: ResponsesInputItems) !*const @TypeOf(input.items[0].assistant_message) {
+    try testing.expectEqual(@as(usize, 1), input.items.len);
+    try testing.expect(input.items[0] == .assistant_message);
+    return &input.items[0].assistant_message;
+}
+
 test "transformMessages converts cross-model thinking to text and strips tool thought signatures" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1073,18 +1094,7 @@ test "convertResponsesMessages hashes foreign responses item ids like pi-mono" {
         } },
     };
 
-    const model = protocol.Model{
-        .id = "gpt-5.3-codex",
-        .name = "GPT-5.3 Codex",
-        .api = .openai_codex_responses,
-        .provider = .openai_codex,
-        .base_url = "https://chatgpt.com/backend-api",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 400000,
-        .max_tokens = 128000,
-    };
+    const model = responsesReplayModel(.openai_codex_responses, .openai_codex, "gpt-5.3-codex");
 
     var transformed = try transformMessages(alloc, transformed_messages, model);
     defer transformed.deinit();
@@ -1113,25 +1123,13 @@ test "convertResponsesMessages preserves legacy plain-string text signatures" {
             .timestamp = 0,
         } },
     };
-    const model = protocol.Model{
-        .id = "gpt-5.4",
-        .name = "GPT-5.4",
-        .api = .openai_responses,
-        .provider = .openai,
-        .base_url = "https://api.openai.com",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 128000,
-        .max_tokens = 4096,
-    };
+    const model = responsesReplayModel(.openai_responses, .openai, "gpt-5.4");
 
     var input = try convertResponsesMessages(alloc, model, null, messages, .{});
     defer input.deinit();
 
-    try testing.expectEqual(@as(usize, 1), input.items.len);
-    try testing.expect(input.items[0] == .assistant_message);
-    try testing.expectEqualStrings("legacy_msg_id", input.items[0].assistant_message.id);
+    const assistant_item = try expectSingleAssistantMessage(input);
+    try testing.expectEqualStrings("legacy_msg_id", assistant_item.id);
 }
 
 test "convertResponsesMessages preserves text signature phase as string" {
@@ -1150,25 +1148,13 @@ test "convertResponsesMessages preserves text signature phase as string" {
             .timestamp = 0,
         } },
     };
-    const model = protocol.Model{
-        .id = "gpt-5.4",
-        .name = "GPT-5.4",
-        .api = .openai_responses,
-        .provider = .openai,
-        .base_url = "https://api.openai.com",
-        .reasoning = true,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 128000,
-        .max_tokens = 4096,
-    };
+    const model = responsesReplayModel(.openai_responses, .openai, "gpt-5.4");
 
     var input = try convertResponsesMessages(alloc, model, null, messages, .{});
     defer input.deinit();
 
-    try testing.expectEqual(@as(usize, 1), input.items.len);
-    try testing.expect(input.items[0] == .assistant_message);
-    try testing.expectEqualStrings("msg_123", input.items[0].assistant_message.id);
-    try testing.expect(input.items[0].assistant_message.phase != null);
-    try testing.expectEqualStrings("final_answer", input.items[0].assistant_message.phase.?);
+    const assistant_item = try expectSingleAssistantMessage(input);
+    try testing.expectEqualStrings("msg_123", assistant_item.id);
+    try testing.expect(assistant_item.phase != null);
+    try testing.expectEqualStrings("final_answer", assistant_item.phase.?);
 }

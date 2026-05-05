@@ -21,3 +21,16 @@
 * Resource allocation may fail; resource deallocation must succeed.
 * Memory is a resource.
 * Together we serve the users.
+
+# agent craft
+
+* Reports are symptoms.
+* Code is evidence.
+* Tests are judgment.
+* Read before writing.
+* Trace before fixing.
+* Workflows should repeat.
+* Boring checks matter.
+* Sessions are artifacts.
+* The project is the workspace.
+* Let humans be terse.

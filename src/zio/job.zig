@@ -272,14 +272,54 @@ fn waitUntil(comptime pred: fn (*TestSink) bool, sink: *TestSink) !void {
     return error.Timeout;
 }
 
-test "zio job streams stdout and reports exit" {
+fn testManager(sink: *TestSink) Manager {
+    return Manager.init(testing.allocator, std.Options.debug_io, .{ .ptr = @ptrCast(sink), .submit = &TestSink.sink });
+}
+
+fn ownedArgv(args: []const []const u8) ![]const []const u8 {
+    const argv = try testing.allocator.alloc([]const u8, args.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (argv[0..initialized]) |arg| testing.allocator.free(arg);
+        testing.allocator.free(argv);
+    }
+    for (args, 0..) |arg, i| {
+        argv[i] = try testing.allocator.dupe(u8, arg);
+        initialized += 1;
+    }
+    return argv;
+}
+
+fn startShellJob(manager: *Manager, id: u64, script: []const u8) !void {
+    try manager.start(id, .{ .argv = try ownedArgv(&.{ "/bin/sh", "-c", script }) });
+}
+
+fn startCommandJob(manager: *Manager, id: u64, args: []const []const u8) !void {
+    try manager.start(id, .{ .argv = try ownedArgv(args) });
+}
+
+fn writeWhenReady(manager: *Manager, id: u64, data: []const u8) !void {
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        manager.write(id, data) catch |err| switch (err) {
+            error.JobNotReady => {
+                std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+    return error.Timeout;
+}
+
+test "zio job forwards stdout chunks and successful exit" {
     var sink = TestSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var manager = Manager.init(testing.allocator, std.Options.debug_io, .{ .ptr = @ptrCast(&sink), .submit = &TestSink.sink });
+    var manager = testManager(&sink);
     defer manager.deinit();
 
-    const argv = try testing.allocator.dupe([]const u8, &.{ try testing.allocator.dupe(u8, "/bin/sh"), try testing.allocator.dupe(u8, "-c"), try testing.allocator.dupe(u8, "printf hello") });
-    try manager.start(1, .{ .argv = argv });
+    try startShellJob(&manager, 1, "printf hello");
 
     try waitUntil(struct {
         fn pred(s: *TestSink) bool {
@@ -293,28 +333,14 @@ test "zio job streams stdout and reports exit" {
     }.pred, &sink);
 }
 
-test "zio job write reaches child stdin" {
+test "zio job writes to child stdin after the process is ready" {
     var sink = TestSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var manager = Manager.init(testing.allocator, std.Options.debug_io, .{ .ptr = @ptrCast(&sink), .submit = &TestSink.sink });
+    var manager = testManager(&sink);
     defer manager.deinit();
 
-    const script = "IFS= read -r line; printf 'got:%s\\n' \"$line\"";
-    const argv = try testing.allocator.dupe([]const u8, &.{ try testing.allocator.dupe(u8, "/bin/sh"), try testing.allocator.dupe(u8, "-c"), try testing.allocator.dupe(u8, script) });
-    try manager.start(2, .{ .argv = argv });
-
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        manager.write(2, "doom\n") catch |err| switch (err) {
-            error.JobNotReady => {
-                std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    }
-    if (attempts == 100) return error.Timeout;
+    try startShellJob(&manager, 2, "IFS= read -r line; printf 'got:%s\\n' \"$line\"");
+    try writeWhenReady(&manager, 2, "doom\n");
 
     try waitUntil(struct {
         fn pred(s: *TestSink) bool {
@@ -331,11 +357,10 @@ test "zio job write reaches child stdin" {
 test "zio job stop terminates a running child" {
     var sink = TestSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var manager = Manager.init(testing.allocator, std.Options.debug_io, .{ .ptr = @ptrCast(&sink), .submit = &TestSink.sink });
+    var manager = testManager(&sink);
     defer manager.deinit();
 
-    const argv = try testing.allocator.dupe([]const u8, &.{ try testing.allocator.dupe(u8, "/bin/sleep"), try testing.allocator.dupe(u8, "100") });
-    try manager.start(3, .{ .argv = argv });
+    try startCommandJob(&manager, 3, &.{ "/bin/sleep", "100" });
     std.Options.debug_io.sleep(.fromMilliseconds(30), .awake) catch {};
     manager.stop(3);
 
@@ -351,12 +376,10 @@ test "zio job stop escalates children that ignore TERM" {
 
     var sink = TestSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var manager = Manager.init(testing.allocator, std.Options.debug_io, .{ .ptr = @ptrCast(&sink), .submit = &TestSink.sink });
+    var manager = testManager(&sink);
     defer manager.deinit();
 
-    const script = "trap '' TERM; while :; do sleep 1; done";
-    const argv = try testing.allocator.dupe([]const u8, &.{ try testing.allocator.dupe(u8, "/bin/sh"), try testing.allocator.dupe(u8, "-c"), try testing.allocator.dupe(u8, script) });
-    try manager.start(4, .{ .argv = argv });
+    try startShellJob(&manager, 4, "trap '' TERM; while :; do sleep 1; done");
     std.Options.debug_io.sleep(.fromMilliseconds(30), .awake) catch {};
     manager.stop(4);
 

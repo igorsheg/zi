@@ -226,6 +226,19 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
 
+fn testPendingImage(data: []const u8, mime_type: []const u8) !PendingImageAttachment {
+    return .{ .image = .{
+        .data = try testing.allocator.dupe(u8, data),
+        .mime_type = try testing.allocator.dupe(u8, mime_type),
+    } };
+}
+
+fn testPendingImageWithDimensions(data: []const u8, mime_type: []const u8, width: u32, height: u32) !PendingImageAttachment {
+    var pending = try testPendingImage(data, mime_type);
+    pending.dimensions = .{ .width = width, .height = height };
+    return pending;
+}
+
 test "prepareClipboardImageAttachment summarizes accepted images and rejects resize-required images" {
     const png = pngHeader(64, 32);
     var accepted = try prepareClipboardImageAttachment(testing.allocator, &png, .{});
@@ -255,24 +268,12 @@ test "prepareClipboardImageAttachment summarizes accepted images and rejects res
 }
 
 test "buildSubmittedUserContent preserves marker order and appends unmarked pending images" {
-    const data1 = try testing.allocator.dupe(u8, "one");
-    defer testing.allocator.free(data1);
-    const mime1 = try testing.allocator.dupe(u8, "image/png");
-    defer testing.allocator.free(mime1);
-    const data2 = try testing.allocator.dupe(u8, "two");
-    defer testing.allocator.free(data2);
-    const mime2 = try testing.allocator.dupe(u8, "image/jpeg");
-    defer testing.allocator.free(mime2);
-    const data3 = try testing.allocator.dupe(u8, "three");
-    defer testing.allocator.free(data3);
-    const mime3 = try testing.allocator.dupe(u8, "image/webp");
-    defer testing.allocator.free(mime3);
-
-    const pending = [_]PendingImageAttachment{
-        .{ .image = .{ .data = data1, .mime_type = mime1 } },
-        .{ .image = .{ .data = data2, .mime_type = mime2 } },
-        .{ .image = .{ .data = data3, .mime_type = mime3 } },
+    var pending = [_]PendingImageAttachment{
+        try testPendingImage("one", "image/png"),
+        try testPendingImage("two", "image/jpeg"),
+        try testPendingImage("three", "image/webp"),
     };
+    defer for (&pending) |*image| image.deinit(testing.allocator);
 
     var built = try buildSubmittedUserContent(testing.allocator, "before [image2] middle [image1] after", &pending);
     defer built.deinit(testing.allocator);
@@ -306,19 +307,11 @@ test "stripPendingImageMarkers removes only valid pending placeholders" {
 }
 
 test "pendingImageBannerText includes latest image summary and clear shortcut" {
-    const data1 = try testing.allocator.dupe(u8, "aaa");
-    defer testing.allocator.free(data1);
-    const mime1 = try testing.allocator.dupe(u8, "image/png");
-    defer testing.allocator.free(mime1);
-    const data2 = try testing.allocator.dupe(u8, "bbb");
-    defer testing.allocator.free(data2);
-    const mime2 = try testing.allocator.dupe(u8, "image/jpeg");
-    defer testing.allocator.free(mime2);
-
-    const pending = [_]PendingImageAttachment{
-        .{ .image = .{ .data = data1, .mime_type = mime1 }, .dimensions = .{ .width = 10, .height = 20 } },
-        .{ .image = .{ .data = data2, .mime_type = mime2 }, .dimensions = .{ .width = 30, .height = 40 } },
+    var pending = [_]PendingImageAttachment{
+        try testPendingImageWithDimensions("aaa", "image/png", 10, 20),
+        try testPendingImageWithDimensions("bbb", "image/jpeg", 30, 40),
     };
+    defer for (&pending) |*image| image.deinit(testing.allocator);
 
     const banner = try pendingImageBannerText(testing.allocator, &pending);
     defer testing.allocator.free(banner);

@@ -203,13 +203,13 @@ fn rowText(buf: *const Buffer, row: u32, allocator: std.mem.Allocator) ![]const 
     return try out.toOwnedSlice(allocator);
 }
 
-fn bufferContainsText(buf: *const Buffer, needle: []const u8, allocator: std.mem.Allocator) !bool {
+fn expectBufferContainsText(buf: *const Buffer, needle: []const u8) !void {
     for (0..buf.height) |row| {
-        const text = try rowText(buf, @intCast(row), allocator);
-        defer allocator.free(text);
-        if (std.mem.indexOf(u8, text, needle) != null) return true;
+        const text = try rowText(buf, @intCast(row), testing.allocator);
+        defer testing.allocator.free(text);
+        if (std.mem.indexOf(u8, text, needle) != null) return;
     }
-    return false;
+    return error.ExpectedVisibleMarkdownText;
 }
 
 fn bufferHasAttr(buf: *const Buffer, comptime field: []const u8) bool {
@@ -242,9 +242,9 @@ test "markdown renders nested lists and preserves ordered numbering" {
     );
     defer buf.deinit();
 
-    try testing.expect(try bufferContainsText(&buf, "1. First item", testing.allocator));
-    try testing.expect(try bufferContainsText(&buf, "- Nested bullet", testing.allocator));
-    try testing.expect(try bufferContainsText(&buf, "2. Second item", testing.allocator));
+    try expectBufferContainsText(&buf, "1. First item");
+    try expectBufferContainsText(&buf, "- Nested bullet");
+    try expectBufferContainsText(&buf, "2. Second item");
 }
 
 test "markdown renders blockquotes with lazy continuation and inline styling" {
@@ -258,7 +258,7 @@ test "markdown renders blockquotes with lazy continuation and inline styling" {
         }
     }
     try testing.expect(quoted_rows >= 1);
-    try testing.expect(try bufferContainsText(&buf, "continued", testing.allocator));
+    try expectBufferContainsText(&buf, "continued");
     try testing.expect(bufferHasAttr(&buf, "bold"));
     try testing.expect(bufferHasBg(&buf, code_inline_bg));
 }
@@ -285,8 +285,8 @@ test "markdown renders links and html like tags as visible text" {
     var buf = try renderToBuffer("Visit [site](https://example.com) and <thinking>keep this</thinking>", 80, 4);
     defer buf.deinit();
 
-    try testing.expect(try bufferContainsText(&buf, "Visit site (https://example.com)", testing.allocator));
-    try testing.expect(try bufferContainsText(&buf, "<thinking>keep this</thinking>", testing.allocator));
+    try expectBufferContainsText(&buf, "Visit site (https://example.com)");
+    try expectBufferContainsText(&buf, "<thinking>keep this</thinking>");
     try testing.expect(bufferHasAttr(&buf, "underline"));
 }
 

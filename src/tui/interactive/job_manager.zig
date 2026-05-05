@@ -352,6 +352,34 @@ fn rgbaFrameBytes(width: u32, height: u32) ?usize {
 
 const testing = std.testing;
 
+fn testSurfaceSinkAdapter(sink: *TestSurfaceSink) SurfaceFrameSink {
+    return .{ .ptr = @ptrCast(sink), .submit = &TestSurfaceSink.submit };
+}
+
+fn testFrameState(queue: *request_mod.RequestQueue, sink: *TestSurfaceSink) JobManager.State {
+    return .{
+        .allocator = testing.allocator,
+        .request_queue = queue,
+        .surface_sink = testSurfaceSinkAdapter(sink),
+    };
+}
+
+fn testFrameDecoder() !FrameDecoder {
+    return FrameDecoder.init(testing.allocator, .{
+        .surface_id = "doom-demo",
+        .state_owner_id = "extension.lua",
+        .generation = 9,
+        .max_frame_bytes = 32,
+    });
+}
+
+fn expectFrame(frame: extension_ui.SurfaceFrame, width: u32, height: u32, data: []const u8) !void {
+    try testing.expectEqualStrings("doom-demo", frame.id);
+    try testing.expectEqual(width, frame.width);
+    try testing.expectEqual(height, frame.height);
+    try testing.expectEqualStrings(data, frame.data);
+}
+
 const TestSurfaceSink = struct {
     allocator: std.mem.Allocator,
     frames: std.ArrayList(extension_ui.SurfaceFrame) = .empty,
@@ -377,18 +405,9 @@ test "surface frame stdout adapter preserves frames split across chunks" {
     defer queue.deinit();
     var sink = TestSurfaceSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var state = JobManager.State{
-        .allocator = testing.allocator,
-        .request_queue = &queue,
-        .surface_sink = .{ .ptr = @ptrCast(&sink), .submit = &TestSurfaceSink.submit },
-    };
+    var state = testFrameState(&queue, &sink);
     defer state.deinit();
-    var decoder = try FrameDecoder.init(testing.allocator, .{
-        .surface_id = "doom-demo",
-        .state_owner_id = "extension.lua",
-        .generation = 9,
-        .max_frame_bytes = 32,
-    });
+    var decoder = try testFrameDecoder();
     defer decoder.deinit(testing.allocator);
 
     try decoder.accept(&state, 1, "noiseFRAME 2 ");
@@ -396,11 +415,7 @@ test "surface frame stdout adapter preserves frames split across chunks" {
     try decoder.accept(&state, 1, "abcdefgh");
 
     try testing.expectEqual(@as(usize, 1), sink.frames.items.len);
-    const frame = sink.frames.items[0];
-    try testing.expectEqualStrings("doom-demo", frame.id);
-    try testing.expectEqual(@as(u32, 2), frame.width);
-    try testing.expectEqual(@as(u32, 1), frame.height);
-    try testing.expectEqualStrings("abcdefgh", frame.data);
+    try expectFrame(sink.frames.items[0], 2, 1, "abcdefgh");
     try testing.expectEqual(@as(usize, 0), queue.pendingDepth());
 }
 
@@ -409,26 +424,15 @@ test "surface frame stdout adapter validates rgba byte length and resyncs" {
     defer queue.deinit();
     var sink = TestSurfaceSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var state = JobManager.State{
-        .allocator = testing.allocator,
-        .request_queue = &queue,
-        .surface_sink = .{ .ptr = @ptrCast(&sink), .submit = &TestSurfaceSink.submit },
-    };
+    var state = testFrameState(&queue, &sink);
     defer state.deinit();
-    var decoder = try FrameDecoder.init(testing.allocator, .{
-        .surface_id = "doom-demo",
-        .state_owner_id = "extension.lua",
-        .generation = 9,
-        .max_frame_bytes = 32,
-    });
+    var decoder = try testFrameDecoder();
     defer decoder.deinit(testing.allocator);
 
     try decoder.accept(&state, 1, "FRAME 2 1 7\nbadbad!FRAME 1 1 4\ngood");
 
     try testing.expectEqual(@as(usize, 1), sink.frames.items.len);
-    try testing.expectEqual(@as(u32, 1), sink.frames.items[0].width);
-    try testing.expectEqual(@as(u32, 1), sink.frames.items[0].height);
-    try testing.expectEqualStrings("good", sink.frames.items[0].data);
+    try expectFrame(sink.frames.items[0], 1, 1, "good");
 }
 
 test "job manager routes configured stdout frames to the surface sink" {
@@ -436,7 +440,7 @@ test "job manager routes configured stdout frames to the surface sink" {
     defer queue.deinit();
     var sink = TestSurfaceSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var manager = try JobManager.init(testing.allocator, std.Options.debug_io, &queue, .{ .ptr = @ptrCast(&sink), .submit = &TestSurfaceSink.submit });
+    var manager = try JobManager.init(testing.allocator, std.Options.debug_io, &queue, testSurfaceSinkAdapter(&sink));
     defer manager.deinit();
 
     const script = "printf 'FRAME 1 1 4\\nabcd'";
@@ -474,24 +478,15 @@ test "surface frame stdout adapter emits surface frames instead of job_stdout ev
     defer queue.deinit();
     var sink = TestSurfaceSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var state = JobManager.State{
-        .allocator = testing.allocator,
-        .request_queue = &queue,
-        .surface_sink = .{ .ptr = @ptrCast(&sink), .submit = &TestSurfaceSink.submit },
-    };
+    var state = testFrameState(&queue, &sink);
     defer state.deinit();
-    var decoder = try FrameDecoder.init(testing.allocator, .{
-        .surface_id = "doom-demo",
-        .state_owner_id = "extension.lua",
-        .generation = 9,
-        .max_frame_bytes = 32,
-    });
+    var decoder = try testFrameDecoder();
     defer decoder.deinit(testing.allocator);
 
     try decoder.accept(&state, 1, "FRAME 1 1 4\none!FRAME 1 1 4\ntwo!");
 
     try testing.expectEqual(@as(usize, 2), sink.frames.items.len);
-    try testing.expectEqualStrings("one!", sink.frames.items[0].data);
-    try testing.expectEqualStrings("two!", sink.frames.items[1].data);
+    try expectFrame(sink.frames.items[0], 1, 1, "one!");
+    try expectFrame(sink.frames.items[1], 1, 1, "two!");
     try testing.expectEqual(@as(usize, 0), queue.pendingDepth());
 }

@@ -584,28 +584,42 @@ fn testAssistantEntry(
 ) !SessionEntry {
     const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
     content[0] = .{ .text = .{ .text = text } };
+    return testAssistantContentEntry(id, parent_id, content);
+}
+
+fn testAssistantContentEntry(
+    id: []const u8,
+    parent_id: ?[]const u8,
+    content: []const ai.protocol.AssistantMessage.AssistantContentBlock,
+) SessionEntry {
     return .{
         .id = id,
         .parent_id = parent_id,
         .timestamp = "2025-01-01T00:00:00Z",
-        .entry = .{ .message = .{ .message = .{
-            .assistant = .{
-                .content = content,
-                .api = .openai_responses,
-                .provider = .openai,
-                .model = "gpt-test",
-                .usage = .{
-                    .input = 0,
-                    .output = 0,
-                    .cache_read = 0,
-                    .cache_write = 0,
-                    .total_tokens = 0,
-                    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-                },
-                .stop_reason = .stop,
-                .timestamp = 1,
-            },
-        } } },
+        .entry = .{ .message = .{ .message = .{ .assistant = testAssistantMessage(content) } } },
+    };
+}
+
+fn testAssistantMessage(content: []const ai.protocol.AssistantMessage.AssistantContentBlock) ai.protocol.AgentMessage {
+    return .{ .assistant = .{
+        .content = content,
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "gpt-test",
+        .usage = zeroUsage(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    } };
+}
+
+fn zeroUsage() ai.protocol.Usage {
+    return .{
+        .input = 0,
+        .output = 0,
+        .cache_read = 0,
+        .cache_write = 0,
+        .total_tokens = 0,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
     };
 }
 
@@ -660,32 +674,36 @@ fn testAssistantToolCallEntry(
         .name = tool_name,
         .arguments = .{ .object = args_obj },
     } };
-    return .{
-        .id = id,
-        .parent_id = parent_id,
-        .timestamp = "2025-01-01T00:00:00Z",
-        .entry = .{ .message = .{ .message = .{
-            .assistant = .{
-                .content = content,
-                .api = .openai_responses,
-                .provider = .openai,
-                .model = "gpt-test",
-                .usage = .{
-                    .input = 0,
-                    .output = 0,
-                    .cache_read = 0,
-                    .cache_write = 0,
-                    .total_tokens = 0,
-                    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-                },
-                .stop_reason = .stop,
-                .timestamp = 1,
-            },
-        } } },
-    };
+    return testAssistantContentEntry(id, parent_id, content);
 }
 
-test "findCutPoint: keeps recent suffix at nearest valid non-tool boundary" {
+fn expectCut(cut: CutPointResult, first_kept: usize, turn_start: ?usize, is_split_turn: bool) !void {
+    try testing.expectEqual(first_kept, cut.first_kept_entry_index);
+    try testing.expectEqual(turn_start, cut.turn_start_index);
+    try testing.expectEqual(is_split_turn, cut.is_split_turn);
+}
+
+fn expectPreparation(
+    prep: CompactionPreparation,
+    first_kept_entry_id: []const u8,
+    is_split_turn: bool,
+    summarized_count: usize,
+    prefix_count: usize,
+) !void {
+    try testing.expectEqualStrings(first_kept_entry_id, prep.first_kept_entry_id);
+    try testing.expectEqual(is_split_turn, prep.is_split_turn);
+    try testing.expectEqual(summarized_count, prep.messages_to_summarize.len);
+    try testing.expectEqual(prefix_count, prep.turn_prefix_messages.len);
+}
+
+fn expectFileLists(lists: ComputedFileLists, read_files: []const []const u8, modified_files: []const []const u8) !void {
+    try testing.expectEqual(read_files.len, lists.read_files.len);
+    for (read_files, 0..) |expected, i| try testing.expectEqualStrings(expected, lists.read_files[i]);
+    try testing.expectEqual(modified_files.len, lists.modified_files.len);
+    for (modified_files, 0..) |expected, i| try testing.expectEqualStrings(expected, lists.modified_files[i]);
+}
+
+test "findCutPoint keeps the recent turn at a user boundary" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -698,11 +716,10 @@ test "findCutPoint: keeps recent suffix at nearest valid non-tool boundary" {
     };
 
     const cut = findCutPoint(&entries, 0, entries.len, 5);
-    try testing.expectEqual(@as(usize, 2), cut.first_kept_entry_index);
-    try testing.expect(!cut.is_split_turn);
+    try expectCut(cut, 2, null, false);
 }
 
-test "findCutPoint: assistant tail triggers split turn rather than blocking compaction" {
+test "findCutPoint cuts inside a turn when assistant tail exceeds budget" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -715,12 +732,10 @@ test "findCutPoint: assistant tail triggers split turn rather than blocking comp
     };
 
     const cut = findCutPoint(&entries, 0, entries.len, 8);
-    try testing.expect(cut.first_kept_entry_index > 0);
-    try testing.expect(cut.is_split_turn);
-    try testing.expect(cut.turn_start_index != null);
+    try expectCut(cut, 3, 2, true);
 }
 
-test "prepareCompaction: user-boundary cut summarizes older messages and keeps recent turn" {
+test "prepareCompaction summarizes older history when cut lands on a user turn" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -733,13 +748,10 @@ test "prepareCompaction: user-boundary cut summarizes older messages and keeps r
     };
 
     const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 5 })).?;
-    try testing.expect(!prep.is_split_turn);
-    try testing.expectEqualStrings("u2", prep.first_kept_entry_id);
-    try testing.expect(prep.messages_to_summarize.len > 0);
-    try testing.expectEqual(@as(usize, 0), prep.turn_prefix_messages.len);
+    try expectPreparation(prep, "u2", false, 2, 0);
 }
 
-test "prepareCompaction: split turn summarizes history and carries prefix for kept assistant tail" {
+test "prepareCompaction carries turn prefix when cut splits a turn" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -752,13 +764,10 @@ test "prepareCompaction: split turn summarizes history and carries prefix for ke
     };
 
     const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 8 })).?;
-    try testing.expect(prep.is_split_turn);
-    try testing.expectEqualStrings("a2", prep.first_kept_entry_id);
-    try testing.expect(prep.messages_to_summarize.len > 0);
-    try testing.expect(prep.turn_prefix_messages.len > 0);
+    try expectPreparation(prep, "a2", true, 2, 1);
 }
 
-test "prepareCompaction: skips already-compacted tail" {
+test "prepareCompaction returns null when latest entry is compaction" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -781,7 +790,7 @@ test "prepareCompaction: skips already-compacted tail" {
     try testing.expectEqual(@as(?CompactionPreparation, null), try prepareCompaction(allocator, &entries, .{}));
 }
 
-test "prepareCompaction: carries previous summary from last compaction" {
+test "prepareCompaction carries previous compaction summary" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -810,7 +819,7 @@ test "prepareCompaction: carries previous summary from last compaction" {
     try testing.expectEqualStrings("earlier summary", prep.previous_summary.?);
 }
 
-test "prepareCompaction: missing previous first-kept id falls back after compaction entry" {
+test "prepareCompaction resumes after previous compaction when kept id is gone" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -829,7 +838,7 @@ test "prepareCompaction: missing previous first-kept id falls back after compact
     try testing.expectEqualStrings("a1", prep.first_kept_entry_id);
 }
 
-test "prepareCompaction: carries file ops from previous pi-generated compaction details" {
+test "prepareCompaction carries file ops from previous pi-generated compaction" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -853,14 +862,10 @@ test "prepareCompaction: carries file ops from previous pi-generated compaction 
 
     const prep = (try prepareCompaction(allocator, &entries, .{ .keep_recent_tokens = 1 })).?;
     const lists = try computeFileLists(allocator, &prep.file_ops);
-    try testing.expectEqual(@as(usize, 2), lists.read_files.len);
-    try testing.expectEqualStrings("/tmp/new-read.txt", lists.read_files[0]);
-    try testing.expectEqualStrings("/tmp/old-read.txt", lists.read_files[1]);
-    try testing.expectEqual(@as(usize, 1), lists.modified_files.len);
-    try testing.expectEqualStrings("/tmp/old-modified.txt", lists.modified_files[0]);
+    try expectFileLists(lists, &.{ "/tmp/new-read.txt", "/tmp/old-read.txt" }, &.{"/tmp/old-modified.txt"});
 }
 
-test "findCutPoint: branch and custom-message cuts match pi-mono split metadata" {
+test "findCutPoint reports split metadata for branch and custom message boundaries" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -872,9 +877,7 @@ test "findCutPoint: branch and custom-message cuts match pi-mono split metadata"
         try testAssistantEntry(allocator, "a2", "b1", "tail"),
     };
     const branch_cut = findCutPoint(&branch_entries, 2, branch_entries.len, 10_000);
-    try testing.expectEqual(@as(usize, 2), branch_cut.first_kept_entry_index);
-    try testing.expect(branch_cut.is_split_turn);
-    try testing.expectEqual(@as(?usize, 2), branch_cut.turn_start_index);
+    try expectCut(branch_cut, 2, 2, true);
 
     const custom_entries = [_]SessionEntry{
         testUserEntry("u1", null, "old prompt"),
@@ -883,9 +886,7 @@ test "findCutPoint: branch and custom-message cuts match pi-mono split metadata"
         try testAssistantEntry(allocator, "a2", "m1", "tail"),
     };
     const custom_cut = findCutPoint(&custom_entries, 2, custom_entries.len, 10_000);
-    try testing.expectEqual(@as(usize, 2), custom_cut.first_kept_entry_index);
-    try testing.expect(custom_cut.is_split_turn);
-    try testing.expectEqual(@as(?usize, 2), custom_cut.turn_start_index);
+    try expectCut(custom_cut, 2, 2, true);
 }
 
 test "file operations: extract, dedupe, classify, and format summary lists" {
@@ -905,11 +906,7 @@ test "file operations: extract, dedupe, classify, and format summary lists" {
     try extractFileOpsFromMessage(allocator, write_entry.entry.message.message, &file_ops);
 
     const lists = try computeFileLists(allocator, &file_ops);
-    try testing.expectEqual(@as(usize, 1), lists.read_files.len);
-    try testing.expectEqualStrings("/tmp/read-only.txt", lists.read_files[0]);
-    try testing.expectEqual(@as(usize, 2), lists.modified_files.len);
-    try testing.expectEqualStrings("/tmp/changed.txt", lists.modified_files[0]);
-    try testing.expectEqualStrings("/tmp/new.txt", lists.modified_files[1]);
+    try expectFileLists(lists, &.{"/tmp/read-only.txt"}, &.{ "/tmp/changed.txt", "/tmp/new.txt" });
 
     const out = try formatFileOperations(allocator, lists.read_files, lists.modified_files);
     try testing.expectEqualStrings(

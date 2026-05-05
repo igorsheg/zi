@@ -326,6 +326,22 @@ const TestProvider = struct {
     }
 };
 
+fn testSession(provider: *TestProvider) AutocompleteSession {
+    var session = AutocompleteSession.init(themes_builtin.dark());
+    session.setProvider(provider.provider());
+    return session;
+}
+
+fn testPrompt(text: []const u8) PromptBuffer {
+    var buffer = PromptBuffer.init(testing.allocator);
+    buffer.setText(text);
+    return buffer;
+}
+
+fn expectSessionActive(session: *const AutocompleteSession, expected: bool) !void {
+    try testing.expectEqual(expected, session.isActive());
+}
+
 test "AutocompleteSession activates, preserves selection, and applies provider result" {
     const items = [_]SelectItem{
         .{ .value = "alpha", .label = "alpha" },
@@ -336,15 +352,14 @@ test "AutocompleteSession activates, preserves selection, and applies provider r
         .replace_range = .{ .start_byte = 4, .end_byte = 6 },
         .submit_on_confirm = true,
     };
-    var session = AutocompleteSession.init(themes_builtin.dark());
-    session.setProvider(provider.provider());
+    var session = testSession(&provider);
 
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = testPrompt("say al tail");
     defer buffer.deinit();
-    buffer.setTextAndCursor("say al tail", 6);
+    buffer.setCursorByte(6);
 
     try testing.expectEqual(InputOutcome.consumed, session.processInput(.{ .code = .tab }, &buffer));
-    try testing.expect(session.isActive());
+    try expectSessionActive(&session, true);
     try testing.expectEqual(@as(u32, 1), provider.request_count);
     try testing.expectEqual(RequestMode.force, provider.last_mode);
 
@@ -355,7 +370,7 @@ test "AutocompleteSession activates, preserves selection, and applies provider r
     try testing.expectEqualStrings("say beta tail", buffer.text());
     try testing.expectEqualStrings("beta", provider.last_applied_value);
     try testing.expectEqual(@as(u32, 1), provider.apply_count);
-    try testing.expect(!session.isActive());
+    try expectSessionActive(&session, false);
 }
 
 test "AutocompleteSession honors provider replacement range over stale editor text" {
@@ -365,30 +380,27 @@ test "AutocompleteSession honors provider replacement range over stale editor te
         .replace_range = .{ .start_byte = 0, .end_byte = 3 },
         .replacement_text = "/model ",
     };
-    var session = AutocompleteSession.init(themes_builtin.dark());
-    session.setProvider(provider.provider());
+    var session = testSession(&provider);
 
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = testPrompt("/mo");
     defer buffer.deinit();
-    buffer.setText("/mo");
     session.refresh(&buffer);
-    try testing.expect(session.isActive());
+    try expectSessionActive(&session, true);
 
     buffer.insertAtCursor(" extra");
     const outcome = session.processInput(.{ .code = .tab }, &buffer);
 
     try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, outcome);
     try testing.expectEqualStrings("/model  extra", buffer.text());
-    try testing.expect(!session.isActive());
+    try expectSessionActive(&session, false);
 }
 
 test "AutocompleteSession cancels on provider boundaries and keeps text edits unhandled" {
     var provider = TestProvider{};
     var session = AutocompleteSession.init(themes_builtin.dark());
 
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = testPrompt("hello");
     defer buffer.deinit();
-    buffer.setText("hello");
 
     try testing.expectEqual(InputOutcome.unhandled, session.processInput(.{ .code = .tab }, &buffer));
 
@@ -397,18 +409,18 @@ test "AutocompleteSession cancels on provider boundaries and keeps text edits un
     provider.replace_range = .{ .start_byte = 0, .end_byte = 5 };
     session.setProvider(provider.provider());
     session.refresh(&buffer);
-    try testing.expect(session.isActive());
+    try expectSessionActive(&session, true);
 
     try testing.expectEqual(InputOutcome.unhandled, session.processInput(.{ .code = .char, .char = 'x' }, &buffer));
-    try testing.expect(session.isActive());
+    try expectSessionActive(&session, true);
 
     try testing.expectEqual(InputOutcome.cancelled, session.processInput(.{ .code = .escape }, &buffer));
-    try testing.expect(!session.isActive());
+    try expectSessionActive(&session, false);
     try testing.expectEqual(@as(u32, 1), provider.cancel_count);
 
     provider.items = &.{};
     session.refresh(&buffer);
-    try testing.expect(!session.isActive());
+    try expectSessionActive(&session, false);
     try testing.expectEqual(@as(u32, 2), provider.cancel_count);
 }
 
@@ -422,19 +434,17 @@ test "AutocompleteSession refreshes after directory-like accept and auto-accepts
         .tick_changed = true,
         .tick_auto_accept_single_on_tab = true,
     };
-    var session = AutocompleteSession.init(themes_builtin.dark());
-    session.setProvider(provider.provider());
+    var session = testSession(&provider);
 
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = testPrompt("./sr");
     defer buffer.deinit();
-    buffer.setText("./sr");
     session.refresh(&buffer);
 
     provider.items = &file_items;
     provider.replace_range = .{ .start_byte = 0, .end_byte = 6 };
     try testing.expectEqual(InputOutcome{ .accepted = .{ .submit = false } }, session.processInput(.{ .code = .tab }, &buffer));
     try testing.expectEqualStrings("./src/", buffer.text());
-    try testing.expect(session.isActive());
+    try expectSessionActive(&session, true);
     try testing.expectEqualStrings("main.zig", session.list.getSelectedItem().?.label);
 
     provider.replace_range = .{ .start_byte = 0, .end_byte = 6 };
@@ -442,5 +452,5 @@ test "AutocompleteSession refreshes after directory-like accept and auto-accepts
     try testing.expect(tick.changed);
     try testing.expect(tick.accepted);
     try testing.expectEqualStrings("./src/main.zig", buffer.text());
-    try testing.expect(!session.isActive());
+    try expectSessionActive(&session, false);
 }

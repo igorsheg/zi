@@ -746,7 +746,25 @@ fn clearNestedMap(_: std.mem.Allocator, map: *std.AutoHashMap(types.SettingsFiel
     map.clearRetainingCapacity();
 }
 
-test "set persists and reload recovers the value" {
+fn initMemoryStorageWithGlobalJson(allocator: std.mem.Allocator, content: []const u8) !*storage_mod.InMemorySettingsStorage {
+    var mem = try allocator.create(storage_mod.InMemorySettingsStorage);
+    errdefer allocator.destroy(mem);
+    mem.* = storage_mod.InMemorySettingsStorage.init(allocator);
+    errdefer mem.deinit();
+    mem.global = try allocator.dupe(u8, content);
+    return mem;
+}
+
+fn destroyMemoryStorage(allocator: std.mem.Allocator, mem: *storage_mod.InMemorySettingsStorage) void {
+    mem.deinit();
+    allocator.destroy(mem);
+}
+
+fn expectJsonContains(raw: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, raw, needle) != null);
+}
+
+test "setDefaultModel persists and reload recovers the value" {
     const allocator = std.testing.allocator;
 
     var mgr = try SettingsManager.inMemory(allocator, null);
@@ -773,19 +791,33 @@ test "setDefaultModelAndProvider writes provider and model in matching fields" {
     try std.testing.expectEqualStrings("claude-sonnet-4", mgr.getDefaultModel().?);
 }
 
+test "project settings override global values while inheriting unrelated fields" {
+    const allocator = std.testing.allocator;
+    const global_json =
+        \\{"defaultModel":"global-model","theme":"dark"}
+    ;
+    const project_json =
+        \\{"defaultModel":"project-model"}
+    ;
+    var mem = try initMemoryStorageWithGlobalJson(allocator, global_json);
+    defer destroyMemoryStorage(allocator, mem);
+    mem.project = try allocator.dupe(u8, project_json);
+
+    var mgr = SettingsManager.fromStorage(allocator, mem.asStorage());
+    defer mgr.deinit();
+
+    try std.testing.expectEqualStrings("project-model", mgr.getDefaultModel().?);
+    try std.testing.expectEqualStrings("dark", mgr.getTheme().?);
+}
+
 test "save preserves external edits to unrelated fields" {
     const allocator = std.testing.allocator;
 
-    var mem = try allocator.create(storage_mod.InMemorySettingsStorage);
-    mem.* = storage_mod.InMemorySettingsStorage.init(allocator);
-    defer {
-        mem.deinit();
-        allocator.destroy(mem);
-    }
     const initial_json =
         \\{"defaultProvider":"anthropic","theme":"dark","unknownField":"preserved"}
     ;
-    mem.global = try allocator.dupe(u8, initial_json);
+    var mem = try initMemoryStorageWithGlobalJson(allocator, initial_json);
+    defer destroyMemoryStorage(allocator, mem);
 
     var mgr = SettingsManager.fromStorage(allocator, mem.asStorage());
     defer mgr.deinit();
@@ -796,7 +828,7 @@ test "save preserves external edits to unrelated fields" {
     mgr.setDefaultModel("gpt-5");
 
     const raw = mem.global orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, raw, "\"dark\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "\"preserved\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "\"gpt-5\"") != null);
+    try expectJsonContains(raw, "\"dark\"");
+    try expectJsonContains(raw, "\"preserved\"");
+    try expectJsonContains(raw, "\"gpt-5\"");
 }

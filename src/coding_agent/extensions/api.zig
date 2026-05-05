@@ -237,6 +237,31 @@ fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
 
 const testing = std.testing;
 
+const ApiTestHost = struct {
+    state: lua_runtime.LuaState,
+    runner: runner_mod.ExtensionRunner,
+
+    fn init(allocator: std.mem.Allocator, generation: runner_mod.Generation) !ApiTestHost {
+        return .{
+            .state = try lua_runtime.LuaState.init(allocator),
+            .runner = runner_mod.ExtensionRunner.init(allocator, generation),
+        };
+    }
+
+    fn deinit(self: *ApiTestHost) void {
+        self.runner.deinit();
+        self.state.deinit();
+    }
+
+    fn installZi(self: *ApiTestHost) void {
+        installZiTable(&self.state, &self.runner);
+    }
+};
+
+fn expectLuaRuntimeError(state: *lua_runtime.LuaState, source: []const u8, chunk_name: [:0]const u8) !void {
+    try testing.expectError(error.LuaRuntime, state.doString(source, chunk_name));
+}
+
 fn testBindGetModel(_: *anyopaque) agent_protocol.Model {
     return .{
         .id = "test-model",
@@ -538,7 +563,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
     };
 
     inline for (invalid_oauth_specs) |spec| {
-        try testing.expectError(error.LuaRuntime, state.doString(spec[1], spec[0]));
+        try expectLuaRuntimeError(&state, spec[1], spec[0]);
     }
     try testing.expectEqual(@as(usize, 2), runner.provider_queue.count());
 
@@ -570,7 +595,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
     };
 
     inline for (invalid_oauth_shape_specs) |spec| {
-        try testing.expectError(error.LuaRuntime, state.doString(spec[1], spec[0]));
+        try expectLuaRuntimeError(&state, spec[1], spec[0]);
     }
 }
 
@@ -745,13 +770,12 @@ test "zi.register_provider rejects unsupported built-in override extras" {
 }
 
 test "zi.register_tool registers a Lua-defined tool end-to-end" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.register_tool({
@@ -851,13 +875,12 @@ test "zi.register_tool after bind refreshes visible tool projection for accepted
 }
 
 test "zi.on subscribes a Lua handler to the right event chain" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\zi.on("message_end", function(event, ctx) end)
@@ -877,13 +900,12 @@ test "zi.on subscribes a Lua handler to the right event chain" {
 }
 
 test "zi.on rejects invalid subscriptions with Lua-catchable errors" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\local cases = {
@@ -901,13 +923,11 @@ test "zi.on rejects invalid subscriptions with Lua-catchable errors" {
 }
 
 test "zi.spawn validates required task and callback shapes" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
 
     try state.doString(
         \\local cases = {
@@ -923,13 +943,11 @@ test "zi.spawn validates required task and callback shapes" {
 }
 
 test "zi.spawn end-to-end: dispatches per-event callbacks via argv_override" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
 
     const Helper = struct {
         fn run(L_opt: ?*c.lua_State) callconv(.c) c_int {
@@ -989,13 +1007,12 @@ test "zi.spawn end-to-end: dispatches per-event callbacks via argv_override" {
 }
 
 test "zi.register_tool surfaces validation errors as Lua errors" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\local ok, err = pcall(function()
@@ -1013,13 +1030,12 @@ test "zi.register_tool surfaces validation errors as Lua errors" {
 }
 
 test "zi.on accepts every reserved v2 event" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     const events = [_][]const u8{
         "session_directory",
@@ -1077,13 +1093,12 @@ test "zi.on accepts every reserved v2 event" {
 }
 
 test "zi.register_command registers commands and disambiguates duplicate visible names" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\assert(zi.register_command({ name = "greet", description = "say hello", handler = function() end }) == true)
@@ -1101,13 +1116,12 @@ test "zi.register_command registers commands and disambiguates duplicate visible
 }
 
 test "zi.register_keybinding registers normalized key specs" {
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
 
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
-    defer runner.deinit();
-
-    installZiTable(&state, &runner);
+    const state = &host.state;
+    const runner = &host.runner;
 
     try state.doString(
         \\assert(zi.register_keybinding({ id = "starter.pick", key = "ctrl+f", description = "Pick starter", handler = function(ctx) end }) == true)

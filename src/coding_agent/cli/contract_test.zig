@@ -34,76 +34,67 @@ fn renderPlanDiagnostic(diagnostic: plan.PlanDiagnostic) ![]const u8 {
     return out.toOwnedSlice();
 }
 
+fn expectInteractiveOutcome(outcome: CliOutcome) !plan.InteractivePlan {
+    return switch (outcome) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run_plan| switch (run_plan) {
+                .interactive => |interactive| interactive,
+                else => error.ExpectedInteractivePlan,
+            },
+            else => error.ExpectedRunPlan,
+        },
+        .parse_diag, .plan_diag => error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectBatchOutcome(outcome: CliOutcome) !plan.BatchPlan {
+    return switch (outcome) {
+        .ok => |execution_plan| switch (execution_plan) {
+            .run => |run_plan| switch (run_plan) {
+                .batch => |batch| batch,
+                else => error.ExpectedBatchPlan,
+            },
+            else => error.ExpectedRunPlan,
+        },
+        .parse_diag, .plan_diag => error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectPlanDiagnosticOutcome(outcome: CliOutcome) !plan.PlanDiagnostic {
+    return switch (outcome) {
+        .plan_diag => |diag| diag,
+        .ok, .parse_diag => error.ExpectedDiagnostic,
+    };
+}
+
 test "cli run contract defaults to interactive and keeps a lone prompt interactive" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const default_result = try parseAndPlan(arena.allocator(), &.{}, null);
-    switch (default_result) {
-        .ok => |execution_plan| switch (execution_plan) {
-            .run => |run_plan| switch (run_plan) {
-                .interactive => |interactive| {
-                    try std.testing.expect(interactive.prompt_sources.prompt_text == null);
-                    try std.testing.expectEqual(@as(usize, 0), interactive.prompt_sources.file_args.len);
-                    try std.testing.expect(interactive.session_target == .none);
-                },
-                else => return error.ExpectedInteractivePlan,
-            },
-            else => return error.ExpectedRunPlan,
-        },
-        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
-    }
+    const default_plan = try expectInteractiveOutcome(try parseAndPlan(arena.allocator(), &.{}, null));
+    try std.testing.expect(default_plan.prompt_sources.prompt_text == null);
+    try std.testing.expectEqual(@as(usize, 0), default_plan.prompt_sources.file_args.len);
+    try std.testing.expect(default_plan.session_target == .none);
 
-    const prompt_result = try parseAndPlan(arena.allocator(), &.{"hello"}, null);
-    switch (prompt_result) {
-        .ok => |execution_plan| switch (execution_plan) {
-            .run => |run_plan| switch (run_plan) {
-                .interactive => |interactive| try std.testing.expectEqualStrings("hello", interactive.prompt_sources.prompt_text.?),
-                else => return error.ExpectedInteractivePlan,
-            },
-            else => return error.ExpectedRunPlan,
-        },
-        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
-    }
+    const prompt_plan = try expectInteractiveOutcome(try parseAndPlan(arena.allocator(), &.{"hello"}, null));
+    try std.testing.expectEqualStrings("hello", prompt_plan.prompt_sources.prompt_text.?);
 }
 
 test "cli batch contract requires explicit selectors for text and json" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const text_result = try parseAndPlan(arena.allocator(), &.{ "-p", "hello" }, null);
-    switch (text_result) {
-        .ok => |execution_plan| switch (execution_plan) {
-            .run => |run_plan| switch (run_plan) {
-                .batch => |batch| {
-                    try std.testing.expectEqual(parse.OutputMode.text, batch.output);
-                    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
-                    try std.testing.expect(batch.prompt_sources.stdin_text == null);
-                    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
-                },
-                else => return error.ExpectedBatchPlan,
-            },
-            else => return error.ExpectedRunPlan,
-        },
-        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
-    }
+    const text_batch = try expectBatchOutcome(try parseAndPlan(arena.allocator(), &.{ "-p", "hello" }, null));
+    try std.testing.expectEqual(parse.OutputMode.text, text_batch.output);
+    try std.testing.expectEqualStrings("hello", text_batch.prompt_sources.prompt_text.?);
+    try std.testing.expect(text_batch.prompt_sources.stdin_text == null);
+    try std.testing.expectEqual(@as(usize, 0), text_batch.prompt_sources.file_args.len);
 
-    const json_result = try parseAndPlan(arena.allocator(), &.{ "--mode", "json", "hello" }, null);
-    switch (json_result) {
-        .ok => |execution_plan| switch (execution_plan) {
-            .run => |run_plan| switch (run_plan) {
-                .batch => |batch| {
-                    try std.testing.expectEqual(parse.OutputMode.json, batch.output);
-                    try std.testing.expectEqualStrings("hello", batch.prompt_sources.prompt_text.?);
-                    try std.testing.expect(batch.prompt_sources.stdin_text == null);
-                    try std.testing.expectEqual(@as(usize, 0), batch.prompt_sources.file_args.len);
-                },
-                else => return error.ExpectedBatchPlan,
-            },
-            else => return error.ExpectedRunPlan,
-        },
-        .parse_diag, .plan_diag => return error.UnexpectedDiagnostic,
-    }
+    const json_batch = try expectBatchOutcome(try parseAndPlan(arena.allocator(), &.{ "--mode", "json", "hello" }, null));
+    try std.testing.expectEqual(parse.OutputMode.json, json_batch.output);
+    try std.testing.expectEqualStrings("hello", json_batch.prompt_sources.prompt_text.?);
+    try std.testing.expect(json_batch.prompt_sources.stdin_text == null);
+    try std.testing.expectEqual(@as(usize, 0), json_batch.prompt_sources.file_args.len);
 }
 
 test "cli prompt source planning keeps stdin batch-only and allows interactive @file startup" {

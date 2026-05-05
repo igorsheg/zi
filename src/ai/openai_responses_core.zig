@@ -1685,6 +1685,24 @@ fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestC
     runProcessWithMapper(arena, sse_bytes, .{ .map = identityEventMapper }, collector);
 }
 
+fn expectCollectorSaw(col: TestCollector, kind: TestCollector.EventKind) !void {
+    for (col.events.items) |event| {
+        if (event == kind) return;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn writeInputToJson(allocator: std.mem.Allocator, model: protocol.Model, ctx: protocol.Context) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
+    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    try jw.beginArray();
+    try writeInputOpts(allocator, &jw, model, ctx, false);
+    try jw.endArray();
+    return allocating.toOwnedSlice();
+}
+
 test "processStream maps reasoning summary deltas to a thinking block" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1707,14 +1725,8 @@ test "processStream maps reasoning summary deltas to a thinking block" {
     try testing.expectEqualStrings("Let me think carefully.", col.thinking.items);
     try testing.expectEqualStrings("resp_abc", col.final_response_id.?);
     try testing.expectEqual(protocol.AssistantMessageEvent.DoneReason.stop, col.done_reason.?);
-    var saw_thinking_start = false;
-    var saw_thinking_end = false;
-    for (col.events.items) |e| {
-        if (e == .thinking_start) saw_thinking_start = true;
-        if (e == .thinking_end) saw_thinking_end = true;
-    }
-    try testing.expect(saw_thinking_start);
-    try testing.expect(saw_thinking_end);
+    try expectCollectorSaw(col, .thinking_start);
+    try expectCollectorSaw(col, .thinking_end);
 }
 
 test "processStream maps output_text deltas to a text block with response_id" {
@@ -1896,15 +1908,8 @@ test "writeInputOpts remaps foreign tool result ids to the replayed function cal
     };
     const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = assistant }, .{ .tool_result = tool_result } } };
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(alloc);
-    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
-    try jw.beginArray();
-    try writeInputOpts(alloc, &jw, test_model, ctx, false);
-    try jw.endArray();
-
-    const written = allocating.written();
+    const written = try writeInputToJson(alloc, test_model, ctx);
+    defer alloc.free(written);
     try testing.expect(std.mem.indexOf(u8, written, "\"call_id\":\"call_bad\"") != null);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "\"call_id\":\"call_bad\""));
 }
@@ -1942,12 +1947,7 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
     const user = protocol.UserMessage{ .content = .{ .text = "next" }, .timestamp = 0 };
     const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = tool_calling_assistant }, .{ .assistant = errored_assistant }, .{ .user = user } } };
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(alloc);
-    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
-    try jw.beginArray();
-    try writeInputOpts(alloc, &jw, protocol.Model{
+    const written = try writeInputToJson(alloc, .{
         .id = "gpt-5.4",
         .name = "codex",
         .api = .openai_codex_responses,
@@ -1958,10 +1958,8 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 4096,
         .max_tokens = 1024,
-    }, ctx, false);
-    try jw.endArray();
-
-    const written = allocating.written();
+    }, ctx);
+    defer alloc.free(written);
     try testing.expect(std.mem.indexOf(u8, written, "No result provided") != null);
     try testing.expect(std.mem.indexOf(u8, written, "should not replay") == null);
 }
@@ -1997,15 +1995,10 @@ test "writeInputOpts serializes invalid tool-result utf-8 as output text" {
     };
     const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = assistant }, .{ .tool_result = tool_result } } };
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(alloc);
-    var allocating = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
-    try jw.beginArray();
-    try writeInputOpts(alloc, &jw, test_model, ctx, false);
-    try jw.endArray();
+    const written = try writeInputToJson(alloc, test_model, ctx);
+    defer alloc.free(written);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, allocating.written(), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, written, .{});
     defer parsed.deinit();
 
     var found = false;
