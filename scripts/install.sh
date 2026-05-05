@@ -131,6 +131,15 @@ fi
 cp "$package_dir/bin/zi" "$install_dir/zi"
 chmod 755 "$install_dir/zi"
 
+# Unsigned Mach-O binaries downloaded from the internet can be killed by
+# macOS before main() runs. Ad-hoc signing is local, requires no Apple
+# identity, and keeps the CLI usable until we have Developer ID notarization.
+if [ "$os" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - "$install_dir/zi" >/dev/null 2>&1 || {
+    echo "warning: failed to ad-hoc sign $install_dir/zi" >&2
+  }
+fi
+
 printf '\ninstalled zi to %s/zi\n' "$install_dir"
 
 if command -v "$install_dir/zi" >/dev/null 2>&1; then

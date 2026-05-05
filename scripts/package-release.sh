@@ -62,6 +62,15 @@ if [ ! -f "$binary_path" ]; then
   exit 1
 fi
 
+# Unsigned Mach-O binaries downloaded from the internet can be killed by
+# macOS before main() runs. Ad-hoc signing is local, requires no Apple
+# identity, and keeps the CLI usable until we have Developer ID notarization.
+if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+  case "$dist_target" in
+    *apple-darwin) codesign --force --sign - "$binary_path" >/dev/null 2>&1 || true ;;
+  esac
+fi
+
 # Smoke-test native/package-host runnable binaries. Cross-built binaries may not
 # execute on the packaging host, so a failed exec is only fatal when the command
 # runs and reports the wrong version.
