@@ -187,6 +187,7 @@ pub const Interactive = struct {
     status_line: StatusLine,
     pending_image_banner: text_mod.Text,
     extension_ui_state: ExtensionUiState,
+    extension_surface_overlay: ?tui_mod.OverlayHandle = null,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
@@ -388,6 +389,7 @@ pub const Interactive = struct {
         self.lifecycle_event_queue.close();
 
         self.drainUiEvents();
+        extension_ui_flow.hideSurfaceOverlay(self);
         self.closeExtensionPromptFlow(false);
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
@@ -632,14 +634,14 @@ pub const Interactive = struct {
         return event_flow.publishLifecycle(self, event);
     }
 
-    fn publishJobSurfaceFrame(ptr: *anyopaque, frame: extension_ui.SurfaceFrame) bool {
+    fn publishJobSurfaceFrame(ptr: *anyopaque, update: extension_ui.SurfaceUpdate) bool {
         const self: *Interactive = @ptrCast(@alignCast(ptr));
         const updates = self.msg_allocator.alloc(extension_ui.SurfaceUpdate, 1) catch {
-            var failed = frame;
+            var failed = update;
             failed.deinit(self.msg_allocator);
             return false;
         };
-        updates[0] = .{ .frame = frame };
+        updates[0] = update;
         return self.publishSnapshotUiEvent(.{ .extension_surface_updated = .{ .updates = updates } });
     }
 

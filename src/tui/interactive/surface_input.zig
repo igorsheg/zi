@@ -17,8 +17,12 @@ pub fn handle(self: anytype, key: Key) bool {
     const surface_id = self.extension_ui_state.keyboardSurfaceId() orelse return false;
     const surface_component = self.extension_ui_state.surfaceComponent();
     if (self.tui.focus.current) |focused| {
-        if (!@import("../component.zig").Component.eql(focused, surface_component)) return false;
-    } else return false;
+        const Component = @import("../component.zig").Component;
+        if (!Component.eql(focused, surface_component)) {
+            if (Component.eql(focused, self.active_editor.component())) return false;
+            if (self.extension_surface_overlay == null) return false;
+        }
+    } else if (self.extension_surface_overlay == null) return false;
 
     if (keybindings.matches(.select_cancel, key) or key.code == .escape) {
         self.tui.setFocus(self.active_editor.component());
@@ -28,6 +32,7 @@ pub fn handle(self: anytype, key: Key) bool {
 
     var input = buildSurfaceInput(self.msg_allocator, surface_id, key) catch return true;
     errdefer input.deinit(self.msg_allocator);
+    writeSurfaceInputJob(self, input);
     switch (self.request_queue.trySend(.{ .extension_surface_input = input })) {
         .ok => return true,
         .dropped => unreachable,
@@ -37,6 +42,18 @@ pub fn handle(self: anytype, key: Key) bool {
             return true;
         },
     }
+}
+
+fn writeSurfaceInputJob(self: anytype, input: extension_ui.SurfaceInput) void {
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "KEY {s} {s} {d} {d} {d} \"\"\n", .{
+        input.action,
+        input.key,
+        @intFromBool(input.ctrl),
+        @intFromBool(input.alt),
+        @intFromBool(input.shift),
+    }) catch return;
+    _ = self.job_manager.writeSurfaceInput(input.id, line);
 }
 
 fn buildSurfaceInput(allocator: std.mem.Allocator, surface_id: []const u8, key: Key) !extension_ui.SurfaceInput {

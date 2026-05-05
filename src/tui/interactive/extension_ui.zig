@@ -1,5 +1,6 @@
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const ui_event_mod = @import("../ui_event.zig");
+const cell_mod = @import("../cell.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 
@@ -56,26 +57,40 @@ pub fn applyPublications(self: *Interactive, updates: []const extension_ui.UiPub
 }
 
 pub fn applySurfaceUpdates(self: *Interactive, updates: []const extension_ui.SurfaceUpdate) void {
-    var focus_surface = false;
-    var close_focused_surface = false;
-    const surface_component = self.extension_ui_state.surfaceComponent();
+    var open_surface: ?extension_ui.SurfaceOpen = null;
+    var close_surface = false;
     for (updates) |update| {
         switch (update) {
-            .open => |open| {
-                if (open.wants_keyboard) focus_surface = true;
-            },
-            .close => {
-                if (self.tui.focus.current) |focused| {
-                    if (@import("../component.zig").Component.eql(focused, surface_component)) close_focused_surface = true;
-                }
-            },
+            .open => |open| open_surface = open,
+            .close => close_surface = true,
             .frame => {},
         }
         self.extension_ui_state.applySurfaceUpdate(update);
     }
-    if (close_focused_surface) self.tui.setFocus(self.active_editor.component());
-    if (focus_surface) self.tui.setFocus(surface_component);
+
+    if (close_surface) hideSurfaceOverlay(self);
+    if (open_surface) |open| showSurfaceOverlay(self, open.wants_keyboard);
     self.tui.dirty = true;
+}
+
+fn showSurfaceOverlay(self: *Interactive, wants_keyboard: bool) void {
+    if (self.extension_surface_overlay) |_| return;
+    const component = self.extension_ui_state.surfaceComponent();
+    self.extension_surface_overlay = self.tui.showOverlay(component, .{
+        .anchor = .center,
+        .width_percent = 92,
+        .max_height_percent = 90,
+        .margin_top = 1,
+        .margin_bottom = 1,
+        .non_capturing = !wants_keyboard,
+        .surface = .{ .fill = cell_mod.Color.default },
+        .backdrop = .dim,
+    });
+}
+
+pub fn hideSurfaceOverlay(self: *Interactive) void {
+    if (self.extension_surface_overlay) |handle| handle.hide();
+    self.extension_surface_overlay = null;
 }
 
 pub fn applyCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {

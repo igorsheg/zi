@@ -123,6 +123,22 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
                 .generation = runner.generation,
                 .max_frame_bytes = @min(@as(usize, @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", limits.surface_frame_bytes))), limits.surface_frame_bytes),
             } };
+        } else if (std.mem.eql(u8, mode, "surface_cells")) {
+            const protocol = try readStringField(allocator, L, stdout_idx, "protocol", "zi-cell-frame-v1");
+            defer allocator.free(protocol);
+            if (!std.mem.eql(u8, protocol, "zi-cell-frame-v1")) return error.InvalidOptions;
+            const runner = runnerFromUpvalue(L);
+            const source = runner.currentLoadSource();
+            const surface_id = try readStringField(allocator, L, stdout_idx, "surface", "surface");
+            errdefer allocator.free(surface_id);
+            const state_owner_id = try allocator.dupe(u8, if (source) |src| src.provenance.state_owner_id else "job");
+            errdefer allocator.free(state_owner_id);
+            request.stdout = .{ .surface_cells = .{
+                .surface_id = surface_id,
+                .state_owner_id = state_owner_id,
+                .generation = runner.generation,
+                .max_frame_bytes = @min(@as(usize, @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", 4 * 1024 * 1024))), 4 * 1024 * 1024),
+            } };
         } else if (std.mem.eql(u8, mode, "json_lines")) {
             const raw_max_line_bytes = readIntegerField(L, stdout_idx, "max_line_bytes", 1024 * 1024);
             if (raw_max_line_bytes <= 0) return error.InvalidOptions;

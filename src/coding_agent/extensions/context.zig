@@ -507,13 +507,14 @@ fn readSurfaceFormat(L: *c.lua_State, idx: c_int) extension_ui.SurfaceFormat {
     var len: usize = 0;
     const ptr = c.lua_tolstring(L, -1, &len) orelse return .rgba8888;
     const value = ptr[0..len];
-    if (std.mem.eql(u8, value, "rgba8888")) return .rgba8888;
+    if (std.mem.eql(u8, value, "halfblock_rgb")) return .halfblock_rgb;
     return .rgba8888;
 }
 
 fn expectedSurfaceFrameBytes(width: u32, height: u32, format: extension_ui.SurfaceFormat) ?usize {
     const bpp: usize = switch (format) {
         .rgba8888 => 4,
+        .halfblock_rgb => 6,
     };
     const pixels = std.math.mul(usize, width, height) catch return null;
     return std.math.mul(usize, pixels, bpp) catch null;

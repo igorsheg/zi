@@ -160,6 +160,7 @@ pub const UiEvent = union(enum) {
             .tool_running,
             .login_progress,
             .status_snapshot,
+            .extension_surface_updated,
             => true,
             else => false,
         };

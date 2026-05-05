@@ -199,6 +199,7 @@ pub const UiPublication = struct {
 
 pub const SurfaceFormat = enum {
     rgba8888,
+    halfblock_rgb,
 };
 
 pub const SurfaceOpen = struct {

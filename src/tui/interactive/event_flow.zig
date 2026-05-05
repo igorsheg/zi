@@ -48,6 +48,10 @@ fn coalescePendingSnapshot(self: *Interactive, event: UiEvent) void {
         .conversation_snapshot => self.snapshot_event_queue.dropMatching(isConversationSnapshot, null),
         .queued_snapshot => self.snapshot_event_queue.dropMatching(isQueuedSnapshot, null),
         .status_snapshot => self.snapshot_event_queue.dropMatching(isStatusSnapshot, null),
+        .extension_surface_updated => |surface| if (isFrameOnlySurfaceUpdate(surface.updates))
+            self.snapshot_event_queue.dropMatching(isFrameOnlySurfaceSnapshot, null)
+        else
+            0,
         else => 0,
     };
     self.snapshot_coalesced_dropped += dropped;
@@ -63,6 +67,18 @@ fn isQueuedSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
 
 fn isStatusSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
     return item.* == .status_snapshot;
+}
+
+fn isFrameOnlySurfaceSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
+    return switch (item.*) {
+        .extension_surface_updated => |surface| isFrameOnlySurfaceUpdate(surface.updates),
+        else => false,
+    };
+}
+
+fn isFrameOnlySurfaceUpdate(updates: []const @import("../../coding_agent/extensions/ui.zig").SurfaceUpdate) bool {
+    if (updates.len != 1) return false;
+    return updates[0] == .frame;
 }
 
 pub fn logStats(comptime label: []const u8, stats: anytype) void {

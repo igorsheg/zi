@@ -58,7 +58,7 @@ pub const FramebufferSurface = struct {
     }
 
     fn applyFrame(self: *FramebufferSurface, frame: extension_ui.SurfaceFrame) void {
-        if (expectedBytes(frame.width, frame.height)) |needed| {
+        if (expectedFrameBytes(frame.width, frame.height, frame.format)) |needed| {
             if (frame.data.len < needed) return;
         } else return;
         self.clearFrame();
@@ -99,7 +99,10 @@ pub const FramebufferSurface = struct {
     pub fn measure(self: *FramebufferSurface, width: u32) Measurement {
         const frame = self.frame orelse return .{ .min_height = 0, .preferred_height = 0 };
         if (width == 0 or frame.width == 0 or frame.height == 0) return .{ .min_height = 0, .preferred_height = 0 };
-        const rows = scaledRows(frame.width, frame.height, width);
+        const rows = switch (frame.format) {
+            .rgba8888 => scaledRows(frame.width, frame.height, width),
+            .halfblock_rgb => frame.height,
+        };
         return .{ .min_height = @min(rows, 1), .preferred_height = rows };
     }
 
@@ -109,8 +112,9 @@ pub const FramebufferSurface = struct {
 
     pub fn renderSlice(self: *FramebufferSurface, region: Region, first_row: u32) void {
         const frame = self.frame orelse return;
+        if (frame.format == .halfblock_rgb) return renderHalfblockFrame(region, frame, first_row);
         if (region.width == 0 or region.height == 0) return;
-        if (expectedBytes(frame.width, frame.height)) |needed| {
+        if (expectedFrameBytes(frame.width, frame.height, frame.format)) |needed| {
             if (frame.data.len < needed) return;
         } else return;
 
@@ -137,9 +141,31 @@ pub const FramebufferSurface = struct {
 
 const Rgb = struct { r: u8, g: u8, b: u8 };
 
-fn expectedBytes(width: u32, height: u32) ?usize {
-    const pixels = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
-    return std.math.mul(usize, pixels, 4) catch null;
+fn expectedFrameBytes(width: u32, height: u32, format: extension_ui.SurfaceFormat) ?usize {
+    const cells = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
+    const bpp: usize = switch (format) { .rgba8888 => 4, .halfblock_rgb => 6 };
+    return std.math.mul(usize, cells, bpp) catch null;
+}
+
+fn renderHalfblockFrame(region: Region, frame: extension_ui.SurfaceFrame, first_row: u32) void {
+    if (region.width == 0 or region.height == 0 or frame.width == 0 or frame.height == 0) return;
+    const expected = expectedFrameBytes(frame.width, frame.height, frame.format) orelse return;
+    if (frame.data.len < expected) return;
+    var y: u32 = 0;
+    while (y < region.height and first_row + y < frame.height) : (y += 1) {
+        const src_y = first_row + y;
+        var x: u32 = 0;
+        while (x < region.width) : (x += 1) {
+            const src_x = @min(frame.width - 1, (x * frame.width) / region.width);
+            const off: usize = (@as(usize, src_y) * @as(usize, frame.width) + @as(usize, src_x)) * 6;
+            region.set(x, y, .{
+                .grapheme = .{ .codepoint = '▀' },
+                .fg = Color.rgb(frame.data[off], frame.data[off + 1], frame.data[off + 2]),
+                .bg = Color.rgb(frame.data[off + 3], frame.data[off + 4], frame.data[off + 5]),
+                .attrs = Attributes.none,
+            });
+        }
+    }
 }
 
 fn scaledRows(src_width: u32, src_height: u32, target_cols: u32) u32 {

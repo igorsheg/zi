@@ -6,6 +6,8 @@ const surface_input_flow = @import("surface_input.zig");
 const Key = keys_mod.Key;
 
 pub fn handle(self: anytype, key: Key) void {
+    if (surface_input_flow.handle(self, key)) return;
+
     if (self.tui.hasOverlay()) {
         if (self.tui.handleInput(key)) {
             if (self.extension_prompt_close_after_submit) {
@@ -81,8 +83,6 @@ pub fn handle(self: anytype, key: Key) void {
             return;
         }
     }
-
-    if (surface_input_flow.handle(self, key)) return;
 
     if (dispatchExtensionKeybinding(self, key)) return;
 

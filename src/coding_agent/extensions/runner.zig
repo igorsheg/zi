@@ -183,6 +183,12 @@ pub const JobStdoutMode = union(enum) {
         generation: Generation,
         max_frame_bytes: usize = 16 * 1024 * 1024,
     },
+    surface_cells: struct {
+        surface_id: []const u8,
+        state_owner_id: []const u8,
+        generation: Generation,
+        max_frame_bytes: usize = 4 * 1024 * 1024,
+    },
     json_lines: struct {
         max_line_bytes: usize = 1024 * 1024,
     },
@@ -196,6 +202,12 @@ pub const JobStdoutMode = union(enum) {
                 .generation = frame.generation,
                 .max_frame_bytes = frame.max_frame_bytes,
             } },
+            .surface_cells => |frame| .{ .surface_cells = .{
+                .surface_id = try allocator.dupe(u8, frame.surface_id),
+                .state_owner_id = try allocator.dupe(u8, frame.state_owner_id),
+                .generation = frame.generation,
+                .max_frame_bytes = frame.max_frame_bytes,
+            } },
             .json_lines => |cfg| .{ .json_lines = .{ .max_line_bytes = cfg.max_line_bytes } },
         };
     }
@@ -204,6 +216,10 @@ pub const JobStdoutMode = union(enum) {
         switch (self.*) {
             .events => {},
             .surface_frame => |frame| {
+                allocator.free(frame.surface_id);
+                allocator.free(frame.state_owner_id);
+            },
+            .surface_cells => |frame| {
                 allocator.free(frame.surface_id);
                 allocator.free(frame.state_owner_id);
             },
