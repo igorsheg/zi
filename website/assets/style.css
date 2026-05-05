@@ -374,7 +374,7 @@
     max-inline-size: var(--measure-xs);
     font-family: var(--font-title);
     font-size: var(--text-title);
-    font-weight: 600;
+    font-weight: 300;
     line-height: var(--line-title);
     letter-spacing: var(--tracking-title);
   }
