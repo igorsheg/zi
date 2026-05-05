@@ -1,156 +1,158 @@
-## Context object
+# Context
 
-Most [tools](api.html#tools), [commands](api.html#commands), and [events](api.html#events) receive `ctx`.
+Most tools, commands, and events receive `ctx`.
 
-`ctx` is the extension's view of the current run: current directory, UI intent, session helpers, state, model helpers, cancellation, and a few session controls.
+`ctx` is the extension's view of the current run.
+
+## Fields
 
 `ctx.cwd`
 : Current working directory.
 
 `ctx.has_ui`
-: Boolean indicating whether UI capabilities are available.
+: Whether UI APIs are available.
 
 `ctx.binding`
-: Session and extension identity information when available.
+: Session and extension identity, when available.
 
 `ctx.extension`
-: Current extension identity and bundled resource paths when the handler belongs to a loaded extension. Contains `id`, `source`, `entry`, and `root`. For bundled extensions, `root` is the extension directory containing `init.lua`; for flat extensions, `root` is the directory containing the `.lua` file.
+: Current extension identity and resource paths. Bundled extensions get their extension directory as `root`; flat extensions get the directory containing the `.lua` file.
 
 `ctx.ui`
-: Host-owned UI API, or `nil` when unavailable.
+: Host-owned UI API, or `nil`.
 
 `ctx.state`
-: Session-persisted state API scoped to the current extension.
+: Session-persisted state scoped to this extension.
 
 `ctx.session`
-: Session information and semantic session helpers when bound.
+: Session information and semantic session helpers.
 
 `ctx.ai`
 : Sessionless AI helper API.
 
 `ctx.models`
-: Visible model catalog helpers when bound.
+: Visible model catalog helpers.
 
 `ctx.signal`
-: Cancellation signal when available; otherwise `nil`.
+: Cancellation signal, or `nil`.
 
 `ctx.is_idle()`
-: Return whether the active session is idle, when bound.
+: Return whether the active session is idle.
 
 `ctx.abort()`
-: Request abort on the active run, when bound.
+: Request abort on the active run.
 
 `ctx.update(partial_result)`
-: Update the current in-flight tool preview from a tool execution. The argument uses the normal tool-result shape (`content`, optional `details`, optional `is_error`). This is live presentation only; the tool's final return remains authoritative.
+: Update the current in-flight tool preview. The final tool return remains authoritative.
 
 `ctx.has_pending_messages()`
-: Return whether the session has queued/pending messages, when bound.
+: Return whether the session has queued messages.
 
 `ctx.shutdown()`
-: Request shutdown when that capability is bound.
+: Request shutdown.
 
 `ctx.get_context_usage()`
-: Return context usage information when bound.
+: Return context usage information.
 
 `ctx.get_system_prompt()`
-: Return the active system prompt when bound.
+: Return the active system prompt.
 
-## Context ui api
+## UI
 
-The UI API publishes presentation intent. Extensions do not own terminal components or redraw. Say what the user should see; the host decides where it fits. Recreate live UI surfaces from [extension lifecycle](extensions.html#extension-lifecycle) events when sessions change.
+`ctx.ui` publishes intent. Extensions do not own terminal components or redraw.
 
 `ctx.ui.message(text, opts?)`
-: Publish short feedback. `opts.id` is the dedupe/update key; `opts.kind` is `info`, `warning`, `error`, or `success`. The host chooses a visible, low-disruption placement.
+: Publish short feedback. `opts.id` dedupes/updates. `opts.kind` is `info`, `warning`, `error`, or `success`.
 
 `ctx.ui.status({ id, text, value, lifetime? })`
-: Publish compact retained state by stable id. `text` or `value` is shown; nil clears the item.
+: Publish compact retained state. Nil clears it.
 
 `ctx.ui.progress({ id, status?, title?, current?, total?, detail?, indeterminate?, text?, lifetime? })`
-: Publish retained progress lifecycle state. `status` is `running`, `done`, `error`, or `cancelled`. The host formats and places it.
+: Publish retained progress. `status` is `running`, `done`, `error`, or `cancelled`.
 
 `ctx.ui.report({ id, title, body, format?, transient? })`
-: Publish a readable document/report. `format = "text"` is the default and current supported format. `body` is plain text; zi owns splitting, scrolling, rendering, and preserving report presentation state by `id` where supported.
+: Publish a readable report. Current format is plain text.
 
 `ctx.ui.surface_open({ id, title?, width, height, format = "rgba8888", input? })`
-: Open or replace an ephemeral host-owned interactive surface. Surfaces are live UI state, not transcript content. `input.keyboard = true` asks zi to focus the surface and route scoped `surface_input` keyboard events to extensions; `Esc` returns focus to the editor.
+: Open or replace an ephemeral interactive surface. `input.keyboard = true` asks zi to focus it and send `surface_input` events. `Esc` returns focus to the editor.
 
 `ctx.ui.surface_frame({ id, width, height, format = "rgba8888", data })`
-: Publish the latest framebuffer for a surface. `data` is a Lua string containing `width * height * 4` RGBA bytes. The TUI keeps/renders the latest frame and may drop stale frames rather than queue unbounded updates.
+: Publish the latest RGBA frame. `data` is `width * height * 4` bytes.
 
 `ctx.ui.surface_close({ id })`
-: Close a previously opened surface.
+: Close a surface.
 
 `ctx.ui.pick({ title, placeholder?, empty_text?, options|items, timeout_ms? })`
-: Request selection from stable options. Items may carry `value`, `label`, `description`, `search`, and static `preview`. Returns `{ status, value, item? }` when submitted.
+: Ask the user to pick an item. Returns `{ status, value, item? }`.
 
 `ctx.ui.prompt({ kind = "confirm"|"select"|"input"|"editor", ... })`
-: Generic modal interaction request. Returns an envelope with `status` and, when submitted, `value`.
+: Ask the user for input. Returns `{ status, value? }`.
 
 `ctx.ui.set_editor_text(text)`
-: Set host editor text.
+: Replace editor text.
 
 `ctx.ui.paste_to_editor(text)`
-: Paste text into the host editor.
+: Paste into the editor.
 
 `ctx.ui.clear_editor_text()`
-: Clear host editor text.
+: Clear editor text.
 
 `ctx.ui.get_editor_text()`
-: Request editor text when the host exposes that capability. Returns `nil` when unavailable.
+: Return editor text, or `nil`.
 
-Surface option tables may include `placement` and `lifetime`. `lifetime` is `session` or `until_input`.
+Surface options may include `placement` and `lifetime`. `lifetime` is `session` or `until_input`.
 
-## Context state api
+## State
 
-`ctx.state` is a per-extension session-persisted map. Use it for small choices and facts your extension owns.
+`ctx.state` is a per-extension session map. Use it for small facts your extension owns.
 
 `ctx.state.get(key)`
 : Return a JSON-compatible value or `nil`.
 
 `ctx.state.set(key, value)`
-: Persist a JSON-compatible value for this extension's state owner.
+: Persist a JSON-compatible value.
 
 `ctx.state.delete(key)`
-: Write a tombstone for the key.
+: Write a tombstone.
 
-State is scoped to the extension and active session. It may survive session changes according to the lifecycle rules in [extension lifecycle](extensions.html#extension-lifecycle). UI handles, prompts, jobs, and provider handles are live objects and should be recreated when needed.
+State may survive session changes. Live handles do not. Recreate UI, prompts, jobs, and provider handles when needed.
 
-## Context session api
+## Session
 
 `ctx.session.info()`
-: Return semantic session information.
+: Return session information.
 
 `ctx.session.name()`
 : Return the session name, or `nil`.
 
 `ctx.session.rename(name)`
-: Set or clear the session name. Returns boolean success.
+: Set or clear the session name.
 
 `ctx.session.messages({ limit?, include_tools? })`
-: Return recent semantic messages from the current visible branch. Default limit is 50; maximum is 500. `include_tools` defaults to true. Returned messages include durable `entry_id` values.
+: Return recent semantic messages. Default limit is 50, max is 500. Returned messages include durable `entry_id` values.
 
 `ctx.session.tool_results(tool_name)`
-: Return recorded tool results for a tool.
+: Return recorded tool results.
 
 `ctx.session.append_note({ kind, title?, body, source_entry_id? })`
-: Append a semantic session note. `source_entry_id` links the note to a durable session entry. `sourceEntryId` is accepted as an alias. Notes are durable custom session artifacts, not transcript mutation. Returns boolean success.
+: Append a durable note. `sourceEntryId` is accepted as an alias.
 
 `ctx.session.notes({ kind?, source_entry_id?, limit? })`
-: Return session notes. Default limit is 50; maximum is 500.
+: Return notes. Default limit is 50, max is 500.
 
 `ctx.session.label(entry_id, label)`
-: Append a lightweight durable label for a session entry. Passing `nil` or an empty string clears the label. Labels have no built-in meanings, colors, or priorities. Returns boolean success.
+: Append a durable label for an entry. Nil or empty label clears it.
 
 `ctx.session.labels({ target_entry_id?, limit? })`
-: Return label entries, optionally filtered to a target session entry. Default limit is 50; maximum is 500.
+: Return label entries.
 
 `ctx.session.entry(entry_id)`
-: Return one semantic session entry by durable id, or `nil` when not found. Message entries return role/text fields when they map to one semantic message; labels return `target_entry_id` and `label`; extension notes return note fields.
+: Return one semantic session entry, or `nil`.
 
 `ctx.session.entries({ label?, limit? })`
-: Return semantic target entries by simple predicates. Currently supports `label`; latest label wins per target entry, cleared labels are excluded, and returned rows are target entries rather than label entries. Default limit is 50; maximum is 500.
+: Return target entries by predicate. Currently supports `label`.
 
-Durable message ids compose with notes and labels. Use them for memory that should be inspectable later, not hidden inside an extension:
+Use durable ids for memory that should be inspectable later.
 
 ```lua
 zi.on("message", function(event, ctx)
@@ -166,7 +168,7 @@ zi.on("message", function(event, ctx)
 end)
 ```
 
-Later, an extension can query and dereference:
+Later:
 
 ```lua
 for _, entry in ipairs(ctx.session.entries({ label = "decision", limit = 20 })) do
@@ -174,7 +176,7 @@ for _, entry in ipairs(ctx.session.entries({ label = "decision", limit = 20 })) 
 end
 ```
 
-## Context model and ai api
+## Models and AI
 
 `ctx.models.list()`
 : Return visible model catalog entries.
@@ -186,9 +188,7 @@ end
 : Resolve a model by id, provider/id string, or model-like table.
 
 `ctx.ai.complete(request)`
-: Run a sessionless model completion. It does not mutate the transcript and does not run tools. Use it for side questions, summaries, or classification that should not become part of the main conversation. For provider/model registration, see [providers](api.html#providers).
-
-`ctx.ai.complete` accepts either a prompt string or a table:
+: Run a sessionless model completion. It does not mutate the transcript and does not run tools.
 
 ```lua
 ctx.ai.complete({
@@ -200,9 +200,9 @@ ctx.ai.complete({
 })
 ```
 
-`reasoning` may be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or a boolean (`true` maps high, `false` maps off).
+`reasoning` may be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or a boolean.
 
-The result shape is:
+Results:
 
 ```lua
 { status = "completed", text = "..." }
@@ -210,9 +210,9 @@ The result shape is:
 { status = "cancelled" }
 ```
 
-## System command helper
+## System commands
 
-`zi.system(argv, opts?)` runs an OS command directly from an argv array. It is yieldable and should be called from command/tool execution contexts, not extension load/register code. Prefer bounded, explicit commands over shell strings. By default it uses captured stdio; with `stdio = "terminal"` it runs an interactive command attached to the user's terminal.
+`zi.system(argv, opts?)` runs an OS command from an argv array. It is yieldable. Call it from tools or commands, not extension load code.
 
 ```lua
 local result = zi.system({ "git", "status", "--short" }, {
@@ -221,7 +221,7 @@ local result = zi.system({ "git", "status", "--short" }, {
 })
 ```
 
-There is no implicit shell string form. Use an explicit shell when needed:
+There is no shell string form. Use a shell explicitly when needed:
 
 ```lua
 zi.system({ "/bin/sh", "-c", "echo $HOME" })
@@ -236,24 +236,24 @@ Options:
 : Optional stdin string.
 
 `env`
-: Optional string map overlaid on the inherited environment.
+: Optional string map over the inherited environment.
 
 `clear_env`
-: Boolean. When true, only `env` is used.
+: When true, only `env` is used.
 
 `timeout_ms`
-: Optional timeout in milliseconds.
+: Timeout in milliseconds.
 
 `max_stdout_bytes`, `max_stderr_bytes`
-: Optional bounded capture limits.
+: Bounded capture limits.
 
 `text`
-: Boolean. Defaults true and normalizes CRLF to LF.
+: Defaults true. Normalizes CRLF to LF.
 
 `stdio`
-: `"capture"` or `"terminal"`. Defaults to `"capture"`. Capture mode returns bounded stdout/stderr. Terminal mode is TUI-only: zi suspends its terminal state, runs the child process attached to stdin/stdout/stderr, restores/redraws after exit, and returns empty stdout/stderr. Use terminal mode for interactive commands such as `$EDITOR`, `$PAGER`, `fzf`, `lazygit`, or login flows. `stdin`, `timeout_ms`, `max_stdout_bytes`, and `max_stderr_bytes` are invalid with terminal mode.
+: `"capture"` or `"terminal"`. Terminal mode is TUI-only and attaches the child to the user's terminal. Use it for `$EDITOR`, `$PAGER`, `fzf`, `lazygit`, and login flows. Capture-only options are invalid with terminal mode.
 
-Result shapes:
+Results:
 
 ```lua
 { status = "completed", code = 0, signal = nil, stdout = "...", stderr = "..." }
@@ -263,9 +263,9 @@ Result shapes:
 
 Non-zero exits are `status = "completed"`; inspect `code`.
 
-## Spawn helper
+## Spawn
 
-`zi.spawn(opts)` runs delegated child zi work through batch JSON mode and returns a table shaped like a tool result. This is for real delegation, not ordinary helper logic. Prefer normal [tools](api.html#tools), [commands](api.html#commands), and [context model and ai api](#context-model-and-ai-api) when a child agent is not required.
+`zi.spawn(opts)` runs a child zi task through batch JSON mode and returns a tool-shaped result. Use it for real delegation, not ordinary helper logic.
 
 ```lua
 local result = zi.spawn({
@@ -298,10 +298,10 @@ Fields:
 : Optional child working directory. Defaults to `.`.
 
 `on`
-: Optional table of event-name callback functions keyed by child event name. Callbacks receive child JSON events on the parent extension/Lua thread while the child is running, so they may update extension-owned state and publish non-yielding current-tool previews with `ctx.update`.
+: Optional event callbacks keyed by child event name. Callbacks run on the parent extension/Lua thread and must not yield.
 
 Caveats:
 
-- `zi.spawn` is yieldable and should be called only from yieldable execution contexts.
-- callbacks in `on` must not yield.
-- abort forwarding depends on the execution context. Prefer spawning from tool or command work where cancellation is expected.
+- `zi.spawn` is yieldable
+- callbacks in `on` must not yield
+- abort forwarding depends on the execution context

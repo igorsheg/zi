@@ -1,112 +1,109 @@
-## Extension api: zi table
+# API
 
-The extension API is plain Lua functions and tables, so an extension can be read, copied, changed, or removed by one person.
+Extensions get a global `zi` table.
 
-Prefer small tools, explicit names, and behavior that will still make sense in a session transcript later.
+The API is plain Lua. Tables in, tables out. Keep names exact and results small.
+
+## `zi` table
 
 `zi.register_tool(spec)`
-: Register a model-visible tool. See [tools](#tools).
+: Register a model-visible tool. Duplicate names are ignored; returns `false`.
 
 `zi.register_command(spec)`
-: Register an interactive slash command. See [commands](#commands).
-
+: Register an interactive slash command. Duplicate names get resolved invocation names.
 
 `zi.register_provider(name, config)`
-: Register or override a provider claim. See [providers](#providers).
+: Register a provider/model claim. Existing claims are not replaced unless owned by this source.
 
 `zi.unregister_provider(name)`
 : Remove this extension's provider claim.
 
 `zi.on(event_name, handler)`
-: Register an observer or interceptor handler. See [events](#events).
-
-`zi.spawn(opts)`
-: Run delegated child zi work through batch JSON mode. See [spawn helper](context.html#spawn-helper).
+: Register an observer or interceptor.
 
 `zi.system(argv, opts?)`
-: Run an argv-style system command through the extension async scheduler. Captures bounded stdout/stderr and returns a structured result.
+: Run an argv command through zi's async scheduler.
 
-`zi.job.start({ argv, cwd?, stdout? })`
-: Start a long-running host job and return `{ id }`. By default, job stdout/stderr/exit are delivered through `job_stdout`, `job_stderr`, and `job_exit` events. `stdout = { mode = "json_lines", max_line_bytes? }` frames stdout as newline-delimited JSON and emits parsed `job_json` events with `value`, raw `data`, and parse/limit failures as `is_error = true`. For framebuffer helpers, `stdout = { mode = "surface_frame", protocol = "zi-rgba-frame-v1", surface = "surface-id", max_frame_bytes? }` decodes `FRAME <width> <height> <byte_len>\n<rgba bytes>` records in the host and publishes complete RGBA frames directly to the named surface instead of emitting `job_stdout` chunks. `zi-rgba-frame-v1` requires non-zero dimensions and `byte_len == width * height * 4`; malformed records are skipped/resynchronized.
+`zi.spawn(opts)`
+: Run delegated child zi work through batch JSON mode.
+
+`zi.job.start(opts)`
+: Start a host job. Returns `{ id }`.
 
 `zi.job.write(id_or_job, data)`
-: Write a string to a job's stdin stream.
+: Write to job stdin.
 
 `zi.job.stop(id_or_job)`
 : Request job termination.
 
 `zi.json.encode(value)`
-: Encode a JSON-compatible Lua value as a JSON string. Tables encode as arrays when they are Lua sequences, otherwise as objects with string keys. Unsupported values or values exceeding host limits raise an error.
+: Encode a JSON-compatible Lua value.
 
 `zi.json.decode(text)`
-: Decode a JSON string into Lua values. JSON objects become tables, arrays become sequence tables, booleans/numbers/strings map directly, and JSON null maps to nil.
+: Decode JSON. JSON `null` becomes Lua `nil`.
 
 ## Tools
 
-Tools are definition-first. A tool definition is the unit zi exposes to the model. Keep each tool narrow: one clear name, one clear parameter shape, one readable result. Tool handlers receive the shared [context object](context.html#context-object).
+A tool is visible to the model. Keep it narrow.
 
 `zi.register_tool(spec)` accepts:
 
 `name`
-: Required string. The model-visible tool id and collision key.
+: Required string. Model-visible id and collision key.
 
 `description`
 : Required string. Human/model-facing description.
 
 `parameters`
-: Required table. JSON-schema-like parameter schema; host validation owns whether `execute` may run.
+: Required JSON-schema-like table.
 
 `execute(params, ctx)`
-: Required function. Runs the tool and returns the terminal tool result. Use [context ui api](context.html#context-ui-api), [context state api](context.html#context-state-api), or [context model and ai api](context.html#context-model-and-ai-api) from here as needed.
+: Required function. Runs the tool and returns the final tool result.
 
 `label`
-: Optional string. UI label. Defaults to `name`.
+: Optional UI label. Defaults to `name`.
 
 `prompt_snippet`
-: Optional string. Prompt metadata for model guidance.
+: Optional prompt metadata.
 
 `prompt_guidelines`
-: Optional array of strings. Additional prompt guidance bullets.
+: Optional array of prompt guidance bullets.
 
 `render_call(args, ctx)`
-: Optional function. Custom call-slot renderer.
+: Optional call-slot renderer.
 
 `render_result(result, ctx)`
-: Optional function. Custom result-slot renderer.
+: Optional result-slot renderer.
 
-A terminal tool result has this shape:
+Tool result:
 
 ```lua
 {
   content = {
     { type = "text", text = "..." },
   },
-  details = {},       -- optional small exact JSON-compatible metadata
-  presentation = {},  -- optional rich render state for render_result
+  details = {},
+  presentation = {},
   is_error = false,
 }
 ```
 
-`content` is the model-visible answer and is tightly bounded. `details` is for small structured metadata and is converted with strict JSON limits. `presentation` is extension-owned UI state passed back to `render_result`; zi does not interpret its schema, but stores and transports it on a bounded best-effort basis. Oversized presentation strings/items may be truncated or omitted and the root object is marked with reserved `__zi_*` fields such as `__zi_truncated`.
-
-Tool names are unique. If a later extension registers a tool with an already-claimed name, the later registration is ignored and `zi.register_tool` returns `false`. This keeps ownership explicit.
+`content` is model-visible and tightly bounded. `details` is small JSON metadata. `presentation` is extension-owned UI state for `render_result`; zi may truncate or omit oversized values and mark the object with reserved `__zi_*` fields.
 
 ## Commands
 
-Commands are direct user actions. Use them for things a person asks zi to do now: open a report, save a note, start a workflow, or change local state.
+Commands are direct user actions.
 
 `zi.register_command(spec)` accepts:
 
 `name`
-: Required string. Slash command name, without the leading `/`.
+: Required string. Slash command name without `/`.
 
 `description`
-: Optional string. Shown in command lists.
+: Optional string shown in command lists.
 
 `handler(args, ctx)`
-: Required function. Runs on the agent thread when the command is invoked.
-
-Example:
+: Required function. Runs on the agent thread.
 
 ```lua
 return function(zi)
@@ -125,24 +122,24 @@ return function(zi)
 end
 ```
 
-Slash command ordering is:
+Slash command order:
 
 1. built-in interactive commands
 2. extension commands
-3. prompt-template and skill expansion on command miss
-4. `input` interceptor over surviving prompt text
+3. prompt-template and skill expansion on miss
+4. `input` interceptor
 5. prompt assembly and provider run
 
-Built-ins stay TUI-local when they need immediate UI/session behavior. Extension commands enqueue semantic command work to the agent thread. Command handlers receive the same [context object](context.html#context-object) as tools and events.
+Built-ins stay TUI-local when they need immediate UI/session behavior. Extension commands enqueue semantic work to the agent thread.
 
 ## Providers
 
-Providers let extensions add or override visible model/provider choices. Use them to describe what models exist; use events to rewrite requests.
+Providers describe visible model/provider choices. Use events to rewrite requests.
 
 `zi.register_provider(name, config)` supports:
 
 `api`
-: Required for custom provider names. For built-in provider overrides, zi can infer the required API family.
+: Required for custom provider names. Built-in provider overrides may infer it.
 
 `base_url`
 : Required string.
@@ -154,49 +151,47 @@ Providers let extensions add or override visible model/provider choices. Use the
 : Optional string map.
 
 `models`
-: Optional array of model tables for provider-owned visible models. Built-in provider overrides use the built-in visible catalog.
+: Optional array of model tables.
 
 `oauth`
-: Optional OAuth callbacks for provider-owned models where the host has a compatible OAuth template. Supported callback fields are `login`, `refresh_token` or `refreshToken`, and `getApiKey`.
+: Optional callbacks for compatible OAuth-backed provider models. Supported fields: `login`, `refresh_token` or `refreshToken`, and `getApiKey`.
 
-Built-in visible provider names with override support today are:
+Built-in visible provider names with override support:
 
 - `anthropic`
 - `openai`
 - `openrouter`
 - `openai-codex`
 
-Provider registration changes the host-owned provider/model views. Extensions own claims, not provider runtime pointers or credential persistence. Use [before_provider_request](#events) for request rewriting, and [context model and ai api](context.html#context-model-and-ai-api) for model inspection/completions.
+Extensions own claims, not provider runtime pointers or credential persistence.
 
 ## Events
 
-`zi.on(name, handler)` registers an observer or interceptor. Handlers receive `(event, ctx)`, where `ctx` is described in [context object](context.html#context-object).
+`zi.on(name, handler)` registers an observer or interceptor. Handlers receive `(event, ctx)`.
 
-Events let extensions react to session life. Keep them visible: avoid surprising network calls, hidden policy, or changes the user cannot explain later.
+Observer events are post-commit. Return values are ignored.
 
-Observer events are additive and post-commit. Return values are ignored.
+Interceptor events run before zi commits an action. Depending on the event, handlers may replace payloads, cancel work, or provide event-specific results.
 
-Interceptor events run before zi commits an action. Depending on the event family, handlers may replace payloads, cancel the action, or provide event-specific results.
-
-Supported event names include:
+Event names:
 
 `session_directory`
-: Startup event for selecting a session directory.
+: Pick a session directory at startup.
 
 `resources_discover`
-: Add resource folders for `lua/`, `prompts/`, `skills/`, `themes/`, and `agents/`.
+: Add resource folders for `lua/`, `prompts/`, `skills`, `themes`, and `agents`.
 
 `input`
-: Middleware/cancellable seam over submitted prompt text after slash-command dispatch.
+: Middleware over submitted prompt text after slash-command dispatch.
 
 `before_agent_start`
-: Event before the final agent prompt/request. May add messages or replace the system prompt.
+: Hook before the final agent prompt/request. May add messages or replace the system prompt.
 
 `context`
-: Middleware over message context used for the next provider call.
+: Middleware over message context for the next provider call.
 
 `before_provider_request`
-: Middleware over semantic provider request payload.
+: Middleware over the semantic provider request payload.
 
 `agent_start`, `agent_end`
 : Observe agent run boundaries.
@@ -205,16 +200,16 @@ Supported event names include:
 : Observe assistant turn boundaries.
 
 `message_start`, `message_update`, `message_end`, `message`
-: Observe transcript/message edges. `message_update` is for streaming assistant deltas. `message_end` is the raw lifecycle edge. `message` is the durable semantic observer, dispatched after session persistence with `event.message.entry_id` for use with `ctx.session.entry`, notes, and labels.
+: Observe transcript/message edges. `message` is the durable semantic observer and includes `event.message.entry_id`.
 
 `tool_execution_start`, `tool_execution_update`, `tool_execution_end`
 : Observe tool execution state.
 
 `tool_call`
-: Middleware/cancellable seam over validated tool call input.
+: Middleware over validated tool call input.
 
 `tool_result`
-: Middleware seam over final tool result content, details, and error bit before commit.
+: Middleware over final tool result content, details, and error bit before commit.
 
 `user_bash`
 : Cancellable/aggregate seam for user-initiated shell execution.
@@ -235,12 +230,30 @@ Supported event names include:
 : Pre/post tree navigation events.
 
 `surface_input`
-: Observe keyboard input routed to a focused extension surface. The payload includes `id`, `kind = "key"`, `action = "press"`, `key`, optional `text`, and modifier booleans. Input is scoped to the focused surface; zi keeps host-owned escape/unfocus behavior.
+: Keyboard input routed to a focused extension surface. Host escape/unfocus behavior is not extension-owned.
 
 `job_stdout`, `job_stderr`, `job_exit`, `job_json`
-: Observe output and exit lifecycle for jobs started with `zi.job.start`. Output events include `id`, `kind`, and `data`; exit events include `id`, `kind = "exit"`, and optional `code`. Jobs started with `stdout = { mode = "json_lines" }` emit `job_json` events: successful lines include `id`, `kind = "json"`, raw `data`, and parsed `value`; malformed or oversized lines include `is_error = true` and `error`.
+: Job output and exit lifecycle events.
 
 `model_select`
 : Observe model selection changes.
 
-Interceptors should return only event-specific semantic data. They should not depend on transport structs, TUI state, mailbox state, or provider runtime handles.
+Interceptors should return semantic data only. Do not depend on transport structs, TUI state, mailbox state, or provider runtime handles.
+
+## Jobs
+
+`zi.job.start({ argv, cwd?, stdout? })` starts a long-running host job.
+
+By default, stdout/stderr/exit are delivered through job events.
+
+`stdout = { mode = "json_lines", max_line_bytes? }` parses stdout as JSONL and emits `job_json`.
+
+`stdout = { mode = "surface_frame", protocol = "zi-rgba-frame-v1", surface = "id", max_frame_bytes? }` publishes framebuffer records to a surface.
+
+`zi-rgba-frame-v1` records look like:
+
+```text
+FRAME <width> <height> <byte_len>\n<rgba bytes>
+```
+
+`byte_len` must equal `width * height * 4`.

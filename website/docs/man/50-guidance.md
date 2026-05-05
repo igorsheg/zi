@@ -1,75 +1,55 @@
-## Extension design rules
+# Extension guidance
 
-Good zi extensions are small, inspectable, and kind to the user.
+Write extensions a tired maintainer can understand.
 
-They do one useful thing, say what they are doing, and leave the user in control. Avoid hidden policy, surprising network calls, and abstractions only the author can debug.
+One job. Clear name. Visible effect. No hidden policy.
 
-This page is guidance for humans and for zi when generating extensions.
-
-Prefer documented host APIs over host details. Do not depend on TUI components, terminal input streams, mailbox payloads, provider runtime handles, transcript row objects, or render caches.
-
-Keep load/register cheap and deterministic. Register capabilities at load time; do real work later, when a tool, command, or event is running with a live context.
+Prefer documented APIs. Do not depend on TUI internals, mailbox payloads, provider runtime handles, transcript rows, terminal streams, or render caches.
 
 ## Choose the smallest surface
-
-Use [tools](api.html#tools) for model-visible capabilities.
-
-Use [commands](api.html#commands) for direct user actions.
-
-Use [events](api.html#events) for lifecycle policy, prompt/context rewriting, message watching, and tool/provider interception.
-
-Use [`ctx.ui`](context.html#context-ui-api) to publish UI intent.
-
-Use [`ctx.state`](context.html#context-state-api) for durable per-extension session state.
-
-Use [`ctx.ai.complete`](context.html#context-model-and-ai-api) for side-channel model calls that should not mutate the transcript.
-
-Use [`zi.register_provider`](api.html#providers) for provider/model visibility, not for request rewriting. Use [`before_provider_request`](api.html#events) for request rewriting.
-
-## Capability guide
 
 Need: add an action the model can call
 : Use [tools](api.html#tools).
 
-Need: add a slash command for the user
+Need: add a slash command
 : Use [commands](api.html#commands).
 
 Need: change the system prompt
-: Use [`before_agent_start`](api.html#events).
+: Use `before_agent_start`.
 
-Need: rewrite submitted user input
-: Use [`input`](api.html#events).
+Need: rewrite submitted input
+: Use `input`.
 
 Need: rewrite messages before a provider call
-: Use [`context`](api.html#events).
+: Use `context`.
 
 Need: rewrite the provider request
-: Use [`before_provider_request`](api.html#events).
+: Use `before_provider_request`.
 
 Need: show feedback, status, progress, a report, or a prompt
-: Use [context ui api](context.html#context-ui-api).
+: Use `ctx.ui`.
 
 Need: remember a per-session choice
-: Use [context state api](context.html#context-state-api).
+: Use `ctx.state`.
 
-Need: inspect the transcript, attach notes, label important entries, or query labeled entries
-: Use [context session api](context.html#context-session-api).
+Need: inspect the transcript, attach notes, or label entries
+: Use `ctx.session`.
 
 Need: ask a side-channel model question
-: Use [`ctx.ai.complete`](context.html#context-model-and-ai-api).
+: Use `ctx.ai.complete`.
 
 Need: expose a model/provider
-: Use [providers](api.html#providers).
+: Use `zi.register_provider`.
 
-Need: run a bounded OS command from extension code
-: Use [`zi.system`](context.html#system-command-helper).
+Need: run a bounded OS command
+: Use `zi.system`.
 
-Need: delegate work to a child zi run
-: Use [spawn helper](context.html#spawn-helper).
+Need: delegate to a child zi run
+: Use `zi.spawn`.
 
-## Canonical patterns
+## Patterns
 
-A model-visible tool has one job: accept structured parameters, perform the action, and return content. If the behavior cannot be described in one sentence, split it.
+A tool has one job. If it cannot be described in one sentence, split it.
 
 ```lua
 return function(zi)
@@ -84,7 +64,7 @@ return function(zi)
 end
 ```
 
-A slash command is for direct user intent. It should be safe to run when a person asks for it.
+A command is direct user intent. It should be safe to run when a person asks for it.
 
 ```lua
 return function(zi)
@@ -99,7 +79,7 @@ return function(zi)
 end
 ```
 
-A semantic message observer can attach durable session metadata without touching raw jsonl or UI rows. Use visible memory when the information belongs to the session.
+A message observer can attach durable memory without touching raw JSONL or UI rows.
 
 ```lua
 zi.on("message", function(event, ctx)
@@ -115,7 +95,7 @@ zi.on("message", function(event, ctx)
 end)
 ```
 
-An event is for policy or reaction. Keep event behavior easy to explain later.
+An event is for policy or reaction. Keep it easy to explain later.
 
 ```lua
 zi.on("message", function(event, ctx)
@@ -128,66 +108,57 @@ end)
 
 ## Kindness rules
 
-Ask before destructive actions.
+- ask before destructive actions
+- show paths before changing files outside the project
+- name models and providers when changing them
+- prefer local files, local state, and project-relative paths
+- do not hide network calls inside unrelated commands
+- return errors a person can act on
+- keep generated extensions short enough to review
 
-Show paths before changing files outside the current project.
-
-Name models and providers when an extension changes them.
-
-Prefer local files, local state, and project-relative paths when possible.
-
-Do not hide network calls inside unrelated commands.
-
-Return readable errors. A person should know what failed and what they can try next.
-
-Keep generated extensions short enough to review.
-
-## Extension examples
+## Examples to copy
 
 `hello.lua`
-: Minimal tool registration.
+: Minimal tool.
 
 `commands.lua`
-: Slash command with a host-owned report.
+: Slash command with a report.
 
 `dynamic_tools.lua`
-: Dynamic tool registration from an event or command.
+: Dynamic tool registration.
 
 `prompt_customizer.lua`
-: System prompt customization with `before_agent_start`.
+: `before_agent_start` prompt customization.
 
 `status_line.lua`
-: Turn lifecycle status publication.
+: Turn lifecycle status.
 
 `message_watch.lua`
 : Semantic message observer.
 
 `model_completion.lua`
-: Model catalog inspection and `ctx.ai.complete`.
+: Model catalog and `ctx.ai.complete`.
 
 `session_lifecycle.lua`
-: Session lifecycle observation and cancellable pre-hooks.
+: Session lifecycle hooks.
 
 `session_notes.lua`
-: Session note storage and retrieval.
+: Session notes.
 
 `auto_label.lua`
-: Durable message labels, label queries, and entry lookup.
+: Durable labels and entry lookup.
 
 `git_status.lua`
-: Yieldable `zi.system` command execution with host-owned report output.
+: `zi.system` with report output.
 
 `message.lua`
-: Short feedback through `ctx.ui.message`.
+: Short feedback.
 
 `question.lua`, `questionnaire.lua`, `timed_confirm.lua`
 : Host-owned prompts.
 
-`custom_header.lua`, `widget_placement.lua`, `hidden_thinking_label.lua`, `titlebar.lua`
-: Pi-mono parity examples rewritten onto host-owned semantic UI primitives.
-
 `input_transform.lua`, `permission_gate.lua`
-: Input and permission-style interception patterns.
+: Input and permission-style interceptors.
 
 `summarize.lua`, `handoff.lua`, `qna.lua`
-: Workflow-shaped commands/tools built from the same primitives.
+: Workflow-shaped commands/tools.

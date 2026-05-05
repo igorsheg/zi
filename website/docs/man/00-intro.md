@@ -1,58 +1,56 @@
-# Zi(1)
+# Zi
 
-## Name
+`zi` is a local coding agent harness.
 
-zi - yours-first coding agent
+It runs in your project, keeps a durable session log, and lets small Lua extensions teach it new habits.
 
-## Synopsis
+Use it when you want agent work that you can inspect, resume, and change.
 
-`zi [run-options] [@file ...] [prompt]`
+## Start
 
-`zi -p [@file ...] [prompt]`
+```sh
+zi
+zi "fix the failing build"
+zi -p "write a commit message"
+zi --mode json "inspect this project"
+```
 
-`zi --mode <text|json> [@file ...] [prompt]`
+## What zi keeps
 
-`zi --continue`
+zi keeps sessions on disk as JSONL. The TUI, replay tools, compaction, and extensions all work from that record.
 
-`zi --resume`
+Disable this for a startup run with `--no-session`.
 
-`zi --session <path|id>`
+## What zi extends
 
-`zi --list-models [search]`
+Extensions can add:
 
-## Description
+- slash commands
+- model-visible tools
+- prompt/context hooks
+- provider/model claims
+- session notes and labels
+- small UI surfaces
+- delegated child zi runs
 
-zi is a local-first coding agent harness. It keeps sessions durable, configuration local, extensions small, and behavior explicit enough to inspect.
+An extension is just Lua loaded from an extension root. No framework is required.
 
-Use it as-is, or teach it one habit at a time: a command, a tool, a prompt rule, a model preference, or a bit of UI.
+## Who this is for
 
-The goal is dependable agent work you can understand and change.
+These docs are for:
 
-## Philosophy
+- people using zi
+- people writing zi extensions
+- zi itself, when asked to write an extension
 
-zi is small on purpose.
+When generating an extension, prefer the API documented here. Keep behavior small, named, and visible in the session.
 
-A good agent harness should be understandable by one person. It should compose with the tools you already use, keep useful history, and make automation visible enough to trust, change, or remove.
+Markdown pages live next to the HTML pages. If a link ends in `.html`, the matching `.md` page usually exists too.
 
-Extensions are how zi becomes yours.
+## Pages
 
-Start small. Add one thing. Keep what helps. Delete what does not.
-
-## Readers
-
-This manual is written for two readers:
-
-- humans who want to use zi or write extensions
-- zi itself, when the user asks: "build me an extension"
-
-When generating an extension, prefer the API documented here and adapt the closest available example. Favor small, explicit behavior over clever machinery.
-
-Agents and other programmatic readers should prefer the Markdown version of each page. Replace the web page suffix with `.md`, for example `cli.html` becomes `cli.md`. When following links from Markdown manually, prefer the adjacent `.md` target when available.
-
-## Contents
-
-- [cli model](cli.html#cli-model) — run modes, prompt inputs, session selectors, and flags
-- [extension purpose](extensions.html#extension-purpose) — what extensions are for and how zi discovers them
-- [extension api: zi table](api.html#extension-api-zi-table) — `zi.register_tool`, commands, providers, events, and spawn
-- [context object](context.html#context-object) — `ctx.ui`, `ctx.state`, `ctx.session`, `ctx.models`, and `ctx.ai`
-- [extension design rules](guidance.html#extension-design-rules) — guidance for humans and for zi when writing extensions
+- [CLI](cli.html) — run modes, prompt inputs, sessions, flags
+- [Extensions](extensions.html) — discovery, loading, lifecycle
+- [API](api.html) — tools, commands, providers, events, jobs, JSON
+- [Context](context.html) — `ctx.ui`, `ctx.state`, `ctx.session`, `ctx.models`, `ctx.ai`
+- [Guidance](guidance.html) — rules for useful extensions

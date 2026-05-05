@@ -1,12 +1,12 @@
-## Cli model
+# CLI
 
-zi chooses its run mode from the arguments you give it. No hidden ceremony is required: run `zi` for an interactive session, or choose batch mode when you want a scriptable result.
+Run `zi` in a project.
 
-Interactive mode is the default when no batch selector is present. Batch mode is explicit: use `-p`, `--print`, or `--mode`. Piped stdin alone does not force batch mode, so an accidental pipe does not quietly change how zi behaves.
+No selector means interactive mode. Batch mode is explicit: use `-p`, `--print`, or `--mode`.
 
-Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. They cannot be combined with startup prompt inputs such as positional prompt text or `@file` arguments. For extension authoring, see [extension purpose](extensions.html#extension-purpose); for lifecycle details, see [extension lifecycle](extensions.html#extension-lifecycle).
+A pipe does not switch zi into batch mode by itself. That keeps accidental shell pipes from changing the run shape.
 
-## Cli examples
+## Common commands
 
 `zi`
 : Start interactive mode in the current project.
@@ -18,45 +18,42 @@ Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. 
 : Start interactive mode with file content plus prompt text.
 
 `zi -p "write a commit message"`
-: Run batch text mode and print the final assistant text after completion.
-
-`zi --mode text "write release notes"`
-: Run explicit batch text mode.
+: Run batch text mode. Print the final assistant text.
 
 `zi --mode json "inspect this project"`
-: Run batch JSON mode. JSON output starts with a session header when persistence is enabled, then emits event lines.
+: Run batch JSON mode. Emits a session header, then event lines, when persistence is enabled.
 
 `printf 'diff...' | zi -p @README.md "review this"`
-: In explicit batch mode, merge stdin, `@file` content, and prompt text in that order.
+: In batch mode, combine stdin, `@file` content, and prompt text.
 
 `zi --continue`
 : Resume the most recent session for this project.
 
 `zi --resume`
-: Open the interactive session picker.
+: Open the session picker.
 
 `zi --session ./path/to/session.jsonl`
 : Resume a specific session file.
 
 `zi --list-models claude`
-: List available models, optionally filtered by search text.
+: List models, optionally filtered.
 
-## Cli options
+## Options
 
 `-p`, `--print`
-: Select batch text mode. Prints the final assistant text only after completion.
+: Batch text mode. Prints final assistant text after the run.
 
 `--mode <text|json>`
-: Select explicit batch output mode. `text` emits final assistant text. `json` emits structured event lines.
+: Explicit batch mode. `text` prints final text. `json` emits event lines.
 
 `-c`, `--continue`
-: Resume the most recent saved session for this project. Interactive-only.
+: Resume the latest saved session for this project. Interactive-only.
 
 `-r`, `--resume`
-: Open the interactive session picker. Interactive-only.
+: Open the session picker. Interactive-only.
 
 `--session <path|id>`
-: Resume a specific session by path or ID prefix. Interactive-only.
+: Resume a session by path or ID prefix. Interactive-only.
 
 `--model <id>`
 : Select a model by ID or pattern.
@@ -65,22 +62,22 @@ Session selectors (`--continue`, `--resume`, `--session`) are interactive-only. 
 : Override the provider API key for this run.
 
 `--no-session`
-: Disable persistence for the startup session. In interactive mode, later `/resume` may enter a persisted session and `/new` starts a normal persisted session.
+: Start without persistence. In interactive mode, later `/resume` may enter a persisted session and `/new` starts a normal persisted session.
 
 `--tools <filter>`
-: Restrict the allowed tool set with a comma-separated filter.
+: Restrict the tool set with a comma-separated filter.
 
 `--append-system-prompt <text|path>`
 : Append literal text or file contents to the system prompt.
 
 `--list-models [search]`
-: List available models. The optional positional value filters the model list.
+: List available models. The optional value filters the list.
 
 `-h`, `--help`
-: Show CLI help.
+: Show help.
 
 `-v`, `--version`
-: Show the zi version.
+: Show version.
 
 ## Prompt inputs
 
@@ -88,14 +85,16 @@ Prompt input may come from:
 
 - positional prompt text
 - one or more `@file` arguments
-- piped stdin, but only in explicit batch mode
+- piped stdin, in explicit batch mode
 
-Prompt assembly order in batch mode is:
+Batch assembly order:
 
 ```text
 stdin + @file text + positional prompt
 ```
 
-`@file` arguments are supported for interactive startup and explicit batch mode. Text files are inserted into the prompt. Image files are detected from file bytes; supported inline images attach to the model request and also contribute text references.
+`@file` works for interactive startup and batch mode. Text files are inserted into the prompt. Supported image files attach to the model request and add text references.
 
-Empty or whitespace-only stdin is ignored. Empty `@file` inputs are skipped. Extensions that rewrite submitted input should use the [`input`](api.html#events) event. Extensions that alter provider context should use [`context`](api.html#events) or [`before_provider_request`](api.html#events).
+Empty stdin is ignored. Empty `@file` inputs are skipped.
+
+Session selectors (`--continue`, `--resume`, `--session`) are interactive-only and cannot be combined with startup prompt text or `@file` arguments.
