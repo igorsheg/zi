@@ -33,10 +33,6 @@ jobs:
             zig_target: native
             dist_target: aarch64-apple-darwin
             archive_kind: tar.gz
-          - os: macos-13
-            zig_target: native
-            dist_target: x86_64-apple-darwin
-            archive_kind: tar.gz
 
     runs-on: ${{ matrix.os }}
 
