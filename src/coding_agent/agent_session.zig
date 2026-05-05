@@ -39,15 +39,12 @@ const session_proto = session_core.protocol;
 
 /// Composition root: wires Agent + SessionStore + tools + model resolution.
 ///
-/// pi-mono equivalent: packages/coding-agent/src/core/sdk.ts (createAgentSession)
-/// + packages/coding-agent/src/core/agent-session.ts (AgentSession)
 ///
 /// Owns:
 /// - Agent (dual-loop, tool pipeline, event system)
 /// - SessionStore (JSONL persistence + context building)
 /// - Tool registry (bash + future tools)
 /// - convertToLlm that handles compaction_summary, branch_summary, custom
-/// - transformContext hook point (wired but no-op until compaction lands)
 /// - Stream hook wrapping provider registry
 pub const AgentSession = struct {
     agent: Agent,
@@ -636,7 +633,6 @@ pub const AgentSession = struct {
         projection_runtime.flushPendingToolProjectionRefresh(self);
     }
 
-    /// Run a new text prompt. Wires session persistence, then delegates to Agent.prompt.
     pub fn run(self: *AgentSession, prompt_text: []const u8) !void {
         try self.runUserContent(.{ .text = prompt_text });
     }
@@ -688,7 +684,6 @@ pub const AgentSession = struct {
         return ai_completion_runtime.completeUserText(self, allocator, system_prompt, prompt_text, max_tokens);
     }
 
-    /// Get session file path (valid after first flush).
     pub fn getSessionFile(self: *const AgentSession) []const u8 {
         return self.session_store.sessionFile();
     }
@@ -706,7 +701,6 @@ pub const AgentSession = struct {
     }
 
     /// Event listener: forwards to user-provided handler, then persists.
-    /// pi-mono ordering: extensions → listeners → persistence (agent-session.ts:507-530)
     fn eventListener(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(ctx));
 
@@ -1000,7 +994,6 @@ fn createAgentDirWithReadOverride(
     return tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
 }
 
-/// Test helper: create a AgentSession wired to a faux provider.
 fn createTestAgentSession(
     allocator: std.mem.Allocator,
     _: *faux.FauxProvider,
@@ -1879,8 +1872,6 @@ pub const ExtensionContext = struct {
 /// entries in v2. Reserving the type here means v2 is pure wiring, not a
 /// struct reshuffle.
 ///
-/// Matches pi-mono's ExtensionCommandContext:
-///   .references/pi-mono/packages/coding-agent/src/core/extensions/runtime.ts
 pub const ExtensionCommandContext = struct {
     /// Embedded base context — every command context IS an extension
     /// context with extra capabilities.

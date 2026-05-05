@@ -281,7 +281,6 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
             .len = seq_len,
         };
     }
-    // tilde-style: \x1b[<num>~ or \x1b[<num>;<modifier>~
     if (terminator == '~') {
         const modifier = if (param_count > 1) params[1] else @as(u16, 0);
         const mods = decodeModifier(modifier);

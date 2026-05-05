@@ -193,24 +193,19 @@ fn classifyEscapeSequence(data: []const u8) SeqStatus {
     switch (data[1]) {
         '[' => return classifyCsi(data),
         'O' => {
-            // SS3: ESC O <char>
             if (data.len < 3) return .incomplete;
             return .{ .complete = 3 };
         },
         ']' => {
-            // OSC: ESC ] ... (BEL or ESC \)
             return classifyStringTerminated(data, 2, true);
         },
         'P' => {
-            // DCS: ESC P ... ESC \
             return classifyStringTerminated(data, 2, false);
         },
         '_' => {
-            // APC: ESC _ ... ESC \
             return classifyStringTerminated(data, 2, false);
         },
         else => {
-            // Meta/alt: ESC + single char
             return .{ .complete = 2 };
         },
     }
@@ -221,7 +216,6 @@ fn classifyEscapeSequence(data: []const u8) SeqStatus {
 fn classifyCsi(data: []const u8) SeqStatus {
     if (data.len < 3) return .incomplete;
 
-    // Special: old-style mouse ESC[M + 3 bytes
     if (data.len >= 3 and data[2] == 'M') {
         if (data.len < 6) return .incomplete;
         return .{ .complete = 6 };

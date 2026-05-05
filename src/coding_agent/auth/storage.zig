@@ -574,25 +574,34 @@ pub const AuthStorage = struct {
     }
 };
 
-test "priority chain: runtime override wins over stored credential" {
+fn seedStoredApiKey(allocator: std.mem.Allocator, data: *types.AuthStorageData, provider: []const u8, api_key: []const u8) !void {
+    const key = try allocator.dupe(u8, provider);
+    errdefer allocator.free(key);
+    const value = try allocator.dupe(u8, api_key);
+    errdefer allocator.free(value);
+    try data.put(key, .{ .api_key = .{ .key = value } });
+}
+
+fn expectApiKey(storage: *AuthStorage, provider: []const u8, expected: []const u8) !void {
+    const key = storage.getApiKey(provider) orelse return error.ExpectedApiKey;
+    try std.testing.expectEqualStrings(expected, key);
+}
+
+fn oauthExpiryFromNow(delta_ms: i64) i64 {
+    return std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + delta_ms;
+}
+
+test "priority chain prefers runtime override before stored credential" {
     const allocator = std.testing.allocator;
     var init_data = types.AuthStorageData.init(allocator);
     defer types.deinitAuthStorageData(&init_data);
-    const key = try allocator.dupe(u8, "test-provider");
-    errdefer allocator.free(key);
-    try init_data.put(key, .{ .api_key = .{
-        .key = try allocator.dupe(u8, "stored-key"),
-    } });
+    try seedStoredApiKey(allocator, &init_data, "test-provider", "stored-key");
 
     var storage = try AuthStorage.inMemory(allocator, &init_data);
     defer storage.deinit();
-    const from_storage = storage.getApiKey("test-provider");
-    try std.testing.expect(from_storage != null);
-    try std.testing.expectEqualStrings("stored-key", from_storage.?);
+    try expectApiKey(&storage, "test-provider", "stored-key");
     storage.setRuntimeApiKey("test-provider", "runtime-key");
-    const from_runtime = storage.getApiKey("test-provider");
-    try std.testing.expect(from_runtime != null);
-    try std.testing.expectEqualStrings("runtime-key", from_runtime.?);
+    try expectApiKey(&storage, "test-provider", "runtime-key");
 }
 
 test "set/get round-trip with in-memory backend" {
@@ -607,9 +616,7 @@ test "set/get round-trip with in-memory backend" {
     try std.testing.expectEqual(.api_key, std.meta.activeTag(cred));
     try std.testing.expectEqualStrings("sk-test-123", cred.api_key.key);
     try std.testing.expect(storage.has("anthropic"));
-    const api_key = storage.getApiKey("anthropic");
-    try std.testing.expect(api_key != null);
-    try std.testing.expectEqualStrings("sk-test-123", api_key.?);
+    try expectApiKey(&storage, "anthropic", "sk-test-123");
     storage.remove("anthropic");
     try std.testing.expect(storage.get("anthropic") == null);
     try std.testing.expect(!storage.has("anthropic"));
@@ -638,7 +645,7 @@ test "oauth-backed claim providers resolve auth by visible claim name only" {
     storage.set("anthropic-messages", .{ .oauth = .{
         .refresh = "delegate-refresh",
         .access = "delegate-access",
-        .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 60_000,
+        .expires = oauthExpiryFromNow(60_000),
         .extras = .{},
     } });
     try std.testing.expect(storage.getApiKey("proxy") == null);
@@ -646,12 +653,10 @@ test "oauth-backed claim providers resolve auth by visible claim name only" {
     storage.set("proxy", .{ .oauth = .{
         .refresh = "proxy-refresh",
         .access = "proxy-access",
-        .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 60_000,
+        .expires = oauthExpiryFromNow(60_000),
         .extras = .{},
     } });
-    const key = storage.getApiKey("proxy");
-    try std.testing.expect(key != null);
-    try std.testing.expectEqualStrings("proxy-access", key.?);
+    try expectApiKey(&storage, "proxy", "proxy-access");
 }
 
 test "extension-owned oauth refresh uses the agent-thread hook and persists the returned credential" {
@@ -679,7 +684,7 @@ test "extension-owned oauth refresh uses the agent-thread hook and persists the 
             return .{ .success = .{
                 .refresh = alloc.dupe(u8, "new-refresh") catch return .{ .err = "oom" },
                 .access = alloc.dupe(u8, "new-access") catch return .{ .err = "oom" },
-                .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() + 60_000,
+                .expires = oauthExpiryFromNow(60_000),
                 .extras = .{},
             } };
         }
@@ -691,13 +696,11 @@ test "extension-owned oauth refresh uses the agent-thread hook and persists the 
     storage.set("proxy-refresh", .{ .oauth = .{
         .refresh = "old-refresh",
         .access = "old-access",
-        .expires = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds() - 1,
+        .expires = oauthExpiryFromNow(-1),
         .extras = .{},
     } });
 
-    const key = storage.getApiKey("proxy-refresh");
-    try std.testing.expect(key != null);
-    try std.testing.expectEqualStrings("new-access", key.?);
+    try expectApiKey(&storage, "proxy-refresh", "new-access");
 
     const refreshed = storage.get("proxy-refresh") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("new-refresh", refreshed.oauth.refresh);

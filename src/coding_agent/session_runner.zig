@@ -215,7 +215,6 @@ pub const SessionRunner = struct {
                         .attempt = self.retry_attempt,
                     });
                 }
-                // pi-mono agent_end → _checkCompaction: post-turn
                 // threshold policy. No retry — distinct from bounded
                 // overflow recovery. Gated so a fresh post-compaction
                 // turn does not retrigger.
@@ -377,7 +376,6 @@ pub const SessionRunner = struct {
         if (self.lifecycle_hooks.on_retry_end) |cb| cb(event, self.lifecycle_hooks.ctx);
     }
 
-    /// pi-mono compaction.ts: shouldCompact. Gate for threshold/pre-prompt
     /// policy. Stale pre-compaction usage is filtered via
     /// `contextUsageUnknownAfterCompaction` so a fresh post-compaction turn
     /// never retriggers based on old usage.

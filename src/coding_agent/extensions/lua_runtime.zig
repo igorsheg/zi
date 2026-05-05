@@ -66,7 +66,7 @@ fn luaAlloc(
         const user_ptr: [*]u8 = @ptrCast(ptr.?);
         const header_ptr: *BlockHeader = @ptrCast(@alignCast(user_ptr - @sizeOf(BlockHeader)));
         break :blk header_ptr.size;
-        // NB: `osize` carries a type tag when ptr is NULL, so we ignore
+        // `osize` carries a type tag when ptr is NULL, so we ignore
         // it on the alloc path. When ptr != NULL the Lua manual says
         // osize equals the previously requested user size — we trust the
         // header instead, which avoids any drift.

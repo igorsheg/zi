@@ -10,7 +10,6 @@ const message_memory = @import("message_memory.zig");
 /// Start an agent loop with new prompt messages.
 /// Prompts are added to the context and events are emitted for them.
 ///
-/// Matches pi-mono's runAgentLoop (agent-loop.ts:95-118).
 pub fn runAgentLoop(
     run_allocator: std.mem.Allocator,
     turn_allocator_parent: std.mem.Allocator,
@@ -48,7 +47,6 @@ pub fn runAgentLoop(
 /// Continue an agent loop from existing context without adding a new message.
 /// Used for retries — context already has user message or tool results.
 ///
-/// Matches pi-mono's runAgentLoopContinue (agent-loop.ts:120-143).
 pub const ContinueError = error{
     EmptyContext,
     AssistantTail,
@@ -85,7 +83,6 @@ pub fn runAgentLoopContinue(
 }
 
 /// Main loop logic shared by runAgentLoop and runAgentLoopContinue.
-/// Implements pi-mono's dual loop (agent-loop.ts:155-232):
 ///   outer loop: continues when follow-up messages arrive after agent would stop
 ///   inner loop: processes tool calls and steering messages
 fn runLoop(
@@ -236,7 +233,6 @@ fn runLoop(
 
 /// Stream an assistant response from the LLM.
 /// Applies transformContext → convertToLlm pipeline before calling the stream function.
-/// Matches pi-mono's streamAssistantResponse (agent-loop.ts:238-331).
 fn streamAssistantResponse(
     run_allocator: std.mem.Allocator,
     turn_allocator: std.mem.Allocator,
