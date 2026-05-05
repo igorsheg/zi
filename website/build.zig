@@ -4,12 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const clean_host_files = b.addSystemCommand(&.{
+        "rm",
+        "-rf",
+        b.fmt("{s}/_redirects", .{b.install_prefix}),
+        b.fmt("{s}/man", .{b.install_prefix}),
+    });
+
     const zine_site = b.addSystemCommand(&.{
         "zine",
         "release",
-        "--force",
         b.fmt("--output={s}", .{b.install_prefix}),
     });
+    zine_site.step.dependOn(&clean_host_files.step);
 
     const mdman = b.addExecutable(.{
         .name = "mdman",
