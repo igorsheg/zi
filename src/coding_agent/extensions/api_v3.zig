@@ -137,6 +137,13 @@ test "api v3 installs exactly the public zi global groups" {
         \\assert(type(zi.json) == "table")
         \\assert(type(zi.json.encode) == "function")
         \\assert(type(zi.json.decode) == "function")
+        \\local expected_json = { encode = true, decode = true }
+        \\for k, _ in pairs(zi.json) do
+        \\  assert(expected_json[k], "unexpected zi.json field: " .. tostring(k))
+        \\end
+        \\for k, _ in pairs(expected_json) do
+        \\  assert(zi.json[k] ~= nil, "missing zi.json field: " .. tostring(k))
+        \\end
         \\local legacy = {
         \\  "register_" .. "tool",
         \\  "register_" .. "command",
@@ -149,4 +156,26 @@ test "api v3 installs exactly the public zi global groups" {
         \\  assert(zi[name] == nil, "legacy API exposed: " .. name)
         \\end
     , "api_v3_perimeter");
+}
+
+test "api v3 json group reports v3 diagnostic names" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+
+    install(&state, &runner);
+
+    try state.doString(
+        \\local cases = {
+        \\  { function() zi.json.encode(function() end) end, "zi.json.encode:" },
+        \\  { function() zi.json.decode({}) end, "zi.json.decode:" },
+        \\}
+        \\for _, case in ipairs(cases) do
+        \\  local ok, err = pcall(case[1])
+        \\  assert(not ok, "expected API call to fail")
+        \\  assert(string.find(tostring(err), case[2], 1, true), tostring(err))
+        \\end
+    , "api_v3_json_errors");
 }
