@@ -19,6 +19,7 @@ pub const ExtensionUiState = struct {
     views: std.StringHashMap(ViewRecord),
     frames: std.StringHashMap(FrameRecord),
     status_component: StatusComponent,
+    toast_component: ToastComponent,
 
     pub fn init(allocator: std.mem.Allocator) ExtensionUiState {
         return .{
@@ -26,6 +27,7 @@ pub const ExtensionUiState = struct {
             .views = std.StringHashMap(ViewRecord).init(allocator),
             .frames = std.StringHashMap(FrameRecord).init(allocator),
             .status_component = .{},
+            .toast_component = .{},
         };
     }
 
@@ -48,6 +50,19 @@ pub const ExtensionUiState = struct {
     pub fn statusComponent(self: *ExtensionUiState) Component {
         self.status_component.state = self;
         return self.status_component.component();
+    }
+
+    pub fn toastComponent(self: *ExtensionUiState) Component {
+        self.toast_component.state = self;
+        return self.toast_component.component();
+    }
+
+    pub fn hasToastViews(self: *ExtensionUiState) bool {
+        var it = self.views.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.spec.target == .toast and entry.value_ptr.spec.root != null) return true;
+        }
+        return false;
     }
 
     pub fn applyRender(self: *ExtensionUiState, render: extension_ui.RenderSpec) void {
@@ -125,6 +140,19 @@ pub const ExtensionUiState = struct {
         const rec = self.frames.get(key) orelse return null;
         return rec.frame;
     }
+
+    fn orderedTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) ![]*ViewRecord {
+        var list = std.ArrayList(*ViewRecord).empty;
+        errdefer list.deinit(self.allocator);
+        var it = self.views.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.spec.target == target and entry.value_ptr.spec.root != null) {
+                try list.append(self.allocator, entry.value_ptr);
+            }
+        }
+        std.mem.sort(*ViewRecord, list.items, {}, lessView);
+        return list.toOwnedSlice(self.allocator);
+    }
 };
 
 const ViewRecord = struct {
@@ -171,16 +199,41 @@ const StatusComponent = struct {
     }
 
     fn orderedStatusViews(self: *StatusComponent) ![]*ViewRecord {
-        var list = std.ArrayList(*ViewRecord).empty;
-        errdefer list.deinit(self.state.allocator);
-        var it = self.state.views.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == .status and entry.value_ptr.spec.root != null) {
-                try list.append(self.state.allocator, entry.value_ptr);
-            }
+        return self.state.orderedTargetViews(.status);
+    }
+};
+
+const ToastComponent = struct {
+    state: *ExtensionUiState = undefined,
+
+    fn component(self: *ToastComponent) Component {
+        return Component.init(ToastComponent, self);
+    }
+
+    pub fn render(self: *ToastComponent, region: Region) void {
+        const ordered = self.orderedToastViews() catch return;
+        defer self.state.allocator.free(ordered);
+        var y: u32 = 0;
+        for (ordered) |view| {
+            if (y >= region.height) break;
+            const h = @min(measureNode(view.spec.root orelse continue, region.width), region.height - y);
+            renderNode(self.state, view.spec, view.spec.root.?, region.sub(0, y, region.width, h));
+            y += h;
         }
-        std.mem.sort(*ViewRecord, list.items, {}, lessView);
-        return list.toOwnedSlice(self.state.allocator);
+    }
+
+    pub fn measure(self: *ToastComponent, width: u32) Measurement {
+        const ordered = self.orderedToastViews() catch return .{ .min_height = 0, .preferred_height = 0 };
+        defer self.state.allocator.free(ordered);
+        var total: u32 = 0;
+        for (ordered) |view| {
+            if (view.spec.root) |root| total += measureNode(root, width);
+        }
+        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
+    }
+
+    fn orderedToastViews(self: *ToastComponent) ![]*ViewRecord {
+        return self.state.orderedTargetViews(.toast);
     }
 };
 
@@ -460,4 +513,32 @@ test "extension ui surface uses keyed frame lookup" {
     comp.render(buf.region());
     try std.testing.expectEqual(@as(u21, '▀'), cpAt(&buf, 0, 0));
     try std.testing.expect(buf.get(0, 0).fg.eql(Color.rgb(255, 0, 0)));
+}
+
+
+test "extension ui sorts toast views and filters status" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .target = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
+    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .target = .toast, .order = 2, .root = .{ .text = .{ .text = "b" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .toast, .order = 1, .root = .{ .text = .{ .text = "z" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .toast, .order = 1, .root = .{ .text = .{ .text = "a" } } });
+
+    try std.testing.expect(state.hasToastViews());
+    var buf = try Buffer.init(std.testing.allocator, 4, 3);
+    defer buf.deinit();
+    var comp = state.toastComponent();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'z'), cpAt(&buf, 0, 1));
+    try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 0, 2));
+}
+
+test "extension ui remove final toast clears presence" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "toast", .target = .toast, .root = .{ .text = .{ .text = "hi" } } });
+    try std.testing.expect(state.hasToastViews());
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "toast", .target = .toast, .remove = true });
+    try std.testing.expect(!state.hasToastViews());
 }

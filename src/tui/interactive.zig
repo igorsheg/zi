@@ -184,6 +184,7 @@ pub const Interactive = struct {
     pending_image_banner: text_mod.Text,
     extension_ui_state: ExtensionUiState,
     extension_surface_overlay: ?tui_mod.OverlayHandle = null,
+    extension_toast_overlay: ?tui_mod.OverlayHandle = null,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,

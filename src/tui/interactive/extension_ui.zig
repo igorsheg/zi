@@ -1,5 +1,6 @@
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const ui_event_mod = @import("../ui_event.zig");
+const overlay_mod = @import("../overlay.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 
@@ -26,6 +27,7 @@ pub fn publishPending(self: *Interactive) void {
 
 pub fn applyRenderUpdates(self: *Interactive, updates: []const extension_ui.RenderSpec) void {
     for (updates) |update| self.extension_ui_state.applyRender(update);
+    syncExtensionToastOverlay(self);
     self.tui.dirty = true;
 }
 
@@ -67,4 +69,25 @@ pub fn applyCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.Ex
         });
     }
     self.tui.dirty = true;
+}
+
+fn extensionToastOptions() overlay_mod.OverlayOptions {
+    var options = overlay_mod.OverlayPresets.topToast();
+    options.width = 40;
+    options.max_height = null;
+    options.max_height_percent = 40;
+    return options;
+}
+
+pub fn syncExtensionToastOverlay(self: *Interactive) void {
+    if (self.extension_ui_state.hasToastViews()) {
+        if (self.extension_toast_overlay) |handle| {
+            handle.setHidden(false);
+        } else {
+            self.extension_toast_overlay = self.tui.showOverlay(self.extension_ui_state.toastComponent(), extensionToastOptions());
+        }
+    } else if (self.extension_toast_overlay) |handle| {
+        self.extension_toast_overlay = null;
+        handle.hide();
+    }
 }
