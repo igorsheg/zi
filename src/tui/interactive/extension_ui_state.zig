@@ -20,6 +20,7 @@ pub const ExtensionUiState = struct {
     frames: std.StringHashMap(FrameRecord),
     status_component: StatusComponent,
     toast_component: ToastComponent,
+    overlay_component: OverlayComponent,
 
     pub fn init(allocator: std.mem.Allocator) ExtensionUiState {
         return .{
@@ -28,6 +29,7 @@ pub const ExtensionUiState = struct {
             .frames = std.StringHashMap(FrameRecord).init(allocator),
             .status_component = .{},
             .toast_component = .{},
+            .overlay_component = .{},
         };
     }
 
@@ -57,10 +59,23 @@ pub const ExtensionUiState = struct {
         return self.toast_component.component();
     }
 
+    pub fn overlayComponent(self: *ExtensionUiState) Component {
+        self.overlay_component.state = self;
+        return self.overlay_component.component();
+    }
+
     pub fn hasToastViews(self: *ExtensionUiState) bool {
+        return self.hasTargetViews(.toast);
+    }
+
+    pub fn hasOverlayViews(self: *ExtensionUiState) bool {
+        return self.hasTargetViews(.overlay);
+    }
+
+    fn hasTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {
         var it = self.views.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == .toast and entry.value_ptr.spec.root != null) return true;
+            if (entry.value_ptr.spec.target == target and entry.value_ptr.spec.root != null) return true;
         }
         return false;
     }
@@ -200,6 +215,40 @@ const StatusComponent = struct {
 
     fn orderedStatusViews(self: *StatusComponent) ![]*ViewRecord {
         return self.state.orderedTargetViews(.status);
+    }
+};
+
+const OverlayComponent = struct {
+    state: *ExtensionUiState = undefined,
+
+    fn component(self: *OverlayComponent) Component {
+        return Component.init(OverlayComponent, self);
+    }
+
+    pub fn render(self: *OverlayComponent, region: Region) void {
+        const ordered = self.orderedOverlayViews() catch return;
+        defer self.state.allocator.free(ordered);
+        var y: u32 = 0;
+        for (ordered) |view| {
+            if (y >= region.height) break;
+            const h = @min(measureNode(view.spec.root orelse continue, region.width), region.height - y);
+            renderNode(self.state, view.spec, view.spec.root.?, region.sub(0, y, region.width, h));
+            y += h;
+        }
+    }
+
+    pub fn measure(self: *OverlayComponent, width: u32) Measurement {
+        const ordered = self.orderedOverlayViews() catch return .{ .min_height = 0, .preferred_height = 0 };
+        defer self.state.allocator.free(ordered);
+        var total: u32 = 0;
+        for (ordered) |view| {
+            if (view.spec.root) |root| total += measureNode(root, width);
+        }
+        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
+    }
+
+    fn orderedOverlayViews(self: *OverlayComponent) ![]*ViewRecord {
+        return self.state.orderedTargetViews(.overlay);
     }
 };
 
@@ -365,7 +414,10 @@ fn resolveConstraint(c: extension_ui.Constraint, avail: u32) u32 {
 }
 
 fn constraintHeight(c: ?extension_ui.Constraint) ?u32 {
-    return if (c) |v| switch (v) { .fixed => |f| edge(f), else => null } else null;
+    return if (c) |v| switch (v) {
+        .fixed => |f| edge(f),
+        else => null,
+    } else null;
 }
 
 fn drawBorder(region: Region) void {
@@ -515,7 +567,6 @@ test "extension ui surface uses keyed frame lookup" {
     try std.testing.expect(buf.get(0, 0).fg.eql(Color.rgb(255, 0, 0)));
 }
 
-
 test "extension ui sorts toast views and filters status" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
@@ -541,4 +592,31 @@ test "extension ui remove final toast clears presence" {
     try std.testing.expect(state.hasToastViews());
     state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "toast", .target = .toast, .remove = true });
     try std.testing.expect(!state.hasToastViews());
+}
+
+test "extension ui sorts overlay views and filters other targets" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .target = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
+    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .target = .overlay, .order = 2, .root = .{ .text = .{ .text = "b" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .overlay, .order = 1, .root = .{ .text = .{ .text = "z" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .overlay, .order = 1, .root = .{ .text = .{ .text = "a" } } });
+
+    try std.testing.expect(state.hasOverlayViews());
+    var buf = try Buffer.init(std.testing.allocator, 4, 3);
+    defer buf.deinit();
+    var comp = state.overlayComponent();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'z'), cpAt(&buf, 0, 1));
+    try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 0, 2));
+}
+
+test "extension ui remove final overlay clears presence" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "overlay", .target = .overlay, .root = .{ .text = .{ .text = "hi" } } });
+    try std.testing.expect(state.hasOverlayViews());
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "overlay", .target = .overlay, .remove = true });
+    try std.testing.expect(!state.hasOverlayViews());
 }

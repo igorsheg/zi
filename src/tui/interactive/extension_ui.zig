@@ -28,6 +28,7 @@ pub fn publishPending(self: *Interactive) void {
 pub fn applyRenderUpdates(self: *Interactive, updates: []const extension_ui.RenderSpec) void {
     for (updates) |update| self.extension_ui_state.applyRender(update);
     syncExtensionToastOverlay(self);
+    syncExtensionOverlay(self);
     self.tui.dirty = true;
 }
 
@@ -79,6 +80,14 @@ fn extensionToastOptions() overlay_mod.OverlayOptions {
     return options;
 }
 
+/// Forward-looking ctx.ui v3 overlay target. Kept non-capturing until v3
+/// focus/key routing is designed; views render through the retained v3 tree.
+fn extensionOverlayOptions() overlay_mod.OverlayOptions {
+    var options = overlay_mod.OverlayPresets.centerDialog();
+    options.non_capturing = true;
+    return options;
+}
+
 pub fn syncExtensionToastOverlay(self: *Interactive) void {
     if (self.extension_ui_state.hasToastViews()) {
         if (self.extension_toast_overlay) |handle| {
@@ -88,6 +97,19 @@ pub fn syncExtensionToastOverlay(self: *Interactive) void {
         }
     } else if (self.extension_toast_overlay) |handle| {
         self.extension_toast_overlay = null;
+        handle.hide();
+    }
+}
+
+pub fn syncExtensionOverlay(self: *Interactive) void {
+    if (self.extension_ui_state.hasOverlayViews()) {
+        if (self.extension_overlay_handle) |handle| {
+            handle.setHidden(false);
+        } else {
+            self.extension_overlay_handle = self.tui.showOverlay(self.extension_ui_state.overlayComponent(), extensionOverlayOptions());
+        }
+    } else if (self.extension_overlay_handle) |handle| {
+        self.extension_overlay_handle = null;
         handle.hide();
     }
 }
