@@ -212,7 +212,7 @@ pub const FrameFormat = enum {
         const pixels = std.math.mul(usize, width, height) catch return null;
         return switch (self) {
             .rgba8888 => std.math.mul(usize, pixels, 4) catch null,
-            .halfblock_rgb => std.math.mul(usize, pixels, 3) catch null,
+            .halfblock_rgb => std.math.mul(usize, pixels, 6) catch null,
         };
     }
 };
@@ -390,7 +390,7 @@ test "ui v3 frame byte validation" {
     const testing = std.testing;
     const rgba = FrameSpec{ .state_owner_id = "owner", .generation = 1, .view = "v", .node = "n", .width = 2, .height = 2, .format = .rgba8888, .data = &[_]u8{0} ** 16 };
     try rgba.validate();
-    const half = FrameSpec{ .state_owner_id = "owner", .generation = 1, .view = "v", .node = "n", .width = 2, .height = 2, .format = .halfblock_rgb, .data = &[_]u8{0} ** 12 };
+    const half = FrameSpec{ .state_owner_id = "owner", .generation = 1, .view = "v", .node = "n", .width = 2, .height = 2, .format = .halfblock_rgb, .data = &[_]u8{0} ** 24 };
     try half.validate();
     const bad = FrameSpec{ .state_owner_id = "owner", .generation = 1, .view = "v", .node = "n", .width = 2, .height = 2, .format = .rgba8888, .data = &[_]u8{0} ** 15 };
     try testing.expectError(error.InvalidFrameByteCount, bad.validate());

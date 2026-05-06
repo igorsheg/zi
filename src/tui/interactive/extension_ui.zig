@@ -80,11 +80,9 @@ fn extensionToastOptions(self: *Interactive) overlay_mod.OverlayOptions {
     return self.extension_ui_state.syncOverlayOptions(.toast, options);
 }
 
-/// Forward-looking ctx.ui v3 overlay target. Kept non-capturing until v3
-/// focus/key routing is designed; views render through the retained v3 tree.
 fn extensionOverlayOptions(self: *Interactive) overlay_mod.OverlayOptions {
     var options = overlay_mod.OverlayPresets.centerDialog();
-    options.non_capturing = true;
+    options.non_capturing = !self.extension_ui_state.targetWantsFocus(.overlay);
     return self.extension_ui_state.syncOverlayOptions(.overlay, options);
 }
 
@@ -105,8 +103,10 @@ pub fn syncExtensionToastOverlay(self: *Interactive) void {
 pub fn syncExtensionOverlay(self: *Interactive) void {
     if (self.extension_ui_state.hasOverlayViews()) {
         if (self.extension_overlay_handle) |handle| {
-            handle.setOptions(extensionOverlayOptions(self));
+            const options = extensionOverlayOptions(self);
+            handle.setOptions(options);
             handle.setHidden(false);
+            if (!options.non_capturing) handle.focus();
         } else {
             self.extension_overlay_handle = self.tui.showOverlay(self.extension_ui_state.overlayComponent(), extensionOverlayOptions(self));
         }

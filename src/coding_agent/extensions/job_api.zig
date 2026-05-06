@@ -123,7 +123,8 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
             errdefer allocator.free(view);
             const node = try readStringField(allocator, L, stdout_idx, "node", "surface");
             errdefer allocator.free(node);
-            const state_owner_id = try allocator.dupe(u8, if (source) |src| src.provenance.state_owner_id else "job");
+            const default_state_owner_id = if (source) |src| src.provenance.state_owner_id else "job";
+            const state_owner_id = try readStringField(allocator, L, stdout_idx, "state_owner_id", default_state_owner_id);
             errdefer allocator.free(state_owner_id);
             request.stdout = .{ .ui_frame = .{
                 .view = view,

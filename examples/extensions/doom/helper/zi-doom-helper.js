@@ -31,7 +31,7 @@ const DoomKeys = {
 };
 
 function usage() {
-  process.stderr.write(`zi-doom-helper\n\nUsage:\n  zi-doom-helper [--wad PATH] [--download-wad PATH] [--smoke]\n\nStdout protocol:\n  CELLS <cols> <rows> <byte_len>\\n<fg_rgb bg_rgb cells>\n\nStdin protocol:\n  KEY <action> <key> <ctrl> <alt> <shift> <quoted-text>\n`);
+  process.stderr.write(`zi-doom-helper\n\nUsage:\n  zi-doom-helper [--wad PATH] [--download-wad PATH] [--smoke]\n\nStdout protocol:\n  HALFBLOCK <cols> <rows> <byte_len>\\n<fg_rgb bg_rgb cells>\n\nStdin protocol:\n  KEY <action> <key> <ctrl> <alt> <shift> <quoted-text>\n`);
 }
 
 function argValue(args, name) {
@@ -68,6 +68,18 @@ async function ensureWad(defaultPath) {
   process.stderr.write(`Downloading shareware DOOM WAD to ${defaultPath}\n`);
   await download(url, defaultPath);
   return defaultPath;
+}
+
+function resolveWadPath(value) {
+  const wadPath = path.resolve(value);
+  let stat;
+  try {
+    stat = fs.statSync(wadPath);
+  } catch (err) {
+    throw new Error(`WAD not found: ${wadPath}`);
+  }
+  if (!stat.isFile()) throw new Error(`WAD path is not a file: ${wadPath}`);
+  return wadPath;
 }
 
 async function loadDoom(wadPath) {
@@ -227,7 +239,8 @@ async function main() {
   if (downloadPath) { await ensureWad(path.resolve(downloadPath)); return; }
   if (args.includes("--smoke")) { process.stderr.write("ok\n"); return; }
 
-  const wad = path.resolve(argValue(args, "--wad") || await ensureWad(defaultWad));
+  const wadArg = argValue(args, "--wad");
+  const wad = resolveWadPath(wadArg || await ensureWad(defaultWad));
   const engine = await loadDoom(wad);
   process.stderr.write(`DOOM loaded: ${engine.width}x${engine.height}\n`);
 
@@ -264,7 +277,7 @@ async function main() {
       releaseExpiredKeys(engine);
       engine.mod._doomgeneric_Tick();
       fillCellFrame(engine, cells);
-      await writeAll(process.stdout, `CELLS ${OUT_COLS} ${OUT_ROWS} ${cells.length}\n`);
+      await writeAll(process.stdout, `HALFBLOCK ${OUT_COLS} ${OUT_ROWS} ${cells.length}\n`);
       await writeAll(process.stdout, cells);
     } catch (err) {
       process.stderr.write(`DOOM stopped: ${err && err.stack || err}\n`);
@@ -276,6 +289,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  process.stderr.write(String(err && err.stack || err) + "\n");
+  process.stderr.write(String(err && err.message || err) + "\n");
   process.exit(1);
 });

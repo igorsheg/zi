@@ -115,6 +115,7 @@ return function(zi)
         id = "hello-command",
         title = "hello",
         target = { kind = "overlay", width = "60%", anchor = "center", backdrop = "dim" },
+        focus = true,
         keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
         root = { type = "text", text = "hello, " .. (args or "zi") },
       })
@@ -132,6 +133,10 @@ Slash command order:
 5. prompt assembly and provider run
 
 Built-ins stay TUI-local when they need immediate UI/session behavior. Extension commands enqueue semantic work to the agent thread.
+
+### UI focus
+
+`ctx.ui.render({ focus = true, target = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. Overlays without `focus = true`, including toasts and status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
 
 ## Providers
 
@@ -249,12 +254,12 @@ By default, stdout/stderr/exit are delivered through job events.
 
 `stdout = { mode = "json_lines", max_line_bytes? }` parses stdout as JSONL and emits `job_json`.
 
-`stdout = { mode = "ui_frame", view = "doom-workbench", node = "doom-surface", protocol = "zi-rgba-frame-v1", max_frame_bytes? }` publishes RGBA framebuffer records to a UI frame node.
+`stdout = { mode = "ui_frame", view = "doom-workbench", node = "doom-surface", protocol = "zi-halfblock-rgb-v1", max_frame_bytes? }` publishes half-block RGB records to a v3 `surface` node.
 
-`zi-rgba-frame-v1` records look like:
+`zi-halfblock-rgb-v1` records look like:
 
 ```text
-FRAME <width> <height> <byte_len>\n<rgba bytes>
+HALFBLOCK <cols> <rows> <byte_len>\n<fg_rgb bg_rgb cell bytes>
 ```
 
-`byte_len` must equal `width * height * 4`.
+`byte_len` must equal `cols * rows * 6`: three foreground RGB bytes for the upper half block, then three background RGB bytes for the lower half block. `FRAME <width> <height> <byte_len>` remains the record marker for `protocol = "zi-rgba-frame-v1"`, where `byte_len` is `width * height * 4`.

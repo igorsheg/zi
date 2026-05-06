@@ -13,7 +13,7 @@ const auth_storage_mod = @import("auth/storage.zig");
 const resolve_config_value = @import("auth/resolve_config_value.zig");
 const settings_manager_mod = @import("settings/manager.zig");
 const storage = @import("../storage.zig");
-const extension_api = @import("extensions/api.zig");
+const extension_api = @import("extensions/api_v3.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const lua_tool_mod = @import("extensions/lua_tool.zig");
@@ -590,7 +590,7 @@ fn buildExtensionRuntime(
     runner_ptr.cwd = resource_loader.cwd;
     runner_ptr.builtin_tool_definitions = if (has_custom_tools) &.{} else builtin_definitions;
     runner_ptr.attachLuaState(state_ptr);
-    extension_api.installZiTable(state_ptr, runner_ptr);
+    extension_api.install(state_ptr, runner_ptr);
 
     _ = c.lua_getglobal(state_ptr.L, "package");
     defer c.lua_pop(state_ptr.L, 1);

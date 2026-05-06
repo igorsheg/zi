@@ -1,16 +1,16 @@
 # DOOM extension example
 
-Play DOOM in a zi extension surface.
+Play DOOM in a zi v3 UI overlay with a retained `surface` node.
 
 This is intentionally split in two:
 
-- `doom.lua` is the zi extension. It opens a host-owned `halfblock_rgb` surface, starts a helper job, and forwards focused surface keyboard input to helper stdin.
-- `helper/zi-doom-helper.js` owns the DOOM engine. It loads the `doomgeneric` WebAssembly build, ticks at ~35 FPS, converts DOOM's framebuffer into terminal half-block cells, and streams those cells over stdout using zi's `zi-cell-frame-v1` protocol.
+- `init.lua` is the zi extension. It renders an overlay with a retained `surface` node, starts a helper job, and forwards v3 UI key events to helper stdin.
+- `helper/zi-doom-helper.js` owns the DOOM engine. It loads the `doomgeneric` WebAssembly build, ticks at ~35 FPS, converts DOOM's framebuffer into terminal half-block cells, and streams those cells over stdout using zi's `zi-halfblock-rgb-v1` protocol.
 
 The frame protocol is:
 
 ```text
-CELLS <cols> <rows> <byte_len>\n<fg_rgb bg_rgb cells>
+HALFBLOCK <cols> <rows> <byte_len>\n<fg_rgb bg_rgb cells>
 ```
 
 ## Run
@@ -18,7 +18,7 @@ CELLS <cols> <rows> <byte_len>\n<fg_rgb bg_rgb cells>
 From the zi repository:
 
 ```sh
-zi --extension ./examples/extensions/doom/doom.lua
+zi --extension ./examples/extensions/doom
 ```
 
 Then run:
@@ -36,16 +36,13 @@ On first run the helper downloads the shareware `doom1.wad` into this directory.
 ## Controls
 
 - arrows or `WASD`: move
-- shifted `WASD`: run
 - `F`: fire
 - `Space`: use/open
-- number keys: weapons
-- `Q`: quit the helper and close the surface
-- `Esc`: return focus to zi's editor
+- `Q` or `Esc`: quit the helper and close the overlay
 
 ## Files
 
-- `doom.lua`: extension entrypoint
+- `init.lua`: extension entrypoint
 - `helper/zi-doom-helper.js`: executable helper job
 - `doom/build/doom.js` and `doom/build/doom.wasm`: prebuilt doomgeneric engine from the pi DOOM overlay example
 - `doom/doomgeneric_pi.c` and `doom/build.sh`: source/build notes for the WASM engine
@@ -53,6 +50,6 @@ On first run the helper downloads the shareware `doom1.wad` into this directory.
 ## What this demonstrates
 
 - Lua extensions can orchestrate native/host jobs without owning rendering internals.
-- zi can decode a continuous binary stdout stream and publish interactive surfaces.
-- High-frequency UI can be composed with `zi.job` stdout `ui_frame` streams.
-- Helpers can stream `zi-rgba-frame-v1` records for zi to publish into UI frame nodes.
+- zi can decode a continuous binary stdout stream and publish frames into v3 UI nodes.
+- High-frequency UI can be composed out of `ctx.ui.render`, `ctx.ui.frame`, v3 `ui` events, and `zi.job`.
+- Helpers can stream `zi-halfblock-rgb-v1` records for zi to publish into UI frame nodes.

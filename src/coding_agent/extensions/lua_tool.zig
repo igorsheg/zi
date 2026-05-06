@@ -28,7 +28,8 @@ const tool_registry = @import("registries/tool_registry.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const abort_signal_mod = @import("../../zio/root.zig").abort;
 const ai = @import("../../ai/root.zig");
-const api = @import("api.zig");
+const api_v3 = @import("api_v3.zig");
+const spawn_api = @import("spawn_api.zig");
 const context_mod = @import("context.zig");
 const resource_types = @import("../resources/types.zig");
 const extension_ui = @import("ui.zig");
@@ -216,7 +217,7 @@ fn serviceYieldedToolCoroutine(
         runner.current_spawn_request = null;
     }
 
-    var trampoline_ctx = api.TrampolineCtx{
+    var trampoline_ctx = spawn_api.TrampolineCtx{
         .L = co.L,
         .callbacks_ref = req.callbacks_ref,
     };
@@ -258,7 +259,7 @@ const SpawnEventFanout = struct {
     };
 
     allocator: std.mem.Allocator,
-    lua: ?*api.TrampolineCtx = null,
+    lua: ?*spawn_api.TrampolineCtx = null,
     events: std.ArrayList(PendingEvent) = .empty,
     mutex: std.Io.Mutex = .init,
 
@@ -287,7 +288,7 @@ const SpawnEventFanout = struct {
         defer freeEvents(self.allocator, &drained);
 
         for (drained.items) |entry| {
-            if (self.lua) |lua| api.eventTrampoline(entry.kind, entry.event, @ptrCast(lua));
+            if (self.lua) |lua| spawn_api.eventTrampoline(entry.kind, entry.event, @ptrCast(lua));
         }
     }
 
@@ -729,7 +730,7 @@ test "lua tool ctx exposes binding from tool provenance" {
         .system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
     }, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1217,7 +1218,7 @@ test "extension command context exposes read-only session ui_publication" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1302,7 +1303,7 @@ test "extension command context exposes model catalog and lookup" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1340,7 +1341,7 @@ test "extension command context publishes host-owned editor buffer actions" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1402,7 +1403,7 @@ test "ctx.ui v3 exposes only render and frame" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1422,15 +1423,6 @@ test "ctx.ui v3 exposes only render and frame" {
         \\    end
         \\    assert(count == 2)
         \\    assert(seen.render and seen.frame)
-        \\    assert(ctx.ui.message == nil)
-        \\    assert(ctx.ui.status == nil)
-        \\    assert(ctx.ui.progress == nil)
-        \\    assert(ctx.ui.report == nil)
-        \\    assert(ctx.ui.pick == nil)
-        \\    assert(ctx.ui.prompt == nil)
-        \\    assert(ctx.ui.surface_open == nil)
-        \\    assert(ctx.ui.surface_frame == nil)
-        \\    assert(ctx.ui.surface_close == nil)
         \\    ctx.ui.render({ id = "demo" })
         \\    ctx.ui.frame({ id = "demo" })
         \\    ctx.ui.render("not-a-table")
@@ -1493,7 +1485,7 @@ test "extension command resumes after zi.system result" {
         if (capture.env_value) |value| testing.allocator.free(value);
     }
     runner.async_dispatcher = .{ .ptr = @ptrCast(&capture), .submit = &Capture.submit };
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1596,7 +1588,7 @@ test "extension job API starts writes and stops through dispatcher" {
         .job_write = &Capture.write,
         .job_stop = &Capture.stop,
     };
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     try state.doString(
@@ -1634,7 +1626,7 @@ test "extension job events dispatch to lua observers" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1667,7 +1659,7 @@ test "extension ui events dispatch to lua observers" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1719,7 +1711,7 @@ test "extension command resumes after ai completion result" {
     var capture = Capture{};
     defer if (capture.model) |model| testing.allocator.free(model);
     runner.async_dispatcher = .{ .ptr = @ptrCast(&capture), .submit = &Capture.submit };
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1764,7 +1756,7 @@ test "extension command resumes after yieldable host result" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1807,7 +1799,7 @@ test "extension command rejects arbitrary coroutine yield" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1835,7 +1827,7 @@ test "ctx.ui.render parses v3 target tables" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
@@ -1873,7 +1865,7 @@ test "todo command can call ctx.ui.render perimeter" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
     try loadTodoFixture(&state, &runner);
 
     const ext_tool = runner.tool_registry.get("todo").?.*;
@@ -1902,7 +1894,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var provider_registry = ai.provider.Registry.init(testing.allocator);
         defer provider_registry.deinit();
         try bindTestRuntime(&runner, &store, &provider_registry);
-        api.installZiTable(&state, &runner);
+        api_v3.install(&state, &runner);
         try loadTodoFixture(&state, &runner);
 
         const ext_tool = runner.tool_registry.get("todo").?.*;
@@ -1924,7 +1916,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var provider_registry = ai.provider.Registry.init(testing.allocator);
         defer provider_registry.deinit();
         try bindTestRuntime(&runner, &store, &provider_registry);
-        api.installZiTable(&state, &runner);
+        api_v3.install(&state, &runner);
         try loadTodoFixture(&state, &runner);
 
         const ext_tool = runner.tool_registry.get("todo").?.*;
@@ -1945,7 +1937,7 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
     runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     try state.doString(
         \\zi.tool({

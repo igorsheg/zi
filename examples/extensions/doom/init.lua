@@ -1,3 +1,4 @@
+return function(zi)
 -- DOOM helper-backed framebuffer demo using v3 ctx.ui.render/frame.
 
 local view_id = "doom-workbench"
@@ -11,8 +12,9 @@ local function extension_root(ctx)
 end
 
 local function helper_path(ctx) return extension_root(ctx) .. "/helper/zi-doom-helper.js" end
-local function trim(s) return (s or ""):gsub("^%s+", ""):gsub("%s+$", "") end
+local function trim(s) return tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "") end
 local function boot_frame(w, h) return string.rep(string.char(8, 8, 12, 8, 8, 12), w * h) end
+local function is_dangerous_wad_path(wad) return wad == "/" or wad:match("^/+$") ~= nil end
 
 local function toast(ctx, text, tone)
   if ctx and ctx.ui and ctx.ui.render then
@@ -52,7 +54,7 @@ zi.on("ui", function(event, ctx)
 end)
 
 zi.on("job_stderr", function(event, ctx)
-  if current_job and event.id == current_job.id and event.data and #event.data > 0 then toast(ctx, event.data, "warning") end
+  if current_job and event.id == current_job.id and event.data and #event.data > 0 then toast(ctx, event.data:sub(1, 240), "warning") end
 end)
 
 zi.on("job_exit", function(event, ctx)
@@ -70,10 +72,12 @@ zi.command({
     if not ctx.has_ui or not ctx.ui or not ctx.ui.render or not ctx.ui.frame then return end
     close(ctx)
     render_workbench(ctx)
-    local argv = { helper_path(ctx) }
+    local argv = { "/usr/bin/env", "node", helper_path(ctx) }
     local wad = trim(args)
+    if is_dangerous_wad_path(wad) then toast(ctx, "Refusing to use a directory as a WAD path", "error"); return end
     if wad ~= "" then argv[#argv + 1] = "--wad"; argv[#argv + 1] = wad end
-    current_job = zi.job.start({ argv = argv, cwd = extension_root(ctx), stdout = { mode = "ui_frame", view = view_id, node = node_id, protocol = "zi-halfblock-rgb-v1", max_frame_bytes = width * height * 6 + 64 } })
+    current_job = zi.job.start({ argv = argv, cwd = extension_root(ctx), stdout = { mode = "ui_frame", view = view_id, node = node_id, state_owner_id = ctx.binding and ctx.binding.state_owner_id or nil, protocol = "zi-halfblock-rgb-v1", max_frame_bytes = width * height * 6 + 64 } })
     toast(ctx, "DOOM helper started", "success")
   end,
 })
+end

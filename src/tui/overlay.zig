@@ -452,6 +452,25 @@ test "OverlayManager stack lifecycle restores focus and removes by id" {
     try testing.expectEqual(@as(usize, 0), mgr.stack.items.len);
 }
 
+test "OverlayManager reports only visible capturing overlays for focus" {
+    var mgr = OverlayManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    var toast = TestComponent{};
+    var modal = TestComponent{};
+
+    _ = mgr.showOverlayReturnId(toast.component(), .{ .non_capturing = true }, null);
+    try testing.expect(mgr.hasVisibleOverlays());
+    try testing.expect(mgr.topmostCapturingComponent() == null);
+
+    const modal_id = mgr.showOverlayReturnId(modal.component(), .{}, null);
+    try testing.expect(mgr.topmostCapturingComponent() != null);
+    try testing.expect(Component.eql(mgr.topmostCapturingComponent().?, modal.component()));
+
+    mgr.findEntry(modal_id).?.hidden = true;
+    try testing.expect(mgr.topmostCapturingComponent() == null);
+}
+
 test "renderOverlays renders visible overlays inside resolved layout bounds" {
     var buf = try buffer_mod.Buffer.init(testing.allocator, 20, 10);
     defer buf.deinit();

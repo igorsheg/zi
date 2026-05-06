@@ -6,7 +6,7 @@ const Key = keys_mod.Key;
 
 pub fn handle(self: anytype, key: Key) void {
 
-    if (self.tui.hasOverlay()) {
+    if (self.tui.hasCapturingOverlay()) {
         if (self.tui.handleInput(key)) {
             self.tui.dirty = true;
             return;

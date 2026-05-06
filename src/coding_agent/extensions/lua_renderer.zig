@@ -510,7 +510,7 @@ fn parseBgColor(name: []const u8) ?theme_mod.BgColor {
 }
 
 const testing = std.testing;
-const api = @import("api.zig");
+const api_v3 = @import("api_v3.zig");
 
 test "dispatchRenderCall parses args into an owned call presentation document" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
@@ -518,7 +518,7 @@ test "dispatchRenderCall parses args into an owned call presentation document" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
     runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     try state.doString(
         \\zi.tool({
@@ -559,7 +559,7 @@ test "dispatchRenderResult renders collapsed and expanded result presentations" 
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
     runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     try state.doString(
         \\zi.tool({
@@ -608,7 +608,7 @@ test "dispatchRenderResultFromResult owns rendered output after host result chan
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
     runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     try state.doString(
         \\zi.tool({
@@ -648,7 +648,7 @@ test "renderer dispatch fails open for missing hooks and lua errors" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
     runner.attachLuaState(&state);
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     try state.doString(
         \\zi.tool({

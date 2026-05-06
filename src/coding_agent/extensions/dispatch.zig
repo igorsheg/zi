@@ -295,13 +295,13 @@ fn runOneHandler(
 }
 
 const testing = std.testing;
-const api = @import("api.zig");
+const api_v3 = @import("api_v3.zig");
 
 /// Helper: register `n` handlers for `kind` via the public Lua API,
 /// each one mutating a global counter table so the tests can verify
 /// the chain ran in order.
 fn setupCounterChain(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner, kind_name: [:0]const u8) !void {
-    api.installZiTable(state, runner);
+    api_v3.install(state, runner);
     try state.doString(
         \\_test_counters = {}
     , "init_counters");
@@ -428,7 +428,7 @@ test "dispatch paths expose binding from handler provenance" {
     var dummy: u8 = 0;
     try bindTestRuntime(&runner, &provider_registry, &dummy);
 
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
 
@@ -522,7 +522,7 @@ test "dispatchCancellable returns blocked=false when chain falls through" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
 
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     try state.doString(
         \\zi.on("tool_call", function(event, ctx) end)
@@ -544,7 +544,7 @@ test "dispatchTransformable feeds each handler's return into the next" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
 
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
 
     try state.doString(
         \\zi.on("tool_result", function(event, ctx)

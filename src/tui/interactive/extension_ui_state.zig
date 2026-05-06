@@ -88,6 +88,13 @@ pub const ExtensionUiState = struct {
         return self.hasTargetViews(.overlay);
     }
 
+    pub fn targetWantsFocus(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {
+        const ordered = self.orderedTargetViews(target) catch return false;
+        defer self.allocator.free(ordered);
+        if (ordered.len == 0) return false;
+        return ordered[ordered.len - 1].spec.focus;
+    }
+
     pub fn matchOverlayKey(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
         const ordered = self.orderedTargetViews(.overlay) catch return null;
         defer self.allocator.free(ordered);
@@ -667,6 +674,17 @@ test "extension ui remove final overlay clears presence" {
     try std.testing.expect(state.hasOverlayViews());
     state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "overlay", .target = .overlay, .remove = true });
     try std.testing.expect(!state.hasOverlayViews());
+}
+
+test "extension ui overlay focus follows top ordered view" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "background", .target = .overlay, .order = 1, .focus = true, .root = .{ .text = .{ .text = "bg" } } });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "front", .target = .overlay, .order = 2, .focus = false, .root = .{ .text = .{ .text = "front" } } });
+    try std.testing.expect(!state.targetWantsFocus(.overlay));
+
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "front", .target = .overlay, .order = 2, .focus = true, .root = .{ .text = .{ .text = "front" } } });
+    try std.testing.expect(state.targetWantsFocus(.overlay));
 }
 
 test "extension ui maps retained overlay target options" {

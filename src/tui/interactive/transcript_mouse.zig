@@ -20,7 +20,7 @@ const Zone = struct {
 };
 
 pub fn handle(self: anytype, event: keys_mod.MouseEvent) void {
-    if (self.tui.hasOverlay()) {
+    if (self.tui.hasCapturingOverlay()) {
         cancelSelection(self);
         return;
     }

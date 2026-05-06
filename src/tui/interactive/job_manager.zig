@@ -71,13 +71,18 @@ pub const JobManager = struct {
         };
         errdefer if (adapter) |*a| a.deinit(self.allocator);
 
-        try self.manager.start(id, .{ .argv = request.argv, .cwd = request.cwd });
-
         if (adapter) |a| {
             self.state.mutex.lockUncancelable(std.Options.debug_io);
             defer self.state.mutex.unlock(std.Options.debug_io);
             try self.state.adapters.put(self.allocator, id, a);
+            adapter = null;
         }
+        errdefer if (self.state.adapters.fetchRemove(id)) |entry| {
+            var removed = entry.value;
+            removed.deinit(self.allocator);
+        };
+
+        try self.manager.start(id, .{ .argv = request.argv, .cwd = request.cwd });
     }
 
     pub fn stop(self: *JobManager, id: u64) void {
@@ -290,7 +295,7 @@ const FrameDecoder = struct {
         const items = self.buffer.items;
         const marker = switch (self.format) {
             .rgba8888 => "FRAME ",
-            .halfblock_rgb => if (std.mem.indexOf(u8, items, "HALFBLOCK ") != null) "HALFBLOCK " else "CELLS ",
+            .halfblock_rgb => "HALFBLOCK ",
         };
         const start = std.mem.indexOf(u8, items, marker) orelse return false;
         if (start > 0) {
@@ -302,7 +307,7 @@ const FrameDecoder = struct {
         var parts = std.mem.tokenizeScalar(u8, header, ' ');
         const expected_header = switch (self.format) {
             .rgba8888 => "FRAME",
-            .halfblock_rgb => if (std.mem.eql(u8, marker, "HALFBLOCK ")) "HALFBLOCK" else "CELLS",
+            .halfblock_rgb => "HALFBLOCK",
         };
         if (!std.mem.eql(u8, parts.next() orelse "", expected_header)) {
             _ = self.buffer.orderedRemove(0);
@@ -445,7 +450,7 @@ test "ui frame stdout adapter decodes halfblock cell frames" {
     });
     defer decoder.deinit(testing.allocator);
 
-    try decoder.accept(&state, 1, "CELLS 1 1 6\nabcdef");
+    try decoder.accept(&state, 1, "HALFBLOCK 1 1 6\nabcdef");
     try testing.expectEqual(@as(usize, 1), sink.frames.items.len);
     try expectFrameFormat(sink.frames.items[0], .halfblock_rgb, 1, 1, "abcdef");
 }

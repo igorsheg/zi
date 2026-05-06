@@ -263,7 +263,7 @@ pub const LoadStats = struct {
 /// stat bundle for the caller to log.
 ///
 /// Caller must have already installed `zi.*` on the state (via
-/// `extensions/api.zig:installZiTable`) before calling this.
+/// `extensions/api_v3.zig:install`) before calling this.
 pub fn loadAll(
     allocator: std.mem.Allocator,
     state: *lua_runtime.LuaState,
@@ -402,7 +402,7 @@ fn sourceKindString(source: ExtensionSource) []const u8 {
     };
 }
 
-const api = @import("api.zig");
+const api_v3 = @import("api_v3.zig");
 const dispatch_mod = @import("dispatch.zig");
 
 fn runtimeRoot(source: ExtensionSource, path: []const u8) StaticExtensionRoot {
@@ -433,7 +433,7 @@ fn expectLoadStats(stats: LoadStats, attempted: u32, loaded: u32, failed: u32) !
 
 fn installLoaderTestRuntime(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     runner.attachLuaState(state);
-    api.installZiTable(state, runner);
+    api_v3.install(state, runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 }
 
@@ -645,7 +645,7 @@ test "shared lua root resolves before later root in canonical order" {
     try shared_buf.print(allocator, "{s}/?.lua;{s}/?/init.lua", .{ shared_path, shared_path });
     runner.shared_lua_paths = try allocator.dupe(u8, shared_buf.items);
 
-    api.installZiTable(&state, &runner);
+    api_v3.install(&state, &runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 
     const stats = loadAll(allocator, &state, &runner, exts, &.{});

@@ -1120,7 +1120,7 @@ fn parseContentArray(
 }
 
 const testing = std.testing;
-const api = @import("api.zig");
+const api_v3 = @import("api_v3.zig");
 
 const BridgeTestHost = struct {
     state: lua_runtime.LuaState,
@@ -1140,7 +1140,7 @@ const BridgeTestHost = struct {
 
     fn attachAndInstallZi(self: *BridgeTestHost) void {
         self.runner.attachLuaState(&self.state);
-        api.installZiTable(&self.state, &self.runner);
+        api_v3.install(&self.state, &self.runner);
     }
 };
 

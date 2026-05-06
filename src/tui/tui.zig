@@ -110,6 +110,10 @@ pub const TUI = struct {
         return self.overlays.hasVisibleOverlays();
     }
 
+    pub fn hasCapturingOverlay(self: *const TUI) bool {
+        return self.overlays.topmostCapturingComponent() != null;
+    }
+
     pub fn addChild(self: *TUI, child: Component) void {
         self.root.addChild(child);
     }
