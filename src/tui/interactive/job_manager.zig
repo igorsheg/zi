@@ -253,6 +253,7 @@ const FrameDecoder = struct {
     node: []const u8,
     state_owner_id: []const u8,
     generation: u64,
+    format: extension_ui.FrameFormat,
     max_frame_bytes: usize,
     buffer: std.ArrayList(u8) = .empty,
 
@@ -262,6 +263,7 @@ const FrameDecoder = struct {
             .node = try allocator.dupe(u8, cfg.node),
             .state_owner_id = try allocator.dupe(u8, cfg.state_owner_id),
             .generation = cfg.generation,
+            .format = cfg.format,
             .max_frame_bytes = cfg.max_frame_bytes,
         };
     }
@@ -286,7 +288,11 @@ const FrameDecoder = struct {
 
     fn nextFrame(self: *FrameDecoder, state: *JobManager.State) !bool {
         const items = self.buffer.items;
-        const start = std.mem.indexOf(u8, items, "FRAME ") orelse return false;
+        const marker = switch (self.format) {
+            .rgba8888 => "FRAME ",
+            .halfblock_rgb => if (std.mem.indexOf(u8, items, "HALFBLOCK ") != null) "HALFBLOCK " else "CELLS ",
+        };
+        const start = std.mem.indexOf(u8, items, marker) orelse return false;
         if (start > 0) {
             std.mem.copyForwards(u8, self.buffer.items[0 .. self.buffer.items.len - start], self.buffer.items[start..]);
             self.buffer.shrinkRetainingCapacity(self.buffer.items.len - start);
@@ -294,7 +300,11 @@ const FrameDecoder = struct {
         const newline = std.mem.indexOfScalar(u8, self.buffer.items, '\n') orelse return false;
         const header = self.buffer.items[0..newline];
         var parts = std.mem.tokenizeScalar(u8, header, ' ');
-        if (!std.mem.eql(u8, parts.next() orelse "", "FRAME")) {
+        const expected_header = switch (self.format) {
+            .rgba8888 => "FRAME",
+            .halfblock_rgb => if (std.mem.eql(u8, marker, "HALFBLOCK ")) "HALFBLOCK" else "CELLS",
+        };
+        if (!std.mem.eql(u8, parts.next() orelse "", expected_header)) {
             _ = self.buffer.orderedRemove(0);
             return true;
         }
@@ -322,7 +332,7 @@ const FrameDecoder = struct {
             _ = self.buffer.orderedRemove(0);
             return true;
         };
-        const expected_len = rgbaFrameBytes(width, height) orelse {
+        const expected_len = frameBytes(width, height, self.format) orelse {
             _ = self.buffer.orderedRemove(0);
             return true;
         };
@@ -341,7 +351,7 @@ const FrameDecoder = struct {
             .node = try state.allocator.dupe(u8, self.node),
             .width = width,
             .height = height,
-            .format = .rgba8888,
+            .format = self.format,
             .data = try state.allocator.dupe(u8, payload),
         };
         _ = JobManager.submitUiFrame(state, frame);
@@ -353,10 +363,13 @@ const FrameDecoder = struct {
     }
 };
 
-fn rgbaFrameBytes(width: u32, height: u32) ?usize {
+fn frameBytes(width: u32, height: u32, format: extension_ui.FrameFormat) ?usize {
     if (width == 0 or height == 0) return null;
-    const pixels = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
-    return std.math.mul(usize, pixels, 4) catch null;
+    const cells = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
+    return std.math.mul(usize, cells, switch (format) {
+        .rgba8888 => 4,
+        .halfblock_rgb => 6,
+    }) catch null;
 }
 
 const testing = std.testing;
@@ -379,6 +392,7 @@ fn testFrameDecoder() !FrameDecoder {
         .node = "doom-demo",
         .state_owner_id = "extension.lua",
         .generation = 9,
+        .format = .rgba8888,
         .max_frame_bytes = 32,
     });
 }
@@ -414,6 +428,27 @@ const TestFrameSink = struct {
         return true;
     }
 };
+
+test "ui frame stdout adapter decodes halfblock cell frames" {
+    var queue = try request_mod.RequestQueue.init(testing.allocator);
+    defer queue.deinit();
+    var sink = TestFrameSink{ .allocator = testing.allocator };
+    defer sink.deinit();
+    var state = testFrameState(&queue, &sink);
+    var decoder = try FrameDecoder.init(testing.allocator, .{
+        .view = "doom-workbench",
+        .node = "doom-demo",
+        .state_owner_id = "extension.lua",
+        .generation = 9,
+        .format = .halfblock_rgb,
+        .max_frame_bytes = 32,
+    });
+    defer decoder.deinit(testing.allocator);
+
+    try decoder.accept(&state, 1, "CELLS 1 1 6\nabcdef");
+    try testing.expectEqual(@as(usize, 1), sink.frames.items.len);
+    try expectFrameFormat(sink.frames.items[0], .halfblock_rgb, 1, 1, "abcdef");
+}
 
 test "ui frame stdout adapter preserves frames split across chunks" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);

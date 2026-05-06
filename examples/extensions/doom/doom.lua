@@ -73,7 +73,7 @@ zi.command({
     local argv = { helper_path(ctx) }
     local wad = trim(args)
     if wad ~= "" then argv[#argv + 1] = "--wad"; argv[#argv + 1] = wad end
-    current_job = zi.job.start({ argv = argv, cwd = extension_root(ctx), stdout = { mode = "ui_frame", view = view_id, node = node_id, protocol = "zi-rgba-frame-v1", max_frame_bytes = width * height * 4 + 64 } })
+    current_job = zi.job.start({ argv = argv, cwd = extension_root(ctx), stdout = { mode = "ui_frame", view = view_id, node = node_id, protocol = "zi-halfblock-rgb-v1", max_frame_bytes = width * height * 6 + 64 } })
     toast(ctx, "DOOM helper started", "success")
   end,
 })

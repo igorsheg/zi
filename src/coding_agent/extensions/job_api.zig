@@ -1,6 +1,7 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const extension_ui = @import("ui.zig");
 const limits = @import("limits.zig");
 
 const c = lua_runtime.c;
@@ -110,7 +111,12 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
         if (std.mem.eql(u8, mode, "ui_frame")) {
             const protocol = try readStringField(allocator, L, stdout_idx, "protocol", "zi-rgba-frame-v1");
             defer allocator.free(protocol);
-            if (!std.mem.eql(u8, protocol, "zi-rgba-frame-v1")) return error.InvalidOptions;
+            const format: extension_ui.FrameFormat = if (std.mem.eql(u8, protocol, "zi-rgba-frame-v1"))
+                .rgba8888
+            else if (std.mem.eql(u8, protocol, "zi-halfblock-rgb-v1"))
+                .halfblock_rgb
+            else
+                return error.InvalidOptions;
             const runner = runnerFromUpvalue(L);
             const source = runner.currentLoadSource();
             const view = try readStringField(allocator, L, stdout_idx, "view", "default");
@@ -124,6 +130,7 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
                 .node = node,
                 .state_owner_id = state_owner_id,
                 .generation = runner.generation,
+                .format = format,
                 .max_frame_bytes = @min(@as(usize, @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", limits.frame_bytes))), limits.frame_bytes),
             } };
         } else if (std.mem.eql(u8, mode, "json_lines")) {

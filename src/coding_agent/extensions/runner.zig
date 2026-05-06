@@ -182,6 +182,7 @@ pub const JobStdoutMode = union(enum) {
         node: []const u8,
         state_owner_id: []const u8,
         generation: Generation,
+        format: @import("ui.zig").FrameFormat = .rgba8888,
         max_frame_bytes: usize = 16 * 1024 * 1024,
     },
     json_lines: struct {
@@ -196,6 +197,7 @@ pub const JobStdoutMode = union(enum) {
                 .node = try allocator.dupe(u8, frame.node),
                 .state_owner_id = try allocator.dupe(u8, frame.state_owner_id),
                 .generation = frame.generation,
+                .format = frame.format,
                 .max_frame_bytes = frame.max_frame_bytes,
             } },
             .json_lines => |cfg| .{ .json_lines = .{ .max_line_bytes = cfg.max_line_bytes } },
