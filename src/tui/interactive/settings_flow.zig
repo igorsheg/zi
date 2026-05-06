@@ -31,11 +31,11 @@ pub fn showSettings(self: anytype, on_select: anytype, on_cancel: anytype) void 
         on_select,
         on_cancel,
     );
-    self.showSimplePickerOverlay(&self.settings_picker_handle, &self.settings_picker);
+    self.showSimplePickerOverlay(&self.settings_picker);
 }
 
 pub fn settingsSelected(self: anytype, selection: anytype, on_thinking_select: anytype, on_thinking_cancel: anytype) void {
-    self.hideSimplePickerOverlay(&self.settings_picker_handle);
+    self.hideSimplePickerOverlay(&self.settings_picker);
     if (selection.source_index >= self.settings_picker_count) return;
 
     switch (self.settings_picker_actions[selection.source_index]) {
@@ -76,12 +76,12 @@ pub fn showThinkingLevel(self: anytype, on_select: anytype, on_cancel: anytype) 
         on_select,
         on_cancel,
     );
-    self.thinking_picker.setInitialSelectionByValue(if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off");
-    self.showSimplePickerOverlay(&self.thinking_picker_handle, &self.thinking_picker);
+    self.thinking_picker.picker.setInitialSelectionByValue(if (self.status_data.thinking_level.len > 0) self.status_data.thinking_level else "off");
+    self.showSimplePickerOverlay(&self.thinking_picker);
 }
 
 pub fn thinkingLevelSelected(self: anytype, selection: anytype) void {
-    self.hideSimplePickerOverlay(&self.thinking_picker_handle);
+    self.hideSimplePickerOverlay(&self.thinking_picker);
     if (selection.source_index < self.thinking_picker_count) {
         self.applyThinkingLevelChange(self.thinking_picker_levels[selection.source_index]);
     }

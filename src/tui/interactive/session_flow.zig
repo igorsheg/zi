@@ -60,7 +60,8 @@ pub fn applyLoaded(self: *Interactive, generation: u64, sessions: []const sessio
     if (flow.generation != generation) return;
 
     if (sessions.len == 0) {
-        flow.picker.setEmptyText("No sessions found");
+        flow.picker.setStatus(.{ .text = "No sessions found", .kind = .info });
+        flow.picker.setEmptyText("No matching sessions");
         flow.picker.setSearchableItems(&.{}, null);
         self.status_line.setPrimary("no sessions found", self.theme.fg(.muted));
         self.tui.dirty = true;
@@ -80,7 +81,8 @@ pub fn applyFailed(self: *Interactive, generation: u64, message: []const u8) voi
     if (generation != self.resume_picker_generation) return;
     if (self.resume_picker_flow) |*flow| {
         if (flow.generation != generation) return;
-        flow.picker.setEmptyText(message);
+        flow.picker.setStatus(.{ .text = message, .kind = .@"error" });
+        flow.picker.setEmptyText("No matching sessions");
         flow.picker.setSearchableItems(&.{}, null);
     }
     self.status_line.setPrimary(message, self.theme.fg(.@"error"));

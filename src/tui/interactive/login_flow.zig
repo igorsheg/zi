@@ -57,7 +57,7 @@ pub fn showPicker(self: *Interactive) void {
         &onProviderSelected,
         &onPickerCancel,
     );
-    self.showSimplePickerOverlay(&self.login_picker_handle, &self.login_picker);
+    self.showSimplePickerOverlay(&self.login_picker);
 }
 
 pub fn start(self: *Interactive, provider_id: []const u8) void {
@@ -94,13 +94,13 @@ pub fn start(self: *Interactive, provider_id: []const u8) void {
 
 fn onProviderSelected(selection: PickerSelection, ctx: ?*anyopaque) void {
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
-    self.hideSimplePickerOverlay(&self.login_picker_handle);
+    self.hideSimplePickerOverlay(&self.login_picker);
     start(self, selection.item.value);
 }
 
 fn onPickerCancel(ctx: ?*anyopaque) void {
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
-    self.hideSimplePickerOverlay(&self.login_picker_handle);
+    self.hideSimplePickerOverlay(&self.login_picker);
 }
 
 const Context = struct {

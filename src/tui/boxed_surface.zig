@@ -1,7 +1,7 @@
 const std = @import("std");
 const excerpt_mod = @import("excerpt.zig");
 const box_chrome = @import("box_chrome.zig");
-const buffer_mod = @import("buffer.zig");
+const buffer_mod = @import("primitives/surface.zig");
 const cell_mod = @import("cell.zig");
 
 const Region = buffer_mod.Region;

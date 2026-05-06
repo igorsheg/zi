@@ -72,32 +72,21 @@ pub fn bindAutocomplete(self: *Interactive) void {
 }
 
 pub fn mountInitialTree(self: *Interactive) void {
-    self.refreshHeaderVisibility();
     self.refreshPendingImageBanner();
     self.status_line.setStatusData(&self.status_data);
     self.status_line.setTheme(self.theme);
-    self.status_container.addChild(self.status_line.component());
-    self.composer_above_container.addChild(self.extension_ui_state.editorBorderTopComponent());
-    self.editor_container.addChild(self.active_editor.component());
-    self.editor_container.focused_child_index = 0;
-    self.composer_below_container.addChild(self.extension_ui_state.editorBorderBottomComponent());
-    self.composer_below_container.addChild(self.extension_ui_state.statusComponent());
 
     self.tui.setFocus(self.active_editor.component());
 
-    self.transcript_container.addChild(self.transcript.component());
-    self.transcript_container.addChild(self.transcript_bottom_padding.component());
-    self.transcript_container.flex_child_index = 0;
-
-    self.tui.root.addChild(self.transcript_container.component());
-    self.tui.root.addChild(self.pending_container.component());
-    self.tui.root.addChild(self.status_container.component());
-    self.tui.root.addChild(self.header_container.component());
-    self.tui.root.addChild(self.composer_above_container.component());
-    self.tui.root.addChild(self.editor_container.component());
-    self.tui.root.addChild(self.composer_below_container.component());
-    self.tui.root.flex_child_index = 0;
-    self.tui.root.focused_child_index = 5;
+    self.tui.root.add(self.transcript.component(), .{ .height = .{ .flex = 1 } });
+    self.tui.root.addSpace(.{ .height = .{ .points = 1 } });
+    self.tui.root.add(self.pending_image_banner.component(), .{});
+    self.tui.root.add(self.status_line.component(), .{});
+    self.tui.root.add(self.greeter.component(), .{ .visible = !self.greeter_dismissed });
+    self.tui.root.add(self.extension_ui_state.editorBorderTopComponent(), .{});
+    self.tui.root.add(self.active_editor.component(), .{});
+    self.tui.root.add(self.extension_ui_state.editorBorderBottomComponent(), .{});
+    self.tui.root.add(self.extension_ui_state.statusComponent(), .{});
 }
 
 fn onEditorChange(_: []const u8, ctx: ?*anyopaque) void {

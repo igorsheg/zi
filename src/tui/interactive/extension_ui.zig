@@ -1,6 +1,6 @@
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const ui_event_mod = @import("../ui_event.zig");
-const overlay_mod = @import("../overlay.zig");
+const overlay_mod = @import("../primitives/overlay.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 

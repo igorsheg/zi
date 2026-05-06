@@ -39,7 +39,8 @@ pub const ResumePickerFlow = struct {
         picker.title = "Resume session";
         picker.list.max_visible = 10;
         picker.setSearchPlaceholder("Filter sessions");
-        picker.setEmptyText("Loading sessions...");
+        picker.setEmptyText("No matching sessions");
+        picker.setStatus(.{ .text = "Loading sessions...", .kind = .loading });
         picker.setSearchableItems(&.{}, null);
 
         return .{
@@ -70,6 +71,7 @@ pub const ResumePickerFlow = struct {
 
         self.rows = rows;
         self.items = items;
+        self.picker.setStatus(null);
         self.picker.setEmptyText("No matching sessions");
         self.picker.setSearchableItems(items, null);
     }

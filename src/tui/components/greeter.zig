@@ -1,7 +1,7 @@
 const std = @import("std");
 const cell_mod = @import("../cell.zig");
-const buffer_mod = @import("../buffer.zig");
-const component_mod = @import("../component.zig");
+const buffer_mod = @import("../primitives/surface.zig");
+const component_mod = @import("../primitives/view.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 

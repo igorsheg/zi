@@ -1,7 +1,7 @@
 const std = @import("std");
-const component_mod = @import("component.zig");
-const buffer_mod = @import("buffer.zig");
-const cell_mod = @import("cell.zig");
+const component_mod = @import("view.zig");
+const buffer_mod = @import("surface.zig");
+const cell_mod = @import("../cell.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;

@@ -28,13 +28,14 @@ pub fn clearPendingImages(self: *Interactive) void {
 }
 
 pub fn refreshPendingImageBanner(self: *Interactive) void {
-    self.pending_container.clear();
-    if (self.pending_images.items.len == 0) return;
+    if (self.pending_images.items.len == 0) {
+        self.pending_image_banner.setContent("");
+        return;
+    }
 
     const banner = clipboard_images.pendingImageBannerText(self.allocator, self.pending_images.items) catch return;
     defer self.allocator.free(banner);
     self.pending_image_banner.setContent(banner);
-    self.pending_container.addChild(self.pending_image_banner.component());
 }
 
 pub fn handlePasteImageShortcut(self: *Interactive) void {

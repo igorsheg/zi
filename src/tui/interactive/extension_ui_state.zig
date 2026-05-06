@@ -1,11 +1,11 @@
 const std = @import("std");
 
-const component_mod = @import("../component.zig");
-const buffer_mod = @import("../buffer.zig");
+const component_mod = @import("../primitives/view.zig");
+const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const framebuffer_surface_mod = @import("../components/framebuffer_surface.zig");
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
-const overlay_mod = @import("../overlay.zig");
+const overlay_mod = @import("../primitives/overlay.zig");
 const keys_mod = @import("../terminal/keys.zig");
 
 const Component = component_mod.Component;

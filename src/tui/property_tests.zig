@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const component_mod = @import("component.zig");
-const buffer_mod = @import("buffer.zig");
+const component_mod = @import("primitives/view.zig");
+const buffer_mod = @import("primitives/surface.zig");
 const transcript_mod = @import("transcript.zig");
 
 const Measurement = component_mod.Measurement;

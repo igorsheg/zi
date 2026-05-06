@@ -1,10 +1,10 @@
 const std = @import("std");
 const clipboard_mod = @import("../terminal/clipboard.zig");
-const container_mod = @import("../container.zig");
+const layout_mod = @import("../primitives/layout.zig");
 const keys_mod = @import("../terminal/keys.zig");
 const transcript_mod = @import("../transcript.zig");
 
-const ChildRect = container_mod.ChildRect;
+const ChildRect = layout_mod.ChildRect;
 
 pub const MouseCapture = union(enum) {
     none,
@@ -82,14 +82,7 @@ pub fn cancelSelection(self: anytype) void {
 }
 
 fn rect(self: anytype) ?ChildRect {
-    const wrapper = self.tui.root.childRect(0) orelse return null;
-    const inner = self.transcript_container.childRect(0) orelse return null;
-    return .{
-        .x = wrapper.x + inner.x,
-        .y = wrapper.y + inner.y,
-        .width = inner.width,
-        .height = inner.height,
-    };
+    return self.tui.root.childRect(0);
 }
 
 fn mouseZone(self: anytype, event: keys_mod.MouseEvent, allow_outside: bool) ?Zone {

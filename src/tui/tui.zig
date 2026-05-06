@@ -1,17 +1,19 @@
 const std = @import("std");
-const component_mod = @import("component.zig");
-const container_mod = @import("container.zig");
-const overlay_mod = @import("overlay.zig");
+const component_mod = @import("primitives/view.zig");
+const stack_mod = @import("primitives/layout.zig");
+const overlay_mod = @import("primitives/overlay.zig");
+const focus_mod = @import("primitives/focus.zig");
 const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal/mod.zig");
 const keys_mod = @import("terminal/keys.zig");
-const buffer_mod = @import("buffer.zig");
+const buffer_mod = @import("primitives/surface.zig");
 
 const Component = component_mod.Component;
 const CursorState = component_mod.CursorState;
-const Container = container_mod.Container;
+const Stack = stack_mod.Stack;
 const OverlayManager = overlay_mod.OverlayManager;
 const OverlayOptions = overlay_mod.OverlayOptions;
+const FocusManager = focus_mod.FocusManager;
 const Renderer = renderer_mod.Renderer;
 const Terminal = terminal_mod.Terminal;
 const Key = keys_mod.Key;
@@ -19,21 +21,20 @@ const Region = buffer_mod.Region;
 
 /// Reusable TUI infrastructure — terminal, renderer, focus, overlays, layout tree.
 ///
-/// Matches pi-mono's TUI class (packages/tui/src/tui.ts):
-///   setFocus, showOverlay, hideOverlay, requestRender, handleInput, addChild.
+/// Reusable TUI infrastructure: terminal, renderer, focus, overlays, root layout tree.
 ///
 /// Interactive mode composes this with domain-specific state (editor, transcript,
 /// agent thread, event queue). Extensions interact through this interface.
 ///
 /// Focus/cursor split:
 ///   - FocusManager is source of truth for input routing and focus state.
-///   - Container.focused_child_index is for cursor y-offset translation ONLY.
-///   - Overlay cursor bypasses the container tree (resolved from overlay layout).
+///   - Base-tree cursor placement is resolved from the root layout tree.
+///   - Overlay cursor bypasses the root tree (resolved from overlay layout).
 pub const TUI = struct {
     allocator: std.mem.Allocator,
     terminal: Terminal,
     renderer: Renderer,
-    root: Container,
+    root: Stack,
     focus: FocusManager = .{},
     overlays: OverlayManager,
     dirty: bool = true,
@@ -46,7 +47,7 @@ pub const TUI = struct {
             .allocator = allocator,
             .terminal = term,
             .renderer = rend,
-            .root = Container.init(allocator),
+            .root = Stack.init(allocator),
             .overlays = OverlayManager.init(allocator),
         };
     }
@@ -114,10 +115,6 @@ pub const TUI = struct {
         return self.overlays.topmostCapturingComponent() != null;
     }
 
-    pub fn addChild(self: *TUI, child: Component) void {
-        self.root.addChild(child);
-    }
-
     pub fn width(self: *const TUI) u32 {
         return self.renderer.width;
     }
@@ -171,7 +168,8 @@ pub const TUI = struct {
         if (self.overlays.hasVisibleOverlays()) {
             if (self.overlayFocusCursor()) |cs| return cs;
         }
-        return self.root.cursorState();
+        if (self.focus.current) |focused| return self.root.cursorFor(focused);
+        return null;
     }
 
     /// Check for terminal resize. Returns true if size changed.
@@ -207,35 +205,6 @@ pub const TUI = struct {
             }
         }
         return null;
-    }
-};
-
-/// Component-identity-based focus manager.
-/// Source of truth for which component receives input and shows cursor.
-///
-/// Cursor y-offset translation still comes from the container tree
-/// (Container.focused_child_index + computeChildYOffset) for base-tree
-/// components. Overlay components get absolute cursor from resolveLayout.
-pub const FocusManager = struct {
-    current: ?Component = null,
-
-    pub fn setFocus(self: *FocusManager, target: ?Component) void {
-        if (self.current) |prev| prev.setFocused(false);
-        self.current = target;
-        if (target) |t| t.setFocused(true);
-    }
-
-    pub fn handleInput(self: *FocusManager, key: Key) bool {
-        if (self.current) |focused| return focused.handleInput(key);
-        return false;
-    }
-
-    pub fn save(self: *FocusManager) ?Component {
-        return self.current;
-    }
-
-    pub fn restore(self: *FocusManager, saved: ?Component) void {
-        self.setFocus(saved);
     }
 };
 
@@ -403,7 +372,7 @@ test "FocusManager save and restore" {
 test "OverlayHandle hide restores focus" {
     var mgr = OverlayManager.init(testing.allocator);
     defer mgr.deinit();
-    var root = Container.init(testing.allocator);
+    var root = Stack.init(testing.allocator);
     defer root.deinit();
 
     var editor = DummyComp{};

@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const buffer_mod = @import("../buffer.zig");
+const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
-const component_mod = @import("../component.zig");
+const component_mod = @import("../primitives/view.zig");
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 
 const Region = buffer_mod.Region;

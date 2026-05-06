@@ -1,35 +1,33 @@
 const Color = @import("../cell.zig").Color;
-const overlay_mod = @import("../overlay.zig");
-const tui_mod = @import("../tui.zig");
-const list_picker_mod = @import("../components/list_picker.zig");
-const select_list_mod = @import("../components/select_list.zig");
+const overlay_mod = @import("../primitives/overlay.zig");
+const simple_picker_flow_mod = @import("simple_picker_flow.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
-const ListPicker = list_picker_mod.ListPicker;
-const PickerSelection = list_picker_mod.Selection;
-const SelectItem = select_list_mod.SelectItem;
+const SimplePickerFlow = simple_picker_flow_mod.SimplePickerFlow;
+const PickerSelection = simple_picker_flow_mod.Selection;
+const SelectItem = simple_picker_flow_mod.SelectItem;
 
 pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
-    const width = self.tui.width();
-    const header_h = self.header_container.measure(width).preferred_height;
     return .{
         .anchor = .bottom_left,
         .width_percent = 100,
         .max_height_percent = 40,
         .margin_bottom = 0,
-        .margin_top = header_h,
+        .margin_top = chromeTopMargin(self),
         .surface = .{ .fill = Color.default },
     };
 }
 
 pub fn centerDialogOptions(self: *Interactive) overlay_mod.OverlayOptions {
     var options = overlay_mod.OverlayPresets.centerDialog();
-    const width = self.tui.width();
-    const header_h = self.header_container.measure(width).preferred_height;
-    options.margin_top = header_h;
+    options.margin_top = chromeTopMargin(self);
     options.margin_bottom = 1;
     options.surface = .{ .fill = self.theme.bg(.tool_pending_bg) };
     return options;
+}
+
+fn chromeTopMargin(self: *Interactive) u32 {
+    return if (self.greeter_dismissed) 0 else self.greeter.measure(self.tui.width()).preferred_height;
 }
 
 pub fn showHotkeys(self: *Interactive) void {
@@ -39,35 +37,25 @@ pub fn showHotkeys(self: *Interactive) void {
 
 pub fn configureSimplePicker(
     self: *Interactive,
-    picker: *ListPicker,
+    picker: *SimplePickerFlow,
     title: []const u8,
     max_visible: u32,
     items: []const SelectItem,
     on_select: ?*const fn (selection: PickerSelection, ctx: ?*anyopaque) void,
     on_cancel: ?*const fn (ctx: ?*anyopaque) void,
 ) void {
-    picker.* = ListPicker.init(self.theme);
-    picker.title = title;
-    picker.list.max_visible = max_visible;
-    picker.setItems(items);
-    picker.on_select = on_select;
-    picker.on_cancel = on_cancel;
-    picker.callback_ctx = @ptrCast(self);
+    picker.configure(self.theme, title, max_visible, items, @ptrCast(self), on_select, on_cancel);
 }
 
 pub fn showSimplePickerOverlay(
     self: *Interactive,
-    handle: *?tui_mod.OverlayHandle,
-    picker: *ListPicker,
+    picker: *SimplePickerFlow,
 ) void {
     self.cancelTranscriptSelection();
-    hideSimplePickerOverlay(handle);
-    handle.* = self.tui.showOverlay(picker.component(), bottomSheetOptions(self));
+    picker.hide();
+    picker.handle = self.tui.showOverlay(picker.picker.component(), bottomSheetOptions(self));
 }
 
-pub fn hideSimplePickerOverlay(handle: *?tui_mod.OverlayHandle) void {
-    if (handle.*) |h| {
-        handle.* = null;
-        h.hide();
-    }
+pub fn hideSimplePickerOverlay(picker: *SimplePickerFlow) void {
+    picker.hide();
 }

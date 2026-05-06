@@ -1,5 +1,5 @@
 const cell_mod = @import("../cell.zig");
-const buffer_mod = @import("../buffer.zig");
+const buffer_mod = @import("../primitives/surface.zig");
 const buffer_state_mod = @import("buffer.zig");
 const types = @import("types.zig");
 

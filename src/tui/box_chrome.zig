@@ -1,5 +1,5 @@
 const std = @import("std");
-const buffer_mod = @import("buffer.zig");
+const buffer_mod = @import("primitives/surface.zig");
 const cell_mod = @import("cell.zig");
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;

@@ -1,7 +1,7 @@
 const std = @import("std");
-const cell_mod = @import("cell.zig");
-const buffer_mod = @import("buffer.zig");
-const keys_mod = @import("terminal/keys.zig");
+const cell_mod = @import("../cell.zig");
+const buffer_mod = @import("surface.zig");
+const keys_mod = @import("../terminal/keys.zig");
 
 const Region = buffer_mod.Region;
 const Key = keys_mod.Key;
@@ -20,8 +20,8 @@ pub const CursorState = struct {
 };
 
 /// Type-erased component interface.
-/// Components implement render/handleInput/measure/cursorState and expose
-/// themselves via `component()` for use in layout containers.
+/// Views implement render/handleInput/measure/cursorState and expose
+/// themselves via `component()` for use in layout primitives.
 ///
 /// Heavy components can optionally implement `renderSlice(region, first_row)`
 /// so viewport owners can paint visible rows directly without full-surface

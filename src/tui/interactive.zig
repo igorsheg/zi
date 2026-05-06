@@ -1,12 +1,11 @@
 const std = @import("std");
 const posix = std.posix;
 const cell_mod = @import("cell.zig");
-const buffer_mod = @import("buffer.zig");
+const buffer_mod = @import("primitives/surface.zig");
 const renderer_mod = @import("renderer.zig");
 const terminal_mod = @import("terminal/mod.zig");
 const keys_mod = @import("terminal/keys.zig");
-const component_mod = @import("component.zig");
-const div_mod = @import("components/div.zig");
+const component_mod = @import("primitives/view.zig");
 const text_mod = @import("components/text.zig");
 const status_line_mod = @import("components/status_line.zig");
 const greeter_mod = @import("components/greeter.zig");
@@ -20,8 +19,7 @@ const extension_runner_mod = @import("../coding_agent/extensions/runner.zig");
 const system_command_mod = @import("../coding_agent/extensions/system_command.zig");
 const transcript_mod = @import("transcript.zig");
 const conversation_projection_mod = @import("conversation_projection.zig");
-const container_mod = @import("container.zig");
-const overlay_mod = @import("overlay.zig");
+const overlay_mod = @import("primitives/overlay.zig");
 const tool_display_mod = @import("tool_display.zig");
 const theme_mod = @import("theme.zig");
 const app_meta = @import("../runtime/app.zig");
@@ -51,6 +49,7 @@ const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const status_flow = @import("interactive/status_flow.zig");
 const memory_telemetry = @import("interactive/memory_telemetry.zig");
 const overlay_flow = @import("interactive/overlay_flow.zig");
+const simple_picker_flow_mod = @import("interactive/simple_picker_flow.zig");
 const idle_request = @import("interactive/idle_request.zig");
 const runtime_loop = @import("interactive/runtime_loop.zig");
 const job_manager_mod = @import("interactive/job_manager.zig");
@@ -76,9 +75,9 @@ const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvid
 const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
 const select_list_mod = @import("components/select_list.zig");
-const ListPicker = list_picker_mod.ListPicker;
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
+const SimplePickerFlow = simple_picker_flow_mod.SimplePickerFlow;
 
 pub const TerminalSystemRequest = struct {
     id: extension_runner_mod.AsyncOpId,
@@ -188,8 +187,6 @@ pub const Interactive = struct {
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
     transcript: Transcript,
-    transcript_container: container_mod.Container,
-    transcript_bottom_padding: div_mod.Div = div_mod.Div.init(1),
     conversation_projection: conversation_projection_mod.ProjectionState,
     resolver: ToolRendererResolver,
     status_data: StatusData,
@@ -214,12 +211,6 @@ pub const Interactive = struct {
     pending_images: std.ArrayListUnmanaged(PendingImageAttachment) = .empty,
     clipboard_image_reader: ClipboardImageReader = clipboard_mod.readImage,
 
-    header_container: container_mod.Container,
-    pending_container: container_mod.Container,
-    status_container: container_mod.Container,
-    composer_above_container: container_mod.Container,
-    editor_container: container_mod.Container,
-    composer_below_container: container_mod.Container,
 
     command_registry: CommandRegistry,
     autocomplete_provider: CombinedAutocompleteProvider = undefined,
@@ -239,22 +230,19 @@ pub const Interactive = struct {
     /// TUI-owned snapshot; never read agent registry from the TUI thread.
     model_catalog: []ai_protocol.Model = &.{},
     model_picker_flow: ?ModelPickerFlow = null,
-    settings_picker: ListPicker = undefined,
+    settings_picker: SimplePickerFlow = .{},
     settings_picker_items: [16]SelectItem = undefined,
     settings_picker_actions: [16]SettingsAction = undefined,
     settings_picker_count: usize = 0,
-    settings_picker_handle: ?tui_mod.OverlayHandle = null,
-    thinking_picker: ListPicker = undefined,
+    thinking_picker: SimplePickerFlow = .{},
     thinking_picker_items: [8]SelectItem = undefined,
     thinking_picker_levels: [8]agent_protocol.ThinkingLevel = undefined,
     thinking_picker_count: usize = 0,
-    thinking_picker_handle: ?tui_mod.OverlayHandle = null,
 
-    login_picker: ListPicker = undefined,
+    login_picker: SimplePickerFlow = .{},
     login_picker_items: [8]SelectItem = undefined,
     login_picker_entries: [8]oauth_mod.ProviderListEntry = undefined,
     login_picker_count: usize = 0,
-    login_picker_handle: ?tui_mod.OverlayHandle = null,
     login_thread: ?std.Thread = null,
     login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -309,17 +297,10 @@ pub const Interactive = struct {
             .footer = .{},
             .hotkeys_overlay = .{},
             .transcript = Transcript.init(allocator),
-            .transcript_container = container_mod.Container.init(allocator),
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
             .status_data = StatusData.init(allocator),
             .runtime_host = runtime_host,
-            .header_container = container_mod.Container.init(allocator),
-            .pending_container = container_mod.Container.init(allocator),
-            .status_container = container_mod.Container.init(allocator),
-            .composer_above_container = container_mod.Container.init(allocator),
-            .editor_container = container_mod.Container.init(allocator),
-            .composer_below_container = container_mod.Container.init(allocator),
             .command_registry = CommandRegistry.init(allocator),
             .input = input_buffer_mod.InputBuffer.init(allocator),
             .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
@@ -415,13 +396,6 @@ pub const Interactive = struct {
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
         self.request_queue.deinit();
-        self.composer_below_container.deinit();
-        self.editor_container.deinit();
-        self.composer_above_container.deinit();
-        self.status_container.deinit();
-        self.pending_container.deinit();
-        self.header_container.deinit();
-        self.transcript_container.deinit();
         self.conversation_projection.deinit();
         self.transcript.deinit();
         self.extension_ui_state.deinit();
@@ -719,9 +693,8 @@ pub const Interactive = struct {
 
         var fixed_total: u32 = 0;
         for (self.tui.root.children.items, 0..) |child, i| {
-            if (self.tui.root.flex_child_index != null and i == self.tui.root.flex_child_index.?) continue;
-            var c = child;
-            fixed_total += c.measure(w).preferred_height;
+            if (self.tui.root.isFlexChild(child, i)) continue;
+            fixed_total += self.tui.root.childDesiredHeight(child, w);
         }
         return if (h > fixed_total) h - fixed_total else 0;
     }
@@ -730,10 +703,7 @@ pub const Interactive = struct {
         if (self.composerHasPendingInput() and !self.greeter_dismissed) {
             self.greeter_dismissed = true;
         }
-        self.header_container.clear();
-        if (!self.greeter_dismissed) {
-            self.header_container.addChild(self.greeter.component());
-        }
+        self.tui.root.setVisible(self.greeter.component(), !self.greeter_dismissed);
     }
 
     pub fn showLoader(self: *Interactive, message: []const u8) void {
@@ -1018,7 +988,7 @@ pub const Interactive = struct {
 
     pub fn configureSimplePicker(
         self: *Interactive,
-        picker: *ListPicker,
+        picker: *SimplePickerFlow,
         title: []const u8,
         max_visible: u32,
         items: []const SelectItem,
@@ -1030,15 +1000,14 @@ pub const Interactive = struct {
 
     pub fn showSimplePickerOverlay(
         self: *Interactive,
-        handle: *?tui_mod.OverlayHandle,
-        picker: *ListPicker,
+        picker: *SimplePickerFlow,
     ) void {
-        overlay_flow.showSimplePickerOverlay(self, handle, picker);
+        overlay_flow.showSimplePickerOverlay(self, picker);
     }
 
-    pub fn hideSimplePickerOverlay(self: *Interactive, handle: *?tui_mod.OverlayHandle) void {
+    pub fn hideSimplePickerOverlay(self: *Interactive, picker: *SimplePickerFlow) void {
         _ = self;
-        overlay_flow.hideSimplePickerOverlay(handle);
+        overlay_flow.hideSimplePickerOverlay(picker);
     }
 
     pub fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
@@ -1076,7 +1045,7 @@ pub const Interactive = struct {
 
     fn onSettingsPickerCancel(ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.hideSimplePickerOverlay(&self.settings_picker_handle);
+        self.hideSimplePickerOverlay(&self.settings_picker);
     }
 
     fn showThinkingLevelPicker(self: *Interactive) void {
@@ -1090,7 +1059,7 @@ pub const Interactive = struct {
 
     fn onThinkingLevelPickerCancel(ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
-        self.hideSimplePickerOverlay(&self.thinking_picker_handle);
+        self.hideSimplePickerOverlay(&self.thinking_picker);
     }
 
     pub fn applyThinkingLevelChange(self: *Interactive, level: agent_protocol.ThinkingLevel) void {
