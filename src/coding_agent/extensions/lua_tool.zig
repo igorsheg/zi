@@ -906,6 +906,7 @@ const TestLabelEntry = struct {
 const TestStateStore = struct {
     allocator: std.mem.Allocator,
     editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
+    render_specs: std.ArrayListUnmanaged(extension_ui.RenderSpec) = .empty,
     session_name: ?[]const u8 = null,
     note_kind: ?[]const u8 = null,
     note_title: ?[]const u8 = null,
@@ -921,6 +922,7 @@ const TestStateStore = struct {
 
     fn deinit(self: *TestStateStore) void {
         self.clearEditorActions();
+        self.clearRenderSpecs();
         if (self.session_name) |name| self.allocator.free(name);
         self.session_name = null;
         if (self.note_kind) |value| self.allocator.free(value);
@@ -1122,7 +1124,9 @@ const TestStateStore = struct {
 
     fn publishRender(session: *anyopaque, spec: extension_ui.RenderSpec) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
-        _ = spec;
+        var cloned = try extension_ui.RenderSpec.clone(self.allocator, spec);
+        errdefer cloned.deinit(self.allocator);
+        try self.render_specs.append(self.allocator, cloned);
         self.render_count += 1;
     }
 
@@ -1148,6 +1152,12 @@ const TestStateStore = struct {
         for (self.editor_actions.items) |*action| action.deinit(self.allocator);
         self.editor_actions.deinit(self.allocator);
         self.editor_actions = .empty;
+    }
+
+    fn clearRenderSpecs(self: *TestStateStore) void {
+        for (self.render_specs.items) |*spec| spec.deinit(self.allocator);
+        self.render_specs.deinit(self.allocator);
+        self.render_specs = .empty;
     }
 };
 
@@ -1780,6 +1790,44 @@ test "extension command rejects arbitrary coroutine yield" {
     try testing.expectError(error.UnexpectedYield, runner.dispatchCommand("bad-yield", ""));
 }
 
+test "ctx.ui.render parses v3 target tables" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 1);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\zi.command({
+        \\  name = "ui-target-table",
+        \\  description = "ui-target-table",
+        \\  handler = function(_, ctx)
+        \\    ctx.ui.render({ id = "mission", target = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" }, root = { type = "text", text = "go" } })
+        \\    ctx.ui.render({ id = "notice", target = { kind = "toast", anchor = "top_right", lifetime = "until_input" }, root = { type = "text", text = "hi" } })
+        \\  end,
+        \\})
+    , "ui_target_table");
+
+    try runner.dispatchCommand("ui-target-table", "");
+    try testing.expectEqual(@as(usize, 2), store.render_specs.items.len);
+    try testing.expectEqual(extension_ui.UiTarget.overlay, store.render_specs.items[0].target);
+    try testing.expectEqual(@as(f32, 92), store.render_specs.items[0].target_options.width.?.percent);
+    try testing.expectEqual(extension_ui.UiBackdrop.dim, store.render_specs.items[0].target_options.backdrop.?);
+    try testing.expectEqual(extension_ui.UiTarget.toast, store.render_specs.items[1].target);
+    try testing.expectEqual(extension_ui.UiAnchor.top_right, store.render_specs.items[1].target_options.anchor.?);
+    try testing.expectEqual(extension_ui.UiLifetime.until_input, store.render_specs.items[1].target_options.lifetime.?);
+}
+
 test "todo command can call ctx.ui.render perimeter" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
@@ -1833,7 +1881,6 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         const add_result = tool.execute(tool.ctx, arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
         try testing.expect(!add_result.is_error);
     }
-
 
     {
         var state = try lua_runtime.LuaState.init(testing.allocator);

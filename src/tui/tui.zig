@@ -289,6 +289,12 @@ pub const OverlayHandle = struct {
         return entry.hidden;
     }
 
+    pub fn setOptions(self: OverlayHandle, options: OverlayOptions) void {
+        const entry = self.tui.overlays.findEntry(self.id) orelse return;
+        entry.options = options;
+        self.tui.dirty = true;
+    }
+
     /// Focus this overlay and bring it to the visual front.
     pub fn focus(self: OverlayHandle) void {
         const entry = self.tui.overlays.findEntry(self.id) orelse return;

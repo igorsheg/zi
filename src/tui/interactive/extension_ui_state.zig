@@ -5,6 +5,7 @@ const buffer_mod = @import("../buffer.zig");
 const cell_mod = @import("../cell.zig");
 const framebuffer_surface_mod = @import("../components/framebuffer_surface.zig");
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
+const overlay_mod = @import("../overlay.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -156,6 +157,15 @@ pub const ExtensionUiState = struct {
         return rec.frame;
     }
 
+    pub fn syncOverlayOptions(self: *ExtensionUiState, target: extension_ui.UiTarget, base: overlay_mod.OverlayOptions) overlay_mod.OverlayOptions {
+        var options = base;
+        const ordered = self.orderedTargetViews(target) catch return options;
+        defer self.allocator.free(ordered);
+        if (ordered.len == 0) return options;
+        applyTargetOptions(&options, ordered[ordered.len - 1].spec.target_options);
+        return options;
+    }
+
     fn orderedTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) ![]*ViewRecord {
         var list = std.ArrayList(*ViewRecord).empty;
         errdefer list.deinit(self.allocator);
@@ -285,6 +295,80 @@ const ToastComponent = struct {
         return self.state.orderedTargetViews(.toast);
     }
 };
+
+fn applyTargetOptions(options: *overlay_mod.OverlayOptions, target: extension_ui.UiTargetOptions) void {
+    if (target.width) |v| applyWidth(options, v);
+    // Current overlay manager does not expose exact height; use height as a max-height constraint.
+    if (target.height) |v| applyMaxHeight(options, v);
+    if (target.min_width) |v| {
+        if (fixedConstraint(v)) |n| options.min_width = n;
+    }
+    // max_width is parsed and retained for v3, but OverlayOptions has no max_width field yet.
+    if (target.max_height) |v| applyMaxHeight(options, v);
+    if (target.anchor) |v| options.anchor = toOverlayAnchor(v);
+    if (target.backdrop) |v| options.backdrop = toOverlayBackdrop(v);
+}
+
+fn applyWidth(options: *overlay_mod.OverlayOptions, c: extension_ui.Constraint) void {
+    switch (c) {
+        .fixed => |v| {
+            options.width = edge(v);
+            options.width_percent = null;
+        },
+        .percent => |v| {
+            options.width_percent = percent(v);
+            options.width = null;
+        },
+        else => {},
+    }
+}
+
+fn applyMaxHeight(options: *overlay_mod.OverlayOptions, c: extension_ui.Constraint) void {
+    switch (c) {
+        .fixed => |v| {
+            options.max_height = edge(v);
+            options.max_height_percent = null;
+        },
+        .percent => |v| {
+            options.max_height_percent = percent(v);
+            options.max_height = null;
+        },
+        else => {},
+    }
+}
+
+fn fixedConstraint(c: extension_ui.Constraint) ?u32 {
+    return switch (c) {
+        .fixed => |v| edge(v),
+        else => null,
+    };
+}
+
+fn percent(v: f32) u8 {
+    if (v <= 0) return 0;
+    if (v >= 100) return 100;
+    return @intFromFloat(v);
+}
+
+fn toOverlayAnchor(anchor: extension_ui.UiAnchor) overlay_mod.OverlayAnchor {
+    return switch (anchor) {
+        .center => .center,
+        .top_left => .top_left,
+        .top_right => .top_right,
+        .bottom_left => .bottom_left,
+        .bottom_right => .bottom_right,
+        .top_center => .top_center,
+        .bottom_center => .bottom_center,
+    };
+}
+
+fn toOverlayBackdrop(backdrop: extension_ui.UiBackdrop) overlay_mod.OverlayBackdrop {
+    return switch (backdrop) {
+        .none => .none,
+        .dim => .dim,
+        .fill => .{ .fill = Color.default },
+    };
+}
 
 fn lessView(_: void, a: *ViewRecord, b: *ViewRecord) bool {
     if (a.spec.order != b.spec.order) return a.spec.order < b.spec.order;
@@ -619,4 +703,22 @@ test "extension ui remove final overlay clears presence" {
     try std.testing.expect(state.hasOverlayViews());
     state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "overlay", .target = .overlay, .remove = true });
     try std.testing.expect(!state.hasOverlayViews());
+}
+
+test "extension ui maps retained overlay target options" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{
+        .state_owner_id = "owner",
+        .generation = 1,
+        .id = "overlay",
+        .target = .overlay,
+        .target_options = .{ .width = .{ .percent = 92 }, .max_height = .{ .percent = 90 }, .anchor = .center, .backdrop = .dim },
+        .root = .{ .text = .{ .text = "hi" } },
+    });
+    const options = state.syncOverlayOptions(.overlay, .{});
+    try std.testing.expectEqual(@as(?u8, 92), options.width_percent);
+    try std.testing.expectEqual(@as(?u8, 90), options.max_height_percent);
+    try std.testing.expectEqual(overlay_mod.OverlayAnchor.center, options.anchor);
+    try std.testing.expect(options.backdrop == .dim);
 }

@@ -72,28 +72,29 @@ pub fn applyCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.Ex
     self.tui.dirty = true;
 }
 
-fn extensionToastOptions() overlay_mod.OverlayOptions {
+fn extensionToastOptions(self: *Interactive) overlay_mod.OverlayOptions {
     var options = overlay_mod.OverlayPresets.topToast();
     options.width = 40;
     options.max_height = null;
     options.max_height_percent = 40;
-    return options;
+    return self.extension_ui_state.syncOverlayOptions(.toast, options);
 }
 
 /// Forward-looking ctx.ui v3 overlay target. Kept non-capturing until v3
 /// focus/key routing is designed; views render through the retained v3 tree.
-fn extensionOverlayOptions() overlay_mod.OverlayOptions {
+fn extensionOverlayOptions(self: *Interactive) overlay_mod.OverlayOptions {
     var options = overlay_mod.OverlayPresets.centerDialog();
     options.non_capturing = true;
-    return options;
+    return self.extension_ui_state.syncOverlayOptions(.overlay, options);
 }
 
 pub fn syncExtensionToastOverlay(self: *Interactive) void {
     if (self.extension_ui_state.hasToastViews()) {
         if (self.extension_toast_overlay) |handle| {
+            handle.setOptions(extensionToastOptions(self));
             handle.setHidden(false);
         } else {
-            self.extension_toast_overlay = self.tui.showOverlay(self.extension_ui_state.toastComponent(), extensionToastOptions());
+            self.extension_toast_overlay = self.tui.showOverlay(self.extension_ui_state.toastComponent(), extensionToastOptions(self));
         }
     } else if (self.extension_toast_overlay) |handle| {
         self.extension_toast_overlay = null;
@@ -104,9 +105,10 @@ pub fn syncExtensionToastOverlay(self: *Interactive) void {
 pub fn syncExtensionOverlay(self: *Interactive) void {
     if (self.extension_ui_state.hasOverlayViews()) {
         if (self.extension_overlay_handle) |handle| {
+            handle.setOptions(extensionOverlayOptions(self));
             handle.setHidden(false);
         } else {
-            self.extension_overlay_handle = self.tui.showOverlay(self.extension_ui_state.overlayComponent(), extensionOverlayOptions());
+            self.extension_overlay_handle = self.tui.showOverlay(self.extension_ui_state.overlayComponent(), extensionOverlayOptions(self));
         }
     } else if (self.extension_overlay_handle) |handle| {
         self.extension_overlay_handle = null;

@@ -263,18 +263,23 @@ fn ctxUiFrame(L_opt: ?*c.lua_State) callconv(.c) c_int {
 fn publishRenderFromArgs(L: *c.lua_State) !void {
     if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
     const runner = stateRunnerFromUpvalue(L);
-    const bound = switch (runner.runtime) { .bound => |bound| bound, .stub => return };
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
     const callback = bound.publish_render orelse return;
 
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
     const spec_idx = c.lua_absindex(L, 1);
+    const target = try readTargetField(L, spec_idx);
     const spec = extension_ui.RenderSpec{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
         .id = try readStringFieldLimit(aa, L, spec_idx, "id", "root", ui_id_bytes),
-        .target = try readTargetField(L, spec_idx),
+        .target = target.kind,
+        .target_options = target.options,
         .title = try readOptionalStringFieldLimit(aa, L, spec_idx, "title", ui_text_bytes),
         .order = readIntField(L, spec_idx, "order", 0),
         .focus = readBoolField(L, spec_idx, "focus", false),
@@ -288,7 +293,10 @@ fn publishRenderFromArgs(L: *c.lua_State) !void {
 fn publishFrameFromArgs(L: *c.lua_State) !void {
     if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
     const runner = stateRunnerFromUpvalue(L);
-    const bound = switch (runner.runtime) { .bound => |bound| bound, .stub => return };
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
     const callback = bound.publish_frame orelse return;
 
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
@@ -310,10 +318,40 @@ fn publishFrameFromArgs(L: *c.lua_State) !void {
     try callback(bound.session, spec);
 }
 
-fn readTargetField(L: *c.lua_State, idx: c_int) !extension_ui.UiTarget {
-    _ = c.lua_getfield(L, idx, "target"); defer c.lua_pop(L, 1);
+const ParsedTarget = struct { kind: extension_ui.UiTarget = .overlay, options: extension_ui.UiTargetOptions = .{} };
+
+fn readTargetField(L: *c.lua_State, idx: c_int) !ParsedTarget {
+    _ = c.lua_getfield(L, idx, "target");
+    defer c.lua_pop(L, 1);
+    return switch (c.lua_type(L, -1)) {
+        c.LUA_TSTRING => .{ .kind = try parseTargetKind(luaString(L, -1) orelse return .{}) },
+        c.LUA_TTABLE => blk: {
+            const tidx = c.lua_absindex(L, -1);
+            const kind = try parseTargetKindField(L, tidx);
+            var options: extension_ui.UiTargetOptions = .{};
+            options.width = readConstraintField(L, tidx, "width");
+            options.height = readConstraintField(L, tidx, "height");
+            options.min_width = readConstraintField(L, tidx, "min_width");
+            options.max_width = readConstraintField(L, tidx, "max_width");
+            options.min_height = readConstraintField(L, tidx, "min_height");
+            options.max_height = readConstraintField(L, tidx, "max_height");
+            options.anchor = try readAnchorField(L, tidx, "anchor");
+            options.backdrop = try readBackdropField(L, tidx, "backdrop");
+            options.lifetime = try readLifetimeField(L, tidx, "lifetime");
+            break :blk .{ .kind = kind, .options = options };
+        },
+        else => .{},
+    };
+}
+
+fn parseTargetKindField(L: *c.lua_State, idx: c_int) !extension_ui.UiTarget {
+    _ = c.lua_getfield(L, idx, "kind");
+    defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return .overlay;
-    var len: usize = 0; const ptr = c.lua_tolstring(L, -1, &len) orelse return .overlay; const value = ptr[0..len];
+    return try parseTargetKind(luaString(L, -1) orelse return .overlay);
+}
+
+fn parseTargetKind(value: []const u8) !extension_ui.UiTarget {
     if (std.mem.eql(u8, value, "overlay")) return .overlay;
     if (std.mem.eql(u8, value, "status")) return .status;
     if (std.mem.eql(u8, value, "toast")) return .toast;
@@ -322,17 +360,63 @@ fn readTargetField(L: *c.lua_State, idx: c_int) !extension_ui.UiTarget {
     return error.InvalidUiTarget;
 }
 
+fn readAnchorField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiAnchor {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    const value = luaString(L, -1) orelse return null;
+    if (std.mem.eql(u8, value, "center")) return .center;
+    if (std.mem.eql(u8, value, "top_left")) return .top_left;
+    if (std.mem.eql(u8, value, "top_right")) return .top_right;
+    if (std.mem.eql(u8, value, "bottom_left")) return .bottom_left;
+    if (std.mem.eql(u8, value, "bottom_right")) return .bottom_right;
+    if (std.mem.eql(u8, value, "top_center")) return .top_center;
+    if (std.mem.eql(u8, value, "bottom_center")) return .bottom_center;
+    return error.InvalidUiAnchor;
+}
+
+fn readBackdropField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiBackdrop {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    const value = luaString(L, -1) orelse return null;
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "dim")) return .dim;
+    if (std.mem.eql(u8, value, "fill")) return .fill;
+    return error.InvalidUiBackdrop;
+}
+
+fn readLifetimeField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiLifetime {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    const value = luaString(L, -1) orelse return null;
+    if (std.mem.eql(u8, value, "until_input")) return .until_input;
+    if (std.mem.eql(u8, value, "manual")) return .manual;
+    return error.InvalidUiLifetime;
+}
+
+fn luaString(L: *c.lua_State, idx: c_int) ?[]const u8 {
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, idx, &len) orelse return null;
+    return ptr[0..len];
+}
+
 fn readFrameFormatField(L: *c.lua_State, idx: c_int) !extension_ui.FrameFormat {
-    _ = c.lua_getfield(L, idx, "format"); defer c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, "format");
+    defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return .rgba8888;
-    var len: usize = 0; const ptr = c.lua_tolstring(L, -1, &len) orelse return .rgba8888; const value = ptr[0..len];
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return .rgba8888;
+    const value = ptr[0..len];
     if (std.mem.eql(u8, value, "rgba8888")) return .rgba8888;
     if (std.mem.eql(u8, value, "halfblock_rgb")) return .halfblock_rgb;
     return error.InvalidFrameFormat;
 }
 
 fn readOptionalNodeField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiNode {
-    _ = c.lua_getfield(L, idx, field.ptr); defer c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TTABLE) return null;
     return try readNode(arena, L, c.lua_absindex(L, -1));
 }
@@ -352,7 +436,8 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
         children = try arena.alloc(extension_ui.UiNode, len);
         var i: usize = 0;
         while (i < len) : (i += 1) {
-            _ = c.lua_rawgeti(L, -1, @intCast(i + 1)); defer c.lua_pop(L, 1);
+            _ = c.lua_rawgeti(L, -1, @intCast(i + 1));
+            defer c.lua_pop(L, 1);
             children[i] = if (c.lua_type(L, -1) == c.LUA_TTABLE) try readNode(arena, L, c.lua_absindex(L, -1)) else .{ .text = .{ .text = "" } };
         }
     }
@@ -362,7 +447,8 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
 
 fn readStyleField(L: *c.lua_State, idx: c_int) !extension_ui.Style {
     var style: extension_ui.Style = .{};
-    _ = c.lua_getfield(L, idx, "style"); defer c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, "style");
+    defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TTABLE) return style;
     const sidx = c.lua_absindex(L, -1);
     style.flex_grow = readFloatField(L, sidx, "flex_grow", style.flex_grow);
@@ -371,43 +457,81 @@ fn readStyleField(L: *c.lua_State, idx: c_int) !extension_ui.Style {
     style.padding = .{ .top = readFloatField(L, sidx, "padding", 0), .right = readFloatField(L, sidx, "padding", 0), .bottom = readFloatField(L, sidx, "padding", 0), .left = readFloatField(L, sidx, "padding", 0) };
     style.width = readConstraintField(L, sidx, "width");
     style.height = readConstraintField(L, sidx, "height");
-    if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "flex_direction", 16)) |dir| { defer std.heap.c_allocator.free(dir); if (std.mem.eql(u8, dir, "row")) style.flex_direction = .row; }
-    if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "tone", 16)) |tone| { defer std.heap.c_allocator.free(tone); if (std.mem.eql(u8, tone, "info")) style.tone = .info else if (std.mem.eql(u8, tone, "success")) style.tone = .success else if (std.mem.eql(u8, tone, "warning")) style.tone = .warning else if (std.mem.eql(u8, tone, "danger")) style.tone = .danger else if (std.mem.eql(u8, tone, "accent")) style.tone = .accent; }
+    if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "flex_direction", 16)) |dir| {
+        defer std.heap.c_allocator.free(dir);
+        if (std.mem.eql(u8, dir, "row")) style.flex_direction = .row;
+    }
+    if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "tone", 16)) |tone| {
+        defer std.heap.c_allocator.free(tone);
+        if (std.mem.eql(u8, tone, "info")) style.tone = .info else if (std.mem.eql(u8, tone, "success")) style.tone = .success else if (std.mem.eql(u8, tone, "warning")) style.tone = .warning else if (std.mem.eql(u8, tone, "danger")) style.tone = .danger else if (std.mem.eql(u8, tone, "accent")) style.tone = .accent;
+    }
     return style;
 }
 
 fn readConstraintField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?extension_ui.Constraint {
-    _ = c.lua_getfield(L, idx, field.ptr); defer c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
     return switch (c.lua_type(L, -1)) {
         c.LUA_TNUMBER => .{ .fixed = @floatCast(c.lua_tonumberx(L, -1, null)) },
-        c.LUA_TSTRING => blk: { var len: usize = 0; const ptr = c.lua_tolstring(L, -1, &len) orelse break :blk null; const v = ptr[0..len]; if (std.mem.eql(u8, v, "fill")) break :blk .{ .fill = 1 }; if (std.mem.eql(u8, v, "auto")) break :blk .{ .auto = {} }; break :blk null; },
+        c.LUA_TSTRING => blk: {
+            const v = luaString(L, -1) orelse break :blk null;
+            if (std.mem.eql(u8, v, "fill")) break :blk .{ .fill = 1 };
+            if (std.mem.eql(u8, v, "auto")) break :blk .{ .auto = {} };
+            if (v.len > 1 and v[v.len - 1] == '%') {
+                const n = std.fmt.parseFloat(f32, v[0 .. v.len - 1]) catch break :blk null;
+                break :blk .{ .percent = n };
+            }
+            break :blk null;
+        },
         else => null,
     };
 }
 
 fn readKeysField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) ![]extension_ui.KeyBinding {
-    _ = c.lua_getfield(L, idx, "keys"); defer c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, "keys");
+    defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TTABLE) return &.{};
     const len = c.lua_rawlen(L, -1);
     const keys = try arena.alloc(extension_ui.KeyBinding, len);
     for (0..len) |i| {
-        _ = c.lua_rawgeti(L, -1, @intCast(i + 1)); defer c.lua_pop(L, 1);
+        _ = c.lua_rawgeti(L, -1, @intCast(i + 1));
+        defer c.lua_pop(L, 1);
         keys[i] = .{ .key = try readStringFieldLimit(arena, L, c.lua_absindex(L, -1), "key", "", ui_id_bytes), .action = try readStringFieldLimit(arena, L, c.lua_absindex(L, -1), "action", "", ui_id_bytes) };
     }
     return keys;
 }
 
 fn readOptionalStringFieldLimit(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8, max_bytes: usize) !?[]const u8 {
-    _ = c.lua_getfield(L, idx, field.ptr); defer c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
     return try dupeLuaStringLimit(arena, L, -1, max_bytes);
 }
 
-fn readBoolField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: bool) bool { _ = c.lua_getfield(L, idx, field.ptr); defer c.lua_pop(L, 1); return if (c.lua_type(L, -1) == c.LUA_TBOOLEAN) c.lua_toboolean(L, -1) != 0 else default; }
-fn readIntField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: i64) i64 { _ = c.lua_getfield(L, idx, field.ptr); defer c.lua_pop(L, 1); return if (c.lua_type(L, -1) == c.LUA_TNUMBER) @intCast(c.lua_tointegerx(L, -1, null)) else default; }
-fn readU32Field(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: u32) u32 { const raw = readIntField(L, idx, field, default); return if (raw < 0) default else @intCast(raw); }
-fn readFloatField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: f32) f32 { _ = c.lua_getfield(L, idx, field.ptr); defer c.lua_pop(L, 1); return if (c.lua_type(L, -1) == c.LUA_TNUMBER) @floatCast(c.lua_tonumberx(L, -1, null)) else default; }
-fn readOptionalFloatField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?f32 { _ = c.lua_getfield(L, idx, field.ptr); defer c.lua_pop(L, 1); return if (c.lua_type(L, -1) == c.LUA_TNUMBER) @floatCast(c.lua_tonumberx(L, -1, null)) else null; }
+fn readBoolField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: bool) bool {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    return if (c.lua_type(L, -1) == c.LUA_TBOOLEAN) c.lua_toboolean(L, -1) != 0 else default;
+}
+fn readIntField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: i64) i64 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    return if (c.lua_type(L, -1) == c.LUA_TNUMBER) @intCast(c.lua_tointegerx(L, -1, null)) else default;
+}
+fn readU32Field(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: u32) u32 {
+    const raw = readIntField(L, idx, field, default);
+    return if (raw < 0) default else @intCast(raw);
+}
+fn readFloatField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: f32) f32 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    return if (c.lua_type(L, -1) == c.LUA_TNUMBER) @floatCast(c.lua_tonumberx(L, -1, null)) else default;
+}
+fn readOptionalFloatField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?f32 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    return if (c.lua_type(L, -1) == c.LUA_TNUMBER) @floatCast(c.lua_tonumberx(L, -1, null)) else null;
+}
 
 fn readOptionalArgString(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]const u8 {
     if (c.lua_type(L, idx) != c.LUA_TSTRING) return null;
