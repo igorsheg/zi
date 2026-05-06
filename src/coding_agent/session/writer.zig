@@ -1,6 +1,7 @@
 const std = @import("std");
 const zio_fs = @import("../../zio/fs.zig");
 const agent = @import("../../agent/root.zig");
+const ai = @import("../../ai/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
 const time_util = @import("../../lib/time_util.zig");
@@ -363,6 +364,11 @@ fn freeAppendedEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) vo
     if (entry.parent_id) |parent_id| allocator.free(parent_id);
     switch (entry.entry) {
         .session_info => |info| if (info.name) |name| allocator.free(name),
+        .compaction => |compaction| {
+            allocator.free(compaction.summary);
+            allocator.free(compaction.first_kept_entry_id);
+            if (compaction.details) |details| ai.json_util.freeJsonValue(allocator, details);
+        },
         .label => |label| {
             allocator.free(label.target_id);
             if (label.label) |value| allocator.free(value);
