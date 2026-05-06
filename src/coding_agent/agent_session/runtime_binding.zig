@@ -45,6 +45,8 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .session_labels_get = &runtimeSessionLabelsGet,
         .session_entry_get = &runtimeSessionEntryGet,
         .session_entries_get = &runtimeSessionEntriesGet,
+        .publish_render = &runtime_ui.publishRender,
+        .publish_frame = &runtime_ui.publishFrame,
         .publish_report = &runtime_ui.publishReport,
         .publish_prompt = &runtime_ui.publishPrompt,
         .resolve_prompt = &runtime_ui.resolvePrompt,

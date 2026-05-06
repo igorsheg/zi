@@ -881,7 +881,7 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  name = "todos",
         \\  description = "Show todos",
         \\  handler = function(_, ctx)
-        \\    ctx.ui.report({ id = "todos", title = "Todos", body = list_text(), transient = true })
+        \\    ctx.ui.render({ id = "todos" })
         \\  end,
         \\})
     , "todo-fixture");
@@ -919,6 +919,8 @@ const TestStateStore = struct {
     label_history: std.ArrayListUnmanaged(TestLabelEntry) = .empty,
     cancel_count: usize = 0,
     revoke_count: usize = 0,
+    render_count: usize = 0,
+    frame_count: usize = 0,
 
     fn deinit(self: *TestStateStore) void {
         if (self.report) |*report| report.deinit(self.allocator);
@@ -1125,6 +1127,18 @@ const TestStateStore = struct {
         return .{ .array = arr };
     }
 
+    fn publishRender(session: *anyopaque, spec: extension_ui.RenderSpec) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        _ = spec;
+        self.render_count += 1;
+    }
+
+    fn publishFrame(session: *anyopaque, spec: extension_ui.FrameSpec) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        _ = spec;
+        self.frame_count += 1;
+    }
+
     fn publishReport(session: *anyopaque, report: extension_ui.Report) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         if (self.report) |*old| old.deinit(self.allocator);
@@ -1247,6 +1261,8 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_labels_get = &TestStateStore.labels,
         .session_entry_get = &TestStateStore.entry,
         .session_entries_get = &TestStateStore.entries,
+        .publish_render = &TestStateStore.publishRender,
+        .publish_frame = &TestStateStore.publishFrame,
         .publish_report = &TestStateStore.publishReport,
         .publish_prompt = &TestStateStore.publishPrompt,
         .cancel_prompts = &TestStateStore.cancelPrompts,
@@ -1452,7 +1468,7 @@ test "extension command context publishes host-owned editor buffer actions" {
     try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
 }
 
-test "extension compact UI updates are bounded" {
+test "ctx.ui v3 exposes only render and frame" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1471,261 +1487,40 @@ test "extension compact UI updates are bounded" {
     defer runner.endLoadContext();
     try state.doString(
         \\zi.command({
-        \\  name = "huge_ui",
-        \\  description = "huge_ui",
+        \\  name = "ui-v3-perimeter",
+        \\  description = "ui-v3-perimeter",
         \\  handler = function(_, ctx)
-        \\    ctx.ui.message(string.rep("m", 9000), { id = string.rep("i", 300) })
-        \\    ctx.ui.progress({ id = "p", title = string.rep("t", 2000), detail = string.rep("d", 9000) })
+        \\    assert(ctx.has_ui == true)
+        \\    assert(ctx.ui ~= nil)
+        \\    local seen = {}
+        \\    local count = 0
+        \\    for k, v in pairs(ctx.ui) do
+        \\      seen[k] = true
+        \\      count = count + 1
+        \\      assert(type(v) == "function")
+        \\    end
+        \\    assert(count == 2)
+        \\    assert(seen.render and seen.frame)
+        \\    assert(ctx.ui.message == nil)
+        \\    assert(ctx.ui.status == nil)
+        \\    assert(ctx.ui.progress == nil)
+        \\    assert(ctx.ui.report == nil)
+        \\    assert(ctx.ui.pick == nil)
+        \\    assert(ctx.ui.prompt == nil)
+        \\    assert(ctx.ui.surface_open == nil)
+        \\    assert(ctx.ui.surface_frame == nil)
+        \\    assert(ctx.ui.surface_close == nil)
+        \\    ctx.ui.render({ id = "demo" })
+        \\    ctx.ui.frame({ id = "demo" })
+        \\    ctx.ui.render("not-a-table")
+        \\    ctx.ui.frame(nil)
         \\  end,
         \\})
-    , "register_huge_ui_command");
+    , "register_ui_v3_perimeter_command");
 
-    try runner.dispatchCommand("huge_ui", "");
-
-    try testing.expectEqual(@as(usize, 2), store.ui_publications.items.len);
-    try testing.expectEqual(@as(usize, 256), store.ui_publications.items[0].id.len);
-    try testing.expectEqual(@as(usize, 8 * 1024), store.ui_publications.items[0].text.?.len);
-    try testing.expectEqual(@as(usize, 1024), store.ui_publications.items[1].title.?.len);
-    try testing.expectEqual(@as(usize, 8 * 1024), store.ui_publications.items[1].detail.?.len);
-
-    runner.unbindRuntime();
-}
-
-test "extension command context publishes semantic ui message status and progress" {
-    var store = TestStateStore{ .allocator = testing.allocator };
-    defer store.deinit();
-
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 14);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-    try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
-
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-    try state.doString(
-        \\zi.command({
-        \\  name = "ui_publications",
-        \\  description = "ui_publications",
-        \\  handler = function(_, ctx)
-        \\    ctx.ui.message("Ready for input", { id = "readiness", kind = "warning", lifetime = "until_input" })
-        \\    ctx.ui.status({ id = "demo", text = "ready" })
-        \\    ctx.ui.progress({ id = "index", title = "Indexing", current = 2, total = 4, detail = "src" })
-        \\  end,
-        \\})
-    , "register_ui_publication_command");
-
-    try runner.dispatchCommand("ui_publications", "");
-
-    try testing.expectEqual(@as(usize, 3), store.ui_publications.items.len);
-    try testing.expectEqual(extension_ui.UiPublicationKind.message, store.ui_publications.items[0].kind);
-    try testing.expectEqualStrings("readiness", store.ui_publications.items[0].id);
-    try testing.expectEqualStrings("Ready for input", store.ui_publications.items[0].text.?);
-    try testing.expectEqualStrings("warning", store.ui_publications.items[0].classification.?);
-    try testing.expectEqual(extension_ui.UiPublicationKind.status, store.ui_publications.items[1].kind);
-    try testing.expectEqualStrings("demo", store.ui_publications.items[1].id);
-    try testing.expectEqualStrings("ready", store.ui_publications.items[1].text.?);
-    try testing.expectEqual(extension_ui.UiPublicationKind.progress, store.ui_publications.items[2].kind);
-    try testing.expectEqualStrings("index", store.ui_publications.items[2].id);
-    try testing.expect(store.ui_publications.items[2].text == null);
-    try testing.expectEqual(extension_ui.ProgressStatus.running, store.ui_publications.items[2].progress_status.?);
-    try testing.expectEqualStrings("Indexing", store.ui_publications.items[2].title.?);
-    try testing.expectEqual(@as(i64, 2), store.ui_publications.items[2].current.?);
-    try testing.expectEqual(@as(i64, 4), store.ui_publications.items[2].total.?);
-    try testing.expectEqualStrings("src", store.ui_publications.items[2].detail.?);
-
-    runner.unbindRuntime();
-    try testing.expectEqual(@as(usize, 1), store.revoke_count);
-    try testing.expectEqual(@as(usize, 0), store.ui_publications.items.len);
-}
-
-test "extension command prompts can resolve through host response" {
-    var store = TestStateStore{ .allocator = testing.allocator };
-    defer store.deinit();
-
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 16);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-    try bindResolvingRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
-
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-    try state.doString(
-        \\zi.command({
-        \\  name = "resolved-prompts",
-        \\  description = "resolved-prompts",
-        \\  handler = function(_, ctx)
-        \\    local confirmed = ctx.ui.prompt({ kind = "confirm", title = "Confirm", message = "Continue?" })
-        \\    assert(confirmed.status == "submitted" and confirmed.value == true)
-        \\    local picked = ctx.ui.pick({ title = "Pick", options = { "A", "B" } })
-        \\    assert(picked.status == "submitted" and picked.value == "A")
-        \\    local input = ctx.ui.prompt({ kind = "input", title = "Input", placeholder = "placeholder" })
-        \\    assert(input.status == "submitted" and input.value == "typed")
-        \\    local edited = ctx.ui.prompt({ kind = "editor", title = "Editor", prefill = "prefill" })
-        \\    assert(edited.status == "submitted" and edited.value == "edited")
-        \\    local selected = ctx.ui.prompt({
-        \\      kind = "select",
-        \\      title = "Pick object",
-        \\      placeholder = "language> ",
-        \\      empty_text = "No languages",
-        \\      options = {
-        \\        {
-        \\          label = "Lua",
-        \\          value = "lua",
-        \\          description = "extension language",
-        \\          search = "lua extension scripting",
-        \\          preview = "Lua\nSmall embeddable language.",
-        \\        },
-        \\        { label = "Zig", value = "zig" },
-        \\      },
-        \\    })
-        \\    assert(selected.status == "submitted")
-        \\    assert(selected.value == "lua")
-        \\    assert(selected.item.value == "lua")
-        \\    assert(selected.item.label == "Lua")
-        \\    assert(selected.item.description == "extension language")
-        \\    assert(selected.item.search == "lua extension scripting")
-        \\    assert(selected.item.preview == "Lua\nSmall embeddable language.")
-        \\    local typed = ctx.ui.prompt({ kind = "input", title = "Name", placeholder = "my-app", default = "zi" })
-        \\    assert(typed.status == "submitted")
-        \\    assert(typed.value == "typed")
-        \\    local timed_out = ctx.ui.prompt({ kind = "confirm", title = "Timed", timeout_ms = 1 })
-        \\    assert(timed_out.status == "timeout")
-        \\  end,
-        \\})
-    , "register_resolved_prompt_command");
-
-    try runner.dispatchCommand("resolved-prompts", "");
-}
-
-test "lua question tool publishes host-owned select prompt request" {
-    var store = TestStateStore{ .allocator = testing.allocator };
-    defer store.deinit();
-
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 17);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-    try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
-
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-    try state.doString(
-        \\zi.tool({
-        \\  name = "question_test",
-        \\  description = "question_test",
-        \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args, ctx)
-        \\    local picked = ctx.ui.pick({ title = args.question, options = args.options })
-        \\    local answer = picked.status == "submitted" and picked.value or nil
-        \\    return {
-        \\      content = { { type = "text", text = answer or "cancelled" } },
-        \\      details = { answer = answer },
-        \\    }
-        \\  end,
-        \\})
-    , "register_question_test_tool");
-
-    const ext_tool = runner.tool_registry.get("question_test").?.*;
-    const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const args = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
-        \\{"question":"Pick one","options":["Alpha","Beta"]}
-    , .{});
-
-    const result = tool.execute(
-        tool.ctx,
-        arena.allocator(),
-        "id-question",
-        args,
-        abort_signal_mod.AbortSignal.none,
-        null,
-        null,
-    );
-
-    try testing.expect(!result.is_error);
-    try testing.expectEqual(@as(usize, 1), store.prompts.items.len);
-    try testing.expectEqual(extension_ui.PromptKind.select, store.prompts.items[0].kind);
-    try testing.expectEqualStrings("Pick one", store.prompts.items[0].title);
-    try testing.expectEqualStrings("Alpha", store.prompts.items[0].options[0].id);
-    try testing.expectEqualStrings("Beta", store.prompts.items[0].options[1].label);
-}
-
-test "extension command context publishes host-owned prompt requests with default outcomes" {
-    var store = TestStateStore{ .allocator = testing.allocator };
-    defer store.deinit();
-
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 13);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-    try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
-
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-    try state.doString(
-        \\zi.command({
-        \\  name = "prompts",
-        \\  description = "prompts",
-        \\  handler = function(_, ctx)
-        \\    local confirmed = ctx.ui.prompt({ kind = "confirm", title = "Confirm", message = "Continue?" })
-        \\    assert(confirmed.status == "submitted" and confirmed.value == false)
-        \\    local picked = ctx.ui.pick({ title = "Pick", options = { "A", "B" } })
-        \\    assert(picked.status == "cancelled")
-        \\    local input = ctx.ui.prompt({ kind = "input", title = "Input", placeholder = "placeholder" })
-        \\    assert(input.status == "cancelled")
-        \\    local edited = ctx.ui.prompt({ kind = "editor", title = "Editor", prefill = "prefill" })
-        \\    assert(edited.status == "cancelled")
-        \\    local cancelled = ctx.ui.prompt({ kind = "select", title = "Pick object", options = { { label = "Lua", value = "lua" } }, timeout_ms = 5000 })
-        \\    assert(cancelled.status == "cancelled")
-        \\  end,
-        \\})
-    , "register_prompt_command");
-
-    try runner.dispatchCommand("prompts", "");
-
-    try testing.expectEqual(@as(usize, 5), store.prompts.items.len);
-    try testing.expectEqual(extension_ui.PromptKind.confirm, store.prompts.items[0].kind);
-    try testing.expectEqualStrings("Confirm", store.prompts.items[0].title);
-    try testing.expectEqualStrings("Continue?", store.prompts.items[0].message.?);
-    try testing.expectEqual(extension_ui.PromptKind.select, store.prompts.items[1].kind);
-    try testing.expectEqualStrings("A", store.prompts.items[1].options[0].id);
-    try testing.expectEqualStrings("B", store.prompts.items[1].options[1].label);
-    try testing.expectEqual(extension_ui.PromptKind.input, store.prompts.items[2].kind);
-    try testing.expectEqualStrings("placeholder", store.prompts.items[2].placeholder.?);
-    try testing.expectEqual(extension_ui.PromptKind.editor, store.prompts.items[3].kind);
-    try testing.expectEqualStrings("prefill", store.prompts.items[3].prefill.?);
-    try testing.expectEqual(extension_ui.PromptKind.select, store.prompts.items[4].kind);
-    try testing.expectEqualStrings("lua", store.prompts.items[4].options[0].id);
-    try testing.expectEqualStrings("Lua", store.prompts.items[4].options[0].label);
-    try testing.expectEqual(@as(?u64, 5000), store.prompts.items[4].timeout_ms);
-
-    runner.unbindRuntime();
-    try testing.expectEqual(@as(usize, 1), store.cancel_count);
-    try testing.expectEqual(@as(usize, 0), store.prompts.items.len);
+    try runner.dispatchCommand("ui-v3-perimeter", "");
+    try testing.expectEqual(@as(usize, 1), store.render_count);
+    try testing.expectEqual(@as(usize, 1), store.frame_count);
 }
 
 test "extension command resumes after zi.system result" {
@@ -2074,55 +1869,7 @@ test "extension command rejects arbitrary coroutine yield" {
     try testing.expectError(error.UnexpectedYield, runner.dispatchCommand("bad-yield", ""));
 }
 
-test "extension command context publishes a host-owned report" {
-    var store = TestStateStore{ .allocator = testing.allocator };
-    defer store.deinit();
-
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 11);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-    try bindTestRuntime(&runner, &store, &provider_registry);
-    api.installZiTable(&state, &runner);
-
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-    try state.doString(
-        \\zi.command({
-        \\  name = "report",
-        \\  description = "report",
-        \\  handler = function(_, ctx)
-        \\    assert(ctx.has_ui == true)
-        \\    ctx.ui.report({
-        \\      id = "demo",
-        \\      title = "Demo",
-        \\      body = "✓ published",
-        \\      transient = true,
-        \\      format = "text",
-        \\    })
-        \\  end,
-        \\})
-    , "register_report_command");
-
-    try runner.dispatchCommand("report", "");
-
-    const report = store.report orelse return error.MissingReport;
-    try testing.expectEqualStrings("state-123", report.state_owner_id);
-    try testing.expectEqual(@as(u64, 11), report.generation);
-    try testing.expectEqualStrings("demo", report.id);
-    try testing.expectEqualStrings("Demo", report.title);
-    try testing.expect(report.transient);
-    try testing.expectEqual(extension_ui.ReportFormat.text, report.format);
-    try testing.expectEqual(@as(usize, 1), report.lines.len);
-    try testing.expectEqual(@as(usize, 1), report.lines[0].len);
-    try testing.expectEqualStrings("✓ published", report.lines[0][0].text);
-}
-
-test "todo command publishes hydrated todos as a host-owned report" {
+test "todo command can call ctx.ui.render perimeter" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -2142,19 +1889,12 @@ test "todo command publishes hydrated todos as a host-owned report" {
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const add_args = try todoArgs(arena.allocator(), "add", "ship report", null);
+    const add_args = try todoArgs(arena.allocator(), "add", "ship perimeter", null);
     const add_result = tool.execute(tool.ctx, arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
     try testing.expect(!add_result.is_error);
 
     try runner.dispatchCommand("todos", "");
-
-    const report = store.report orelse return error.MissingReport;
-    try testing.expectEqualStrings("todos", report.id);
-    try testing.expectEqualStrings("Todos", report.title);
-    try testing.expect(report.transient);
-    try testing.expectEqual(@as(usize, 1), report.lines.len);
-    try testing.expectEqual(@as(usize, 1), report.lines[0].len);
-    try testing.expectEqualStrings("[ ] #1: ship report", report.lines[0][0].text);
+    try testing.expectEqual(@as(usize, 1), store.render_count);
 }
 
 test "todo fixture keeps ephemeral Lua locals within one extension generation" {

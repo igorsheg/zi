@@ -26,7 +26,7 @@
 //! Coroutine model: every handler runs in a fresh coroutine
 //! (`Coroutine.init`), even when it can't yield. This is the spec's
 //! §Lua Coroutine C-Call Model invariant — once host functions like
-//! `zi.spawn` and `ctx.ui.prompt` exist (E5+), they must yield, and
+//! `zi.spawn` and future yieldable host functions exist, they must yield, and
 //! `lua_resume` is the only way to call something that might. Using
 //! coroutines uniformly avoids a future migration where we'd have
 //! to rewrite the dispatcher.

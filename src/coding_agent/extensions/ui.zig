@@ -1,6 +1,18 @@
 const std = @import("std");
 const json_value = @import("../../json/value.zig");
 
+pub const RenderSpec = struct {
+    state_owner_id: []const u8,
+    generation: u64,
+    id: []const u8,
+};
+
+pub const FrameSpec = struct {
+    state_owner_id: []const u8,
+    generation: u64,
+    id: []const u8,
+};
+
 pub const TextSpan = struct {
     text: []const u8,
     fg: ?[]const u8 = null,

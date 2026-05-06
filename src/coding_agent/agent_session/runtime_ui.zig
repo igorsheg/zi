@@ -2,6 +2,16 @@ const extension_ui = @import("../extensions/ui.zig");
 const request_mod = @import("../request.zig");
 const AgentSession = @import("../agent_session.zig").AgentSession;
 
+pub fn publishRender(session_ptr: *anyopaque, spec: extension_ui.RenderSpec) !void {
+    _ = session_ptr;
+    _ = spec;
+}
+
+pub fn publishFrame(session_ptr: *anyopaque, spec: extension_ui.FrameSpec) !void {
+    _ = session_ptr;
+    _ = spec;
+}
+
 pub fn publishReport(session_ptr: *anyopaque, report: extension_ui.Report) !void {
     const self = session(session_ptr);
     try self.pending_extension_ui.publishReport(report);
