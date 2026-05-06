@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const Interactive = @import("../interactive.zig").Interactive;
-const session_reader = @import("../../coding_agent/session/reader.zig");
+const Interactive = @import("../../interactive.zig").Interactive;
+const session_reader = @import("../../../coding_agent/session/reader.zig");
 
 pub const log_interval_ns: i128 = 5 * std.time.ns_per_s;
 

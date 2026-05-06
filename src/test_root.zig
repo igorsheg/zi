@@ -30,7 +30,8 @@ test {
     _ = @import("coding_agent/tools/bash.zig");
     _ = @import("coding_agent/tools/read.zig");
     _ = @import("tui/root.zig");
-    _ = @import("tui/interactive/job_manager.zig");
+    _ = @import("tui/interactive/runtime/job_manager.zig");
+    _ = @import("tui/interactive/session_index_worker.zig");
     _ = @import("themes/root.zig");
     _ = @import("tui/editor/root.zig");
     _ = @import("coding_agent/slash_commands.zig");

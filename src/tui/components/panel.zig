@@ -1,7 +1,7 @@
 const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
-const box_chrome = @import("../box_chrome.zig");
+const box_chrome = @import("../surfaces/box_chrome.zig");
 
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;

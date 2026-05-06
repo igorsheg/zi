@@ -1,6 +1,6 @@
-const coding_agent_mod = @import("../../coding_agent/root.zig");
+const coding_agent_mod = @import("../../../coding_agent/root.zig");
 
-const Interactive = @import("../interactive.zig").Interactive;
+const Interactive = @import("../../interactive.zig").Interactive;
 const AgentRequest = coding_agent_mod.AgentRequest;
 
 pub const Options = struct {

@@ -1,8 +1,8 @@
 const std = @import("std");
-const rendered_tool_result_mod = @import("../agent/rendered_tool_result.zig");
-const theme_mod = @import("theme.zig");
-const buffer_mod = @import("primitives/surface.zig");
-const cell_mod = @import("cell.zig");
+const rendered_tool_result_mod = @import("../../agent/rendered_tool_result.zig");
+const theme_mod = @import("../theme.zig");
+const buffer_mod = @import("../primitives/surface.zig");
+const cell_mod = @import("../cell.zig");
 
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;

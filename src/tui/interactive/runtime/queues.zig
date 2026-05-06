@@ -1,8 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
 
-const mailbox_mod = @import("../../zio/root.zig").mailbox;
-const ui_event_mod = @import("../ui_event.zig");
+const mailbox_mod = @import("../../../zio/root.zig").mailbox;
+const ui_event_mod = @import("../../ui_event.zig");
 
 const UiEvent = ui_event_mod.UiEvent;
 
@@ -30,7 +30,7 @@ pub const UiLifecycleQueue = mailbox_mod.Mailbox(UiEvent, .{
 });
 
 test "UiSnapshotQueue drops newest snapshot traffic when bounded" {
-    const themes_builtin = @import("../../themes/builtin.zig");
+    const themes_builtin = @import("../../../themes/builtin.zig");
     var q = try UiSnapshotQueue.init(std.testing.allocator);
     defer q.deinit();
 

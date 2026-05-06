@@ -2,7 +2,7 @@ const std = @import("std");
 const clipboard_mod = @import("../terminal/clipboard.zig");
 const layout_mod = @import("../primitives/layout.zig");
 const keys_mod = @import("../terminal/keys.zig");
-const transcript_mod = @import("../transcript.zig");
+const transcript_mod = @import("../conversation/transcript.zig");
 
 const ChildRect = layout_mod.ChildRect;
 

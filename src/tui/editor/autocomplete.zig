@@ -1,5 +1,5 @@
 const std = @import("std");
-const autocomplete_mod = @import("../autocomplete.zig");
+const autocomplete_mod = @import("../autocomplete/provider.zig");
 const keys_mod = @import("../terminal/keys.zig");
 const theme_mod = @import("../theme.zig");
 const select_list_mod = @import("../components/select_list.zig");

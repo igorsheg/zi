@@ -1,13 +1,13 @@
 const std = @import("std");
-const logging = @import("../../logging.zig");
-const coding_agent_mod = @import("../../coding_agent/root.zig");
-const request_mod = @import("../../coding_agent/request.zig");
-const auth_types = @import("../../coding_agent/auth/types.zig");
-const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
-const extension_runner_mod = @import("../../coding_agent/extensions/runner.zig");
-const agent_requests_mod = @import("agent_requests.zig");
+const logging = @import("../../../logging.zig");
+const coding_agent_mod = @import("../../../coding_agent/root.zig");
+const request_mod = @import("../../../coding_agent/request.zig");
+const auth_types = @import("../../../coding_agent/auth/types.zig");
+const oauth_mod = @import("../../../coding_agent/auth/oauth.zig");
+const extension_runner_mod = @import("../../../coding_agent/extensions/runner.zig");
+const agent_requests_mod = @import("../agent_requests.zig");
 
-const Interactive = @import("../interactive.zig").Interactive;
+const Interactive = @import("../../interactive.zig").Interactive;
 const AgentRequest = coding_agent_mod.AgentRequest;
 const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 
@@ -113,7 +113,7 @@ fn submitExtensionAsyncResultFn(ptr: *anyopaque, id: extension_runner_mod.AsyncO
     }
 }
 
-pub fn extensionAsyncDispatcher(self: *@import("../interactive.zig").Interactive) extension_runner_mod.AsyncDispatcher {
+pub fn extensionAsyncDispatcher(self: *@import("../../interactive.zig").Interactive) extension_runner_mod.AsyncDispatcher {
     return .{
         .ptr = @ptrCast(self),
         .submit = &submitExtensionAsyncFromRunnerFn,

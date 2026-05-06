@@ -2,7 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
-const display_wrap_mod = @import("../display_wrap.zig");
+const display_wrap_mod = @import("../wrap/display.zig");
 const grapheme_mod = @import("../grapheme.zig");
 
 pub const Span = struct {

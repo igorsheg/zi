@@ -48,7 +48,7 @@ const runner_mod = @import("runner.zig");
 const tool_registry_mod = @import("registries/tool_registry.zig");
 const theme_mod = @import("../../tui/theme.zig");
 const theme_tokens = @import("../../themes/tokens.zig");
-const rendered_tool_result_view = @import("../../tui/rendered_tool_result.zig");
+const rendered_tool_result_view = @import("../../tui/conversation/rendered_tool_result.zig");
 const agent_protocol = @import("../../agent/types.zig");
 
 pub const Span = rendered_tool_result_view.Span;

@@ -5,6 +5,7 @@ const navigation = @import("navigation.zig");
 const autocomplete = @import("autocomplete.zig");
 const render = @import("render.zig");
 const types = @import("types.zig");
+pub const interface = @import("interface.zig");
 
 pub const PromptBuffer = buffer.PromptBuffer;
 pub const PromptView = view.PromptView;

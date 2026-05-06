@@ -1,8 +1,8 @@
-const component_mod = @import("primitives/view.zig");
-const cell_mod = @import("cell.zig");
-const autocomplete_mod = @import("autocomplete.zig");
-const status_data_mod = @import("status_data.zig");
-const theme_mod = @import("theme.zig");
+const component_mod = @import("../primitives/view.zig");
+const cell_mod = @import("../cell.zig");
+const autocomplete_mod = @import("../autocomplete/provider.zig");
+const status_data_mod = @import("../status_data.zig");
+const theme_mod = @import("../theme.zig");
 
 const Component = component_mod.Component;
 const Color = cell_mod.Color;
@@ -252,7 +252,7 @@ pub const EditorInterface = struct {
     }
 };
 
-const buffer_mod = @import("primitives/surface.zig");
+const buffer_mod = @import("../primitives/surface.zig");
 const Region = buffer_mod.Region;
 
 pub const MockEditor = struct {

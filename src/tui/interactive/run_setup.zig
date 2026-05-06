@@ -1,8 +1,8 @@
 const std = @import("std");
 const editor_mod = @import("../components/editor.zig");
-const editor_iface_mod = @import("../editor_iface.zig");
-const autocomplete_mod = @import("../autocomplete.zig");
-const runtime_loop = @import("runtime_loop.zig");
+const editor_iface_mod = @import("../editor/interface.zig");
+const autocomplete_mod = @import("../autocomplete/provider.zig");
+const runtime_loop = @import("runtime/loop.zig");
 const composer_flow = @import("composer_flow.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;

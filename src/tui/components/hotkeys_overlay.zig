@@ -4,7 +4,7 @@ const buffer_mod = @import("../primitives/surface.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const cell_mod = @import("../cell.zig");
-const box_chrome = @import("../box_chrome.zig");
+const box_chrome = @import("../surfaces/box_chrome.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const keybindings = @import("../keybindings.zig");
 

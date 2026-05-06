@@ -1,6 +1,6 @@
 const std = @import("std");
-const buffer_mod = @import("primitives/surface.zig");
-const cell_mod = @import("cell.zig");
+const buffer_mod = @import("../primitives/surface.zig");
+const cell_mod = @import("../cell.zig");
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -95,7 +95,7 @@ pub fn measureHeight(visible_lines: u32, gap_count: u32) u32 {
     return 1 + visible_lines + gap_count + 1;
 }
 
-const grapheme_mod = @import("grapheme.zig");
+const grapheme_mod = @import("../grapheme.zig");
 
 /// Draw closed top border: ╭─ {left} ──── {right} ─╮
 /// Labels are optional. Fill with ─ between them.

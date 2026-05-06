@@ -1,5 +1,5 @@
 const std = @import("std");
-const breaks_mod = @import("wrap/breaks.zig");
+const breaks_mod = @import("breaks.zig");
 
 const Segment = breaks_mod.Segment;
 const SegmentOptions = breaks_mod.SegmentOptions;

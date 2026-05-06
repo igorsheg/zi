@@ -1,10 +1,10 @@
 const std = @import("std");
 
-const extension_runner = @import("../../coding_agent/extensions/runner.zig");
-const extension_ui = @import("../../coding_agent/extensions/ui.zig");
-const request_mod = @import("../../coding_agent/request.zig");
-const zio_job = @import("../../zio/root.zig").job;
-const json_root = @import("../../json/root.zig");
+const extension_runner = @import("../../../coding_agent/extensions/runner.zig");
+const extension_ui = @import("../../../coding_agent/extensions/ui.zig");
+const request_mod = @import("../../../coding_agent/request.zig");
+const zio_job = @import("../../../zio/root.zig").job;
+const json_root = @import("../../../json/root.zig");
 const jsonl = json_root.jsonl;
 const json_value = json_root.value;
 

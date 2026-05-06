@@ -2,7 +2,7 @@ const std = @import("std");
 
 const component_mod = @import("primitives/view.zig");
 const buffer_mod = @import("primitives/surface.zig");
-const transcript_mod = @import("transcript.zig");
+const transcript_mod = @import("conversation/transcript.zig");
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;

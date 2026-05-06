@@ -1,7 +1,7 @@
 const std = @import("std");
-const ui_event_mod = @import("../ui_event.zig");
+const ui_event_mod = @import("../../ui_event.zig");
 
-const Interactive = @import("../interactive.zig").Interactive;
+const Interactive = @import("../../interactive.zig").Interactive;
 const UiEvent = ui_event_mod.UiEvent;
 const log = std.log.scoped(.tui_interactive);
 

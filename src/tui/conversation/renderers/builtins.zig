@@ -5,16 +5,16 @@
 
 const std = @import("std");
 const tool_display_mod = @import("../tool_display.zig");
-const boxed_surface = @import("../boxed_surface.zig");
-const excerpt_mod = @import("../excerpt.zig");
-const buffer_mod = @import("../primitives/surface.zig");
-const cell_mod = @import("../cell.zig");
-const theme_mod = @import("../theme.zig");
-const themes_builtin = @import("../../themes/builtin.zig");
-const json_util = @import("../../ai/json_util.zig");
-const diff_view = @import("../../diff/view.zig");
-const tool_result_details = @import("../../coding_agent/tools/result_details.zig");
-const agent_protocol = @import("../../agent/root.zig").protocol;
+const boxed_surface = @import("../../surfaces/boxed.zig");
+const excerpt_mod = @import("../../excerpt.zig");
+const buffer_mod = @import("../../primitives/surface.zig");
+const cell_mod = @import("../../cell.zig");
+const theme_mod = @import("../../theme.zig");
+const themes_builtin = @import("../../../themes/builtin.zig");
+const json_util = @import("../../../ai/json_util.zig");
+const diff_view = @import("../../../diff/view.zig");
+const tool_result_details = @import("../../../coding_agent/tools/result_details.zig");
+const agent_protocol = @import("../../../agent/root.zig").protocol;
 
 const ToolRenderer = tool_display_mod.ToolRenderer;
 const ToolStateContext = tool_display_mod.ToolStateContext;
@@ -91,7 +91,7 @@ fn builtinResultChanged(ctx: *const ToolStateContext) void {
 }
 
 fn makePalette(ctx: *const ToolRenderContext) boxed_surface.Palette {
-    const base: @import("../box_chrome.zig").Style = .{
+    const base: @import("../../surfaces/box_chrome.zig").Style = .{
         .chrome = ctx.theme.fg(.dim),
         .fg = if (ctx.is_error) ctx.theme.fg(.@"error") else ctx.theme.fg(.tool_output),
         .dim = ctx.theme.fg(.dim),
@@ -675,7 +675,7 @@ test "bashCall accepts legacy command arg for old sessions" {
 }
 
 test "edit renderer prefers structured diff details over fallback text" {
-    const diff_mod = @import("../../diff/document.zig");
+    const diff_mod = @import("../../../diff/document.zig");
 
     var doc = try diff_mod.buildDocument(testing.allocator, &[_]diff_mod.Input{.{
         .old_path = "a.txt",

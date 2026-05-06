@@ -1,8 +1,8 @@
 const std = @import("std");
-const theme_mod = @import("theme.zig");
-const buffer_mod = @import("primitives/surface.zig");
+const theme_mod = @import("../theme.zig");
+const buffer_mod = @import("../primitives/surface.zig");
 const Region = buffer_mod.Region;
-const agent_protocol = @import("../agent/root.zig").protocol;
+const agent_protocol = @import("../../agent/root.zig").protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 
 pub const ToolRenderer = struct {
