@@ -52,5 +52,5 @@ Markdown pages live next to the HTML pages. If a link ends in `.html`, the match
 - [CLI](cli.html) — run modes, prompt inputs, sessions, flags
 - [Extensions](extensions.html) — discovery, loading, lifecycle
 - [API](api.html) — tools, commands, providers, events, jobs, JSON
-- [Context](context.html) — `ctx.ui`, `ctx.state`, `ctx.session`, `ctx.models`, `ctx.ai`
+- [Context](context.html) — `ctx.ui`, `ctx.editor`, `ctx.session`, `ctx.models`, `ctx.ai`
 - [Guidance](guidance.html) — rules for useful extensions

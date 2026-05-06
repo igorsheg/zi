@@ -35,7 +35,7 @@ return function(zi)
       })
 
       if result and result.status == "submitted" and result.value then
-        ctx.ui.paste_to_editor(result.value)
+        ctx.editor.insert_text(result.value)
       end
     end,
   })

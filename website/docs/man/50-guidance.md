@@ -30,7 +30,7 @@ Need: show feedback, status, progress, a report, or a prompt
 : Use `ctx.ui`.
 
 Need: remember a per-session choice
-: Use `ctx.state`.
+: Use explicit `ctx.session` artifacts such as notes or labels.
 
 Need: inspect the transcript, attach notes, or label entries
 : Use `ctx.session`.

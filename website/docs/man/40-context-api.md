@@ -21,8 +21,8 @@ Most tools, commands, and events receive `ctx`.
 `ctx.ui`
 : Host-owned UI API, or `nil`.
 
-`ctx.state`
-: Session-persisted state scoped to this extension.
+`ctx.editor`
+: Host-owned editor draft API, or `nil`.
 
 `ctx.session`
 : Session information and semantic session helpers.
@@ -51,10 +51,10 @@ Most tools, commands, and events receive `ctx`.
 `ctx.shutdown()`
 : Request shutdown.
 
-`ctx.get_context_usage()`
+`ctx.context_usage()`
 : Return context usage information.
 
-`ctx.get_system_prompt()`
+`ctx.system_prompt()`
 : Return the active system prompt.
 
 ## UI
@@ -88,34 +88,26 @@ Most tools, commands, and events receive `ctx`.
 `ctx.ui.prompt({ kind = "confirm"|"select"|"input"|"editor", ... })`
 : Ask the user for input. Returns `{ status, value? }`.
 
-`ctx.ui.set_editor_text(text)`
+Surface options may include `placement` and `lifetime`. `lifetime` is `session` or `until_input`.
+
+## Editor
+
+`ctx.editor` is available when zi can update the host-owned editor draft. It exposes exactly these methods:
+
+`ctx.editor.set_text(text)`
 : Replace editor text.
 
-`ctx.ui.paste_to_editor(text)`
-: Paste into the editor.
+`ctx.editor.insert_text(text)`
+: Insert text at the editor cursor.
 
-`ctx.ui.clear_editor_text()`
+`ctx.editor.clear()`
 : Clear editor text.
 
-`ctx.ui.get_editor_text()`
-: Return editor text, or `nil`.
-
-Surface options may include `placement` and `lifetime`. `lifetime` is `session` or `until_input`.
+There is no synchronous editor text getter.
 
 ## State
 
-`ctx.state` is a per-extension session map. Use it for small facts your extension owns.
-
-`ctx.state.get(key)`
-: Return a JSON-compatible value or `nil`.
-
-`ctx.state.set(key, value)`
-: Persist a JSON-compatible value.
-
-`ctx.state.delete(key)`
-: Write a tombstone.
-
-State may survive session changes. Live handles do not. Recreate UI, prompts, jobs, and provider handles when needed.
+Extension-scoped state maps are not part of API v3. Use Lua locals for extension-ephemeral state. Durable extension state should be represented explicitly as session artifacts such as notes or labels.
 
 ## Session
 

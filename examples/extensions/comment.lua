@@ -102,7 +102,7 @@ zi.command({
       return
     end
 
-    ctx.ui.set_editor_text(edited_or_err)
+    ctx.editor.set_text(edited_or_err)
     ctx.ui.message("Loaded edited quoted assistant text into the editor", { kind = "info", lifetime = "until_input" })
   end,
 })

@@ -966,8 +966,8 @@ test "stream closure derives request api key from oauth.getApiKey when the activ
         .abort = &Hooks.abort,
         .has_pending_messages = &Hooks.hasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &Hooks.getContextUsage,
-        .get_system_prompt = &Hooks.getSystemPrompt,
+        .context_usage = &Hooks.getContextUsage,
+        .system_prompt = &Hooks.getSystemPrompt,
         .get_binding_info = &Hooks.getBindingInfo,
     }, &registry);
 

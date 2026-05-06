@@ -12,7 +12,7 @@ return function(zi)
         question = "What should we do next?"
       end
 
-      ctx.ui.set_editor_text("Question: " .. tostring(question) .. "\n\nAnswer: ")
+      ctx.editor.set_text("Question: " .. tostring(question) .. "\n\nAnswer: ")
     end,
   })
 end

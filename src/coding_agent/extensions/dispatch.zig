@@ -377,8 +377,8 @@ fn bindTestRuntime(runner: *runner_mod.ExtensionRunner, provider_registry: *ai.p
         .abort = &testAbort,
         .has_pending_messages = &testHasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
+        .context_usage = &testGetContextUsage,
+        .system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
     }, provider_registry);
 }

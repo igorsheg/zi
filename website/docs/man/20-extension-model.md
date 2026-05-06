@@ -106,8 +106,8 @@ Rules:
 - use tools and commands for visible actions
 - use events for policy and reaction
 - recreate live UI, prompts, jobs, and provider handles after session changes
-- keep durable private state in `ctx.state`
-- keep durable session facts in `ctx.session`
+- keep ephemeral private state in Lua locals
+- keep durable session facts in `ctx.session` artifacts
 
 Common lifecycle events:
 

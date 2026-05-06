@@ -725,8 +725,8 @@ test "lua tool ctx exposes binding from tool provenance" {
         .abort = &testAbort,
         .has_pending_messages = &testHasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
+        .context_usage = &testGetContextUsage,
+        .system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
     }, &provider_registry);
     api.installZiTable(&state, &runner);
@@ -741,6 +741,12 @@ test "lua tool ctx exposes binding from tool provenance" {
         \\  parameters = { type = "object", properties = {} },
         \\  execute = function(args, ctx)
         \\    assert(ctx.binding ~= nil)
+        \\    assert(ctx.editor == nil)
+        \\    assert(ctx["st" .. "ate"] == nil)
+        \\    assert(ctx["get_" .. "context_usage"] == nil)
+        \\    assert(ctx["get_" .. "system_prompt"] == nil)
+        \\    assert(type(ctx.context_usage) == "function")
+        \\    assert(type(ctx.system_prompt) == "function")
         \\    return {
         \\      details = {
         \\        runtime_root_id = ctx.binding.runtime_root_id,
@@ -799,21 +805,6 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  return out
         \\end
         \\
-        \\local function hydrate(ctx)
-        \\  if not ctx or not ctx.state then return end
-        \\  local saved = ctx.state.get("todos")
-        \\  if type(saved) == "table" then
-        \\    todos = saved.todos or {}
-        \\    next_id = saved.nextId or 1
-        \\  end
-        \\end
-        \\
-        \\local function persist(ctx)
-        \\  if ctx and ctx.state then
-        \\    ctx.state.set("todos", { todos = clone_todos(), nextId = next_id })
-        \\  end
-        \\end
-        \\
         \\local function list_text()
         \\  if #todos == 0 then return "No todos" end
         \\  local lines = {}
@@ -848,7 +839,6 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\    required = { "action" },
         \\  },
         \\  execute = function(params, ctx)
-        \\    hydrate(ctx)
         \\    local action = params.action
         \\    if action == "list" then
         \\      return { content = { { type = "text", text = list_text() } }, details = details("list") }
@@ -857,13 +847,11 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\      local todo = { id = next_id, text = params.text, done = false }
         \\      next_id = next_id + 1
         \\      todos[#todos + 1] = todo
-        \\      persist(ctx)
         \\      return { content = { { type = "text", text = string.format("Added todo #%d: %s", todo.id, todo.text) } }, details = details("add") }
         \\    end
         \\    if action == "toggle" then
         \\      local todo = find_todo(params.id)
         \\      todo.done = not todo.done
-        \\      persist(ctx)
         \\      return { content = { { type = "text", text = string.format("Todo #%d %s", todo.id, todo.done and "completed" or "uncompleted") } }, details = details("toggle") }
         \\    end
         \\    return { content = { { type = "text", text = "Unknown action" } }, is_error = true, details = details("list", "unknown action") }
@@ -889,14 +877,10 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  end,
         \\})
         \\
-        \\zi.on("session_start", function(_, ctx) hydrate(ctx) end)
-        \\zi.on("session_tree", function(_, ctx) hydrate(ctx) end)
-        \\
         \\zi.command({
         \\  name = "todos",
         \\  description = "Show todos",
         \\  handler = function(_, ctx)
-        \\    hydrate(ctx)
         \\    ctx.ui.report({ id = "todos", title = "Todos", body = list_text(), transient = true })
         \\  end,
         \\})
@@ -921,7 +905,6 @@ const TestLabelEntry = struct {
 
 const TestStateStore = struct {
     allocator: std.mem.Allocator,
-    value: ?std.json.Value = null,
     report: ?extension_ui.Report = null,
     prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
     ui_publications: std.ArrayListUnmanaged(extension_ui.UiPublication) = .empty,
@@ -938,8 +921,6 @@ const TestStateStore = struct {
     revoke_count: usize = 0,
 
     fn deinit(self: *TestStateStore) void {
-        if (self.value) |value| ai.json_util.freeJsonValue(self.allocator, value);
-        self.value = null;
         if (self.report) |*report| report.deinit(self.allocator);
         self.report = null;
         self.clearPrompts();
@@ -964,24 +945,6 @@ const TestStateStore = struct {
         self.note_source_entry_id = null;
         self.label_target_entry_id = null;
         self.label_value = null;
-    }
-
-    fn get(session: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8) ?std.json.Value {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        const value = self.value orelse return null;
-        return ai.json_util.cloneJsonValue(allocator, value) catch null;
-    }
-
-    fn set(session: *anyopaque, _: []const u8, _: []const u8, value: std.json.Value) !void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        if (self.value) |old| ai.json_util.freeJsonValue(self.allocator, old);
-        self.value = try ai.json_util.cloneJsonValue(self.allocator, value);
-    }
-
-    fn delete(session: *anyopaque, _: []const u8, _: []const u8) !void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        if (self.value) |old| ai.json_util.freeJsonValue(self.allocator, old);
-        self.value = null;
     }
 
     fn sessionInfo(session: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {
@@ -1270,12 +1233,9 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .abort = &testAbort,
         .has_pending_messages = &testHasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &testGetContextUsage,
-        .get_system_prompt = &testGetSystemPrompt,
+        .context_usage = &testGetContextUsage,
+        .system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
-        .session_state_get = &TestStateStore.get,
-        .session_state_set = &TestStateStore.set,
-        .session_state_delete = &TestStateStore.delete,
         .session_info_get = &TestStateStore.sessionInfo,
         .session_name_get = &TestStateStore.sessionName,
         .session_name_set = &TestStateStore.setSessionName,
@@ -1452,23 +1412,41 @@ test "extension command context publishes host-owned editor buffer actions" {
         \\  name = "editor-actions",
         \\  description = "editor-actions",
         \\  handler = function(_, ctx)
-        \\    ctx.ui.set_editor_text("hello")
-        \\    ctx.ui.paste_to_editor(" world")
-        \\    ctx.ui.clear_editor_text()
-        \\    assert(ctx.ui.get_editor_text() == nil)
+        \\    assert(ctx["st" .. "ate"] == nil)
+        \\    assert(ctx["get_" .. "context_usage"] == nil)
+        \\    assert(ctx["get_" .. "system_prompt"] == nil)
+        \\    assert(type(ctx.context_usage) == "function")
+        \\    assert(type(ctx.system_prompt) == "function")
+        \\    assert(ctx.ui["set_" .. "editor_text"] == nil)
+        \\    assert(ctx.ui["paste_" .. "to_editor"] == nil)
+        \\    assert(ctx.ui["clear_" .. "editor_text"] == nil)
+        \\    assert(ctx.ui["get_" .. "editor_text"] == nil)
+        \\    assert(ctx.editor ~= nil)
+        \\    local seen = {}
+        \\    for k, v in pairs(ctx.editor) do
+        \\      assert(type(v) == "function")
+        \\      seen[k] = true
+        \\    end
+        \\    assert(seen.set_text and seen.insert_text and seen.clear)
+        \\    assert(not seen.get_text)
+        \\    local count = 0
+        \\    for _ in pairs(seen) do count = count + 1 end
+        \\    assert(count == 3)
+        \\    ctx.editor.set_text("hello")
+        \\    ctx.editor.insert_text(" world")
+        \\    ctx.editor.clear()
         \\  end,
         \\})
     , "register_editor_action_command");
 
     try runner.dispatchCommand("editor-actions", "");
 
-    try testing.expectEqual(@as(usize, 4), store.editor_actions.items.len);
+    try testing.expectEqual(@as(usize, 3), store.editor_actions.items.len);
     try testing.expectEqual(extension_ui.EditorActionKind.set_text, store.editor_actions.items[0].kind);
     try testing.expectEqualStrings("hello", store.editor_actions.items[0].text.?);
     try testing.expectEqual(extension_ui.EditorActionKind.paste_text, store.editor_actions.items[1].kind);
     try testing.expectEqualStrings(" world", store.editor_actions.items[1].text.?);
     try testing.expectEqual(extension_ui.EditorActionKind.clear_text, store.editor_actions.items[2].kind);
-    try testing.expectEqual(extension_ui.EditorActionKind.get_text, store.editor_actions.items[3].kind);
 
     runner.unbindRuntime();
     try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
@@ -2179,7 +2157,7 @@ test "todo command publishes hydrated todos as a host-owned report" {
     try testing.expectEqualStrings("[ ] #1: ship report", report.lines[0][0].text);
 }
 
-test "todo fixture rehydrates from session state across extension generations" {
+test "todo fixture keeps ephemeral Lua locals within one extension generation" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -2205,7 +2183,6 @@ test "todo fixture rehydrates from session state across extension generations" {
         try testing.expect(!add_result.is_error);
     }
 
-    try testing.expect(store.value != null);
 
     {
         var state = try lua_runtime.LuaState.init(testing.allocator);
@@ -2227,7 +2204,7 @@ test "todo fixture rehydrates from session state across extension generations" {
         const list_args = try todoArgs(arena.allocator(), "list", null, null);
         const list_result = tool.execute(tool.ctx, arena.allocator(), "todo-2", list_args, abort_signal_mod.AbortSignal.none, null, null);
         try testing.expect(!list_result.is_error);
-        try testing.expectEqualStrings("[ ] #1: persist me", list_result.content[0].text.text);
+        try testing.expectEqualStrings("No todos", list_result.content[0].text.text);
     }
 }
 

@@ -3,7 +3,6 @@ const ai = @import("../../ai/root.zig");
 const protocol = @import("../../agent/types.zig");
 const extension_runner_mod = @import("../extensions/runner.zig");
 const runtime_models = @import("runtime_models.zig");
-const runtime_state = @import("runtime_state.zig");
 const runtime_session = @import("runtime_session.zig");
 const runtime_ui = @import("runtime_ui.zig");
 const projection_runtime = @import("projection_runtime.zig");
@@ -32,12 +31,9 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .abort = &runtimeAbort,
         .has_pending_messages = &runtimeHasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &runtimeGetContextUsage,
-        .get_system_prompt = &runtimeGetSystemPrompt,
+        .context_usage = &runtimeGetContextUsage,
+        .system_prompt = &runtimeGetSystemPrompt,
         .get_binding_info = &runtimeGetBindingInfo,
-        .session_state_get = &runtimeSessionStateGet,
-        .session_state_set = &runtimeSessionStateSet,
-        .session_state_delete = &runtimeSessionStateDelete,
         .session_info_get = &runtimeSessionInfoGet,
         .session_name_get = &runtimeSessionNameGet,
         .session_name_set = &runtimeSessionNameSet,
@@ -129,18 +125,6 @@ fn runtimeGetBindingInfo(session_ptr: *anyopaque) extension_runner_mod.Extension
         .session_id = self.session_store.sessionId(),
         .session_file = if (session_file.len == 0) null else session_file,
     };
-}
-
-fn runtimeSessionStateGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, state_owner_id: []const u8, key: []const u8) ?std.json.Value {
-    return runtime_state.get(session(session_ptr), allocator, state_owner_id, key);
-}
-
-fn runtimeSessionStateSet(session_ptr: *anyopaque, state_owner_id: []const u8, key: []const u8, value: std.json.Value) !void {
-    try runtime_state.set(session(session_ptr), state_owner_id, key, value);
-}
-
-fn runtimeSessionStateDelete(session_ptr: *anyopaque, state_owner_id: []const u8, key: []const u8) !void {
-    try runtime_state.delete(session(session_ptr), state_owner_id, key);
 }
 
 fn runtimeSessionInfoGet(session_ptr: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value {

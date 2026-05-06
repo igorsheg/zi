@@ -293,8 +293,8 @@ test "zi.provider queues models metadata before bind and keeps live routing beha
         .abort = &testBindAbort,
         .has_pending_messages = &testBindHasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &testBindGetContextUsage,
-        .get_system_prompt = &testBindGetSystemPrompt,
+        .context_usage = &testBindGetContextUsage,
+        .system_prompt = &testBindGetSystemPrompt,
         .get_binding_info = &testBindGetBindingInfo,
     }, &provider_registry);
 
@@ -573,8 +573,8 @@ test "zi.provider infers built-in override api and restores the baseline" {
         .abort = &testBindAbort,
         .has_pending_messages = &testBindHasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &testBindGetContextUsage,
-        .get_system_prompt = &testBindGetSystemPrompt,
+        .context_usage = &testBindGetContextUsage,
+        .system_prompt = &testBindGetSystemPrompt,
         .get_binding_info = &testBindGetBindingInfo,
     }, &provider_registry);
 
@@ -742,8 +742,8 @@ test "zi.tool after bind refreshes visible tool projection for accepted claims o
         .abort = &testBindAbort,
         .has_pending_messages = &testBindHasPendingMessages,
         .shutdown = null,
-        .get_context_usage = &testBindGetContextUsage,
-        .get_system_prompt = &testBindGetSystemPrompt,
+        .context_usage = &testBindGetContextUsage,
+        .system_prompt = &testBindGetSystemPrompt,
         .get_binding_info = &testBindGetBindingInfo,
         .tool_projection_changed = &testToolProjectionChanged,
     }, &provider_registry);

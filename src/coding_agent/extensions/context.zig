@@ -45,11 +45,11 @@ pub fn pushExtensionContext(
     pushUiApi(L, runner, provenance);
     c.lua_setfield(L, -2, "ui");
 
+    pushEditorApi(L, runner, provenance);
+    c.lua_setfield(L, -2, "editor");
+
     c.lua_pushnil(L);
     c.lua_setfield(L, -2, "signal");
-
-    pushStateApi(L, runner, provenance);
-    c.lua_setfield(L, -2, "state");
 
     pushSessionApi(L, runner);
     c.lua_setfield(L, -2, "session");
@@ -89,11 +89,11 @@ pub fn pushExtensionContext(
             }
             c.lua_setfield(L, -2, "shutdown");
 
-            pushMethod(L, runner, &ctxGetContextUsage);
-            c.lua_setfield(L, -2, "get_context_usage");
+            pushMethod(L, runner, &ctxContextUsage);
+            c.lua_setfield(L, -2, "context_usage");
 
-            pushMethod(L, runner, &ctxGetSystemPrompt);
-            c.lua_setfield(L, -2, "get_system_prompt");
+            pushMethod(L, runner, &ctxSystemPrompt);
+            c.lua_setfield(L, -2, "system_prompt");
         },
         .stub => {
             c.lua_pushnil(L);
@@ -107,9 +107,9 @@ pub fn pushExtensionContext(
             c.lua_pushnil(L);
             c.lua_setfield(L, -2, "shutdown");
             c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "get_context_usage");
+            c.lua_setfield(L, -2, "context_usage");
             c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "get_system_prompt");
+            c.lua_setfield(L, -2, "system_prompt");
         },
     }
 }
@@ -151,7 +151,7 @@ fn pushUiApi(
     };
 
     const has_methods = switch (runner.runtime) {
-        .bound => |bound| bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_surface_update != null or bound.publish_editor_action != null,
+        .bound => |bound| bound.publish_report != null or bound.publish_prompt != null or bound.publish_ui != null or bound.publish_surface_update != null,
         .stub => false,
     };
     if (!has_methods) {
@@ -169,16 +169,6 @@ fn pushUiApi(
         c.lua_setfield(L, -2, "prompt");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiPick);
         c.lua_setfield(L, -2, "pick");
-    }
-    if (runner.runtime.bound.publish_editor_action != null) {
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiSetEditorText);
-        c.lua_setfield(L, -2, "set_editor_text");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiPasteToEditor);
-        c.lua_setfield(L, -2, "paste_to_editor");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiClearEditorText);
-        c.lua_setfield(L, -2, "clear_editor_text");
-        pushUiMethod(L, runner, prov.state_owner_id, &ctxUiGetEditorText);
-        c.lua_setfield(L, -2, "get_editor_text");
     }
     if (runner.runtime.bound.publish_ui != null) {
         pushUiMethod(L, runner, prov.state_owner_id, &ctxUiMessage);
@@ -198,6 +188,34 @@ fn pushUiApi(
     }
 }
 
+fn pushEditorApi(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+    provenance: ?resource_types.ExtensionProvenance,
+) void {
+    const prov = provenance orelse {
+        c.lua_pushnil(L);
+        return;
+    };
+
+    const has_editor = switch (runner.runtime) {
+        .bound => |bound| bound.publish_editor_action != null,
+        .stub => false,
+    };
+    if (!has_editor) {
+        c.lua_pushnil(L);
+        return;
+    }
+
+    c.lua_createtable(L, 0, 3);
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxEditorSetText);
+    c.lua_setfield(L, -2, "set_text");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxEditorInsertText);
+    c.lua_setfield(L, -2, "insert_text");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxEditorClear);
+    c.lua_setfield(L, -2, "clear");
+}
+
 fn pushUiMethod(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,
@@ -209,29 +227,33 @@ fn pushUiMethod(
     c.lua_pushcclosure(L, func, 2);
 }
 
-fn ctxUiSetEditorText(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn stateRunnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
+    const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
+    return @ptrCast(@alignCast(ud.?));
+}
+
+fn stateOwnerFromUpvalue(L: *c.lua_State) []const u8 {
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, c.lua_upvalueindex(2), &len) orelse return &.{};
+    return ptr[0..len];
+}
+
+fn ctxEditorSetText(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     publishEditorActionFromArgs(L, .set_text) catch {};
     return 0;
 }
 
-fn ctxUiPasteToEditor(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxEditorInsertText(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     publishEditorActionFromArgs(L, .paste_text) catch {};
     return 0;
 }
 
-fn ctxUiClearEditorText(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxEditorClear(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     publishEditorActionFromArgs(L, .clear_text) catch {};
     return 0;
-}
-
-fn ctxUiGetEditorText(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    publishEditorActionFromArgs(L, .get_text) catch {};
-    c.lua_pushnil(L);
-    return 1;
 }
 
 fn publishEditorActionFromArgs(L: *c.lua_State, kind: extension_ui.EditorActionKind) !void {
@@ -970,117 +992,6 @@ fn dupeLuaStringWithMarker(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int
     return out;
 }
 
-fn pushStateApi(
-    L: *c.lua_State,
-    runner: *runner_mod.ExtensionRunner,
-    provenance: ?resource_types.ExtensionProvenance,
-) void {
-    const prov = provenance orelse {
-        c.lua_pushnil(L);
-        return;
-    };
-
-    c.lua_createtable(L, 0, 3);
-    pushStateMethod(L, runner, prov.state_owner_id, &ctxStateGet);
-    c.lua_setfield(L, -2, "get");
-    pushStateMethod(L, runner, prov.state_owner_id, &ctxStateSet);
-    c.lua_setfield(L, -2, "set");
-    pushStateMethod(L, runner, prov.state_owner_id, &ctxStateDelete);
-    c.lua_setfield(L, -2, "delete");
-}
-
-fn pushStateMethod(
-    L: *c.lua_State,
-    runner: *runner_mod.ExtensionRunner,
-    state_owner_id: []const u8,
-    func: *const fn (?*c.lua_State) callconv(.c) c_int,
-) void {
-    c.lua_pushlightuserdata(L, runner);
-    _ = c.lua_pushlstring(L, state_owner_id.ptr, state_owner_id.len);
-    c.lua_pushcclosure(L, func, 2);
-}
-
-fn stateRunnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
-    return @ptrCast(@alignCast(ud.?));
-}
-
-fn stateOwnerFromUpvalue(L: *c.lua_State) []const u8 {
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(L, c.lua_upvalueindex(2), &len) orelse return &.{};
-    return ptr[0..len];
-}
-
-fn readKeyArg(L: *c.lua_State) ?[]const u8 {
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) return null;
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(L, 1, &len) orelse return null;
-    return ptr[0..len];
-}
-
-fn ctxStateGet(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    const runner = stateRunnerFromUpvalue(L);
-    const key = readKeyArg(L) orelse {
-        c.lua_pushnil(L);
-        return 1;
-    };
-
-    switch (runner.runtime) {
-        .bound => |bound| {
-            const getter = bound.session_state_get orelse {
-                c.lua_pushnil(L);
-                return 1;
-            };
-            const value = getter(bound.session, runner.allocator, stateOwnerFromUpvalue(L), key) orelse {
-                c.lua_pushnil(L);
-                return 1;
-            };
-            defer json_util.freeJsonValue(runner.allocator, value);
-            lua_runtime.pushJsonValue(L, value) catch c.lua_pushnil(L);
-            return 1;
-        },
-        .stub => {
-            c.lua_pushnil(L);
-            return 1;
-        },
-    }
-}
-
-fn ctxStateSet(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    const runner = stateRunnerFromUpvalue(L);
-    const key = readKeyArg(L) orelse return 0;
-    if (c.lua_type(L, 2) == c.LUA_TNIL) return 0;
-
-    switch (runner.runtime) {
-        .bound => |bound| {
-            const setter = bound.session_state_set orelse return 0;
-            var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
-            const value = lua_runtime.luaValueToJsonLimited(L, 2, runner.allocator, &budget) catch return 0;
-            defer json_util.freeJsonValue(runner.allocator, value);
-            setter(bound.session, stateOwnerFromUpvalue(L), key, value) catch return 0;
-        },
-        .stub => {},
-    }
-    return 0;
-}
-
-fn ctxStateDelete(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    const runner = stateRunnerFromUpvalue(L);
-    const key = readKeyArg(L) orelse return 0;
-
-    switch (runner.runtime) {
-        .bound => |bound| {
-            const deleter = bound.session_state_delete orelse return 0;
-            deleter(bound.session, stateOwnerFromUpvalue(L), key) catch return 0;
-        },
-        .stub => {},
-    }
-    return 0;
-}
-
 fn pushAiApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_createtable(L, 0, 1);
     pushMethod(L, runner, &ctxAiComplete);
@@ -1221,6 +1132,13 @@ fn ctxSessionInfo(L_opt: ?*c.lua_State) callconv(.c) c_int {
             return 1;
         },
     }
+}
+
+fn readKeyArg(L: *c.lua_State) ?[]const u8 {
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) return null;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, 1, &len) orelse return null;
+    return ptr[0..len];
 }
 
 fn ctxSessionName(L_opt: ?*c.lua_State) callconv(.c) c_int {
@@ -1898,12 +1816,12 @@ fn ctxShutdown(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
-fn ctxGetContextUsage(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxContextUsage(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
     switch (runner.runtime) {
         .bound => |bound| {
-            if (bound.get_context_usage(bound.session)) |usage| {
+            if (bound.context_usage(bound.session)) |usage| {
                 pushContextUsage(L, usage);
             } else {
                 c.lua_pushnil(L);
@@ -1914,12 +1832,12 @@ fn ctxGetContextUsage(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-fn ctxGetSystemPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxSystemPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
     switch (runner.runtime) {
         .bound => |bound| {
-            const prompt = bound.get_system_prompt(bound.session);
+            const prompt = bound.system_prompt(bound.session);
             _ = c.lua_pushlstring(L, prompt.ptr, prompt.len);
         },
         .stub => _ = c.lua_pushlstring(L, "".ptr, 0),
