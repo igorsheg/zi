@@ -996,12 +996,13 @@ test "zi.on accepts every reserved v2 event" {
         "session_before_tree",
         "session_tree",
         "model_select",
+        "ui",
     };
 
     inline for (events) |event_name| {
         try testing.expect(parseEventKind(event_name) != null);
     }
-    try testing.expectEqual(@as(usize, 29), events.len);
+    try testing.expectEqual(@as(usize, 30), events.len);
 
     try state.doString(
         \\local events = {
@@ -1011,15 +1012,32 @@ test "zi.on accepts every reserved v2 event" {
         \\  "tool_execution_start", "tool_execution_update", "tool_execution_end", "tool_call", "tool_result", "user_bash",
         \\  "session_start", "session_shutdown", "session_before_switch", "session_before_fork",
         \\  "session_before_compact", "session_compact", "session_before_tree", "session_tree",
-        \\  "model_select",
+        \\  "model_select", "ui",
         \\}
         \\for _, name in ipairs(events) do
         \\  zi.on(name, function() end)
         \\end
     , "test_all_reserved_events");
 
-    try testing.expectEqual(@as(usize, 29), runner.event_registry.count());
+    try testing.expectEqual(@as(usize, 30), runner.event_registry.count());
 }
+
+test "zi.on accepts ui and rejects legacy surface_input" {
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
+
+    try testing.expect(parseEventKind("ui") != null);
+    try testing.expect(parseEventKind("surface_input") == null);
+    try host.state.doString(
+        \\zi.on("ui", function() end)
+    , "register_ui_event");
+    try testing.expectEqual(@as(usize, 1), host.runner.event_registry.count());
+    try testing.expectError(error.LuaRuntime, host.state.doString(
+        \\zi.on("surface_input", function() end)
+    , "reject_surface_input"));
+}
+
 
 test "zi.command registers commands and disambiguates duplicate visible names" {
     var host = try ApiTestHost.init(testing.allocator, 0);

@@ -173,6 +173,11 @@ pub const RuntimeHost = struct {
         try runner.dispatchJobEvent(event);
     }
 
+    pub fn dispatchExtensionUiEvent(self: *RuntimeHost, event: extension_ui.UiEvent) !void {
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        try runner.dispatchUiEvent(event);
+    }
+
     pub fn dispatchToolExpandedChanged(self: *RuntimeHost, tool_name: []const u8, tool_call_id: []const u8, expanded: bool) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchToolExpandedChanged(tool_name, tool_call_id, expanded);

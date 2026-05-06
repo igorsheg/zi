@@ -1654,6 +1654,38 @@ test "extension job events dispatch to lua observers" {
     try testing.expectEqualStrings("7:hello:exit=0", ptr[0..len]);
 }
 
+test "extension ui events dispatch to lua observers" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 42);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api.installZiTable(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\ui_seen = ""
+        \\zi.on("ui", function(event) ui_seen = event.type .. ":" .. event.view .. ":" .. event.key .. ":" .. event.action .. ":" .. tostring(event.ctrl) end)
+    , "register_ui_event_handler");
+
+    try runner.dispatchUiEvent(.{ .state_owner_id = "owner", .generation = 7, .view = "demo", .type = .key, .action = "close", .key = "escape", .ctrl = true });
+
+    _ = c.lua_getglobal(state.L, "ui_seen");
+    defer c.lua_pop(state.L, 1);
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(state.L, -1, &len) orelse return error.MissingUiSeen;
+    try testing.expectEqualStrings("key:demo:escape:close:true", ptr[0..len]);
+}
+
+
 test "extension command resumes after ai completion result" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();

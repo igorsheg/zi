@@ -280,6 +280,44 @@ pub const EditorAction = struct {
     }
 };
 
+pub const UiEventType = enum { key };
+
+pub const UiEvent = struct {
+    state_owner_id: []const u8,
+    generation: u64,
+    view: []const u8,
+    node: ?[]const u8 = null,
+    type: UiEventType = .key,
+    action: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    ctrl: bool = false,
+    alt: bool = false,
+    shift: bool = false,
+
+    pub fn clone(allocator: std.mem.Allocator, event: UiEvent) !UiEvent {
+        const state_owner_id = try allocator.dupe(u8, event.state_owner_id);
+        errdefer allocator.free(state_owner_id);
+        const view = try allocator.dupe(u8, event.view);
+        errdefer allocator.free(view);
+        const node = if (event.node) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (node) |v| allocator.free(v);
+        const action = if (event.action) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (action) |v| allocator.free(v);
+        const key = if (event.key) |v| try allocator.dupe(u8, v) else null;
+        errdefer if (key) |v| allocator.free(v);
+        return .{ .state_owner_id = state_owner_id, .generation = event.generation, .view = view, .node = node, .type = event.type, .action = action, .key = key, .ctrl = event.ctrl, .alt = event.alt, .shift = event.shift };
+    }
+
+    pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.state_owner_id);
+        allocator.free(self.view);
+        if (self.node) |v| allocator.free(v);
+        if (self.action) |v| allocator.free(v);
+        if (self.key) |v| allocator.free(v);
+        self.* = undefined;
+    }
+};
+
 pub const JobEventKind = enum { stdout, stderr, exit, json };
 
 pub const JobEvent = struct {
@@ -323,6 +361,29 @@ test "ui v3 render spec clone owns node tree" {
     try testing.expectEqual(UiAnchor.top_right, cloned.target_options.anchor.?);
     try testing.expect(cloned.root != null);
     try testing.expectEqual(@as(usize, 1), cloned.keys.len);
+}
+
+test "ui v3 render spec clone owns keys" {
+    const testing = std.testing;
+    const spec = RenderSpec{ .state_owner_id = "owner", .generation = 1, .id = "view", .keys = @constCast(&[_]KeyBinding{ .{ .key = "escape", .action = "close" }, .{ .key = "q", .action = "close" } }) };
+    var cloned = try RenderSpec.clone(testing.allocator, spec);
+    defer cloned.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), cloned.keys.len);
+    try testing.expectEqualStrings("escape", cloned.keys[0].key);
+    try testing.expectEqualStrings("close", cloned.keys[0].action);
+    try testing.expectEqualStrings("q", cloned.keys[1].key);
+}
+
+test "ui v3 event clone owns payload" {
+    const testing = std.testing;
+    var cloned = try UiEvent.clone(testing.allocator, .{ .state_owner_id = "owner", .generation = 2, .view = "demo", .node = "root", .action = "close", .key = "escape", .ctrl = true });
+    defer cloned.deinit(testing.allocator);
+    try testing.expectEqualStrings("owner", cloned.state_owner_id);
+    try testing.expectEqualStrings("demo", cloned.view);
+    try testing.expectEqualStrings("root", cloned.node.?);
+    try testing.expectEqualStrings("close", cloned.action.?);
+    try testing.expectEqualStrings("escape", cloned.key.?);
+    try testing.expect(cloned.ctrl);
 }
 
 test "ui v3 frame byte validation" {

@@ -81,6 +81,7 @@ pub fn parseEventKind(name: []const u8) ?event_registry.EventKind {
         .{ .name = "job_stderr", .kind = .job_stderr },
         .{ .name = "job_exit", .kind = .job_exit },
         .{ .name = "model_select", .kind = .model_select },
+        .{ .name = "ui", .kind = .ui },
     };
     for (table) |p| {
         if (std.mem.eql(u8, p.name, name)) return p.kind;

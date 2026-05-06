@@ -11,6 +11,18 @@ pub fn handle(self: anytype, key: Key) void {
             self.tui.dirty = true;
             return;
         }
+        if (self.extension_ui_state.matchOverlayKey(key)) |event| {
+            const owned = @import("../../coding_agent/extensions/ui.zig").UiEvent.clone(self.msg_allocator, event) catch return;
+            switch (self.request_queue.trySend(.{ .extension_ui_event = owned })) {
+                .ok, .dropped => {},
+                .full, .closed, .oom => |rejected| {
+                    var failed = rejected;
+                    failed.deinit(self.msg_allocator);
+                },
+            }
+            self.tui.dirty = true;
+            return;
+        }
         if (keybindings.matches(.select_cancel, key)) {
             self.tui.hideOverlay();
             return;

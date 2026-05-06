@@ -66,6 +66,7 @@ pub const EventKind = enum {
     job_json,
 
     model_select,
+    ui,
 
     /// Dispatch semantics for this kind. Used by D4's dispatcher to
     /// pick a chain implementation. Hard-coded here so the registry
@@ -193,7 +194,7 @@ test "EventRegistry subscribes in order and dispatches correct chain" {
 }
 
 test "EventKind reserves the v3 event surface" {
-    try testing.expectEqual(@as(usize, 33), @typeInfo(EventKind).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 34), @typeInfo(EventKind).@"enum".fields.len);
 }
 
 test "EventKind.semantics matches spec" {

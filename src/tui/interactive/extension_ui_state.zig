@@ -6,6 +6,7 @@ const cell_mod = @import("../cell.zig");
 const framebuffer_surface_mod = @import("../components/framebuffer_surface.zig");
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const overlay_mod = @import("../overlay.zig");
+const keys_mod = @import("../terminal/keys.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -71,6 +72,22 @@ pub const ExtensionUiState = struct {
 
     pub fn hasOverlayViews(self: *ExtensionUiState) bool {
         return self.hasTargetViews(.overlay);
+    }
+
+    pub fn matchOverlayKey(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
+        const ordered = self.orderedTargetViews(.overlay) catch return null;
+        defer self.allocator.free(ordered);
+        var i = ordered.len;
+        while (i > 0) {
+            i -= 1;
+            const spec = ordered[i].spec;
+            for (spec.keys) |binding| {
+                const parsed = keys_mod.parseKeySpec(binding.key) catch continue;
+                if (!parsed.eql(key)) continue;
+                return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .type = .key, .action = binding.action, .key = binding.key, .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
+            }
+        }
+        return null;
     }
 
     fn hasTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {

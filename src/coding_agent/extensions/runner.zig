@@ -1049,6 +1049,15 @@ pub const ExtensionRunner = struct {
         try dispatch_mod.dispatchObserver(state, self, kind, -1);
     }
 
+    pub fn dispatchUiEvent(self: *ExtensionRunner, event: extension_ui.UiEvent) !void {
+        self.assertOnLuaThread();
+        if (self.event_registry.handlers(.ui).len == 0) return;
+        const state = self.lua_state orelse return error.MissingLuaState;
+        pushUiEventPayload(state.L, event);
+        defer lua_runtime.c.lua_pop(state.L, 1);
+        try dispatch_mod.dispatchObserver(state, self, .ui, -1);
+    }
+
     pub fn reserveJobId(self: *ExtensionRunner) u64 {
         const id = self.next_job_id;
         self.next_job_id += 1;
@@ -1583,6 +1592,25 @@ fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) !
 
     const dir = std.fs.path.dirname(path) orelse path;
     return try std.fs.path.join(allocator, &.{ dir, "lua" });
+}
+
+fn pushUiEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.UiEvent) void {
+    const c = lua_runtime.c;
+    c.lua_createtable(L, 0, 10);
+    pushStringField(L, "type", @tagName(event.type));
+    pushStringField(L, "view", event.view);
+    pushStringField(L, "state_owner_id", event.state_owner_id);
+    c.lua_pushinteger(L, @intCast(event.generation));
+    c.lua_setfield(L, -2, "generation");
+    if (event.node) |node| pushStringField(L, "node", node);
+    if (event.action) |action| pushStringField(L, "action", action);
+    if (event.key) |key| pushStringField(L, "key", key);
+    c.lua_pushboolean(L, if (event.ctrl) 1 else 0);
+    c.lua_setfield(L, -2, "ctrl");
+    c.lua_pushboolean(L, if (event.alt) 1 else 0);
+    c.lua_setfield(L, -2, "alt");
+    c.lua_pushboolean(L, if (event.shift) 1 else 0);
+    c.lua_setfield(L, -2, "shift");
 }
 
 fn pushJobEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.JobEvent) void {
