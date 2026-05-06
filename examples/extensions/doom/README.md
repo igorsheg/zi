@@ -54,5 +54,5 @@ On first run the helper downloads the shareware `doom1.wad` into this directory.
 
 - Lua extensions can orchestrate native/host jobs without owning rendering internals.
 - zi can decode a continuous binary stdout stream and publish interactive surfaces.
-- High-frequency UI can be composed out of small APIs: `surface_open`, `surface_frame`, `surface_input`, and `zi.job`.
-- Helpers can precompute terminal-ready `halfblock_rgb` frames so zi applies cells directly instead of resampling RGBA every render.
+- High-frequency UI can be composed with `zi.job` stdout `ui_frame` streams.
+- Helpers can stream `zi-rgba-frame-v1` records for zi to publish into UI frame nodes.

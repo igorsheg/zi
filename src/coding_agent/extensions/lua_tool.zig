@@ -1874,8 +1874,7 @@ test "extension job API starts writes and stops through dispatcher" {
             if (request.cwd) |cwd| self.cwd = try testing.allocator.dupe(u8, cwd);
             switch (request.stdout) {
                 .events => {},
-                .surface_frame => |frame| self.stdout_surface = try testing.allocator.dupe(u8, frame.surface_id),
-                .surface_cells => |frame| self.stdout_surface = try testing.allocator.dupe(u8, frame.surface_id),
+                .ui_frame => |frame| self.stdout_surface = try testing.allocator.dupe(u8, frame.node),
                 .json_lines => {},
             }
         }
@@ -1910,7 +1909,7 @@ test "extension job API starts writes and stops through dispatcher" {
         \\zi.command({
         \\  name = "job-api",
         \\  handler = function(_, ctx)
-        \\    local job = zi.job.start({ argv = { "/bin/cat" }, cwd = ctx.cwd, stdout = { mode = "surface_frame", surface = "doom-demo" } })
+        \\    local job = zi.job.start({ argv = { "/bin/cat" }, cwd = ctx.cwd, stdout = { mode = "ui_frame", view = "doom-workbench", node = "doom-demo", protocol = "zi-rgba-frame-v1" } })
         \\    zi.job.write(job, "KEY left\n")
         \\    zi.job.stop(job.id)
         \\  end,

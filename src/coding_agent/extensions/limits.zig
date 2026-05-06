@@ -19,7 +19,7 @@ pub const report_body_bytes: usize = 256 * 1024;
 pub const report_lines: usize = 5_000;
 pub const report_line_bytes: usize = 4 * 1024;
 
-pub const surface_frame_bytes: usize = 16 * 1024 * 1024;
+pub const frame_bytes: usize = 16 * 1024 * 1024;
 
 pub const spawn_pending_events: usize = 256;
 pub const job_output_event_bytes: usize = 64 * 1024;

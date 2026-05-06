@@ -820,6 +820,37 @@ test "zi.on rejects invalid subscriptions with Lua-catchable errors" {
     try testing.expectEqual(@as(usize, 0), runner.event_registry.count());
 }
 
+
+test "zi.job.start accepts ui_frame stdout and rejects old stdout modes" {
+    var host = try ApiTestHost.init(testing.allocator, 0);
+    defer host.deinit();
+    host.installZi();
+
+    try host.state.doString(
+        \\local old_modes = { "surface_frame", "surface_cells" }
+        \\for _, mode in ipairs(old_modes) do
+        \\  local ok, err = pcall(function()
+        \\    zi.job.start({ argv = { "echo", "x" }, stdout = { mode = mode } })
+        \\  end)
+        \\  assert(not ok, "old stdout mode should be rejected: " .. mode)
+        \\  assert(string.find(tostring(err), "InvalidOptions") ~= nil, tostring(err))
+        \\end
+        \\local ok, err = pcall(function()
+        \\  zi.job.start({
+        \\    argv = { "echo", "x" },
+        \\    stdout = {
+        \\      mode = "ui_frame",
+        \\      view = "doom-workbench",
+        \\      node = "doom-surface",
+        \\      protocol = "zi-rgba-frame-v1",
+        \\    },
+        \\  })
+        \\end)
+        \\assert(not ok, "non-interactive host should still fail after parsing")
+        \\assert(string.find(tostring(err), "unavailable outside interactive") ~= nil, tostring(err))
+    , "job_stdout_modes_v3");
+}
+
 test "zi.spawn validates required task and callback shapes" {
     var host = try ApiTestHost.init(testing.allocator, 0);
     defer host.deinit();

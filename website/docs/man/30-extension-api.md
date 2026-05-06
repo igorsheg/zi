@@ -248,7 +248,7 @@ By default, stdout/stderr/exit are delivered through job events.
 
 `stdout = { mode = "json_lines", max_line_bytes? }` parses stdout as JSONL and emits `job_json`.
 
-`stdout = { mode = "surface_frame", protocol = "zi-rgba-frame-v1", surface = "id", max_frame_bytes? }` publishes framebuffer records to a surface.
+`stdout = { mode = "ui_frame", view = "doom-workbench", node = "doom-surface", protocol = "zi-rgba-frame-v1", max_frame_bytes? }` publishes RGBA framebuffer records to a UI frame node.
 
 `zi-rgba-frame-v1` records look like:
 
@@ -257,11 +257,3 @@ FRAME <width> <height> <byte_len>\n<rgba bytes>
 ```
 
 `byte_len` must equal `width * height * 4`.
-
-`stdout = { mode = "surface_cells", protocol = "zi-cell-frame-v1", surface = "id", max_frame_bytes? }` publishes ready-to-render half-block terminal cell records to a surface. Each cell is six bytes: foreground RGB followed by background RGB. zi renders each cell as `▀`.
-
-```text
-CELLS <cols> <rows> <byte_len>\n<fg_rgb bg_rgb cells>
-```
-
-`byte_len` must equal `cols * rows * 6`.

@@ -66,8 +66,7 @@ pub const JobManager = struct {
         defer stdout_owned.deinit(self.allocator);
         var adapter: ?OutputAdapter = switch (request.stdout) {
             .events => null,
-            .surface_frame => |frame| try OutputAdapter.initSurfaceFrame(self.allocator, frame),
-            .surface_cells => |frame| try OutputAdapter.initSurfaceCells(self.allocator, frame),
+            .ui_frame => |frame| try OutputAdapter.initUiFrame(self.allocator, frame),
             .json_lines => |cfg| OutputAdapter.initJsonLines(self.allocator, cfg),
         };
         errdefer if (adapter) |*a| a.deinit(self.allocator);
@@ -158,16 +157,11 @@ pub const JobManager = struct {
 };
 
 const OutputAdapter = union(enum) {
-    surface_frame: FrameDecoder,
-    surface_cells: CellDecoder,
+    ui_frame: FrameDecoder,
     json_lines: JsonLinesDecoder,
 
-    fn initSurfaceFrame(allocator: std.mem.Allocator, cfg: anytype) !OutputAdapter {
-        return .{ .surface_frame = try FrameDecoder.init(allocator, cfg) };
-    }
-
-    fn initSurfaceCells(allocator: std.mem.Allocator, cfg: anytype) !OutputAdapter {
-        return .{ .surface_cells = try CellDecoder.init(allocator, cfg) };
+    fn initUiFrame(allocator: std.mem.Allocator, cfg: anytype) !OutputAdapter {
+        return .{ .ui_frame = try FrameDecoder.init(allocator, cfg) };
     }
 
     fn initJsonLines(allocator: std.mem.Allocator, cfg: anytype) OutputAdapter {
@@ -176,8 +170,7 @@ const OutputAdapter = union(enum) {
 
     fn deinit(self: *OutputAdapter, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .surface_frame => |*decoder| decoder.deinit(allocator),
-            .surface_cells => |*decoder| decoder.deinit(allocator),
+            .ui_frame => |*decoder| decoder.deinit(allocator),
             .json_lines => |*decoder| decoder.deinit(allocator),
         }
         self.* = undefined;
@@ -185,24 +178,21 @@ const OutputAdapter = union(enum) {
 
     fn accept(self: *OutputAdapter, state: *JobManager.State, id: u64, data: []const u8) !void {
         switch (self.*) {
-            .surface_frame => |*decoder| try decoder.accept(state, id, data),
-            .surface_cells => |*decoder| try decoder.accept(state, id, data),
+            .ui_frame => |*decoder| try decoder.accept(state, id, data),
             .json_lines => |*decoder| try decoder.accept(state, id, data),
         }
     }
 
     fn finish(self: *OutputAdapter, state: *JobManager.State, id: u64) void {
         switch (self.*) {
-            .surface_frame => {},
-            .surface_cells => {},
+            .ui_frame => {},
             .json_lines => |*decoder| decoder.finish(state, id),
         }
     }
 
     fn surfaceId(self: *const OutputAdapter) ?[]const u8 {
         return switch (self.*) {
-            .surface_frame => |*decoder| decoder.surface_id,
-            .surface_cells => |*decoder| decoder.surface_id,
+            .ui_frame => |*decoder| decoder.node,
             .json_lines => null,
         };
     }
@@ -280,7 +270,8 @@ const JsonLineCtx = struct {
 };
 
 const FrameDecoder = struct {
-    surface_id: []const u8,
+    view: []const u8,
+    node: []const u8,
     state_owner_id: []const u8,
     generation: u64,
     max_frame_bytes: usize,
@@ -288,7 +279,8 @@ const FrameDecoder = struct {
 
     fn init(allocator: std.mem.Allocator, cfg: anytype) !FrameDecoder {
         return .{
-            .surface_id = try allocator.dupe(u8, cfg.surface_id),
+            .view = try allocator.dupe(u8, cfg.view),
+            .node = try allocator.dupe(u8, cfg.node),
             .state_owner_id = try allocator.dupe(u8, cfg.state_owner_id),
             .generation = cfg.generation,
             .max_frame_bytes = cfg.max_frame_bytes,
@@ -296,7 +288,8 @@ const FrameDecoder = struct {
     }
 
     fn deinit(self: *FrameDecoder, allocator: std.mem.Allocator) void {
-        allocator.free(self.surface_id);
+        allocator.free(self.view);
+        allocator.free(self.node);
         allocator.free(self.state_owner_id);
         self.buffer.deinit(allocator);
         self.* = undefined;
@@ -365,7 +358,7 @@ const FrameDecoder = struct {
         const frame = extension_ui.SurfaceFrame{
             .state_owner_id = try state.allocator.dupe(u8, self.state_owner_id),
             .generation = self.generation,
-            .id = try state.allocator.dupe(u8, self.surface_id),
+            .id = try state.allocator.dupe(u8, self.node),
             .width = width,
             .height = height,
             .format = .rgba8888,
@@ -379,67 +372,6 @@ const FrameDecoder = struct {
         return true;
     }
 };
-
-const CellDecoder = struct {
-    surface_id: []const u8,
-    state_owner_id: []const u8,
-    generation: u64,
-    max_frame_bytes: usize,
-    buffer: std.ArrayList(u8) = .empty,
-
-    fn init(allocator: std.mem.Allocator, cfg: anytype) !CellDecoder {
-        return .{ .surface_id = try allocator.dupe(u8, cfg.surface_id), .state_owner_id = try allocator.dupe(u8, cfg.state_owner_id), .generation = cfg.generation, .max_frame_bytes = cfg.max_frame_bytes };
-    }
-
-    fn deinit(self: *CellDecoder, allocator: std.mem.Allocator) void {
-        allocator.free(self.surface_id);
-        allocator.free(self.state_owner_id);
-        self.buffer.deinit(allocator);
-        self.* = undefined;
-    }
-
-    fn accept(self: *CellDecoder, state: *JobManager.State, _: u64, data: []const u8) !void {
-        try self.buffer.appendSlice(state.allocator, data);
-        while (try self.nextFrame(state)) {}
-        if (self.buffer.items.len > self.max_frame_bytes + 4096) {
-            const keep = @min(self.buffer.items.len, 4096);
-            std.mem.copyForwards(u8, self.buffer.items[0..keep], self.buffer.items[self.buffer.items.len - keep ..]);
-            self.buffer.shrinkRetainingCapacity(keep);
-        }
-    }
-
-    fn nextFrame(self: *CellDecoder, state: *JobManager.State) !bool {
-        const start = std.mem.indexOf(u8, self.buffer.items, "CELLS ") orelse return false;
-        if (start > 0) {
-            std.mem.copyForwards(u8, self.buffer.items[0 .. self.buffer.items.len - start], self.buffer.items[start..]);
-            self.buffer.shrinkRetainingCapacity(self.buffer.items.len - start);
-        }
-        const newline = std.mem.indexOfScalar(u8, self.buffer.items, '\n') orelse return false;
-        const header = self.buffer.items[0..newline];
-        var parts = std.mem.tokenizeScalar(u8, header, ' ');
-        if (!std.mem.eql(u8, parts.next() orelse "", "CELLS")) { _ = self.buffer.orderedRemove(0); return true; }
-        const cols = std.fmt.parseInt(u32, parts.next() orelse "", 10) catch { _ = self.buffer.orderedRemove(0); return true; };
-        const rows = std.fmt.parseInt(u32, parts.next() orelse "", 10) catch { _ = self.buffer.orderedRemove(0); return true; };
-        const len = std.fmt.parseInt(usize, parts.next() orelse "", 10) catch { _ = self.buffer.orderedRemove(0); return true; };
-        const expected_len = cellFrameBytes(cols, rows) orelse { _ = self.buffer.orderedRemove(0); return true; };
-        if (len != expected_len or len > self.max_frame_bytes) { _ = self.buffer.orderedRemove(0); return true; }
-        if (self.buffer.items.len < newline + 1 + len) return false;
-        const payload_start = newline + 1;
-        const payload = self.buffer.items[payload_start .. payload_start + len];
-        const frame = extension_ui.SurfaceFrame{ .state_owner_id = try state.allocator.dupe(u8, self.state_owner_id), .generation = self.generation, .id = try state.allocator.dupe(u8, self.surface_id), .width = cols, .height = rows, .format = .halfblock_rgb, .data = try state.allocator.dupe(u8, payload) };
-        _ = JobManager.submitSurfaceFrame(state, .{ .frame = frame });
-        const consumed = payload_start + len;
-        std.mem.copyForwards(u8, self.buffer.items[0 .. self.buffer.items.len - consumed], self.buffer.items[consumed..]);
-        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - consumed);
-        return true;
-    }
-};
-
-fn cellFrameBytes(cols: u32, rows: u32) ?usize {
-    if (cols == 0 or rows == 0) return null;
-    const cells = std.math.mul(usize, @intCast(cols), @intCast(rows)) catch return null;
-    return std.math.mul(usize, cells, 6) catch null;
-}
 
 fn rgbaFrameBytes(width: u32, height: u32) ?usize {
     if (width == 0 or height == 0) return null;
@@ -463,19 +395,11 @@ fn testFrameState(queue: *request_mod.RequestQueue, sink: *TestSurfaceSink) JobM
 
 fn testFrameDecoder() !FrameDecoder {
     return FrameDecoder.init(testing.allocator, .{
-        .surface_id = "doom-demo",
+        .view = "doom-workbench",
+        .node = "doom-demo",
         .state_owner_id = "extension.lua",
         .generation = 9,
         .max_frame_bytes = 32,
-    });
-}
-
-fn testCellDecoder() !CellDecoder {
-    return CellDecoder.init(testing.allocator, .{
-        .surface_id = "doom-demo",
-        .state_owner_id = "extension.lua",
-        .generation = 9,
-        .max_frame_bytes = 64,
     });
 }
 
@@ -520,7 +444,7 @@ const TestSurfaceSink = struct {
     }
 };
 
-test "surface frame stdout adapter preserves frames split across chunks" {
+test "ui frame stdout adapter preserves frames split across chunks" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);
     defer queue.deinit();
     var sink = TestSurfaceSink{ .allocator = testing.allocator };
@@ -539,7 +463,7 @@ test "surface frame stdout adapter preserves frames split across chunks" {
     try testing.expectEqual(@as(usize, 0), queue.pendingDepth());
 }
 
-test "surface frame stdout adapter validates rgba byte length and resyncs" {
+test "ui frame stdout adapter validates rgba byte length and resyncs" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);
     defer queue.deinit();
     var sink = TestSurfaceSink{ .allocator = testing.allocator };
@@ -567,8 +491,9 @@ test "job manager routes configured stdout frames to the surface sink" {
     const argv = try testing.allocator.dupe([]const u8, &.{ try testing.allocator.dupe(u8, "/bin/sh"), try testing.allocator.dupe(u8, "-c"), try testing.allocator.dupe(u8, script) });
     try manager.start(55, .{
         .argv = argv,
-        .stdout = .{ .surface_frame = .{
-            .surface_id = try testing.allocator.dupe(u8, "doom-demo"),
+        .stdout = .{ .ui_frame = .{
+            .view = try testing.allocator.dupe(u8, "doom-workbench"),
+            .node = try testing.allocator.dupe(u8, "doom-demo"),
             .state_owner_id = try testing.allocator.dupe(u8, "extension.lua"),
             .generation = 9,
             .max_frame_bytes = 32,
@@ -593,7 +518,7 @@ test "job manager routes configured stdout frames to the surface sink" {
     return error.Timeout;
 }
 
-test "surface frame stdout adapter emits surface frames instead of job_stdout events" {
+test "ui frame stdout adapter emits UI frames instead of job_stdout events" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);
     defer queue.deinit();
     var sink = TestSurfaceSink{ .allocator = testing.allocator };
@@ -609,39 +534,4 @@ test "surface frame stdout adapter emits surface frames instead of job_stdout ev
     try expectFrame(sink.frames.items[0], 1, 1, "one!");
     try expectFrame(sink.frames.items[1], 1, 1, "two!");
     try testing.expectEqual(@as(usize, 0), queue.pendingDepth());
-}
-
-test "surface cell stdout adapter preserves frames split across chunks" {
-    var queue = try request_mod.RequestQueue.init(testing.allocator);
-    defer queue.deinit();
-    var sink = TestSurfaceSink{ .allocator = testing.allocator };
-    defer sink.deinit();
-    var state = testFrameState(&queue, &sink);
-    defer state.deinit();
-    var decoder = try testCellDecoder();
-    defer decoder.deinit(testing.allocator);
-
-    try decoder.accept(&state, 1, "noiseCELLS 2 ");
-    try decoder.accept(&state, 1, "1 12\n");
-    try decoder.accept(&state, 1, "abcdefghijkl");
-
-    try testing.expectEqual(@as(usize, 1), sink.frames.items.len);
-    try expectFrameFormat(sink.frames.items[0], .halfblock_rgb, 2, 1, "abcdefghijkl");
-    try testing.expectEqual(@as(usize, 0), queue.pendingDepth());
-}
-
-test "surface cell stdout adapter validates byte length and resyncs" {
-    var queue = try request_mod.RequestQueue.init(testing.allocator);
-    defer queue.deinit();
-    var sink = TestSurfaceSink{ .allocator = testing.allocator };
-    defer sink.deinit();
-    var state = testFrameState(&queue, &sink);
-    defer state.deinit();
-    var decoder = try testCellDecoder();
-    defer decoder.deinit(testing.allocator);
-
-    try decoder.accept(&state, 1, "CELLS 2 1 11\nbadbadbad!!CELLS 1 1 6\nabcdef");
-
-    try testing.expectEqual(@as(usize, 1), sink.frames.items.len);
-    try expectFrameFormat(sink.frames.items[0], .halfblock_rgb, 1, 1, "abcdef");
 }

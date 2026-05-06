@@ -18,7 +18,7 @@ const ui_title_bytes: usize = limits.ui_title_bytes;
 const report_body_bytes: usize = limits.report_body_bytes;
 const report_lines: usize = limits.report_lines;
 const report_line_bytes: usize = limits.report_line_bytes;
-const surface_frame_bytes: usize = limits.surface_frame_bytes;
+const frame_bytes: usize = limits.frame_bytes;
 const truncated_marker = "\n... [extension UI text truncated] ...";
 const report_truncated_marker = "... [report truncated at 256KiB / 5000 lines] ...";
 
@@ -412,7 +412,7 @@ fn publishSurfaceFrameFromArgs(L: *c.lua_State) !void {
     const height = readU32Field(L, spec_idx, "height", 1);
     const format = readSurfaceFormat(L, spec_idx);
     const expected_len = expectedSurfaceFrameBytes(width, height, format) orelse return;
-    if (expected_len > surface_frame_bytes) return;
+    if (expected_len > frame_bytes) return;
 
     _ = c.lua_getfield(L, spec_idx, "data");
     defer c.lua_pop(L, 1);

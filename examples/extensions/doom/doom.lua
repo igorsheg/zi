@@ -107,10 +107,11 @@ zi.command({
       argv = argv,
       cwd = extension_root(ctx),
       stdout = {
-        mode = "surface_cells",
-        protocol = "zi-cell-frame-v1",
-        surface = surface_id,
-        max_frame_bytes = width * height * 6 + 64,
+        mode = "ui_frame",
+        view = "doom-workbench",
+        node = surface_id,
+        protocol = "zi-rgba-frame-v1",
+        max_frame_bytes = width * height * 4 + 64,
       },
     })
     ctx.ui.message("DOOM helper started. Arrows/WASD move, F fires, Space uses, Q quits, Esc returns focus.", { kind = "success" })
