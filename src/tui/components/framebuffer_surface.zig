@@ -63,32 +63,36 @@ pub const FramebufferSurface = struct {
 
     pub fn renderSlice(self: *FramebufferSurface, region: Region, first_row: u32) void {
         const frame = self.frame orelse return;
-        if (frame.format == .halfblock_rgb) return renderHalfblockFrame(region, frame, first_row);
-        if (region.width == 0 or region.height == 0) return;
-        if (expectedFrameBytes(frame.width, frame.height, frame.format)) |needed| {
-            if (frame.data.len < needed) return;
-        } else return;
-
-        const rows_total = scaledRows(frame.width, frame.height, region.width);
-        var y: u32 = 0;
-        while (y < region.height and first_row + y < rows_total) : (y += 1) {
-            var x: u32 = 0;
-            while (x < region.width) : (x += 1) {
-                const src_x = @min(frame.width - 1, (x * frame.width) / region.width);
-                const upper_y = @min(frame.height - 1, (((first_row + y) * 2) * frame.height) / (rows_total * 2));
-                const lower_y = @min(frame.height - 1, ((((first_row + y) * 2) + 1) * frame.height) / (rows_total * 2));
-                const upper = rgbaAt(frame.data, frame.width, src_x, upper_y);
-                const lower = rgbaAt(frame.data, frame.width, src_x, lower_y);
-                region.set(x, y, .{
-                    .grapheme = .{ .codepoint = '▀' },
-                    .fg = Color.rgb(upper.r, upper.g, upper.b),
-                    .bg = Color.rgb(lower.r, lower.g, lower.b),
-                    .attrs = Attributes.none,
-                });
-            }
-        }
+        renderFrame(region, frame, first_row);
     }
 };
+
+pub fn renderFrame(region: Region, frame: extension_ui.UiFrame, first_row: u32) void {
+    if (frame.format == .halfblock_rgb) return renderHalfblockFrame(region, frame, first_row);
+    if (region.width == 0 or region.height == 0) return;
+    if (expectedFrameBytes(frame.width, frame.height, frame.format)) |needed| {
+        if (frame.data.len < needed) return;
+    } else return;
+
+    const rows_total = scaledRows(frame.width, frame.height, region.width);
+    var y: u32 = 0;
+    while (y < region.height and first_row + y < rows_total) : (y += 1) {
+        var x: u32 = 0;
+        while (x < region.width) : (x += 1) {
+            const src_x = @min(frame.width - 1, (x * frame.width) / region.width);
+            const upper_y = @min(frame.height - 1, (((first_row + y) * 2) * frame.height) / (rows_total * 2));
+            const lower_y = @min(frame.height - 1, ((((first_row + y) * 2) + 1) * frame.height) / (rows_total * 2));
+            const upper = rgbaAt(frame.data, frame.width, src_x, upper_y);
+            const lower = rgbaAt(frame.data, frame.width, src_x, lower_y);
+            region.set(x, y, .{
+                .grapheme = .{ .codepoint = '▀' },
+                .fg = Color.rgb(upper.r, upper.g, upper.b),
+                .bg = Color.rgb(lower.r, lower.g, lower.b),
+                .attrs = Attributes.none,
+            });
+        }
+    }
+}
 
 const Rgb = struct { r: u8, g: u8, b: u8 };
 
