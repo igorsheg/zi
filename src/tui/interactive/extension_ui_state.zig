@@ -20,18 +20,22 @@ pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
     views: std.StringHashMap(ViewRecord),
     frames: std.StringHashMap(FrameRecord),
-    status_component: StatusComponent,
-    toast_component: ToastComponent,
-    overlay_component: OverlayComponent,
+    status_component: TargetComponent,
+    toast_component: TargetComponent,
+    overlay_component: TargetComponent,
+    editor_border_top_component: TargetComponent,
+    editor_border_bottom_component: TargetComponent,
 
     pub fn init(allocator: std.mem.Allocator) ExtensionUiState {
         return .{
             .allocator = allocator,
             .views = std.StringHashMap(ViewRecord).init(allocator),
             .frames = std.StringHashMap(FrameRecord).init(allocator),
-            .status_component = .{},
-            .toast_component = .{},
-            .overlay_component = .{},
+            .status_component = .{ .target = .status },
+            .toast_component = .{ .target = .toast },
+            .overlay_component = .{ .target = .overlay },
+            .editor_border_top_component = .{ .target = .editor_border_top },
+            .editor_border_bottom_component = .{ .target = .editor_border_bottom },
         };
     }
 
@@ -64,6 +68,16 @@ pub const ExtensionUiState = struct {
     pub fn overlayComponent(self: *ExtensionUiState) Component {
         self.overlay_component.state = self;
         return self.overlay_component.component();
+    }
+
+    pub fn editorBorderTopComponent(self: *ExtensionUiState) Component {
+        self.editor_border_top_component.state = self;
+        return self.editor_border_top_component.component();
+    }
+
+    pub fn editorBorderBottomComponent(self: *ExtensionUiState) Component {
+        self.editor_border_bottom_component.state = self;
+        return self.editor_border_bottom_component.component();
     }
 
     pub fn hasToastViews(self: *ExtensionUiState) bool {
@@ -211,15 +225,16 @@ const FrameRecord = struct {
     }
 };
 
-const StatusComponent = struct {
+const TargetComponent = struct {
     state: *ExtensionUiState = undefined,
+    target: extension_ui.UiTarget,
 
-    fn component(self: *StatusComponent) Component {
-        return Component.init(StatusComponent, self);
+    fn component(self: *TargetComponent) Component {
+        return Component.init(TargetComponent, self);
     }
 
-    pub fn render(self: *StatusComponent, region: Region) void {
-        const ordered = self.orderedStatusViews() catch return;
+    pub fn render(self: *TargetComponent, region: Region) void {
+        const ordered = self.orderedViews() catch return;
         defer self.state.allocator.free(ordered);
         var y: u32 = 0;
         for (ordered) |view| {
@@ -230,8 +245,8 @@ const StatusComponent = struct {
         }
     }
 
-    pub fn measure(self: *StatusComponent, width: u32) Measurement {
-        const ordered = self.orderedStatusViews() catch return .{ .min_height = 0, .preferred_height = 0 };
+    pub fn measure(self: *TargetComponent, width: u32) Measurement {
+        const ordered = self.orderedViews() catch return .{ .min_height = 0, .preferred_height = 0 };
         defer self.state.allocator.free(ordered);
         var total: u32 = 0;
         for (ordered) |view| {
@@ -240,76 +255,8 @@ const StatusComponent = struct {
         return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
     }
 
-    fn orderedStatusViews(self: *StatusComponent) ![]*ViewRecord {
-        return self.state.orderedTargetViews(.status);
-    }
-};
-
-const OverlayComponent = struct {
-    state: *ExtensionUiState = undefined,
-
-    fn component(self: *OverlayComponent) Component {
-        return Component.init(OverlayComponent, self);
-    }
-
-    pub fn render(self: *OverlayComponent, region: Region) void {
-        const ordered = self.orderedOverlayViews() catch return;
-        defer self.state.allocator.free(ordered);
-        var y: u32 = 0;
-        for (ordered) |view| {
-            if (y >= region.height) break;
-            const h = @min(measureNode(view.spec.root orelse continue, region.width), region.height - y);
-            renderNode(self.state, view.spec, view.spec.root.?, region.sub(0, y, region.width, h));
-            y += h;
-        }
-    }
-
-    pub fn measure(self: *OverlayComponent, width: u32) Measurement {
-        const ordered = self.orderedOverlayViews() catch return .{ .min_height = 0, .preferred_height = 0 };
-        defer self.state.allocator.free(ordered);
-        var total: u32 = 0;
-        for (ordered) |view| {
-            if (view.spec.root) |root| total += measureNode(root, width);
-        }
-        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
-    }
-
-    fn orderedOverlayViews(self: *OverlayComponent) ![]*ViewRecord {
-        return self.state.orderedTargetViews(.overlay);
-    }
-};
-
-const ToastComponent = struct {
-    state: *ExtensionUiState = undefined,
-
-    fn component(self: *ToastComponent) Component {
-        return Component.init(ToastComponent, self);
-    }
-
-    pub fn render(self: *ToastComponent, region: Region) void {
-        const ordered = self.orderedToastViews() catch return;
-        defer self.state.allocator.free(ordered);
-        var y: u32 = 0;
-        for (ordered) |view| {
-            if (y >= region.height) break;
-            const h = @min(measureNode(view.spec.root orelse continue, region.width), region.height - y);
-            renderNode(self.state, view.spec, view.spec.root.?, region.sub(0, y, region.width, h));
-            y += h;
-        }
-    }
-
-    pub fn measure(self: *ToastComponent, width: u32) Measurement {
-        const ordered = self.orderedToastViews() catch return .{ .min_height = 0, .preferred_height = 0 };
-        defer self.state.allocator.free(ordered);
-        var total: u32 = 0;
-        for (ordered) |view| {
-            if (view.spec.root) |root| total += measureNode(root, width);
-        }
-        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
-    }
-
-    fn orderedToastViews(self: *ToastComponent) ![]*ViewRecord {
-        return self.state.orderedTargetViews(.toast);
+    fn orderedViews(self: *TargetComponent) ![]*ViewRecord {
+        return self.state.orderedTargetViews(self.target);
     }
 };
 
@@ -738,4 +685,39 @@ test "extension ui maps retained overlay target options" {
     try std.testing.expectEqual(@as(?u8, 90), options.max_height_percent);
     try std.testing.expectEqual(overlay_mod.OverlayAnchor.center, options.anchor);
     try std.testing.expect(options.backdrop == .dim);
+}
+
+test "extension ui sorts editor border top views and filters other targets" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .target = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
+    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .target = .editor_border_top, .order = 2, .root = .{ .text = .{ .text = "b" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "z" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "a" } } });
+
+    var buf = try Buffer.init(std.testing.allocator, 4, 3);
+    defer buf.deinit();
+    var comp = state.editorBorderTopComponent();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'z'), cpAt(&buf, 0, 1));
+    try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 0, 2));
+}
+
+test "extension ui renders and removes editor border bottom views" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "bottom", .target = .editor_border_bottom, .root = .{ .chip = .{ .label = "hint" } } });
+
+    var buf = try Buffer.init(std.testing.allocator, 8, 1);
+    defer buf.deinit();
+    var comp = state.editorBorderBottomComponent();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, '['), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'h'), cpAt(&buf, 2, 0));
+
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "bottom", .target = .editor_border_bottom, .remove = true });
+    try std.testing.expectEqual(@as(usize, 0), state.views.count());
+    const m = comp.measure(8);
+    try std.testing.expectEqual(@as(u32, 0), m.preferred_height);
 }
