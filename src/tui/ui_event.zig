@@ -98,21 +98,14 @@ pub const UiEvent = union(enum) {
     extension_keybindings_updated: struct {
         keybindings: []ExtensionKeybindingEntry,
     },
-    extension_report_shown: struct {
-        report: extension_ui.Report,
+    extension_ui_rendered: struct {
+        updates: []extension_ui.RenderSpec,
     },
-    extension_ui_published: struct {
-        updates: []extension_ui.UiPublication,
-    },
-    extension_surface_updated: struct {
-        updates: []extension_ui.SurfaceUpdate,
+    extension_ui_framed: struct {
+        updates: []extension_ui.UiFrame,
     },
     extension_editor_actions: struct {
         actions: []extension_ui.EditorAction,
-    },
-    extension_prompt_requested: struct {
-        prompt: extension_ui.PromptRequest,
-        response: *request_mod.ExtensionPromptResponse,
     },
 
     visible_models_snapshot: struct {
@@ -160,7 +153,6 @@ pub const UiEvent = union(enum) {
             .tool_running,
             .login_progress,
             .status_snapshot,
-            .extension_surface_updated,
             => true,
             else => false,
         };
@@ -240,12 +232,11 @@ pub const UiEvent = union(enum) {
                 }
                 allocator.free(u.keybindings);
             },
-            .extension_report_shown => |*u| u.report.deinit(allocator),
-            .extension_ui_published => |u| {
+            .extension_ui_rendered => |u| {
                 for (u.updates) |*update| update.deinit(allocator);
                 allocator.free(u.updates);
             },
-            .extension_surface_updated => |u| {
+            .extension_ui_framed => |u| {
                 for (u.updates) |*update| update.deinit(allocator);
                 allocator.free(u.updates);
             },
@@ -253,7 +244,6 @@ pub const UiEvent = union(enum) {
                 for (u.actions) |*action| action.deinit(allocator);
                 allocator.free(u.actions);
             },
-            .extension_prompt_requested => |*u| u.prompt.deinit(allocator),
             .visible_models_snapshot => |u| model_registry_mod.deinitOwnedModels(allocator, u.models),
             .session_new_started => {},
             .session_fork_started => {},

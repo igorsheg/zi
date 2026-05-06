@@ -33,8 +33,6 @@ const mailbox_mod = @import("../zio/root.zig").mailbox;
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const model_flow = @import("interactive/model_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
-const extension_prompt_flow_mod = @import("interactive/extension_prompt_flow.zig");
-const extension_prompt = @import("interactive/extension_prompt.zig");
 const thinking_mod = @import("interactive/thinking.zig");
 const slash_command_mod = @import("interactive/slash_command.zig");
 const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
@@ -64,7 +62,6 @@ const run_setup = @import("interactive/run_setup.zig");
 const startup_flow = @import("interactive/startup_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
-const surface_input_flow = @import("interactive/surface_input.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("terminal/clipboard.zig");
 const agent_ui_event_mod = @import("interactive/agent_ui_event.zig");
@@ -101,7 +98,6 @@ const userFacingFailureMessage = agent_ui_event_mod.userFacingFailureMessage;
 const PendingImageAttachment = clipboard_images_mod.PendingImageAttachment;
 const ModelPickerFlow = model_picker_flow_mod.ModelPickerFlow;
 const ResumePickerFlow = resume_picker_flow_mod.ResumePickerFlow;
-const ExtensionPromptFlow = extension_prompt_flow_mod.ExtensionPromptFlow;
 const ExtensionUiState = extension_ui_state_mod.ExtensionUiState;
 const session_store_mod = @import("../coding_agent/session/store.zig");
 const session_index_worker_mod = @import("session_index_worker.zig");
@@ -242,9 +238,6 @@ pub const Interactive = struct {
     /// TUI-owned snapshot; never read agent registry from the TUI thread.
     model_catalog: []ai_protocol.Model = &.{},
     model_picker_flow: ?ModelPickerFlow = null,
-    extension_prompt_flow: ?ExtensionPromptFlow = null,
-    extension_prompt_close_after_submit: bool = false,
-
     settings_picker: ListPicker = undefined,
     settings_picker_items: [16]SelectItem = undefined,
     settings_picker_actions: [16]SettingsAction = undefined,
@@ -389,8 +382,6 @@ pub const Interactive = struct {
         self.lifecycle_event_queue.close();
 
         self.drainUiEvents();
-        extension_ui_flow.hideSurfaceOverlay(self);
-        self.closeExtensionPromptFlow(false);
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
         self.clearLoginPickerEntries();
@@ -478,7 +469,7 @@ pub const Interactive = struct {
         run_setup.bindAutocomplete(self);
         run_setup.mountInitialTree(self);
 
-        self.job_manager.setSurfaceSink(.{ .ptr = @ptrCast(self), .submit = &publishJobSurfaceFrame });
+        self.job_manager.setFrameSink(.{ .ptr = @ptrCast(self), .submit = &publishJobUiFrame });
 
         self.publishPendingExtensionUi();
 
@@ -507,8 +498,6 @@ pub const Interactive = struct {
 
             self.input.checkTimeout(&terminal_input_flow.onSequence, @ptrCast(self));
             self.finishKittyNegotiationIfDue();
-            self.finishExtensionPromptIfTimedOut();
-
             if (self.tui.checkResize()) {
                 self.cancelTranscriptSelection();
             }
@@ -634,15 +623,15 @@ pub const Interactive = struct {
         return event_flow.publishLifecycle(self, event);
     }
 
-    fn publishJobSurfaceFrame(ptr: *anyopaque, update: extension_ui.SurfaceUpdate) bool {
+    fn publishJobUiFrame(ptr: *anyopaque, frame: extension_ui.UiFrame) bool {
         const self: *Interactive = @ptrCast(@alignCast(ptr));
-        const updates = self.msg_allocator.alloc(extension_ui.SurfaceUpdate, 1) catch {
-            var failed = update;
+        const updates = self.msg_allocator.alloc(extension_ui.UiFrame, 1) catch {
+            var failed = frame;
             failed.deinit(self.msg_allocator);
             return false;
         };
-        updates[0] = update;
-        return self.publishSnapshotUiEvent(.{ .extension_surface_updated = .{ .updates = updates } });
+        updates[0] = frame;
+        return self.publishLifecycleUiEvent(.{ .extension_ui_framed = .{ .updates = updates } });
     }
 
     pub fn handleKey(self: *Interactive, key: Key) void {
@@ -798,9 +787,6 @@ pub const Interactive = struct {
         }
         if (self.tui.nextAnimationDeadline(now_ns)) |deadline| {
             next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
-        }
-        if (self.extension_prompt_flow) |flow| {
-            if (flow.deadline_ns) |deadline| next_deadline = if (next_deadline) |cur| @min(cur, deadline) else deadline;
         }
 
         return next_deadline;
@@ -1070,18 +1056,6 @@ pub const Interactive = struct {
         model_flow.switchDirect(self, pattern);
     }
 
-    pub fn closeExtensionPromptFlow(self: *Interactive, resolve_default: bool) void {
-        extension_prompt.close(self, resolve_default);
-    }
-
-    fn finishExtensionPromptIfTimedOut(self: *Interactive) void {
-        extension_prompt.finishIfTimedOut(self);
-    }
-
-    pub fn showExtensionPrompt(self: *Interactive, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
-        extension_prompt.show(self, prompt, response);
-    }
-
     fn closeModelPickerFlow(self: *Interactive) void {
         model_flow.close(self);
     }
@@ -1228,20 +1202,16 @@ pub const Interactive = struct {
         extension_ui_flow.publishPending(self);
     }
 
-    pub fn applyExtensionReport(self: *Interactive, report: extension_ui.Report) void {
-        extension_ui_flow.applyReport(self, report);
-    }
-
     pub fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
         extension_ui_flow.applyEditorActions(self, actions);
     }
 
-    pub fn applyExtensionUiPublications(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiPublication) void {
-        extension_ui_flow.applyPublications(self, updates);
+    pub fn applyExtensionRenderUpdates(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").RenderSpec) void {
+        extension_ui_flow.applyRenderUpdates(self, updates);
     }
 
-    pub fn applyExtensionSurfaceUpdates(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").SurfaceUpdate) void {
-        extension_ui_flow.applySurfaceUpdates(self, updates);
+    pub fn applyExtensionFrameUpdates(self: *Interactive, updates: []const @import("../coding_agent/extensions/ui.zig").UiFrame) void {
+        extension_ui_flow.applyFrameUpdates(self, updates);
     }
 
     pub fn applyExtensionCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.ExtensionCommandEntry) void {

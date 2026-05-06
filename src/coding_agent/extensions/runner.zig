@@ -351,13 +351,6 @@ pub const ExtensionRuntime = union(enum) {
         session_entries_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, label: ?[]const u8, limit: usize) ?std.json.Value = null,
         publish_render: ?*const fn (session: *anyopaque, spec: extension_ui.RenderSpec) anyerror!void = null,
         publish_frame: ?*const fn (session: *anyopaque, spec: extension_ui.FrameSpec) anyerror!void = null,
-        publish_report: ?*const fn (session: *anyopaque, report: extension_ui.Report) anyerror!void = null,
-        publish_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest) anyerror!void = null,
-        resolve_prompt: ?*const fn (session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void = null,
-        cancel_prompts: ?*const fn (session: *anyopaque) void = null,
-        publish_ui: ?*const fn (session: *anyopaque, update: extension_ui.UiPublication) anyerror!void = null,
-        revoke_ui: ?*const fn (session: *anyopaque) void = null,
-        publish_surface_update: ?*const fn (session: *anyopaque, update: extension_ui.SurfaceUpdate) anyerror!void = null,
         publish_editor_action: ?*const fn (session: *anyopaque, action: extension_ui.EditorAction) anyerror!void = null,
         clear_editor_actions: ?*const fn (session: *anyopaque) void = null,
         provider_projection_changed: ?*const fn (session: *anyopaque) void = null,
@@ -871,8 +864,6 @@ pub const ExtensionRunner = struct {
     pub fn unbindRuntime(self: *ExtensionRunner) void {
         if (self.runtime == .bound) {
             const bound = self.runtime.bound;
-            if (bound.cancel_prompts) |cancel| cancel(bound.session);
-            if (bound.revoke_ui) |revoke| revoke(bound.session);
             if (bound.clear_editor_actions) |clear| clear(bound.session);
             var projection_changed = false;
             if (self._provider_registry) |registry| {
@@ -1041,15 +1032,6 @@ pub const ExtensionRunner = struct {
             },
             .ok, .finished => {},
         }
-    }
-
-    pub fn dispatchSurfaceInput(self: *ExtensionRunner, input: extension_ui.SurfaceInput) !void {
-        self.assertOnLuaThread();
-        if (self.event_registry.handlers(.surface_input).len == 0) return;
-        const state = self.lua_state orelse return error.MissingLuaState;
-        pushSurfaceInputPayload(state.L, input);
-        defer lua_runtime.c.lua_pop(state.L, 1);
-        try dispatch_mod.dispatchObserver(state, self, .surface_input, -1);
     }
 
     pub fn dispatchJobEvent(self: *ExtensionRunner, event: extension_ui.JobEvent) !void {
@@ -1601,22 +1583,6 @@ fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) !
 
     const dir = std.fs.path.dirname(path) orelse path;
     return try std.fs.path.join(allocator, &.{ dir, "lua" });
-}
-
-fn pushSurfaceInputPayload(L: *lua_runtime.c.lua_State, input: extension_ui.SurfaceInput) void {
-    const c = lua_runtime.c;
-    c.lua_createtable(L, 0, 8);
-    pushStringField(L, "id", input.id);
-    pushStringField(L, "kind", input.kind);
-    pushStringField(L, "action", input.action);
-    pushStringField(L, "key", input.key);
-    if (input.text) |text| pushStringField(L, "text", text);
-    c.lua_pushboolean(L, if (input.ctrl) 1 else 0);
-    c.lua_setfield(L, -2, "ctrl");
-    c.lua_pushboolean(L, if (input.alt) 1 else 0);
-    c.lua_setfield(L, -2, "alt");
-    c.lua_pushboolean(L, if (input.shift) 1 else 0);
-    c.lua_setfield(L, -2, "shift");
 }
 
 fn pushJobEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.JobEvent) void {

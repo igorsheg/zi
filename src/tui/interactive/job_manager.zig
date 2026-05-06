@@ -12,9 +12,9 @@ const json_value = json_root.value;
 ///
 /// This layer translates extension-domain start requests/events to the generic
 /// zio job supervisor. It intentionally owns no threads/process mechanics.
-pub const SurfaceUpdateSink = struct {
+pub const FrameSink = struct {
     ptr: *anyopaque,
-    submit: *const fn (ptr: *anyopaque, update: extension_ui.SurfaceUpdate) bool,
+    submit: *const fn (ptr: *anyopaque, frame: extension_ui.UiFrame) bool,
 };
 
 pub const JobManager = struct {
@@ -27,7 +27,7 @@ pub const JobManager = struct {
         request_queue: *request_mod.RequestQueue,
         mutex: std.Io.Mutex = .init,
         adapters: std.AutoHashMapUnmanaged(u64, OutputAdapter) = .empty,
-        surface_sink: ?SurfaceUpdateSink = null,
+        frame_sink: ?FrameSink = null,
 
         fn deinit(self: *State) void {
             var it = self.adapters.iterator();
@@ -37,10 +37,10 @@ pub const JobManager = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, request_queue: *request_mod.RequestQueue, surface_sink: ?SurfaceUpdateSink) !JobManager {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, request_queue: *request_mod.RequestQueue, frame_sink: ?FrameSink) !JobManager {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.* = .{ .allocator = allocator, .request_queue = request_queue, .surface_sink = surface_sink };
+        state.* = .{ .allocator = allocator, .request_queue = request_queue, .frame_sink = frame_sink };
         return .{
             .allocator = allocator,
             .state = state,
@@ -55,10 +55,10 @@ pub const JobManager = struct {
         self.* = undefined;
     }
 
-    pub fn setSurfaceSink(self: *JobManager, sink: SurfaceUpdateSink) void {
+    pub fn setFrameSink(self: *JobManager, sink: FrameSink) void {
         self.state.mutex.lockUncancelable(std.Options.debug_io);
         defer self.state.mutex.unlock(std.Options.debug_io);
-        self.state.surface_sink = sink;
+        self.state.frame_sink = sink;
     }
 
     pub fn start(self: *JobManager, id: u64, request: extension_runner.JobStartRequest) !void {
@@ -86,21 +86,6 @@ pub const JobManager = struct {
 
     pub fn write(self: *JobManager, id: u64, data: []const u8) !void {
         try self.manager.write(id, data);
-    }
-
-    pub fn writeSurfaceInput(self: *JobManager, surface_id: []const u8, data: []const u8) bool {
-        self.state.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.state.mutex.unlock(std.Options.debug_io);
-        var it = self.state.adapters.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.surfaceId()) |id| {
-                if (std.mem.eql(u8, id, surface_id)) {
-                    self.manager.write(entry.key_ptr.*, data) catch return false;
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     fn submitEvent(ptr: *anyopaque, event: zio_job.Event) bool {
@@ -148,9 +133,9 @@ pub const JobManager = struct {
         }
     }
 
-    fn submitSurfaceFrame(state: *State, update: extension_ui.SurfaceUpdate) bool {
-        if (state.surface_sink) |sink| return sink.submit(sink.ptr, update);
-        var dropped = update;
+    fn submitUiFrame(state: *State, frame: extension_ui.UiFrame) bool {
+        if (state.frame_sink) |sink| return sink.submit(sink.ptr, frame);
+        var dropped = frame;
         dropped.deinit(state.allocator);
         return false;
     }
@@ -190,12 +175,6 @@ const OutputAdapter = union(enum) {
         }
     }
 
-    fn surfaceId(self: *const OutputAdapter) ?[]const u8 {
-        return switch (self.*) {
-            .ui_frame => |*decoder| decoder.node,
-            .json_lines => null,
-        };
-    }
 };
 
 const JsonLinesDecoder = struct {
@@ -355,16 +334,17 @@ const FrameDecoder = struct {
 
         const payload_start = newline + 1;
         const payload = self.buffer.items[payload_start .. payload_start + len];
-        const frame = extension_ui.SurfaceFrame{
+        const frame = extension_ui.UiFrame{
             .state_owner_id = try state.allocator.dupe(u8, self.state_owner_id),
             .generation = self.generation,
-            .id = try state.allocator.dupe(u8, self.node),
+            .view = try state.allocator.dupe(u8, self.view),
+            .node = try state.allocator.dupe(u8, self.node),
             .width = width,
             .height = height,
             .format = .rgba8888,
             .data = try state.allocator.dupe(u8, payload),
         };
-        _ = JobManager.submitSurfaceFrame(state, .{ .frame = frame });
+        _ = JobManager.submitUiFrame(state, frame);
 
         const consumed = payload_start + len;
         std.mem.copyForwards(u8, self.buffer.items[0 .. self.buffer.items.len - consumed], self.buffer.items[consumed..]);
@@ -381,15 +361,15 @@ fn rgbaFrameBytes(width: u32, height: u32) ?usize {
 
 const testing = std.testing;
 
-fn testSurfaceSinkAdapter(sink: *TestSurfaceSink) SurfaceUpdateSink {
-    return .{ .ptr = @ptrCast(sink), .submit = &TestSurfaceSink.submit };
+fn testFrameSinkAdapter(sink: *TestFrameSink) FrameSink {
+    return .{ .ptr = @ptrCast(sink), .submit = &TestFrameSink.submit };
 }
 
-fn testFrameState(queue: *request_mod.RequestQueue, sink: *TestSurfaceSink) JobManager.State {
+fn testFrameState(queue: *request_mod.RequestQueue, sink: *TestFrameSink) JobManager.State {
     return .{
         .allocator = testing.allocator,
         .request_queue = queue,
-        .surface_sink = testSurfaceSinkAdapter(sink),
+        .frame_sink = testFrameSinkAdapter(sink),
     };
 }
 
@@ -403,51 +383,42 @@ fn testFrameDecoder() !FrameDecoder {
     });
 }
 
-fn expectFrame(frame: extension_ui.SurfaceFrame, width: u32, height: u32, data: []const u8) !void {
-    try testing.expectEqualStrings("doom-demo", frame.id);
+fn expectFrame(frame: extension_ui.UiFrame, width: u32, height: u32, data: []const u8) !void {
+    try testing.expectEqualStrings("doom-demo", frame.node);
     try testing.expectEqual(width, frame.width);
     try testing.expectEqual(height, frame.height);
     try testing.expectEqualStrings(data, frame.data);
 }
 
-fn expectFrameFormat(frame: extension_ui.SurfaceFrame, format: extension_ui.SurfaceFormat, width: u32, height: u32, data: []const u8) !void {
+fn expectFrameFormat(frame: extension_ui.UiFrame, format: extension_ui.FrameFormat, width: u32, height: u32, data: []const u8) !void {
     try expectFrame(frame, width, height, data);
     try testing.expectEqual(format, frame.format);
 }
 
-const TestSurfaceSink = struct {
+const TestFrameSink = struct {
     allocator: std.mem.Allocator,
-    frames: std.ArrayList(extension_ui.SurfaceFrame) = .empty,
+    frames: std.ArrayList(extension_ui.UiFrame) = .empty,
 
-    fn deinit(self: *TestSurfaceSink) void {
+    fn deinit(self: *TestFrameSink) void {
         for (self.frames.items) |*frame| frame.deinit(self.allocator);
         self.frames.deinit(self.allocator);
     }
 
-    fn submit(ptr: *anyopaque, update: extension_ui.SurfaceUpdate) bool {
+    fn submit(ptr: *anyopaque, frame: extension_ui.UiFrame) bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        switch (update) {
-            .frame => |frame| {
-                self.frames.append(self.allocator, frame) catch {
-                    var failed = frame;
-                    failed.deinit(self.allocator);
-                    return false;
-                };
-                return true;
-            },
-            else => {
-                var failed = update;
-                failed.deinit(self.allocator);
-                return false;
-            },
-        }
+        self.frames.append(self.allocator, frame) catch {
+            var failed = frame;
+            failed.deinit(self.allocator);
+            return false;
+        };
+        return true;
     }
 };
 
 test "ui frame stdout adapter preserves frames split across chunks" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);
     defer queue.deinit();
-    var sink = TestSurfaceSink{ .allocator = testing.allocator };
+    var sink = TestFrameSink{ .allocator = testing.allocator };
     defer sink.deinit();
     var state = testFrameState(&queue, &sink);
     defer state.deinit();
@@ -466,7 +437,7 @@ test "ui frame stdout adapter preserves frames split across chunks" {
 test "ui frame stdout adapter validates rgba byte length and resyncs" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);
     defer queue.deinit();
-    var sink = TestSurfaceSink{ .allocator = testing.allocator };
+    var sink = TestFrameSink{ .allocator = testing.allocator };
     defer sink.deinit();
     var state = testFrameState(&queue, &sink);
     defer state.deinit();
@@ -479,12 +450,12 @@ test "ui frame stdout adapter validates rgba byte length and resyncs" {
     try expectFrame(sink.frames.items[0], 1, 1, "good");
 }
 
-test "job manager routes configured stdout frames to the surface sink" {
+test "job manager routes configured stdout frames to the frame sink" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);
     defer queue.deinit();
-    var sink = TestSurfaceSink{ .allocator = testing.allocator };
+    var sink = TestFrameSink{ .allocator = testing.allocator };
     defer sink.deinit();
-    var manager = try JobManager.init(testing.allocator, std.Options.debug_io, &queue, testSurfaceSinkAdapter(&sink));
+    var manager = try JobManager.init(testing.allocator, std.Options.debug_io, &queue, testFrameSinkAdapter(&sink));
     defer manager.deinit();
 
     const script = "printf 'FRAME 1 1 4\\nabcd'";
@@ -521,7 +492,7 @@ test "job manager routes configured stdout frames to the surface sink" {
 test "ui frame stdout adapter emits UI frames instead of job_stdout events" {
     var queue = try request_mod.RequestQueue.init(testing.allocator);
     defer queue.deinit();
-    var sink = TestSurfaceSink{ .allocator = testing.allocator };
+    var sink = TestFrameSink{ .allocator = testing.allocator };
     defer sink.deinit();
     var state = testFrameState(&queue, &sink);
     defer state.deinit();

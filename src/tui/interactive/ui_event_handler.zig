@@ -168,11 +168,9 @@ pub fn handle(self: anytype, ev: *UiEvent) void {
         .resume_sessions_failed => |f| self.applyResumeSessionsFailed(f.generation, f.message),
         .extension_commands_updated => |u| self.applyExtensionCommandsUpdate(u.commands),
         .extension_keybindings_updated => |u| self.applyExtensionKeybindingsUpdate(u.keybindings),
-        .extension_report_shown => |u| self.applyExtensionReport(u.report),
-        .extension_ui_published => |u| self.applyExtensionUiPublications(u.updates),
-        .extension_surface_updated => |u| self.applyExtensionSurfaceUpdates(u.updates),
+        .extension_ui_rendered => |u| self.applyExtensionRenderUpdates(u.updates),
+        .extension_ui_framed => |u| self.applyExtensionFrameUpdates(u.updates),
         .extension_editor_actions => |u| self.applyExtensionEditorActions(u.actions),
-        .extension_prompt_requested => |u| self.showExtensionPrompt(u.prompt, u.response),
         .session_new_started => {
             self.transcript.scrollToBottom(self.tui.width(), self.outputHeight());
             self.status_line.setPrimary("new session started", self.theme.fg(.success));

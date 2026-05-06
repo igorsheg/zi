@@ -1,7 +1,5 @@
 const std = @import("std");
 const ai_protocol = @import("../ai/protocol.zig");
-const extension_ui = @import("extensions/ui.zig");
-const request_mod = @import("request.zig");
 
 pub const RetryStart = struct {
     attempt: u32,
@@ -44,11 +42,6 @@ pub const CompactionEnd = struct {
     error_message: ?[]const u8 = null,
 };
 
-pub const ExtensionPromptRequest = struct {
-    prompt: extension_ui.PromptRequest,
-    response: *request_mod.ExtensionPromptResponse,
-};
-
 pub const SessionEvent = union(enum) {
     auto_retry_start: RetryStart,
     auto_retry_wait_finished: void,
@@ -56,5 +49,4 @@ pub const SessionEvent = union(enum) {
     compaction_start: CompactionStart,
     compaction_end: CompactionEnd,
     visible_models_changed: void,
-    extension_prompt_request: ExtensionPromptRequest,
 };

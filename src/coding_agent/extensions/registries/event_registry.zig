@@ -60,7 +60,6 @@ pub const EventKind = enum {
     session_before_tree,
     session_tree,
 
-    surface_input,
     job_stdout,
     job_stderr,
     job_exit,
@@ -193,8 +192,8 @@ test "EventRegistry subscribes in order and dispatches correct chain" {
     try testing.expectEqualStrings("ext-c", me[0].source_id);
 }
 
-test "EventKind reserves the full v2 event surface" {
-    try testing.expectEqual(@as(usize, 34), @typeInfo(EventKind).@"enum".fields.len);
+test "EventKind reserves the v3 event surface" {
+    try testing.expectEqual(@as(usize, 33), @typeInfo(EventKind).@"enum".fields.len);
 }
 
 test "EventKind.semantics matches spec" {

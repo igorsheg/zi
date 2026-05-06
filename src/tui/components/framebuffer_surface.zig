@@ -13,8 +13,7 @@ const Attributes = cell_mod.Attributes;
 
 pub const FramebufferSurface = struct {
     allocator: std.mem.Allocator,
-    open: ?extension_ui.SurfaceOpen = null,
-    frame: ?extension_ui.SurfaceFrame = null,
+    frame: ?extension_ui.UiFrame = null,
     focused: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) FramebufferSurface {
@@ -23,7 +22,6 @@ pub const FramebufferSurface = struct {
 
     pub fn deinit(self: *FramebufferSurface) void {
         self.clearFrame();
-        self.clearOpen();
     }
 
     pub fn component(self: *FramebufferSurface) Component {
@@ -38,57 +36,10 @@ pub const FramebufferSurface = struct {
         return false;
     }
 
-    pub fn keyboardSurfaceId(self: *const FramebufferSurface) ?[]const u8 {
-        const open = self.open orelse return null;
-        if (!open.wants_keyboard) return null;
-        return open.id;
-    }
-
-    pub fn apply(self: *FramebufferSurface, update: extension_ui.SurfaceUpdate) void {
-        switch (update) {
-            .open => |open| self.applyOpen(open),
-            .frame => |frame| self.applyFrame(frame),
-            .close => |close| self.applyClose(close),
-        }
-    }
-
-    fn applyOpen(self: *FramebufferSurface, open: extension_ui.SurfaceOpen) void {
-        self.clearOpen();
-        self.open = extension_ui.SurfaceOpen.clone(self.allocator, open) catch null;
-    }
-
-    fn applyFrame(self: *FramebufferSurface, frame: extension_ui.SurfaceFrame) void {
-        if (expectedFrameBytes(frame.width, frame.height, frame.format)) |needed| {
-            if (frame.data.len < needed) return;
-        } else return;
+    pub fn applyFrame(self: *FramebufferSurface, frame: extension_ui.UiFrame) void {
+        frame.validate() catch return;
         self.clearFrame();
-        self.frame = extension_ui.SurfaceFrame.clone(self.allocator, frame) catch null;
-        if (self.open == null) {
-            const synthetic = extension_ui.SurfaceOpen{
-                .state_owner_id = frame.state_owner_id,
-                .generation = frame.generation,
-                .id = frame.id,
-                .title = frame.id,
-                .width = frame.width,
-                .height = frame.height,
-                .format = frame.format,
-            };
-            self.open = extension_ui.SurfaceOpen.clone(self.allocator, synthetic) catch null;
-        }
-    }
-
-    fn applyClose(self: *FramebufferSurface, close: extension_ui.SurfaceClose) void {
-        if (self.open) |open| {
-            if (!std.mem.eql(u8, open.id, close.id)) return;
-        }
-        self.clearFrame();
-        self.clearOpen();
-        self.focused = false;
-    }
-
-    fn clearOpen(self: *FramebufferSurface) void {
-        if (self.open) |*open| open.deinit(self.allocator);
-        self.open = null;
+        self.frame = extension_ui.UiFrame.clone(self.allocator, frame) catch null;
     }
 
     fn clearFrame(self: *FramebufferSurface) void {
@@ -141,13 +92,11 @@ pub const FramebufferSurface = struct {
 
 const Rgb = struct { r: u8, g: u8, b: u8 };
 
-fn expectedFrameBytes(width: u32, height: u32, format: extension_ui.SurfaceFormat) ?usize {
-    const cells = std.math.mul(usize, @intCast(width), @intCast(height)) catch return null;
-    const bpp: usize = switch (format) { .rgba8888 => 4, .halfblock_rgb => 6 };
-    return std.math.mul(usize, cells, bpp) catch null;
+fn expectedFrameBytes(width: u32, height: u32, format: extension_ui.FrameFormat) ?usize {
+    return format.expectedBytes(width, height);
 }
 
-fn renderHalfblockFrame(region: Region, frame: extension_ui.SurfaceFrame, first_row: u32) void {
+fn renderHalfblockFrame(region: Region, frame: extension_ui.UiFrame, first_row: u32) void {
     if (region.width == 0 or region.height == 0 or frame.width == 0 or frame.height == 0) return;
     const expected = expectedFrameBytes(frame.width, frame.height, frame.format) orelse return;
     if (frame.data.len < expected) return;

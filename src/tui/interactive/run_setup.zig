@@ -79,7 +79,6 @@ pub fn mountInitialTree(self: *Interactive) void {
     self.status_container.addChild(self.status_line.component());
     self.editor_container.addChild(self.active_editor.component());
     self.editor_container.focused_child_index = 0;
-    self.composer_below_container.addChild(self.extension_ui_state.reportComponent());
     self.composer_below_container.addChild(self.extension_ui_state.messageComponent());
 
     self.tui.setFocus(self.active_editor.component());

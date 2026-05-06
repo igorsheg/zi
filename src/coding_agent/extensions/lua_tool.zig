@@ -905,9 +905,6 @@ const TestLabelEntry = struct {
 
 const TestStateStore = struct {
     allocator: std.mem.Allocator,
-    report: ?extension_ui.Report = null,
-    prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
-    ui_publications: std.ArrayListUnmanaged(extension_ui.UiPublication) = .empty,
     editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
     session_name: ?[]const u8 = null,
     note_kind: ?[]const u8 = null,
@@ -923,10 +920,6 @@ const TestStateStore = struct {
     frame_count: usize = 0,
 
     fn deinit(self: *TestStateStore) void {
-        if (self.report) |*report| report.deinit(self.allocator);
-        self.report = null;
-        self.clearPrompts();
-        self.clearUiPublications();
         self.clearEditorActions();
         if (self.session_name) |name| self.allocator.free(name);
         self.session_name = null;
@@ -1139,88 +1132,11 @@ const TestStateStore = struct {
         self.frame_count += 1;
     }
 
-    fn publishReport(session: *anyopaque, report: extension_ui.Report) !void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        if (self.report) |*old| old.deinit(self.allocator);
-        self.report = try extension_ui.Report.clone(self.allocator, report);
-    }
-
-    fn publishPrompt(session: *anyopaque, prompt: extension_ui.PromptRequest) !void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        var cloned = try extension_ui.PromptRequest.clone(self.allocator, prompt);
-        errdefer cloned.deinit(self.allocator);
-        try self.prompts.append(self.allocator, cloned);
-    }
-
-    fn cancelPrompts(session: *anyopaque) void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        self.cancel_count += 1;
-        self.clearPrompts();
-    }
-
-    fn clearPrompts(self: *TestStateStore) void {
-        for (self.prompts.items) |*prompt| prompt.deinit(self.allocator);
-        self.prompts.deinit(self.allocator);
-        self.prompts = .empty;
-    }
-
-    fn publishUi(session: *anyopaque, update: extension_ui.UiPublication) !void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        var cloned = try extension_ui.UiPublication.clone(self.allocator, update);
-        errdefer cloned.deinit(self.allocator);
-        try self.ui_publications.append(self.allocator, cloned);
-    }
-
-    fn revokeUi(session: *anyopaque) void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        self.revoke_count += 1;
-        self.clearUiPublications();
-    }
-
-    fn clearUiPublications(self: *TestStateStore) void {
-        for (self.ui_publications.items) |*update| update.deinit(self.allocator);
-        self.ui_publications.deinit(self.allocator);
-        self.ui_publications = .empty;
-    }
-
     fn publishEditorAction(session: *anyopaque, action: extension_ui.EditorAction) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         var cloned = try extension_ui.EditorAction.clone(self.allocator, action);
         errdefer cloned.deinit(self.allocator);
         try self.editor_actions.append(self.allocator, cloned);
-    }
-
-    fn resolvePrompt(session: *anyopaque, prompt: extension_ui.PromptRequest, response: *request_mod.ExtensionPromptResponse) void {
-        const self: *TestStateStore = @ptrCast(@alignCast(session));
-        if (prompt.timeout_ms == 1) return response.finish(.timeout);
-        switch (prompt.kind) {
-            .confirm => response.finish(.{ .confirm = true }),
-            .select => {
-                const selected = if (prompt.options.len > 0) prompt.options[0] else null;
-                const selected_id = if (selected) |option| option.id else "";
-                const text = self.allocator.dupe(u8, selected_id) catch return response.finish(.{ .value = null });
-                const label = if (selected) |option| self.allocator.dupe(u8, option.label) catch null else null;
-                const description = if (selected) |option| if (option.description) |value| self.allocator.dupe(u8, value) catch null else null else null;
-                const search = if (selected) |option| if (option.search) |value| self.allocator.dupe(u8, value) catch null else null else null;
-                const preview = if (selected) |option| if (option.preview) |value| self.allocator.dupe(u8, value) catch null else null else null;
-                response.finish(.{ .value = .{
-                    .text = text,
-                    .allocator = self.allocator,
-                    .label = label,
-                    .description = description,
-                    .search = search,
-                    .preview = preview,
-                } });
-            },
-            .input => {
-                const text = self.allocator.dupe(u8, "typed") catch return response.finish(.{ .value = null });
-                response.finish(.{ .value = .{ .text = text, .allocator = self.allocator } });
-            },
-            .editor => {
-                const text = self.allocator.dupe(u8, "edited") catch return response.finish(.{ .value = null });
-                response.finish(.{ .value = .{ .text = text, .allocator = self.allocator } });
-            },
-        }
     }
 
     fn clearEditorActionsCallback(session: *anyopaque) void {
@@ -1263,11 +1179,6 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_entries_get = &TestStateStore.entries,
         .publish_render = &TestStateStore.publishRender,
         .publish_frame = &TestStateStore.publishFrame,
-        .publish_report = &TestStateStore.publishReport,
-        .publish_prompt = &TestStateStore.publishPrompt,
-        .cancel_prompts = &TestStateStore.cancelPrompts,
-        .publish_ui = &TestStateStore.publishUi,
-        .revoke_ui = &TestStateStore.revokeUi,
         .publish_editor_action = &TestStateStore.publishEditorAction,
         .clear_editor_actions = &TestStateStore.clearEditorActionsCallback,
     };

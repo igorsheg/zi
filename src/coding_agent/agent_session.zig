@@ -527,20 +527,12 @@ pub const AgentSession = struct {
         }
     }
 
-    pub fn takePendingExtensionReport(self: *AgentSession) ?extension_ui.Report {
-        return self.pending_extension_ui.takeReport();
+    pub fn takePendingExtensionRenderUpdates(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.RenderSpec {
+        return self.pending_extension_ui.takeRenderUpdates(allocator);
     }
 
-    pub fn pendingExtensionPromptCount(self: *const AgentSession) usize {
-        return self.pending_extension_ui.promptCount();
-    }
-
-    pub fn takePendingExtensionUiPublications(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.UiPublication {
-        return self.pending_extension_ui.takeUiPublications(allocator);
-    }
-
-    pub fn takePendingExtensionSurfaceUpdates(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.SurfaceUpdate {
-        return self.pending_extension_ui.takeSurfaceUpdates(allocator);
+    pub fn takePendingExtensionFrameUpdates(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.UiFrame {
+        return self.pending_extension_ui.takeFrameUpdates(allocator);
     }
 
     pub fn takePendingExtensionEditorActions(self: *AgentSession, allocator: std.mem.Allocator) ![]extension_ui.EditorAction {

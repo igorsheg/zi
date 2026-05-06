@@ -1,6 +1,4 @@
 const coding_agent_mod = @import("../../coding_agent/root.zig");
-const extension_ui = @import("../../coding_agent/extensions/ui.zig");
-const request_mod = @import("../../coding_agent/request.zig");
 
 pub fn handle(self: anytype, event: anytype) void {
     switch (event) {
@@ -41,13 +39,6 @@ pub fn handle(self: anytype, event: anytype) void {
         .visible_models_changed => {
             self.publishVisibleModelsSnapshot();
             self.publishStatusSnapshot();
-        },
-        .extension_prompt_request => |request| {
-            const prompt = extension_ui.PromptRequest.clone(self.msg_allocator, request.prompt) catch {
-                request.response.finish(request_mod.ExtensionPromptResponse.defaultFor(request.prompt.kind));
-                return;
-            };
-            _ = self.publishLifecycleUiEvent(.{ .extension_prompt_requested = .{ .prompt = prompt, .response = request.response } });
         },
     }
 }

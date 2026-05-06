@@ -4,10 +4,8 @@ const extension_ui = @import("../extensions/ui.zig");
 
 pub const PendingExtensionUi = struct {
     allocator: std.mem.Allocator,
-    report: ?extension_ui.Report = null,
-    prompts: std.ArrayListUnmanaged(extension_ui.PromptRequest) = .empty,
-    ui_publications: std.ArrayListUnmanaged(extension_ui.UiPublication) = .empty,
-    surface_updates: std.ArrayListUnmanaged(extension_ui.SurfaceUpdate) = .empty,
+    render_updates: std.ArrayListUnmanaged(extension_ui.RenderSpec) = .empty,
+    frame_updates: std.ArrayListUnmanaged(extension_ui.UiFrame) = .empty,
     editor_actions: std.ArrayListUnmanaged(extension_ui.EditorAction) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) PendingExtensionUi {
@@ -15,97 +13,60 @@ pub const PendingExtensionUi = struct {
     }
 
     pub fn deinit(self: *PendingExtensionUi) void {
-        self.clearReport();
-        self.clearPrompts();
-        self.clearUiPublications();
-        self.clearSurfaceUpdates();
+        self.clearRenderUpdates();
+        self.clearFrameUpdates();
         self.clearEditorActions();
     }
 
-    pub fn publishReport(self: *PendingExtensionUi, report: extension_ui.Report) !void {
-        self.clearReport();
-        self.report = try extension_ui.Report.clone(self.allocator, report);
-    }
-
-    pub fn takeReport(self: *PendingExtensionUi) ?extension_ui.Report {
-        const report = self.report;
-        self.report = null;
-        return report;
-    }
-
-    pub fn clearReport(self: *PendingExtensionUi) void {
-        if (self.report) |*report| report.deinit(self.allocator);
-        self.report = null;
-    }
-
-    pub fn publishPrompt(self: *PendingExtensionUi, prompt: extension_ui.PromptRequest) !void {
-        var cloned = try extension_ui.PromptRequest.clone(self.allocator, prompt);
+    pub fn publishRender(self: *PendingExtensionUi, spec: extension_ui.RenderSpec) !void {
+        var cloned = try extension_ui.RenderSpec.clone(self.allocator, spec);
         errdefer cloned.deinit(self.allocator);
-        try self.prompts.append(self.allocator, cloned);
+        try self.render_updates.append(self.allocator, cloned);
     }
 
-    pub fn promptCount(self: *const PendingExtensionUi) usize {
-        return self.prompts.items.len;
-    }
-
-    pub fn clearPrompts(self: *PendingExtensionUi) void {
-        for (self.prompts.items) |*prompt| prompt.deinit(self.allocator);
-        self.prompts.deinit(self.allocator);
-        self.prompts = .empty;
-    }
-
-    pub fn publishUi(self: *PendingExtensionUi, update: extension_ui.UiPublication) !void {
-        var cloned = try extension_ui.UiPublication.clone(self.allocator, update);
-        errdefer cloned.deinit(self.allocator);
-        try self.ui_publications.append(self.allocator, cloned);
-    }
-
-    pub fn takeUiPublications(self: *PendingExtensionUi, allocator: std.mem.Allocator) ![]extension_ui.UiPublication {
-        const out = try allocator.alloc(extension_ui.UiPublication, self.ui_publications.items.len);
+    pub fn takeRenderUpdates(self: *PendingExtensionUi, allocator: std.mem.Allocator) ![]extension_ui.RenderSpec {
+        const out = try allocator.alloc(extension_ui.RenderSpec, self.render_updates.items.len);
         errdefer allocator.free(out);
         var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |*update| update.deinit(allocator);
-        }
-        for (self.ui_publications.items, 0..) |update, i| {
-            out[i] = try extension_ui.UiPublication.clone(allocator, update);
+        errdefer for (out[0..initialized]) |*update| update.deinit(allocator);
+        for (self.render_updates.items, 0..) |update, i| {
+            out[i] = try extension_ui.RenderSpec.clone(allocator, update);
             initialized += 1;
         }
-        self.clearUiPublications();
+        self.clearRenderUpdates();
         return out;
     }
 
-    pub fn clearUiPublications(self: *PendingExtensionUi) void {
-        for (self.ui_publications.items) |*update| update.deinit(self.allocator);
-        self.ui_publications.deinit(self.allocator);
-        self.ui_publications = .empty;
+    pub fn clearRenderUpdates(self: *PendingExtensionUi) void {
+        for (self.render_updates.items) |*update| update.deinit(self.allocator);
+        self.render_updates.deinit(self.allocator);
+        self.render_updates = .empty;
     }
 
-    pub fn publishSurfaceUpdate(self: *PendingExtensionUi, update: extension_ui.SurfaceUpdate) !void {
-        var cloned = try extension_ui.SurfaceUpdate.clone(self.allocator, update);
+    pub fn publishFrame(self: *PendingExtensionUi, frame: extension_ui.UiFrame) !void {
+        try frame.validate();
+        var cloned = try extension_ui.UiFrame.clone(self.allocator, frame);
         errdefer cloned.deinit(self.allocator);
-        try self.surface_updates.append(self.allocator, cloned);
+        try self.frame_updates.append(self.allocator, cloned);
     }
 
-    pub fn takeSurfaceUpdates(self: *PendingExtensionUi, allocator: std.mem.Allocator) ![]extension_ui.SurfaceUpdate {
-        const out = try allocator.alloc(extension_ui.SurfaceUpdate, self.surface_updates.items.len);
+    pub fn takeFrameUpdates(self: *PendingExtensionUi, allocator: std.mem.Allocator) ![]extension_ui.UiFrame {
+        const out = try allocator.alloc(extension_ui.UiFrame, self.frame_updates.items.len);
         errdefer allocator.free(out);
         var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |*update| update.deinit(allocator);
-        }
-        for (self.surface_updates.items, 0..) |update, i| {
-            out[i] = try extension_ui.SurfaceUpdate.clone(allocator, update);
+        errdefer for (out[0..initialized]) |*update| update.deinit(allocator);
+        for (self.frame_updates.items, 0..) |update, i| {
+            out[i] = try extension_ui.UiFrame.clone(allocator, update);
             initialized += 1;
         }
-        self.clearSurfaceUpdates();
+        self.clearFrameUpdates();
         return out;
     }
 
-    pub fn clearSurfaceUpdates(self: *PendingExtensionUi) void {
-        for (self.surface_updates.items) |*update| update.deinit(self.allocator);
-        self.surface_updates.deinit(self.allocator);
-        self.surface_updates = .empty;
+    pub fn clearFrameUpdates(self: *PendingExtensionUi) void {
+        for (self.frame_updates.items) |*update| update.deinit(self.allocator);
+        self.frame_updates.deinit(self.allocator);
+        self.frame_updates = .empty;
     }
 
     pub fn publishEditorAction(self: *PendingExtensionUi, action: extension_ui.EditorAction) !void {
@@ -118,9 +79,7 @@ pub const PendingExtensionUi = struct {
         const out = try allocator.alloc(extension_ui.EditorAction, self.editor_actions.items.len);
         errdefer allocator.free(out);
         var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |*action| action.deinit(allocator);
-        }
+        errdefer for (out[0..initialized]) |*action| action.deinit(allocator);
         for (self.editor_actions.items, 0..) |action, i| {
             out[i] = try extension_ui.EditorAction.clone(allocator, action);
             initialized += 1;

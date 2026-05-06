@@ -54,67 +54,6 @@ pub const ExtensionOAuthLoginCallbacks = struct {
     ctx: ?*anyopaque = null,
 };
 
-pub const ExtensionPromptResponse = struct {
-    mutex: std.Io.Mutex = .init,
-    condition: std.Io.Condition = .init,
-    completed: bool = false,
-    result: ?Result = null,
-
-    pub const OwnedValue = struct {
-        text: []const u8,
-        allocator: std.mem.Allocator,
-        label: ?[]const u8 = null,
-        description: ?[]const u8 = null,
-        search: ?[]const u8 = null,
-        preview: ?[]const u8 = null,
-
-        pub fn deinit(self: OwnedValue) void {
-            self.allocator.free(self.text);
-            if (self.label) |value| self.allocator.free(value);
-            if (self.description) |value| self.allocator.free(value);
-            if (self.search) |value| self.allocator.free(value);
-            if (self.preview) |value| self.allocator.free(value);
-        }
-    };
-
-    pub const Result = union(enum) {
-        confirm: bool,
-        value: ?OwnedValue,
-        timeout,
-
-        pub fn deinit(self: *Result) void {
-            switch (self.*) {
-                .value => |maybe| if (maybe) |value| value.deinit(),
-                .confirm, .timeout => {},
-            }
-            self.* = undefined;
-        }
-    };
-
-    pub fn defaultFor(kind: extension_ui.PromptKind) Result {
-        return switch (kind) {
-            .confirm => .{ .confirm = false },
-            .select, .input, .editor => .{ .value = null },
-        };
-    }
-
-    pub fn finish(self: *ExtensionPromptResponse, result: Result) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-        if (self.completed) return;
-        self.result = result;
-        self.completed = true;
-        self.condition.broadcast(std.Options.debug_io);
-    }
-
-    pub fn wait(self: *ExtensionPromptResponse) Result {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-        while (!self.completed) self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
-        return self.result.?;
-    }
-};
-
 pub const ExtensionOAuthLoginResponse = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
@@ -225,7 +164,6 @@ pub const AgentRequest = union(enum) {
     extension_keybinding: struct {
         id: []const u8,
     },
-    extension_surface_input: extension_ui.SurfaceInput,
     extension_job_event: extension_ui.JobEvent,
     extension_oauth_login: struct {
         provider_id: []const u8,
@@ -265,7 +203,6 @@ pub const AgentRequest = union(enum) {
                 allocator.free(ec.args);
             },
             .extension_keybinding => |ek| allocator.free(ek.id),
-            .extension_surface_input => |*input| input.deinit(allocator),
             .extension_job_event => |*event| event.deinit(allocator),
             .extension_oauth_login => |oauth| allocator.free(oauth.provider_id),
             .extension_oauth_refresh => |oauth| {

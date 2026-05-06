@@ -168,11 +168,6 @@ pub const RuntimeHost = struct {
         try runner.dispatchKeybinding(id);
     }
 
-    pub fn dispatchExtensionSurfaceInput(self: *RuntimeHost, input: extension_ui.SurfaceInput) !void {
-        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
-        try runner.dispatchSurfaceInput(input);
-    }
-
     pub fn dispatchExtensionJobEvent(self: *RuntimeHost, event: extension_ui.JobEvent) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchJobEvent(event);
@@ -195,18 +190,12 @@ pub const RuntimeHost = struct {
         try runner.resumeAsync(id, owned);
     }
 
-    pub fn takePendingExtensionReport(self: *RuntimeHost, allocator: std.mem.Allocator) ?extension_ui.Report {
-        var report = self.session.takePendingExtensionReport() orelse return null;
-        defer report.deinit(self.session.allocator);
-        return extension_ui.Report.clone(allocator, report) catch null;
+    pub fn takePendingExtensionRenderUpdates(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.RenderSpec {
+        return self.session.takePendingExtensionRenderUpdates(allocator) catch allocator.alloc(extension_ui.RenderSpec, 0) catch &.{};
     }
 
-    pub fn takePendingExtensionUiPublications(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.UiPublication {
-        return self.session.takePendingExtensionUiPublications(allocator) catch allocator.alloc(extension_ui.UiPublication, 0) catch &.{};
-    }
-
-    pub fn takePendingExtensionSurfaceUpdates(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.SurfaceUpdate {
-        return self.session.takePendingExtensionSurfaceUpdates(allocator) catch allocator.alloc(extension_ui.SurfaceUpdate, 0) catch &.{};
+    pub fn takePendingExtensionFrameUpdates(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.UiFrame {
+        return self.session.takePendingExtensionFrameUpdates(allocator) catch allocator.alloc(extension_ui.UiFrame, 0) catch &.{};
     }
 
     pub fn takePendingExtensionEditorActions(self: *RuntimeHost, allocator: std.mem.Allocator) []extension_ui.EditorAction {

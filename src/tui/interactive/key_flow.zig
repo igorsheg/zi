@@ -1,28 +1,18 @@
 const std = @import("std");
 const keybindings = @import("../keybindings.zig");
 const keys_mod = @import("../terminal/keys.zig");
-const surface_input_flow = @import("surface_input.zig");
 
 const Key = keys_mod.Key;
 
 pub fn handle(self: anytype, key: Key) void {
-    if (surface_input_flow.handle(self, key)) return;
 
     if (self.tui.hasOverlay()) {
         if (self.tui.handleInput(key)) {
-            if (self.extension_prompt_close_after_submit) {
-                self.extension_prompt_close_after_submit = false;
-                self.closeExtensionPromptFlow(false);
-            }
             self.tui.dirty = true;
             return;
         }
         if (keybindings.matches(.select_cancel, key)) {
-            if (self.extension_prompt_flow != null) {
-                self.closeExtensionPromptFlow(true);
-            } else {
-                self.tui.hideOverlay();
-            }
+            self.tui.hideOverlay();
             return;
         }
         return;
