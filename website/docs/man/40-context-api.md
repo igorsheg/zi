@@ -59,36 +59,39 @@ Most tools, commands, and events receive `ctx`.
 
 ## UI
 
-`ctx.ui` publishes intent. Extensions do not own terminal components or redraw.
+`ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v3 exposes two methods:
 
-`ctx.ui.message(text, opts?)`
-: Publish short feedback. `opts.id` dedupes/updates. `opts.kind` is `info`, `warning`, `error`, or `success`.
+`ctx.ui.render(spec)`
+: Publish, update, or remove a retained UI view. `spec.id` is required. `spec.target` is one of `status`, `toast`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`box`, `text`, `chip`, `progress`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
 
-`ctx.ui.status({ id, text, value, lifetime? })`
-: Publish compact retained state. Nil clears it.
+`ctx.ui.frame(spec)`
+: Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`.
 
-`ctx.ui.progress({ id, status?, title?, current?, total?, detail?, indeterminate?, text?, lifetime? })`
-: Publish retained progress. `status` is `running`, `done`, `error`, or `cancelled`.
+Example:
 
-`ctx.ui.report({ id, title, body, format?, transient? })`
-: Publish a readable report. Current format is plain text.
+```lua
+ctx.ui.render({
+  id = "hello",
+  target = { kind = "toast", anchor = "top_right", lifetime = "until_input" },
+  root = { type = "text", text = "Hello from zi" },
+})
 
-`ctx.ui.surface_open({ id, title?, width, height, format = "rgba8888", input? })`
-: Open or replace an ephemeral interactive surface. `input.keyboard = true` asks zi to focus it and send `surface_input` events. `Esc` returns focus to the editor.
+ctx.ui.render({
+  id = "panel",
+  title = "Panel",
+  target = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" },
+  keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
+  root = { type = "box", style = { border = true, padding = 1 }, children = {
+    { type = "text", text = "Press q or Esc to close." },
+  } },
+})
 
-`ctx.ui.surface_frame({ id, width, height, format = "rgba8888", data })`
-: Publish the latest RGBA frame. `data` is `width * height * 4` bytes.
-
-`ctx.ui.surface_close({ id })`
-: Close a surface.
-
-`ctx.ui.pick({ title, placeholder?, empty_text?, options|items, timeout_ms? })`
-: Ask the user to pick an item. Returns `{ status, value, item? }`.
-
-`ctx.ui.prompt({ kind = "confirm"|"select"|"input"|"editor", ... })`
-: Ask the user for input. Returns `{ status, value? }`.
-
-Surface options may include `placement` and `lifetime`. `lifetime` is `session` or `until_input`.
+zi.on("ui", function(event, ctx)
+  if event.view == "panel" and event.action == "close" then
+    ctx.ui.render({ id = "panel", remove = true })
+  end
+end)
+```
 
 ## Editor
 

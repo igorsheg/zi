@@ -1,42 +1,23 @@
-return function(zi)
-  local starters = {
-    {
-      label = "Plan",
-      value = "Create a concise implementation plan for: ",
-      description = "Ask Zi to plan before editing",
-    },
-    {
-      label = "Explain",
-      value = "Explain the relevant code paths and tradeoffs for: ",
-      description = "Ask for codebase explanation",
-    },
-    {
-      label = "Test",
-      value = "Add meaningful behavior tests for: ",
-      description = "Ask for test coverage",
-    },
-    {
-      label = "Review",
-      value = "Review this change for correctness, edge cases, and maintainability: ",
-      description = "Ask for a focused review",
-    },
-  }
-
-  zi.command({
-    name = "starter-prompts",
-    description = "Pick a starter prompt and append it to the editor.",
-    handler = function(args, ctx)
-      if not ctx.ui then return end
-
-      local result = ctx.ui.pick({
-        title = "Starter prompts",
-        placeholder = "Choose a prompt starter...",
-        items = starters,
-      })
-
-      if result and result.status == "submitted" and result.value then
-        ctx.editor.insert_text(result.value)
-      end
-    end,
-  })
+local function overlay(ctx, id, title, lines)
+  if not (ctx and ctx.ui and ctx.ui.render) then return end
+  local children = { { type = "text", text = title } }
+  for _, line in ipairs(lines or {}) do children[#children + 1] = { type = "text", text = tostring(line) } end
+  ctx.ui.render({ id = id, title = title, target = { kind = "overlay", width = "70%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "box", style = { border = true, padding = 1 }, children = children } })
 end
+
+zi.on("ui", function(event, ctx)
+  if event.action == "close" and ctx and ctx.ui and ctx.ui.render then ctx.ui.render({ id = event.view, remove = true }) end
+end)
+
+zi.command({
+  name = "starter-prompts",
+  description = "Show starter prompts in a v3 overlay",
+  handler = function(_, ctx)
+    overlay(ctx, "starter-prompts", "Starter prompts", {
+      "• Explain this codebase",
+      "• Find a small bug and fix it",
+      "• Write tests for the current change",
+      "Copy one into the editor; input/select node events are deferred.",
+    })
+  end,
+})

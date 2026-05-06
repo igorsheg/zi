@@ -111,11 +111,12 @@ return function(zi)
     name = "hello",
     description = "Show a greeting.",
     handler = function(args, ctx)
-      ctx.ui.report({
+      ctx.ui.render({
         id = "hello-command",
         title = "hello",
-        body = "hello, " .. (args or "zi"),
-        transient = true,
+        target = { kind = "overlay", width = "60%", anchor = "center", backdrop = "dim" },
+        keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
+        root = { type = "text", text = "hello, " .. (args or "zi") },
       })
     end,
   })
@@ -229,8 +230,8 @@ Event names:
 `session_before_tree`, `session_tree`
 : Pre/post tree navigation events.
 
-`surface_input`
-: Keyboard input routed to a focused extension surface. Host escape/unfocus behavior is not extension-owned.
+`ui`
+: Key interactions from focused v3 UI views. Handlers receive `{ type = "key", view, node?, action?, key?, ctrl, alt, shift }`. Use `ctx.ui.render({ id = event.view, remove = true })` to close views.
 
 `job_stdout`, `job_stderr`, `job_exit`, `job_json`
 : Job output and exit lifecycle events.
