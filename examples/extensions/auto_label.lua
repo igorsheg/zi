@@ -37,7 +37,7 @@ local function preview_entry(entry)
   return preview
 end
 
-zi.register_command({
+zi.command({
   name = "labels",
   description = "List durable session labels.",
   handler = function(args, ctx)
@@ -61,7 +61,7 @@ zi.register_command({
   end,
 })
 
-zi.register_command({
+zi.command({
   name = "decisions",
   description = "List entries labelled as decisions.",
   handler = function(_, ctx)

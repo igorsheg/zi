@@ -6,16 +6,16 @@ The API is plain Lua. Tables in, tables out. Keep names exact and results small.
 
 ## `zi` table
 
-`zi.register_tool(spec)`
+`zi.tool(spec)`
 : Register a model-visible tool. Duplicate names are ignored; returns `false`.
 
-`zi.register_command(spec)`
+`zi.command(spec)`
 : Register an interactive slash command. Duplicate names get resolved invocation names.
 
-`zi.register_provider(name, config)`
+`zi.provider(name, config)`
 : Register a provider/model claim. Existing claims are not replaced unless owned by this source.
 
-`zi.unregister_provider(name)`
+`zi.unprovider(name)`
 : Remove this extension's provider claim.
 
 `zi.on(event_name, handler)`
@@ -46,7 +46,7 @@ The API is plain Lua. Tables in, tables out. Keep names exact and results small.
 
 A tool is visible to the model. Keep it narrow.
 
-`zi.register_tool(spec)` accepts:
+`zi.tool(spec)` accepts:
 
 `name`
 : Required string. Model-visible id and collision key.
@@ -94,7 +94,7 @@ Tool result:
 
 Commands are direct user actions.
 
-`zi.register_command(spec)` accepts:
+`zi.command(spec)` accepts:
 
 `name`
 : Required string. Slash command name without `/`.
@@ -107,7 +107,7 @@ Commands are direct user actions.
 
 ```lua
 return function(zi)
-  zi.register_command({
+  zi.command({
     name = "hello",
     description = "Show a greeting.",
     handler = function(args, ctx)
@@ -136,7 +136,7 @@ Built-ins stay TUI-local when they need immediate UI/session behavior. Extension
 
 Providers describe visible model/provider choices. Use events to rewrite requests.
 
-`zi.register_provider(name, config)` supports:
+`zi.provider(name, config)` supports:
 
 `api`
 : Required for custom provider names. Built-in provider overrides may infer it.

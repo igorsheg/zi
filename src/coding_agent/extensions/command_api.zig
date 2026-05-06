@@ -6,26 +6,28 @@ const tool_registry = @import("registries/tool_registry.zig");
 
 const c = lua_runtime.c;
 
-/// Lua `zi.register_command(def)`: duplicate names surface as `name:1`, `name:2`, …
-pub fn ziRegisterCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
+/// Lua `zi.command(spec)`: duplicate names surface as `name:1`, `name:2`, …
+pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const api_name = "zi.command";
+
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
     if (c.lua_type(L, 1) != c.LUA_TTABLE) {
-        return luaError(L, "register_command: expected a table argument");
+        return luaErrorFmt(L, "{s}: expected spec table", .{api_name});
     }
 
     const cmd = buildCommandDef(L, runner) catch |err| {
-        return luaError(L, switch (err) {
-            error.MissingName => "register_command: missing required field \"name\" (string)",
-            error.InvalidDescription => "register_command: \"description\" must be a string",
-            error.MissingHandler => "register_command: missing required field \"handler\" (function)",
-            error.InvalidHandler => "register_command: \"handler\" must be a function",
-            error.OutOfMemory => "register_command: out of memory",
+        return luaApiError(L, api_name, switch (err) {
+            error.MissingName => "missing required field 'name' (string)",
+            error.InvalidDescription => "field 'description' must be a string",
+            error.MissingHandler => "missing required field 'handler' (function)",
+            error.InvalidHandler => "field 'handler' must be a function",
+            error.OutOfMemory => "out of memory",
         });
     };
 
-    return registerCommandDef(L, runner, cmd, "register_command");
+    return registerCommandDef(L, runner, cmd, api_name);
 }
 
 fn registerCommandDef(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, cmd_in: command_registry.CommandDef, api_name: [:0]const u8) c_int {
@@ -131,6 +133,14 @@ fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
 fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
+    _ = c.lua_pushstring(L, msg.ptr);
+    _ = c.lua_error(L);
+    return 0;
+}
+
+fn luaApiError(L: *c.lua_State, api_name: []const u8, detail: []const u8) c_int {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ api_name, detail }) catch "lua error";
     _ = c.lua_pushstring(L, msg.ptr);
     _ = c.lua_error(L);
     return 0;

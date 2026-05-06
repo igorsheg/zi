@@ -2,7 +2,7 @@
 --
 -- /git-status
 
-zi.register_command({
+zi.command({
   name = "git-status",
   description = "Show git status for the current working directory.",
   handler = function(_, ctx)

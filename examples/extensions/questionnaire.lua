@@ -2,7 +2,7 @@
 -- This intentionally avoids raw/custom TUI access. The extension describes
 -- semantic prompts; zi owns rendering, input handling, and lifecycle.
 
-zi.register_tool({
+zi.tool({
   name = "questionnaire",
   label = "Questionnaire",
   description = "Ask a small multi-step questionnaire using ctx.ui.prompt.",

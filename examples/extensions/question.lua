@@ -2,7 +2,7 @@
 -- Product-equivalent to pi-mono question.ts without raw custom UI: the tool asks
 -- the host to present a select prompt and receives only the semantic answer.
 
-zi.register_tool({
+zi.tool({
   name = "question",
   label = "Question",
   description = "Ask the user a question and let them pick from options.",

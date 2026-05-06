@@ -1,7 +1,7 @@
 //! Lua-driven tool renderers.
 //!
 //! Bridges the first vertical of zi's host-owned presentation contract:
-//! `zi.register_tool({ render_call = ..., render_result = ... })` maps
+//! `zi.tool({ render_call = ..., render_result = ... })` maps
 //! to the tool `call` and `result` presentation slots and returns owned,
 //! width-agnostic presentation documents.
 //!
@@ -521,7 +521,7 @@ test "dispatchRenderCall parses args into an owned call presentation document" {
     api.installZiTable(&state, &runner);
 
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "callable",
         \\  description = "callable",
         \\  parameters = { type = "object" },
@@ -562,7 +562,7 @@ test "dispatchRenderResult renders collapsed and expanded result presentations" 
     api.installZiTable(&state, &runner);
 
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "rich",
         \\  description = "rich",
         \\  parameters = { type = "object" },
@@ -611,7 +611,7 @@ test "dispatchRenderResultFromResult owns rendered output after host result chan
     api.installZiTable(&state, &runner);
 
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "owned",
         \\  description = "owned",
         \\  parameters = { type = "object" },
@@ -651,20 +651,20 @@ test "renderer dispatch fails open for missing hooks and lua errors" {
     api.installZiTable(&state, &runner);
 
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "plain",
         \\  description = "no renderer",
         \\  parameters = { type = "object" },
         \\  execute = function() end,
         \\})
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "bad_call",
         \\  description = "bad call",
         \\  parameters = { type = "object" },
         \\  execute = function() end,
         \\  render_call = function() error("nope") end,
         \\})
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "bad_result",
         \\  description = "bad result",
         \\  parameters = { type = "object" },

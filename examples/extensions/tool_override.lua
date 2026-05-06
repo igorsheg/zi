@@ -13,7 +13,7 @@ return function(zi)
     return false
   end
 
-  zi.register_tool({
+  zi.tool({
     name = "read",
     label = "read (audited)",
     description = "Read a file with a small sensitive-path gate. This intentionally overrides the builtin read tool while preserving the builtin read renderer by same-name inheritance.",

@@ -10,7 +10,7 @@ return function(zi)
 
   local function register_echo_tool(name, label, prefix)
     if registered[name] then return false end
-    local ok = zi.register_tool({
+    local ok = zi.tool({
       name = name,
       label = label,
       description = "Echo a message with prefix: " .. prefix,
@@ -46,7 +46,7 @@ return function(zi)
     register_echo_tool("echo_session", "Echo Session", "[session] ")
   end)
 
-  zi.register_command({
+  zi.command({
     name = "add-echo-tool",
     description = "Register a new echo tool dynamically: /add-echo-tool <tool_name>",
     handler = function(args, ctx)

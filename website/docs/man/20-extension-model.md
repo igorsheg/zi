@@ -72,7 +72,7 @@ zi installs a global `zi` table. An extension may register at top level or retur
 
 ```lua
 return function(zi)
-  zi.register_tool({
+  zi.tool({
     name = "greet",
     description = "Generate a greeting.",
     parameters = {

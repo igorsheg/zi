@@ -63,7 +63,7 @@ zi.on("session_shutdown", function(_, ctx)
   if ctx.ui and ctx.ui.surface_close then ctx.ui.surface_close({ id = surface_id }) end
 end)
 
-zi.register_command({
+zi.command({
   name = "doom",
   description = "Play DOOM in a zi surface. Optional: /doom /path/to/doom1.wad",
   handler = function(args, ctx)

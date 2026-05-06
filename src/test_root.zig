@@ -40,6 +40,7 @@ test {
     _ = @import("coding_agent/extensions/registries/root.zig");
     _ = @import("coding_agent/extensions/runner.zig");
     _ = @import("coding_agent/extensions/api.zig");
+    _ = @import("coding_agent/extensions/api_v3.zig");
     _ = @import("coding_agent/extensions/dispatch.zig");
     _ = @import("coding_agent/extensions/event_bridge.zig");
     _ = @import("coding_agent/extensions/system_worker.zig");

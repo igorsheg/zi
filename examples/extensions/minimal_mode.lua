@@ -1,5 +1,5 @@
 return function(zi)
-  zi.register_tool({
+  zi.tool({
     name = "read",
     label = "read (minimal)",
     description = "Read a text file with minimal collapsed presentation and fuller expanded presentation.",

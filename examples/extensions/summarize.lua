@@ -28,7 +28,7 @@ local function serialize_messages(messages)
 end
 
 
-zi.register_command({
+zi.command({
   name = "summarize",
   description = "Summarize recent session messages",
   handler = function(args, ctx)

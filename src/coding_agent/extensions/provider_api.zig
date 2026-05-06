@@ -55,60 +55,60 @@ const RegisterProviderError = error{
     OutOfMemory,
 };
 
-/// Lua `zi.register_provider(name, config)`: returns `false` when another owner already claimed the provider.
-pub fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
+/// Lua `zi.provider(name, config)`: returns `false` when another owner already claimed the provider.
+pub fn ziProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
     const claim = buildProviderRegistration(L, runner) catch |err| {
         return luaError(L, switch (err) {
-            error.MissingName, error.InvalidName => "register_provider: expected provider name string as first argument",
-            error.MissingConfig, error.InvalidConfig => "register_provider: expected config table as second argument",
-            error.MissingApi => "register_provider: missing required field 'api'",
-            error.InvalidApi => "register_provider: field 'api' must be a string",
-            error.BuiltinOverrideApiMismatch => "register_provider: field 'api' must match the built-in provider api family in this slice",
-            error.MissingBaseUrl => "register_provider: missing required field 'base_url'",
-            error.InvalidBaseUrl => "register_provider: field 'base_url' must be a string",
-            error.InvalidApiKey => "register_provider: field 'api_key' must be a string",
-            error.InvalidHeaders => "register_provider: field 'headers' must be a string map",
-            error.InvalidOAuth => "register_provider: field 'oauth' only supports optional string field 'name' plus function fields 'login', 'refresh_token', 'refreshToken', and 'getApiKey' in this slice",
-            error.InvalidOAuthName => "register_provider: field 'oauth.name' must be a string when present",
-            error.InvalidOAuthLogin => "register_provider: field 'oauth.login' must be a function",
-            error.InvalidOAuthRefreshToken => "register_provider: field 'oauth.refresh_token' must be a function",
-            error.InvalidOAuthRefreshTokenCamel => "register_provider: field 'oauth.refreshToken' must be a function",
-            error.InvalidOAuthGetApiKey => "register_provider: field 'oauth.getApiKey' must be a function",
-            error.UnsupportedOAuthModifyModels => "register_provider: field 'oauth.modifyModels' is unsupported in this slice",
-            error.UnsupportedOAuthRequiresModels => "register_provider: field 'oauth' requires claim-backed models in this slice",
-            error.UnsupportedOAuthBuiltinOverride => "register_provider: field 'oauth' does not support built-in provider override semantics in this slice",
-            error.UnsupportedOAuthApiFamily => "register_provider: field 'oauth' requires a built-in host oauth template for the claim api family in this slice",
-            error.UnsupportedOAuthMixedApiFamilies => "register_provider: field 'oauth' requires every claim-backed model to resolve to the same built-in oauth-capable api family",
-            error.DeferredAuthHeader => "register_provider: field 'auth_header' is deferred in this slice",
-            error.DeferredAuthHeaderCamel => "register_provider: field 'authHeader' is deferred in this slice",
-            error.DeferredStreamSimple => "register_provider: field 'stream_simple' is deferred in this slice",
-            error.DeferredStreamSimpleCamel => "register_provider: field 'streamSimple' is deferred in this slice",
-            error.InvalidModels => "register_provider: field 'models' must be an array of model tables",
-            error.BuiltinOverrideModelsUnsupported => "register_provider: built-in provider overrides do not support field 'models' in this slice",
-            error.MissingModelId, error.InvalidModelId => "register_provider: each model requires string field 'id'",
-            error.MissingModelDisplayName, error.InvalidModelDisplayName => "register_provider: each model requires string field 'name'",
-            error.InvalidModelApi => "register_provider: model field 'api' must be a string when present",
-            error.MissingModelReasoning, error.InvalidModelReasoning => "register_provider: each model requires boolean field 'reasoning'",
-            error.MissingModelInput, error.InvalidModelInput => "register_provider: each model requires array field 'input' containing 'text' and/or 'image'",
-            error.MissingModelCost, error.InvalidModelCost => "register_provider: each model requires cost table with numeric input/output/cache_read/cache_write fields",
-            error.MissingModelContextWindow, error.InvalidModelContextWindow => "register_provider: each model requires integer field 'context_window'",
-            error.MissingModelMaxTokens, error.InvalidModelMaxTokens => "register_provider: each model requires integer field 'max_tokens'",
-            error.InvalidModelHeaders => "register_provider: model field 'headers' must be a string map",
-            error.InvalidModelCompat => "register_provider: model field 'compat' must be a JSON-compatible table",
-            error.OutOfMemory => "register_provider: out of memory",
+            error.MissingName, error.InvalidName => "zi.provider: expected provider name string as first argument",
+            error.MissingConfig, error.InvalidConfig => "zi.provider: expected config table as second argument",
+            error.MissingApi => "zi.provider: missing required field 'api'",
+            error.InvalidApi => "zi.provider: field 'api' must be a string",
+            error.BuiltinOverrideApiMismatch => "zi.provider: field 'api' must match the built-in provider api family in this slice",
+            error.MissingBaseUrl => "zi.provider: missing required field 'base_url'",
+            error.InvalidBaseUrl => "zi.provider: field 'base_url' must be a string",
+            error.InvalidApiKey => "zi.provider: field 'api_key' must be a string",
+            error.InvalidHeaders => "zi.provider: field 'headers' must be a string map",
+            error.InvalidOAuth => "zi.provider: field 'oauth' only supports optional string field 'name' plus function fields 'login', 'refresh_token', 'refreshToken', and 'getApiKey' in this slice",
+            error.InvalidOAuthName => "zi.provider: field 'oauth.name' must be a string when present",
+            error.InvalidOAuthLogin => "zi.provider: field 'oauth.login' must be a function",
+            error.InvalidOAuthRefreshToken => "zi.provider: field 'oauth.refresh_token' must be a function",
+            error.InvalidOAuthRefreshTokenCamel => "zi.provider: field 'oauth.refreshToken' must be a function",
+            error.InvalidOAuthGetApiKey => "zi.provider: field 'oauth.getApiKey' must be a function",
+            error.UnsupportedOAuthModifyModels => "zi.provider: field 'oauth.modifyModels' is unsupported in this slice",
+            error.UnsupportedOAuthRequiresModels => "zi.provider: field 'oauth' requires claim-backed models in this slice",
+            error.UnsupportedOAuthBuiltinOverride => "zi.provider: field 'oauth' does not support built-in provider override semantics in this slice",
+            error.UnsupportedOAuthApiFamily => "zi.provider: field 'oauth' requires a built-in host oauth template for the claim api family in this slice",
+            error.UnsupportedOAuthMixedApiFamilies => "zi.provider: field 'oauth' requires every claim-backed model to resolve to the same built-in oauth-capable api family",
+            error.DeferredAuthHeader => "zi.provider: field 'auth_header' is deferred in this slice",
+            error.DeferredAuthHeaderCamel => "zi.provider: field 'authHeader' is deferred in this slice",
+            error.DeferredStreamSimple => "zi.provider: field 'stream_simple' is deferred in this slice",
+            error.DeferredStreamSimpleCamel => "zi.provider: field 'streamSimple' is deferred in this slice",
+            error.InvalidModels => "zi.provider: field 'models' must be an array of model tables",
+            error.BuiltinOverrideModelsUnsupported => "zi.provider: built-in provider overrides do not support field 'models' in this slice",
+            error.MissingModelId, error.InvalidModelId => "zi.provider: each model requires string field 'id'",
+            error.MissingModelDisplayName, error.InvalidModelDisplayName => "zi.provider: each model requires string field 'name'",
+            error.InvalidModelApi => "zi.provider: model field 'api' must be a string when present",
+            error.MissingModelReasoning, error.InvalidModelReasoning => "zi.provider: each model requires boolean field 'reasoning'",
+            error.MissingModelInput, error.InvalidModelInput => "zi.provider: each model requires array field 'input' containing 'text' and/or 'image'",
+            error.MissingModelCost, error.InvalidModelCost => "zi.provider: each model requires cost table with numeric input/output/cache_read/cache_write fields",
+            error.MissingModelContextWindow, error.InvalidModelContextWindow => "zi.provider: each model requires integer field 'context_window'",
+            error.MissingModelMaxTokens, error.InvalidModelMaxTokens => "zi.provider: each model requires integer field 'max_tokens'",
+            error.InvalidModelHeaders => "zi.provider: model field 'headers' must be a string map",
+            error.InvalidModelCompat => "zi.provider: model field 'compat' must be a JSON-compatible table",
+            error.OutOfMemory => "zi.provider: out of memory",
         });
     };
 
     const accepted = runner.registerProviderClaim(claim) catch |err| {
         return luaError(L, switch (err) {
-            error.UnknownApi => "register_provider: this slice only supports overriding an existing api",
-            error.BuiltinOverrideUnsupported => "register_provider: field 'oauth' does not support built-in provider override semantics in this slice",
-            error.UnsupportedApiFamily => "register_provider: field 'oauth' requires a built-in host oauth template for the claim api family in this slice",
-            error.ConflictingApiFamilies => "register_provider: field 'oauth' requires every claim-backed model to resolve to the same built-in oauth-capable api family",
-            error.OutOfMemory => "register_provider: out of memory",
+            error.UnknownApi => "zi.provider: this slice only supports overriding an existing api",
+            error.BuiltinOverrideUnsupported => "zi.provider: field 'oauth' does not support built-in provider override semantics in this slice",
+            error.UnsupportedApiFamily => "zi.provider: field 'oauth' requires a built-in host oauth template for the claim api family in this slice",
+            error.ConflictingApiFamilies => "zi.provider: field 'oauth' requires every claim-backed model to resolve to the same built-in oauth-capable api family",
+            error.OutOfMemory => "zi.provider: out of memory",
         });
     };
     if (!accepted) {
@@ -120,26 +120,26 @@ pub fn ziRegisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// Lua `zi.unregister_provider(name)`: only removes claims owned by the current extension load source.
-pub fn ziUnregisterProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
+/// Lua `zi.unprovider(name)`: only removes claims owned by the current extension load source.
+pub fn ziUnprovider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
     if (c.lua_type(L, 1) != c.LUA_TSTRING) {
-        return luaError(L, "unregister_provider: expected provider name string as first argument");
+        return luaError(L, "zi.unprovider: expected provider name string as first argument");
     }
 
     var name_len: usize = 0;
-    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return luaError(L, "unregister_provider: invalid provider name");
-    const owned_name = runner.allocator.dupe(u8, name_ptr[0..name_len]) catch return luaError(L, "unregister_provider: out of memory");
+    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return luaError(L, "zi.unprovider: invalid provider name");
+    const owned_name = runner.allocator.dupe(u8, name_ptr[0..name_len]) catch return luaError(L, "zi.unprovider: out of memory");
     const owned_owner = runner.allocator.dupe(u8, currentProviderOwnerId(runner)) catch {
         runner.allocator.free(owned_name);
-        return luaError(L, "unregister_provider: out of memory");
+        return luaError(L, "zi.unprovider: out of memory");
     };
 
     const removed = runner.unregisterProviderClaim(owned_name, owned_owner) catch |err| {
         return luaError(L, switch (err) {
-            error.OutOfMemory => "unregister_provider: out of memory",
+            error.OutOfMemory => "zi.unprovider: out of memory",
         });
     };
 

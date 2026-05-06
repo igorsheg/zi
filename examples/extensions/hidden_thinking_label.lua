@@ -15,7 +15,7 @@ zi.on("session_start", function(_, ctx)
   apply_label(ctx)
 end)
 
-zi.register_command({
+zi.command({
   name = "thinking-label",
   description = "Set the thinking status label. Use without args to reset.",
   handler = function(args, ctx)

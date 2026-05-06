@@ -9,7 +9,7 @@ local function trim(s)
   return tostring(s or ""):match("^%s*(.-)%s*$") or ""
 end
 
-zi.register_command({
+zi.command({
   name = "session-name",
   description = "Set or show session name (usage: /session-name [new name])",
   handler = function(args, ctx)

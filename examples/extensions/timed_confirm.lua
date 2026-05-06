@@ -1,6 +1,6 @@
 -- Timed confirmation example: timeout as part of semantic prompts.
 
-zi.register_command({
+zi.command({
   name = "timed",
   description = "Show a confirmation prompt that auto-cancels after 5 seconds.",
   handler = function(_, ctx)
@@ -21,7 +21,7 @@ zi.register_command({
   end,
 })
 
-zi.register_command({
+zi.command({
   name = "timed-select",
   description = "Show a select prompt that auto-cancels after 10 seconds.",
   handler = function(_, ctx)

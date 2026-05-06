@@ -6,7 +6,7 @@
 //!
 //! ```lua
 //! return function(zi)
-//!   zi.register_tool({ name = "...", ... })
+//!   zi.tool({ name = "...", ... })
 //! end
 //! ```
 //!
@@ -50,13 +50,12 @@ const json_api = @import("json_api.zig");
 const spawn_api = @import("spawn_api.zig");
 const provider_api = @import("provider_api.zig");
 const command_api = @import("command_api.zig");
-const keybinding_api = @import("keybinding_api.zig");
 const event_api = @import("event_api.zig");
 const tool_api = @import("tool_api.zig");
+const api_v3 = @import("api_v3.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const event_registry = @import("registries/event_registry.zig");
 const command_registry = @import("registries/command_registry.zig");
-const tool_def = @import("../tools/definition.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
@@ -76,71 +75,7 @@ const log = std.log.scoped(.zi_api);
 /// global with a fresh table. Used by D3's runtime construction and
 /// by tests that build a state inline.
 pub fn installZiTable(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
-    const L = state.L;
-    c.lua_createtable(L, 0, 11);
-
-    state.pushCClosureWithUserdata(tool_api.ziRegisterTool, runner);
-    c.lua_setfield(L, -2, "register_tool");
-
-    state.pushCClosureWithUserdata(command_api.ziRegisterCommand, runner);
-    c.lua_setfield(L, -2, "register_command");
-
-    state.pushCClosureWithUserdata(keybinding_api.ziRegisterKeybinding, runner);
-    c.lua_setfield(L, -2, "register_keybinding");
-
-    state.pushCClosureWithUserdata(provider_api.ziRegisterProvider, runner);
-    c.lua_setfield(L, -2, "register_provider");
-
-    state.pushCClosureWithUserdata(provider_api.ziUnregisterProvider, runner);
-    c.lua_setfield(L, -2, "unregister_provider");
-
-    state.pushCClosureWithUserdata(ziRegisterBuiltinTools, runner);
-    c.lua_setfield(L, -2, "__register_builtin_tools");
-
-    state.pushCClosureWithUserdata(event_api.ziOn, runner);
-    c.lua_setfield(L, -2, "on");
-
-    state.pushCClosureWithUserdata(spawn_api.ziSpawn, runner);
-    c.lua_setfield(L, -2, "spawn");
-
-    state.pushCClosureWithUserdata(system_api.ziSystem, runner);
-    c.lua_setfield(L, -2, "system");
-
-    job_api.install(state, runner);
-    c.lua_setfield(L, -2, "job");
-
-    json_api.install(state, runner);
-    c.lua_setfield(L, -2, "json");
-
-    c.lua_setglobal(L, "zi");
-}
-
-fn ziRegisterBuiltinTools(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const L = L_opt.?;
-    const runner = runnerFromUpvalue(L);
-    const source = runner.currentLoadSource() orelse return luaError(L, "builtin bridge: missing load context");
-    if (!std.mem.eql(u8, source.kind, "builtin")) {
-        return luaError(L, "builtin bridge: builtin load context required");
-    }
-
-    for (runner.builtin_tool_definitions) |definition| {
-        var cloned = tool_def.cloneOwned(runner.allocator, definition) catch {
-            return luaError(L, "builtin bridge: failed to clone builtin tool");
-        };
-        errdefer tool_def.freeOwned(runner.allocator, &cloned);
-        cloned.source = currentRegistrationSource(runner);
-
-        const accepted = runner.tool_registry.register(cloned) catch {
-            tool_def.freeOwned(runner.allocator, &cloned);
-            return luaError(L, "builtin bridge: registry insert failed");
-        };
-        if (!accepted) {
-            tool_def.freeOwned(runner.allocator, &cloned);
-        }
-    }
-
-    c.lua_pushboolean(L, 1);
-    return 1;
+    api_v3.install(state, runner);
 }
 
 fn pushLiteralField(L: *c.lua_State, field: [:0]const u8, value: [:0]const u8) void {
@@ -168,11 +103,6 @@ fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
     const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
     return @ptrCast(@alignCast(ud.?));
-}
-
-fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_registry.RegistrationSource {
-    const source = runner.currentLoadSource() orelse return .{ .kind = "lua", .id = "lua" };
-    return .{ .kind = source.kind, .id = source.path, .provenance = source.provenance };
 }
 
 fn currentEventProvenance(runner: *const runner_mod.ExtensionRunner) ?@import("../resources/types.zig").ExtensionProvenance {
@@ -294,7 +224,7 @@ fn testProviderLoadSource() runner_mod.ExtensionLoadSource {
     };
 }
 
-test "zi.register_provider queues models metadata before bind and keeps live routing behavior" {
+test "zi.provider queues models metadata before bind and keeps live routing behavior" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -306,7 +236,7 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
     runner.beginLoadContext(testProviderLoadSource());
 
     try state.doString(
-        \\assert(zi.register_provider("queued", {
+        \\assert(zi.provider("queued", {
         \\  api = "anthropic-messages",
         \\  base_url = "https://queued.example",
         \\  api_key = "QUEUED_PROXY_API_KEY",
@@ -383,7 +313,7 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
     defer runner.endExecutionContext();
 
     try state.doString(
-        \\assert(zi.register_provider("live", {
+        \\assert(zi.provider("live", {
         \\  api = "anthropic-messages",
         \\  base_url = "https://live.example",
         \\  models = {
@@ -409,14 +339,14 @@ test "zi.register_provider queues models metadata before bind and keeps live rou
     try testing.expectEqualStrings("openai-responses", live_claim.models[0].api.?);
 
     try state.doString(
-        \\assert(zi.unregister_provider("live") == true)
+        \\assert(zi.unprovider("live") == true)
     , "provider_live_unregister");
 
     try testing.expectEqualStrings("queued", provider_registry.get("anthropic-messages").?.getName());
     try testing.expectEqual(@as(usize, 1), provider_registry.activeClaimCount());
 }
 
-test "zi.register_provider retains oauth callback refs and still rejects deferred oauth semantics" {
+test "zi.provider retains oauth callback refs and still rejects deferred oauth semantics" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -429,7 +359,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
     defer runner.endLoadContext();
 
     try state.doString(
-        \\assert(zi.register_provider("oauth-claim", {
+        \\assert(zi.provider("oauth-claim", {
         \\  api = "anthropic-messages",
         \\  base_url = "https://proxy.example",
         \\  oauth = { name = "Corp Claude", login = function(callbacks)
@@ -456,7 +386,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
     , "provider_oauth_minimal_metadata");
 
     try state.doString(
-        \\assert(zi.register_provider("oauth-claim-unnamed", {
+        \\assert(zi.provider("oauth-claim-unnamed", {
         \\  api = "anthropic-messages",
         \\  base_url = "https://proxy-2.example",
         \\  oauth = {},
@@ -495,7 +425,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
     const invalid_oauth_specs = .{
         .{
             "provider_oauth_modify_models_reject",
-            \\return zi.register_provider("broken", {
+            \\return zi.provider("broken", {
             \\  api = "anthropic-messages",
             \\  base_url = "https://proxy.example",
             \\  oauth = { modifyModels = function() end },
@@ -503,7 +433,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
         },
         .{
             "provider_oauth_requires_models_reject",
-            \\return zi.register_provider("broken", {
+            \\return zi.provider("broken", {
             \\  api = "anthropic-messages",
             \\  base_url = "https://proxy.example",
             \\  oauth = {},
@@ -511,7 +441,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
         },
         .{
             "provider_oauth_template_reject",
-            \\return zi.register_provider("broken", {
+            \\return zi.provider("broken", {
             \\  api = "openai-responses",
             \\  base_url = "https://proxy.example",
             \\  oauth = {},
@@ -538,7 +468,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
     const invalid_oauth_shape_specs = .{
         .{
             "provider_oauth_refresh_token_non_function_reject",
-            \\return zi.register_provider("broken", {
+            \\return zi.provider("broken", {
             \\  api = "anthropic-messages",
             \\  base_url = "https://proxy.example",
             \\  oauth = { refresh_token = "nope" },
@@ -546,7 +476,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
         },
         .{
             "provider_oauth_refresh_token_camel_non_function_reject",
-            \\return zi.register_provider("broken", {
+            \\return zi.provider("broken", {
             \\  api = "anthropic-messages",
             \\  base_url = "https://proxy.example",
             \\  oauth = { refreshToken = "nope" },
@@ -554,7 +484,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
         },
         .{
             "provider_oauth_get_api_key_non_function_reject",
-            \\return zi.register_provider("broken", {
+            \\return zi.provider("broken", {
             \\  api = "anthropic-messages",
             \\  base_url = "https://proxy.example",
             \\  oauth = { getApiKey = "nope" },
@@ -567,7 +497,7 @@ test "zi.register_provider retains oauth callback refs and still rejects deferre
     }
 }
 
-test "zi.register_provider rejects deferred provider fields instead of silently dropping them" {
+test "zi.provider rejects deferred provider fields instead of silently dropping them" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -584,7 +514,7 @@ test "zi.register_provider rejects deferred provider fields instead of silently 
         \\}) do
         \\  local ok, err = pcall(function()
         \\    local chunk = string.format([[
-        \\      return zi.register_provider("deferred", {
+        \\      return zi.provider("deferred", {
         \\        api = "anthropic-messages",
         \\        base_url = "https://proxy.example",
         \\        %s = %s,
@@ -600,7 +530,7 @@ test "zi.register_provider rejects deferred provider fields instead of silently 
     try testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
 }
 
-test "zi.register_provider infers built-in override api and restores the baseline" {
+test "zi.provider infers built-in override api and restores the baseline" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -611,7 +541,7 @@ test "zi.register_provider infers built-in override api and restores the baselin
 
     runner.beginLoadContext(testProviderLoadSource());
     try state.doString(
-        \\assert(zi.register_provider("anthropic", {
+        \\assert(zi.provider("anthropic", {
         \\  base_url = "https://queued.example",
         \\}) == true)
     , "builtin_provider_override_prebind");
@@ -658,7 +588,7 @@ test "zi.register_provider infers built-in override api and restores the baselin
     defer runner.endExecutionContext();
 
     try state.doString(
-        \\assert(zi.register_provider("anthropic", {
+        \\assert(zi.provider("anthropic", {
         \\  api = "anthropic-messages",
         \\  base_url = "https://live.example",
         \\  headers = { ["x-provider"] = "anthropic" },
@@ -671,7 +601,7 @@ test "zi.register_provider infers built-in override api and restores the baselin
     try testing.expectEqual(@as(usize, 0), active_claim.headers.len);
 
     try state.doString(
-        \\assert(zi.unregister_provider("anthropic") == true)
+        \\assert(zi.unprovider("anthropic") == true)
     , "builtin_provider_override_unregister");
 
     const restored_claim = provider_registry.activeClaimRegistrationByName("anthropic") orelse return error.ExpectedQueuedProviderRegistration;
@@ -682,7 +612,7 @@ test "zi.register_provider infers built-in override api and restores the baselin
     try testing.expectEqualStrings("anthropic", provider_registry.get("anthropic-messages").?.getName());
 }
 
-test "zi.register_provider rejects unsupported built-in override extras" {
+test "zi.provider rejects unsupported built-in override extras" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -693,7 +623,7 @@ test "zi.register_provider rejects unsupported built-in override extras" {
 
     try state.doString(
         \\local ok, err = pcall(function()
-        \\  zi.register_provider("openai", {
+        \\  zi.provider("openai", {
         \\    api = "anthropic-messages",
         \\    base_url = "https://proxy.example",
         \\  })
@@ -704,7 +634,7 @@ test "zi.register_provider rejects unsupported built-in override extras" {
 
     try state.doString(
         \\local ok, err = pcall(function()
-        \\  zi.register_provider("openai", {
+        \\  zi.provider("openai", {
         \\    base_url = "https://proxy.example",
         \\    models = {
         \\      {
@@ -725,7 +655,7 @@ test "zi.register_provider rejects unsupported built-in override extras" {
 
     try state.doString(
         \\local ok, err = pcall(function()
-        \\  zi.register_provider("anthropic", {
+        \\  zi.provider("anthropic", {
         \\    base_url = "https://proxy.example",
         \\    oauth = {},
         \\  })
@@ -737,7 +667,7 @@ test "zi.register_provider rejects unsupported built-in override extras" {
     try testing.expectEqual(@as(usize, 0), runner.provider_queue.count());
 }
 
-test "zi.register_tool registers a Lua-defined tool end-to-end" {
+test "zi.tool registers a Lua-defined tool end-to-end" {
     var host = try ApiTestHost.init(testing.allocator, 0);
     defer host.deinit();
     host.installZi();
@@ -746,7 +676,7 @@ test "zi.register_tool registers a Lua-defined tool end-to-end" {
     const runner = &host.runner;
 
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "finder",
         \\  label = "Finder",
         \\  description = "search the codebase",
@@ -789,7 +719,7 @@ test "zi.register_tool registers a Lua-defined tool end-to-end" {
     try testing.expect(tool.impl.lua != c.LUA_REFNIL);
 }
 
-test "zi.register_tool after bind refreshes visible tool projection for accepted claims only" {
+test "zi.tool after bind refreshes visible tool projection for accepted claims only" {
     var state = try lua_runtime.LuaState.init(testing.allocator);
     defer state.deinit();
 
@@ -821,13 +751,13 @@ test "zi.register_tool after bind refreshes visible tool projection for accepted
     installZiTable(&state, &runner);
 
     try state.doString(
-        \\local first = zi.register_tool({
+        \\local first = zi.tool({
         \\  name = "runtime_echo",
         \\  description = "runtime registration",
         \\  parameters = { type = "object" },
         \\  execute = function() end,
         \\})
-        \\local duplicate = zi.register_tool({
+        \\local duplicate = zi.tool({
         \\  name = "runtime_echo",
         \\  description = "duplicate registration",
         \\  parameters = { type = "object" },
@@ -835,7 +765,7 @@ test "zi.register_tool after bind refreshes visible tool projection for accepted
         \\})
         \\assert(first == true, "runtime registration should be accepted")
         \\assert(duplicate == false, "duplicate runtime registration should fail open")
-    , "test_runtime_register_tool");
+    , "test_runtime_tool");
 
     try testing.expectEqual(@as(usize, 1), runner.tool_registry.count());
     try testing.expectEqual(@as(usize, 1), projection_changes);
@@ -974,7 +904,7 @@ test "zi.spawn end-to-end: dispatches per-event callbacks via argv_override" {
     , "spawn_e2e");
 }
 
-test "zi.register_tool surfaces validation errors as Lua errors" {
+test "zi.tool surfaces validation errors as Lua errors" {
     var host = try ApiTestHost.init(testing.allocator, 0);
     defer host.deinit();
     host.installZi();
@@ -984,7 +914,7 @@ test "zi.register_tool surfaces validation errors as Lua errors" {
 
     try state.doString(
         \\local ok, err = pcall(function()
-        \\  zi.register_tool({
+        \\  zi.tool({
         \\    name = "broken",
         \\    description = "no execute",
         \\    parameters = { type = "object" },
@@ -1060,7 +990,7 @@ test "zi.on accepts every reserved v2 event" {
     try testing.expectEqual(@as(usize, 29), runner.event_registry.count());
 }
 
-test "zi.register_command registers commands and disambiguates duplicate visible names" {
+test "zi.command registers commands and disambiguates duplicate visible names" {
     var host = try ApiTestHost.init(testing.allocator, 0);
     defer host.deinit();
     host.installZi();
@@ -1069,10 +999,10 @@ test "zi.register_command registers commands and disambiguates duplicate visible
     const runner = &host.runner;
 
     try state.doString(
-        \\assert(zi.register_command({ name = "greet", description = "say hello", handler = function() end }) == true)
-        \\zi.register_command({ name = "dup", description = "first", handler = function() end })
-        \\zi.register_command({ name = "dup", description = "second", handler = function() end })
-    , "test_register_commands");
+        \\assert(zi.command({ name = "greet", description = "say hello", handler = function() end }) == true)
+        \\zi.command({ name = "dup", description = "first", handler = function() end })
+        \\zi.command({ name = "dup", description = "second", handler = function() end })
+    , "test_commands");
 
     try testing.expectEqual(@as(usize, 3), runner.command_registry.count());
     const cmd = runner.command_registry.getByVisibleName("greet").?;
@@ -1083,22 +1013,14 @@ test "zi.register_command registers commands and disambiguates duplicate visible
     try testing.expect(runner.command_registry.getByVisibleName("dup:2") != null);
 }
 
-test "zi.register_keybinding registers normalized key specs" {
+test "api v3 does not expose keybinding registration" {
     var host = try ApiTestHost.init(testing.allocator, 0);
     defer host.deinit();
-    host.installZi();
-
-    const state = &host.state;
-    const runner = &host.runner;
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    installZiTable(&state, &host.runner);
 
     try state.doString(
-        \\assert(zi.register_keybinding({ id = "starter.pick", key = "ctrl+f", description = "Pick starter", handler = function(ctx) end }) == true)
-    , "test_register_keybindings");
-
-    try testing.expectEqual(@as(usize, 1), runner.keybinding_registry.count());
-    const kb = runner.keybinding_registry.items()[0];
-    try testing.expectEqualStrings("starter.pick", kb.id);
-    try testing.expectEqualStrings("Pick starter", kb.description);
-    try testing.expectEqual(@as(usize, 1), kb.keys.len);
-    try testing.expect(keys_mod.Key.eql(kb.keys[0], .{ .code = .char, .char = 'f', .ctrl = true }));
+        \\assert(zi["register_" .. "keybinding"] == nil)
+    , "test_keybinding_registration_not_public");
 }

@@ -34,7 +34,7 @@ local function line_for(msg)
   return role .. ": " .. shorten(msg.text or "", 140)
 end
 
-zi.register_command({
+zi.command({
   name = "handoff",
   description = "Show a compact handoff of recent session messages",
   handler = function(args, ctx)

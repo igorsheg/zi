@@ -81,7 +81,7 @@ local function edit_with_editor(initial_text, ctx)
   return edited
 end
 
-zi.register_command({
+zi.command({
   name = "comment",
   description = "Open the last assistant message in $EDITOR and load the result into the editor",
   handler = function(_, ctx)

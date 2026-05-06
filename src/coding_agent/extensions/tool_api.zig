@@ -7,40 +7,42 @@ const tool_def = @import("../tools/definition.zig");
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
 
-/// Lua `zi.register_tool(def)`: first registration for a name wins; duplicates return `false`.
-pub fn ziRegisterTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
+/// Lua `zi.tool(spec)`: first registration for a name wins; duplicates return `false`.
+pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const api_name = "zi.tool";
+
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
     if (c.lua_type(L, 1) != c.LUA_TTABLE) {
-        return luaError(L, "register_tool: expected a table argument");
+        return luaErrorFmt(L, "{s}: expected spec table", .{api_name});
     }
 
     var built = buildExtensionTool(L, runner) catch |err| {
-        return luaError(L, switch (err) {
-            error.MissingName => "register_tool: missing required field 'name'",
-            error.MissingDescription => "register_tool: missing required field 'description'",
-            error.MissingParameters => "register_tool: missing required field 'parameters'",
-            error.MissingExecute => "register_tool: missing required field 'execute'",
-            error.InvalidExecute => "register_tool: 'execute' must be a function",
-            error.InvalidRenderCall => "register_tool: 'render_call' must be a function",
-            error.InvalidRenderResult => "register_tool: 'render_result' must be a function",
-            error.InvalidExpandedChanged => "register_tool: 'on_expanded_changed' must be a function",
-            error.InvalidName => "register_tool: 'name' must be a string",
-            error.InvalidDescription => "register_tool: 'description' must be a string",
-            error.InvalidLabel => "register_tool: 'label' must be a string",
-            error.InvalidPromptSnippet => "register_tool: 'prompt_snippet' must be a string",
-            error.InvalidPromptGuidelines => "register_tool: 'prompt_guidelines' must be an array of strings",
-            error.InvalidParameters => "register_tool: 'parameters' must be a table",
-            error.OutOfMemory => "register_tool: out of memory",
-            error.UnsupportedLuaType => "register_tool: parameter schema contains an unsupported value",
-            error.InvalidUtf8 => "register_tool: parameter schema contains invalid UTF-8",
+        return luaApiError(L, api_name, switch (err) {
+            error.MissingName => "missing required field 'name'",
+            error.MissingDescription => "missing required field 'description'",
+            error.MissingParameters => "missing required field 'parameters'",
+            error.MissingExecute => "missing required field 'execute'",
+            error.InvalidExecute => "field 'execute' must be a function",
+            error.InvalidRenderCall => "field 'render_call' must be a function",
+            error.InvalidRenderResult => "field 'render_result' must be a function",
+            error.InvalidExpandedChanged => "field 'on_expanded_changed' must be a function",
+            error.InvalidName => "field 'name' must be a string",
+            error.InvalidDescription => "field 'description' must be a string",
+            error.InvalidLabel => "field 'label' must be a string",
+            error.InvalidPromptSnippet => "field 'prompt_snippet' must be a string",
+            error.InvalidPromptGuidelines => "field 'prompt_guidelines' must be an array of strings",
+            error.InvalidParameters => "field 'parameters' must be a table",
+            error.OutOfMemory => "out of memory",
+            error.UnsupportedLuaType => "parameter schema contains an unsupported value",
+            error.InvalidUtf8 => "parameter schema contains invalid UTF-8",
         });
     };
 
     const accepted = runner.tool_registry.register(built) catch {
         freeBuiltTool(runner.allocator, &built);
-        return luaError(L, "register_tool: registry insert failed");
+        return luaErrorFmt(L, "{s}: registry insert failed", .{api_name});
     };
 
     if (!accepted) {
@@ -308,6 +310,22 @@ fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_reg
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
+    _ = c.lua_pushstring(L, msg.ptr);
+    _ = c.lua_error(L);
+    return 0;
+}
+
+fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
+    _ = c.lua_pushstring(L, msg.ptr);
+    _ = c.lua_error(L);
+    return 0;
+}
+
+fn luaApiError(L: *c.lua_State, api_name: []const u8, detail: []const u8) c_int {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ api_name, detail }) catch "lua error";
     _ = c.lua_pushstring(L, msg.ptr);
     _ = c.lua_error(L);
     return 0;

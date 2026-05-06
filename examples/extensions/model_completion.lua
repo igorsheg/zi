@@ -7,7 +7,7 @@
 -- ctx.models.list(). ctx.ai.complete stays sessionless: it does not mutate the
 -- transcript or run tools.
 
-zi.register_command({
+zi.command({
   name = "models",
   description = "Show visible model catalog.",
   handler = function(_, ctx)
@@ -50,7 +50,7 @@ zi.register_command({
   end,
 })
 
-zi.register_command({
+zi.command({
   name = "ask-model",
   description = "Run a sessionless completion with a selected model.",
   handler = function(args, ctx)

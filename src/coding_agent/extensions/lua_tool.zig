@@ -735,7 +735,7 @@ test "lua tool ctx exposes binding from tool provenance" {
     defer runner.endLoadContext();
 
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "binding",
         \\  description = "binding",
         \\  parameters = { type = "object", properties = {} },
@@ -754,7 +754,7 @@ test "lua tool ctx exposes binding from tool provenance" {
         \\    }
         \\  end,
         \\})
-    , "register_binding_tool");
+    , "tool_binding");
 
     const ext_tool = runner.tool_registry.get("binding").?.*;
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
@@ -834,7 +834,7 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  return nil
         \\end
         \\
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "todo",
         \\  label = "Todo",
         \\  description = "Manage a todo list",
@@ -892,7 +892,7 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\zi.on("session_start", function(_, ctx) hydrate(ctx) end)
         \\zi.on("session_tree", function(_, ctx) hydrate(ctx) end)
         \\
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "todos",
         \\  description = "Show todos",
         \\  handler = function(_, ctx)
@@ -1325,7 +1325,7 @@ test "extension command context exposes read-only session ui_publication" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "session-ui_publication",
         \\  description = "session-ui_publication",
         \\  handler = function(_, ctx)
@@ -1410,7 +1410,7 @@ test "extension command context exposes model catalog and lookup" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "model-ui_publication",
         \\  description = "model-ui_publication",
         \\  handler = function(_, ctx)
@@ -1448,7 +1448,7 @@ test "extension command context publishes host-owned editor buffer actions" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "editor-actions",
         \\  description = "editor-actions",
         \\  handler = function(_, ctx)
@@ -1492,7 +1492,7 @@ test "extension compact UI updates are bounded" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "huge_ui",
         \\  description = "huge_ui",
         \\  handler = function(_, ctx)
@@ -1531,7 +1531,7 @@ test "extension command context publishes semantic ui message status and progres
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "ui_publications",
         \\  description = "ui_publications",
         \\  handler = function(_, ctx)
@@ -1584,7 +1584,7 @@ test "extension command prompts can resolve through host response" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "resolved-prompts",
         \\  description = "resolved-prompts",
         \\  handler = function(_, ctx)
@@ -1649,7 +1649,7 @@ test "lua question tool publishes host-owned select prompt request" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "question_test",
         \\  description = "question_test",
         \\  parameters = { type = "object", properties = {} },
@@ -1709,7 +1709,7 @@ test "extension command context publishes host-owned prompt requests with defaul
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "prompts",
         \\  description = "prompts",
         \\  handler = function(_, ctx)
@@ -1804,7 +1804,7 @@ test "extension command resumes after zi.system result" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "system-test",
         \\  description = "system-test",
         \\  handler = function(_, ctx)
@@ -1907,7 +1907,7 @@ test "extension job API starts writes and stops through dispatcher" {
 
     runner.beginLoadContext(testLoadSource());
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "job-api",
         \\  handler = function(_, ctx)
         \\    local job = zi.job.start({ argv = { "/bin/cat" }, cwd = ctx.cwd, stdout = { mode = "surface_frame", surface = "doom-demo" } })
@@ -1999,7 +1999,7 @@ test "extension command resumes after ai completion result" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "ai-complete-test",
         \\  description = "ai-complete-test",
         \\  handler = function(_, ctx)
@@ -2044,7 +2044,7 @@ test "extension command resumes after yieldable host result" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "async-test",
         \\  description = "async-test",
         \\  handler = function(_, ctx)
@@ -2087,7 +2087,7 @@ test "extension command rejects arbitrary coroutine yield" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "bad-yield",
         \\  description = "bad-yield",
         \\  handler = function() coroutine.yield() end,
@@ -2115,7 +2115,7 @@ test "extension command context publishes a host-owned report" {
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.register_command({
+        \\zi.command({
         \\  name = "report",
         \\  description = "report",
         \\  handler = function(_, ctx)
@@ -2242,19 +2242,19 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
     api.installZiTable(&state, &runner);
 
     try state.doString(
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "echo",
         \\  description = "echo",
         \\  parameters = { type = "object", properties = {} },
         \\  execute = function(args) return "hello " .. (args.who or "world") end,
         \\})
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "fail",
         \\  description = "always fails",
         \\  parameters = { type = "object", properties = {} },
         \\  execute = function(args) return { content = { { type = "text", text = "boom" } }, is_error = true } end,
         \\})
-        \\zi.register_tool({
+        \\zi.tool({
         \\  name = "explode",
         \\  description = "raises",
         \\  parameters = { type = "object", properties = {} },

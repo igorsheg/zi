@@ -39,7 +39,7 @@ Need: ask a side-channel model question
 : Use `ctx.ai.complete`.
 
 Need: expose a model/provider
-: Use `zi.register_provider`.
+: Use `zi.provider`.
 
 Need: run a bounded OS command
 : Use `zi.system`.
@@ -53,7 +53,7 @@ A tool has one job. If it cannot be described in one sentence, split it.
 
 ```lua
 return function(zi)
-  zi.register_tool({
+  zi.tool({
     name = "project_status",
     description = "Summarize project status.",
     parameters = { type = "object", properties = {} },
@@ -68,7 +68,7 @@ A command is direct user intent. It should be safe to run when a person asks for
 
 ```lua
 return function(zi)
-  zi.register_command({
+  zi.command({
     name = "note",
     description = "Save a session note.",
     handler = function(args, ctx)

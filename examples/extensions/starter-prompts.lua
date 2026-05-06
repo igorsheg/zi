@@ -22,11 +22,10 @@ return function(zi)
     },
   }
 
-  zi.register_keybinding({
-    id = "starter-prompts.pick",
-    key = "ctrl+f",
+  zi.command({
+    name = "starter-prompts",
     description = "Pick a starter prompt and append it to the editor.",
-    handler = function(ctx)
+    handler = function(args, ctx)
       if not ctx.ui then return end
 
       local result = ctx.ui.pick({

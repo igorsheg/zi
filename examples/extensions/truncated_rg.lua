@@ -73,7 +73,7 @@ return function(zi)
     return output, "rg failed: " .. tostring(reason or code)
   end
 
-  zi.register_tool({
+  zi.tool({
     name = "rg_demo",
     label = "ripgrep demo",
     description = "Search with ripgrep. Output is bounded to 2000 lines or 50 KiB; truncated full output is saved to a temp file.",

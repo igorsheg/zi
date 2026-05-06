@@ -504,7 +504,7 @@ pub const ExtensionRunner = struct {
     /// Provider queue — pending custom-provider registrations that
     /// arrived during the pre-bind load phase. Drained by
     /// `bindRuntime` (D7) into the AI provider registry. v1 leaves
-    /// this empty; v2 wires `zi.register_provider`.
+    /// this empty; v3 wires `zi.provider`.
     provider_queue: registries.ProviderQueue,
 
     /// Lua state for this generation. Borrowed (NOT owned) — the

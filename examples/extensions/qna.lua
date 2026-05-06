@@ -3,7 +3,7 @@
 -- full parity also needs branch/message reads, extension model completion,
 -- notification/working UI, and async command cancellation.
 return function(zi)
-  zi.register_command({
+  zi.command({
     name = "qna",
     description = "Copy a question prompt into the editor.",
     handler = function(args, ctx)

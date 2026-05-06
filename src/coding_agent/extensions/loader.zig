@@ -11,10 +11,6 @@ const log = std.log.scoped(.extensions);
 /// in the wrong dir, runaway generator). Capping here keeps the
 /// read path bounded without needing streaming.
 const MAX_EXTENSION_SIZE: usize = 1024 * 1024;
-const BUILTIN_EXTENSION_SOURCE =
-    "return function(zi)\n" ++
-    "  zi.__register_builtin_tools()\n" ++
-    "end\n";
 
 pub const ExtensionSource = resource_types.ExtensionSource;
 pub const StaticExtensionRoot = resource_types.StaticExtensionRoot;
@@ -313,11 +309,6 @@ fn loadBuiltinExtension(
 ) !void {
     if (builtin_definitions.len == 0) return;
 
-    const chunk_name_buf = try std.fmt.allocPrint(runner.allocator, "@{s}", .{ext.path});
-    defer runner.allocator.free(chunk_name_buf);
-    const chunk_name = try runner.allocator.dupeZ(u8, chunk_name_buf);
-    defer runner.allocator.free(chunk_name);
-
     const load_source: runner_mod.ExtensionLoadSource = .{
         .kind = sourceKindString(ext.source),
         .id = ext.id,
@@ -328,23 +319,17 @@ fn loadBuiltinExtension(
     defer runner.endLoadContext();
     runner.setModuleContext(state, ext.provenance);
 
-    try state.loadChunk(BUILTIN_EXTENSION_SOURCE, chunk_name);
-    const chunk_call_rc = lua_runtime.c.lua_pcallk(state.L, 0, 1, 0, 0, null);
-    if (chunk_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, chunk_call_rc);
+    for (builtin_definitions) |definition| {
+        var cloned = try tool_def.cloneOwned(runner.allocator, definition);
+        errdefer tool_def.freeOwned(runner.allocator, &cloned);
+        cloned.source = .{ .kind = load_source.kind, .id = load_source.path, .provenance = load_source.provenance };
 
-    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TFUNCTION) {
-        lua_runtime.c.lua_pop(state.L, 1);
-        return error.ExtensionFactoryExpectedFunction;
+        const accepted = try runner.tool_registry.register(cloned);
+        if (!accepted) {
+            tool_def.freeOwned(runner.allocator, &cloned);
+        }
     }
 
-    _ = lua_runtime.c.lua_getglobal(state.L, "zi");
-    if (lua_runtime.c.lua_type(state.L, -1) != lua_runtime.c.LUA_TTABLE) {
-        lua_runtime.c.lua_pop(state.L, 2);
-        return error.LuaRuntime;
-    }
-
-    const factory_call_rc = lua_runtime.c.lua_pcallk(state.L, 1, 0, 0, 0, null);
-    if (factory_call_rc != lua_runtime.c.LUA_OK) return lua_runtime.mapCallError(state.L, factory_call_rc);
     try runner.recordLoadedExtension(ext.provenance);
 }
 
@@ -779,7 +764,7 @@ test "user extension wins precedence over builtin with same name" {
     var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const user_src =
         "return function(zi)\n" ++
-        "  zi.register_tool({\n" ++
+        "  zi.tool({\n" ++
         "    name = \"bash\",\n" ++
         "    description = \"user bash\",\n" ++
         "    parameters = { type = \"object\", properties = {} },\n" ++
@@ -853,7 +838,7 @@ test "user extension wins precedence over builtin with same name" {
     try std.testing.expectEqualStrings("user", tool.source.kind);
 }
 
-test "builtin registration bridge rejects calls outside builtin load context" {
+test "builtin registration is host-owned and not public Lua API" {
     const allocator = std.testing.allocator;
 
     var state = try lua_runtime.LuaState.init(allocator);
@@ -864,9 +849,6 @@ test "builtin registration bridge rejects calls outside builtin load context" {
     installLoaderTestRuntime(&state, &runner);
 
     try state.doString(
-        \\local ok = pcall(function()
-        \\  zi.__register_builtin_tools()
-        \\end)
-        \\assert(ok == false)
-    , "verify_builtin_bridge_private");
+        \\assert(zi["__register_" .. "builtin_tools"] == nil)
+    , "verify_builtin_registration_host_owned");
 }

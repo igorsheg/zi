@@ -1,5 +1,5 @@
 return function(zi)
-  zi.register_tool({
+  zi.tool({
     name = "greet",
     label = "Greeting",
     description = "Generate a friendly greeting for a named person.",

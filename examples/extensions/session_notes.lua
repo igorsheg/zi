@@ -8,7 +8,7 @@
 -- "extension_note". They are durable session artifacts, but not raw transcript
 -- mutation and not injected into the LLM context.
 
-zi.register_command({
+zi.command({
   name = "note",
   description = "Append a durable session note.",
   handler = function(args, ctx)
@@ -39,7 +39,7 @@ zi.register_command({
   end,
 })
 
-zi.register_command({
+zi.command({
   name = "notes",
   description = "List durable session notes.",
   handler = function(_, ctx)

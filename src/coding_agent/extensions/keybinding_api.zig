@@ -7,24 +7,24 @@ const keys_mod = @import("../../tui/terminal/keys.zig");
 
 const c = lua_runtime.c;
 
-/// Lua `zi.register_keybinding(def)`: accepts `key` and/or dense-array `keys`.
+/// Keybinding definition parser: accepts `key` and/or dense-array `keys`.
 pub fn ziRegisterKeybinding(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
     if (c.lua_type(L, 1) != c.LUA_TTABLE) {
-        return luaError(L, "register_keybinding: expected a table argument");
+        return luaError(L, "keybinding: expected a table argument");
     }
 
     const def = buildKeybindingDef(L, runner) catch |err| {
         return luaError(L, switch (err) {
-            error.MissingId => "register_keybinding: missing required field \"id\" (string)",
-            error.InvalidDescription => "register_keybinding: \"description\" must be a string",
-            error.MissingKey => "register_keybinding: missing required field \"key\" or \"keys\"",
-            error.InvalidKey => "register_keybinding: key specs must be strings like \"ctrl+f\"",
-            error.MissingHandler => "register_keybinding: missing required field \"handler\" (function)",
-            error.InvalidHandler => "register_keybinding: \"handler\" must be a function",
-            error.OutOfMemory => "register_keybinding: out of memory",
+            error.MissingId => "keybinding: missing required field \"id\" (string)",
+            error.InvalidDescription => "keybinding: \"description\" must be a string",
+            error.MissingKey => "keybinding: missing required field \"key\" or \"keys\"",
+            error.InvalidKey => "keybinding: key specs must be strings like \"ctrl+f\"",
+            error.MissingHandler => "keybinding: missing required field \"handler\" (function)",
+            error.InvalidHandler => "keybinding: \"handler\" must be a function",
+            error.OutOfMemory => "keybinding: out of memory",
         });
     };
 
@@ -32,7 +32,7 @@ pub fn ziRegisterKeybinding(L_opt: ?*c.lua_State) callconv(.c) c_int {
         var failed = def;
         c.luaL_unref(L, c.LUA_REGISTRYINDEX, failed.lua_ref);
         failed.deinit(runner.allocator);
-        return luaError(L, "register_keybinding: registry insert failed");
+        return luaError(L, "keybinding: registry insert failed");
     };
 
     c.lua_pushboolean(L, 1);

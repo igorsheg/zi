@@ -1,5 +1,5 @@
 return function(zi)
-  zi.register_command({
+  zi.command({
     name = "hello",
     description = "Show a greeting from an extension command.",
     handler = function(args, ctx)

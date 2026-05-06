@@ -45,7 +45,7 @@ return function(zi)
     return nil
   end
 
-  zi.register_tool({
+  zi.tool({
     name = "todo",
     label = "Todo",
     description = "Manage a todo list. Actions: list, add (text), toggle (id), clear",
@@ -158,7 +158,7 @@ return function(zi)
     hydrate(ctx)
   end)
 
-  zi.register_command({
+  zi.command({
     name = "todos",
     description = "Show all todos on the current session branch",
     handler = function(_, ctx)
