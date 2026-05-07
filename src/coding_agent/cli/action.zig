@@ -6,20 +6,28 @@ pub const Action = enum {
     help,
     version,
     list_models,
+    docs,
+    man,
 
     pub fn detect(argv: []const []const u8) Action {
         var saw_help = false;
         var saw_list_models = false;
+        var saw_docs = false;
+        var saw_man = false;
 
         for (argv) |arg| {
             const utility_action = spec.utilityActionForArg(arg) orelse continue;
             switch (utility_action) {
                 .version => return .version,
                 .list_models => saw_list_models = true,
+                .docs => saw_docs = true,
+                .man => saw_man = true,
                 .help => saw_help = true,
             }
         }
 
+        if (saw_docs) return .docs;
+        if (saw_man) return .man;
         if (saw_list_models) return .list_models;
         if (saw_help) return .help;
         return .run;

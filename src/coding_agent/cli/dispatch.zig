@@ -7,6 +7,7 @@ const context_mod = @import("context.zig");
 const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const plan = @import("plan.zig");
+const self_docs = @import("../../self_docs.zig");
 
 const stdout: std.Io.File = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
 
@@ -26,6 +27,23 @@ pub fn run(ctx: Context, cli_runtime: ?*runtime_mod.Runtime, execution_plan: pla
             var out_buf: [2048]u8 = undefined;
             var out_writer = stdout.writer(std.Options.debug_io, &out_buf);
             try help.writeGeneralHelp(&out_writer.interface);
+            try out_writer.end();
+            return .ok;
+        },
+        .docs => |docs_plan| {
+            var out_buf: [8192]u8 = undefined;
+            var out_writer = stdout.writer(std.Options.debug_io, &out_buf);
+            try self_docs.writeSearch(ctx.allocator, &out_writer.interface, docs_plan.query);
+            try out_writer.end();
+            return .ok;
+        },
+        .man => |man_plan| {
+            var out_buf: [16384]u8 = undefined;
+            var out_writer = stdout.writer(std.Options.debug_io, &out_buf);
+            if (!try self_docs.writeMan(&out_writer.interface, man_plan.topic)) {
+                try out_writer.interface.print("unknown zi docs topic: {s}\n\n", .{man_plan.topic.?});
+                try self_docs.writeTopicList(&out_writer.interface);
+            }
             try out_writer.end();
             return .ok;
         },

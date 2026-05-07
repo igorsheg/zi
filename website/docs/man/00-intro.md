@@ -1,3 +1,14 @@
+---
+slug: intro
+title: Zi
+order: 0
+aliases:
+  - overview
+  - start
+  - getting started
+  - about
+---
+
 # Zi
 
 `zi` is a local coding agent harness.

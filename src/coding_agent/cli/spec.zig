@@ -24,6 +24,8 @@ pub const FlagId = enum {
     tools_filter,
     append_system_prompt,
     list_models,
+    docs,
+    man,
     help,
     version,
 };
@@ -75,6 +77,8 @@ const ActionSet = struct {
     help: bool = false,
     version: bool = false,
     list_models: bool = false,
+    docs: bool = false,
+    man: bool = false,
 
     fn contains(self: ActionSet, action: ActionScope) bool {
         return switch (action) {
@@ -82,6 +86,8 @@ const ActionSet = struct {
             .help => self.help,
             .version => self.version,
             .list_models => self.list_models,
+            .docs => self.docs,
+            .man => self.man,
         };
     }
 };
@@ -91,12 +97,16 @@ pub const ActionScope = enum {
     help,
     version,
     list_models,
+    docs,
+    man,
 };
 
 pub const UtilityAction = enum {
     help,
     version,
     list_models,
+    docs,
+    man,
 };
 
 pub const all_flags = [_]FlagSpec{
@@ -186,6 +196,23 @@ pub const all_flags = [_]FlagSpec{
         .section = .run_options,
     },
     .{
+        .id = .docs,
+        .long = "docs",
+        .value_kind = .required,
+        .help_suffix = " <query>",
+        .description = "Search embedded zi documentation",
+        .actions = .{ .docs = true },
+        .section = .actions,
+    },
+    .{
+        .id = .man,
+        .long = "man",
+        .help_suffix = " [topic]",
+        .description = "Print embedded zi documentation topics",
+        .actions = .{ .man = true },
+        .section = .actions,
+    },
+    .{
         .id = .list_models,
         .long = "list-models",
         .help_suffix = " [search]",
@@ -222,6 +249,12 @@ pub fn utilityActionForArg(arg: []const u8) ?UtilityAction {
     if (findForAction(.version, arg) != null) return .version;
     if (findForAction(.list_models, arg)) |flag| {
         if (flag.id == .list_models) return .list_models;
+    }
+    if (findForAction(.docs, arg)) |flag| {
+        if (flag.id == .docs) return .docs;
+    }
+    if (findForAction(.man, arg)) |flag| {
+        if (flag.id == .man) return .man;
     }
     if (findForAction(.help, arg) != null) return .help;
     return null;

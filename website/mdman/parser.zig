@@ -66,6 +66,7 @@ const Parser = struct {
 
     fn parse(self: *Parser) !Document {
         var nodes: std.ArrayListUnmanaged(Node) = .empty;
+        self.skipFrontmatter();
 
         while (!self.isAtEnd()) {
             self.skipBlankLines();
@@ -82,6 +83,10 @@ const Parser = struct {
     fn parseNode(self: *Parser) !?Node {
         const line = self.peekLine();
 
+        if (std.mem.startsWith(u8, line, "### ")) {
+            _ = self.consumeLine();
+            return .{ .heading = .{ .level = 3, .text = line[4..] } };
+        }
         if (std.mem.startsWith(u8, line, "## ")) {
             _ = self.consumeLine();
             return .{ .heading = .{ .level = 2, .text = line[3..] } };
@@ -147,7 +152,7 @@ const Parser = struct {
         const term = try self.parseInline(term_line);
 
         const desc_line = self.consumeLine();
-        const desc_text = std.mem.trimLeft(u8, desc_line[1..], " \t");
+        const desc_text = std.mem.trim(u8, desc_line[1..], " \t");
 
         var full_desc: std.ArrayListUnmanaged(u8) = .empty;
         try full_desc.appendSlice(self.allocator, desc_text);
@@ -159,12 +164,21 @@ const Parser = struct {
 
             _ = self.consumeLine();
             try full_desc.append(self.allocator, ' ');
-            try full_desc.appendSlice(self.allocator, std.mem.trimLeft(u8, next_line, " \t"));
+            try full_desc.appendSlice(self.allocator, std.mem.trim(u8, next_line, " \t"));
         }
 
         const description = try self.parseInline(full_desc.items);
 
         return .{ .definition = .{ .term = term, .description = description } };
+    }
+
+    fn skipFrontmatter(self: *Parser) void {
+        if (!std.mem.startsWith(u8, self.source, "---\n") and !std.mem.startsWith(u8, self.source, "---\r\n")) return;
+        _ = self.consumeLine();
+        while (!self.isAtEnd()) {
+            const line = self.consumeLine();
+            if (std.mem.eql(u8, line, "---")) break;
+        }
     }
 
     fn parseParagraph(self: *Parser) !Node {
@@ -175,6 +189,7 @@ const Parser = struct {
             if (line.len == 0 or
                 std.mem.startsWith(u8, line, "# ") or
                 std.mem.startsWith(u8, line, "## ") or
+                std.mem.startsWith(u8, line, "### ") or
                 std.mem.startsWith(u8, line, "```") or
                 std.mem.startsWith(u8, line, "- "))
             {

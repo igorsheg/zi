@@ -1,3 +1,15 @@
+---
+slug: context
+title: Context
+order: 40
+aliases:
+  - ctx
+  - context api
+  - session
+  - ui
+  - models
+---
+
 # Context
 
 Most tools, commands, and events receive `ctx`.

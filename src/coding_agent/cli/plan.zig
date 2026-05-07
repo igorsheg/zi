@@ -5,6 +5,8 @@ pub const OutputMode = parse.OutputMode;
 pub const RawCommand = parse.RawCommand;
 pub const RawRunArgs = parse.RawRunArgs;
 pub const RawListModelsArgs = parse.RawListModelsArgs;
+pub const RawDocsArgs = parse.RawDocsArgs;
+pub const RawManArgs = parse.RawManArgs;
 
 pub const SessionTarget = union(enum) {
     none,
@@ -52,6 +54,8 @@ pub const ExecutionPlan = union(enum) {
     help: HelpPlan,
     version: VersionPlan,
     list_models: ListModelsPlan,
+    docs: DocsPlan,
+    man: ManPlan,
     run: RunPlan,
 };
 
@@ -60,6 +64,8 @@ pub const VersionPlan = struct {};
 pub const ListModelsPlan = struct {
     search: ?[]const u8 = null,
 };
+pub const DocsPlan = struct { query: []const u8 };
+pub const ManPlan = struct { topic: ?[]const u8 = null };
 
 pub const BuildOptions = struct {
     piped_stdin: ?[]const u8 = null,
@@ -93,6 +99,8 @@ pub fn build(allocator: std.mem.Allocator, raw: RawCommand, options: BuildOption
         .help => .{ .ok = .{ .help = .{} } },
         .version => .{ .ok = .{ .version = .{} } },
         .list_models => |list_models| buildListModels(list_models),
+        .docs => |docs| .{ .ok = .{ .docs = .{ .query = docs.query } } },
+        .man => |man| .{ .ok = .{ .man = .{ .topic = man.topic } } },
         .run => |run| try buildRun(allocator, run, options),
     };
 }

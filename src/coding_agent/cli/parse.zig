@@ -38,6 +38,8 @@ pub const RawListModelsArgs = struct {
         self.* = undefined;
     }
 };
+pub const RawDocsArgs = struct { query: []const u8 };
+pub const RawManArgs = struct { topic: ?[]const u8 = null };
 pub const RawHelpArgs = struct {};
 pub const RawVersionArgs = struct {};
 
@@ -46,12 +48,14 @@ pub const RawCommand = union(Action) {
     help: RawHelpArgs,
     version: RawVersionArgs,
     list_models: RawListModelsArgs,
+    docs: RawDocsArgs,
+    man: RawManArgs,
 
     pub fn deinit(self: *RawCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .run => |*run| run.deinit(allocator),
             .list_models => |*list_models| list_models.deinit(allocator),
-            .help, .version => self.* = undefined,
+            .help, .version, .docs, .man => self.* = undefined,
         }
     }
 };
@@ -78,6 +82,8 @@ pub fn parse(
         .help => try parseUtilityAction(.help, argv),
         .version => try parseUtilityAction(.version, argv),
         .list_models => try parseListModels(allocator, argv),
+        .docs => parseDocs(argv),
+        .man => parseMan(argv),
     };
 }
 
@@ -111,7 +117,7 @@ fn parseRun(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allo
                 .no_session => raw.no_session = true,
                 .tools_filter => raw.tools_filter = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } },
                 .append_system_prompt => raw.append_system_prompt = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } },
-                .list_models, .help, .version => unreachable,
+                .list_models, .docs, .man, .help, .version => unreachable,
             }
             continue;
         }
@@ -138,8 +144,42 @@ fn parseUtilityAction(comptime action: spec.ActionScope, argv: []const []const u
     return switch (action) {
         .help => .{ .ok = .{ .help = .{} } },
         .version => .{ .ok = .{ .version = .{} } },
-        .run, .list_models => unreachable,
+        .run, .list_models, .docs, .man => unreachable,
     };
+}
+
+fn parseDocs(argv: []const []const u8) ParseResult {
+    var query: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (spec.findForAction(.docs, arg)) |flag| {
+            if (flag.id != .docs) continue;
+            query = consumeValue(argv, &i, arg) orelse return .{ .err = .{ .missing_value = arg } };
+            continue;
+        }
+        if (arg.len > 0 and arg[0] == '-') return .{ .err = .{ .unknown_flag = arg } };
+        return .{ .err = .{ .unexpected_argument = arg } };
+    }
+    return .{ .ok = .{ .docs = .{ .query = query orelse return .{ .err = .{ .missing_value = "--docs" } } } } };
+}
+
+fn parseMan(argv: []const []const u8) ParseResult {
+    var topic: ?[]const u8 = null;
+    var saw_man = false;
+    for (argv) |arg| {
+        if (spec.findForAction(.man, arg)) |flag| {
+            if (flag.id == .man) {
+                saw_man = true;
+                continue;
+            }
+        }
+        if (arg.len > 0 and arg[0] == '-') return .{ .err = .{ .unknown_flag = arg } };
+        if (topic != null) return .{ .err = .{ .unexpected_argument = arg } };
+        topic = arg;
+    }
+    if (!saw_man) return .{ .err = .{ .missing_value = "--man" } };
+    return .{ .ok = .{ .man = .{ .topic = topic } } };
 }
 
 fn parseListModels(allocator: std.mem.Allocator, argv: []const []const u8) std.mem.Allocator.Error!ParseResult {

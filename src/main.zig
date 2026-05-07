@@ -120,7 +120,7 @@ fn writeExecutionDiagnostic(diag: cli.result.ExecutionDiagnostic) !void {
 
 fn planRequiresRuntime(execution_plan: cli.plan.ExecutionPlan) bool {
     return switch (execution_plan) {
-        .help, .version => false,
+        .help, .version, .docs, .man => false,
         .list_models, .run => true,
     };
 }
@@ -152,7 +152,7 @@ fn buildLoggingOptions(allocator: std.mem.Allocator, io: std.Io, execution_plan:
 
 fn defaultSinksForPlan(execution_plan: cli.plan.ExecutionPlan) logging.SinkOptions {
     return switch (execution_plan) {
-        .help, .version, .list_models => .{},
+        .help, .version, .docs, .man, .list_models => .{},
         .run => .{ .file = true },
     };
 }

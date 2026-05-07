@@ -1,3 +1,14 @@
+---
+slug: cli
+title: CLI
+order: 10
+aliases:
+  - flags
+  - options
+  - batch
+  - json mode
+---
+
 # CLI
 
 Run `zi` in a project.
@@ -78,6 +89,11 @@ A pipe does not switch zi into batch mode by itself. That keeps accidental shell
 
 `-v`, `--version`
 : Show version.
+
+## Environment
+
+`ZI_CODEX_FAST_MODE=1`
+: For `openai-codex/gpt-5.4` and `openai-codex/gpt-5.5`, send Codex requests with `text.verbosity = "low"` and `service_tier = "priority"`. Accepted enabled values are `1`, `true`, `on`, and `yes`.
 
 ## Prompt inputs
 

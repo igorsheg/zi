@@ -1,3 +1,15 @@
+---
+slug: api
+title: API
+order: 30
+aliases:
+  - extension api
+  - zi api
+  - tools
+  - commands
+  - events
+---
+
 # API
 
 Extensions get a global `zi` table.

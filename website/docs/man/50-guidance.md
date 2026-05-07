@@ -1,3 +1,15 @@
+---
+slug: guidance
+title: Extension guidance
+order: 50
+aliases:
+  - best practices
+  - patterns
+  - examples
+  - create extension
+  - kindness
+---
+
 # Extension guidance
 
 Write extensions a tired maintainer can understand.

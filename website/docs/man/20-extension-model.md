@@ -1,3 +1,16 @@
+---
+slug: extensions
+title: Extensions
+order: 20
+aliases:
+  - extension
+  - extension model
+  - teach zi
+  - discovery
+  - loading
+  - lifecycle
+---
+
 # Extensions
 
 An extension is a Lua entrypoint that teaches zi one habit.

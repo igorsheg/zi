@@ -21,6 +21,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
+const env = @import("env");
 const ai_models = @import("models.zig");
 const ai_provider = @import("provider.zig");
 const core = @import("openai_responses_core.zig");
@@ -152,7 +153,7 @@ fn acceptCodexTransport(
 ///
 /// Key differences from the standard responses body:
 ///   - `instructions` is a top-level field (system prompt excluded from `input`)
-///   - `text.verbosity: "medium"`
+///   - `text.verbosity: "medium"` (`"low"` when Codex fast mode is enabled)
 ///   - `include: ["reasoning.encrypted_content"]`
 ///   - `tool_choice: "auto"`, `parallel_tool_calls: true`
 ///   - reasoning defaults to `effort: "low"`, `summary: "auto"`
@@ -164,6 +165,28 @@ fn buildCodexRequestJson(
     options: protocol.StreamOptions,
     reasoning_effort: ?[]const u8,
     reasoning_summary: ?[]const u8,
+) anyerror!void {
+    return buildCodexRequestJsonWithFastMode(
+        allocator,
+        out,
+        model,
+        context,
+        options,
+        reasoning_effort,
+        reasoning_summary,
+        codexFastModeEnabledForModel(model.id),
+    );
+}
+
+fn buildCodexRequestJsonWithFastMode(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    model: protocol.Model,
+    context: protocol.Context,
+    options: protocol.StreamOptions,
+    reasoning_effort: ?[]const u8,
+    reasoning_summary: ?[]const u8,
+    use_codex_fast_mode: bool,
 ) anyerror!void {
     var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
@@ -185,7 +208,7 @@ fn buildCodexRequestJson(
     try jw.objectField("text");
     try jw.beginObject();
     try jw.objectField("verbosity");
-    try jw.write("medium");
+    try jw.write(codexVerbosity(use_codex_fast_mode));
     try jw.endObject();
 
     try jw.objectField("include");
@@ -221,6 +244,11 @@ fn buildCodexRequestJson(
         try jw.objectField("summary");
         try jw.write(reasoning_summary orelse "auto");
         try jw.endObject();
+    }
+
+    if (use_codex_fast_mode) {
+        try jw.objectField("service_tier");
+        try jw.write("priority");
     }
 
     try jw.endObject();
@@ -288,11 +316,40 @@ fn fillCodexHeaders(buf: *[6]protocol.Header, account_id: []const u8, user_agent
     return 5;
 }
 
+const CODEX_FAST_MODE_ENV = "ZI_CODEX_FAST_MODE";
+
+fn codexModelLeaf(model_id: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |idx| model_id[idx + 1 ..] else model_id;
+}
+
+fn isCodexFastModeSupportedModel(model_id: []const u8) bool {
+    const id = codexModelLeaf(model_id);
+    return std.mem.eql(u8, id, "gpt-5.4") or std.mem.eql(u8, id, "gpt-5.5");
+}
+
+fn codexFastModeEnabledForModel(model_id: []const u8) bool {
+    return isCodexFastModeSupportedModel(model_id) and envFlagEnabled(env.get(CODEX_FAST_MODE_ENV));
+}
+
+fn envFlagEnabled(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "on") or
+        std.ascii.eqlIgnoreCase(trimmed, "yes");
+}
+
+fn codexVerbosity(use_codex_fast_mode: bool) []const u8 {
+    return if (use_codex_fast_mode) "low" else "medium";
+}
+
 fn clampCodexReasoningEffort(model_id: []const u8, effort: []const u8) []const u8 {
-    const id = if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |idx| model_id[idx + 1 ..] else model_id;
+    const id = codexModelLeaf(model_id);
     if ((std.mem.startsWith(u8, id, "gpt-5.2") or
         std.mem.startsWith(u8, id, "gpt-5.3") or
-        std.mem.startsWith(u8, id, "gpt-5.4")) and
+        std.mem.startsWith(u8, id, "gpt-5.4") or
+        std.mem.startsWith(u8, id, "gpt-5.5")) and
         std.mem.eql(u8, effort, "minimal"))
     {
         return "low";
@@ -364,6 +421,23 @@ test "clampCodexReasoningEffort matches codex model/API boundaries" {
     try testing.expectEqualStrings("medium", clampCodexReasoningEffort("gpt-5.1-codex-mini", "low"));
     try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.1-codex-mini", "xhigh"));
     try testing.expectEqualStrings("high", clampCodexReasoningEffort("gpt-5.4", "high"));
+    try testing.expectEqualStrings("low", clampCodexReasoningEffort("gpt-5.5", "minimal"));
+}
+
+test "Codex fast mode env helpers are explicit and model-scoped" {
+    try testing.expect(envFlagEnabled("1"));
+    try testing.expect(envFlagEnabled("true"));
+    try testing.expect(envFlagEnabled("ON"));
+    try testing.expect(envFlagEnabled(" yes "));
+    try testing.expect(!envFlagEnabled(null));
+    try testing.expect(!envFlagEnabled("0"));
+    try testing.expect(!envFlagEnabled("false"));
+
+    try testing.expect(isCodexFastModeSupportedModel("gpt-5.4"));
+    try testing.expect(isCodexFastModeSupportedModel("openai/gpt-5.5"));
+    try testing.expect(!isCodexFastModeSupportedModel("gpt-5.3-codex"));
+    try testing.expectEqualStrings("low", codexVerbosity(true));
+    try testing.expectEqualStrings("medium", codexVerbosity(false));
 }
 
 test "Codex provider rejects websocket transport before auth" {
@@ -426,10 +500,10 @@ test "buildCodexRequestJson preserves Codex request contract" {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
 
-    try buildCodexRequestJson(alloc, &out, codexTestModel(), ctx, .{
+    try buildCodexRequestJsonWithFastMode(alloc, &out, codexTestModel(), ctx, .{
         .session_id = "session-abc",
         .temperature = 0.25,
-    }, "low", "auto");
+    }, "low", "auto", false);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
     defer parsed.deinit();
@@ -446,10 +520,22 @@ test "buildCodexRequestJson preserves Codex request contract" {
     try testing.expectEqualStrings("auto", root.get("reasoning").?.object.get("summary").?.string);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"temperature\":0.25") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"strict\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"service_tier\"") == null);
 
     out.clearRetainingCapacity();
-    try buildCodexRequestJson(alloc, &out, codexTestModel(), ctx, .{}, null, null);
+    try buildCodexRequestJsonWithFastMode(alloc, &out, codexTestModel(), ctx, .{}, null, null, false);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"reasoning\"") == null);
+
+    out.clearRetainingCapacity();
+    var fast_model = codexTestModel();
+    fast_model.id = "gpt-5.5";
+    try buildCodexRequestJsonWithFastMode(alloc, &out, fast_model, ctx, .{}, null, null, true);
+    const fast_parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+    defer fast_parsed.deinit();
+    const fast_root = fast_parsed.value.object;
+    try testing.expectEqualStrings("gpt-5.5", fast_root.get("model").?.string);
+    try testing.expectEqualStrings("low", fast_root.get("text").?.object.get("verbosity").?.string);
+    try testing.expectEqualStrings("priority", fast_root.get("service_tier").?.string);
 }
 
 fn codexTestModel() protocol.Model {
