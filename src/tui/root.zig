@@ -5,6 +5,7 @@ pub const renderer = @import("renderer.zig");
 pub const terminal = @import("terminal/mod.zig");
 pub const components = @import("components/root.zig");
 pub const wrap = @import("wrap/root.zig");
+pub const text = @import("text/root.zig");
 pub const ui_event = @import("ui_event.zig");
 pub const conversation = @import("conversation/root.zig");
 pub const tui = @import("tui.zig");

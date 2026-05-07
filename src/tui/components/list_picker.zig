@@ -219,11 +219,11 @@ pub const ListPicker = struct {
     search_placeholder: ?[]const u8 = null,
     empty_text: []const u8 = "No matching commands",
     status: ?Status = null,
-    pub fn init(theme: *const Theme) ListPicker {
+    pub fn init(allocator: std.mem.Allocator, theme: *const Theme) ListPicker {
         return .{
             .list = .{ .theme = theme },
             .search_input = SearchInput.init(theme),
-            .status_text = StatusText.init(theme),
+            .status_text = StatusText.init(allocator, theme, .wcwidth),
             .theme = theme,
         };
     }
@@ -434,7 +434,7 @@ test "plain picker navigates and reports visible source index" {
     const theme = testTheme();
     var items = pickerItems();
 
-    var picker = ListPicker.init(&theme);
+    var picker = ListPicker.init(testing.allocator, &theme);
     var capture = SelectionCapture{};
     picker.setItems(&items);
     picker.on_select = &captureSelection;
@@ -456,7 +456,7 @@ test "searchable picker filters and reports original source index" {
     var items = pickerItems();
     const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
 
-    var picker = ListPicker.init(&theme);
+    var picker = ListPicker.init(testing.allocator, &theme);
     var capture = SelectionCapture{};
     picker.setSearchableItems(&items, &search_texts);
     picker.on_select = &captureSelection;
@@ -475,7 +475,7 @@ test "searchable picker preserves selected value across filter changes" {
     var items = pickerItems();
     const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
 
-    var picker = ListPicker.init(&theme);
+    var picker = ListPicker.init(testing.allocator, &theme);
     picker.setSearchableItems(&items, &search_texts);
     picker.setInitialSelectionByValue("beta");
 

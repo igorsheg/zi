@@ -2,7 +2,7 @@ const std = @import("std");
 const cell_mod = @import("../cell.zig");
 const buffer_mod = @import("../primitives/surface.zig");
 const component_mod = @import("../primitives/view.zig");
-const display_wrap_mod = @import("../wrap/display.zig");
+const text_layout = @import("../text/layout.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -10,7 +10,14 @@ const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const grapheme = @import("../grapheme.zig");
-const Line = display_wrap_mod.Line;
+const Line = text_layout.Line;
+pub const WrapMode = text_layout.WrapMode;
+pub const OverflowMode = text_layout.OverflowMode;
+pub const TextAlign = text_layout.TextAlign;
+pub const TextRun = text_layout.TextRun;
+const StyleSpan = text_layout.StyleSpan;
+const LayoutCache = text_layout.LayoutCache;
+const TextBuffer = text_layout.TextBuffer;
 
 /// Styled text with word wrapping, padding, and scroll support.
 ///
@@ -27,31 +34,35 @@ pub const Text = struct {
     padding_x: u32 = 0,
     padding_y: u32 = 0,
     scroll_offset: u32 = 0,
+    scroll_x: u32 = 0,
+    text_align: TextAlign = .left,
+    wrap_mode: WrapMode = .word,
+    overflow: OverflowMode = .clip,
+    max_lines: ?u32 = null,
+    link: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
-    /// Owned content buffer — setContent copies into this so callers
-    /// don't need to keep the source alive.
-    content_buf: std.ArrayListUnmanaged(u8) = .empty,
-
-    cached_lines: ?[]Line = null,
-    cached_width: u32 = 0,
-    cached_content_ptr: ?[*]const u8 = null,
-    cached_content_len: usize = 0,
-    cached_width_method: grapheme.WidthMethod = .wcwidth,
+    /// Owned content and style mapping. Direct `content` assignment remains
+    /// supported for plain compatibility; setContent/setRuns copy into this
+    /// buffer when callers want lifetime-safe content.
+    buffer: TextBuffer = .{},
+    layout_cache: LayoutCache = .{},
     width_method: grapheme.WidthMethod = .wcwidth,
 
     pub fn init(allocator: std.mem.Allocator, width_method: grapheme.WidthMethod) Text {
         return .{
             .allocator = allocator,
-            .cached_width_method = width_method,
             .width_method = width_method,
         };
     }
 
     pub fn setContent(self: *Text, text: []const u8) void {
-        self.content_buf.clearRetainingCapacity();
-        self.content_buf.appendSlice(self.allocator, text) catch return;
-        self.content = self.content_buf.items;
+        self.content = self.buffer.setPlain(self.allocator, text) catch return;
+        self.invalidateCache();
+    }
+
+    pub fn setRuns(self: *Text, runs: []const TextRun) void {
+        self.content = self.buffer.setRuns(self.allocator, runs) catch return;
         self.invalidateCache();
     }
 
@@ -89,15 +100,9 @@ pub const Text = struct {
     }
 
     pub fn renderSlice(self: *Text, region: Region, first_row: u32) void {
-        if (self.content.len == 0) return;
-
         const w = region.width;
         const h = region.height;
         if (w == 0 or h == 0) return;
-
-        const content_width = if (w > self.padding_x * 2) w - self.padding_x * 2 else 1;
-        const width_method = region.buf.width_method;
-        const lines = self.getWrappedLines(content_width, width_method) orelse return;
 
         if (!self.bg.eql(Color.default)) {
             region.fill(0, 0, w, h, .{
@@ -106,25 +111,29 @@ pub const Text = struct {
                 .bg = self.bg,
             });
         }
+        if (self.content.len == 0) return;
 
-        const pad_y = self.padding_y;
+        const content_width = self.contentWidth(w);
+        const layout = self.getLayout(content_width, region.buf.width_method) orelse return;
+        const lines = layout.lines orelse return;
+
+        const row_limit = if (self.max_lines) |m| @min(h, m) else h;
         var row: u32 = 0;
         var virtual_row: u32 = self.scroll_offset + first_row;
-
-        while (row < h) {
-            if (virtual_row < pad_y) {
+        while (row < row_limit) {
+            if (virtual_row < self.padding_y) {
                 virtual_row += 1;
                 row += 1;
                 continue;
             }
 
-            const line_idx = virtual_row - pad_y;
+            const line_idx = virtual_row - self.padding_y;
             if (line_idx >= lines.len) break;
 
             const line = lines[line_idx];
             const line_text = line.text(self.content);
             if (line_text.len > 0) {
-                _ = region.writeStr(self.padding_x, row, line_text, self.fg, self.bg, self.attrs);
+                self.writeLine(region, self.padding_x, row, line, line_text, content_width);
             }
 
             row += 1;
@@ -136,51 +145,91 @@ pub const Text = struct {
         if (self.content.len == 0) return .{ .min_height = 0, .preferred_height = 0 };
         if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
 
-        const content_width = if (width > self.padding_x * 2) width - self.padding_x * 2 else 1;
-        const lines = self.getWrappedLines(content_width, self.width_method) orelse
+        const layout = self.getLayout(self.contentWidth(width), self.width_method) orelse
             return .{ .min_height = 1, .preferred_height = 1 };
+        const lines = layout.lines orelse return .{ .min_height = 1, .preferred_height = 1 };
 
-        const line_count: u32 = @intCast(lines.len);
-        const total = line_count + self.padding_y * 2;
-        return .{ .min_height = 1, .preferred_height = total };
+        const total = text_layout.measureLineCount(lines, self.padding_y, self.max_lines);
+        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
     }
 
     pub fn component(self: *Text) Component {
         return Component.init(Text, self);
     }
 
-    fn getWrappedLines(self: *Text, content_width: u32, width_method: grapheme.WidthMethod) ?[]Line {
-        if (self.cached_lines) |cached| {
-            if (self.cached_width == content_width and
-                self.cached_content_ptr == self.content.ptr and
-                self.cached_content_len == self.content.len and
-                self.cached_width_method == width_method)
-            {
-                return cached;
-            }
-            self.allocator.free(cached);
-            self.cached_lines = null;
-        }
+    fn contentWidth(self: *const Text, outer_width: u32) u32 {
+        return if (outer_width > self.padding_x * 2) outer_width - self.padding_x * 2 else 1;
+    }
 
-        const lines = display_wrap_mod.wordWrap(self.content, content_width, self.allocator, width_method) catch return null;
-        self.cached_lines = lines;
-        self.cached_width = content_width;
-        self.cached_content_ptr = self.content.ptr;
-        self.cached_content_len = self.content.len;
-        self.cached_width_method = width_method;
-        return lines;
+    fn writeLine(self: *Text, region: Region, x: u32, y: u32, line: Line, line_text: []const u8, content_width: u32) void {
+        if (content_width == 0) return;
+
+        const viewport = text_layout.viewportForLine(self.content, line, content_width, self.scroll_x, region.buf.width_method);
+        if (viewport.start >= viewport.end) return;
+        const visible_text = self.content[viewport.start..viewport.end];
+        const visible_width: u32 = @intCast(grapheme.strWidth(visible_text, region.buf.width_method));
+        const aligned_x = x + text_layout.alignmentOffset(self.text_align, content_width, visible_width);
+
+        if (self.overflow == .ellipsis and self.scroll_x == 0 and grapheme.strWidth(line_text, region.buf.width_method) > content_width) {
+            if (content_width == 1) {
+                self.writeFallbackGlyph(region, aligned_x, y, "…");
+                return;
+            }
+            const prefix = grapheme.sliceToWidth(line_text, content_width - 1, region.buf.width_method);
+            const used: u32 = @intCast(grapheme.strWidth(prefix, region.buf.width_method));
+            self.writeStyledSlice(region, aligned_x, y, line.start, line.start + prefix.len);
+            self.writeFallbackGlyph(region, aligned_x + used, y, "…");
+            return;
+        }
+        self.writeStyledSlice(region, aligned_x, y, viewport.start, viewport.end);
+    }
+
+    fn writeStyledSlice(self: *Text, region: Region, x: u32, y: u32, start: usize, end: usize) void {
+        const fallback = StyleSpan{ .start = start, .end = end, .fg = self.fg, .bg = self.bg, .attrs = self.attrs, .link = self.link };
+        var col = x;
+        var byte = start;
+        var cached_link: ?[]const u8 = null;
+        var cached_id: u16 = 0;
+        while (byte < end and col < region.width) {
+            const next = grapheme.nextGraphemeBoundaryFromBoundary(self.content[start..end], byte - start, region.buf.width_method) + start;
+            if (next <= byte) break;
+            const span = self.buffer.styleAt(byte, fallback);
+            const link_id = if (span.link) |url| blk: {
+                if (cached_link == null or !std.mem.eql(u8, cached_link.?, url)) {
+                    cached_link = url;
+                    cached_id = region.buf.addLink(url) catch 0;
+                }
+                break :blk cached_id;
+            } else 0;
+            const wrote = region.writeStrLink(col, y, self.content[byte..next], span.fg, span.bg, span.attrs, link_id);
+            col += wrote;
+            byte = next;
+        }
+    }
+
+    fn writeFallbackGlyph(self: *Text, region: Region, x: u32, y: u32, glyph: []const u8) void {
+        const link_id = if (self.link) |url| region.buf.addLink(url) catch 0 else 0;
+        _ = region.writeStrLink(x, y, glyph, self.fg, self.bg, self.attrs, link_id);
+    }
+
+    fn getLayout(self: *Text, content_width: u32, width_method: grapheme.WidthMethod) ?*const LayoutCache {
+        return text_layout.getCached(&self.layout_cache, self.allocator, .{
+            .text = self.content,
+            .width = content_width,
+            .wrap_mode = self.wrap_mode,
+            .max_lines = self.max_lines,
+            .width_method = width_method,
+            .style_generation = self.buffer.style_generation,
+        }) catch null;
     }
 
     fn invalidateCache(self: *Text) void {
-        if (self.cached_lines) |cached| {
-            self.allocator.free(cached);
-            self.cached_lines = null;
-        }
+        self.layout_cache.clear(self.allocator);
     }
 
     pub fn deinit(self: *Text) void {
-        self.content_buf.deinit(self.allocator);
-        self.invalidateCache();
+        self.layout_cache.clear(self.allocator);
+        self.buffer.deinit(self.allocator);
     }
 };
 
@@ -251,4 +300,296 @@ test "Text scroll_offset skips top lines" {
 
     try testing.expectEqual(@as(u21, 'c'), small_buf.get(0, 0).grapheme.codepoint);
     try testing.expectEqual(@as(u21, 'd'), small_buf.get(0, 1).grapheme.codepoint);
+}
+
+test "Text wrap none measures explicit lines only and clips horizontally" {
+    var buf = try Buffer.init(testing.allocator, 5, 2, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "hello world\nbye";
+    text.wrap_mode = .none;
+
+    try testing.expectEqual(@as(u32, 2), text.measure(5).preferred_height);
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'h'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'o'), buf.get(4, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'b'), buf.get(0, 1).grapheme.codepoint);
+}
+
+test "Text max_lines caps measurement and render" {
+    var buf = try Buffer.init(testing.allocator, 3, 4, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "aa bb cc dd";
+    text.max_lines = 2;
+
+    try testing.expectEqual(@as(u32, 2), text.measure(3).preferred_height);
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'a'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'b'), buf.get(0, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, ' '), buf.get(0, 2).grapheme.codepoint);
+}
+
+test "Text renders adjacent styled runs" {
+    var buf = try Buffer.init(testing.allocator, 8, 1, .wcwidth);
+    defer buf.deinit();
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    const red = Color.rgb(255, 0, 0);
+    const green = Color.rgb(0, 255, 0);
+    const runs = [_]TextRun{ .{ .text = "ab", .fg = red }, .{ .text = "cd", .fg = green, .attrs = .{ .bold = true } } };
+    text.setRuns(&runs);
+    text.render(buf.region());
+    try testing.expect(buf.get(0, 0).fg.eql(red));
+    try testing.expect(buf.get(2, 0).fg.eql(green));
+    try testing.expect(buf.get(2, 0).attrs.bold);
+}
+
+test "Text wraps styled runs across boundaries" {
+    var buf = try Buffer.init(testing.allocator, 3, 2, .wcwidth);
+    defer buf.deinit();
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.wrap_mode = .char;
+    const blue = Color.rgb(0, 0, 255);
+    const yellow = Color.rgb(255, 255, 0);
+    const runs = [_]TextRun{ .{ .text = "abc", .fg = blue }, .{ .text = "def", .fg = yellow } };
+    text.setRuns(&runs);
+    try testing.expectEqual(@as(u32, 2), text.measure(3).preferred_height);
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'a'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'd'), buf.get(0, 1).grapheme.codepoint);
+    try testing.expect(buf.get(0, 0).fg.eql(blue));
+    try testing.expect(buf.get(0, 1).fg.eql(yellow));
+}
+
+test "Text layout cache invalidates for same-buffer content mutation" {
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+
+    var bytes = [_]u8{ 'a', 'b' };
+    text.content = bytes[0..];
+    text.wrap_mode = .none;
+
+    try testing.expectEqual(@as(u32, 1), text.measure(10).preferred_height);
+    bytes[1] = '\n';
+    try testing.expectEqual(@as(u32, 2), text.measure(10).preferred_height);
+}
+
+test "Text layout cache key includes max_lines" {
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "aa bb cc dd";
+
+    try testing.expectEqual(@as(u32, 4), text.measure(3).preferred_height);
+    text.max_lines = 2;
+    try testing.expectEqual(@as(u32, 2), text.measure(3).preferred_height);
+}
+
+test "Text setContent keeps plain text compatible and owned" {
+    var buf = try Buffer.init(testing.allocator, 5, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+
+    var source = [_]u8{ 'h', 'e', 'l', 'l', 'o' };
+    text.setContent(source[0..]);
+    source[0] = 'j';
+
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'h'), buf.get(0, 0).grapheme.codepoint);
+}
+
+test "Text styles grapheme cluster using run at cluster start" {
+    var buf = try Buffer.init(testing.allocator, 4, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    const red = Color.rgb(255, 0, 0);
+    const green = Color.rgb(0, 255, 0);
+    const runs = [_]TextRun{
+        .{ .text = "e", .fg = red },
+        .{ .text = "\u{0301}", .fg = green },
+    };
+    text.setRuns(&runs);
+
+    text.render(buf.region());
+    try testing.expect(buf.get(0, 0).grapheme == .pooled);
+    try testing.expect(buf.get(0, 0).fg.eql(red));
+    try testing.expectEqual(@as(u21, ' '), buf.get(1, 0).grapheme.codepoint);
+}
+
+test "Text max_lines and scroll render a capped viewport" {
+    var buf = try Buffer.init(testing.allocator, 3, 4, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "aa bb cc dd";
+    text.max_lines = 2;
+    text.scroll_offset = 1;
+
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'b'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'c'), buf.get(0, 1).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, ' '), buf.get(0, 2).grapheme.codepoint);
+}
+
+test "Text fills background across padded region" {
+    var buf = try Buffer.init(testing.allocator, 4, 3, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    const bg = Color.rgb(10, 20, 30);
+    text.setContent("x");
+    text.bg = bg;
+    text.padding_x = 1;
+    text.padding_y = 1;
+
+    text.render(buf.region());
+    try testing.expect(buf.get(0, 0).bg.eql(bg));
+    try testing.expect(buf.get(1, 1).bg.eql(bg));
+    try testing.expectEqual(@as(u21, 'x'), buf.get(1, 1).grapheme.codepoint);
+}
+
+test "Text aligns visual lines left center and right" {
+    var buf = try Buffer.init(testing.allocator, 6, 3, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "hi";
+
+    text.text_align = .left;
+    text.renderSlice(buf.region().sub(0, 0, 6, 1), 0);
+    try testing.expectEqual(@as(u21, 'h'), buf.get(0, 0).grapheme.codepoint);
+
+    text.text_align = .center;
+    text.renderSlice(buf.region().sub(0, 1, 6, 1), 0);
+    try testing.expectEqual(@as(u21, 'h'), buf.get(2, 1).grapheme.codepoint);
+
+    text.text_align = .right;
+    text.renderSlice(buf.region().sub(0, 2, 6, 1), 0);
+    try testing.expectEqual(@as(u21, 'h'), buf.get(4, 2).grapheme.codepoint);
+}
+
+test "Text scroll_x clips horizontal viewport for wrap none" {
+    var buf = try Buffer.init(testing.allocator, 4, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "abcdef";
+    text.wrap_mode = .none;
+    text.scroll_x = 2;
+
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'c'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'f'), buf.get(3, 0).grapheme.codepoint);
+}
+
+test "Text scroll_x respects padding" {
+    var buf = try Buffer.init(testing.allocator, 6, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "abcdef";
+    text.wrap_mode = .none;
+    text.padding_x = 1;
+    text.scroll_x = 2;
+
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, ' '), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'c'), buf.get(1, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'f'), buf.get(4, 0).grapheme.codepoint);
+}
+
+test "Text alignment respects padding" {
+    var buf = try Buffer.init(testing.allocator, 8, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "hi";
+    text.padding_x = 1;
+    text.text_align = .right;
+
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'h'), buf.get(5, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 'i'), buf.get(6, 0).grapheme.codepoint);
+}
+
+test "Text alignment applies after max_lines viewport" {
+    var buf = try Buffer.init(testing.allocator, 5, 3, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "a\nb";
+    text.wrap_mode = .none;
+    text.text_align = .center;
+    text.max_lines = 1;
+    text.scroll_offset = 1;
+
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'b'), buf.get(2, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, ' '), buf.get(2, 1).grapheme.codepoint);
+}
+
+test "Text renders links into cell link ids" {
+    var buf = try Buffer.init(testing.allocator, 8, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    const runs = [_]TextRun{.{ .text = "hi", .link = "https://example.test" }};
+    text.setRuns(&runs);
+    text.render(buf.region());
+
+    try testing.expectEqual(@as(usize, 1), buf.link_table.items.len);
+    try testing.expectEqualStrings("https://example.test", buf.link_table.items[0]);
+    try testing.expectEqual(@as(u16, 1), buf.get(0, 0).link_id);
+    try testing.expectEqual(@as(u16, 1), buf.get(1, 0).link_id);
+}
+
+test "Text default link applies to plain content" {
+    var buf = try Buffer.init(testing.allocator, 8, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "go";
+    text.link = "https://plain.test";
+    text.render(buf.region());
+
+    try testing.expectEqual(@as(usize, 1), buf.link_table.items.len);
+    try testing.expectEqualStrings("https://plain.test", buf.link_table.items[0]);
+    try testing.expectEqual(@as(u16, 1), buf.get(0, 0).link_id);
+}
+
+test "Text setRuns owns text and does not retain caller run slice" {
+    var buf = try Buffer.init(testing.allocator, 2, 1, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+
+    const source = try testing.allocator.dupe(u8, "hi");
+    var runs = try testing.allocator.alloc(TextRun, 1);
+    runs[0] = .{ .text = source, .fg = Color.rgb(1, 2, 3) };
+    text.setRuns(runs);
+    testing.allocator.free(runs);
+    testing.allocator.free(source);
+
+    text.render(buf.region());
+    try testing.expectEqual(@as(u21, 'h'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expect(buf.get(0, 0).fg.eql(Color.rgb(1, 2, 3)));
 }

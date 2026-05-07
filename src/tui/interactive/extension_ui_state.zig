@@ -4,9 +4,12 @@ const component_mod = @import("../primitives/view.zig");
 const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const framebuffer_surface_mod = @import("../components/framebuffer_surface.zig");
+const text_component_mod = @import("../components/text.zig");
+const markdown_component_mod = @import("../components/markdown.zig");
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const overlay_mod = @import("../primitives/overlay.zig");
 const keys_mod = @import("../terminal/keys.zig");
+const grapheme_mod = @import("../grapheme.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -15,6 +18,10 @@ const Buffer = buffer_mod.Buffer;
 const Cell = cell_mod.Cell;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
+const TextComponent = text_component_mod.Text;
+const TextRun = text_component_mod.TextRun;
+const MarkdownComponent = markdown_component_mod.Markdown;
+const WidthMethod = grapheme_mod.WidthMethod;
 
 pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
@@ -235,18 +242,20 @@ const FrameRecord = struct {
 const TargetComponent = struct {
     state: *ExtensionUiState = undefined,
     target: extension_ui.UiTarget,
+    width_method: WidthMethod = .wcwidth,
 
     fn component(self: *TargetComponent) Component {
         return Component.init(TargetComponent, self);
     }
 
     pub fn render(self: *TargetComponent, region: Region) void {
+        self.width_method = region.buf.width_method;
         const ordered = self.orderedViews() catch return;
         defer self.state.allocator.free(ordered);
         var y: u32 = 0;
         for (ordered) |view| {
             if (y >= region.height) break;
-            const h = @min(measureNode(view.spec.root orelse continue, region.width), region.height - y);
+            const h = @min(measureNode(self.state, view.spec.root orelse continue, region.width, region.buf.width_method), region.height - y);
             renderNode(self.state, view.spec, view.spec.root.?, region.sub(0, y, region.width, h));
             y += h;
         }
@@ -257,7 +266,7 @@ const TargetComponent = struct {
         defer self.state.allocator.free(ordered);
         var total: u32 = 0;
         for (ordered) |view| {
-            if (view.spec.root) |root| total += measureNode(root, width);
+            if (view.spec.root) |root| total += measureNode(self.state, root, width, self.width_method);
         }
         return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
     }
@@ -350,37 +359,370 @@ fn lessView(_: void, a: *ViewRecord, b: *ViewRecord) bool {
 
 const Rect = struct { x: u32, y: u32, width: u32, height: u32 };
 
-fn measureNode(node: extension_ui.UiNode, width: u32) u32 {
+fn measureNode(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, width_method: WidthMethod) u32 {
     return switch (node) {
-        .text => 1,
+        .text => |t| measureText(state, t, width, width_method),
         .chip => 1,
         .progress => 1,
         .surface => |s| constraintHeight(s.style.height) orelse 1,
-        .box => |b| measureBox(b, width),
+        .box => |b| measureBox(state, b, width, width_method),
     };
 }
 
-fn measureBox(b: extension_ui.UiNode.Box, width: u32) u32 {
+fn measureBox(state: *ExtensionUiState, b: extension_ui.UiNode.Box, width: u32, width_method: WidthMethod) u32 {
     const border: u32 = if (b.style.border) 1 else 0;
     const pad_v = edge(b.style.padding.top) + edge(b.style.padding.bottom);
+    const pad_h = edge(b.style.padding.left) + edge(b.style.padding.right);
+    const child_width = width -| (border * 2 + pad_h);
     var content: u32 = 0;
     if (b.children.len == 0) {
         content = 0;
     } else if (b.style.flex_direction == .row) {
-        for (b.children) |child| content = @max(content, measureNode(child, width));
+        for (b.children) |child| content = @max(content, measureNode(state, child, child_width, width_method));
     } else {
         for (b.children, 0..) |child, i| {
-            content += measureNode(child, width);
+            content += measureNode(state, child, child_width, width_method);
             if (i + 1 < b.children.len) content += edge(b.style.gap);
         }
     }
     return @max(1, border * 2 + pad_v + content);
 }
 
+fn measureText(state: *ExtensionUiState, t: extension_ui.UiNode.Text, width: u32, width_method: WidthMethod) u32 {
+    if (t.format == .markdown) return measureMarkdown(state, t, width, width_method);
+    var text = TextComponent.init(state.allocator, width_method);
+    defer text.deinit();
+    applyTextContent(state, &text, t) catch {
+        text.content = t.text;
+    };
+    applyTextOptions(&text, t);
+    return text.measure(width).preferred_height;
+}
+
+fn applyTextOptions(text: *TextComponent, t: extension_ui.UiNode.Text) void {
+    text.wrap_mode = switch (t.wrap) {
+        .none => .none,
+        .char => .char,
+        .word => .word,
+    };
+    text.overflow = switch (t.overflow) {
+        .clip => .clip,
+        .ellipsis => .ellipsis,
+    };
+    text.text_align = switch (t.@"align") {
+        .left => .left,
+        .center => .center,
+        .right => .right,
+    };
+    text.max_lines = t.max_lines;
+    text.scroll_offset = t.scroll_y;
+    text.scroll_x = t.scroll_x;
+    text.link = t.link;
+    // selectable is retained on extension_ui.UiNode.Text for future event/selection UX.
+}
+
+fn applyTextContent(state: *ExtensionUiState, text: *TextComponent, t: extension_ui.UiNode.Text) !void {
+    applyStyleToText(text, t.style);
+    if (t.format == .ansi) {
+        const parsed = try parseAnsiText(state.allocator, t.text, text.fg);
+        defer parsed.deinit(state.allocator);
+        text.setRuns(parsed.runs);
+        return;
+    }
+    if (t.spans) |spans| {
+        const runs = try state.allocator.alloc(TextRun, spans.len);
+        defer state.allocator.free(runs);
+        for (spans, 0..) |span, i| {
+            const style = span.style orelse t.style;
+            runs[i] = .{ .text = span.text, .fg = styleFg(style), .bg = styleBg(style), .attrs = styleAttrs(style), .link = span.link orelse t.link };
+        }
+        text.setRuns(runs);
+    } else {
+        text.content = t.text;
+    }
+}
+
+const ParsedAnsiText = struct {
+    text: []u8,
+    runs: []TextRun,
+
+    fn deinit(self: ParsedAnsiText, allocator: std.mem.Allocator) void {
+        allocator.free(self.runs);
+        allocator.free(self.text);
+    }
+};
+
+const AnsiStyle = struct {
+    fg: Color,
+    bg: Color = Color.default,
+    attrs: Attributes = .{},
+    link: ?[]const u8 = null,
+};
+
+fn parseAnsiText(allocator: std.mem.Allocator, input: []const u8, base_fg: Color) !ParsedAnsiText {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var runs = std.ArrayList(TextRun).empty;
+    errdefer runs.deinit(allocator);
+    var style = AnsiStyle{ .fg = base_fg };
+    var run_start: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == 0x1b and i + 1 < input.len) {
+            if (input[i + 1] == '[') {
+                if (findCsiEnd(input, i + 2)) |end| {
+                    if (input[end] == 'm') {
+                        try flushAnsiRun(allocator, &runs, out.items, &run_start, style);
+                        applySgr(input[i + 2 .. end], &style, base_fg);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            } else if (input[i + 1] == ']') {
+                if (findOscEnd(input, i + 2)) |end| {
+                    const payload_end = oscPayloadEnd(input, end);
+                    try flushAnsiRun(allocator, &runs, out.items, &run_start, style);
+                    applyOsc(input[i + 2 .. payload_end], &style);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        try out.append(allocator, input[i]);
+        i += 1;
+    }
+    try flushAnsiRun(allocator, &runs, out.items, &run_start, style);
+    const text_slice = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(text_slice);
+    var offset: usize = 0;
+    for (runs.items) |*run| {
+        const len = run.text.len;
+        run.text = text_slice[offset .. offset + len];
+        offset += len;
+    }
+    return .{ .text = text_slice, .runs = try runs.toOwnedSlice(allocator) };
+}
+
+fn findCsiEnd(input: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < input.len) : (i += 1) {
+        const b = input[i];
+        if (b >= 0x40 and b <= 0x7e) return i;
+    }
+    return null;
+}
+
+fn findOscEnd(input: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == 0x07) return i + 1;
+        if (input[i] == 0x1b and i + 1 < input.len and input[i + 1] == '\\') return i + 2;
+    }
+    return null;
+}
+
+fn oscPayloadEnd(input: []const u8, end: usize) usize {
+    if (end > 0 and input[end - 1] == 0x07) return end - 1;
+    return end - 2;
+}
+
+fn applyOsc(payload: []const u8, style: *AnsiStyle) void {
+    if (!std.mem.startsWith(u8, payload, "8;")) return;
+    const second_sep = std.mem.indexOfScalarPos(u8, payload, 2, ';') orelse return;
+    const uri = payload[second_sep + 1 ..];
+    style.link = if (uri.len == 0) null else uri;
+}
+
+fn flushAnsiRun(allocator: std.mem.Allocator, runs: *std.ArrayList(TextRun), text: []u8, run_start: *usize, style: AnsiStyle) !void {
+    if (text.len == run_start.*) return;
+    try runs.append(allocator, .{ .text = text[run_start.*..], .fg = style.fg, .bg = style.bg, .attrs = style.attrs, .link = style.link });
+    run_start.* = text.len;
+}
+
+fn applySgr(params: []const u8, style: *AnsiStyle, base_fg: Color) void {
+    if (params.len == 0) {
+        const link = style.link;
+        style.* = .{ .fg = base_fg, .link = link };
+        return;
+    }
+    var it = std.mem.splitScalar(u8, params, ';');
+    while (it.next()) |part| {
+        const code = parseSgrInt(part) orelse 0;
+        switch (code) {
+            0 => {
+                const link = style.link;
+                style.* = .{ .fg = base_fg, .link = link };
+            },
+            1 => style.attrs.bold = true,
+            2 => style.attrs.dim = true,
+            3 => style.attrs.italic = true,
+            4 => style.attrs.underline = true,
+            9 => style.attrs.strikethrough = true,
+            22 => {
+                style.attrs.bold = false;
+                style.attrs.dim = false;
+            },
+            23 => style.attrs.italic = false,
+            24 => style.attrs.underline = false,
+            29 => style.attrs.strikethrough = false,
+            30...37 => style.fg = ansiColor(@intCast(code - 30), false),
+            39 => style.fg = base_fg,
+            90...97 => style.fg = ansiColor(@intCast(code - 90), true),
+            40...47 => style.bg = ansiColor(@intCast(code - 40), false),
+            49 => style.bg = Color.default,
+            100...107 => style.bg = ansiColor(@intCast(code - 100), true),
+            38, 48 => {
+                const is_fg = code == 38;
+                const mode = parseSgrInt(it.next() orelse "") orelse continue;
+                if (mode == 2) {
+                    const r = parseByte(it.next() orelse "") orelse continue;
+                    const g = parseByte(it.next() orelse "") orelse continue;
+                    const b = parseByte(it.next() orelse "") orelse continue;
+                    if (is_fg) style.fg = Color.rgb(r, g, b) else style.bg = Color.rgb(r, g, b);
+                } else if (mode == 5) {
+                    const index = parseByte(it.next() orelse "") orelse continue;
+                    if (is_fg) style.fg = ansi256Color(index) else style.bg = ansi256Color(index);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+fn parseSgrInt(bytes: []const u8) ?u16 {
+    if (bytes.len == 0) return 0;
+    return std.fmt.parseInt(u16, bytes, 10) catch null;
+}
+
+fn parseByte(bytes: []const u8) ?u8 {
+    const v = parseSgrInt(bytes) orelse return null;
+    if (v > 255) return null;
+    return @intCast(v);
+}
+
+fn ansiColor(index: u3, bright: bool) Color {
+    const normal = [_]Color{
+        Color.rgb(0, 0, 0),
+        Color.rgb(205, 49, 49),
+        Color.rgb(13, 188, 121),
+        Color.rgb(229, 229, 16),
+        Color.rgb(36, 114, 200),
+        Color.rgb(188, 63, 188),
+        Color.rgb(17, 168, 205),
+        Color.rgb(229, 229, 229),
+    };
+    const bright_palette = [_]Color{
+        Color.rgb(102, 102, 102),
+        Color.rgb(241, 76, 76),
+        Color.rgb(35, 209, 139),
+        Color.rgb(245, 245, 67),
+        Color.rgb(59, 142, 234),
+        Color.rgb(214, 112, 214),
+        Color.rgb(41, 184, 219),
+        Color.rgb(255, 255, 255),
+    };
+    return if (bright) bright_palette[index] else normal[index];
+}
+
+fn ansi256Color(index: u8) Color {
+    if (index < 8) return ansiColor(@intCast(index), false);
+    if (index < 16) return ansiColor(@intCast(index - 8), true);
+    if (index < 232) {
+        const cube_index = index - 16;
+        const levels = [_]u8{ 0, 95, 135, 175, 215, 255 };
+        return Color.rgb(
+            levels[cube_index / 36],
+            levels[(cube_index / 6) % 6],
+            levels[cube_index % 6],
+        );
+    }
+    const level: u8 = 8 + (index - 232) * 10;
+    return Color.rgb(level, level, level);
+}
+
+fn applyStyleToText(text: *TextComponent, style: extension_ui.Style) void {
+    text.fg = styleFg(style);
+    text.bg = styleBg(style);
+    text.attrs = styleAttrs(style);
+}
+
+fn styleFg(style: extension_ui.Style) Color {
+    return if (style.fg) |fg| uiColor(fg) else toneColor(style.tone);
+}
+
+fn styleBg(style: extension_ui.Style) Color {
+    return if (style.bg) |bg| uiColor(bg) else Color.default;
+}
+
+fn styleAttrs(style: extension_ui.Style) Attributes {
+    return .{
+        .bold = style.bold,
+        .dim = style.dim,
+        .italic = style.italic,
+        .underline = style.underline,
+        .strikethrough = style.strikethrough,
+    };
+}
+
+fn uiColor(color: extension_ui.Color) Color {
+    return Color.rgb(color.r, color.g, color.b);
+}
+
+fn toneColor(tone: extension_ui.Tone) Color {
+    return switch (tone) {
+        .neutral => Color.default,
+        .info => Color.rgb(96, 165, 250),
+        .success => Color.rgb(34, 197, 94),
+        .warning => Color.rgb(234, 179, 8),
+        .danger => Color.rgb(239, 68, 68),
+        .accent => Color.rgb(168, 85, 247),
+    };
+}
+
+fn initMarkdown(state: *ExtensionUiState, t: extension_ui.UiNode.Text, width_method: WidthMethod) MarkdownComponent {
+    var md = MarkdownComponent.init(state.allocator, width_method);
+    md.setContent(t.text);
+    md.fg = styleFg(t.style);
+    md.bg = styleBg(t.style);
+    md.attrs = styleAttrs(t.style);
+    // Markdown exposes symmetric padding only. Preserve text style padding when it is
+    // representable; asymmetric padding is rounded up so content is never clipped.
+    md.padding_x = @max(edge(t.style.padding.left), edge(t.style.padding.right));
+    md.padding_y = @max(edge(t.style.padding.top), edge(t.style.padding.bottom));
+    md.scroll_offset = t.scroll_y;
+    return md;
+}
+
+fn measureMarkdown(state: *ExtensionUiState, t: extension_ui.UiNode.Text, width: u32, width_method: WidthMethod) u32 {
+    var md = initMarkdown(state, t, width_method);
+    defer md.deinit();
+    // Markdown owns wrapping during document rendering; extension Text wrap=none,
+    // max_lines, scroll_x, and align do not have compatible Markdown component knobs.
+    return md.measure(width).preferred_height;
+}
+
+fn renderMarkdown(state: *ExtensionUiState, region: Region, t: extension_ui.UiNode.Text) void {
+    var md = initMarkdown(state, t, region.buf.width_method);
+    defer md.deinit();
+    // Caveat: max_lines, scroll_x, and align intentionally remain Text-only options.
+    md.render(region);
+}
+
+fn renderText(state: *ExtensionUiState, region: Region, t: extension_ui.UiNode.Text) void {
+    if (t.format == .markdown) return renderMarkdown(state, region, t);
+    var text = TextComponent.init(state.allocator, region.buf.width_method);
+    defer text.deinit();
+    applyTextContent(state, &text, t) catch {
+        text.content = t.text;
+    };
+    applyTextOptions(&text, t);
+    text.render(region);
+}
+
 fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: extension_ui.UiNode, region: Region) void {
     if (region.width == 0 or region.height == 0) return;
     switch (node) {
-        .text => |t| writeClipped(region, t.text),
+        .text => |t| renderText(state, region, t),
         .chip => |ch| renderChip(region, ch.label),
         .progress => |pr| renderProgress(region, pr),
         .surface => |s| if (state.findFrame(view.state_owner_id, view.id, s.id)) |frame| {
@@ -410,7 +752,7 @@ fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: exte
     var y: u32 = 0;
     for (b.children, 0..) |child, i| {
         if (y >= region.height) break;
-        const h = @min(resolveHeight(child, region.height - y), region.height - y);
+        const h = @min(resolveHeight(state, child, region.width, region.height - y, region.buf.width_method), region.height - y);
         renderNode(state, view, child, region.sub(0, y, region.width, h));
         y += h;
         if (i + 1 < b.children.len) y +|= gap;
@@ -437,7 +779,7 @@ fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extensi
     }
 }
 
-fn resolveHeight(node: extension_ui.UiNode, avail: u32) u32 {
+fn resolveHeight(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, avail: u32, width_method: WidthMethod) u32 {
     const c = switch (node) {
         .box => |b| b.style.height,
         .text => |t| t.style.height,
@@ -446,7 +788,7 @@ fn resolveHeight(node: extension_ui.UiNode, avail: u32) u32 {
         .surface => |s| s.style.height,
     };
     if (c) |v| return resolveConstraint(v, avail);
-    return measureNode(node, avail);
+    return measureNode(state, node, width, width_method);
 }
 
 fn widthConstraint(node: extension_ui.UiNode) ?extension_ui.Constraint {
@@ -538,6 +880,31 @@ fn makeFrameKey(allocator: std.mem.Allocator, owner: []const u8, view: []const u
     return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ owner, view, node });
 }
 
+fn bufferContainsText(buf: *Buffer, needle: []const u8) !bool {
+    var row: u32 = 0;
+    while (row < buf.height) : (row += 1) {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(std.testing.allocator);
+        var col: u32 = 0;
+        while (col < buf.width) : (col += 1) {
+            try buf.appendCellText(&out, std.testing.allocator, buf.get(col, row));
+        }
+        if (std.mem.indexOf(u8, out.items, needle) != null) return true;
+    }
+    return false;
+}
+
+fn bufferHasAttr(buf: *Buffer, comptime field: []const u8) bool {
+    var row: u32 = 0;
+    while (row < buf.height) : (row += 1) {
+        var col: u32 = 0;
+        while (col < buf.width) : (col += 1) {
+            if (@field(buf.get(col, row).attrs, field)) return true;
+        }
+    }
+    return false;
+}
+
 fn cpAt(buf: *Buffer, x: u32, y: u32) u21 {
     const cell = buf.get(x, y);
     return switch (cell.grapheme) {
@@ -579,6 +946,44 @@ test "extension ui renders text" {
     try std.testing.expectEqual(@as(u21, 'o'), cpAt(&buf, 4, 0));
 }
 
+test "extension ui measures and renders multiline text" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const root = extension_ui.UiNode{ .text = .{ .text = "hello\nworld" } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+
+    var comp = state.statusComponent();
+    const measured = comp.measure(10);
+    try std.testing.expectEqual(@as(u32, 2), measured.preferred_height);
+
+    var buf = try Buffer.init(std.testing.allocator, 10, 2, .wcwidth);
+    defer buf.deinit();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'h'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'w'), cpAt(&buf, 0, 1));
+}
+
+test "extension ui wraps text and lays out following column content below it" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const text = extension_ui.UiNode{ .text = .{ .text = "hello world" } };
+    const chip = extension_ui.UiNode{ .chip = .{ .label = "next" } };
+    const children = [_]extension_ui.UiNode{ text, chip };
+    const root = extension_ui.UiNode{ .box = .{ .children = @constCast(&children) } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+
+    var comp = state.statusComponent();
+    const measured = comp.measure(5);
+    try std.testing.expectEqual(@as(u32, 3), measured.preferred_height);
+
+    var buf = try Buffer.init(std.testing.allocator, 5, 3, .wcwidth);
+    defer buf.deinit();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'h'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'w'), cpAt(&buf, 0, 1));
+    try std.testing.expectEqual(@as(u21, '['), cpAt(&buf, 0, 2));
+}
+
 test "extension ui renders bordered box" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
@@ -607,6 +1012,260 @@ test "extension ui sorts status views by order and id" {
     try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
     try std.testing.expectEqual(@as(u21, 'c'), cpAt(&buf, 0, 1));
     try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 0, 2));
+}
+
+test "extension ui renders text spans with colors and attributes" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const spans = [_]extension_ui.TextSpan{
+        .{ .text = "ok", .style = .{ .tone = .success, .fg = extension_ui.Color.rgb(1, 2, 3), .bg = extension_ui.Color.rgb(4, 5, 6), .bold = true, .underline = true } },
+        .{ .text = "!", .style = .{ .tone = .danger, .italic = true, .strikethrough = true } },
+    };
+    const root = extension_ui.UiNode{ .text = .{ .text = "ok!", .spans = @constCast(&spans) } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    var buf = try Buffer.init(std.testing.allocator, 4, 1, .wcwidth);
+    defer buf.deinit();
+    var comp = state.statusComponent();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'o'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, '!'), cpAt(&buf, 2, 0));
+    try std.testing.expect(buf.get(0, 0).fg.eql(Color.rgb(1, 2, 3)));
+    try std.testing.expect(buf.get(0, 0).bg.eql(Color.rgb(4, 5, 6)));
+    try std.testing.expect(buf.get(0, 0).attrs.bold);
+    try std.testing.expect(buf.get(0, 0).attrs.underline);
+    try std.testing.expect(buf.get(2, 0).fg.eql(toneColor(.danger)));
+    try std.testing.expect(buf.get(2, 0).attrs.italic);
+    try std.testing.expect(buf.get(2, 0).attrs.strikethrough);
+}
+
+test "extension ui renders default text style colors and attrs" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    var buf = try Buffer.init(std.testing.allocator, 8, 1, .wcwidth);
+    defer buf.deinit();
+    const root = extension_ui.UiNode{ .text = .{ .text = "hi", .style = .{ .fg = extension_ui.Color.rgb(9, 8, 7), .bg = extension_ui.Color.rgb(6, 5, 4), .bold = true, .dim = true, .italic = true, .underline = true, .strikethrough = true } } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.statusComponent().render(buf.region());
+    const cell = buf.get(0, 0);
+    try std.testing.expect(cell.fg.eql(Color.rgb(9, 8, 7)));
+    try std.testing.expect(cell.bg.eql(Color.rgb(6, 5, 4)));
+    try std.testing.expect(cell.attrs.bold);
+    try std.testing.expect(cell.attrs.dim);
+    try std.testing.expect(cell.attrs.italic);
+    try std.testing.expect(cell.attrs.underline);
+    try std.testing.expect(cell.attrs.strikethrough);
+}
+
+test "extension ui renders text span links" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const spans = [_]extension_ui.TextSpan{
+        .{ .text = "go", .link = "https://span.test" },
+        .{ .text = "!" },
+    };
+    const node = extension_ui.UiNode{ .text = .{ .text = "go!", .spans = @constCast(&spans), .link = "https://node.test" } };
+    var buf = try Buffer.init(std.testing.allocator, 4, 1, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+
+    try std.testing.expectEqual(@as(usize, 2), buf.link_table.items.len);
+    try std.testing.expectEqualStrings("https://span.test", buf.link_table.items[0]);
+    try std.testing.expectEqualStrings("https://node.test", buf.link_table.items[1]);
+    try std.testing.expectEqual(@as(u16, 1), buf.get(0, 0).link_id);
+    try std.testing.expectEqual(@as(u16, 2), buf.get(2, 0).link_id);
+}
+
+test "extension ui wraps text spans across span boundaries" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const spans = [_]extension_ui.TextSpan{ .{ .text = "abc", .style = .{ .tone = .info } }, .{ .text = "def", .style = .{ .tone = .warning } } };
+    const node = extension_ui.UiNode{ .text = .{ .text = "abcdef", .spans = @constCast(&spans), .wrap = .char } };
+    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 3, .wcwidth));
+    var buf = try Buffer.init(std.testing.allocator, 3, 2, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+    try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'd'), cpAt(&buf, 0, 1));
+    try std.testing.expect(buf.get(0, 0).fg.eql(toneColor(.info)));
+    try std.testing.expect(buf.get(0, 1).fg.eql(toneColor(.warning)));
+}
+
+test "extension ui ansi text strips escapes for measurement and render" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const node = extension_ui.UiNode{ .text = .{ .text = "a\x1b[31mb\x1b[0mc", .format = .ansi, .wrap = .char } };
+    try std.testing.expectEqual(@as(u32, 1), measureNode(&state, node, 3, .wcwidth));
+
+    var buf = try Buffer.init(std.testing.allocator, 3, 1, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+    try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 1, 0));
+    try std.testing.expectEqual(@as(u21, 'c'), cpAt(&buf, 2, 0));
+}
+
+test "extension ui ansi text renders color spans and reset" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const node = extension_ui.UiNode{ .text = .{ .text = "x\x1b[31my\x1b[0mz", .format = .ansi } };
+    var buf = try Buffer.init(std.testing.allocator, 3, 1, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+    try std.testing.expect(buf.get(1, 0).fg.eql(ansiColor(1, false)));
+    try std.testing.expect(buf.get(2, 0).fg.eql(Color.default));
+}
+
+test "extension ui ansi text renders truecolor and attributes" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const node = extension_ui.UiNode{ .text = .{ .text = "\x1b[1;3;4;38;2;1;2;3;48;2;4;5;6mA", .format = .ansi } };
+    var buf = try Buffer.init(std.testing.allocator, 1, 1, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+    const cell = buf.get(0, 0);
+    try std.testing.expect(cell.fg.eql(Color.rgb(1, 2, 3)));
+    try std.testing.expect(cell.bg.eql(Color.rgb(4, 5, 6)));
+    try std.testing.expect(cell.attrs.bold);
+    try std.testing.expect(cell.attrs.italic);
+    try std.testing.expect(cell.attrs.underline);
+}
+
+test "extension ui ansi text ignores unknown escapes safely" {
+    const parsed = try parseAnsiText(std.testing.allocator, "a\x1b[999mb\x1b[?25hcd", Color.default);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("abcd", parsed.text);
+    for (parsed.runs) |run| try std.testing.expect(run.fg.eql(Color.default));
+}
+
+test "extension ui ansi text extracts OSC 8 hyperlinks" {
+    const parsed = try parseAnsiText(std.testing.allocator, "a\x1b]8;;https://example.test\x07b\x1b[31mc\x1b]8;;\x1b\\d", Color.default);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("abcd", parsed.text);
+    try std.testing.expectEqual(@as(usize, 4), parsed.runs.len);
+    try std.testing.expect(parsed.runs[0].link == null);
+    try std.testing.expectEqualStrings("https://example.test", parsed.runs[1].link.?);
+    try std.testing.expectEqualStrings("https://example.test", parsed.runs[2].link.?);
+    try std.testing.expect(parsed.runs[2].fg.eql(ansiColor(1, false)));
+    try std.testing.expect(parsed.runs[3].link == null);
+}
+
+test "extension ui ansi text renders OSC 8 hyperlinks" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const node = extension_ui.UiNode{ .text = .{ .text = "a\x1b]8;;https://example.test\x07bc\x1b]8;;\x07d", .format = .ansi } };
+    var buf = try Buffer.init(std.testing.allocator, 4, 1, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+    try std.testing.expectEqual(@as(usize, 1), buf.link_table.items.len);
+    try std.testing.expectEqualStrings("https://example.test", buf.link_table.items[0]);
+    try std.testing.expectEqual(@as(u16, 0), buf.get(0, 0).link_id);
+    try std.testing.expectEqual(@as(u16, 1), buf.get(1, 0).link_id);
+    try std.testing.expectEqual(@as(u16, 1), buf.get(2, 0).link_id);
+    try std.testing.expectEqual(@as(u16, 0), buf.get(3, 0).link_id);
+}
+
+test "extension ui ansi text supports partial attribute resets" {
+    const bold_dim = try parseAnsiText(std.testing.allocator, "\x1b[1;2mA\x1b[22mB", Color.default);
+    defer bold_dim.deinit(std.testing.allocator);
+    try std.testing.expect(bold_dim.runs[0].attrs.bold);
+    try std.testing.expect(bold_dim.runs[0].attrs.dim);
+    try std.testing.expect(!bold_dim.runs[1].attrs.bold);
+    try std.testing.expect(!bold_dim.runs[1].attrs.dim);
+
+    const italic = try parseAnsiText(std.testing.allocator, "\x1b[3mA\x1b[23mB", Color.default);
+    defer italic.deinit(std.testing.allocator);
+    try std.testing.expect(italic.runs[0].attrs.italic);
+    try std.testing.expect(!italic.runs[1].attrs.italic);
+
+    const underline = try parseAnsiText(std.testing.allocator, "\x1b[4mA\x1b[24mB", Color.default);
+    defer underline.deinit(std.testing.allocator);
+    try std.testing.expect(underline.runs[0].attrs.underline);
+    try std.testing.expect(!underline.runs[1].attrs.underline);
+
+    const strike = try parseAnsiText(std.testing.allocator, "\x1b[9mA\x1b[29mB", Color.default);
+    defer strike.deinit(std.testing.allocator);
+    try std.testing.expect(strike.runs[0].attrs.strikethrough);
+    try std.testing.expect(!strike.runs[1].attrs.strikethrough);
+}
+
+test "extension ui ansi text supports default fg and bg resets" {
+    const base = Color.rgb(7, 8, 9);
+    const parsed = try parseAnsiText(std.testing.allocator, "\x1b[31;42mA\x1b[39;49mB", base);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.runs[0].fg.eql(ansiColor(1, false)));
+    try std.testing.expect(parsed.runs[0].bg.eql(ansiColor(2, false)));
+    try std.testing.expect(parsed.runs[1].fg.eql(base));
+    try std.testing.expect(parsed.runs[1].bg.eql(Color.default));
+}
+
+test "extension ui ansi text maps xterm 256 colors" {
+    try std.testing.expect(ansi256Color(1).eql(ansiColor(1, false)));
+    try std.testing.expect(ansi256Color(9).eql(ansiColor(1, true)));
+    try std.testing.expect(ansi256Color(16).eql(Color.rgb(0, 0, 0)));
+    try std.testing.expect(ansi256Color(21).eql(Color.rgb(0, 0, 255)));
+    try std.testing.expect(ansi256Color(51).eql(Color.rgb(0, 255, 255)));
+    try std.testing.expect(ansi256Color(231).eql(Color.rgb(255, 255, 255)));
+    try std.testing.expect(ansi256Color(232).eql(Color.rgb(8, 8, 8)));
+    try std.testing.expect(ansi256Color(255).eql(Color.rgb(238, 238, 238)));
+}
+
+test "extension ui ansi text supports 256 color fg and bg sequences" {
+    const parsed = try parseAnsiText(std.testing.allocator, "\x1b[38;5;196;48;5;24mA", Color.default);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("A", parsed.text);
+    try std.testing.expect(parsed.runs[0].fg.eql(Color.rgb(255, 0, 0)));
+    try std.testing.expect(parsed.runs[0].bg.eql(Color.rgb(0, 95, 135)));
+}
+
+test "extension ui ansi text supports mixed sgr sequences" {
+    const parsed = try parseAnsiText(std.testing.allocator, "\x1b[1;38;2;1;2;3mA\x1b[38;5;46mB\x1b[22;48;5;240mC\x1b[999mD", Color.default);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ABCD", parsed.text);
+    try std.testing.expect(parsed.runs[0].fg.eql(Color.rgb(1, 2, 3)));
+    try std.testing.expect(parsed.runs[0].attrs.bold);
+    try std.testing.expect(parsed.runs[1].fg.eql(Color.rgb(0, 255, 0)));
+    try std.testing.expect(parsed.runs[1].attrs.bold);
+    try std.testing.expect(parsed.runs[2].fg.eql(Color.rgb(0, 255, 0)));
+    try std.testing.expect(parsed.runs[2].bg.eql(Color.rgb(88, 88, 88)));
+    try std.testing.expect(!parsed.runs[2].attrs.bold);
+    try std.testing.expect(parsed.runs[3].fg.eql(Color.rgb(0, 255, 0)));
+    try std.testing.expect(parsed.runs[3].bg.eql(Color.rgb(88, 88, 88)));
+}
+
+test "extension ui markdown text renders heading bold list and table basics" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const node = extension_ui.UiNode{ .text = .{
+        .format = .markdown,
+        .text = "# Title\n\n**bold**\n\n- item\n\n| A | B |\n| --- | --- |\n| 1 | 2 |",
+    } };
+
+    var buf = try Buffer.init(std.testing.allocator, 32, 18, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+
+    try std.testing.expect(try bufferContainsText(&buf, "Title"));
+    try std.testing.expect(try bufferContainsText(&buf, "bold"));
+    try std.testing.expect(bufferHasAttr(&buf, "bold"));
+    try std.testing.expect(try bufferContainsText(&buf, "- item"));
+    try std.testing.expect(try bufferContainsText(&buf, "A"));
+    try std.testing.expect(try bufferContainsText(&buf, "1"));
+    try std.testing.expectEqual(@as(u21, '┌'), cpAt(&buf, 0, 7));
+}
+
+test "extension ui markdown text measures multiline height and maps scroll_y" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const measured_node = extension_ui.UiNode{ .text = .{ .format = .markdown, .text = "# Title\nBody" } };
+    try std.testing.expectEqual(@as(u32, 3), measureNode(&state, measured_node, 20, .wcwidth));
+
+    // Markdown has no knobs for extension Text max_lines/scroll_x/align, but it does
+    // share the vertical scroll model through scroll_y -> Markdown.scroll_offset.
+    const scrolled_node = extension_ui.UiNode{ .text = .{ .format = .markdown, .text = "# Title\nBody", .scroll_y = 2, .max_lines = 1, .scroll_x = 3, .@"align" = .right } };
+    var buf = try Buffer.init(std.testing.allocator, 20, 1, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, scrolled_node, buf.region());
+    try std.testing.expectEqual(@as(u21, 'B'), cpAt(&buf, 0, 0));
 }
 
 test "extension ui surface uses keyed frame lookup" {
@@ -742,4 +1401,65 @@ test "extension ui renders and removes editor border bottom views" {
     try std.testing.expectEqual(@as(usize, 0), state.views.count());
     const m = comp.measure(8);
     try std.testing.expectEqual(@as(u32, 0), m.preferred_height);
+}
+
+test "extension ui text measurement uses supplied width method" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const node = extension_ui.UiNode{ .text = .{ .text = "☕x", .wrap = .char } };
+    try std.testing.expectEqual(@as(u32, 1), measureNode(&state, node, 2, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 2, .unicode));
+}
+
+test "extension ui markdown measurement uses supplied width method" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const node = extension_ui.UiNode{ .text = .{ .format = .markdown, .text = "☕x" } };
+    try std.testing.expectEqual(@as(u32, 1), measureNode(&state, node, 2, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 2, .unicode));
+}
+
+test "extension ui text max_lines and scroll_y affect measurement and render" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const node = extension_ui.UiNode{ .text = .{ .text = "aa bb cc dd", .max_lines = 2, .scroll_y = 1 } };
+    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 3, .wcwidth));
+
+    var buf = try Buffer.init(std.testing.allocator, 3, 2, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+    try std.testing.expectEqual(@as(u21, 'b'), buf.get(0, 0).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'c'), buf.get(0, 1).grapheme.codepoint);
+}
+
+test "extension ui text wrap none measures explicit lines" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const node = extension_ui.UiNode{ .text = .{ .text = "hello world\nbye", .wrap = .none } };
+    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 5, .wcwidth));
+
+    var buf = try Buffer.init(std.testing.allocator, 5, 2, .wcwidth);
+    defer buf.deinit();
+    renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
+    try std.testing.expectEqual(@as(u21, 'o'), buf.get(4, 0).grapheme.codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), buf.get(0, 1).grapheme.codepoint);
+}
+
+test "extension ui wires text align and scroll_x" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const root = extension_ui.UiNode{ .text = .{ .text = "abcdef", .wrap = .none, .@"align" = .right, .scroll_x = 4 } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+
+    var buf = try Buffer.init(std.testing.allocator, 5, 1, .wcwidth);
+    defer buf.deinit();
+    var comp = state.statusComponent();
+    comp.render(buf.region());
+
+    try std.testing.expectEqual(@as(u21, 'e'), cpAt(&buf, 3, 0));
+    try std.testing.expectEqual(@as(u21, 'f'), cpAt(&buf, 4, 0));
 }

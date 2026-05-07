@@ -35,7 +35,7 @@ pub const ResumePickerFlow = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
 
-        var picker = ListPicker.init(theme);
+        var picker = ListPicker.init(gpa, theme);
         picker.title = "Resume session";
         picker.list.max_visible = 10;
         picker.setSearchPlaceholder("Filter sessions");

@@ -162,6 +162,10 @@ pub const Buffer = struct {
     }
 
     pub fn writeStr(self: *Buffer, x: u32, y: u32, text: []const u8, fg: Color, bg: Color, attrs: Attributes) u32 {
+        return self.writeStrLink(x, y, text, fg, bg, attrs, 0);
+    }
+
+    pub fn writeStrLink(self: *Buffer, x: u32, y: u32, text: []const u8, fg: Color, bg: Color, attrs: Attributes, link_id: u16) u32 {
         if (y >= self.height) return 0;
         var col = x;
         var i: usize = 0;
@@ -186,6 +190,7 @@ pub const Buffer = struct {
                 .bg = bg,
                 .attrs = attrs,
                 .width = w,
+                .link_id = link_id,
             });
             col += @as(u32, w);
         }
@@ -205,7 +210,12 @@ pub const Buffer = struct {
     }
 
     pub fn addLink(self: *Buffer, url: []const u8) !u16 {
+        for (self.link_table.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, url)) return @intCast(i + 1);
+        }
+        if (self.link_table.items.len >= std.math.maxInt(u16)) return error.TooManyLinks;
         const duped = try self.allocator.dupe(u8, url);
+        errdefer self.allocator.free(duped);
         try self.link_table.append(self.allocator, duped);
         return @intCast(self.link_table.items.len);
     }
@@ -239,10 +249,14 @@ pub const Region = struct {
     }
 
     pub fn writeStr(self: Region, x: u32, y: u32, text: []const u8, fg: Color, bg: Color, attrs: Attributes) u32 {
+        return self.writeStrLink(x, y, text, fg, bg, attrs, 0);
+    }
+
+    pub fn writeStrLink(self: Region, x: u32, y: u32, text: []const u8, fg: Color, bg: Color, attrs: Attributes, link_id: u16) u32 {
         if (x >= self.width or y >= self.height) return 0;
         const max_w = self.width - x;
         const clipped = grapheme_mod.sliceToWidth(text, max_w, self.buf.width_method);
-        return self.buf.writeStr(self.x + x, self.y + y, clipped, fg, bg, attrs);
+        return self.buf.writeStrLink(self.x + x, self.y + y, clipped, fg, bg, attrs, link_id);
     }
 
     pub fn textWidth(self: Region, text: []const u8) u32 {
@@ -367,4 +381,20 @@ test "GraphemePool stores and retrieves clusters" {
     defer pool.deinit();
     const id = try pool.add("👨‍👩‍👧");
     try std.testing.expectEqualStrings("👨‍👩‍👧", pool.get(id));
+}
+
+test "Buffer addLink dedupes and guards id overflow" {
+    var buf = try Buffer.init(std.testing.allocator, 1, 1, .wcwidth);
+    defer buf.deinit();
+
+    const first = try buf.addLink("https://example.test");
+    const second = try buf.addLink("https://example.test");
+    try std.testing.expectEqual(first, second);
+    try std.testing.expectEqual(@as(usize, 1), buf.link_table.items.len);
+
+    while (buf.link_table.items.len < std.math.maxInt(u16)) {
+        const url = try std.testing.allocator.dupe(u8, "x");
+        try buf.link_table.append(std.testing.allocator, url);
+    }
+    try std.testing.expectError(error.TooManyLinks, buf.addLink("https://overflow.test"));
 }

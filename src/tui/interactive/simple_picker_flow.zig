@@ -1,3 +1,4 @@
+const std = @import("std");
 const list_picker_mod = @import("../components/list_picker.zig");
 const select_list_mod = @import("../components/select_list.zig");
 const tui_mod = @import("../tui.zig");
@@ -19,6 +20,7 @@ pub const SimplePickerFlow = struct {
 
     pub fn configure(
         self: *SimplePickerFlow,
+        allocator: std.mem.Allocator,
         theme: *const Theme,
         title: []const u8,
         max_visible: u32,
@@ -27,7 +29,7 @@ pub const SimplePickerFlow = struct {
         on_select: ?*const fn (selection: Selection, ctx: ?*anyopaque) void,
         on_cancel: ?*const fn (ctx: ?*anyopaque) void,
     ) void {
-        self.picker = ListPicker.init(theme);
+        self.picker = ListPicker.init(allocator, theme);
         self.picker.title = title;
         self.picker.list.max_visible = max_visible;
         self.picker.setItems(items);

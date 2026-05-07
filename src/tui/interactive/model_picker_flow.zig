@@ -64,7 +64,7 @@ pub const ModelPickerFlow = struct {
             i += 1;
         }
 
-        var picker = ListPicker.init(theme);
+        var picker = ListPicker.init(gpa, theme);
         picker.title = "Select model";
         picker.list.max_visible = 12;
         picker.setSearchPlaceholder("Search models");

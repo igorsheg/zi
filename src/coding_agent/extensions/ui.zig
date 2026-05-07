@@ -21,6 +21,10 @@ pub const UiAnchor = enum {
 
 pub const UiBackdrop = enum { none, dim, fill };
 pub const UiLifetime = enum { until_input, manual };
+pub const TextWrap = enum { none, char, word };
+pub const TextOverflow = enum { clip, ellipsis };
+pub const TextAlign = enum { left, center, right };
+pub const TextFormat = enum { plain, ansi, markdown };
 
 pub const UiTargetOptions = struct {
     width: ?Constraint = null,
@@ -40,6 +44,16 @@ pub const UiTargetOptions = struct {
 };
 
 pub const Tone = enum { neutral, info, success, warning, danger, accent };
+
+pub const Color = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+
+    pub fn rgb(r: u8, g: u8, b: u8) Color {
+        return .{ .r = r, .g = g, .b = b };
+    }
+};
 pub const Direction = enum { row, column };
 pub const Align = enum { start, center, end, stretch };
 pub const Justify = enum { start, center, end, space_between };
@@ -69,11 +83,36 @@ pub const Style = struct {
     gap: f32 = 0,
     border: bool = false,
     tone: Tone = .neutral,
+    fg: ?Color = null,
+    bg: ?Color = null,
+    bold: bool = false,
+    dim: bool = false,
+    italic: bool = false,
+    underline: bool = false,
+    strikethrough: bool = false,
 
     pub fn clone(_: std.mem.Allocator, style: Style) !Style {
         return style;
     }
     pub fn deinit(_: *Style, _: std.mem.Allocator) void {}
+};
+
+pub const TextSpan = struct {
+    text: []const u8,
+    style: ?Style = null,
+    link: ?[]const u8 = null,
+
+    pub fn clone(allocator: std.mem.Allocator, span: TextSpan) !TextSpan {
+        const text = try allocator.dupe(u8, span.text);
+        errdefer allocator.free(text);
+        return .{ .text = text, .style = span.style, .link = if (span.link) |v| try allocator.dupe(u8, v) else null };
+    }
+
+    pub fn deinit(self: *TextSpan, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        if (self.link) |v| allocator.free(v);
+        self.* = undefined;
+    }
 };
 
 pub const UiNode = union(enum) {
@@ -84,7 +123,7 @@ pub const UiNode = union(enum) {
     surface: Surface,
 
     pub const Box = struct { id: ?[]const u8 = null, style: Style = .{}, children: []UiNode = &.{} };
-    pub const Text = struct { id: ?[]const u8 = null, text: []const u8, style: Style = .{} };
+    pub const Text = struct { id: ?[]const u8 = null, text: []const u8, spans: ?[]TextSpan = null, style: Style = .{}, wrap: TextWrap = .word, overflow: TextOverflow = .clip, format: TextFormat = .plain, @"align": TextAlign = .left, max_lines: ?u32 = null, scroll_y: u32 = 0, scroll_x: u32 = 0, link: ?[]const u8 = null, selectable: bool = false };
     pub const Chip = struct { id: ?[]const u8 = null, label: []const u8, style: Style = .{} };
     pub const Progress = struct { id: ?[]const u8 = null, value: ?f32 = null, label: ?[]const u8 = null, style: Style = .{} };
     pub const Surface = struct { id: []const u8, style: Style = .{} };
@@ -106,7 +145,28 @@ pub const UiNode = union(enum) {
                 }
                 break :blk .{ .box = .{ .id = id, .style = try Style.clone(allocator, b.style), .children = children } };
             },
-            .text => |t| .{ .text = .{ .id = if (t.id) |v| try allocator.dupe(u8, v) else null, .text = try allocator.dupe(u8, t.text), .style = t.style } },
+            .text => |t| blk: {
+                const id = if (t.id) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (id) |v| allocator.free(v);
+                const text = try allocator.dupe(u8, t.text);
+                errdefer allocator.free(text);
+                const link = if (t.link) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (link) |v| allocator.free(v);
+                const spans = if (t.spans) |src| sblk: {
+                    const dst = try allocator.alloc(TextSpan, src.len);
+                    var n: usize = 0;
+                    errdefer {
+                        for (dst[0..n]) |*span| span.deinit(allocator);
+                        allocator.free(dst);
+                    }
+                    for (src, 0..) |span, i| {
+                        dst[i] = try TextSpan.clone(allocator, span);
+                        n += 1;
+                    }
+                    break :sblk dst;
+                } else null;
+                break :blk .{ .text = .{ .id = id, .text = text, .spans = spans, .style = t.style, .wrap = t.wrap, .overflow = t.overflow, .format = t.format, .@"align" = t.@"align", .max_lines = t.max_lines, .scroll_y = t.scroll_y, .scroll_x = t.scroll_x, .link = link, .selectable = t.selectable } };
+            },
             .chip => |ch| .{ .chip = .{ .id = if (ch.id) |v| try allocator.dupe(u8, v) else null, .label = try allocator.dupe(u8, ch.label), .style = ch.style } },
             .progress => |pr| .{ .progress = .{ .id = if (pr.id) |v| try allocator.dupe(u8, v) else null, .value = pr.value, .label = if (pr.label) |v| try allocator.dupe(u8, v) else null, .style = pr.style } },
             .surface => |s| .{ .surface = .{ .id = try allocator.dupe(u8, s.id), .style = s.style } },
@@ -123,6 +183,11 @@ pub const UiNode = union(enum) {
             .text => |*t| {
                 if (t.id) |v| allocator.free(v);
                 allocator.free(t.text);
+                if (t.link) |v| allocator.free(v);
+                if (t.spans) |spans| {
+                    for (spans) |*span| span.deinit(allocator);
+                    allocator.free(spans);
+                }
             },
             .chip => |*ch| {
                 if (ch.id) |v| allocator.free(v);
@@ -361,6 +426,27 @@ test "ui v3 render spec clone owns node tree" {
     try testing.expectEqual(UiAnchor.top_right, cloned.target_options.anchor.?);
     try testing.expect(cloned.root != null);
     try testing.expectEqual(@as(usize, 1), cloned.keys.len);
+}
+
+test "ui v3 text span clone owns spans" {
+    const testing = std.testing;
+    const spans = [_]TextSpan{
+        .{ .text = "hello", .style = .{ .tone = .accent, .fg = Color.rgb(255, 0, 0), .bold = true }, .link = "https://span.test" },
+        .{ .text = " world", .style = .{ .tone = .success } },
+    };
+    const node = UiNode{ .text = .{ .text = "hello world", .spans = @constCast(&spans), .link = "https://node.test", .selectable = true } };
+    var cloned = try UiNode.clone(testing.allocator, node);
+    defer cloned.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello world", cloned.text.text);
+    try testing.expect(cloned.text.spans != null);
+    try testing.expectEqual(@as(usize, 2), cloned.text.spans.?.len);
+    try testing.expectEqualStrings("hello", cloned.text.spans.?[0].text);
+    try testing.expectEqual(Tone.accent, cloned.text.spans.?[0].style.?.tone);
+    try testing.expectEqual(Color.rgb(255, 0, 0), cloned.text.spans.?[0].style.?.fg.?);
+    try testing.expect(cloned.text.spans.?[0].style.?.bold);
+    try testing.expectEqualStrings("https://span.test", cloned.text.spans.?[0].link.?);
+    try testing.expectEqualStrings("https://node.test", cloned.text.link.?);
+    try testing.expect(cloned.text.selectable);
 }
 
 test "ui v3 render spec clone owns keys" {

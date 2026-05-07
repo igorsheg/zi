@@ -77,7 +77,63 @@ Most tools, commands, and events receive `ctx`.
 : Publish, update, or remove a retained UI view. `spec.id` is required. `spec.target` is one of `status`, `toast`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`box`, `text`, `chip`, `progress`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
 
 `ctx.ui.frame(spec)`
-: Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`.
+: Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`. `surface` remains the node type for framebuffer graphs and other pixel/cell-frame visuals.
+
+### UI text nodes
+
+Text nodes render plain, ANSI, or Markdown text and may contain newlines. By default they wrap by word to the node width; explicit newlines always start new lines. Use `wrap = "none"` for fixed-width dashboards/tables or `wrap = "char"` for character wrapping.
+
+`{ type = "text", ... }` supports:
+
+`text`
+: String content. Omit when using `spans`.
+
+`spans`
+: Array of `{ text, style?, link? }`. Spans concatenate into the node text and can style or link ranges. Span `style` supports `fg`, `bg`, `tone`, `bold`, `dim`, `italic`, `underline`, and `strikethrough`.
+
+`wrap`
+: `"word"` (default), `"char"`, or `"none"`. Markdown format uses the existing Markdown renderer/document layer, which owns document wrapping; `wrap`, `max_lines`, `scroll_x`, and `align` are Text-component options and do not affect Markdown rendering. `scroll_y` does apply to Markdown.
+
+`overflow`
+: `"clip"` (default) or `"ellipsis"` for clipped text.
+
+`max_lines`
+: Optional maximum rendered/measured line count.
+
+`scroll_y`, `scroll_x`
+: Optional vertical/horizontal scroll offsets. `scroll_x` is most useful with `wrap = "none"`.
+
+`align`
+: `"left"` (default), `"center"`, or `"right"`.
+
+`format`
+: `"plain"` (default), `"ansi"`, or `"markdown"`. ANSI uses an SGR text parser and supports OSC 8 hyperlinks. Markdown uses zi's existing Markdown renderer/document layer.
+
+`link`
+: Optional link for the whole node. Span links can override ranges. Markdown-format text currently ignores node-level `link`; use inline Markdown links instead.
+
+`selectable`
+: Optional boolean marking text as selectable for future selection-oriented UI behavior. Markdown-format text currently ignores this hint.
+
+Style colors accept names such as `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `black`, or hex strings like `#7aa2f7`. Tones include `neutral`, `info`, `success`, `warning`, `danger`, and `accent`.
+
+Dashboard text example:
+
+```lua
+ctx.ui.render({
+  id = "session-breakdown",
+  title = "Session breakdown",
+  target = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center" },
+  root = { type = "box", style = { border = true, padding = 1, gap = 1 }, children = {
+    { type = "text", wrap = "none", spans = {
+      { text = "7d", style = { tone = "accent", bold = true } },
+      { text = " · tokens · cost", style = { dim = true } },
+    } },
+    { type = "text", text = "Tokens: 184k\nCost:   $3.42", wrap = "none", align = "right" },
+    { type = "text", text = "## Notes\n- Spike on Tuesday\n- Cache hits improved", format = "markdown", scroll_y = 0 },
+  } },
+})
+```
 
 Example:
 

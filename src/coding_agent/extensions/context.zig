@@ -425,7 +425,11 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
     const typ = try readStringFieldLimit(arena, L, idx, "type", "box", 32);
     const style = try readStyleField(L, idx);
     const id = try readOptionalStringFieldLimit(arena, L, idx, "id", ui_id_bytes);
-    if (std.mem.eql(u8, typ, "text")) return .{ .text = .{ .id = id, .text = try readStringFieldLimit(arena, L, idx, "text", "", ui_text_bytes), .style = style } };
+    if (std.mem.eql(u8, typ, "text")) {
+        const spans = try readTextSpansField(arena, L, idx);
+        const text = if (spans) |items| try concatSpansText(arena, items) else try readStringFieldLimit(arena, L, idx, "text", "", ui_text_bytes);
+        return .{ .text = .{ .id = id, .text = text, .spans = spans, .style = style, .wrap = try readTextWrapField(L, idx), .overflow = try readTextOverflowField(L, idx), .format = try readTextFormatField(L, idx), .@"align" = try readTextAlignField(L, idx), .max_lines = readOptionalU32Field(L, idx, "max_lines"), .scroll_y = readU32Field(L, idx, "scroll_y", 0), .scroll_x = readU32Field(L, idx, "scroll_x", 0), .link = try readOptionalStringFieldLimit(arena, L, idx, "link", ui_text_bytes), .selectable = readBoolField(L, idx, "selectable", false) } };
+    }
     if (std.mem.eql(u8, typ, "chip")) return .{ .chip = .{ .id = id, .label = try readStringFieldLimit(arena, L, idx, "label", "", ui_text_bytes), .style = style } };
     if (std.mem.eql(u8, typ, "progress")) return .{ .progress = .{ .id = id, .value = readOptionalFloatField(L, idx, "value"), .label = try readOptionalStringFieldLimit(arena, L, idx, "label", ui_text_bytes), .style = style } };
     if (std.mem.eql(u8, typ, "surface")) return .{ .surface = .{ .id = try readStringFieldLimit(arena, L, idx, "id", "surface", ui_id_bytes), .style = style } };
@@ -445,12 +449,99 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
     return .{ .box = .{ .id = id, .style = style, .children = children } };
 }
 
-fn readStyleField(L: *c.lua_State, idx: c_int) !extension_ui.Style {
-    var style: extension_ui.Style = .{};
-    _ = c.lua_getfield(L, idx, "style");
+fn readTextSpansField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]extension_ui.TextSpan {
+    _ = c.lua_getfield(L, idx, "spans");
     defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TTABLE) return style;
-    const sidx = c.lua_absindex(L, -1);
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) return null;
+    const spans_idx = c.lua_absindex(L, -1);
+    const len = c.lua_rawlen(L, spans_idx);
+    const spans = try arena.alloc(extension_ui.TextSpan, len);
+    for (0..len) |i| {
+        _ = c.lua_rawgeti(L, spans_idx, @intCast(i + 1));
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+            const span_idx = c.lua_absindex(L, -1);
+            spans[i] = .{
+                .text = try readStringFieldLimit(arena, L, span_idx, "text", "", ui_text_bytes),
+                .style = try readOptionalStyleField(L, span_idx, "style"),
+                .link = try readOptionalStringFieldLimit(arena, L, span_idx, "link", ui_text_bytes),
+            };
+        } else {
+            spans[i] = .{ .text = try arena.dupe(u8, "") };
+        }
+    }
+    return spans;
+}
+
+fn concatSpansText(arena: std.mem.Allocator, spans: []const extension_ui.TextSpan) ![]const u8 {
+    var total: usize = 0;
+    for (spans) |span| total += span.text.len;
+
+    var joined = std.ArrayList(u8).empty;
+    defer joined.deinit(arena);
+    for (spans) |span| {
+        try joined.appendSlice(arena, span.text);
+        if (joined.items.len > ui_text_bytes) break;
+    }
+    return truncateBytesWithMarker(arena, joined.items, ui_text_bytes, truncated_marker);
+}
+
+fn readTextWrapField(L: *c.lua_State, idx: c_int) !extension_ui.TextWrap {
+    _ = c.lua_getfield(L, idx, "wrap");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .word;
+    const value = luaString(L, -1) orelse return .word;
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "char")) return .char;
+    if (std.mem.eql(u8, value, "word")) return .word;
+    return error.InvalidTextWrap;
+}
+
+fn readTextAlignField(L: *c.lua_State, idx: c_int) !extension_ui.TextAlign {
+    _ = c.lua_getfield(L, idx, "align");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .left;
+    const value = luaString(L, -1) orelse return .left;
+    if (std.mem.eql(u8, value, "left")) return .left;
+    if (std.mem.eql(u8, value, "center")) return .center;
+    if (std.mem.eql(u8, value, "right")) return .right;
+    return error.InvalidTextAlign;
+}
+
+fn readTextOverflowField(L: *c.lua_State, idx: c_int) !extension_ui.TextOverflow {
+    _ = c.lua_getfield(L, idx, "overflow");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .clip;
+    const value = luaString(L, -1) orelse return .clip;
+    if (std.mem.eql(u8, value, "clip")) return .clip;
+    if (std.mem.eql(u8, value, "ellipsis")) return .ellipsis;
+    return error.InvalidTextOverflow;
+}
+
+fn readTextFormatField(L: *c.lua_State, idx: c_int) !extension_ui.TextFormat {
+    _ = c.lua_getfield(L, idx, "format");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .plain;
+    const value = luaString(L, -1) orelse return .plain;
+    if (std.mem.eql(u8, value, "plain")) return .plain;
+    if (std.mem.eql(u8, value, "ansi")) return .ansi;
+    if (std.mem.eql(u8, value, "markdown")) return .markdown;
+    return error.InvalidTextFormat;
+}
+
+fn readStyleField(L: *c.lua_State, idx: c_int) !extension_ui.Style {
+    return (try readOptionalStyleField(L, idx, "style")) orelse .{};
+}
+
+fn readOptionalStyleField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.Style {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) return null;
+    return try readStyleTable(L, c.lua_absindex(L, -1));
+}
+
+fn readStyleTable(L: *c.lua_State, sidx: c_int) !extension_ui.Style {
+    var style: extension_ui.Style = .{};
     style.flex_grow = readFloatField(L, sidx, "flex_grow", style.flex_grow);
     style.gap = readFloatField(L, sidx, "gap", style.gap);
     style.border = readBoolField(L, sidx, "border", style.border);
@@ -465,7 +556,56 @@ fn readStyleField(L: *c.lua_State, idx: c_int) !extension_ui.Style {
         defer std.heap.c_allocator.free(tone);
         if (std.mem.eql(u8, tone, "info")) style.tone = .info else if (std.mem.eql(u8, tone, "success")) style.tone = .success else if (std.mem.eql(u8, tone, "warning")) style.tone = .warning else if (std.mem.eql(u8, tone, "danger")) style.tone = .danger else if (std.mem.eql(u8, tone, "accent")) style.tone = .accent;
     }
+    style.fg = try readColorField(L, sidx, "fg");
+    style.bg = try readColorField(L, sidx, "bg");
+    style.bold = readBoolField(L, sidx, "bold", style.bold);
+    style.dim = readBoolField(L, sidx, "dim", style.dim);
+    style.italic = readBoolField(L, sidx, "italic", style.italic);
+    style.underline = readBoolField(L, sidx, "underline", style.underline);
+    style.strikethrough = readBoolField(L, sidx, "strikethrough", style.strikethrough);
     return style;
+}
+
+fn readColorField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.Color {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    const value = luaString(L, -1) orelse return null;
+    return try parseStyleColor(value);
+}
+
+fn parseStyleColor(value: []const u8) !extension_ui.Color {
+    if (value.len == 4 and value[0] == '#') {
+        const r = try parseHexNibble(value[1]);
+        const g = try parseHexNibble(value[2]);
+        const b = try parseHexNibble(value[3]);
+        return extension_ui.Color.rgb(r * 17, g * 17, b * 17);
+    }
+    if (value.len == 7 and value[0] == '#') {
+        return extension_ui.Color.rgb(try parseHexByte(value[1..3]), try parseHexByte(value[3..5]), try parseHexByte(value[5..7]));
+    }
+    if (std.mem.eql(u8, value, "black")) return extension_ui.Color.rgb(0, 0, 0);
+    if (std.mem.eql(u8, value, "red")) return extension_ui.Color.rgb(205, 49, 49);
+    if (std.mem.eql(u8, value, "green")) return extension_ui.Color.rgb(13, 188, 121);
+    if (std.mem.eql(u8, value, "yellow")) return extension_ui.Color.rgb(229, 229, 16);
+    if (std.mem.eql(u8, value, "blue")) return extension_ui.Color.rgb(36, 114, 200);
+    if (std.mem.eql(u8, value, "magenta")) return extension_ui.Color.rgb(188, 63, 188);
+    if (std.mem.eql(u8, value, "cyan")) return extension_ui.Color.rgb(17, 168, 205);
+    if (std.mem.eql(u8, value, "white")) return extension_ui.Color.rgb(229, 229, 229);
+    return error.InvalidStyleColor;
+}
+
+fn parseHexByte(bytes: []const u8) !u8 {
+    return (try parseHexNibble(bytes[0])) * 16 + try parseHexNibble(bytes[1]);
+}
+
+fn parseHexNibble(byte: u8) !u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => error.InvalidStyleColor,
+    };
 }
 
 fn readConstraintField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?extension_ui.Constraint {
@@ -522,6 +662,13 @@ fn readU32Field(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: u32) 
     const raw = readIntField(L, idx, field, default);
     return if (raw < 0) default else @intCast(raw);
 }
+fn readOptionalU32Field(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?u32 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TNUMBER) return null;
+    const raw: i64 = @intCast(c.lua_tointegerx(L, -1, null));
+    return if (raw < 0) null else @intCast(raw);
+}
 fn readFloatField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: f32) f32 {
     _ = c.lua_getfield(L, idx, field.ptr);
     defer c.lua_pop(L, 1);
@@ -558,16 +705,26 @@ fn dupeLuaStringLimit(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, max
 fn dupeLuaStringWithMarker(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, max_bytes: usize, marker: []const u8) ![]const u8 {
     var len: usize = 0;
     const ptr = c.lua_tolstring(L, idx, &len) orelse return &.{};
-    const value = ptr[0..len];
+    return truncateBytesWithMarker(arena, ptr[0..len], max_bytes, marker);
+}
+
+fn truncateBytesWithMarker(arena: std.mem.Allocator, value: []const u8, max_bytes: usize, marker: []const u8) ![]const u8 {
     if (value.len <= max_bytes) return try arena.dupe(u8, value);
     if (max_bytes == 0) return &.{};
 
     const marker_len = @min(marker.len, max_bytes);
-    const prefix_len = max_bytes - marker_len;
-    const out = try arena.alloc(u8, max_bytes);
+    const prefix_limit = max_bytes - marker_len;
+    const prefix_len = utf8SafePrefixLen(value, prefix_limit);
+    const out = try arena.alloc(u8, prefix_len + marker_len);
     @memcpy(out[0..prefix_len], value[0..prefix_len]);
     @memcpy(out[prefix_len..], marker[0..marker_len]);
     return out;
+}
+
+fn utf8SafePrefixLen(value: []const u8, limit: usize) usize {
+    var n = @min(value.len, limit);
+    while (n > 0 and (value[n] & 0xc0) == 0x80) n -= 1;
+    return n;
 }
 
 fn pushAiApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
@@ -1449,4 +1606,99 @@ pub fn pushCommandContext(
     c.lua_setfield(L, -2, "switch_session");
     c.lua_pushnil(L);
     c.lua_setfield(L, -2, "reload");
+}
+
+test "extension ui parses text node options" {
+    var lua = try lua_runtime.LuaState.init(std.testing.allocator);
+    defer lua.deinit();
+    try lua.doString("return { type = 'text', text = 'hello', wrap = 'none', overflow = 'ellipsis', format = 'markdown', max_lines = 2, scroll_y = 1, link = 'https://node.test', selectable = true }", "test_text_options");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const node = try readNode(arena.allocator(), lua.L, -1);
+
+    try std.testing.expect(node == .text);
+    try std.testing.expectEqual(extension_ui.TextWrap.none, node.text.wrap);
+    try std.testing.expectEqual(extension_ui.TextOverflow.ellipsis, node.text.overflow);
+    try std.testing.expectEqual(extension_ui.TextFormat.markdown, node.text.format);
+    try std.testing.expectEqual(@as(?u32, 2), node.text.max_lines);
+    try std.testing.expectEqual(@as(u32, 1), node.text.scroll_y);
+    try std.testing.expectEqualStrings("https://node.test", node.text.link.?);
+    try std.testing.expect(node.text.selectable);
+}
+
+test "extension ui text node option defaults preserve behavior" {
+    var lua = try lua_runtime.LuaState.init(std.testing.allocator);
+    defer lua.deinit();
+    try lua.doString("return { type = 'text', text = 'hello' }", "test_text_option_defaults");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const node = try readNode(arena.allocator(), lua.L, -1);
+
+    try std.testing.expect(node == .text);
+    try std.testing.expectEqual(extension_ui.TextWrap.word, node.text.wrap);
+    try std.testing.expectEqual(extension_ui.TextOverflow.clip, node.text.overflow);
+    try std.testing.expectEqual(extension_ui.TextFormat.plain, node.text.format);
+    try std.testing.expectEqual(@as(?u32, null), node.text.max_lines);
+    try std.testing.expectEqual(@as(u32, 0), node.text.scroll_y);
+}
+
+test "extension ui parses text node spans" {
+    var lua = try lua_runtime.LuaState.init(std.testing.allocator);
+    defer lua.deinit();
+    try lua.doString("return { type = 'text', text = 'fallback', spans = { { text = 'hello', link = 'https://span.test', style = { tone = 'accent' } }, { text = ' world', style = { tone = 'success' } } } }", "test_text_spans");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const node = try readNode(arena.allocator(), lua.L, -1);
+
+    try std.testing.expect(node == .text);
+    try std.testing.expectEqualStrings("hello world", node.text.text);
+    try std.testing.expect(node.text.spans != null);
+    try std.testing.expectEqual(@as(usize, 2), node.text.spans.?.len);
+    try std.testing.expectEqualStrings("hello", node.text.spans.?[0].text);
+    try std.testing.expectEqual(extension_ui.Tone.accent, node.text.spans.?[0].style.?.tone);
+    try std.testing.expectEqualStrings("https://span.test", node.text.spans.?[0].link.?);
+    try std.testing.expectEqual(extension_ui.Tone.success, node.text.spans.?[1].style.?.tone);
+}
+
+test "extension ui parses style colors and attributes" {
+    var lua = try lua_runtime.LuaState.init(std.testing.allocator);
+    defer lua.deinit();
+    try lua.doString("return { type = 'text', text = 'fallback', style = { fg = '#0f8', bg = 'blue', bold = true, dim = true, italic = true, underline = true, strikethrough = true }, spans = { { text = 'x', style = { fg = '#112233', bg = 'red', bold = true } } } }", "test_text_styles");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const node = try readNode(arena.allocator(), lua.L, -1);
+
+    try std.testing.expect(node == .text);
+    try std.testing.expectEqual(extension_ui.Color.rgb(0, 255, 136), node.text.style.fg.?);
+    try std.testing.expectEqual(extension_ui.Color.rgb(36, 114, 200), node.text.style.bg.?);
+    try std.testing.expect(node.text.style.bold);
+    try std.testing.expect(node.text.style.dim);
+    try std.testing.expect(node.text.style.italic);
+    try std.testing.expect(node.text.style.underline);
+    try std.testing.expect(node.text.style.strikethrough);
+    try std.testing.expectEqual(extension_ui.Color.rgb(0x11, 0x22, 0x33), node.text.spans.?[0].style.?.fg.?);
+    try std.testing.expectEqual(extension_ui.Color.rgb(205, 49, 49), node.text.spans.?[0].style.?.bg.?);
+}
+
+test "extension context truncates span text on utf8 boundary with marker" {
+    const text = "abcédef";
+    const truncated = try truncateBytesWithMarker(std.testing.allocator, text, 6, "...");
+    defer std.testing.allocator.free(truncated);
+    try std.testing.expectEqualStrings("abc...", truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncated));
+}
+
+test "extension context concatSpansText marks truncated output" {
+    const spans = [_]extension_ui.TextSpan{
+        .{ .text = "abc" },
+        .{ .text = "é" ** ui_text_bytes },
+    };
+    const text = try concatSpansText(std.testing.allocator, &spans);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.endsWith(u8, text, truncated_marker));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
 }

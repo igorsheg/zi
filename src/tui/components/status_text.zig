@@ -1,7 +1,11 @@
+const std = @import("std");
 const component_mod = @import("../primitives/view.zig");
 const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
+const text_layout = @import("../text/layout.zig");
+const grapheme = @import("../grapheme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -15,17 +19,21 @@ pub const Kind = enum {
     @"error",
 };
 
-/// Single-line status text primitive.
+/// Status text primitive for short modal/status messages.
 ///
 /// This is intentionally only presentation. Owners decide when a status exists
-/// and what it means; the primitive maps kind to theme color and height.
+/// and what it means; the primitive maps kind to theme color and uses the
+/// shared text layout layer for width-aware wrapping when callers give it
+/// multiple rows.
 pub const StatusText = struct {
+    allocator: std.mem.Allocator,
     theme: *const Theme,
     text: []const u8 = "",
     kind: Kind = .info,
+    width_method: grapheme.WidthMethod,
 
-    pub fn init(theme: *const Theme) StatusText {
-        return .{ .theme = theme };
+    pub fn init(allocator: std.mem.Allocator, theme: *const Theme, width_method: grapheme.WidthMethod) StatusText {
+        return .{ .allocator = allocator, .theme = theme, .width_method = width_method };
     }
 
     pub fn set(self: *StatusText, text: []const u8, kind: Kind) void {
@@ -40,11 +48,26 @@ pub const StatusText = struct {
 
     pub fn render(self: *StatusText, region: Region) void {
         if (self.text.len == 0 or region.width == 0 or region.height == 0) return;
-        _ = region.writeStr(0, 0, self.text, self.color(), Color.default, .{ .dim = self.kind == .info });
+
+        const lines = text_layout.wrapLines(self.text, region.width, .word, self.allocator, self.width_method) catch return;
+        defer self.allocator.free(lines);
+
+        const fg = self.color();
+        const attrs: cell_mod.Attributes = .{ .dim = self.kind == .info };
+        var row: u32 = 0;
+        while (row < region.height and row < lines.len) : (row += 1) {
+            _ = region.writeStr(0, row, lines[row].text(self.text), fg, Color.default, attrs);
+        }
     }
 
-    pub fn measure(self: *StatusText, _: u32) Measurement {
-        return .{ .min_height = if (self.text.len == 0) 0 else 1, .preferred_height = if (self.text.len == 0) 0 else 1 };
+    pub fn measure(self: *StatusText, width: u32) Measurement {
+        if (self.text.len == 0) return .{ .min_height = 0, .preferred_height = 0 };
+        if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
+        const lines = text_layout.wrapLines(self.text, width, .word, self.allocator, self.width_method) catch
+            return .{ .min_height = 1, .preferred_height = 1 };
+        defer self.allocator.free(lines);
+        const h: u32 = @intCast(lines.len);
+        return .{ .min_height = 1, .preferred_height = h };
     }
 
     pub fn component(self: *StatusText) Component {
@@ -59,3 +82,40 @@ pub const StatusText = struct {
         };
     }
 };
+
+const testing = std.testing;
+const Buffer = buffer_mod.Buffer;
+
+test "StatusText wraps when region offers multiple rows" {
+    var buf = try Buffer.init(testing.allocator, 7, 2, .wcwidth);
+    defer buf.deinit();
+
+    var status = StatusText.init(testing.allocator, themes_builtin.dark(), .wcwidth);
+    status.set("loading sessions", .loading);
+
+    try testing.expectEqual(@as(u32, 2), status.measure(7).preferred_height);
+    status.render(buf.region());
+
+    try testing.expectEqual(@as(u21, 'l'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expectEqual(@as(u21, 's'), buf.get(0, 1).grapheme.codepoint);
+    try testing.expect(buf.get(0, 0).fg.eql(themes_builtin.dark().fg(.accent)));
+}
+
+test "StatusText keeps one-row callers clipped by region height" {
+    var buf = try Buffer.init(testing.allocator, 7, 1, .wcwidth);
+    defer buf.deinit();
+
+    var status = StatusText.init(testing.allocator, themes_builtin.dark(), .wcwidth);
+    status.set("loading sessions", .info);
+    status.render(buf.region());
+
+    try testing.expectEqual(@as(u21, 'l'), buf.get(0, 0).grapheme.codepoint);
+    try testing.expect(buf.get(0, 0).attrs.dim);
+}
+
+test "StatusText measure uses configured width method" {
+    var status = StatusText.init(testing.allocator, themes_builtin.dark(), .unicode);
+    status.set("☕☕", .info);
+
+    try testing.expectEqual(@as(u32, 2), status.measure(3).preferred_height);
+}

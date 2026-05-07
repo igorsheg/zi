@@ -44,7 +44,7 @@ pub fn configureSimplePicker(
     on_select: ?*const fn (selection: PickerSelection, ctx: ?*anyopaque) void,
     on_cancel: ?*const fn (ctx: ?*anyopaque) void,
 ) void {
-    picker.configure(self.theme, title, max_visible, items, @ptrCast(self), on_select, on_cancel);
+    picker.configure(self.allocator, self.theme, title, max_visible, items, @ptrCast(self), on_select, on_cancel);
 }
 
 pub fn showSimplePickerOverlay(
