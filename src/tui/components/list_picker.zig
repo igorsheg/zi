@@ -397,7 +397,6 @@ pub const ListPicker = struct {
             self.status_text.clear();
         }
     }
-
 };
 
 const testing = std.testing;

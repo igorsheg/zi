@@ -10,8 +10,24 @@ permissions:
   contents: read
 
 jobs:
+  fmt:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        shell: bash
+        run: git ls-files '*.zig' -z | xargs -0 zig fmt --check
+
   test:
     name: Test ${{ matrix.dist_target }}
+    needs: fmt
     strategy:
       fail-fast: false
       matrix:
@@ -32,9 +48,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-
-      - name: Check formatting
-        run: zig fmt --check .
 
       - name: Build debug
         run: zig build

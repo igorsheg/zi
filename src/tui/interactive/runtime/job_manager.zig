@@ -179,7 +179,6 @@ const OutputAdapter = union(enum) {
             .json_lines => |*decoder| decoder.finish(state, id),
         }
     }
-
 };
 
 const JsonLinesDecoder = struct {

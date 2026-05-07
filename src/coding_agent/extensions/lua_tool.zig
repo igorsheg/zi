@@ -1677,7 +1677,6 @@ test "extension ui events dispatch to lua observers" {
     try testing.expectEqualStrings("key:demo:escape:close:true", ptr[0..len]);
 }
 
-
 test "extension command resumes after ai completion result" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();

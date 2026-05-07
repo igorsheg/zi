@@ -215,7 +215,6 @@ pub const Interactive = struct {
     pending_images: std.ArrayListUnmanaged(PendingImageAttachment) = .empty,
     clipboard_image_reader: ClipboardImageReader = clipboard_mod.readImage,
 
-
     command_registry: CommandRegistry,
     autocomplete_provider: CombinedAutocompleteProvider = undefined,
     autocomplete_provider_bound: bool = false,
