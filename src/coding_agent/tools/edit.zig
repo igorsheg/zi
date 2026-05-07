@@ -456,6 +456,8 @@ fn unescapeStrDup(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
                 't' => '\t',
                 'r' => '\r',
                 '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
                 else => null,
             };
             if (replacement) |r| {
@@ -525,16 +527,14 @@ const CachedEdit = struct {
     new_str: []const u8,
     unescaped_old: ?[]const u8 = null,
     unescaped_new: ?[]const u8 = null,
-    fuzzy_old: ?[]const u8 = null,
+    fuzzy_replace: ?[]const u8 = null,
 
     fn deinit(self: *CachedEdit, allocator: std.mem.Allocator) void {
         if (self.unescaped_old) |s| allocator.free(s);
         if (self.unescaped_new) |s| allocator.free(s);
-        if (self.fuzzy_old) |s| allocator.free(s);
+        if (self.fuzzy_replace) |s| allocator.free(s);
     }
 };
-
-const MatchMode = enum { no_fuzzy, fuzzy_base };
 
 fn findSearchStats(haystack: []const u8, needle: []const u8) ?SearchStats {
     if (needle.len == 0) return .{ .first_index = 0, .occurrences = 0 };
@@ -577,18 +577,11 @@ fn cachedUnescapedNew(allocator: std.mem.Allocator, cache: *CachedEdit) ![]const
     return unescaped;
 }
 
-fn cachedFuzzyOld(allocator: std.mem.Allocator, cache: *CachedEdit) ![]const u8 {
-    if (cache.fuzzy_old) |s| return s;
-    const fuzzy = try fuzzyNormalize(allocator, cache.old_str);
-    cache.fuzzy_old = fuzzy;
-    return fuzzy;
-}
-
 fn prepareMatch(
     allocator: std.mem.Allocator,
     base: []const u8,
     cache: *CachedEdit,
-    mode: MatchMode,
+    allow_fuzzy: bool,
 ) !?PreparedEdit {
     if (findSearchStats(base, cache.old_str)) |stats| {
         return .{
@@ -614,20 +607,159 @@ fn prepareMatch(
         }
     }
 
-    if (mode == .fuzzy_base) {
-        const fuzzy_old = try cachedFuzzyOld(allocator, cache);
-        if (findSearchStats(base, fuzzy_old)) |stats| {
-            return .{
+    if (allow_fuzzy) {
+        if (try prepareFuzzyLineMatch(allocator, base, cache, cache.old_str, cache.new_str)) |prepared| return prepared;
+        if (try cachedUnescapedOld(allocator, cache)) |unescaped_old| {
+            return try prepareFuzzyLineMatch(allocator, base, cache, unescaped_old, try cachedUnescapedNew(allocator, cache));
+        }
+    }
+
+    return null;
+}
+
+const LineSpan = struct {
+    start: usize,
+    end: usize,
+    next: usize,
+};
+
+fn lineAt(content: []const u8, start: usize) LineSpan {
+    const rel_end = std.mem.indexOfScalar(u8, content[start..], '\n');
+    if (rel_end) |rel| {
+        const end = start + rel;
+        return .{ .start = start, .end = end, .next = end + 1 };
+    }
+    return .{ .start = start, .end = content.len, .next = content.len };
+}
+
+fn collectLineStarts(allocator: std.mem.Allocator, content: []const u8) ![]usize {
+    var starts: std.ArrayList(usize) = .empty;
+    errdefer starts.deinit(allocator);
+    try starts.append(allocator, 0);
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (content[i] == '\n' and i + 1 < content.len) {
+            try starts.append(allocator, i + 1);
+        }
+    }
+    return starts.toOwnedSlice(allocator);
+}
+
+fn collectPatternLines(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, pattern, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 and it.index == null and pattern.len > 0 and pattern[pattern.len - 1] == '\n') break;
+        try lines.append(allocator, line);
+    }
+    return lines.toOwnedSlice(allocator);
+}
+
+fn fuzzyLineEquals(allocator: std.mem.Allocator, file_line: []const u8, pattern_line: []const u8) !bool {
+    const file_norm = try fuzzyNormalize(allocator, file_line);
+    defer allocator.free(file_norm);
+    const pattern_norm = try fuzzyNormalize(allocator, pattern_line);
+    defer allocator.free(pattern_norm);
+    const file_trimmed = std.mem.trim(u8, file_norm, " \t");
+    const pattern_trimmed = std.mem.trim(u8, pattern_norm, " \t");
+    return std.mem.eql(u8, file_trimmed, pattern_trimmed);
+}
+
+fn leadingWhitespace(s: []const u8) []const u8 {
+    var n: usize = 0;
+    while (n < s.len and (s[n] == ' ' or s[n] == '\t')) : (n += 1) {}
+    return s[0..n];
+}
+
+fn rebaseReplacementIndent(allocator: std.mem.Allocator, replacement: []const u8, file_indent: []const u8) ![]const u8 {
+    const first_nl = std.mem.indexOfScalar(u8, replacement, '\n') orelse replacement.len;
+    const replacement_indent = leadingWhitespace(replacement[0..first_nl]);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, replacement.len + file_indent.len * 4);
+
+    var pos: usize = 0;
+    while (pos <= replacement.len) {
+        const rel_nl = std.mem.indexOfScalar(u8, replacement[pos..], '\n');
+        const line_end = if (rel_nl) |rel| pos + rel else replacement.len;
+        const line = replacement[pos..line_end];
+        if (line.len > 0) {
+            const indent = leadingWhitespace(line);
+            const rest_indent = if (std.mem.startsWith(u8, indent, replacement_indent))
+                indent[replacement_indent.len..]
+            else
+                indent;
+            try out.appendSlice(allocator, file_indent);
+            try out.appendSlice(allocator, rest_indent);
+            try out.appendSlice(allocator, line[indent.len..]);
+        }
+        if (rel_nl == null) break;
+        try out.append(allocator, '\n');
+        pos = line_end + 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn prepareFuzzyLineMatch(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    cache: *CachedEdit,
+    pattern: []const u8,
+    replacement: []const u8,
+) !?PreparedEdit {
+    const pattern_lines = try collectPatternLines(allocator, pattern);
+    defer allocator.free(pattern_lines);
+    if (pattern_lines.len == 0) return null;
+
+    const starts = try collectLineStarts(allocator, content);
+    defer allocator.free(starts);
+
+    var first_match: ?PreparedEdit = null;
+    var occurrences: usize = 0;
+    for (starts, 0..) |start, start_idx| {
+        if (start_idx + pattern_lines.len > starts.len) break;
+        var ok = true;
+        var line_idx: usize = 0;
+        while (line_idx < pattern_lines.len) : (line_idx += 1) {
+            const span = lineAt(content, starts[start_idx + line_idx]);
+            if (!(try fuzzyLineEquals(allocator, content[span.start..span.end], pattern_lines[line_idx]))) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+
+        occurrences += 1;
+        if (first_match == null) {
+            const first_span = lineAt(content, start);
+            const last_span = lineAt(content, starts[start_idx + pattern_lines.len - 1]);
+            const match_end = if (pattern.len > 0 and pattern[pattern.len - 1] == '\n') last_span.next else last_span.end;
+            const file_indent = leadingWhitespace(content[first_span.start..first_span.end]);
+            cache.fuzzy_replace = try rebaseReplacementIndent(allocator, replacement, file_indent);
+            first_match = .{
                 .edit_index = cache.edit_index,
-                .match_index = stats.first_index,
-                .match_len = fuzzy_old.len,
-                .occurrences = stats.occurrences,
-                .search_str = fuzzy_old,
-                .replace_str = cache.new_str,
+                .match_index = start,
+                .match_len = match_end - start,
+                .occurrences = 0,
+                .search_str = content[start..match_end],
+                .replace_str = cache.fuzzy_replace.?,
             };
         }
     }
 
+    if (first_match) |m| {
+        return .{
+            .edit_index = m.edit_index,
+            .match_index = m.match_index,
+            .match_len = m.match_len,
+            .occurrences = occurrences,
+            .search_str = m.search_str,
+            .replace_str = m.replace_str,
+        };
+    }
     return null;
 }
 
@@ -700,27 +832,14 @@ fn applyEdits(
     }
     defer for (caches) |*cache| cache.deinit(allocator);
 
-    var any_fuzzy = false;
-    for (caches) |*cache| {
-        if (try prepareMatch(allocator, content, cache, .no_fuzzy) == null) {
-            any_fuzzy = true;
-            break;
-        }
-    }
-
-    const base: []const u8 = if (any_fuzzy)
-        try fuzzyNormalize(allocator, content)
-    else
-        content;
-    const base_owned = any_fuzzy;
-    errdefer if (base_owned) allocator.free(base);
+    const base: []const u8 = content;
 
     var matches: std.ArrayList(MatchedEdit) = .empty;
     defer matches.deinit(allocator);
     try matches.ensureTotalCapacity(allocator, edits.len);
 
     for (caches) |*cache| {
-        const prepared = (try prepareMatch(allocator, base, cache, if (any_fuzzy) .fuzzy_base else .no_fuzzy)) orelse {
+        const prepared = (try prepareMatch(allocator, base, cache, true)) orelse {
             failure_out.* = .{ .edit_index = cache.edit_index, .kind = .not_found };
             return error.NotFound;
         };
@@ -915,7 +1034,7 @@ test "applyEdits supports exact, escaped, fuzzy, and batch replacements" {
     try expectApplyEdits(
         "let title = “old”;  \n",
         &.{.{ .old_str = "let title = \"old\";\n", .new_str = "let title = \"new\";\n", .replace_all = false }},
-        "let title = \"old\";\n",
+        "let title = “old”;  \n",
         "let title = \"new\";\n",
     );
 
@@ -927,6 +1046,27 @@ test "applyEdits supports exact, escaped, fuzzy, and batch replacements" {
         },
         "alpha\nbeta\ngamma\n",
         "ALPHA\nbeta\nGAMMA\n",
+    );
+
+    try expectApplyEdits(
+        "const keep = “smart”;  \n    if (ok) {\n        call();\n    }\n",
+        &.{.{ .old_str = "if (ok) {\n  call();\n}\n", .new_str = "if (ok) {\n  done();\n}\n", .replace_all = false }},
+        "const keep = “smart”;  \n    if (ok) {\n        call();\n    }\n",
+        "const keep = “smart”;  \n    if (ok) {\n      done();\n    }\n",
+    );
+
+    try expectApplyEdits(
+        "const msg = \"hi\";\n",
+        &.{.{ .old_str = "const msg = \\\"hi\\\";\\n", .new_str = "const msg = \\\"bye\\\";\\n", .replace_all = false }},
+        "const msg = \"hi\";\n",
+        "const msg = \"bye\";\n",
+    );
+
+    try expectApplyEdits(
+        "    const msg = \"hi\";\n",
+        &.{.{ .old_str = "const msg = \\\"hi\\\";\\n", .new_str = "const msg = \\\"bye\\\";\\n", .replace_all = false }},
+        "    const msg = \"hi\";\n",
+        "    const msg = \"bye\";\n",
     );
 }
 
