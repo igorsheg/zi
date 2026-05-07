@@ -30,7 +30,7 @@ esac
 
 printf 'release-check: version=%s target=%s\n' "$version" "$dist_target"
 
-zig fmt --check .
+git ls-files '*.zig' -z | xargs -0 zig fmt --check
 zig build test --summary all
 zig build -Doptimize=ReleaseSafe -Dstrip=true -Dversion="$version"
 
