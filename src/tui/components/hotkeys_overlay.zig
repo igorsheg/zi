@@ -5,7 +5,6 @@ const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const cell_mod = @import("../cell.zig");
 const box_chrome = @import("../surfaces/box_chrome.zig");
-const grapheme_mod = @import("../grapheme.zig");
 const keybindings = @import("../keybindings.zig");
 
 const Component = component_mod.Component;
@@ -43,7 +42,7 @@ pub const HotkeysOverlay = struct {
         }
 
         if (inner.width == 0 or inner.height == 0) return;
-        const key_width = maxKeyWidth();
+        const key_width = maxKeyWidth(inner);
         var content_row: u32 = 0;
         var last_section: ?keybindings.Section = null;
 
@@ -64,7 +63,7 @@ pub const HotkeysOverlay = struct {
 
             var binding_buf: [64]u8 = undefined;
             const binding_text = keybindings.formatBindings(def.action, " / ", &binding_buf);
-            const binding_width = grapheme_mod.strWidth(binding_text);
+            const binding_width = inner.textWidth(binding_text);
             _ = inner.writeStr(0, content_row, binding_text, theme.fg(.text), Color.default, .{});
 
             const desc_col: u32 = @intCast(@min(inner.width, key_width + 2));
@@ -121,15 +120,15 @@ pub const HotkeysOverlay = struct {
         return Component.init(HotkeysOverlay, self);
     }
 
-    fn maxKeyWidth() u32 {
-        var max_width: usize = 0;
+    fn maxKeyWidth(region: Region) u32 {
+        var max_width: u32 = 0;
         for (keybindings.all()) |def| {
             if (!def.show_in_help) continue;
             var binding_buf: [64]u8 = undefined;
-            const width = grapheme_mod.strWidth(keybindings.formatBindings(def.action, " / ", &binding_buf));
+            const width = region.textWidth(keybindings.formatBindings(def.action, " / ", &binding_buf));
             if (width > max_width) max_width = width;
         }
-        return @intCast(max_width);
+        return max_width;
     }
 };
 
@@ -157,7 +156,7 @@ fn bufferContainsText(buf: *const Buffer, needle: []const u8) bool {
 
 test "HotkeysOverlay renders shared keybinding sections" {
     var overlay = HotkeysOverlay{};
-    var buf = try Buffer.init(testing.allocator, 80, 20);
+    var buf = try Buffer.init(testing.allocator, 80, 20, .wcwidth);
     defer buf.deinit();
 
     overlay.render(buf.region());

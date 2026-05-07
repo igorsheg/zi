@@ -24,6 +24,7 @@ pub fn nextSegment(
     max_width: usize,
     is_continuation: bool,
     options: SegmentOptions,
+    width_method: grapheme.WidthMethod,
 ) ?Segment {
     if (start >= line.len) return null;
     if (max_width == 0) {
@@ -36,7 +37,7 @@ pub fn nextSegment(
         if (line_begin >= line.len) return null;
     }
 
-    const remaining_width = grapheme.strWidth(line[line_begin..]);
+    const remaining_width = grapheme.strWidth(line[line_begin..], width_method);
     if (remaining_width <= max_width) {
         const raw_end = line.len;
         const end = applyTrim(line, line_begin, raw_end, options);
@@ -44,7 +45,7 @@ pub fn nextSegment(
             .start = line_begin,
             .end = end,
             .next_start = raw_end,
-            .width_cols = @intCast(grapheme.strWidth(line[line_begin..end])),
+            .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
         };
     }
 
@@ -54,7 +55,7 @@ pub fn nextSegment(
     while (current_start < line.len) {
         const token = nextToken(line, current_start);
         const token_text = token.text(line);
-        const token_width = grapheme.strWidth(token_text);
+        const token_width = grapheme.strWidth(token_text, width_method);
         const token_is_whitespace = isAllWhitespace(token_text);
 
         if (token_width > max_width) {
@@ -64,17 +65,17 @@ pub fn nextSegment(
                     .start = line_begin,
                     .end = end,
                     .next_start = current_start,
-                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end])),
+                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
                 };
             }
 
-            const piece_end = breakPiece(line, token.start, token.end, max_width);
+            const piece_end = breakPiece(line, token.start, token.end, max_width, width_method);
             const end = applyTrim(line, line_begin, piece_end, options);
             return .{
                 .start = line_begin,
                 .end = end,
                 .next_start = piece_end,
-                .width_cols = @intCast(grapheme.strWidth(line[line_begin..end])),
+                .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
             };
         }
 
@@ -87,7 +88,7 @@ pub fn nextSegment(
                     .start = line_begin,
                     .end = end,
                     .next_start = next_start,
-                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end])),
+                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
                 };
             }
 
@@ -96,7 +97,7 @@ pub fn nextSegment(
                 .start = line_begin,
                 .end = end,
                 .next_start = current_start,
-                .width_cols = @intCast(grapheme.strWidth(line[line_begin..end])),
+                .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
             };
         }
 
@@ -109,7 +110,7 @@ pub fn nextSegment(
         .start = line_begin,
         .end = end,
         .next_start = current_start,
-        .width_cols = @intCast(grapheme.strWidth(line[line_begin..end])),
+        .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
     };
 }
 
@@ -160,13 +161,13 @@ fn applyTrim(line: []const u8, start: usize, raw_end: usize, options: SegmentOpt
     return start + trimTrailingWhitespace(line[start..raw_end]);
 }
 
-fn breakPiece(line: []const u8, start: usize, end: usize, max_width: usize) usize {
+fn breakPiece(line: []const u8, start: usize, end: usize, max_width: usize, width_method: grapheme.WidthMethod) usize {
     var pos = start;
     var width: usize = 0;
 
     while (pos < end) {
-        const next = @min(grapheme.nextGraphemeBoundary(line[0..end], pos), end);
-        const cluster_width = grapheme.strWidth(line[pos..next]);
+        const next = @min(grapheme.nextGraphemeBoundary(line[0..end], pos, width_method), end);
+        const cluster_width = grapheme.strWidth(line[pos..next], width_method);
         if (width + cluster_width > max_width and width > 0) break;
         width += cluster_width;
         pos = next;
@@ -182,7 +183,7 @@ test "nextSegment display policy consumes overflow whitespace" {
         .trim_trailing_whitespace = true,
         .skip_leading_whitespace_on_continuation = true,
         .consume_overflow_whitespace = true,
-    }).?;
+    }, .wcwidth).?;
     try testing.expectEqualStrings("hello", seg1.text("hello world"));
     try testing.expectEqual(@as(usize, 6), seg1.next_start);
 
@@ -190,15 +191,15 @@ test "nextSegment display policy consumes overflow whitespace" {
         .trim_trailing_whitespace = true,
         .skip_leading_whitespace_on_continuation = true,
         .consume_overflow_whitespace = true,
-    }).?;
+    }, .wcwidth).?;
     try testing.expectEqualStrings("world", seg2.text("hello world"));
 }
 
 test "nextSegment preserve policy keeps separator bytes on previous line" {
-    const seg1 = nextSegment("hello world", 0, 5, false, .{}).?;
+    const seg1 = nextSegment("hello world", 0, 5, false, .{}, .wcwidth).?;
     try testing.expectEqualStrings("hello ", seg1.text("hello world"));
     try testing.expectEqual(@as(usize, 6), seg1.next_start);
 
-    const seg2 = nextSegment("hello world", seg1.next_start, 5, true, .{}).?;
+    const seg2 = nextSegment("hello world", seg1.next_start, 5, true, .{}, .wcwidth).?;
     try testing.expectEqualStrings("world", seg2.text("hello world"));
 }

@@ -1,15 +1,30 @@
 const std = @import("std");
 
+pub const WidthMethod = enum {
+    /// Terminal wcwidth-compatible behavior. This is the conservative default
+    /// for multiplexers and terminals that do not support explicit Unicode width.
+    wcwidth,
+    /// Unicode/emoji-biased behavior for modern terminals.
+    unicode,
+};
+
 const Decoded = struct {
     cp: u21,
     len: usize,
+};
+
+pub const Cluster = struct {
+    bytes: []const u8,
+    width: u2,
+    single_codepoint: ?u21,
 };
 
 /// Returns the display width (in terminal columns) of a Unicode codepoint.
 /// 0 for combining marks, zero-width chars, controls.
 /// 2 for CJK ideographs, fullwidth forms, wide emoji.
 /// 1 for everything else.
-pub fn charWidth(cp: u21) u2 {
+pub fn charWidth(cp: u21, method: WidthMethod) u2 {
+    _ = method;
     if (cp >= 0x20 and cp <= 0x7E) return 1;
 
     if (cp <= 0x1F or cp == 0x7F) return 0;
@@ -76,26 +91,26 @@ pub fn charWidth(cp: u21) u2 {
     return 1;
 }
 
-pub fn prevGraphemeBoundary(text: []const u8, byte_offset: usize) usize {
+pub fn prevGraphemeBoundary(text: []const u8, byte_offset: usize, method: WidthMethod) usize {
     const clamped = @min(byte_offset, text.len);
     if (clamped == 0 or text.len == 0) return 0;
 
     var start: usize = 0;
     while (start < text.len) {
-        const end = nextGraphemeBoundaryFromBoundary(text, start);
+        const end = nextGraphemeBoundaryFromBoundary(text, start, method);
         if (end >= clamped) return start;
         start = end;
     }
     return 0;
 }
 
-pub fn nextGraphemeBoundary(text: []const u8, byte_offset: usize) usize {
+pub fn nextGraphemeBoundary(text: []const u8, byte_offset: usize, method: WidthMethod) usize {
     const clamped = @min(byte_offset, text.len);
     if (clamped >= text.len or text.len == 0) return text.len;
 
     var start: usize = 0;
     while (start < text.len) {
-        const end = nextGraphemeBoundaryFromBoundary(text, start);
+        const end = nextGraphemeBoundaryFromBoundary(text, start, method);
         if (clamped <= start or clamped < end) return end;
         start = end;
     }
@@ -103,12 +118,12 @@ pub fn nextGraphemeBoundary(text: []const u8, byte_offset: usize) usize {
 }
 
 /// Returns the total display width (in terminal columns) of a UTF-8 string.
-pub fn strWidth(text: []const u8) usize {
+pub fn strWidth(text: []const u8, method: WidthMethod) usize {
     var cols: usize = 0;
     var start: usize = 0;
     while (start < text.len) {
-        const end = nextGraphemeBoundaryFromBoundary(text, start);
-        cols += graphemeWidth(text[start..end]);
+        const end = nextGraphemeBoundaryFromBoundary(text, start, method);
+        cols += clusterWidth(text[start..end], method);
         start = end;
     }
     return cols;
@@ -116,12 +131,12 @@ pub fn strWidth(text: []const u8) usize {
 
 /// Returns the longest prefix of `text` that fits within `max_cols` display columns.
 /// Never splits a grapheme cluster.
-pub fn sliceToWidth(text: []const u8, max_cols: usize) []const u8 {
+pub fn sliceToWidth(text: []const u8, max_cols: usize, method: WidthMethod) []const u8 {
     var cols: usize = 0;
     var start: usize = 0;
     while (start < text.len) {
-        const end = nextGraphemeBoundaryFromBoundary(text, start);
-        const cluster_width = graphemeWidth(text[start..end]);
+        const end = nextGraphemeBoundaryFromBoundary(text, start, method);
+        const cluster_width = clusterWidth(text[start..end], method);
         if (cols + cluster_width > max_cols) break;
         cols += cluster_width;
         start = end;
@@ -129,7 +144,8 @@ pub fn sliceToWidth(text: []const u8, max_cols: usize) []const u8 {
     return text[0..start];
 }
 
-fn nextGraphemeBoundaryFromBoundary(text: []const u8, start: usize) usize {
+pub fn nextGraphemeBoundaryFromBoundary(text: []const u8, start: usize, method: WidthMethod) usize {
+    _ = method;
     if (start >= text.len) return text.len;
 
     const first = decodeAt(text, start);
@@ -161,7 +177,7 @@ fn nextGraphemeBoundaryFromBoundary(text: []const u8, start: usize) usize {
     return text.len;
 }
 
-fn graphemeWidth(cluster: []const u8) usize {
+pub fn clusterWidth(cluster: []const u8, method: WidthMethod) u2 {
     var raw_max: usize = 0;
     var visible_max: usize = 0;
     var pos: usize = 0;
@@ -169,7 +185,7 @@ fn graphemeWidth(cluster: []const u8) usize {
     while (pos < cluster.len) {
         const decoded = decodeAt(cluster, pos);
         if (decoded.len == 0) break;
-        const width: usize = @intCast(charWidth(decoded.cp));
+        const width: usize = @intCast(charWidth(decoded.cp, method));
         raw_max = @max(raw_max, width);
         if (!isExtend(decoded.cp) and decoded.cp != 0x200D and !isControl(decoded.cp)) {
             visible_max = @max(visible_max, width);
@@ -177,7 +193,20 @@ fn graphemeWidth(cluster: []const u8) usize {
         pos += decoded.len;
     }
 
-    return if (visible_max > 0) visible_max else raw_max;
+    return @intCast(@min(if (visible_max > 0) visible_max else raw_max, 2));
+}
+
+pub fn nextCluster(text: []const u8, start: usize, method: WidthMethod) ?Cluster {
+    if (start >= text.len) return null;
+    const end = nextGraphemeBoundaryFromBoundary(text, start, method);
+    const bytes = text[start..end];
+    const first = decodeAt(text, start);
+    const single = if (first.len == bytes.len) first.cp else null;
+    return .{
+        .bytes = bytes,
+        .width = clusterWidth(bytes, method),
+        .single_codepoint = single,
+    };
 }
 
 fn isGraphemeBreak(
@@ -385,42 +414,42 @@ fn isHangulLVT(cp: u21) bool {
 }
 
 test "charWidth covers ASCII, wide, zero-width, and control ranges" {
-    try std.testing.expectEqual(@as(u2, 1), charWidth('A'));
-    try std.testing.expectEqual(@as(u2, 1), charWidth(' '));
-    try std.testing.expectEqual(@as(u2, 2), charWidth(0x4E00));
-    try std.testing.expectEqual(@as(u2, 2), charWidth(0x3042));
-    try std.testing.expectEqual(@as(u2, 0), charWidth(0x0300));
-    try std.testing.expectEqual(@as(u2, 0), charWidth(0x200B));
-    try std.testing.expectEqual(@as(u2, 0), charWidth(0x00));
-    try std.testing.expectEqual(@as(u2, 0), charWidth(0x1B));
+    try std.testing.expectEqual(@as(u2, 1), charWidth('A', .wcwidth));
+    try std.testing.expectEqual(@as(u2, 1), charWidth(' ', .wcwidth));
+    try std.testing.expectEqual(@as(u2, 2), charWidth(0x4E00, .wcwidth));
+    try std.testing.expectEqual(@as(u2, 2), charWidth(0x3042, .wcwidth));
+    try std.testing.expectEqual(@as(u2, 0), charWidth(0x0300, .wcwidth));
+    try std.testing.expectEqual(@as(u2, 0), charWidth(0x200B, .wcwidth));
+    try std.testing.expectEqual(@as(u2, 0), charWidth(0x00, .wcwidth));
+    try std.testing.expectEqual(@as(u2, 0), charWidth(0x1B, .wcwidth));
 }
 
 test "grapheme boundaries keep combining marks and emoji sequences atomic" {
-    try std.testing.expectEqual(@as(usize, "e\u{0301}".len), nextGraphemeBoundary("e\u{0301}", 0));
-    try std.testing.expectEqual(@as(usize, "👋🏿".len), nextGraphemeBoundary("👋🏿", 0));
-    try std.testing.expectEqual(@as(usize, "👩‍🚀".len), nextGraphemeBoundary("👩‍🚀", 0));
-    try std.testing.expectEqual(@as(usize, "🇨🇦".len), nextGraphemeBoundary("🇨🇦", 0));
+    try std.testing.expectEqual(@as(usize, "e\u{0301}".len), nextGraphemeBoundary("e\u{0301}", 0, .wcwidth));
+    try std.testing.expectEqual(@as(usize, "👋🏿".len), nextGraphemeBoundary("👋🏿", 0, .wcwidth));
+    try std.testing.expectEqual(@as(usize, "👩‍🚀".len), nextGraphemeBoundary("👩‍🚀", 0, .wcwidth));
+    try std.testing.expectEqual(@as(usize, "🇨🇦".len), nextGraphemeBoundary("🇨🇦", 0, .wcwidth));
 
-    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("e\u{0301}", "e\u{0301}".len));
-    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("👋🏿", "👋🏿".len));
-    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("👩‍🚀", "👩‍🚀".len));
-    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("🇨🇦", "🇨🇦".len));
+    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("e\u{0301}", "e\u{0301}".len, .wcwidth));
+    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("👋🏿", "👋🏿".len, .wcwidth));
+    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("👩‍🚀", "👩‍🚀".len, .wcwidth));
+    try std.testing.expectEqual(@as(usize, 0), prevGraphemeBoundary("🇨🇦", "🇨🇦".len, .wcwidth));
 }
 
 test "strWidth sums grapheme cluster widths" {
-    try std.testing.expectEqual(@as(usize, 5), strWidth("hello"));
-    try std.testing.expectEqual(@as(usize, 0), strWidth(""));
-    try std.testing.expectEqual(@as(usize, 4), strWidth("一二"));
-    try std.testing.expectEqual(@as(usize, 1), strWidth("e\u{0301}"));
-    try std.testing.expectEqual(@as(usize, 2), strWidth("👋🏿"));
-    try std.testing.expectEqual(@as(usize, 2), strWidth("👩‍🚀"));
-    try std.testing.expectEqual(@as(usize, 2), strWidth("🇨🇦"));
+    try std.testing.expectEqual(@as(usize, 5), strWidth("hello", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 0), strWidth("", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 4), strWidth("一二", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 1), strWidth("e\u{0301}", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 2), strWidth("👋🏿", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 2), strWidth("👩‍🚀", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 2), strWidth("🇨🇦", .wcwidth));
 }
 
 test "sliceToWidth truncates at grapheme boundary" {
-    try std.testing.expectEqualStrings("hel", sliceToWidth("hello", 3));
-    const result = sliceToWidth("一二三", 3);
-    try std.testing.expectEqual(@as(usize, 2), strWidth(result));
-    try std.testing.expectEqualStrings("👩‍🚀", sliceToWidth("👩‍🚀x", 2));
-    try std.testing.expectEqualStrings("", sliceToWidth("👩‍🚀x", 1));
+    try std.testing.expectEqualStrings("hel", sliceToWidth("hello", 3, .wcwidth));
+    const result = sliceToWidth("一二三", 3, .wcwidth);
+    try std.testing.expectEqual(@as(usize, 2), strWidth(result, .wcwidth));
+    try std.testing.expectEqualStrings("👩‍🚀", sliceToWidth("👩‍🚀x", 2, .wcwidth));
+    try std.testing.expectEqualStrings("", sliceToWidth("👩‍🚀x", 1, .wcwidth));
 }

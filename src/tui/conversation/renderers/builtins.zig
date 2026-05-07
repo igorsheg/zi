@@ -557,8 +557,12 @@ fn rowAscii(buf: *const buffer_mod.Buffer, y: u32, out: []u8) []const u8 {
     var len: usize = 0;
     var x: u32 = 0;
     while (x < buf.width and len < out.len) : (x += 1) {
-        const cp = buf.get(x, y).grapheme.codepoint;
-        out[len] = if (cp <= 0x7f) @intCast(cp) else '?';
+        const cell = buf.get(x, y);
+        if (cell.width == 0) continue;
+        switch (cell.grapheme) {
+            .codepoint => |cp| out[len] = if (cp <= 0x7f) @intCast(cp) else '?',
+            .pooled => out[len] = '?',
+        }
         len += 1;
     }
     return std.mem.trimEnd(u8, out[0..len], " ");
@@ -615,7 +619,7 @@ fn prepareRendererStateForTest(
 }
 
 test "bashCall renders command title contract" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 64, 1);
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 64, 1, .wcwidth);
     defer buf.deinit();
 
     const args = try makeBashArgsForTest(testing.allocator, "cmd", "echo hi", .{ .integer = 5 });
@@ -645,7 +649,7 @@ test "bashCall renders command title contract" {
 }
 
 test "bashCall accepts legacy command arg for old sessions" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 32, 1);
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 32, 1, .wcwidth);
     defer buf.deinit();
 
     const args = try makeBashArgsForTest(testing.allocator, "command", "ls -la", null);

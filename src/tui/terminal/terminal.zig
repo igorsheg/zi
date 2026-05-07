@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime_fd = @import("fd.zig");
 const posix = std.posix;
 const ansi = @import("ansi.zig");
+const grapheme = @import("../grapheme.zig");
 
 /// Global terminal pointer for signal/panic cleanup.
 /// Set by Terminal.installSignalHandlers(), cleared by Terminal.deinit().
@@ -32,6 +33,18 @@ pub const panic = struct {
     }
 }.call;
 
+pub const Capabilities = struct {
+    width_method: grapheme.WidthMethod = .wcwidth,
+    synchronized_updates: bool = true,
+    rgb: bool = true,
+    bracketed_paste: bool = true,
+    kitty_keyboard: bool = false,
+    modify_other_keys: bool = false,
+    mouse: bool = true,
+    hyperlinks: bool = false,
+    explicit_width: bool = false,
+};
+
 pub const Terminal = struct {
     fd_in: posix.fd_t,
     fd_out: posix.fd_t,
@@ -44,6 +57,7 @@ pub const Terminal = struct {
     bracketed_paste_active: bool,
     mouse_tracking_active: bool,
     cursor_hidden: bool,
+    capabilities: Capabilities,
 
     pub fn init() Terminal {
         return .{
@@ -58,7 +72,28 @@ pub const Terminal = struct {
             .bracketed_paste_active = false,
             .mouse_tracking_active = false,
             .cursor_hidden = false,
+            .capabilities = detectCapabilities(),
         };
+    }
+
+    fn detectCapabilities() Capabilities {
+        var caps: Capabilities = .{};
+
+        if (std.c.getenv("TMUX") != null) {
+            caps.width_method = .wcwidth;
+        } else if (std.c.getenv("TERM")) |term_z| {
+            const term = std.mem.span(term_z);
+            if (std.mem.startsWith(u8, term, "tmux") or std.mem.startsWith(u8, term, "screen")) {
+                caps.width_method = .wcwidth;
+            }
+        }
+
+        if (std.c.getenv("COLORTERM")) |colorterm_z| {
+            const colorterm = std.mem.span(colorterm_z);
+            caps.rgb = std.mem.eql(u8, colorterm, "truecolor") or std.mem.eql(u8, colorterm, "24bit");
+        }
+
+        return caps;
     }
 
     /// Enter raw mode: disable echo, canonical processing, signals.

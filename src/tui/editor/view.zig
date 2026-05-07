@@ -310,7 +310,7 @@ pub const PromptView = struct {
 const testing = std.testing;
 
 test "PromptView wrapped visual up down preserves desired visual column" {
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = PromptBuffer.init(testing.allocator, .wcwidth);
     defer buffer.deinit();
     buffer.setText("abcd efgh ijkl");
 
@@ -334,7 +334,7 @@ test "PromptView wrapped visual up down preserves desired visual column" {
 }
 
 test "PromptView ensureCursorVisible keeps cursor inside scroll margins" {
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = PromptBuffer.init(testing.allocator, .wcwidth);
     defer buffer.deinit();
     buffer.setText("one two three four five six seven");
 
@@ -350,7 +350,7 @@ test "PromptView ensureCursorVisible keeps cursor inside scroll margins" {
 }
 
 test "PromptView resize reflows once and keeps cursor visible" {
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = PromptBuffer.init(testing.allocator, .wcwidth);
     defer buffer.deinit();
     buffer.setText("alpha beta gamma delta epsilon");
 

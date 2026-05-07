@@ -19,6 +19,7 @@ const conversation_state_mod = @import("../../agent/conversation_state.zig");
 const message_memory = @import("../../agent/message_memory.zig");
 const json_util = @import("../../ai/json_util.zig");
 const rendered_tool_result_view = @import("rendered_tool_result.zig");
+const grapheme = @import("../grapheme.zig");
 
 const Transcript = transcript_mod.Transcript;
 const TranscriptItem = transcript_mod.TranscriptItem;
@@ -35,6 +36,7 @@ pub const RebuildOptions = struct {
     theme: *const Theme,
     retry_attempt: u32 = 0,
     hidden_thinking_label: []const u8 = "Thinking...",
+    width_method: grapheme.WidthMethod,
 };
 
 const DesiredItem = struct {
@@ -664,7 +666,7 @@ fn appendTransientDesiredItems(
             try appendDesiredItem(
                 allocator,
                 desired_items,
-                buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids, options.theme, hide_thinking_block, options.hidden_thinking_label),
+                buildActiveAssistantDesiredItem(allocator, transcript, assistant, live_tool_ids, options.theme, hide_thinking_block, options.hidden_thinking_label, options.width_method),
             );
         }
         for (turn.tool_executions) |*tool| {
@@ -680,14 +682,14 @@ fn appendTransientDesiredItems(
             try appendDesiredItem(
                 allocator,
                 desired_items,
-                buildQueuedUserDesiredItem(allocator, transcript, .steering, idx, entry.text, options.theme),
+                buildQueuedUserDesiredItem(allocator, transcript, .steering, idx, entry.text, options.theme, options.width_method),
             );
         }
         for (q.follow_up, 0..) |entry, idx| {
             try appendDesiredItem(
                 allocator,
                 desired_items,
-                buildQueuedUserDesiredItem(allocator, transcript, .follow_up, idx, entry.text, options.theme),
+                buildQueuedUserDesiredItem(allocator, transcript, .follow_up, idx, entry.text, options.theme, options.width_method),
             );
         }
     }
@@ -761,13 +763,14 @@ fn buildActiveAssistantDesiredItem(
     theme: *const Theme,
     hide_thinking_block: bool,
     hidden_thinking_label: []const u8,
+    width_method: grapheme.WidthMethod,
 ) !DesiredItem {
     const item_id = activeAssistantId(assistant);
     const semantic_version = activeAssistantSemanticVersion(assistant);
     if (transcript.hasRetainedMatch(item_id, semantic_version)) {
         return .{ .item_id = item_id, .semantic_version = semantic_version };
     }
-    var row = try createAssistantMessageRow(allocator, assistant, live_tool_ids, theme, hide_thinking_block, hidden_thinking_label);
+    var row = try createAssistantMessageRow(allocator, assistant, live_tool_ids, theme, hide_thinking_block, hidden_thinking_label, width_method);
     row.retained_item_id = item_id;
     row.retained_semantic_version = semantic_version;
     return .{ .item_id = item_id, .semantic_version = semantic_version, .row = row };
@@ -829,6 +832,7 @@ fn buildQueuedUserDesiredItem(
     ordinal: usize,
     text: []const u8,
     theme: *const Theme,
+    width_method: grapheme.WidthMethod,
 ) !DesiredItem {
     const item_id = queuedUserMessageId(kind, ordinal);
     const semantic_version = queuedUserMessageSemanticVersion(text);
@@ -846,7 +850,7 @@ fn buildQueuedUserDesiredItem(
     );
     defer model.deinit(allocator);
 
-    var row = try createUserMessageRow(allocator, &model, .queued_user_message, theme);
+    var row = try createUserMessageRow(allocator, &model, .queued_user_message, theme, width_method);
     row.retained_item_id = item_id;
     row.retained_semantic_version = semantic_version;
     return .{ .item_id = item_id, .semantic_version = semantic_version, .row = row };
@@ -1005,40 +1009,40 @@ fn buildMessageRow(
     hide_thinking_block: bool,
 ) !TranscriptItem {
     return switch (message) {
-        .user => try buildUserRow(allocator, message, options.theme),
-        .assistant => |assistant| try createAssistantMessageRow(allocator, assistant, live_tool_ids, options.theme, hide_thinking_block, options.hidden_thinking_label),
-        .compaction_summary => |summary| try buildSummaryRow(allocator, options.theme, "Compaction summary", summary.summary),
-        .branch_summary => |summary| try buildSummaryRow(allocator, options.theme, "Branch summary", summary.summary),
+        .user => try buildUserRow(allocator, message, options.theme, options.width_method),
+        .assistant => |assistant| try createAssistantMessageRow(allocator, assistant, live_tool_ids, options.theme, hide_thinking_block, options.hidden_thinking_label, options.width_method),
+        .compaction_summary => |summary| try buildSummaryRow(allocator, options.theme, "Compaction summary", summary.summary, options.width_method),
+        .branch_summary => |summary| try buildSummaryRow(allocator, options.theme, "Branch summary", summary.summary, options.width_method),
         .custom => |custom| if (custom.display)
-            try buildCustomRow(allocator, options.theme, custom)
+            try buildCustomRow(allocator, options.theme, custom, options.width_method)
         else
             error.SkipHiddenCustomMessage,
         .tool_result => error.UnsupportedStandaloneToolResult,
     };
 }
 
-fn buildUserRow(allocator: std.mem.Allocator, message: agent_protocol.AgentMessage, theme: *const Theme) !TranscriptItem {
+fn buildUserRow(allocator: std.mem.Allocator, message: agent_protocol.AgentMessage, theme: *const Theme, width_method: grapheme.WidthMethod) !TranscriptItem {
     const text = extractUserMessageText(allocator, message) orelse return error.EmptyUserMessage;
     defer text.deinit(allocator);
 
     var model = try buildUserRowModel(allocator, text.slice(), .none, .in_chat);
     defer model.deinit(allocator);
-    return createUserMessageRow(allocator, &model, .user_message, theme);
+    return createUserMessageRow(allocator, &model, .user_message, theme, width_method);
 }
 
-fn buildSummaryRow(allocator: std.mem.Allocator, theme: *const Theme, label: []const u8, summary: []const u8) !TranscriptItem {
+fn buildSummaryRow(allocator: std.mem.Allocator, theme: *const Theme, label: []const u8, summary: []const u8, width_method: grapheme.WidthMethod) !TranscriptItem {
     const content = try std.fmt.allocPrint(allocator, "**{s}**\n\n{s}", .{ label, summary });
     defer allocator.free(content);
-    return createMarkdownRow(allocator, theme, content, theme.fg(.muted), Color.default);
+    return createMarkdownRow(allocator, theme, content, theme.fg(.muted), Color.default, width_method);
 }
 
-fn buildCustomRow(allocator: std.mem.Allocator, theme: *const Theme, custom: agent_protocol.AgentMessage.CustomMessage) !TranscriptItem {
+fn buildCustomRow(allocator: std.mem.Allocator, theme: *const Theme, custom: agent_protocol.AgentMessage.CustomMessage, width_method: grapheme.WidthMethod) !TranscriptItem {
     const body = try customContentText(allocator, custom.content);
     defer allocator.free(body);
     if (body.len == 0) return error.EmptyCustomMessage;
     const content = try std.fmt.allocPrint(allocator, "**{s}**\n\n{s}", .{ custom.custom_type, body });
     defer allocator.free(content);
-    return createMarkdownRow(allocator, theme, content, theme.fg(.custom_message_text), theme.bg(.custom_message_bg));
+    return createMarkdownRow(allocator, theme, content, theme.fg(.custom_message_text), theme.bg(.custom_message_bg), width_method);
 }
 
 fn buildAssistantRowModel(
@@ -1073,6 +1077,7 @@ fn createAssistantMessageRow(
     theme: *const Theme,
     hide_thinking_block: bool,
     hidden_thinking_label: []const u8,
+    width_method: grapheme.WidthMethod,
 ) !TranscriptItem {
     var model = try buildAssistantRowModel(allocator, assistant, live_tool_ids);
     errdefer model.deinit(allocator);
@@ -1080,7 +1085,7 @@ fn createAssistantMessageRow(
 
     const am = try allocator.create(assistant_message_component_mod.AssistantMessage);
     errdefer allocator.destroy(am);
-    am.* = assistant_message_component_mod.AssistantMessage.init(allocator);
+    am.* = assistant_message_component_mod.AssistantMessage.init(allocator, width_method);
     errdefer am.deinit();
     am.theme = theme;
     am.hide_thinking_block = hide_thinking_block;
@@ -1112,10 +1117,11 @@ pub fn createUserMessageRow(
     model: *user_message_component_mod.UserRowModel,
     kind: transcript_mod.ItemKind,
     theme: *const Theme,
+    width_method: grapheme.WidthMethod,
 ) !TranscriptItem {
     const msg = try allocator.create(user_message_component_mod.UserMessage);
     errdefer allocator.destroy(msg);
-    msg.* = user_message_component_mod.UserMessage.init(allocator);
+    msg.* = user_message_component_mod.UserMessage.init(allocator, width_method);
     errdefer msg.deinit();
     msg.setTheme(theme);
     msg.setOwnedModel(model);
@@ -1579,10 +1585,11 @@ fn createMarkdownRow(
     content: []const u8,
     fg: Color,
     bg: Color,
+    width_method: grapheme.WidthMethod,
 ) !TranscriptItem {
     const md = try allocator.create(Markdown);
     errdefer allocator.destroy(md);
-    md.* = Markdown.init(allocator);
+    md.* = Markdown.init(allocator, width_method);
     errdefer md.deinit();
     md.theme = theme;
     md.padding_x = 1;
@@ -1592,6 +1599,7 @@ fn createMarkdownRow(
     md.setContent(content);
     return .{
         .renderable = TranscriptRenderable.init(Markdown, md),
+        .kind = .markdown,
         .deinit_ctx = @ptrCast(md),
         .deinit_fn = deinitMarkdown,
     };
@@ -1664,9 +1672,9 @@ fn joinUserBlocksText(
     return out.toOwnedSlice(allocator);
 }
 
-fn renderTranscriptText(allocator: std.mem.Allocator, transcript: *Transcript, width: u32) ![]u8 {
+fn renderTranscriptText(allocator: std.mem.Allocator, transcript: *Transcript, width: u32, width_method: grapheme.WidthMethod) ![]u8 {
     const height = @max(@as(u32, 1), transcript.totalHeight(width));
-    var buf = try Buffer.init(allocator, width, height);
+    var buf = try Buffer.init(allocator, width, height, width_method);
     defer buf.deinit();
     transcript.render(buf.region());
 
@@ -1677,12 +1685,10 @@ fn renderTranscriptText(allocator: std.mem.Allocator, transcript: *Transcript, w
     while (row < height) : (row += 1) {
         if (row > 0) try out.append(allocator, '\n');
         var end = width;
-        while (end > 0 and buf.get(end - 1, row).grapheme.codepoint == ' ') : (end -= 1) {}
+        while (end > 0 and buf.cellIsSpace(buf.get(end - 1, row))) : (end -= 1) {}
         var col: u32 = 0;
         while (col < end) : (col += 1) {
-            var utf8_buf: [4]u8 = undefined;
-            const len = std.unicode.utf8Encode(buf.get(col, row).grapheme.codepoint, &utf8_buf) catch continue;
-            try out.appendSlice(allocator, utf8_buf[0..len]);
+            try buf.appendCellText(&out, allocator, buf.get(col, row));
         }
     }
 
@@ -1752,11 +1758,52 @@ fn dupQueuedEntries(allocator: std.mem.Allocator, texts: []const []const u8) ![]
     return entries;
 }
 
+test "projection threads width method into constructed transcript rows" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var editor = editor_mod.Editor.init(testing.allocator, .unicode);
+    defer editor.deinit();
+
+    const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
+        .{ .text = .{ .text = "assistant text" } },
+    };
+    const messages = [_]agent_protocol.AgentMessage{
+        makeUserMessage("hello"),
+        makeAssistantMessage(&assistant_content, .endTurn, null),
+        .{ .compaction_summary = .{ .summary = "summary", .tokens_before = 10, .timestamp = 1 } },
+    };
+
+    var state = try ownedViewSnapshotFromMessages(testing.allocator, &messages);
+    defer state.deinit(testing.allocator);
+
+    rebuildFromSnapshots(
+        &transcript,
+        EditorInterface.init(editor_mod.Editor, &editor),
+        tool_display_mod.empty_resolver,
+        state,
+        null,
+        .{ .theme = themes_builtin.dark(), .width_method = .unicode },
+    );
+
+    try testing.expectEqual(@as(usize, 3), transcript.items.items.len);
+
+    const user: *user_message_component_mod.UserMessage = @ptrCast(@alignCast(transcript.items.items[0].deinit_ctx.?));
+    try testing.expectEqual(grapheme.WidthMethod.unicode, user.body.width_method);
+    try testing.expectEqual(grapheme.WidthMethod.unicode, user.meta.width_method);
+
+    const assistant: *assistant_message_component_mod.AssistantMessage = @ptrCast(@alignCast(transcript.items.items[1].deinit_ctx.?));
+    try testing.expectEqual(grapheme.WidthMethod.unicode, assistant.width_method);
+
+    const markdown: *Markdown = @ptrCast(@alignCast(transcript.items.items[2].deinit_ctx.?));
+    try testing.expectEqual(grapheme.WidthMethod.unicode, markdown.width_method);
+}
+
 test "rebuildFromSnapshots reconstructs tool call rows and tool results from committed messages" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var editor = editor_mod.Editor.init(testing.allocator);
+    var editor = editor_mod.Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     const tool_call = agent_protocol.ToolCall{ .id = "tc-1", .name = "bash", .arguments = .null };
@@ -1782,7 +1829,7 @@ test "rebuildFromSnapshots reconstructs tool call rows and tool results from com
         tool_display_mod.empty_resolver,
         state,
         null,
-        .{ .theme = themes_builtin.dark() },
+        .{ .theme = themes_builtin.dark(), .width_method = .wcwidth },
     );
 
     try testing.expectEqual(@as(usize, 1), editor.history.items.len);
@@ -1803,7 +1850,7 @@ test "rebuildFromSnapshots preserves assistant text thinking and tool call order
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var editor = editor_mod.Editor.init(testing.allocator);
+    var editor = editor_mod.Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
@@ -1824,10 +1871,10 @@ test "rebuildFromSnapshots preserves assistant text thinking and tool call order
         tool_display_mod.empty_resolver,
         state,
         null,
-        .{ .theme = themes_builtin.dark() },
+        .{ .theme = themes_builtin.dark(), .width_method = .wcwidth },
     );
 
-    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40, .wcwidth);
     defer testing.allocator.free(rendered);
 
     const alpha_idx = std.mem.indexOf(u8, rendered, "alpha") orelse return error.MissingAssistantText;
@@ -1842,7 +1889,7 @@ test "rebuildFromSnapshots respects hidden thinking labels for committed assista
     defer transcript.deinit();
     transcript.hide_thinking_block = true;
 
-    var editor = editor_mod.Editor.init(testing.allocator);
+    var editor = editor_mod.Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
@@ -1862,10 +1909,10 @@ test "rebuildFromSnapshots respects hidden thinking labels for committed assista
         tool_display_mod.empty_resolver,
         state,
         null,
-        .{ .theme = themes_builtin.dark() },
+        .{ .theme = themes_builtin.dark(), .width_method = .wcwidth },
     );
 
-    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40, .wcwidth);
     defer testing.allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "alpha") != null);
@@ -1877,7 +1924,7 @@ test "rebuildFromSnapshots renders failed tool rows for aborted assistant" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var editor = editor_mod.Editor.init(testing.allocator);
+    var editor = editor_mod.Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
@@ -1915,7 +1962,7 @@ test "rebuildFromSnapshots includes summaries displayable custom messages and ed
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var editor = editor_mod.Editor.init(testing.allocator);
+    var editor = editor_mod.Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     const user_blocks = [_]ai_protocol.UserMessage.UserMessageContent.Block{
@@ -1950,12 +1997,12 @@ test "rebuildFromSnapshots includes summaries displayable custom messages and ed
         tool_display_mod.empty_resolver,
         state,
         null,
-        .{ .theme = themes_builtin.dark() },
+        .{ .theme = themes_builtin.dark(), .width_method = .wcwidth },
     );
 
     try testing.expectEqual(@as(usize, 1), editor.history.items.len);
     try testing.expectEqualStrings("hello [image1] world", editor.history.items[0]);
-    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60, .wcwidth);
     defer testing.allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "hello [image1] world") != null);
@@ -1969,7 +2016,7 @@ test "rebuildFromSnapshots reconstructs committed messages and queued rows" {
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var editor = editor_mod.Editor.init(testing.allocator);
+    var editor = editor_mod.Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     const messages = [_]agent_protocol.AgentMessage{
@@ -1992,13 +2039,13 @@ test "rebuildFromSnapshots reconstructs committed messages and queued rows" {
         tool_display_mod.empty_resolver,
         state,
         queued,
-        .{ .theme = themes_builtin.dark() },
+        .{ .theme = themes_builtin.dark(), .width_method = .wcwidth },
     );
 
     try testing.expectEqual(@as(usize, 1), editor.history.items.len);
     try testing.expectEqualStrings("hello", editor.history.items[0]);
 
-    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60, .wcwidth);
     defer testing.allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "hello") != null);
@@ -2013,7 +2060,7 @@ test "rebuildFromSnapshots reconstructs active assistant and live tool execution
     var transcript = Transcript.init(testing.allocator);
     defer transcript.deinit();
 
-    var editor = editor_mod.Editor.init(testing.allocator);
+    var editor = editor_mod.Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     const assistant_content = [_]agent_protocol.AssistantMessage.AssistantContentBlock{
@@ -2051,10 +2098,10 @@ test "rebuildFromSnapshots reconstructs active assistant and live tool execution
         tool_display_mod.empty_resolver,
         state,
         null,
-        .{ .theme = themes_builtin.dark() },
+        .{ .theme = themes_builtin.dark(), .width_method = .wcwidth },
     );
 
-    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 60, .wcwidth);
     defer testing.allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "working") != null);
@@ -2073,12 +2120,12 @@ test "reconcileFromSnapshots retains unchanged rows and appends editor history o
     var state = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("hello")});
     defer state.deinit(testing.allocator);
 
-    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state, null, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(usize, 1), transcript.items.items.len);
     const first_ptr = transcript.items.items[0].deinit_ctx;
     try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
 
-    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state, null, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(first_ptr, transcript.items.items[0].deinit_ctx);
     try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
 }
@@ -2092,14 +2139,14 @@ test "reconcileFromSnapshots replaces only changed semantic rows" {
 
     var state_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two") });
     defer state_a.deinit(testing.allocator);
-    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_a, null, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_a, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     const first_ptr = transcript.items.items[0].deinit_ctx;
     const second_ptr = transcript.items.items[1].deinit_ctx;
 
     var state_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two updated") });
     defer state_b.deinit(testing.allocator);
-    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     try testing.expectEqual(first_ptr, transcript.items.items[0].deinit_ctx);
     try testing.expect(second_ptr != transcript.items.items[1].deinit_ctx);
@@ -2114,14 +2161,14 @@ test "reconcileFromSnapshots reorders rows and preserves scroll offset when not 
 
     var state_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two"), makeUserMessage("three") });
     defer state_a.deinit(testing.allocator);
-    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_a, null, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_a, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     _ = transcript.totalHeight(40);
     transcript.scrollBy(40, 2, -1);
     const scroll_before = transcript.scrollOffset();
 
     var state_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("three"), makeUserMessage("one"), makeUserMessage("two") });
     defer state_b.deinit(testing.allocator);
-    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark() });
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     try testing.expectEqual(scroll_before, transcript.scrollOffset());
 }
@@ -2138,13 +2185,13 @@ test "replaceAllOwnedState clears and reseeds editor history when committed user
 
     var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("old")});
     var queued_a = try emptyQueuedSnapshot(testing.allocator);
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_a, &queued_a, .{ .theme = themes_builtin.dark() });
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_a, &queued_a, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(u32, 1), mock_editor.history_count);
     try testing.expectEqual(@as(u32, 0), mock_editor.clear_history_count);
 
     var view_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("new")});
     var queued_b = try emptyQueuedSnapshot(testing.allocator);
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_b, &queued_b, .{ .theme = themes_builtin.dark() });
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_b, &queued_b, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     try testing.expectEqual(@as(u32, 2), mock_editor.history_count);
     try testing.expectEqual(@as(u32, 1), mock_editor.clear_history_count);
@@ -2162,11 +2209,11 @@ test "replaceAllOwnedState preserves editor history on append-only user history"
 
     var view_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{makeUserMessage("one")});
     var queued_a = try emptyQueuedSnapshot(testing.allocator);
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_a, &queued_a, .{ .theme = themes_builtin.dark() });
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_a, &queued_a, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     var view_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{ makeUserMessage("one"), makeUserMessage("two") });
     var queued_b = try emptyQueuedSnapshot(testing.allocator);
-    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_b, &queued_b, .{ .theme = themes_builtin.dark() });
+    projection.replaceAllOwnedState(&transcript, editor, tool_display_mod.empty_resolver, &view_b, &queued_b, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     try testing.expectEqual(@as(u32, 2), mock_editor.history_count);
     try testing.expectEqual(@as(u32, 0), mock_editor.clear_history_count);
@@ -2195,14 +2242,14 @@ test "replaceViewSnapshot converges frontier commit into committed history" {
         .assistant = try message_memory.cloneAssistantMessage(testing.allocator, assistant_message.assistant),
         .tool_executions = try testing.allocator.alloc(conversation_state_mod.ToolExecution, 0),
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &frontier_view, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &frontier_view, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     var committed_view = try ownedViewSnapshotFromMessages(testing.allocator, &.{ user_message, .{ .assistant = assistant_message.assistant } });
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &committed_view, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &committed_view, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
     try testing.expect(projection.view_snapshot.?.view.in_flight == null);
-    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40);
+    const rendered = try renderTranscriptText(testing.allocator, &transcript, 40, .wcwidth);
     defer testing.allocator.free(rendered);
     try testing.expect(std.mem.indexOf(u8, rendered, "working") != null);
 }
@@ -2225,7 +2272,7 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
         .conversation_version = 1,
         .view = .{ .committed = shared.retain(), .in_flight = null },
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &fresh, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &fresh, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
@@ -2234,7 +2281,7 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
         .conversation_version = 0,
         .view = .{ .committed = shared.retain(), .in_flight = null },
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &stale_version, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &stale_version, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
@@ -2243,7 +2290,7 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
         .conversation_version = 5,
         .view = .{ .committed = shared.retain(), .in_flight = null },
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &stale_gen, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &stale_gen, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
@@ -2252,7 +2299,7 @@ test "replaceViewSnapshot rejects stale snapshots by generation and version" {
         .conversation_version = 0,
         .view = .{ .committed = shared.retain(), .in_flight = null },
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &newer_gen, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &newer_gen, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(u64, 2), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 0), projection.view_snapshot.?.conversation_version);
 
@@ -2277,7 +2324,7 @@ test "replaceViewSnapshot converges after dropped intermediate snapshot because 
         .conversation_version = 1,
         .view = .{ .committed = shared.retain(), .in_flight = null },
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &initial, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &initial, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.conversation_version);
 
@@ -2286,7 +2333,7 @@ test "replaceViewSnapshot converges after dropped intermediate snapshot because 
         .conversation_version = 3,
         .view = .{ .committed = shared.retain(), .in_flight = null },
     };
-    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &final, .{ .theme = themes_builtin.dark() });
+    projection.replaceViewSnapshot(&transcript, editor, tool_display_mod.empty_resolver, &final, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
     try testing.expectEqual(@as(u64, 1), projection.view_snapshot.?.session_generation);
     try testing.expectEqual(@as(u64, 3), projection.view_snapshot.?.conversation_version);
 

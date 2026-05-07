@@ -95,8 +95,6 @@ pub fn measureHeight(visible_lines: u32, gap_count: u32) u32 {
     return 1 + visible_lines + gap_count + 1;
 }
 
-const grapheme_mod = @import("../grapheme.zig");
-
 /// Draw closed top border: ╭─ {left} ──── {right} ─╮
 /// Labels are optional. Fill with ─ between them.
 fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]const u8, style: Style) u32 {
@@ -121,7 +119,7 @@ fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]co
     var right_w: u32 = 0;
     if (right) |r| {
         if (r.len > 0) {
-            right_w = @intCast(grapheme_mod.strWidth(r));
+            right_w = region.textWidth(r);
             right_w += 2;
         }
     }

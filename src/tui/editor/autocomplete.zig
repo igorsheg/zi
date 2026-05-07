@@ -333,7 +333,7 @@ fn testSession(provider: *TestProvider) AutocompleteSession {
 }
 
 fn testPrompt(text: []const u8) PromptBuffer {
-    var buffer = PromptBuffer.init(testing.allocator);
+    var buffer = PromptBuffer.init(testing.allocator, .wcwidth);
     buffer.setText(text);
     return buffer;
 }

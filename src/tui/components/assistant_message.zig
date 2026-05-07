@@ -3,6 +3,7 @@ const component_mod = @import("../primitives/view.zig");
 const buffer_mod = @import("../primitives/surface.zig");
 const markdown_mod = @import("markdown.zig");
 const text_mod = @import("text.zig");
+const grapheme_mod = @import("../grapheme.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 
@@ -65,6 +66,7 @@ pub const AssistantMessage = struct {
 
     model: AssistantRowModel = .{},
     render_blocks: std.ArrayListUnmanaged(RenderBlock) = .empty,
+    width_method: grapheme_mod.WidthMethod,
 
     const RenderBlock = union(enum) {
         markdown: *markdown_mod.Markdown,
@@ -85,13 +87,24 @@ pub const AssistantMessage = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator) AssistantMessage {
-        return .{ .allocator = allocator, .theme = themes_builtin.dark() };
+    pub fn init(allocator: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) AssistantMessage {
+        return .{ .allocator = allocator, .theme = themes_builtin.dark(), .width_method = width_method };
     }
 
     pub fn deinit(self: *AssistantMessage) void {
         self.deinitRenderBlocks();
         self.model.deinit(self.allocator);
+    }
+
+    pub fn setWidthMethod(self: *AssistantMessage, width_method: grapheme_mod.WidthMethod) void {
+        if (self.width_method == width_method) return;
+        self.width_method = width_method;
+        for (self.render_blocks.items) |*block| {
+            switch (block.*) {
+                .markdown => |md| md.setWidthMethod(width_method),
+                .label => |label| label.setWidthMethod(width_method),
+            }
+        }
     }
 
     pub fn component(self: *AssistantMessage) Component {
@@ -158,7 +171,7 @@ pub const AssistantMessage = struct {
         const md = try self.allocator.create(markdown_mod.Markdown);
         errdefer self.allocator.destroy(md);
 
-        md.* = markdown_mod.Markdown.init(self.allocator);
+        md.* = markdown_mod.Markdown.init(self.allocator, self.width_method);
         errdefer md.deinit();
         md.padding_x = 1;
         md.theme = self.theme;
@@ -174,7 +187,7 @@ pub const AssistantMessage = struct {
         const label = try self.allocator.create(text_mod.Text);
         errdefer self.allocator.destroy(label);
 
-        label.* = text_mod.Text.init(self.allocator);
+        label.* = text_mod.Text.init(self.allocator, self.width_method);
         errdefer label.deinit();
         label.padding_x = 1;
         label.fg = self.theme.fg(.thinking_text);
@@ -308,10 +321,9 @@ fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
     for (0..buf.height) |row| {
         if (row > 0) try out.append(allocator, '\n');
         var end = buf.width;
-        while (end > 0 and buf.get(end - 1, @intCast(row)).grapheme.codepoint == ' ') : (end -= 1) {}
+        while (end > 0 and buf.cellIsSpace(buf.get(end - 1, @intCast(row)))) : (end -= 1) {}
         for (0..end) |col| {
-            const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
-            try out.append(allocator, @intCast(cp));
+            try buf.appendCellText(&out, allocator, buf.get(@intCast(col), @intCast(row)));
         }
     }
 
@@ -325,11 +337,11 @@ test "assistant message renders stable row model and hidden thinking label" {
     try appendModelBlock(&model, .{ .thinking = @constCast("ponder") });
     try appendModelBlock(&model, .{ .text = @constCast("world") });
 
-    var msg = AssistantMessage.init(testing.allocator);
+    var msg = AssistantMessage.init(testing.allocator, .wcwidth);
     defer msg.deinit();
     try msg.setOwnedModel(&model);
 
-    var visible_buf = try Buffer.init(testing.allocator, 40, 8);
+    var visible_buf = try Buffer.init(testing.allocator, 40, 8, .wcwidth);
     defer visible_buf.deinit();
     msg.render(visible_buf.region());
 
@@ -341,7 +353,7 @@ test "assistant message renders stable row model and hidden thinking label" {
 
     try msg.setHideThinkingBlock(true);
 
-    var hidden_buf = try Buffer.init(testing.allocator, 40, 8);
+    var hidden_buf = try Buffer.init(testing.allocator, 40, 8, .wcwidth);
     defer hidden_buf.deinit();
     msg.render(hidden_buf.region());
 
@@ -351,7 +363,7 @@ test "assistant message renders stable row model and hidden thinking label" {
     try testing.expect(std.mem.indexOf(u8, hidden_text, "ponder") == null);
 
     try msg.setHiddenThinkingLabel("Pondering...");
-    var custom_label_buf = try Buffer.init(testing.allocator, 40, 8);
+    var custom_label_buf = try Buffer.init(testing.allocator, 40, 8, .wcwidth);
     defer custom_label_buf.deinit();
     msg.render(custom_label_buf.region());
 

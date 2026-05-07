@@ -5,7 +5,6 @@ const component_mod = @import("../primitives/view.zig");
 const status_data_mod = @import("../status_data.zig");
 const theme_mod = @import("../theme.zig");
 const shimmer_mod = @import("../shimmer.zig");
-const grapheme_mod = @import("../grapheme.zig");
 const shuffle_text_mod = @import("../shuffle_text.zig");
 
 const Color = cell_mod.Color;
@@ -192,7 +191,7 @@ pub const StatusLine = struct {
     }
 
     fn renderWorking(self: *StatusLine, region: Region) void {
-        const working_cols: u32 = @intCast(grapheme_mod.strWidth(self.working_message));
+        const working_cols = region.textWidth(self.working_message);
         _ = shimmer_mod.writeSmooth(region, 0, 0, self.working_message, self.shimmerConfig(), self.shimmer_phase, 96);
 
         const data = self.status_data orelse return;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const breaks_mod = @import("breaks.zig");
+const grapheme = @import("../grapheme.zig");
 
 const Segment = breaks_mod.Segment;
 const SegmentOptions = breaks_mod.SegmentOptions;
@@ -30,7 +31,7 @@ const display_options = SegmentOptions{
 /// - trims trailing whitespace on all lines
 ///
 /// Returns byte-offset pairs into `text`. Caller owns the returned slice.
-pub fn wordWrap(text: []const u8, max_width: usize, allocator: std.mem.Allocator) ![]Line {
+pub fn wordWrap(text: []const u8, max_width: usize, allocator: std.mem.Allocator, width_method: grapheme.WidthMethod) ![]Line {
     if (max_width == 0) return try allocator.dupe(Line, &.{.{ .start = 0, .end = 0 }});
 
     var lines: std.ArrayListUnmanaged(Line) = .empty;
@@ -47,7 +48,7 @@ pub fn wordWrap(text: []const u8, max_width: usize, allocator: std.mem.Allocator
         const line_end = if (newline_pos) |p| line_start + p else text.len;
         const input_line = text[line_start..line_end];
 
-        try wrapSingleLine(input_line, line_start, max_width, &lines, allocator);
+        try wrapSingleLine(input_line, line_start, max_width, &lines, allocator, width_method);
 
         if (newline_pos == null) break;
         line_start = line_end + 1;
@@ -71,6 +72,7 @@ fn wrapSingleLine(
     max_width: usize,
     lines: *std.ArrayListUnmanaged(Line),
     allocator: std.mem.Allocator,
+    width_method: grapheme.WidthMethod,
 ) !void {
     if (line.len == 0) {
         try lines.append(allocator, .{ .start = base_offset, .end = base_offset });
@@ -80,7 +82,7 @@ fn wrapSingleLine(
     var start: usize = 0;
     var continuation = false;
     while (true) {
-        const segment = breaks_mod.nextSegment(line, start, max_width, continuation, display_options) orelse break;
+        const segment = breaks_mod.nextSegment(line, start, max_width, continuation, display_options, width_method) orelse break;
         try appendLine(lines, base_offset, segment, allocator);
         if (segment.next_start >= line.len) break;
         start = segment.next_start;
@@ -102,7 +104,7 @@ fn appendLine(lines: *std.ArrayListUnmanaged(Line), base_offset: usize, segment:
 const testing = std.testing;
 
 fn expectWrapped(text: []const u8, width: usize, expected: []const []const u8) !void {
-    const lines = try wordWrap(text, width, testing.allocator);
+    const lines = try wordWrap(text, width, testing.allocator, .wcwidth);
     defer testing.allocator.free(lines);
 
     if (lines.len != expected.len) {

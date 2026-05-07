@@ -18,6 +18,7 @@ pub fn handle(self: anytype, ev: *UiEvent) void {
                 .theme = self.theme,
                 .retry_attempt = self.retry_attempt,
                 .hidden_thinking_label = self.currentHiddenThinkingLabel(),
+                .width_method = self.tui.terminal.capabilities.width_method,
             },
         );
         if (was_following_bottom) {
@@ -39,6 +40,7 @@ pub fn handle(self: anytype, ev: *UiEvent) void {
                 .theme = self.theme,
                 .retry_attempt = self.retry_attempt,
                 .hidden_thinking_label = self.currentHiddenThinkingLabel(),
+                .width_method = self.tui.terminal.capabilities.width_method,
             },
         );
         if (was_following_bottom) {

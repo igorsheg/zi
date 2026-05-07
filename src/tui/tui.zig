@@ -42,7 +42,7 @@ pub const TUI = struct {
     pub fn init(allocator: std.mem.Allocator) !TUI {
         var term = Terminal.init();
         term.updateSize();
-        const rend = try Renderer.init(allocator, term.fd_out, term.width, term.height);
+        const rend = try Renderer.init(allocator, term.fd_out, term.width, term.height, term.capabilities.width_method);
         return .{
             .allocator = allocator,
             .terminal = term,

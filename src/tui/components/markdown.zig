@@ -33,12 +33,16 @@ pub const Markdown = struct {
     cached_lines: ?[]const RenderedLine = null,
     cached_width: u32 = 0,
     cached_content_len: usize = 0,
+    cached_width_method: grapheme_mod.WidthMethod = .wcwidth,
+    width_method: grapheme_mod.WidthMethod = .wcwidth,
 
-    pub fn init(allocator: std.mem.Allocator) Markdown {
+    pub fn init(allocator: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) Markdown {
         return .{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .theme = themes_builtin.dark(),
+            .cached_width_method = width_method,
+            .width_method = width_method,
         };
     }
 
@@ -57,6 +61,12 @@ pub const Markdown = struct {
     pub fn appendContent(self: *Markdown, delta: []const u8) void {
         self.content_buf.appendSlice(self.allocator, delta) catch return;
         self.content = self.content_buf.items;
+        self.invalidate();
+    }
+
+    pub fn setWidthMethod(self: *Markdown, width_method: grapheme_mod.WidthMethod) void {
+        if (self.width_method == width_method) return;
+        self.width_method = width_method;
         self.invalidate();
     }
 
@@ -82,7 +92,7 @@ pub const Markdown = struct {
         if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
 
         const content_width = if (width > self.padding_x * 2) width - self.padding_x * 2 else 1;
-        const rendered = self.getRenderedLines(content_width) orelse return .{ .min_height = 1, .preferred_height = 1 };
+        const rendered = self.getRenderedLines(content_width, self.width_method) orelse return .{ .min_height = 1, .preferred_height = 1 };
         return .{
             .min_height = 1,
             .preferred_height = @as(u32, @intCast(rendered.len)) + self.padding_y * 2,
@@ -100,7 +110,8 @@ pub const Markdown = struct {
         if (w == 0 or h == 0) return;
 
         const content_width = if (w > self.padding_x * 2) w - self.padding_x * 2 else 1;
-        const rendered = self.getRenderedLines(content_width) orelse return;
+        const width_method = region.buf.width_method;
+        const rendered = self.getRenderedLines(content_width, width_method) orelse return;
 
         if (!self.bg.eql(Color.default)) {
             region.fill(0, 0, w, h, .{
@@ -126,7 +137,7 @@ pub const Markdown = struct {
             for (rendered[line_idx].spans) |span| {
                 if (span.text.len == 0) continue;
                 if (!span.bg.eql(Color.default)) {
-                    region.fill(col, row, @intCast(grapheme_mod.strWidth(span.text)), 1, .{
+                    region.fill(col, row, @intCast(grapheme_mod.strWidth(span.text, width_method)), 1, .{
                         .grapheme = .{ .codepoint = ' ' },
                         .bg = span.bg,
                     });
@@ -140,9 +151,9 @@ pub const Markdown = struct {
         }
     }
 
-    fn getRenderedLines(self: *Markdown, content_width: u32) ?[]const RenderedLine {
+    fn getRenderedLines(self: *Markdown, content_width: u32, width_method: grapheme_mod.WidthMethod) ?[]const RenderedLine {
         if (self.cached_lines) |cached| {
-            if (self.cached_width == content_width and self.cached_content_len == self.content.len) {
+            if (self.cached_width == content_width and self.cached_content_len == self.content.len and self.cached_width_method == width_method) {
                 return cached;
             }
         }
@@ -158,13 +169,14 @@ pub const Markdown = struct {
             .fg = self.fg,
             .bg = Color.default,
             .attrs = self.attrs,
-        }, self.code_block_indent, arena) catch {
+        }, self.code_block_indent, arena, width_method) catch {
             return null;
         };
 
         self.cached_lines = built;
         self.cached_width = content_width;
         self.cached_content_len = self.content.len;
+        self.cached_width_method = width_method;
         return built;
     }
 };
@@ -173,9 +185,9 @@ const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
 
 fn renderToBuffer(text: []const u8, width: u32, height: u32) !Buffer {
-    var md = Markdown.init(testing.allocator);
+    var md = Markdown.init(testing.allocator, .wcwidth);
     md.setContent(text);
-    var buf = try Buffer.init(testing.allocator, width, height);
+    var buf = try Buffer.init(testing.allocator, width, height, .wcwidth);
     md.render(buf.region());
     md.deinit();
     return buf;
@@ -186,16 +198,7 @@ fn rowText(buf: *const Buffer, row: u32, allocator: std.mem.Allocator) ![]const 
     errdefer out.deinit(allocator);
     var col: u32 = 0;
     while (col < buf.width) : (col += 1) {
-        const cell = buf.get(col, row);
-        if (cell.width == 0) continue;
-        switch (cell.grapheme) {
-            .codepoint => |cp| {
-                var tmp: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(cp, &tmp) catch continue;
-                try out.appendSlice(allocator, tmp[0..len]);
-            },
-            .pooled => {},
-        }
+        try buf.appendCellText(&out, allocator, buf.get(col, row));
     }
     while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') {
         out.items.len -= 1;
@@ -264,7 +267,7 @@ test "markdown renders blockquotes with lazy continuation and inline styling" {
 }
 
 test "markdown renders tables with borders wrapping and inline code" {
-    var md = Markdown.init(testing.allocator);
+    var md = Markdown.init(testing.allocator, .wcwidth);
     defer md.deinit();
     md.setContent(
         "| Command | Description |\n" ++
@@ -272,7 +275,7 @@ test "markdown renders tables with borders wrapping and inline code" {
             "| `npm run build` | Build the project artifacts |",
     );
 
-    var buf = try Buffer.init(testing.allocator, 26, 12);
+    var buf = try Buffer.init(testing.allocator, 26, 12, .wcwidth);
     defer buf.deinit();
     md.render(buf.region());
 
@@ -290,8 +293,19 @@ test "markdown renders links and html like tags as visible text" {
     try testing.expect(bufferHasAttr(&buf, "underline"));
 }
 
+test "markdown renders pooled grapheme clusters as visible text" {
+    var buf = try renderToBuffer("Cafe\u{0301} 👩‍🚀", 12, 3);
+    defer buf.deinit();
+
+    try expectBufferContainsText(&buf, "Cafe\u{0301} 👩‍🚀");
+    try testing.expect(buf.get(3, 0).grapheme == .pooled);
+    try testing.expect(buf.get(6, 0).grapheme == .pooled);
+    try testing.expectEqual(@as(u2, 2), buf.get(6, 0).width);
+    try testing.expectEqual(@as(u2, 0), buf.get(7, 0).width);
+}
+
 test "markdown applies default attrs and heading spacing without trailing blank line" {
-    var md = Markdown.init(testing.allocator);
+    var md = Markdown.init(testing.allocator, .wcwidth);
     defer md.deinit();
     md.attrs = .{ .italic = true };
     md.setContent("# Title\nBody");
@@ -299,7 +313,7 @@ test "markdown applies default attrs and heading spacing without trailing blank 
     const measure = md.measure(20);
     try testing.expectEqual(@as(u32, 3), measure.preferred_height);
 
-    var buf = try Buffer.init(testing.allocator, 20, 4);
+    var buf = try Buffer.init(testing.allocator, 20, 4, .wcwidth);
     defer buf.deinit();
     md.render(buf.region());
 

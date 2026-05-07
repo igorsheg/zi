@@ -24,6 +24,7 @@ pub const Config = struct {
     base_attrs: Attributes = .{ .dim = true },
     edge_attrs: Attributes = .{},
     peak_attrs: Attributes = .{ .bold = true },
+    width_method: grapheme_mod.WidthMethod = .wcwidth,
 };
 
 pub const Bucket = enum {
@@ -47,6 +48,8 @@ pub fn phaseForTime(now_ns: i128, cfg: Config, text: []const u8) u32 {
 
 pub fn write(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, phase: u32) u32 {
     if (text.len == 0 or y >= region.height or x >= region.width) return 0;
+    var effective_cfg = cfg;
+    effective_cfg.width_method = region.buf.width_method;
 
     var written_cols: u32 = 0;
     var visual_col: u32 = 0;
@@ -56,13 +59,13 @@ pub fn write(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, phas
     var i: usize = 0;
     while (i < text.len) {
         const char_start = i;
-        const width = decodeWidth(text, &i);
-        const bucket = bucketForColumn(cfg, phase, visual_col);
+        const width = decodeWidth(text, &i, effective_cfg.width_method);
+        const bucket = bucketForColumn(effective_cfg, phase, visual_col);
 
         if (run_bucket == null) {
             run_bucket = bucket;
         } else if (run_bucket.? != bucket) {
-            written_cols += flushRun(region, x + written_cols, y, text[run_start..char_start], cfg, run_bucket.?);
+            written_cols += flushRun(region, x + written_cols, y, text[run_start..char_start], effective_cfg, run_bucket.?);
             run_start = char_start;
             run_bucket = bucket;
         }
@@ -71,14 +74,14 @@ pub fn write(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, phas
     }
 
     if (run_bucket) |bucket| {
-        written_cols += flushRun(region, x + written_cols, y, text[run_start..], cfg, bucket);
+        written_cols += flushRun(region, x + written_cols, y, text[run_start..], effective_cfg, bucket);
     }
 
     return written_cols;
 }
 
 fn shimmerPeriod(cfg: Config, text: []const u8) u32 {
-    const text_cols: u32 = @intCast(grapheme_mod.strWidth(text));
+    const text_cols: u32 = @intCast(grapheme_mod.strWidth(text, cfg.width_method));
     return text_cols + cfg.lead_pad_cols + cfg.tail_pad_cols;
 }
 
@@ -138,16 +141,18 @@ pub fn lerpColor(from: Color, to: Color, t: u8) Color {
 
 pub fn writeSmooth(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, phase: u32, floor: u8) u32 {
     if (text.len == 0 or y >= region.height or x >= region.width) return 0;
+    var effective_cfg = cfg;
+    effective_cfg.width_method = region.buf.width_method;
 
     var written_cols: u32 = 0;
     var visual_col: u32 = 0;
     var i: usize = 0;
     while (i < text.len) {
         const char_start = i;
-        const width = decodeWidth(text, &i);
-        const strength = floorStrength(strengthForColumn(cfg, phase, visual_col), floor);
-        const fg = if (strength == 0) cfg.base_fg else lerpColor(cfg.base_fg, cfg.peak_fg, strength);
-        const attrs = if (strength >= 224) mergeAttrs(cfg.base_attrs, cfg.peak_attrs) else cfg.base_attrs;
+        const width = decodeWidth(text, &i, effective_cfg.width_method);
+        const strength = floorStrength(strengthForColumn(effective_cfg, phase, visual_col), floor);
+        const fg = if (strength == 0) effective_cfg.base_fg else lerpColor(effective_cfg.base_fg, effective_cfg.peak_fg, strength);
+        const attrs = if (strength >= 224) mergeAttrs(effective_cfg.base_attrs, effective_cfg.peak_attrs) else effective_cfg.base_attrs;
         written_cols += region.writeStr(x + written_cols, y, text[char_start..i], fg, Color.default, attrs);
         visual_col += width;
     }
@@ -184,26 +189,32 @@ fn mergeAttrs(base: Attributes, overlay: Attributes) Attributes {
     };
 }
 
-fn decodeWidth(text: []const u8, i: *usize) u32 {
-    const start = i.*;
-    const byte_len = std.unicode.utf8ByteSequenceLength(text[start]) catch {
-        i.* += 1;
-        return 1;
+fn decodeWidth(text: []const u8, i: *usize, width_method: grapheme_mod.WidthMethod) u32 {
+    const cluster = grapheme_mod.nextCluster(text, i.*, width_method) orelse return 0;
+    if (cluster.bytes.len == 0) return 0;
+    i.* += cluster.bytes.len;
+    return cluster.width;
+}
+
+test "writeSmooth keeps grapheme clusters atomic" {
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 12, 1, .wcwidth);
+    defer buf.deinit();
+
+    const cfg = Config{
+        .base_fg = Color.default,
+        .edge_fg = Color.rgb(120, 120, 120),
+        .peak_fg = Color.rgb(255, 255, 255),
     };
-    if (start + byte_len > text.len) {
-        i.* = text.len;
-        return 1;
-    }
-    const cp = std.unicode.utf8Decode(text[start .. start + byte_len]) catch {
-        i.* += 1;
-        return 1;
-    };
-    i.* += byte_len;
-    return grapheme_mod.charWidth(cp);
+    _ = writeSmooth(buf.region(), 0, 0, "e\u{0301}👩‍🚀", cfg, 0, 0);
+
+    try std.testing.expect(buf.get(0, 0).grapheme == .pooled);
+    try std.testing.expect(buf.get(1, 0).grapheme == .pooled);
+    try std.testing.expectEqual(@as(u2, 2), buf.get(1, 0).width);
+    try std.testing.expectEqual(@as(u2, 0), buf.get(2, 0).width);
 }
 
 test "write groups contiguous shimmer buckets into styled runs" {
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 16, 1);
+    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 16, 1, .wcwidth);
     defer buf.deinit();
 
     const cfg = Config{

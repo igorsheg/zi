@@ -13,9 +13,10 @@ pub const PromptBuffer = struct {
     cursor_line: u32 = 0,
     cursor_col: u32 = 0,
     version_tag: u64 = 1,
+    width_method: grapheme_mod.WidthMethod,
 
-    pub fn init(allocator: Allocator) PromptBuffer {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: Allocator, width_method: grapheme_mod.WidthMethod) PromptBuffer {
+        return .{ .allocator = allocator, .width_method = width_method };
     }
 
     pub fn deinit(self: *PromptBuffer) void {
@@ -95,7 +96,7 @@ pub const PromptBuffer = struct {
 
     pub fn backspace(self: *PromptBuffer) void {
         if (self.cursor_byte == 0) return;
-        const prev: u32 = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte));
+        const prev: u32 = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         const items = self.buf.items;
         std.mem.copyForwards(u8, items[prev..], items[self.cursor_byte..]);
         self.buf.items.len -= self.cursor_byte - prev;
@@ -106,7 +107,7 @@ pub const PromptBuffer = struct {
 
     pub fn deleteForward(self: *PromptBuffer) void {
         if (self.cursor_byte >= self.buf.items.len) return;
-        const next: u32 = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte));
+        const next: u32 = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         const items = self.buf.items;
         std.mem.copyForwards(u8, items[self.cursor_byte..], items[next..]);
         self.buf.items.len -= next - self.cursor_byte;
@@ -116,13 +117,13 @@ pub const PromptBuffer = struct {
 
     pub fn moveLeft(self: *PromptBuffer) void {
         if (self.cursor_byte == 0) return;
-        self.cursor_byte = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte));
+        self.cursor_byte = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         self.recomputeCursorMetrics();
     }
 
     pub fn moveRight(self: *PromptBuffer) void {
         if (self.cursor_byte >= self.buf.items.len) return;
-        self.cursor_byte = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte));
+        self.cursor_byte = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         self.recomputeCursorMetrics();
     }
 
@@ -196,7 +197,7 @@ pub const PromptBuffer = struct {
                 line_start = i + 1;
             }
         }
-        return @intCast(grapheme_mod.strWidth(self.buf.items[line_start..clamped]));
+        return @intCast(grapheme_mod.strWidth(self.buf.items[line_start..clamped], self.width_method));
     }
 
     pub fn byteAtDisplayCol(self: *const PromptBuffer, line_start: u32, line_end: u32, target_col: u32) u32 {
@@ -204,10 +205,10 @@ pub const PromptBuffer = struct {
         var i: u32 = line_start;
         while (i < line_end) {
             const next_boundary: u32 = @intCast(@min(
-                grapheme_mod.nextGraphemeBoundary(self.buf.items, i),
+                grapheme_mod.nextGraphemeBoundary(self.buf.items, i, self.width_method),
                 @as(usize, line_end),
             ));
-            const width: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[i..next_boundary]));
+            const width: u32 = @intCast(grapheme_mod.strWidth(self.buf.items[i..next_boundary], self.width_method));
             if (col + width > target_col and width > 0) break;
             col += width;
             i = next_boundary;
@@ -229,7 +230,7 @@ pub const PromptBuffer = struct {
         }
 
         self.cursor_line = line;
-        self.cursor_col = @intCast(grapheme_mod.strWidth(self.buf.items[line_start..self.cursor_byte]));
+        self.cursor_col = @intCast(grapheme_mod.strWidth(self.buf.items[line_start..self.cursor_byte], self.width_method));
     }
 
     fn bumpVersion(self: *PromptBuffer) void {

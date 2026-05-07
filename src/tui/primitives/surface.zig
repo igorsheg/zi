@@ -50,8 +50,9 @@ pub const Buffer = struct {
     allocator: std.mem.Allocator,
     grapheme_pool: GraphemePool,
     link_table: std.ArrayList([]const u8),
+    width_method: grapheme_mod.WidthMethod,
 
-    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !Buffer {
+    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32, width_method: grapheme_mod.WidthMethod) !Buffer {
         const len: usize = @as(usize, width) * @as(usize, height);
         const cells = try allocator.alloc(Cell, len);
         @memset(cells, Cell.blank);
@@ -62,6 +63,7 @@ pub const Buffer = struct {
             .allocator = allocator,
             .grapheme_pool = GraphemePool.init(allocator),
             .link_table = .empty,
+            .width_method = width_method,
         };
     }
 
@@ -102,9 +104,61 @@ pub const Buffer = struct {
         return self.cells[@as(usize, y) * @as(usize, self.width) + @as(usize, x)];
     }
 
+    pub fn appendCellText(self: *const Buffer, out: anytype, allocator: std.mem.Allocator, cell: Cell) !void {
+        if (cell.width == 0) return;
+        switch (cell.grapheme) {
+            .codepoint => |cp| {
+                var buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(cp, &buf) catch return;
+                try out.appendSlice(allocator, buf[0..len]);
+            },
+            .pooled => |id| try out.appendSlice(allocator, self.grapheme_pool.get(id)),
+        }
+    }
+
+    pub fn cellIsSpace(self: *const Buffer, cell: Cell) bool {
+        if (cell.width == 0) return true;
+        return switch (cell.grapheme) {
+            .codepoint => |cp| cp == ' ',
+            .pooled => |id| std.mem.eql(u8, self.grapheme_pool.get(id), " "),
+        };
+    }
+
     pub fn set(self: *Buffer, x: u32, y: u32, c: Cell) void {
         if (x >= self.width or y >= self.height) return;
-        self.cells[@as(usize, y) * @as(usize, self.width) + @as(usize, x)] = c;
+        const idx = @as(usize, y) * @as(usize, self.width) + @as(usize, x);
+
+        // If replacing a continuation cell, clear the probable start cell to
+        // avoid stale wide/grapheme left halves after partial overwrites.
+        if (self.cells[idx].width == 0 and x > 0) {
+            self.cells[idx - 1] = Cell.blank;
+        }
+
+        // If replacing a wide/grapheme start, clear its continuation cells.
+        const old = self.cells[idx];
+        if (old.width > 1) {
+            var i: u32 = 1;
+            while (i < old.width and x + i < self.width) : (i += 1) {
+                self.cells[idx + i] = Cell.blank;
+            }
+        }
+
+        self.cells[idx] = c;
+
+        // Install continuation cells for wide/grapheme starts.
+        if (c.width > 1) {
+            var i: u32 = 1;
+            while (i < c.width and x + i < self.width) : (i += 1) {
+                self.cells[idx + i] = .{
+                    .grapheme = .{ .codepoint = ' ' },
+                    .fg = c.fg,
+                    .bg = c.bg,
+                    .attrs = c.attrs,
+                    .width = 0,
+                    .link_id = c.link_id,
+                };
+            }
+        }
     }
 
     pub fn writeStr(self: *Buffer, x: u32, y: u32, text: []const u8, fg: Color, bg: Color, attrs: Attributes) u32 {
@@ -112,39 +166,28 @@ pub const Buffer = struct {
         var col = x;
         var i: usize = 0;
         while (i < text.len) {
-            const byte_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
-                i += 1;
-                continue;
-            };
-            if (i + byte_len > text.len) break;
-            const cp = std.unicode.utf8Decode(text[i..][0..byte_len]) catch {
-                i += 1;
-                continue;
-            };
-            const w = grapheme_mod.charWidth(cp);
-            if (w == 0) {
-                i += byte_len;
-                continue;
-            }
+            const cluster = grapheme_mod.nextCluster(text, i, self.width_method) orelse break;
+            if (cluster.bytes.len == 0) break;
+            i += cluster.bytes.len;
+            const w = cluster.width;
+            if (w == 0) continue;
             if (col + @as(u32, w) > self.width) break;
+
+            const g: Grapheme = if (cluster.single_codepoint) |cp|
+                .{ .codepoint = cp }
+            else blk: {
+                const id = self.grapheme_pool.add(cluster.bytes) catch break;
+                break :blk .{ .pooled = id };
+            };
+
             self.set(col, y, .{
-                .grapheme = .{ .codepoint = cp },
+                .grapheme = g,
                 .fg = fg,
                 .bg = bg,
                 .attrs = attrs,
                 .width = w,
             });
-            if (w == 2) {
-                self.set(col + 1, y, .{
-                    .grapheme = .{ .codepoint = ' ' },
-                    .fg = fg,
-                    .bg = bg,
-                    .attrs = attrs,
-                    .width = 0,
-                });
-            }
             col += @as(u32, w);
-            i += byte_len;
         }
         return col - x;
     }
@@ -198,8 +241,16 @@ pub const Region = struct {
     pub fn writeStr(self: Region, x: u32, y: u32, text: []const u8, fg: Color, bg: Color, attrs: Attributes) u32 {
         if (x >= self.width or y >= self.height) return 0;
         const max_w = self.width - x;
-        const clipped = grapheme_mod.sliceToWidth(text, max_w);
+        const clipped = grapheme_mod.sliceToWidth(text, max_w, self.buf.width_method);
         return self.buf.writeStr(self.x + x, self.y + y, clipped, fg, bg, attrs);
+    }
+
+    pub fn textWidth(self: Region, text: []const u8) u32 {
+        return @intCast(grapheme_mod.strWidth(text, self.buf.width_method));
+    }
+
+    pub fn sliceToWidth(self: Region, text: []const u8, max_cols: u32) []const u8 {
+        return grapheme_mod.sliceToWidth(text, max_cols, self.buf.width_method);
     }
 
     pub fn fill(self: Region, x: u32, y: u32, w: u32, h: u32, c: Cell) void {
@@ -224,7 +275,7 @@ pub const Region = struct {
 };
 
 test "Buffer read-write round-trip and clear" {
-    var buf = try Buffer.init(std.testing.allocator, 10, 5);
+    var buf = try Buffer.init(std.testing.allocator, 10, 5, .wcwidth);
     defer buf.deinit();
 
     try std.testing.expect(buf.get(0, 0).eql(Cell.blank));
@@ -236,7 +287,7 @@ test "Buffer read-write round-trip and clear" {
 }
 
 test "writeStr and fill respect buffer bounds" {
-    var buf = try Buffer.init(std.testing.allocator, 5, 2);
+    var buf = try Buffer.init(std.testing.allocator, 5, 2, .wcwidth);
     defer buf.deinit();
 
     const cols = buf.writeStr(0, 0, "hello world", Color.default, Color.default, Attributes.none);
@@ -247,7 +298,7 @@ test "writeStr and fill respect buffer bounds" {
 }
 
 test "Region clips and nests correctly" {
-    var buf = try Buffer.init(std.testing.allocator, 20, 20);
+    var buf = try Buffer.init(std.testing.allocator, 20, 20, .wcwidth);
     defer buf.deinit();
 
     const r = Region{ .buf = &buf, .x = 5, .y = 5, .width = 10, .height = 10 };
@@ -259,6 +310,56 @@ test "Region clips and nests correctly" {
     const inner = r.sub(2, 3, 4, 4);
     try std.testing.expectEqual(@as(u32, 7), inner.x);
     try std.testing.expectEqual(@as(u32, 8), inner.y);
+}
+
+test "writeStr stores grapheme clusters as pooled cells" {
+    var buf = try Buffer.init(std.testing.allocator, 8, 2, .wcwidth);
+    defer buf.deinit();
+
+    const combining_cols = buf.writeStr(0, 0, "e\u{0301}x", Color.default, Color.default, Attributes.none);
+    try std.testing.expectEqual(@as(u32, 2), combining_cols);
+    try std.testing.expect(buf.get(0, 0).grapheme == .pooled);
+    try std.testing.expectEqualStrings("e\u{0301}", buf.grapheme_pool.get(buf.get(0, 0).grapheme.pooled));
+    try std.testing.expectEqual(@as(u2, 1), buf.get(0, 0).width);
+    try std.testing.expectEqual(@as(u21, 'x'), buf.get(1, 0).grapheme.codepoint);
+
+    const emoji_cols = buf.writeStr(0, 1, "👩‍🚀!", Color.default, Color.default, Attributes.none);
+    try std.testing.expectEqual(@as(u32, 3), emoji_cols);
+    try std.testing.expect(buf.get(0, 1).grapheme == .pooled);
+    try std.testing.expectEqualStrings("👩‍🚀", buf.grapheme_pool.get(buf.get(0, 1).grapheme.pooled));
+    try std.testing.expectEqual(@as(u2, 2), buf.get(0, 1).width);
+    try std.testing.expectEqual(@as(u2, 0), buf.get(1, 1).width);
+    try std.testing.expectEqual(@as(u21, '!'), buf.get(2, 1).grapheme.codepoint);
+}
+
+test "appendCellText extracts pooled graphemes" {
+    var buf = try Buffer.init(std.testing.allocator, 4, 1, .wcwidth);
+    defer buf.deinit();
+
+    _ = buf.writeStr(0, 0, "e\u{0301}x", Color.default, Color.default, Attributes.none);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try buf.appendCellText(&out, std.testing.allocator, buf.get(0, 0));
+    try buf.appendCellText(&out, std.testing.allocator, buf.get(1, 0));
+    try std.testing.expectEqualStrings("e\u{0301}x", out.items);
+}
+
+test "Buffer.set clears stale wide continuations" {
+    var buf = try Buffer.init(std.testing.allocator, 4, 1, .wcwidth);
+    defer buf.deinit();
+
+    _ = buf.writeStr(0, 0, "界x", Color.default, Color.default, Attributes.none);
+    try std.testing.expectEqual(@as(u2, 2), buf.get(0, 0).width);
+    try std.testing.expectEqual(@as(u2, 0), buf.get(1, 0).width);
+
+    buf.set(1, 0, Cell{ .grapheme = .{ .codepoint = 'A' } });
+    try std.testing.expect(buf.get(0, 0).eql(Cell.blank));
+    try std.testing.expectEqual(@as(u21, 'A'), buf.get(1, 0).grapheme.codepoint);
+
+    _ = buf.writeStr(0, 0, "界", Color.default, Color.default, Attributes.none);
+    buf.set(0, 0, Cell{ .grapheme = .{ .codepoint = 'B' } });
+    try std.testing.expectEqual(@as(u21, 'B'), buf.get(0, 0).grapheme.codepoint);
+    try std.testing.expect(buf.get(1, 0).eql(Cell.blank));
 }
 
 test "GraphemePool stores and retrieves clusters" {

@@ -37,9 +37,15 @@ pub const Text = struct {
     cached_width: u32 = 0,
     cached_content_ptr: ?[*]const u8 = null,
     cached_content_len: usize = 0,
+    cached_width_method: grapheme.WidthMethod = .wcwidth,
+    width_method: grapheme.WidthMethod = .wcwidth,
 
-    pub fn init(allocator: std.mem.Allocator) Text {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, width_method: grapheme.WidthMethod) Text {
+        return .{
+            .allocator = allocator,
+            .cached_width_method = width_method,
+            .width_method = width_method,
+        };
     }
 
     pub fn setContent(self: *Text, text: []const u8) void {
@@ -52,6 +58,12 @@ pub const Text = struct {
     pub fn setPadding(self: *Text, x: u32, y: u32) void {
         self.padding_x = x;
         self.padding_y = y;
+        self.invalidateCache();
+    }
+
+    pub fn setWidthMethod(self: *Text, width_method: grapheme.WidthMethod) void {
+        if (self.width_method == width_method) return;
+        self.width_method = width_method;
         self.invalidateCache();
     }
 
@@ -84,7 +96,8 @@ pub const Text = struct {
         if (w == 0 or h == 0) return;
 
         const content_width = if (w > self.padding_x * 2) w - self.padding_x * 2 else 1;
-        const lines = self.getWrappedLines(content_width) orelse return;
+        const width_method = region.buf.width_method;
+        const lines = self.getWrappedLines(content_width, width_method) orelse return;
 
         if (!self.bg.eql(Color.default)) {
             region.fill(0, 0, w, h, .{
@@ -124,7 +137,7 @@ pub const Text = struct {
         if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
 
         const content_width = if (width > self.padding_x * 2) width - self.padding_x * 2 else 1;
-        const lines = self.getWrappedLines(content_width) orelse
+        const lines = self.getWrappedLines(content_width, self.width_method) orelse
             return .{ .min_height = 1, .preferred_height = 1 };
 
         const line_count: u32 = @intCast(lines.len);
@@ -136,11 +149,12 @@ pub const Text = struct {
         return Component.init(Text, self);
     }
 
-    fn getWrappedLines(self: *Text, content_width: u32) ?[]Line {
+    fn getWrappedLines(self: *Text, content_width: u32, width_method: grapheme.WidthMethod) ?[]Line {
         if (self.cached_lines) |cached| {
             if (self.cached_width == content_width and
                 self.cached_content_ptr == self.content.ptr and
-                self.cached_content_len == self.content.len)
+                self.cached_content_len == self.content.len and
+                self.cached_width_method == width_method)
             {
                 return cached;
             }
@@ -148,11 +162,12 @@ pub const Text = struct {
             self.cached_lines = null;
         }
 
-        const lines = display_wrap_mod.wordWrap(self.content, content_width, self.allocator) catch return null;
+        const lines = display_wrap_mod.wordWrap(self.content, content_width, self.allocator, width_method) catch return null;
         self.cached_lines = lines;
         self.cached_width = content_width;
         self.cached_content_ptr = self.content.ptr;
         self.cached_content_len = self.content.len;
+        self.cached_width_method = width_method;
         return lines;
     }
 
@@ -173,10 +188,10 @@ const testing = std.testing;
 const Buffer = buffer_mod.Buffer;
 
 test "Text wraps content across multiple rows" {
-    var buf = try Buffer.init(testing.allocator, 10, 5);
+    var buf = try Buffer.init(testing.allocator, 10, 5, .wcwidth);
     defer buf.deinit();
 
-    var text = Text.init(testing.allocator);
+    var text = Text.init(testing.allocator, .wcwidth);
     defer text.deinit();
     text.content = "hello world how are you";
     text.fg = Color.rgb(255, 255, 255);
@@ -187,8 +202,23 @@ test "Text wraps content across multiple rows" {
     try testing.expectEqual(@as(u21, 'a'), buf.get(0, 2).grapheme.codepoint);
 }
 
+test "Text renders pooled grapheme clusters without splitting" {
+    var buf = try Buffer.init(testing.allocator, 12, 2, .wcwidth);
+    defer buf.deinit();
+
+    var text = Text.init(testing.allocator, .wcwidth);
+    defer text.deinit();
+    text.content = "Cafe\u{0301} 👩‍🚀";
+    text.render(buf.region());
+
+    try testing.expect(buf.get(3, 0).grapheme == .pooled);
+    try testing.expect(buf.get(6, 0).grapheme == .pooled);
+    try testing.expectEqual(@as(u2, 2), buf.get(6, 0).width);
+    try testing.expectEqual(@as(u2, 0), buf.get(7, 0).width);
+}
+
 test "Text measure returns accurate wrapped line count" {
-    var text = Text.init(testing.allocator);
+    var text = Text.init(testing.allocator, .wcwidth);
     defer text.deinit();
     text.content = "hello world";
 
@@ -199,21 +229,21 @@ test "Text measure returns accurate wrapped line count" {
     text.padding_y = 1;
     try testing.expectEqual(@as(u32, 4), text.measure(5).preferred_height);
 
-    var empty = Text.init(testing.allocator);
+    var empty = Text.init(testing.allocator, .wcwidth);
     defer empty.deinit();
     try testing.expectEqual(@as(u32, 0), empty.measure(10).preferred_height);
 }
 
 test "Text scroll_offset skips top lines" {
-    var buf = try Buffer.init(testing.allocator, 10, 2);
+    var buf = try Buffer.init(testing.allocator, 10, 2, .wcwidth);
     defer buf.deinit();
 
-    var text = Text.init(testing.allocator);
+    var text = Text.init(testing.allocator, .wcwidth);
     defer text.deinit();
     text.content = "aaa bbb ccc ddd";
     text.content = "aa bb cc dd";
 
-    var small_buf = try Buffer.init(testing.allocator, 3, 2);
+    var small_buf = try Buffer.init(testing.allocator, 3, 2, .wcwidth);
     defer small_buf.deinit();
 
     text.scroll_offset = 2;

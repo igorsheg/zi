@@ -7,6 +7,7 @@ const text_mod = @import("text.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const keybindings = @import("../keybindings.zig");
+const grapheme_mod = @import("../grapheme.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -83,12 +84,12 @@ pub const UserMessage = struct {
     meta_visible: bool = false,
     model: UserRowModel = .{},
 
-    pub fn init(allocator: std.mem.Allocator) UserMessage {
+    pub fn init(allocator: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) UserMessage {
         var self = UserMessage{
             .allocator = allocator,
             .theme = themes_builtin.dark(),
-            .body = markdown_mod.Markdown.init(allocator),
-            .meta = text_mod.Text.init(allocator),
+            .body = markdown_mod.Markdown.init(allocator, width_method),
+            .meta = text_mod.Text.init(allocator, width_method),
         };
         self.setTheme(self.theme);
         return self;
@@ -102,6 +103,11 @@ pub const UserMessage = struct {
 
     pub fn component(self: *UserMessage) Component {
         return Component.init(UserMessage, self);
+    }
+
+    pub fn setWidthMethod(self: *UserMessage, width_method: grapheme_mod.WidthMethod) void {
+        self.body.setWidthMethod(width_method);
+        self.meta.setWidthMethod(width_method);
     }
 
     pub fn setTheme(self: *UserMessage, theme: *const Theme) void {
@@ -246,12 +252,9 @@ fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
     for (0..buf.height) |row| {
         if (row > 0) try out.append(allocator, '\n');
         var end = buf.width;
-        while (end > 0 and buf.get(end - 1, @intCast(row)).grapheme.codepoint == ' ') : (end -= 1) {}
+        while (end > 0 and buf.cellIsSpace(buf.get(end - 1, @intCast(row)))) : (end -= 1) {}
         for (0..end) |col| {
-            const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
-            var encoded: [4]u8 = undefined;
-            const n = try std.unicode.utf8Encode(cp, &encoded);
-            try out.appendSlice(allocator, encoded[0..n]);
+            try buf.appendCellText(&out, allocator, buf.get(@intCast(col), @intCast(row)));
         }
     }
 
@@ -259,14 +262,14 @@ fn bufferText(buf: *const Buffer, allocator: std.mem.Allocator) ![]u8 {
 }
 
 test "user message renders body and queued meta line from owned model" {
-    var msg = UserMessage.init(testing.allocator);
+    var msg = UserMessage.init(testing.allocator, .wcwidth);
     defer msg.deinit();
 
     var model = try makeTestModel("hello", .queued_follow_up, .in_chat);
     defer model.deinit(testing.allocator);
     setTestModel(&msg, &model);
 
-    var buf = try Buffer.init(testing.allocator, 30, 6);
+    var buf = try Buffer.init(testing.allocator, 30, 6, .wcwidth);
     defer buf.deinit();
     msg.render(buf.region());
 
@@ -278,14 +281,14 @@ test "user message renders body and queued meta line from owned model" {
 }
 
 test "queued user message meta line is transparent and mentions queued amend shortcut" {
-    var msg = UserMessage.init(testing.allocator);
+    var msg = UserMessage.init(testing.allocator, .wcwidth);
     defer msg.deinit();
 
     var model = try makeTestModel("hello", .queued_follow_up, .pending);
     defer model.deinit(testing.allocator);
     setTestModel(&msg, &model);
 
-    var buf = try Buffer.init(testing.allocator, 80, 6);
+    var buf = try Buffer.init(testing.allocator, 80, 6, .wcwidth);
     defer buf.deinit();
 
     msg.render(buf.region());
@@ -304,7 +307,7 @@ test "queued user message meta line is transparent and mentions queued amend sho
 }
 
 test "user message model replacement updates body and meta visibility" {
-    var msg = UserMessage.init(testing.allocator);
+    var msg = UserMessage.init(testing.allocator, .wcwidth);
     defer msg.deinit();
 
     var first = try makeTestModel("hello", .queued_follow_up, .pending);

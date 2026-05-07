@@ -6,6 +6,7 @@ const keys_mod = @import("../terminal/keys.zig");
 const text_mod = @import("text.zig");
 const panel_mod = @import("panel.zig");
 const theme_mod = @import("../theme.zig");
+const grapheme_mod = @import("../grapheme.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -25,8 +26,8 @@ pub const ScrollTextOverlay = struct {
     last_body_width: u32 = 80,
     last_body_height: u32 = 1,
 
-    pub fn init(allocator: std.mem.Allocator, theme: *const theme_mod.Theme) ScrollTextOverlay {
-        var text = text_mod.Text.init(allocator);
+    pub fn init(allocator: std.mem.Allocator, theme: *const theme_mod.Theme, width_method: grapheme_mod.WidthMethod) ScrollTextOverlay {
+        var text = text_mod.Text.init(allocator, width_method);
         text.setPadding(1, 0);
         return .{
             .allocator = allocator,

@@ -110,6 +110,7 @@ pub const SemanticVersion = u64;
 
 pub const ItemKind = enum {
     generic,
+    markdown,
     assistant_message,
     user_message,
     queued_user_message,
@@ -533,7 +534,9 @@ pub const ToolExecution = struct {
     renderer_state: ?*anyopaque = null,
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = undefined,
+    width_method: grapheme.WidthMethod = .wcwidth,
     measured_content_width: u32 = 0,
+    measured_width_method: grapheme.WidthMethod = .wcwidth,
     measured_result_height: u32 = 0,
 
     pub fn deinit(self: *ToolExecution) void {
@@ -623,6 +626,7 @@ pub const ToolExecution = struct {
         const content_w = if (width > 2) width - 2 else 1;
         const result_h = self.measureResult(content_w);
         self.measured_content_width = content_w;
+        self.measured_width_method = self.width_method;
         self.measured_result_height = result_h;
         var h: u32 = padding_y;
         h += 1;
@@ -682,8 +686,9 @@ pub const ToolExecution = struct {
     }
 
     fn ensureMeasuredResultHeight(self: *ToolExecution, width: u32) u32 {
-        if (self.measured_content_width != width) {
+        if (self.measured_content_width != width or self.measured_width_method != self.width_method) {
             self.measured_content_width = width;
+            self.measured_width_method = self.width_method;
             self.measured_result_height = self.measureResult(width);
         }
         return self.measured_result_height;
@@ -732,7 +737,7 @@ pub const ToolExecution = struct {
 
         const fg = if (self.model.is_error) self.theme.fg(.@"error") else self.theme.fg(.tool_output);
         const w: usize = @intCast(region.width);
-        const lines = display_wrap_mod.wordWrap(result_text, w, self.allocator) catch return;
+        const lines = display_wrap_mod.wordWrap(result_text, w, self.allocator, region.buf.width_method) catch return;
         defer self.allocator.free(lines);
 
         const max_preview: u32 = if (self.expanded) @intCast(lines.len) else 5;
@@ -769,7 +774,7 @@ pub const ToolExecution = struct {
         defer self.allocator.free(result_text);
 
         const w: usize = @intCast(width);
-        const lines = display_wrap_mod.wordWrap(result_text, w, self.allocator) catch return 1;
+        const lines = display_wrap_mod.wordWrap(result_text, w, self.allocator, self.width_method) catch return 1;
         defer self.allocator.free(lines);
 
         if (self.expanded) return @intCast(lines.len);
@@ -865,7 +870,7 @@ pub const ToolExecution = struct {
 };
 
 test "tool execution renderSlice starts inside a wrapped tool result" {
-    var buffer = try buffer_mod.Buffer.init(testing.allocator, 6, 3);
+    var buffer = try buffer_mod.Buffer.init(testing.allocator, 6, 3, .wcwidth);
     defer buffer.deinit();
 
     const content = try testing.allocator.alloc(AgentToolResult.ContentBlock, 1);
@@ -934,6 +939,7 @@ pub const Transcript = struct {
     last_visible_height: u32 = 0,
     /// Cached from last render() call, used by clampScroll().
     last_render_width: u32 = 80,
+    last_width_method: grapheme.WidthMethod = .wcwidth,
 
     selection: SelectionState = .inactive,
 
@@ -1321,7 +1327,7 @@ pub const Transcript = struct {
         const selection = self.normalizedSelection(width) orelse return null;
         if (width == 0) return null;
 
-        var scratch = try Buffer.init(allocator, width, 1);
+        var scratch = try Buffer.init(allocator, width, 1, self.last_width_method);
         defer scratch.deinit();
 
         var out: std.ArrayList(u8) = .empty;
@@ -1544,6 +1550,10 @@ pub const Transcript = struct {
         const w = region.width;
         const h = region.height;
         if (w == 0 or h == 0) return;
+        if (self.last_width_method != region.buf.width_method) {
+            self.last_width_method = region.buf.width_method;
+            self.layout.invalidateAll();
+        }
         self.ensureLayout(w);
         self.last_visible_height = h;
         self.layout.clampScroll(h);
@@ -1570,6 +1580,7 @@ pub const Transcript = struct {
     }
 
     fn renderItem(self: *Transcript, index: usize, item: *TranscriptItem, row_region: Region, skipped: u32, _: u32, w: u32) void {
+        self.applyWidthMethod(item, row_region.buf.width_method);
         const gap_rows = self.gapBeforeItem(index);
         if (gap_rows > 0 and skipped < gap_rows) {
             const gap_visible = gap_rows - skipped;
@@ -1592,8 +1603,31 @@ pub const Transcript = struct {
         return if (index == 0) 0 else self.child_gap_rows;
     }
 
-    fn itemHeight(self: *const Transcript, index: usize, item: *TranscriptItem, width: u32) u32 {
+    fn itemHeight(self: *Transcript, index: usize, item: *TranscriptItem, width: u32) u32 {
+        self.applyWidthMethod(item, self.last_width_method);
         return @max(1, item.renderable.measure(width).preferred_height) + self.gapBeforeItem(index);
+    }
+
+    fn applyWidthMethod(_: *Transcript, item: *TranscriptItem, width_method: grapheme.WidthMethod) void {
+        switch (item.kind) {
+            .assistant_message => {
+                const msg: *assistant_message_mod.AssistantMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
+                msg.setWidthMethod(width_method);
+            },
+            .user_message, .queued_user_message => {
+                const msg: *user_message_mod.UserMessage = @ptrCast(@alignCast(item.deinit_ctx.?));
+                msg.setWidthMethod(width_method);
+            },
+            .tool_execution => {
+                const tool: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
+                tool.width_method = width_method;
+            },
+            .markdown => {
+                const md: *markdown_mod.Markdown = @ptrCast(@alignCast(item.deinit_ctx.?));
+                md.setWidthMethod(width_method);
+            },
+            .generic => {},
+        }
     }
 };
 
@@ -1709,9 +1743,7 @@ fn renderedBufferText(allocator: std.mem.Allocator, buf: *const Buffer) ![]u8 {
     for (0..buf.height) |row| {
         if (row > 0) try text.append(allocator, '\n');
         for (0..buf.width) |col| {
-            const cp = buf.get(@intCast(col), @intCast(row)).grapheme.codepoint;
-            if (cp == 0) continue;
-            try text.append(allocator, @intCast(cp));
+            try buf.appendCellText(&text, allocator, buf.get(@intCast(col), @intCast(row)));
         }
     }
     return text.toOwnedSlice(allocator);
@@ -1720,7 +1752,7 @@ fn renderedBufferText(allocator: std.mem.Allocator, buf: *const Buffer) ![]u8 {
 fn appendTestAssistantRow(transcript: *Transcript) !usize {
     const assistant = try transcript.allocator.create(assistant_message_mod.AssistantMessage);
     errdefer transcript.allocator.destroy(assistant);
-    assistant.* = assistant_message_mod.AssistantMessage.init(transcript.allocator);
+    assistant.* = assistant_message_mod.AssistantMessage.init(transcript.allocator, transcript.last_width_method);
     errdefer assistant.deinit();
     assistant.theme = transcript.theme;
     assistant.hide_thinking_block = transcript.hide_thinking_block;
@@ -1852,7 +1884,7 @@ fn appendTestUserRow(
 ) !usize {
     const msg = try transcript.allocator.create(user_message_mod.UserMessage);
     errdefer transcript.allocator.destroy(msg);
-    msg.* = user_message_mod.UserMessage.init(transcript.allocator);
+    msg.* = user_message_mod.UserMessage.init(transcript.allocator, transcript.last_width_method);
     errdefer msg.deinit();
     msg.setTheme(transcript.theme);
 
@@ -1893,7 +1925,7 @@ test "Transcript renders assistant response before tool execution" {
 
     try testing.expectEqual(@as(usize, 2), transcript.items.items.len);
 
-    var buf = try Buffer.init(testing.allocator, 30, 10);
+    var buf = try Buffer.init(testing.allocator, 30, 10, .wcwidth);
     defer buf.deinit();
     transcript.render(buf.region());
 
@@ -1970,7 +2002,7 @@ test "ToolExecution does not invoke result renderers before any result exists" {
     try setTestToolExecutionState(&transcript, tool, false, true, null, true, false);
     transcript.itemMutatedAt(tool_idx);
 
-    var buf = try Buffer.init(testing.allocator, 30, 6);
+    var buf = try Buffer.init(testing.allocator, 30, 6, .wcwidth);
     defer buf.deinit();
     transcript.render(buf.region());
 
@@ -1994,7 +2026,7 @@ test "Transcript scroll window advances through tool output rows" {
     transcript.scrollToBottom(20, 3);
     transcript.scrollBy(20, 3, -3);
 
-    var buf = try Buffer.init(testing.allocator, 20, 3);
+    var buf = try Buffer.init(testing.allocator, 20, 3, .wcwidth);
     defer buf.deinit();
     transcript.render(buf.region());
 
@@ -2015,7 +2047,7 @@ test "Transcript item gap is parent-owned spacing between children" {
 
     try testing.expectEqual(@as(u32, 3), transcript.totalHeight(10));
 
-    var buf = try Buffer.init(testing.allocator, 10, 3);
+    var buf = try Buffer.init(testing.allocator, 10, 3, .wcwidth);
     defer buf.deinit();
     transcript.render(buf.region());
 
@@ -2034,7 +2066,7 @@ test "Transcript preserves visible anchor when earlier items grow" {
     transcript.addRenderable(second.renderable());
     transcript.scrollBy(10, 2, 4);
 
-    var before = try Buffer.init(testing.allocator, 10, 2);
+    var before = try Buffer.init(testing.allocator, 10, 2, .wcwidth);
     defer before.deinit();
     transcript.render(before.region());
     try testing.expectEqual(@as(u21, 'B'), before.get(0, 0).grapheme.codepoint);
@@ -2042,7 +2074,7 @@ test "Transcript preserves visible anchor when earlier items grow" {
     first.height = 5;
     transcript.noteItemMutated(0);
 
-    var after = try Buffer.init(testing.allocator, 10, 2);
+    var after = try Buffer.init(testing.allocator, 10, 2, .wcwidth);
     defer after.deinit();
     transcript.render(after.region());
     try testing.expectEqual(@as(u21, 'B'), after.get(0, 0).grapheme.codepoint);
@@ -2062,7 +2094,7 @@ test "ToolExecution collapsed plain text renderer shows overflow hint row" {
     transcript.clearToolRoutingAt(tool_idx);
     transcript.itemMutatedAt(tool_idx);
 
-    var buf = try Buffer.init(testing.allocator, 20, 10);
+    var buf = try Buffer.init(testing.allocator, 20, 10, .wcwidth);
     defer buf.deinit();
     transcript.render(buf.region());
 
@@ -2126,7 +2158,7 @@ test "Transcript selection autoscroll advances viewport while dragging below" {
     try testing.expect(transcript.tickAnimation(50 * std.time.ns_per_ms));
     try testing.expectEqual(@as(u32, 1), transcript.scrollOffset());
 
-    var buf = try Buffer.init(testing.allocator, 10, 2);
+    var buf = try Buffer.init(testing.allocator, 10, 2, .wcwidth);
     defer buf.deinit();
     transcript.render(buf.region());
     try testing.expectEqual(@as(u21, 'r'), buf.get(0, 0).grapheme.codepoint);

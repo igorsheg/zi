@@ -279,8 +279,12 @@ fn rowAscii(buf: *const Buffer, y: u32, out: []u8) []const u8 {
     var len: usize = 0;
     var x: u32 = 0;
     while (x < buf.width and len < out.len) : (x += 1) {
-        const cp = buf.get(x, y).grapheme.codepoint;
-        out[len] = if (cp <= 0x7f) @intCast(cp) else '?';
+        const cell = buf.get(x, y);
+        if (cell.width == 0) continue;
+        switch (cell.grapheme) {
+            .codepoint => |cp| out[len] = if (cp <= 0x7f) @intCast(cp) else '?',
+            .pooled => out[len] = '?',
+        }
         len += 1;
     }
     return std.mem.trimEnd(u8, out[0..len], " ");
@@ -307,7 +311,7 @@ test "owned surface renders collapsed rows and gaps from an arbitrary offset" {
         .context = .{ .chrome = Color.default, .fg = Color.default, .dim = Color.default },
     };
 
-    var buf = try Buffer.init(testing.allocator, 40, 4);
+    var buf = try Buffer.init(testing.allocator, 40, 4, .wcwidth);
     defer buf.deinit();
 
     surface.renderSlice(buf.region(), palette, false, 1);

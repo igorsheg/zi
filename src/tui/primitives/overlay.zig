@@ -472,7 +472,7 @@ test "OverlayManager reports only visible capturing overlays for focus" {
 }
 
 test "renderOverlays renders visible overlays inside resolved layout bounds" {
-    var buf = try buffer_mod.Buffer.init(testing.allocator, 20, 10);
+    var buf = try buffer_mod.Buffer.init(testing.allocator, 20, 10, .wcwidth);
     defer buf.deinit();
 
     var mgr = OverlayManager.init(testing.allocator);

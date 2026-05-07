@@ -539,7 +539,11 @@ fn makeFrameKey(allocator: std.mem.Allocator, owner: []const u8, view: []const u
 }
 
 fn cpAt(buf: *Buffer, x: u32, y: u32) u21 {
-    return buf.get(x, y).grapheme.codepoint;
+    const cell = buf.get(x, y);
+    return switch (cell.grapheme) {
+        .codepoint => |cp| cp,
+        .pooled => 0,
+    };
 }
 
 test "extension ui retains clone remove and generation gates" {
@@ -567,7 +571,7 @@ test "extension ui renders text" {
     defer state.deinit();
     const root = extension_ui.UiNode{ .text = .{ .text = "hello" } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
-    var buf = try Buffer.init(std.testing.allocator, 10, 1);
+    var buf = try Buffer.init(std.testing.allocator, 10, 1, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
     comp.render(buf.region());
@@ -581,7 +585,7 @@ test "extension ui renders bordered box" {
     const child = extension_ui.UiNode{ .text = .{ .text = "hi" } };
     const root = extension_ui.UiNode{ .box = .{ .style = .{ .border = true, .padding = .{ .left = 1, .top = 0 } }, .children = @constCast(&[_]extension_ui.UiNode{child}) } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
-    var buf = try Buffer.init(std.testing.allocator, 8, 3);
+    var buf = try Buffer.init(std.testing.allocator, 8, 3, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
     comp.render(buf.region());
@@ -596,7 +600,7 @@ test "extension ui sorts status views by order and id" {
     state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "b", .target = .status, .order = 2, .root = .{ .text = .{ .text = "b" } } });
     state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "a", .target = .status, .order = 1, .root = .{ .text = .{ .text = "a" } } });
     state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "c", .target = .status, .order = 1, .root = .{ .text = .{ .text = "c" } } });
-    var buf = try Buffer.init(std.testing.allocator, 4, 3);
+    var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
     comp.render(buf.region());
@@ -614,7 +618,7 @@ test "extension ui surface uses keyed frame lookup" {
     const blue = [_]u8{ 0, 0, 255, 255, 0, 0, 255, 255 };
     state.applyFrame(.{ .state_owner_id = "owner", .generation = 1, .view = "other", .node = "node", .width = 1, .height = 2, .data = &blue });
     state.applyFrame(.{ .state_owner_id = "owner", .generation = 2, .view = "view", .node = "node", .width = 1, .height = 2, .data = &red });
-    var buf = try Buffer.init(std.testing.allocator, 1, 1);
+    var buf = try Buffer.init(std.testing.allocator, 1, 1, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
     comp.render(buf.region());
@@ -631,7 +635,7 @@ test "extension ui sorts toast views and filters status" {
     state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .toast, .order = 1, .root = .{ .text = .{ .text = "a" } } });
 
     try std.testing.expect(state.hasToastViews());
-    var buf = try Buffer.init(std.testing.allocator, 4, 3);
+    var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
     defer buf.deinit();
     var comp = state.toastComponent();
     comp.render(buf.region());
@@ -658,7 +662,7 @@ test "extension ui sorts overlay views and filters other targets" {
     state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .overlay, .order = 1, .root = .{ .text = .{ .text = "a" } } });
 
     try std.testing.expect(state.hasOverlayViews());
-    var buf = try Buffer.init(std.testing.allocator, 4, 3);
+    var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
     defer buf.deinit();
     var comp = state.overlayComponent();
     comp.render(buf.region());
@@ -713,7 +717,7 @@ test "extension ui sorts editor border top views and filters other targets" {
     state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "z" } } });
     state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "a" } } });
 
-    var buf = try Buffer.init(std.testing.allocator, 4, 3);
+    var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
     defer buf.deinit();
     var comp = state.editorBorderTopComponent();
     comp.render(buf.region());
@@ -727,7 +731,7 @@ test "extension ui renders and removes editor border bottom views" {
     defer state.deinit();
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "bottom", .target = .editor_border_bottom, .root = .{ .chip = .{ .label = "hint" } } });
 
-    var buf = try Buffer.init(std.testing.allocator, 8, 1);
+    var buf = try Buffer.init(std.testing.allocator, 8, 1, .wcwidth);
     defer buf.deinit();
     var comp = state.editorBorderBottomComponent();
     comp.render(buf.region());

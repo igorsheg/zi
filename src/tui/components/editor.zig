@@ -80,10 +80,10 @@ pub const Editor = struct {
     focused: bool = true,
     theme: ?*const Theme = null,
 
-    pub fn init(allocator: std.mem.Allocator) Editor {
+    pub fn init(allocator: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) Editor {
         const default_theme = themes_builtin.dark();
         const buffer = allocator.create(PromptBuffer) catch @panic("OOM");
-        buffer.* = PromptBuffer.init(allocator);
+        buffer.* = PromptBuffer.init(allocator, width_method);
         var view = PromptView.init(allocator, buffer);
         view.setViewportHeight(10);
         return .{
@@ -773,8 +773,9 @@ pub const Editor = struct {
     fn syncViewGeometry(self: *Editor, total_width: u32, viewport_rows: u32) void {
         const applied_padding = self.appliedPaddingX(total_width);
         const content_width = self.effectiveContentWidth(total_width);
-        const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
-        const continuation_width: u32 = @intCast(grapheme_mod.strWidth(self.continuationPrompt()));
+        const width_method = self.buffer.width_method;
+        const prompt_width: u32 = @intCast(grapheme_mod.strWidth(self.prompt, width_method));
+        const continuation_width: u32 = @intCast(grapheme_mod.strWidth(self.continuationPrompt(), width_method));
 
         self.last_total_width = total_width;
         self.last_applied_padding_x = applied_padding;
@@ -1030,7 +1031,7 @@ fn undo(editor: *Editor) !void {
 const LargeMultilinePaste = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11";
 
 test "Editor undo groups continuous typing by word" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     try typeText(&editor, "hi there");
@@ -1044,7 +1045,7 @@ test "Editor undo groups continuous typing by word" {
 }
 
 test "Editor undo restores backspace and delete edits" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     editor.setText("abc");
@@ -1071,7 +1072,7 @@ test "Editor undo restores autocomplete application as one edit" {
     defer registry.deinit();
 
     var provider = autocomplete_mod.SlashCommandProvider.init(&registry);
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
     editor.setAutocompleteProvider(provider.provider());
 
@@ -1086,7 +1087,7 @@ test "Editor undo restores autocomplete application as one edit" {
 }
 
 test "Editor submit respects disabled state and escaped newline" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     var capture = SubmitCapture{};
@@ -1116,7 +1117,7 @@ test "Editor autocomplete confirm respects disable-submit and stays undoable" {
     defer registry.deinit();
 
     var provider = autocomplete_mod.SlashCommandProvider.init(&registry);
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     var capture = SubmitCapture{};
@@ -1136,7 +1137,7 @@ test "Editor autocomplete confirm respects disable-submit and stays undoable" {
 }
 
 test "Editor history browsing snapshots the empty draft and submit clears undo state" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     var capture = SubmitCapture{};
@@ -1166,7 +1167,7 @@ test "Editor history browsing snapshots the empty draft and submit clears undo s
 }
 
 test "Editor up/down handle prompt boundaries and history crossover" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     editor.setText("hello");
@@ -1189,7 +1190,7 @@ test "Editor up/down handle prompt boundaries and history crossover" {
 }
 
 test "Editor handlePaste normalizes content and undoes atomically" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     editor.setText("open");
@@ -1203,7 +1204,7 @@ test "Editor handlePaste normalizes content and undoes atomically" {
 test "Editor large multiline paste marker expands on submit" {
     const pasted = LargeMultilinePaste;
 
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     var capture = SubmitCapture{};
@@ -1221,7 +1222,7 @@ test "Editor large multiline paste marker expands on submit" {
 }
 
 test "Editor large single-line paste marker reports character count" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     var pasted: [1001]u8 = undefined;
@@ -1237,7 +1238,7 @@ test "Editor stored paste markers move and delete as one unit" {
     const pasted = LargeMultilinePaste;
 
     {
-        var editor = Editor.init(testing.allocator);
+        var editor = Editor.init(testing.allocator, .wcwidth);
         defer editor.deinit();
 
         editor.insertText("A");
@@ -1257,7 +1258,7 @@ test "Editor stored paste markers move and delete as one unit" {
     }
 
     {
-        var editor = Editor.init(testing.allocator);
+        var editor = Editor.init(testing.allocator, .wcwidth);
         defer editor.deinit();
 
         editor.insertText("A");
@@ -1272,7 +1273,7 @@ test "Editor stored paste markers move and delete as one unit" {
 }
 
 test "Editor ignores manually typed marker-like text for atomic movement" {
-    var editor = Editor.init(testing.allocator);
+    var editor = Editor.init(testing.allocator, .wcwidth);
     defer editor.deinit();
 
     editor.setText("[paste #99 +5 lines]");
@@ -1295,7 +1296,7 @@ test "Editor arrow keys move by grapheme cluster for combining marks and emoji" 
     };
 
     for (cases) |case| {
-        var editor = Editor.init(testing.allocator);
+        var editor = Editor.init(testing.allocator, .wcwidth);
         defer editor.deinit();
 
         editor.setText(case.text);
@@ -1325,7 +1326,7 @@ test "Editor backspace and delete remove whole grapheme clusters" {
 
     for (cases) |case| {
         {
-            var editor = Editor.init(testing.allocator);
+            var editor = Editor.init(testing.allocator, .wcwidth);
             defer editor.deinit();
 
             const text = try std.fmt.allocPrint(testing.allocator, "A{s}B", .{case.atomic});
@@ -1341,7 +1342,7 @@ test "Editor backspace and delete remove whole grapheme clusters" {
         }
 
         {
-            var editor = Editor.init(testing.allocator);
+            var editor = Editor.init(testing.allocator, .wcwidth);
             defer editor.deinit();
 
             const text = try std.fmt.allocPrint(testing.allocator, "A{s}B", .{case.atomic});

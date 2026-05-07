@@ -3,6 +3,7 @@ const runtime_fd = @import("terminal/fd.zig");
 const ansi = @import("terminal/ansi.zig");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("primitives/surface.zig");
+const grapheme_mod = @import("grapheme.zig");
 const Cell = cell_mod.Cell;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -11,6 +12,25 @@ const Region = buffer_mod.Region;
 
 const min_retained_output_capacity: usize = 2 * 1024 * 1024;
 const max_retained_output_capacity: usize = 8 * 1024 * 1024;
+
+fn nowUs() i64 {
+    const ns = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
+    return @intCast(@divTrunc(ns, 1000));
+}
+
+pub const Stats = struct {
+    frames: u64 = 0,
+    cells_scanned: u32 = 0,
+    cells_changed: u32 = 0,
+    cursor_moves: u32 = 0,
+    fg_changes: u32 = 0,
+    bg_changes: u32 = 0,
+    attr_changes: u32 = 0,
+    graphemes_written: u32 = 0,
+    bytes_emitted: usize = 0,
+    render_us: i64 = 0,
+    write_us: i64 = 0,
+};
 
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
@@ -21,15 +41,17 @@ pub const Renderer = struct {
     width: u32,
     height: u32,
     force_redraw: bool,
+    width_method: grapheme_mod.WidthMethod,
+    stats: Stats = .{},
 
-    pub fn init(allocator: std.mem.Allocator, fd: std.posix.fd_t, width: u32, height: u32) !Renderer {
+    pub fn init(allocator: std.mem.Allocator, fd: std.posix.fd_t, width: u32, height: u32, width_method: grapheme_mod.WidthMethod) !Renderer {
         var output: std.ArrayListUnmanaged(u8) = .empty;
         errdefer output.deinit(allocator);
         try output.ensureTotalCapacity(allocator, @as(usize, width) * @as(usize, height) * 4);
 
-        var current = try Buffer.init(allocator, width, height);
+        var current = try Buffer.init(allocator, width, height, width_method);
         errdefer current.deinit();
-        var next = try Buffer.init(allocator, width, height);
+        var next = try Buffer.init(allocator, width, height, width_method);
         errdefer next.deinit();
 
         return .{
@@ -41,6 +63,7 @@ pub const Renderer = struct {
             .width = width,
             .height = height,
             .force_redraw = true,
+            .width_method = width_method,
         };
     }
 
@@ -56,13 +79,13 @@ pub const Renderer = struct {
     }
 
     pub fn end(self: *Renderer) !void {
+        const render_start = nowUs();
+        var stats = Stats{ .frames = self.stats.frames + 1 };
         self.output.clearRetainingCapacity();
 
         appendStr(self, ansi.sync_enable);
 
-        var last_fg: ?Color = null;
-        var last_bg: ?Color = null;
-        var last_attrs: ?Attributes = null;
+        var style_state = StyleState{};
 
         const row_width: usize = @intCast(self.width);
         for (0..self.height) |y_usize| {
@@ -78,29 +101,20 @@ pub const Renderer = struct {
                 if (!self.force_redraw and curr.eql(next_cell)) continue;
 
                 appendCursorPos(self, @intCast(x_usize), y);
+                stats.cursor_moves += 1;
 
                 while (x_usize < row_width) : (x_usize += 1) {
                     const run_curr = current_row[x_usize];
                     const run_next = next_row[x_usize];
                     if (!self.force_redraw and run_curr.eql(run_next)) break;
 
-                    if (last_fg == null or !last_fg.?.eql(run_next.fg)) {
-                        appendFgColor(self, run_next.fg);
-                        last_fg = run_next.fg;
-                    }
+                    stats.cells_changed += 1;
 
-                    if (last_bg == null or !last_bg.?.eql(run_next.bg)) {
-                        appendBgColor(self, run_next.bg);
-                        last_bg = run_next.bg;
-                    }
-
-                    if (last_attrs == null or !last_attrs.?.eql(run_next.attrs)) {
-                        appendAttrs(self, run_next.attrs);
-                        last_attrs = run_next.attrs;
-                    }
+                    emitStyleDelta(self, run_next, &style_state, &stats);
 
                     if (run_next.width != 0) {
                         appendGrapheme(self, run_next.grapheme, &self.next.grapheme_pool);
+                        stats.graphemes_written += 1;
                     }
                 }
 
@@ -108,10 +122,20 @@ pub const Renderer = struct {
             }
         }
 
+        stats.cells_scanned = self.width * self.height;
+
         appendStr(self, ansi.reset);
         appendStr(self, ansi.sync_disable);
 
+        const render_end = nowUs();
+        stats.render_us = render_end - render_start;
+        stats.bytes_emitted = self.output.items.len;
+
+        const write_start = nowUs();
         writeAll(self.fd, self.output.items);
+        const write_end = nowUs();
+        stats.write_us = write_end - write_start;
+        self.stats = stats;
         self.releaseOversizedOutputBuffer();
 
         std.mem.swap(Buffer, &self.current, &self.next);
@@ -139,6 +163,32 @@ pub const Renderer = struct {
         self.output.ensureTotalCapacity(self.allocator, retain_capacity) catch {};
     }
 };
+
+const StyleState = struct {
+    fg: ?Color = null,
+    bg: ?Color = null,
+    attrs: ?Attributes = null,
+};
+
+fn emitStyleDelta(self: *Renderer, cell: Cell, state: *StyleState, stats: *Stats) void {
+    if (state.fg == null or !state.fg.?.eql(cell.fg)) {
+        appendFgColor(self, cell.fg);
+        stats.fg_changes += 1;
+        state.fg = cell.fg;
+    }
+
+    if (state.bg == null or !state.bg.?.eql(cell.bg)) {
+        appendBgColor(self, cell.bg);
+        stats.bg_changes += 1;
+        state.bg = cell.bg;
+    }
+
+    if (state.attrs == null or !state.attrs.?.eql(cell.attrs)) {
+        appendAttrs(self, cell.attrs);
+        stats.attr_changes += 1;
+        state.attrs = cell.attrs;
+    }
+}
 
 fn appendStr(self: *Renderer, s: []const u8) void {
     self.output.appendSlice(self.allocator, s) catch return;
@@ -230,7 +280,7 @@ test "Renderer end writes a frame and promotes it to current" {
     defer runtime_fd.close(pipe[0]);
     defer runtime_fd.close(pipe[1]);
 
-    var r = try Renderer.init(std.testing.allocator, pipe[1], 5, 1);
+    var r = try Renderer.init(std.testing.allocator, pipe[1], 5, 1, .wcwidth);
     defer r.deinit();
 
     const reg = r.begin();
@@ -244,6 +294,39 @@ test "Renderer end writes a frame and promotes it to current" {
     try std.testing.expect(std.mem.indexOf(u8, output, "A") != null);
     try std.testing.expectEqual(@as(u21, 'A'), r.current.get(0, 0).grapheme.codepoint);
     try std.testing.expect(!r.force_redraw);
+    try std.testing.expectEqual(@as(u64, 1), r.stats.frames);
+    try std.testing.expect(r.stats.cells_changed > 0);
+    try std.testing.expect(r.stats.bytes_emitted > 0);
+}
+
+test "Renderer emits wide-cell overwrites as concrete cell updates" {
+    const pipe = try testPipe();
+    defer runtime_fd.close(pipe[0]);
+    defer runtime_fd.close(pipe[1]);
+
+    var r = try Renderer.init(std.testing.allocator, pipe[1], 4, 1, .wcwidth);
+    defer r.deinit();
+
+    {
+        const reg = r.begin();
+        _ = reg.writeStr(0, 0, "界x", Color.default, Color.default, Attributes.none);
+        try r.end();
+        var drain: [4096]u8 = undefined;
+        _ = try readPipe(pipe[0], &drain);
+    }
+
+    {
+        const reg = r.begin();
+        _ = reg.writeStr(1, 0, "A", Color.default, Color.default, Attributes.none);
+        try r.end();
+
+        var read_buf: [4096]u8 = undefined;
+        const output = try readPipe(pipe[0], &read_buf);
+        try std.testing.expect(std.mem.indexOf(u8, output, "A") != null);
+        try std.testing.expectEqual(@as(u21, ' '), r.current.get(0, 0).grapheme.codepoint);
+        try std.testing.expectEqual(@as(u21, 'A'), r.current.get(1, 0).grapheme.codepoint);
+        try std.testing.expectEqual(@as(u21, ' '), r.current.get(2, 0).grapheme.codepoint);
+    }
 }
 
 test "Renderer diffs subsequent frames and clears deleted cells" {
@@ -251,7 +334,7 @@ test "Renderer diffs subsequent frames and clears deleted cells" {
     defer runtime_fd.close(pipe[0]);
     defer runtime_fd.close(pipe[1]);
 
-    var r = try Renderer.init(std.testing.allocator, pipe[1], 10, 1);
+    var r = try Renderer.init(std.testing.allocator, pipe[1], 10, 1, .wcwidth);
     defer r.deinit();
 
     {

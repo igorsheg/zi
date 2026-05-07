@@ -260,7 +260,6 @@ pub const Stack = struct {
         return Component.init(Stack, self);
     }
 
-
     pub fn isFlexChild(self: *const Stack, child: Child, index: usize) bool {
         _ = self;
         _ = index;
@@ -380,7 +379,7 @@ test "Stack gives flex child remaining height and reports rendered geometry" {
     stack.add(body.view(), .{ .height = .{ .flex = 1 } });
     stack.add(footer.view(), .{});
 
-    var buf = try Buffer.init(testing.allocator, 10, 8);
+    var buf = try Buffer.init(testing.allocator, 10, 8, .wcwidth);
     defer buf.deinit();
     stack.render(buf.region());
 
@@ -404,7 +403,7 @@ test "Stack clips rendering to available height" {
     stack.add(clipped.view(), .{});
     stack.add(hidden.view(), .{});
 
-    var buf = try Buffer.init(testing.allocator, 10, 3);
+    var buf = try Buffer.init(testing.allocator, 10, 3, .wcwidth);
     defer buf.deinit();
     stack.render(buf.region());
 
@@ -427,7 +426,7 @@ test "Stack resolves cursor for focused child identity" {
     stack.add(top.view(), .{});
     stack.add(focused.view(), .{});
 
-    var buf = try Buffer.init(testing.allocator, 10, 5);
+    var buf = try Buffer.init(testing.allocator, 10, 5, .wcwidth);
     defer buf.deinit();
     stack.render(buf.region());
 

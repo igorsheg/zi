@@ -286,22 +286,23 @@ pub const Interactive = struct {
         auth_storage: *auth_storage_mod.AuthStorage,
         settings_manager: *settings_manager_mod.SettingsManager,
     ) !Interactive {
+        const tui = try TUI.init(allocator);
         var self: Interactive = .{
             .allocator = allocator,
             .msg_allocator = msg_allocator,
             .io = io,
-            .tui = try TUI.init(allocator),
+            .tui = tui,
             .theme_storage = undefined,
             .theme = undefined,
             .cwd = cwd,
-            .editor = editor_mod.Editor.init(allocator),
+            .editor = editor_mod.Editor.init(allocator, tui.terminal.capabilities.width_method),
             .status_line = StatusLine.init(allocator),
-            .pending_image_banner = text_mod.Text.init(allocator),
+            .pending_image_banner = text_mod.Text.init(allocator, tui.terminal.capabilities.width_method),
             .extension_ui_state = ExtensionUiState.init(allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
-            .logs_overlay = ScrollTextOverlay.init(allocator, themes_builtin.dark()),
+            .logs_overlay = ScrollTextOverlay.init(allocator, themes_builtin.dark(), tui.terminal.capabilities.width_method),
             .transcript = Transcript.init(allocator),
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
@@ -1018,7 +1019,7 @@ pub const Interactive = struct {
             self.tui.dirty = true;
             return;
         };
-        row.* = text_mod.Text.init(self.allocator);
+        row.* = text_mod.Text.init(self.allocator, self.tui.terminal.capabilities.width_method);
         row.fg = self.theme.fg(color);
         row.setContent(content);
 

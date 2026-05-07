@@ -36,8 +36,9 @@ pub fn renderDocument(
     base_style: ast.Style,
     code_block_indent: []const u8,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
-    return renderBlocks(doc.blocks, width, theme, base_style, code_block_indent, arena);
+    return renderBlocks(doc.blocks, width, theme, base_style, code_block_indent, arena, width_method);
 }
 
 fn renderBlocks(
@@ -47,6 +48,7 @@ fn renderBlocks(
     base_style: ast.Style,
     code_block_indent: []const u8,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     if (width == 0) return &.{};
 
@@ -57,7 +59,7 @@ fn renderBlocks(
         if (idx > 0 and (node.separated or needsSemanticGap(blocks[idx - 1].block, node.block))) {
             try lines.append(arena, .{ .spans = &.{} });
         }
-        const rendered = try renderBlock(node.block, width, theme, base_style, code_block_indent, arena);
+        const rendered = try renderBlock(node.block, width, theme, base_style, code_block_indent, arena, width_method);
         try lines.appendSlice(arena, rendered);
     }
 
@@ -83,15 +85,16 @@ fn renderBlock(
     base_style: ast.Style,
     code_block_indent: []const u8,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     return switch (block) {
-        .paragraph => |p| renderParagraph(p.inlines, width, theme, base_style, arena),
-        .heading => |h| renderHeading(h, width, theme, arena),
-        .code_block => |cb| renderCodeBlock(cb, width, theme, code_block_indent, arena),
-        .list => |list| renderList(list, width, theme, base_style, code_block_indent, arena),
-        .quote => |quote| renderQuote(quote, width, theme, code_block_indent, arena),
+        .paragraph => |p| renderParagraph(p.inlines, width, theme, base_style, arena, width_method),
+        .heading => |h| renderHeading(h, width, theme, arena, width_method),
+        .code_block => |cb| renderCodeBlock(cb, width, theme, code_block_indent, arena, width_method),
+        .list => |list| renderList(list, width, theme, base_style, code_block_indent, arena, width_method),
+        .quote => |quote| renderQuote(quote, width, theme, code_block_indent, arena, width_method),
         .thematic_break => renderThematicBreak(width, theme, arena),
-        .table => |table| renderTable(table, width, theme, base_style, arena),
+        .table => |table| renderTable(table, width, theme, base_style, arena, width_method),
     };
 }
 
@@ -101,12 +104,13 @@ fn renderParagraph(
     theme: *const theme_mod.Theme,
     base_style: ast.Style,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     const flat = try flattenInlines(inlines, base_style, theme, arena);
-    return try wrapFlatText(flat, width, arena);
+    return try wrapFlatText(flat, width, arena, width_method);
 }
 
-fn renderHeading(h: ast.Heading, width: u32, theme: *const theme_mod.Theme, arena: std.mem.Allocator) std.mem.Allocator.Error![]const RenderedLine {
+fn renderHeading(h: ast.Heading, width: u32, theme: *const theme_mod.Theme, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) std.mem.Allocator.Error![]const RenderedLine {
     var heading_attrs: ast.Attributes = .{ .bold = true };
     if (h.level == 1) heading_attrs.underline = true;
     const style = ast.Style{
@@ -123,9 +127,9 @@ fn renderHeading(h: ast.Heading, width: u32, theme: *const theme_mod.Theme, aren
         @memset(prefix_text[0..h.level], '#');
         prefix_text[h.level] = ' ';
         prefix[0] = .{ .text = prefix_text, .fg = style.fg, .bg = style.bg, .attrs = style.attrs };
-        return try wrapWithPrefix(prefix, @intCast(prefix_len), flat, width, arena);
+        return try wrapWithPrefix(prefix, @intCast(prefix_len), flat, width, arena, width_method);
     }
-    return try wrapFlatText(flat, width, arena);
+    return try wrapFlatText(flat, width, arena, width_method);
 }
 
 fn renderCodeBlock(
@@ -134,6 +138,7 @@ fn renderCodeBlock(
     theme: *const theme_mod.Theme,
     code_block_indent: []const u8,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     var lines: std.ArrayListUnmanaged(RenderedLine) = .empty;
     errdefer lines.deinit(arena);
@@ -150,10 +155,10 @@ fn renderCodeBlock(
         arena,
     ) });
 
-    const indent_width: u32 = @intCast(grapheme_mod.strWidth(code_block_indent));
+    const indent_width: u32 = @intCast(grapheme_mod.strWidth(code_block_indent, width_method));
     const avail = if (width > indent_width) width - indent_width else 1;
     for (cb.lines) |line| {
-        const chunks = try hardWrap(line, avail, arena);
+        const chunks = try hardWrap(line, avail, arena, width_method);
         if (chunks.len == 0) {
             try lines.append(arena, .{ .spans = try prefixedCodeLine(code_block_indent, "", theme, arena) });
             continue;
@@ -191,6 +196,7 @@ fn renderList(
     base_style: ast.Style,
     code_block_indent: []const u8,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     var lines: std.ArrayListUnmanaged(RenderedLine) = .empty;
     errdefer lines.deinit(arena);
@@ -200,9 +206,9 @@ fn renderList(
             try std.fmt.allocPrint(arena, "{d}. ", .{list.start + idx})
         else
             "- ";
-        const prefix_width: u32 = @intCast(grapheme_mod.strWidth(bullet_text));
+        const prefix_width: u32 = @intCast(grapheme_mod.strWidth(bullet_text, width_method));
         const content_width = if (width > prefix_width) width - prefix_width else 1;
-        const rendered_item = try renderBlocks(item.blocks, content_width, theme, base_style, code_block_indent, arena);
+        const rendered_item = try renderBlocks(item.blocks, content_width, theme, base_style, code_block_indent, arena, width_method);
         const prefix = try arena.alloc(Span, 1);
         prefix[0] = .{ .text = bullet_text, .fg = theme.fg(.md_list_bullet), .bg = ast.Color.default, .attrs = .{} };
         const wrapped = try applyPrefixToLines(prefix, prefix_width, rendered_item, arena);
@@ -218,6 +224,7 @@ fn renderQuote(
     theme: *const theme_mod.Theme,
     code_block_indent: []const u8,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     const prefix_width: u32 = 2;
     const content_width = if (width > prefix_width) width - prefix_width else 1;
@@ -226,7 +233,7 @@ fn renderQuote(
         .bg = ast.Color.default,
         .attrs = .{ .italic = true },
     };
-    const inner = try renderBlocks(quote.blocks, content_width, theme, quote_style, code_block_indent, arena);
+    const inner = try renderBlocks(quote.blocks, content_width, theme, quote_style, code_block_indent, arena, width_method);
     const prefix = try arena.alloc(Span, 1);
     prefix[0] = .{ .text = "│ ", .fg = theme.fg(.md_quote_border), .bg = ast.Color.default, .attrs = .{ .dim = true } };
     return try applyPrefixToLines(prefix, prefix_width, inner, arena);
@@ -247,18 +254,19 @@ fn renderTable(
     theme: *const theme_mod.Theme,
     base_style: ast.Style,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     const num_cols = table.alignments.len;
     if (num_cols == 0) return &.{};
 
     const border_overhead: u32 = @intCast(3 * num_cols + 1);
     if (width <= border_overhead) {
-        return try renderTableFallback(table, width, theme, base_style, arena);
+        return try renderTableFallback(table, width, theme, base_style, arena, width_method);
     }
 
     const available_for_cells = width - border_overhead;
     if (available_for_cells < num_cols) {
-        return try renderTableFallback(table, width, theme, base_style, arena);
+        return try renderTableFallback(table, width, theme, base_style, arena, width_method);
     }
 
     var natural_widths = try arena.alloc(u32, num_cols);
@@ -272,14 +280,14 @@ fn renderTable(
             .bg = base_style.bg,
             .attrs = mergeAttrs(base_style.attrs, .{ .bold = true }),
         }, theme, arena);
-        natural_widths[i] = flatWidth(flat);
-        min_word_widths[i] = longestWordWidth(flat.text, 30);
+        natural_widths[i] = flatWidth(flat, width_method);
+        min_word_widths[i] = longestWordWidth(flat.text, 30, width_method);
     }
     for (table.rows) |row| {
         for (row.cells, 0..) |cell, i| {
             const flat = try flattenInlines(cell.inlines, base_style, theme, arena);
-            natural_widths[i] = @max(natural_widths[i], flatWidth(flat));
-            min_word_widths[i] = @max(min_word_widths[i], longestWordWidth(flat.text, 30));
+            natural_widths[i] = @max(natural_widths[i], flatWidth(flat, width_method));
+            min_word_widths[i] = @max(min_word_widths[i], longestWordWidth(flat.text, 30, width_method));
         }
     }
 
@@ -290,14 +298,14 @@ fn renderTable(
 
     try lines.append(arena, .{ .spans = try borderLine("┌─", "─┬─", "─┐", column_widths, theme, arena) });
 
-    const header_rows = try renderTableRow(table.header, column_widths, table.alignments, theme, base_style, true, arena);
+    const header_rows = try renderTableRow(table.header, column_widths, table.alignments, theme, base_style, true, arena, width_method);
     try lines.appendSlice(arena, header_rows);
 
     const separator = try borderLine("├─", "─┼─", "─┤", column_widths, theme, arena);
     try lines.append(arena, .{ .spans = separator });
 
     for (table.rows, 0..) |row, row_idx| {
-        const row_lines = try renderTableRow(row.cells, column_widths, table.alignments, theme, base_style, false, arena);
+        const row_lines = try renderTableRow(row.cells, column_widths, table.alignments, theme, base_style, false, arena, width_method);
         try lines.appendSlice(arena, row_lines);
         if (row_idx + 1 < table.rows.len) {
             try lines.append(arena, .{ .spans = separator });
@@ -314,6 +322,7 @@ fn renderTableFallback(
     theme: *const theme_mod.Theme,
     base_style: ast.Style,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     var blocks: std.ArrayListUnmanaged(ast.BlockNode) = .empty;
     errdefer blocks.deinit(arena);
@@ -337,7 +346,7 @@ fn renderTableFallback(
         try blocks.append(arena, .{ .block = .{ .paragraph = .{ .inlines = try singleTextNode(line_buf.items, arena) } }, .separated = true });
     }
 
-    return try renderBlocks(blocks.items, width, theme, base_style, "  ", arena);
+    return try renderBlocks(blocks.items, width, theme, base_style, "  ", arena, width_method);
 }
 
 fn renderTableRow(
@@ -348,6 +357,7 @@ fn renderTableRow(
     base_style: ast.Style,
     header: bool,
     arena: std.mem.Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
     const num_cols = column_widths.len;
     var cell_line_sets = try arena.alloc([]const []const Span, num_cols);
@@ -360,9 +370,9 @@ fn renderTableRow(
             base_style;
         const inlines = if (i < cells.len) cells[i].inlines else &.{};
         const flat = try flattenInlines(inlines, style, theme, arena);
-        const wrapped = try wrapFlatTextToSpans(flat, column_widths[i], arena);
+        const wrapped = try wrapFlatTextToSpans(flat, column_widths[i], arena, width_method);
         if (wrapped.len > max_lines) max_lines = wrapped.len;
-        cell_line_sets[i] = try alignCellLines(wrapped, column_widths[i], alignments[i], arena);
+        cell_line_sets[i] = try alignCellLines(wrapped, column_widths[i], alignments[i], arena, width_method);
     }
 
     var rows: std.ArrayListUnmanaged(RenderedLine) = .empty;
@@ -387,12 +397,12 @@ fn renderTableRow(
     return try rows.toOwnedSlice(arena);
 }
 
-fn alignCellLines(lines: []const []const Span, width: u32, alignment: ast.Alignment, arena: std.mem.Allocator) std.mem.Allocator.Error![]const []const Span {
+fn alignCellLines(lines: []const []const Span, width: u32, alignment: ast.Alignment, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) std.mem.Allocator.Error![]const []const Span {
     var result: std.ArrayListUnmanaged([]const Span) = .empty;
     errdefer result.deinit(arena);
 
     for (lines) |line| {
-        try result.append(arena, try padAlignedSpans(line, width, alignment, arena));
+        try result.append(arena, try padAlignedSpans(line, width, alignment, arena, width_method));
     }
     if (result.items.len == 0) {
         try result.append(arena, try blankSpanLine(width, .{ .fg = ast.Color.default, .bg = ast.Color.default, .attrs = .{} }, arena));
@@ -594,13 +604,13 @@ fn appendStyledText(
     try runs.append(arena, .{ .start = start, .end = end, .style = style });
 }
 
-fn wrapFlatText(flat: FlatText, width: u32, arena: std.mem.Allocator) ![]const RenderedLine {
+fn wrapFlatText(flat: FlatText, width: u32, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) ![]const RenderedLine {
     if (width == 0) return &.{};
-    return try wrapFlatTextToRendered(flat, width, arena);
+    return try wrapFlatTextToRendered(flat, width, arena, width_method);
 }
 
-fn wrapFlatTextToRendered(flat: FlatText, width: u32, arena: std.mem.Allocator) ![]const RenderedLine {
-    const wrapped = try display_wrap_mod.wordWrap(flat.text, width, arena);
+fn wrapFlatTextToRendered(flat: FlatText, width: u32, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) ![]const RenderedLine {
+    const wrapped = try display_wrap_mod.wordWrap(flat.text, width, arena, width_method);
     var lines: std.ArrayListUnmanaged(RenderedLine) = .empty;
     errdefer lines.deinit(arena);
     for (wrapped) |line| {
@@ -609,8 +619,8 @@ fn wrapFlatTextToRendered(flat: FlatText, width: u32, arena: std.mem.Allocator) 
     return try lines.toOwnedSlice(arena);
 }
 
-fn wrapFlatTextToSpans(flat: FlatText, width: u32, arena: std.mem.Allocator) ![]const []const Span {
-    const wrapped = try display_wrap_mod.wordWrap(flat.text, width, arena);
+fn wrapFlatTextToSpans(flat: FlatText, width: u32, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) ![]const []const Span {
+    const wrapped = try display_wrap_mod.wordWrap(flat.text, width, arena, width_method);
     var lines: std.ArrayListUnmanaged([]const Span) = .empty;
     errdefer lines.deinit(arena);
     for (wrapped) |line| {
@@ -619,9 +629,9 @@ fn wrapFlatTextToSpans(flat: FlatText, width: u32, arena: std.mem.Allocator) ![]
     return try lines.toOwnedSlice(arena);
 }
 
-fn wrapWithPrefix(prefix: []const Span, prefix_width: u32, flat: FlatText, total_width: u32, arena: std.mem.Allocator) ![]const RenderedLine {
+fn wrapWithPrefix(prefix: []const Span, prefix_width: u32, flat: FlatText, total_width: u32, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) ![]const RenderedLine {
     const content_width = if (total_width > prefix_width) total_width - prefix_width else 1;
-    const wrapped = try wrapFlatTextToRendered(flat, content_width, arena);
+    const wrapped = try wrapFlatTextToRendered(flat, content_width, arena, width_method);
     return try applyPrefixToLines(prefix, prefix_width, wrapped, arena);
 }
 
@@ -640,18 +650,18 @@ fn reconstructSpans(start: usize, end: usize, flat: FlatText, arena: std.mem.All
     return try spans.toOwnedSlice(arena);
 }
 
-fn flatWidth(flat: FlatText) u32 {
-    return @intCast(grapheme_mod.strWidth(flat.text));
+fn flatWidth(flat: FlatText, width_method: grapheme_mod.WidthMethod) u32 {
+    return @intCast(grapheme_mod.strWidth(flat.text, width_method));
 }
 
-fn longestWordWidth(text: []const u8, cap: u32) u32 {
+fn longestWordWidth(text: []const u8, cap: u32, width_method: grapheme_mod.WidthMethod) u32 {
     var longest: u32 = 1;
     var start: usize = 0;
     var in_word = false;
     for (text, 0..) |c, idx| {
         if (c == ' ' or c == '\t' or c == '\n') {
             if (in_word) {
-                longest = @max(longest, @as(u32, @intCast(grapheme_mod.strWidth(text[start..idx]))));
+                longest = @max(longest, @as(u32, @intCast(grapheme_mod.strWidth(text[start..idx], width_method))));
                 in_word = false;
             }
         } else if (!in_word) {
@@ -660,19 +670,19 @@ fn longestWordWidth(text: []const u8, cap: u32) u32 {
         }
     }
     if (in_word) {
-        longest = @max(longest, @as(u32, @intCast(grapheme_mod.strWidth(text[start..]))));
+        longest = @max(longest, @as(u32, @intCast(grapheme_mod.strWidth(text[start..], width_method))));
     }
     return @min(longest, cap);
 }
 
-fn hardWrap(text: []const u8, width: u32, arena: std.mem.Allocator) ![]const []const u8 {
+fn hardWrap(text: []const u8, width: u32, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) ![]const []const u8 {
     var parts: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer parts.deinit(arena);
     if (text.len == 0) return &.{};
 
     var rest = text;
     while (rest.len > 0) {
-        const chunk = grapheme_mod.sliceToWidth(rest, width);
+        const chunk = grapheme_mod.sliceToWidth(rest, width, width_method);
         if (chunk.len == 0) break;
         try parts.append(arena, chunk);
         rest = rest[chunk.len..];
@@ -696,8 +706,8 @@ fn borderLine(left: []const u8, mid: []const u8, right: []const u8, widths: []co
     return try singleSpan(try buf.toOwnedSlice(arena), theme.fg(.md_hr), ast.Color.default, .{ .dim = true }, arena);
 }
 
-fn padAlignedSpans(spans: []const Span, width: u32, alignment: ast.Alignment, arena: std.mem.Allocator) std.mem.Allocator.Error![]const Span {
-    const used: u32 = @intCast(visibleWidthSpans(spans));
+fn padAlignedSpans(spans: []const Span, width: u32, alignment: ast.Alignment, arena: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) std.mem.Allocator.Error![]const Span {
+    const used: u32 = @intCast(visibleWidthSpans(spans, width_method));
     if (used >= width) return spans;
     const remaining = width - used;
     const left_pad: u32 = switch (alignment) {
@@ -720,9 +730,9 @@ fn blankSpanLine(width: u32, style: ast.Style, arena: std.mem.Allocator) std.mem
     return try singleSpan(try spaces(width, arena), style.fg, style.bg, style.attrs, arena);
 }
 
-fn visibleWidthSpans(spans: []const Span) usize {
+fn visibleWidthSpans(spans: []const Span, width_method: grapheme_mod.WidthMethod) usize {
     var total: usize = 0;
-    for (spans) |span| total += grapheme_mod.strWidth(span.text);
+    for (spans) |span| total += grapheme_mod.strWidth(span.text, width_method);
     return total;
 }
 
@@ -781,7 +791,7 @@ test "renderer wraps tables and preserves quote and heading styling" {
         .fg = ast.Color.default,
         .bg = ast.Color.default,
         .attrs = .{},
-    }, "  ", arena.allocator());
+    }, "  ", arena.allocator(), .wcwidth);
 
     try std.testing.expect(lines.len > 0);
     try std.testing.expect(std.mem.eql(u8, lines[0].spans[0].text, "### "));
@@ -800,4 +810,22 @@ test "renderer wraps tables and preserves quote and heading styling" {
     try std.testing.expect(saw_quote_border);
     try std.testing.expect(saw_inline_code_bg);
     try std.testing.expect(saw_table_border);
+}
+
+test "renderer wraps without splitting grapheme clusters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const parser = @import("parser.zig");
+    const doc = try parser.parseDocument("e\u{0301}x 👩‍🚀y", arena.allocator());
+    const lines = try renderDocument(doc, 2, themes_builtin.dark(), .{
+        .fg = ast.Color.default,
+        .bg = ast.Color.default,
+        .attrs = .{},
+    }, "  ", arena.allocator(), .wcwidth);
+
+    try std.testing.expect(lines.len >= 3);
+    try std.testing.expectEqualStrings("e\u{0301}x", lines[0].spans[0].text);
+    try std.testing.expectEqualStrings("👩‍🚀", lines[1].spans[0].text);
+    try std.testing.expectEqualStrings("y", lines[2].spans[0].text);
 }

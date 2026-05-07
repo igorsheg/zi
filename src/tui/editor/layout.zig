@@ -80,6 +80,7 @@ fn buildVirtualLines(buffer: *const PromptBuffer, config: LayoutConfig, allocato
             continuation_text_width,
             config.continuation_text_col,
             allocator,
+            buffer.width_method,
         );
 
         logical_line += 1;
@@ -113,6 +114,7 @@ fn appendWrappedSlices(
     continuation_width: u32,
     continuation_text_col: u32,
     allocator: Allocator,
+    width_method: grapheme_mod.WidthMethod,
 ) !void {
     var start: usize = 0;
     var current_kind = first_kind;
@@ -121,20 +123,20 @@ fn appendWrappedSlices(
     var logical_col_start: u32 = 0;
     var continuation = false;
 
-    while (breaks_mod.nextSegment(line_text, start, current_width, continuation, .{})) |segment| {
+    while (breaks_mod.nextSegment(line_text, start, current_width, continuation, .{}, width_method)) |segment| {
         try out.append(allocator, .{
             .byte_start = base_start + @as(u32, @intCast(segment.start)),
             .byte_end = base_start + @as(u32, @intCast(segment.end)),
             .logical_line = logical_line,
             .logical_col_start = logical_col_start,
-            .width_cols = @intCast(grapheme_mod.strWidth(line_text[segment.start..segment.end])),
+            .width_cols = @intCast(grapheme_mod.strWidth(line_text[segment.start..segment.end], width_method)),
             .text_col = current_text_col,
             .kind = current_kind,
         });
 
         if (segment.next_start >= line_text.len) break;
 
-        logical_col_start += @intCast(grapheme_mod.strWidth(line_text[start..segment.next_start]));
+        logical_col_start += @intCast(grapheme_mod.strWidth(line_text[start..segment.next_start], width_method));
         start = segment.next_start;
         current_kind = .wrapped_continuation;
         current_text_col = continuation_text_col;

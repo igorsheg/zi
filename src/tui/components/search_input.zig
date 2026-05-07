@@ -22,6 +22,7 @@ pub const SearchInput = struct {
     text: []const u8 = "",
     placeholder: ?[]const u8 = null,
     focused: bool = false,
+    width_method: grapheme_mod.WidthMethod = .wcwidth,
 
     pub fn init(theme: *const Theme) SearchInput {
         return .{ .theme = theme };
@@ -33,7 +34,8 @@ pub const SearchInput = struct {
 
     pub fn render(self: *SearchInput, region: Region) void {
         if (region.width == 0 or region.height == 0) return;
-        const prompt_w: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
+        self.width_method = region.buf.width_method;
+        const prompt_w = region.textWidth(self.prompt);
         _ = region.writeStr(0, 0, self.prompt, self.theme.fg(.accent), Color.default, .{});
         if (self.text.len > 0) {
             _ = region.writeStr(prompt_w, 0, self.text, self.theme.fg(.text), Color.default, .{});
@@ -48,8 +50,8 @@ pub const SearchInput = struct {
 
     pub fn cursorState(self: *SearchInput) ?CursorState {
         if (!self.focused) return null;
-        const prompt_w: u32 = @intCast(grapheme_mod.strWidth(self.prompt));
-        const text_w: u32 = @intCast(grapheme_mod.strWidth(self.text));
+        const prompt_w: u32 = @intCast(grapheme_mod.strWidth(self.prompt, self.width_method));
+        const text_w: u32 = @intCast(grapheme_mod.strWidth(self.text, self.width_method));
         return .{ .x = prompt_w + text_w, .y = 0, .style = .bar };
     }
 

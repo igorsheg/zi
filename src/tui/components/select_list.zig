@@ -2,7 +2,6 @@ const std = @import("std");
 const cell_mod = @import("../cell.zig");
 const buffer_mod = @import("../primitives/surface.zig");
 const keys_mod = @import("../terminal/keys.zig");
-const grapheme_mod = @import("../grapheme.zig");
 const component_mod = @import("../primitives/view.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
@@ -133,9 +132,9 @@ pub const SelectList = struct {
         const start = @min(if (self.selected_index > half) self.selected_index - half else 0, max_start);
         const end = @min(start + visible, len);
 
-        var label_w: usize = 0;
+        var label_w: u32 = 0;
         for (start..end) |i| {
-            const w = grapheme_mod.strWidth(self.items[i].label);
+            const w = region.textWidth(self.items[i].label);
             if (w > label_w) label_w = w;
         }
         const desc_threshold: u32 = 40;
@@ -152,8 +151,8 @@ pub const SelectList = struct {
 
             if (item.description) |desc| {
                 if (region.width > desc_threshold) {
-                    const current_label_w = grapheme_mod.strWidth(item.label);
-                    const pad: u32 = @intCast(label_w - current_label_w + 2);
+                    const current_label_w = region.textWidth(item.label);
+                    const pad = label_w - current_label_w + 2;
                     col += pad;
                     _ = region.writeStr(col, row, desc, muted, Color.default, .{ .dim = true });
                 }
