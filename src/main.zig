@@ -60,10 +60,8 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    var log_session = try logging.init(allocator, .{
-        .io = init.io,
-        .sink_mode = sinkModeForPlan(execution_plan),
-    });
+    const log_options = buildLoggingOptions(allocator, init.io, execution_plan);
+    var log_session = try logging.init(allocator, log_options);
     defer log_session.deinit();
 
     var cli_runtime: ?cli.runtime.Runtime = null;
@@ -127,9 +125,58 @@ fn planRequiresRuntime(execution_plan: cli.plan.ExecutionPlan) bool {
     };
 }
 
-fn sinkModeForPlan(execution_plan: cli.plan.ExecutionPlan) logging.SinkMode {
-    return switch (execution_plan) {
-        .help, .version, .list_models => .disabled,
-        .run => .file_only,
+fn buildLoggingOptions(allocator: std.mem.Allocator, io: std.Io, execution_plan: cli.plan.ExecutionPlan) logging.InitOptions {
+    var sinks = defaultSinksForPlan(execution_plan);
+    var min_level: std.log.Level = .info;
+
+    _ = allocator;
+    if (env.get("ZI_LOG_LEVEL")) |value| {
+        min_level = parseLogLevel(value) orelse min_level;
+    }
+
+    if (env.get("ZI_LOG_SINK")) |value| {
+        sinks = parseLogSinks(value);
+    }
+
+    if (env.get("ZI_LOG_FILE")) |value| {
+        sinks.file = true;
+        sinks.file_path = value;
+    }
+
+    return .{
+        .io = io,
+        .sinks = sinks,
+        .min_level = min_level,
     };
+}
+
+fn defaultSinksForPlan(execution_plan: cli.plan.ExecutionPlan) logging.SinkOptions {
+    return switch (execution_plan) {
+        .help, .version, .list_models => .{},
+        .run => .{ .file = true },
+    };
+}
+
+fn parseLogLevel(value: []const u8) ?std.log.Level {
+    if (std.ascii.eqlIgnoreCase(value, "debug")) return .debug;
+    if (std.ascii.eqlIgnoreCase(value, "info")) return .info;
+    if (std.ascii.eqlIgnoreCase(value, "warn")) return .warn;
+    if (std.ascii.eqlIgnoreCase(value, "err")) return .err;
+    if (std.ascii.eqlIgnoreCase(value, "error")) return .err;
+    return null;
+}
+
+fn parseLogSinks(value: []const u8) logging.SinkOptions {
+    var sinks: logging.SinkOptions = .{};
+    var it = std.mem.tokenizeScalar(u8, value, ',');
+    while (it.next()) |raw| {
+        const part = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(part, "file")) sinks.file = true else if (std.ascii.eqlIgnoreCase(part, "stderr")) sinks.stderr = true else if (std.ascii.eqlIgnoreCase(part, "both")) {
+            sinks.file = true;
+            sinks.stderr = true;
+        } else if (std.ascii.eqlIgnoreCase(part, "off") or std.ascii.eqlIgnoreCase(part, "disabled")) {
+            sinks = .{};
+        }
+    }
+    return sinks;
 }

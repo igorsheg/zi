@@ -22,6 +22,7 @@ const conversation_projection_mod = @import("conversation/projection.zig");
 const overlay_mod = @import("primitives/overlay.zig");
 const tool_display_mod = @import("conversation/tool_display.zig");
 const theme_mod = @import("theme.zig");
+const themes_builtin = @import("../themes/builtin.zig");
 const app_meta = @import("../runtime/app.zig");
 const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("editor/interface.zig");
@@ -65,6 +66,8 @@ const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("terminal/clipboard.zig");
 const agent_ui_event_mod = @import("interactive/agent_ui_event.zig");
 const clipboard_images_mod = @import("interactive/clipboard_images.zig");
+const scroll_text_overlay_mod = @import("components/scroll_text_overlay.zig");
+const logging = @import("../logging.zig");
 
 const autocomplete_mod = @import("autocomplete/provider.zig");
 const keybindings = @import("keybindings.zig");
@@ -78,6 +81,7 @@ const select_list_mod = @import("components/select_list.zig");
 const PickerSelection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
 const SimplePickerFlow = simple_picker_flow_mod.SimplePickerFlow;
+const ScrollTextOverlay = scroll_text_overlay_mod.ScrollTextOverlay;
 
 pub const TerminalSystemRequest = struct {
     id: extension_runner_mod.AsyncOpId,
@@ -216,6 +220,7 @@ pub const Interactive = struct {
     autocomplete_provider: CombinedAutocompleteProvider = undefined,
     autocomplete_provider_bound: bool = false,
     hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
+    logs_overlay: ScrollTextOverlay,
     extension_keybindings: std.ArrayListUnmanaged(ui_event_mod.ExtensionKeybindingEntry) = .empty,
 
     resume_picker_flow: ?ResumePickerFlow = null,
@@ -296,6 +301,7 @@ pub const Interactive = struct {
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
+            .logs_overlay = ScrollTextOverlay.init(allocator, themes_builtin.dark()),
             .transcript = Transcript.init(allocator),
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
             .resolver = resolver,
@@ -317,6 +323,7 @@ pub const Interactive = struct {
         self.job_manager = try job_manager_mod.JobManager.init(msg_allocator, io, &self.request_queue, null);
         self.ai_complete_worker = try ai_complete_worker_mod.AiCompleteWorker.init(msg_allocator);
         self.system_worker = try system_worker_mod.SystemWorker.init(msg_allocator, io);
+        self.logs_overlay.setTheme(self.theme);
         self.pending_image_banner.setPadding(1, 0);
         self.editor.setCwd(cwd);
         self.hide_thinking_block = settings_manager.getHideThinkingBlock();
@@ -399,6 +406,7 @@ pub const Interactive = struct {
         self.conversation_projection.deinit();
         self.transcript.deinit();
         self.extension_ui_state.deinit();
+        self.logs_overlay.deinit();
         self.pending_image_banner.deinit();
         self.status_line.deinit();
         self.editor.deinit();
@@ -938,6 +946,7 @@ pub const Interactive = struct {
             .settings => self.showSettingsPicker(),
             .hotkeys => self.showHotkeysOverlay(),
             .memory => self.showMemoryTelemetry(),
+            .logs => self.showLogs(args),
         }
         return true;
     }
@@ -954,6 +963,42 @@ pub const Interactive = struct {
         overlay_flow.showHotkeys(self);
     }
 
+    fn showLogs(self: *Interactive, args: []const u8) void {
+        const trimmed = std.mem.trim(u8, args, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "snapshot")) {
+            const path = logging.writeSnapshotFileDefault(self.allocator) catch {
+                self.status_line.setPrimary("log snapshot failed", self.theme.fg(.@"error"));
+                self.tui.dirty = true;
+                return;
+            };
+            defer self.allocator.free(path);
+            self.status_line.setPrimary("log snapshot written", self.theme.fg(.accent));
+            self.tui.dirty = true;
+            return;
+        }
+
+        const snapshot = logging.recentSnapshotAlloc(self.allocator) catch {
+            self.status_line.setPrimary("logs unavailable", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+            return;
+        };
+        defer self.allocator.free(snapshot);
+
+        var subtitle_buf: [512]u8 = undefined;
+        const subtitle = if (logging.currentLogPath()) |path|
+            std.fmt.bufPrint(&subtitle_buf, "file: {s}", .{path}) catch "file: <path too long>"
+        else
+            "file logging disabled; showing recent in-memory logs";
+
+        self.logs_overlay.setTheme(self.theme);
+        self.logs_overlay.setContent("Logs", subtitle, snapshot) catch {
+            self.status_line.setPrimary("log overlay allocation failed", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+            return;
+        };
+        _ = self.tui.showOverlay(self.logs_overlay.component(), self.bottomSheetOptions());
+    }
+
     fn showMemoryTelemetry(self: *Interactive) void {
         const content = memory_telemetry.format(self.allocator, self) catch {
             self.status_line.setPrimary("memory telemetry unavailable", self.theme.fg(.@"error"));
@@ -962,13 +1007,19 @@ pub const Interactive = struct {
         };
         defer self.allocator.free(content);
 
+        self.addTextTranscriptItem(content, .accent, "memory telemetry added to transcript");
+        memory_telemetry.log(self, "slash");
+        self.tui.dirty = true;
+    }
+
+    fn addTextTranscriptItem(self: *Interactive, content: []const u8, color: theme_mod.FgColor, success_message: []const u8) void {
         var row = self.allocator.create(text_mod.Text) catch {
-            self.status_line.setPrimary("memory telemetry allocation failed", self.theme.fg(.@"error"));
+            self.status_line.setPrimary("transcript allocation failed", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
         row.* = text_mod.Text.init(self.allocator);
-        row.fg = self.theme.fg(.accent);
+        row.fg = self.theme.fg(color);
         row.setContent(content);
 
         const item: transcript_mod.TranscriptItem = .{
@@ -978,11 +1029,10 @@ pub const Interactive = struct {
         };
         if (!self.transcript.addItem(item)) {
             deinitTranscriptText(@ptrCast(row), self.allocator);
-            self.status_line.setPrimary("memory telemetry unavailable", self.theme.fg(.@"error"));
+            self.status_line.setPrimary("transcript unavailable", self.theme.fg(.@"error"));
         } else {
-            self.status_line.setPrimary("memory telemetry added to transcript", self.theme.fg(.accent));
+            self.status_line.setPrimary(success_message, self.theme.fg(.accent));
         }
-        memory_telemetry.log(self, "slash");
         self.tui.dirty = true;
     }
 
