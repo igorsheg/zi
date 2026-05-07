@@ -8,10 +8,13 @@ const output_buffer = @import("output_buffer.zig");
 const runtime_process = @import("../../zio/root.zig").process;
 const lock_registry = @import("lock_registry.zig");
 
-const HEAD_LINES: usize = 50;
-const TAIL_LINES: usize = 50;
+const HEAD_LINES: usize = 0;
+const TAIL_LINES: usize = 2000;
+const MAX_VISIBLE_BYTES: usize = 50 * 1024;
+const MAX_ROLLING_BYTES: usize = MAX_VISIBLE_BYTES * 2;
+const MAX_LINE_BYTES: usize = 50 * 1024;
 const TRUNCATED_FMT = "... [{d} lines truncated] ...";
-const STREAM_UPDATE_MIN_INTERVAL_MS: u64 = 100;
+const STREAM_UPDATE_MIN_INTERVAL_MS: u64 = 500;
 
 const bash_schema =
     \\{"type":"object","properties":{"cmd":{"type":"string","description":"The shell command to execute."},"cwd":{"type":"string","description":"Working directory for the command (absolute path). Defaults to workspace root."},"timeout":{"type":"number","description":"Timeout in seconds."}},"required":["cmd"]}
@@ -21,7 +24,7 @@ const DESCRIPTION =
     "Executes the given shell command using bash.\n\n" ++
     "- Do NOT chain commands with `;` or `&&` or use `&` for background processes; make separate tool calls instead\n" ++
     "- Do NOT use interactive commands (REPLs, editors, password prompts)\n" ++
-    "- Output shows first 50 and last 50 lines; middle is truncated for large outputs\n" ++
+    "- Output is truncated to the last 2000 lines or 50KB, whichever is hit first; large output is saved to a temp file\n" ++
     "- Environment variables and `cd` do not persist between commands; use the `cwd` parameter instead\n" ++
     "- Commands run in the workspace root by default; only use `cwd` when you need a different directory\n" ++
     "- ALWAYS quote file paths: `cat \"path with spaces/file.txt\"`\n" ++
@@ -265,24 +268,56 @@ const StreamingCapture = struct {
     mutex: std.Io.Mutex = .init,
     io: std.Io,
     output: output_buffer.LineOutputBuffer,
+    total_bytes: usize = 0,
+    full_output_path: ?[]u8 = null,
+    full_output_file: ?std.Io.File = null,
     dirty: bool = false,
 
     fn init(allocator: std.mem.Allocator, io: std.Io) StreamingCapture {
         return .{
             .io = io,
-            .output = output_buffer.LineOutputBuffer.init(allocator, HEAD_LINES, TAIL_LINES),
+            .output = blk: {
+                var buf = output_buffer.LineOutputBuffer.init(allocator, HEAD_LINES, TAIL_LINES);
+                buf.max_line_bytes = MAX_LINE_BYTES;
+                buf.max_tail_bytes = MAX_ROLLING_BYTES;
+                break :blk buf;
+            },
         };
     }
 
     fn deinit(self: *StreamingCapture) void {
+        if (self.full_output_file) |file| file.close(self.io);
+        if (self.full_output_path) |path| {
+            if (self.total_bytes <= MAX_VISIBLE_BYTES) std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+            self.output.allocator.free(path);
+        }
         self.output.deinit();
     }
 
     fn append(self: *StreamingCapture, bytes: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.total_bytes += bytes.len;
+        self.writeFullOutput(bytes);
         self.output.addChunk(bytes) catch return;
         self.dirty = true;
+    }
+
+    fn writeFullOutput(self: *StreamingCapture, bytes: []const u8) void {
+        if (self.full_output_file == null) {
+            const path = std.fmt.allocPrint(
+                self.output.allocator,
+                "/tmp/zi-bash-{d}.log",
+                .{@as(i128, @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds()))},
+            ) catch return;
+            const file = std.Io.Dir.createFileAbsolute(self.io, path, .{ .truncate = true }) catch {
+                self.output.allocator.free(path);
+                return;
+            };
+            self.full_output_path = path;
+            self.full_output_file = file;
+        }
+        if (self.full_output_file) |file| file.writeStreamingAll(self.io, bytes) catch {};
     }
 
     fn takeDirtySnapshot(self: *StreamingCapture, allocator: std.mem.Allocator) ?[]u8 {
@@ -291,16 +326,61 @@ const StreamingCapture = struct {
         if (!self.dirty) return null;
         self.dirty = false;
         const snapshot = self.output.snapshotAlloc(allocator, TRUNCATED_FMT) catch return null;
-        return snapshot.text;
+        return capVisibleOutput(allocator, snapshot.text, snapshot.truncated_lines) catch snapshot.text;
     }
 
     fn finishText(self: *StreamingCapture, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const final = try self.output.finishAlloc(allocator, TRUNCATED_FMT);
-        return final.text;
+        var text = try capVisibleOutput(allocator, final.text, final.truncated_lines);
+        if (self.total_bytes > MAX_VISIBLE_BYTES) {
+            text = try appendFullOutputNotice(allocator, text, self.full_output_path, self.total_bytes);
+        }
+        return text;
     }
 };
+
+fn appendFullOutputNotice(allocator: std.mem.Allocator, text: []u8, path: ?[]const u8, total_bytes: usize) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, text);
+    if (path) |p| {
+        const notice = try std.fmt.allocPrint(allocator, "\n\n[Full output: {s}. Total output: {d} bytes]", .{ p, total_bytes });
+        defer allocator.free(notice);
+        try out.appendSlice(allocator, notice);
+    } else {
+        const notice = try std.fmt.allocPrint(allocator, "\n\n[Output truncated. Total output: {d} bytes]", .{total_bytes});
+        defer allocator.free(notice);
+        try out.appendSlice(allocator, notice);
+    }
+    allocator.free(text);
+    return out.toOwnedSlice(allocator);
+}
+
+fn capVisibleOutput(allocator: std.mem.Allocator, text: []u8, truncated_lines: usize) ![]u8 {
+    if (text.len <= MAX_VISIBLE_BYTES) return text;
+
+    const keep_budget = MAX_VISIBLE_BYTES -| 256;
+    var start = text.len - @min(text.len, keep_budget);
+    if (std.mem.indexOfScalar(u8, text[start..], '\n')) |newline_offset| {
+        start += newline_offset + 1;
+    }
+
+    const marker = try std.fmt.allocPrint(
+        allocator,
+        "... [output truncated to last {d}KB; {d} earlier lines omitted] ...\n\n",
+        .{ MAX_VISIBLE_BYTES / 1024, truncated_lines },
+    );
+    defer allocator.free(marker);
+
+    var capped = std.ArrayList(u8).empty;
+    errdefer capped.deinit(allocator);
+    try capped.appendSlice(allocator, marker);
+    try capped.appendSlice(allocator, text[start..]);
+    allocator.free(text);
+    return capped.toOwnedSlice(allocator);
+}
 
 fn expectTextBlockContains(result: protocol.AgentToolResult, needle_text: []const u8) !void {
     try std.testing.expectEqual(@as(usize, 1), result.content.len);
@@ -353,7 +433,7 @@ test "runCommand handles concurrent mixed output without assuming cross-stream o
     const testing = std.testing;
     const cmd =
         \\i=0
-        \\while [ "$i" -lt 400 ]; do
+        \\while [ "$i" -lt 1200 ]; do
         \\  printf 'out%04d\n' "$i"
         \\  printf 'err%04d\n' "$i" 1>&2
         \\  i=$((i + 1))

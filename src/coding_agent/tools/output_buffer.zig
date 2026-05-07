@@ -73,6 +73,8 @@ pub const LineOutputBuffer = struct {
     max_head: usize,
     max_tail: usize,
     max_line_bytes: usize = default_max_line_bytes,
+    max_tail_bytes: ?usize = null,
+    tail_bytes: usize = 0,
     head: std.ArrayList([]u8) = .empty,
     tail: std.ArrayList([]u8) = .empty,
     pending: std.ArrayList(u8) = .empty,
@@ -177,9 +179,11 @@ pub const LineOutputBuffer = struct {
             return;
         }
 
+        self.tail_bytes += owned.len;
         try self.tail.append(self.allocator, owned);
-        if (self.tail.items.len > self.max_tail) {
+        while (self.tail.items.len > self.max_tail or (self.max_tail_bytes != null and self.tail_bytes > self.max_tail_bytes.? and self.tail.items.len > 1)) {
             const evicted = self.tail.orderedRemove(0);
+            self.tail_bytes -|= evicted.len;
             self.allocator.free(evicted);
         }
     }

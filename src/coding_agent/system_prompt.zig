@@ -165,13 +165,10 @@ fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
 
 fn writeZiDocsSection(w: *std.Io.Writer) !void {
     try w.writeAll(
-        "\nZi documentation (read only when the user asks about zi itself, extensions, themes, or the TUI):\n" ++
-            "- Start with docs/README.md\n" ++
-            "- Core docs: docs/principles.md, docs/architecture.md, docs/runtime.md\n" ++
-            "- Topic docs: extensions (docs/extensions.md), TUI (docs/tui.md), themes (docs/theme-system.md), replay/providers (docs/replay.md)\n" ++
-            "- Historical notes live in docs/archive/ but are not the source of truth\n" ++
-            "- When working on zi topics, read the docs and follow .md cross-references before implementing\n" ++
-            "- Always read zi .md files completely and follow links to related docs\n",
+        "\nZi help (lazy progressive eval):\n" ++
+            "- `zi --help` prints CLI usage and actions\n" ++
+            "- `zi --docs <query>` searches embedded zi docs\n" ++
+            "- `zi --man [topic]` lists topics or prints one embedded doc\n",
     );
 }
 
@@ -211,14 +208,15 @@ fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !v
     }
 }
 
-test "default prompt includes zi identity docs and cwd" {
+test "default prompt includes zi identity help and cwd" {
     const result = try buildSystemPrompt(std.testing.allocator, .{
         .cwd = "/home/user/project",
     });
     defer std.testing.allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "operating inside zi, a coding agent harness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Zi documentation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Zi help (lazy progressive eval)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "docs/README.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Current working directory: /home/user/project") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Be concise in your responses") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Available tools:") != null);
@@ -276,7 +274,7 @@ test "tool guidelines adapt to available tools" {
     try std.testing.expect(std.mem.indexOf(u8, bash_grep, "Prefer grep/find/ls tools over bash") != null);
 }
 
-test "default prompt orders docs append context and read-gated skills" {
+test "default prompt orders zi help append context and read-gated skills" {
     const files = [_]ContextFile{
         .{ .path = "/proj/AGENTS.md", .content = "rule 1" },
         .{ .path = "/proj/docs/STYLE.md", .content = "rule 2" },
@@ -289,7 +287,7 @@ test "default prompt orders docs append context and read-gated skills" {
     defer std.testing.allocator.free(with_read);
 
     try expectOrderedSubstrings(with_read, &.{
-        "Zi documentation",
+        "Zi help (lazy progressive eval)",
         "appended guidance",
         "# Project Context",
         "<available_skills>",
