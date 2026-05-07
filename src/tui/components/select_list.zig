@@ -13,6 +13,7 @@ const Region = buffer_mod.Region;
 const Key = keys_mod.Key;
 const Measurement = component_mod.Measurement;
 const Theme = theme_mod.Theme;
+const Buffer = buffer_mod.Buffer;
 
 pub const SelectItem = struct {
     value: []const u8,
@@ -219,6 +220,19 @@ fn listWithItems(theme: *const Theme, items: []const SelectItem) SelectList {
     return list;
 }
 
+fn firstCodepointColumn(buf: *const Buffer, row: u32, cp: u21) ?u32 {
+    var x: u32 = 0;
+    while (x < buf.width) : (x += 1) {
+        const cell = buf.get(x, row);
+        if (cell.width == 0) continue;
+        switch (cell.grapheme) {
+            .codepoint => |c| if (c == cp) return x,
+            .pooled => {},
+        }
+    }
+    return null;
+}
+
 test "SelectList up/down wraps around" {
     const theme = testTheme();
     var items = makeItems();
@@ -267,6 +281,24 @@ test "SelectList page home and end navigation clamp within items" {
     try testing.expectEqual(@as(u32, 7), sl.selected_index);
     _ = sl.processInput(.{ .code = .page_up });
     try testing.expectEqual(@as(u32, 4), sl.selected_index);
+}
+
+test "SelectList description alignment follows region width method" {
+    const theme = testTheme();
+    const items = [_]SelectItem{
+        .{ .value = "heart", .label = "♥️", .description = "desc" },
+    };
+    var sl = listWithItems(&theme, &items);
+
+    var wc_buf = try Buffer.init(testing.allocator, 50, 2, .wcwidth);
+    defer wc_buf.deinit();
+    sl.render(wc_buf.region());
+    try testing.expectEqual(@as(?u32, 5), firstCodepointColumn(&wc_buf, 0, 'd'));
+
+    var unicode_buf = try Buffer.init(testing.allocator, 50, 2, .unicode);
+    defer unicode_buf.deinit();
+    sl.render(unicode_buf.region());
+    try testing.expectEqual(@as(?u32, 6), firstCodepointColumn(&unicode_buf, 0, 'd'));
 }
 
 test "SelectList preserves selection by value across setItems" {

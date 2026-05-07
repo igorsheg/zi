@@ -24,7 +24,6 @@ pub const Cluster = struct {
 /// 2 for CJK ideographs, fullwidth forms, wide emoji.
 /// 1 for everything else.
 pub fn charWidth(cp: u21, method: WidthMethod) u2 {
-    _ = method;
     if (cp >= 0x20 and cp <= 0x7E) return 1;
 
     if (cp <= 0x1F or cp == 0x7F) return 0;
@@ -83,6 +82,7 @@ pub fn charWidth(cp: u21, method: WidthMethod) u2 {
     if (cp >= 0x1F1E6 and cp <= 0x1F1FF) return 2;
 
     if (cp >= 0x1F300 and cp <= 0x1F9FF) return 2;
+    if (method == .unicode and isEmojiPresentationCodepoint(cp)) return 2;
 
     if (cp >= 0x20000 and cp <= 0x2FFFF) return 2;
 
@@ -181,16 +181,32 @@ pub fn clusterWidth(cluster: []const u8, method: WidthMethod) u2 {
     var raw_max: usize = 0;
     var visible_max: usize = 0;
     var pos: usize = 0;
+    var has_zwj = false;
+    var has_emoji_variation = false;
+    var has_text_variation = false;
+    var has_extended_pictographic = false;
+    var regional_indicators: u32 = 0;
 
     while (pos < cluster.len) {
         const decoded = decodeAt(cluster, pos);
         if (decoded.len == 0) break;
+        if (decoded.cp == 0x200D) has_zwj = true;
+        if (decoded.cp == 0xFE0F) has_emoji_variation = true;
+        if (decoded.cp == 0xFE0E) has_text_variation = true;
+        if (isExtendedPictographic(decoded.cp)) has_extended_pictographic = true;
+        if (isRegionalIndicator(decoded.cp)) regional_indicators += 1;
+
         const width: usize = @intCast(charWidth(decoded.cp, method));
         raw_max = @max(raw_max, width);
         if (!isExtend(decoded.cp) and decoded.cp != 0x200D and !isControl(decoded.cp)) {
             visible_max = @max(visible_max, width);
         }
         pos += decoded.len;
+    }
+
+    if (method == .unicode and !has_text_variation) {
+        if (has_extended_pictographic and (has_emoji_variation or has_zwj)) return 2;
+        if (regional_indicators >= 2) return 2;
     }
 
     return @intCast(@min(if (visible_max > 0) visible_max else raw_max, 2));
@@ -358,6 +374,46 @@ fn isRegionalIndicator(cp: u21) bool {
     return cp >= 0x1F1E6 and cp <= 0x1F1FF;
 }
 
+fn isEmojiPresentationCodepoint(cp: u21) bool {
+    return switch (cp) {
+        0x231A...0x231B,
+        0x23E9...0x23EC,
+        0x23F0,
+        0x23F3,
+        0x25FD...0x25FE,
+        0x2614...0x2615,
+        0x2648...0x2653,
+        0x267F,
+        0x2693,
+        0x26A1,
+        0x26AA...0x26AB,
+        0x26BD...0x26BE,
+        0x26C4...0x26C5,
+        0x26CE,
+        0x26D4,
+        0x26EA,
+        0x26F2...0x26F3,
+        0x26F5,
+        0x26FA,
+        0x26FD,
+        0x2705,
+        0x270A...0x270B,
+        0x2728,
+        0x274C,
+        0x274E,
+        0x2753...0x2755,
+        0x2757,
+        0x2795...0x2797,
+        0x27B0,
+        0x27BF,
+        0x2B1B...0x2B1C,
+        0x2B50,
+        0x2B55,
+        => true,
+        else => false,
+    };
+}
+
 fn isExtendedPictographic(cp: u21) bool {
     if (cp >= 0x1F000 and cp <= 0x1FAFF) return true;
     return switch (cp) {
@@ -444,6 +500,27 @@ test "strWidth sums grapheme cluster widths" {
     try std.testing.expectEqual(@as(usize, 2), strWidth("👋🏿", .wcwidth));
     try std.testing.expectEqual(@as(usize, 2), strWidth("👩‍🚀", .wcwidth));
     try std.testing.expectEqual(@as(usize, 2), strWidth("🇨🇦", .wcwidth));
+}
+
+test "WidthMethod distinguishes emoji presentation clusters" {
+    try std.testing.expectEqual(@as(usize, 1), strWidth("♥", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 1), strWidth("♥", .unicode));
+    try std.testing.expectEqual(@as(usize, 1), strWidth("♥️", .wcwidth));
+    try std.testing.expectEqual(@as(usize, 2), strWidth("♥️", .unicode));
+    try std.testing.expectEqual(@as(usize, 1), strWidth("♥︎", .unicode));
+    try std.testing.expectEqual(@as(usize, 2), strWidth("☕", .unicode));
+}
+
+test "unicode width treats emoji clusters as width two" {
+    try std.testing.expectEqual(@as(usize, 2), strWidth("👩‍🚀", .unicode));
+    try std.testing.expectEqual(@as(usize, 2), strWidth("🇨🇦", .unicode));
+    try std.testing.expectEqual(@as(usize, 2), strWidth("👋🏿", .unicode));
+}
+
+test "sliceToWidth respects emoji presentation width" {
+    try std.testing.expectEqualStrings("♥️", sliceToWidth("♥️x", 2, .unicode));
+    try std.testing.expectEqualStrings("", sliceToWidth("♥️x", 1, .unicode));
+    try std.testing.expectEqualStrings("♥️x", sliceToWidth("♥️x", 3, .unicode));
 }
 
 test "sliceToWidth truncates at grapheme boundary" {

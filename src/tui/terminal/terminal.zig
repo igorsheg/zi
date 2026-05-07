@@ -78,13 +78,42 @@ pub const Terminal = struct {
 
     fn detectCapabilities() Capabilities {
         var caps: Capabilities = .{};
+        var width_forced = false;
 
-        if (std.c.getenv("TMUX") != null) {
+        if (std.c.getenv("ZI_WIDTH_METHOD")) |override_z| {
+            const override = std.mem.span(override_z);
+            if (std.mem.eql(u8, override, "unicode")) {
+                caps.width_method = .unicode;
+                width_forced = true;
+            } else if (std.mem.eql(u8, override, "wcwidth")) {
+                caps.width_method = .wcwidth;
+                width_forced = true;
+            }
+        } else if (std.c.getenv("TMUX") != null) {
             caps.width_method = .wcwidth;
         } else if (std.c.getenv("TERM")) |term_z| {
             const term = std.mem.span(term_z);
             if (std.mem.startsWith(u8, term, "tmux") or std.mem.startsWith(u8, term, "screen")) {
                 caps.width_method = .wcwidth;
+            } else if (std.mem.eql(u8, term, "xterm-kitty") or std.mem.indexOf(u8, term, "ghostty") != null) {
+                caps.width_method = .unicode;
+            }
+        }
+
+        if (!width_forced and caps.width_method == .wcwidth) {
+            if (std.c.getenv("KITTY_WINDOW_ID") != null or
+                std.c.getenv("WEZTERM_EXECUTABLE") != null or
+                std.c.getenv("GHOSTTY_RESOURCES_DIR") != null)
+            {
+                caps.width_method = .unicode;
+            } else if (std.c.getenv("TERM_PROGRAM")) |program_z| {
+                const program = std.mem.span(program_z);
+                if (std.mem.eql(u8, program, "WezTerm") or
+                    std.mem.eql(u8, program, "iTerm.app") or
+                    std.mem.eql(u8, program, "ghostty"))
+                {
+                    caps.width_method = .unicode;
+                }
             }
         }
 

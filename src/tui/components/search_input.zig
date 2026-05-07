@@ -3,6 +3,7 @@ const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -63,3 +64,23 @@ pub const SearchInput = struct {
         return Component.init(SearchInput, self);
     }
 };
+
+const testing = @import("std").testing;
+const Buffer = buffer_mod.Buffer;
+
+test "SearchInput cursor follows rendered width method" {
+    const theme = themes_builtin.dark();
+    var input = SearchInput.init(theme);
+    input.setText("♥️x");
+    input.setFocused(true);
+
+    var wc_buf = try Buffer.init(testing.allocator, 8, 1, .wcwidth);
+    defer wc_buf.deinit();
+    input.render(wc_buf.region());
+    try testing.expectEqual(@as(u32, 4), input.cursorState().?.x);
+
+    var unicode_buf = try Buffer.init(testing.allocator, 8, 1, .unicode);
+    defer unicode_buf.deinit();
+    input.render(unicode_buf.region());
+    try testing.expectEqual(@as(u32, 5), input.cursorState().?.x);
+}
