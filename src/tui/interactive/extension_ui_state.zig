@@ -10,6 +10,9 @@ const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const overlay_mod = @import("../primitives/overlay.zig");
 const keys_mod = @import("../terminal/keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
+const chrome_mod = @import("../primitives/chrome.zig");
+const theme_mod = @import("../theme.zig");
+const themes_builtin = @import("../../themes/builtin.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
@@ -22,11 +25,13 @@ const TextComponent = text_component_mod.Text;
 const TextRun = text_component_mod.TextRun;
 const MarkdownComponent = markdown_component_mod.Markdown;
 const WidthMethod = grapheme_mod.WidthMethod;
+const Theme = theme_mod.Theme;
 
 pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
     views: std.StringHashMap(ViewRecord),
     frames: std.StringHashMap(FrameRecord),
+    theme: *const Theme,
     status_component: TargetComponent,
     toast_component: TargetComponent,
     overlay_component: TargetComponent,
@@ -38,6 +43,7 @@ pub const ExtensionUiState = struct {
             .allocator = allocator,
             .views = std.StringHashMap(ViewRecord).init(allocator),
             .frames = std.StringHashMap(FrameRecord).init(allocator),
+            .theme = themes_builtin.dark(),
             .status_component = .{ .target = .status },
             .toast_component = .{ .target = .toast },
             .overlay_component = .{ .target = .overlay },
@@ -60,6 +66,14 @@ pub const ExtensionUiState = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.frames.deinit();
+    }
+
+    pub fn setTheme(self: *ExtensionUiState, theme: *const Theme) void {
+        self.theme = theme;
+    }
+
+    fn activeTheme(self: *const ExtensionUiState) *const Theme {
+        return self.theme;
     }
 
     pub fn statusComponent(self: *ExtensionUiState) Component {
@@ -364,13 +378,14 @@ fn measureNode(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, 
         .text => |t| measureText(state, t, width, width_method),
         .chip => 1,
         .progress => 1,
+        .separator => 1,
         .surface => |s| constraintHeight(s.style.height) orelse 1,
-        .box => |b| measureBox(state, b, width, width_method),
+        .view => |b| measureView(state, b, width, width_method),
     };
 }
 
-fn measureBox(state: *ExtensionUiState, b: extension_ui.UiNode.Box, width: u32, width_method: WidthMethod) u32 {
-    const border: u32 = if (b.style.border) 1 else 0;
+fn measureView(state: *ExtensionUiState, b: extension_ui.UiNode.View, width: u32, width_method: WidthMethod) u32 {
+    const border: u32 = if (hasFrameChrome(b.style.chrome)) 1 else 0;
     const pad_v = edge(b.style.padding.top) + edge(b.style.padding.bottom);
     const pad_h = edge(b.style.padding.left) + edge(b.style.padding.right);
     const child_width = width -| (border * 2 + pad_h);
@@ -422,7 +437,7 @@ fn applyTextOptions(text: *TextComponent, t: extension_ui.UiNode.Text) void {
 }
 
 fn applyTextContent(state: *ExtensionUiState, text: *TextComponent, t: extension_ui.UiNode.Text) !void {
-    applyStyleToText(text, t.style);
+    applyStyleToText(state, text, t.style);
     if (t.format == .ansi) {
         const parsed = try parseAnsiText(state.allocator, t.text, text.fg);
         defer parsed.deinit(state.allocator);
@@ -434,7 +449,7 @@ fn applyTextContent(state: *ExtensionUiState, text: *TextComponent, t: extension
         defer state.allocator.free(runs);
         for (spans, 0..) |span, i| {
             const style = span.style orelse t.style;
-            runs[i] = .{ .text = span.text, .fg = styleFg(style), .bg = styleBg(style), .attrs = styleAttrs(style), .link = span.link orelse t.link };
+            runs[i] = .{ .text = span.text, .fg = styleFg(state.activeTheme(), style), .bg = styleBg(style), .attrs = styleAttrs(style), .link = span.link orelse t.link };
         }
         text.setRuns(runs);
     } else {
@@ -640,14 +655,14 @@ fn ansi256Color(index: u8) Color {
     return Color.rgb(level, level, level);
 }
 
-fn applyStyleToText(text: *TextComponent, style: extension_ui.Style) void {
-    text.fg = styleFg(style);
+fn applyStyleToText(state: *ExtensionUiState, text: *TextComponent, style: extension_ui.Style) void {
+    text.fg = styleFg(state.activeTheme(), style);
     text.bg = styleBg(style);
     text.attrs = styleAttrs(style);
 }
 
-fn styleFg(style: extension_ui.Style) Color {
-    return if (style.fg) |fg| uiColor(fg) else toneColor(style.tone);
+fn styleFg(theme: *const Theme, style: extension_ui.Style) Color {
+    return if (style.fg) |fg| uiColor(fg) else chrome_mod.toneFg(theme, toChromeTone(style.tone));
 }
 
 fn styleBg(style: extension_ui.Style) Color {
@@ -668,21 +683,10 @@ fn uiColor(color: extension_ui.Color) Color {
     return Color.rgb(color.r, color.g, color.b);
 }
 
-fn toneColor(tone: extension_ui.Tone) Color {
-    return switch (tone) {
-        .neutral => Color.default,
-        .info => Color.rgb(96, 165, 250),
-        .success => Color.rgb(34, 197, 94),
-        .warning => Color.rgb(234, 179, 8),
-        .danger => Color.rgb(239, 68, 68),
-        .accent => Color.rgb(168, 85, 247),
-    };
-}
-
 fn initMarkdown(state: *ExtensionUiState, t: extension_ui.UiNode.Text, width_method: WidthMethod) MarkdownComponent {
     var md = MarkdownComponent.init(state.allocator, width_method);
     md.setContent(t.text);
-    md.fg = styleFg(t.style);
+    md.fg = styleFg(state.activeTheme(), t.style);
     md.bg = styleBg(t.style);
     md.attrs = styleAttrs(t.style);
     // Markdown exposes symmetric padding only. Preserve text style padding when it is
@@ -725,18 +729,18 @@ fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: ext
         .text => |t| renderText(state, region, t),
         .chip => |ch| renderChip(region, ch.label),
         .progress => |pr| renderProgress(region, pr),
+        .separator => |sep| renderSeparator(state, region, sep),
         .surface => |s| if (state.findFrame(view.state_owner_id, view.id, s.id)) |frame| {
             if (frame.generation >= view.generation) framebuffer_surface_mod.renderFrame(region, frame, 0);
         },
-        .box => |b| renderBox(state, view, b, region),
+        .view => |b| renderView(state, view, b, region),
     }
 }
 
-fn renderBox(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.Box, region: Region) void {
+fn renderView(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, region: Region) void {
     var inner = region;
-    if (b.style.border and region.width >= 2 and region.height >= 2) {
-        drawBorder(region);
-        inner = region.sub(1, 1, region.width - 2, region.height - 2);
+    if (renderChrome(state, b.style.chrome, region)) |chrome_inner| {
+        inner = chrome_inner;
     }
     const pl = edge(b.style.padding.left);
     const pr = edge(b.style.padding.right);
@@ -747,7 +751,7 @@ fn renderBox(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extensi
     if (b.style.flex_direction == .row) renderRow(state, view, b, inner) else renderColumn(state, view, b, inner);
 }
 
-fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.Box, region: Region) void {
+fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, region: Region) void {
     const gap = edge(b.style.gap);
     var y: u32 = 0;
     for (b.children, 0..) |child, i| {
@@ -759,7 +763,7 @@ fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: exte
     }
 }
 
-fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.Box, region: Region) void {
+fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, region: Region) void {
     const gap = edge(b.style.gap);
     const total_gap = gap *| @as(u32, @intCast(if (b.children.len > 0) b.children.len - 1 else 0));
     const avail = region.width -| total_gap;
@@ -781,10 +785,11 @@ fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extensi
 
 fn resolveHeight(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, avail: u32, width_method: WidthMethod) u32 {
     const c = switch (node) {
-        .box => |b| b.style.height,
+        .view => |b| b.style.height,
         .text => |t| t.style.height,
         .chip => |c| c.style.height,
         .progress => |p| p.style.height,
+        .separator => |s| s.style.height,
         .surface => |s| s.style.height,
     };
     if (c) |v| return resolveConstraint(v, avail);
@@ -793,10 +798,11 @@ fn resolveHeight(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32
 
 fn widthConstraint(node: extension_ui.UiNode) ?extension_ui.Constraint {
     return switch (node) {
-        .box => |b| b.style.width,
+        .view => |b| b.style.width,
         .text => |t| t.style.width,
         .chip => |c| c.style.width,
         .progress => |p| p.style.width,
+        .separator => |s| s.style.width,
         .surface => |s| s.style.width,
     };
 }
@@ -817,24 +823,48 @@ fn constraintHeight(c: ?extension_ui.Constraint) ?u32 {
     } else null;
 }
 
-fn drawBorder(region: Region) void {
-    const attrs = Attributes.none;
-    const fg = Color.default;
-    const bg = Color.default;
-    region.set(0, 0, charCell('┌', fg, bg, attrs));
-    region.set(region.width - 1, 0, charCell('┐', fg, bg, attrs));
-    region.set(0, region.height - 1, charCell('└', fg, bg, attrs));
-    region.set(region.width - 1, region.height - 1, charCell('┘', fg, bg, attrs));
-    var x: u32 = 1;
-    while (x + 1 < region.width) : (x += 1) {
-        region.set(x, 0, charCell('─', fg, bg, attrs));
-        region.set(x, region.height - 1, charCell('─', fg, bg, attrs));
-    }
-    var y: u32 = 1;
-    while (y + 1 < region.height) : (y += 1) {
-        region.set(0, y, charCell('│', fg, bg, attrs));
-        region.set(region.width - 1, y, charCell('│', fg, bg, attrs));
-    }
+fn hasFrameChrome(chrome: extension_ui.Chrome) bool {
+    return switch (chrome) {
+        .none => false,
+        .frame => true,
+    };
+}
+
+fn renderChrome(state: *ExtensionUiState, chrome_spec: extension_ui.Chrome, region: Region) ?Region {
+    return switch (chrome_spec) {
+        .none => null,
+        .frame => |frame| renderFrameChrome(state, frame, region),
+    };
+}
+
+fn renderFrameChrome(state: *ExtensionUiState, frame_chrome: extension_ui.Chrome.FrameChrome, region: Region) ?Region {
+    const frame = chrome_mod.Frame{
+        .title = frame_chrome.title,
+        .trailing = frame_chrome.trailing,
+        .border = toChromeBorderStyle(frame_chrome.border),
+        .tone = toChromeTone(frame_chrome.tone),
+    };
+    const layout = frame.render(region, state.activeTheme()) orelse return null;
+    return layout.body;
+}
+
+fn toChromeTone(tone: extension_ui.Tone) chrome_mod.Tone {
+    return switch (tone) {
+        .neutral => .neutral,
+        .muted => .muted,
+        .info => .info,
+        .success => .success,
+        .warning => .warning,
+        .danger => .danger,
+        .accent => .accent,
+    };
+}
+
+fn toChromeBorderStyle(border: extension_ui.BorderStyle) chrome_mod.BorderStyle {
+    return switch (border) {
+        .rounded => .rounded,
+        .square => .square,
+    };
 }
 
 fn renderChip(region: Region, label: []const u8) void {
@@ -842,6 +872,11 @@ fn renderChip(region: Region, label: []const u8) void {
     if (region.width > 2) _ = region.writeStr(2, 0, label, Color.default, Color.default, Attributes.none);
     const close_x = @min(@as(u32, @intCast(label.len)) + 2, region.width - 1);
     if (close_x + 1 < region.width) _ = region.writeStr(close_x, 0, " ]", Color.default, Color.default, Attributes.none);
+}
+
+fn renderSeparator(state: *ExtensionUiState, region: Region, sep: extension_ui.UiNode.Separator) void {
+    const color = if (sep.style.fg) |fg| uiColor(fg) else null;
+    (chrome_mod.Separator{ .color = color }).render(region, state.activeTheme());
 }
 
 fn renderProgress(region: Region, pr: extension_ui.UiNode.Progress) void {
@@ -969,7 +1004,7 @@ test "extension ui wraps text and lays out following column content below it" {
     const text = extension_ui.UiNode{ .text = .{ .text = "hello world" } };
     const chip = extension_ui.UiNode{ .chip = .{ .label = "next" } };
     const children = [_]extension_ui.UiNode{ text, chip };
-    const root = extension_ui.UiNode{ .box = .{ .children = @constCast(&children) } };
+    const root = extension_ui.UiNode{ .view = .{ .children = @constCast(&children) } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
 
     var comp = state.statusComponent();
@@ -988,7 +1023,7 @@ test "extension ui renders bordered box" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const child = extension_ui.UiNode{ .text = .{ .text = "hi" } };
-    const root = extension_ui.UiNode{ .box = .{ .style = .{ .border = true, .padding = .{ .left = 1, .top = 0 } }, .children = @constCast(&[_]extension_ui.UiNode{child}) } };
+    const root = extension_ui.UiNode{ .view = .{ .style = .{ .chrome = .{ .frame = .{} }, .padding = .{ .left = 1, .top = 0 } }, .children = @constCast(&[_]extension_ui.UiNode{child}) } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
     var buf = try Buffer.init(std.testing.allocator, 8, 3, .wcwidth);
     defer buf.deinit();
@@ -1033,7 +1068,7 @@ test "extension ui renders text spans with colors and attributes" {
     try std.testing.expect(buf.get(0, 0).bg.eql(Color.rgb(4, 5, 6)));
     try std.testing.expect(buf.get(0, 0).attrs.bold);
     try std.testing.expect(buf.get(0, 0).attrs.underline);
-    try std.testing.expect(buf.get(2, 0).fg.eql(toneColor(.danger)));
+    try std.testing.expect(buf.get(2, 0).fg.eql(chrome_mod.toneFg(state.activeTheme(), toChromeTone(.danger))));
     try std.testing.expect(buf.get(2, 0).attrs.italic);
     try std.testing.expect(buf.get(2, 0).attrs.strikethrough);
 }
@@ -1086,8 +1121,8 @@ test "extension ui wraps text spans across span boundaries" {
     renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
     try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
     try std.testing.expectEqual(@as(u21, 'd'), cpAt(&buf, 0, 1));
-    try std.testing.expect(buf.get(0, 0).fg.eql(toneColor(.info)));
-    try std.testing.expect(buf.get(0, 1).fg.eql(toneColor(.warning)));
+    try std.testing.expect(buf.get(0, 0).fg.eql(chrome_mod.toneFg(state.activeTheme(), toChromeTone(.info))));
+    try std.testing.expect(buf.get(0, 1).fg.eql(chrome_mod.toneFg(state.activeTheme(), toChromeTone(.warning))));
 }
 
 test "extension ui ansi text strips escapes for measurement and render" {

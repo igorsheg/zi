@@ -43,7 +43,49 @@ pub const UiTargetOptions = struct {
     pub fn deinit(_: *UiTargetOptions, _: std.mem.Allocator) void {}
 };
 
-pub const Tone = enum { neutral, info, success, warning, danger, accent };
+pub const Tone = enum { neutral, muted, info, success, warning, danger, accent };
+
+pub const BorderStyle = enum { rounded, square };
+
+pub const Chrome = union(enum) {
+    none,
+    frame: FrameChrome,
+
+    pub const FrameChrome = struct {
+        title: ?[]const u8 = null,
+        trailing: ?[]const u8 = null,
+        border: BorderStyle = .rounded,
+        tone: Tone = .muted,
+    };
+
+    pub fn clone(allocator: std.mem.Allocator, chrome: Chrome) !Chrome {
+        return switch (chrome) {
+            .none => .none,
+            .frame => |f| blk: {
+                const title = if (f.title) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (title) |v| allocator.free(v);
+                const trailing = if (f.trailing) |v| try allocator.dupe(u8, v) else null;
+                break :blk .{ .frame = .{
+                    .title = title,
+                    .trailing = trailing,
+                    .border = f.border,
+                    .tone = f.tone,
+                } };
+            },
+        };
+    }
+
+    pub fn deinit(self: *Chrome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .none => {},
+            .frame => |*f| {
+                if (f.title) |v| allocator.free(v);
+                if (f.trailing) |v| allocator.free(v);
+            },
+        }
+        self.* = undefined;
+    }
+};
 
 pub const Color = struct {
     r: u8,
@@ -81,7 +123,7 @@ pub const Style = struct {
     justify: Justify = .start,
     padding: EdgeSizes = .{},
     gap: f32 = 0,
-    border: bool = false,
+    chrome: Chrome = .none,
     tone: Tone = .neutral,
     fg: ?Color = null,
     bg: ?Color = null,
@@ -91,10 +133,15 @@ pub const Style = struct {
     underline: bool = false,
     strikethrough: bool = false,
 
-    pub fn clone(_: std.mem.Allocator, style: Style) !Style {
-        return style;
+    pub fn clone(allocator: std.mem.Allocator, style: Style) !Style {
+        var cloned = style;
+        cloned.chrome = try Chrome.clone(allocator, style.chrome);
+        return cloned;
     }
-    pub fn deinit(_: *Style, _: std.mem.Allocator) void {}
+    pub fn deinit(self: *Style, allocator: std.mem.Allocator) void {
+        self.chrome.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 pub const TextSpan = struct {
@@ -105,32 +152,38 @@ pub const TextSpan = struct {
     pub fn clone(allocator: std.mem.Allocator, span: TextSpan) !TextSpan {
         const text = try allocator.dupe(u8, span.text);
         errdefer allocator.free(text);
-        return .{ .text = text, .style = span.style, .link = if (span.link) |v| try allocator.dupe(u8, v) else null };
+        var style = if (span.style) |s| try Style.clone(allocator, s) else null;
+        errdefer if (style) |*v| v.deinit(allocator);
+        const link = if (span.link) |v| try allocator.dupe(u8, v) else null;
+        return .{ .text = text, .style = style, .link = link };
     }
 
     pub fn deinit(self: *TextSpan, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
+        if (self.style) |*s| s.deinit(allocator);
         if (self.link) |v| allocator.free(v);
         self.* = undefined;
     }
 };
 
 pub const UiNode = union(enum) {
-    box: Box,
+    view: View,
     text: Text,
     chip: Chip,
     progress: Progress,
+    separator: Separator,
     surface: Surface,
 
-    pub const Box = struct { id: ?[]const u8 = null, style: Style = .{}, children: []UiNode = &.{} };
+    pub const View = struct { id: ?[]const u8 = null, style: Style = .{}, children: []UiNode = &.{} };
     pub const Text = struct { id: ?[]const u8 = null, text: []const u8, spans: ?[]TextSpan = null, style: Style = .{}, wrap: TextWrap = .word, overflow: TextOverflow = .clip, format: TextFormat = .plain, @"align": TextAlign = .left, max_lines: ?u32 = null, scroll_y: u32 = 0, scroll_x: u32 = 0, link: ?[]const u8 = null, selectable: bool = false };
     pub const Chip = struct { id: ?[]const u8 = null, label: []const u8, style: Style = .{} };
     pub const Progress = struct { id: ?[]const u8 = null, value: ?f32 = null, label: ?[]const u8 = null, style: Style = .{} };
+    pub const Separator = struct { id: ?[]const u8 = null, style: Style = .{} };
     pub const Surface = struct { id: []const u8, style: Style = .{} };
 
     pub fn clone(allocator: std.mem.Allocator, node: UiNode) !UiNode {
         return switch (node) {
-            .box => |b| blk: {
+            .view => |b| blk: {
                 const id = if (b.id) |v| try allocator.dupe(u8, v) else null;
                 errdefer if (id) |v| allocator.free(v);
                 const children = try allocator.alloc(UiNode, b.children.len);
@@ -143,7 +196,7 @@ pub const UiNode = union(enum) {
                     children[i] = try UiNode.clone(allocator, child);
                     n += 1;
                 }
-                break :blk .{ .box = .{ .id = id, .style = try Style.clone(allocator, b.style), .children = children } };
+                break :blk .{ .view = .{ .id = id, .style = try Style.clone(allocator, b.style), .children = children } };
             },
             .text => |t| blk: {
                 const id = if (t.id) |v| try allocator.dupe(u8, v) else null;
@@ -165,24 +218,67 @@ pub const UiNode = union(enum) {
                     }
                     break :sblk dst;
                 } else null;
-                break :blk .{ .text = .{ .id = id, .text = text, .spans = spans, .style = t.style, .wrap = t.wrap, .overflow = t.overflow, .format = t.format, .@"align" = t.@"align", .max_lines = t.max_lines, .scroll_y = t.scroll_y, .scroll_x = t.scroll_x, .link = link, .selectable = t.selectable } };
+                errdefer if (spans) |items| {
+                    for (items) |*span| span.deinit(allocator);
+                    allocator.free(items);
+                };
+                break :blk .{ .text = .{ .id = id, .text = text, .spans = spans, .style = try Style.clone(allocator, t.style), .wrap = t.wrap, .overflow = t.overflow, .format = t.format, .@"align" = t.@"align", .max_lines = t.max_lines, .scroll_y = t.scroll_y, .scroll_x = t.scroll_x, .link = link, .selectable = t.selectable } };
             },
-            .chip => |ch| .{ .chip = .{ .id = if (ch.id) |v| try allocator.dupe(u8, v) else null, .label = try allocator.dupe(u8, ch.label), .style = ch.style } },
-            .progress => |pr| .{ .progress = .{ .id = if (pr.id) |v| try allocator.dupe(u8, v) else null, .value = pr.value, .label = if (pr.label) |v| try allocator.dupe(u8, v) else null, .style = pr.style } },
-            .surface => |s| .{ .surface = .{ .id = try allocator.dupe(u8, s.id), .style = s.style } },
+            .chip => |ch| blk: {
+                const style = try Style.clone(allocator, ch.style);
+                errdefer {
+                    var owned = style;
+                    owned.deinit(allocator);
+                }
+                const id = if (ch.id) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (id) |v| allocator.free(v);
+                const label = try allocator.dupe(u8, ch.label);
+                break :blk .{ .chip = .{ .id = id, .label = label, .style = style } };
+            },
+            .progress => |pr| blk: {
+                const style = try Style.clone(allocator, pr.style);
+                errdefer {
+                    var owned = style;
+                    owned.deinit(allocator);
+                }
+                const id = if (pr.id) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (id) |v| allocator.free(v);
+                const label = if (pr.label) |v| try allocator.dupe(u8, v) else null;
+                break :blk .{ .progress = .{ .id = id, .value = pr.value, .label = label, .style = style } };
+            },
+            .separator => |sep| blk: {
+                const style = try Style.clone(allocator, sep.style);
+                errdefer {
+                    var owned = style;
+                    owned.deinit(allocator);
+                }
+                const id = if (sep.id) |v| try allocator.dupe(u8, v) else null;
+                break :blk .{ .separator = .{ .id = id, .style = style } };
+            },
+            .surface => |s| blk: {
+                const style = try Style.clone(allocator, s.style);
+                errdefer {
+                    var owned = style;
+                    owned.deinit(allocator);
+                }
+                const id = try allocator.dupe(u8, s.id);
+                break :blk .{ .surface = .{ .id = id, .style = style } };
+            },
         };
     }
 
     pub fn deinit(self: *UiNode, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .box => |*b| {
+            .view => |*b| {
                 if (b.id) |v| allocator.free(v);
+                b.style.deinit(allocator);
                 for (b.children) |*child| child.deinit(allocator);
                 allocator.free(b.children);
             },
             .text => |*t| {
                 if (t.id) |v| allocator.free(v);
                 allocator.free(t.text);
+                t.style.deinit(allocator);
                 if (t.link) |v| allocator.free(v);
                 if (t.spans) |spans| {
                     for (spans) |*span| span.deinit(allocator);
@@ -192,12 +288,21 @@ pub const UiNode = union(enum) {
             .chip => |*ch| {
                 if (ch.id) |v| allocator.free(v);
                 allocator.free(ch.label);
+                ch.style.deinit(allocator);
             },
             .progress => |*pr| {
                 if (pr.id) |v| allocator.free(v);
                 if (pr.label) |v| allocator.free(v);
+                pr.style.deinit(allocator);
             },
-            .surface => |*s| allocator.free(s.id),
+            .separator => |*sep| {
+                if (sep.id) |v| allocator.free(v);
+                sep.style.deinit(allocator);
+            },
+            .surface => |*s| {
+                allocator.free(s.id);
+                s.style.deinit(allocator);
+            },
         }
         self.* = undefined;
     }
@@ -225,7 +330,6 @@ pub const RenderSpec = struct {
     id: []const u8,
     target: UiTarget = .overlay,
     target_options: UiTargetOptions = .{},
-    title: ?[]const u8 = null,
     order: i64 = 0,
     focus: bool = false,
     remove: bool = false,
@@ -237,8 +341,6 @@ pub const RenderSpec = struct {
         errdefer allocator.free(state_owner_id);
         const id = try allocator.dupe(u8, spec.id);
         errdefer allocator.free(id);
-        const title = if (spec.title) |v| try allocator.dupe(u8, v) else null;
-        errdefer if (title) |v| allocator.free(v);
         const root = if (spec.root) |n| try UiNode.clone(allocator, n) else null;
         errdefer if (root) |*r| {
             var rr = r.*;
@@ -254,14 +356,13 @@ pub const RenderSpec = struct {
             keys[i] = try KeyBinding.clone(allocator, k);
             initialized += 1;
         }
-        return .{ .state_owner_id = state_owner_id, .generation = spec.generation, .id = id, .target = spec.target, .target_options = try UiTargetOptions.clone(allocator, spec.target_options), .title = title, .order = spec.order, .focus = spec.focus, .remove = spec.remove, .root = root, .keys = keys };
+        return .{ .state_owner_id = state_owner_id, .generation = spec.generation, .id = id, .target = spec.target, .target_options = try UiTargetOptions.clone(allocator, spec.target_options), .order = spec.order, .focus = spec.focus, .remove = spec.remove, .root = root, .keys = keys };
     }
 
     pub fn deinit(self: *RenderSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.state_owner_id);
         allocator.free(self.id);
         self.target_options.deinit(allocator);
-        if (self.title) |v| allocator.free(v);
         if (self.root) |*r| r.deinit(allocator);
         for (self.keys) |*k| k.deinit(allocator);
         allocator.free(self.keys);
@@ -417,8 +518,8 @@ pub const JobEvent = struct {
 test "ui v3 render spec clone owns node tree" {
     const testing = std.testing;
     const child = UiNode{ .text = .{ .id = "child", .text = "hello", .style = .{ .tone = .info } } };
-    const root = UiNode{ .box = .{ .id = "root-node", .style = .{ .flex_direction = .row, .gap = 1 }, .children = @constCast(&[_]UiNode{child}) } };
-    const spec = RenderSpec{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .target_options = .{ .anchor = .top_right }, .title = "Title", .root = root, .keys = @constCast(&[_]KeyBinding{.{ .key = "ctrl+x", .action = "close" }}) };
+    const root = UiNode{ .view = .{ .id = "root-node", .style = .{ .flex_direction = .row, .gap = 1 }, .children = @constCast(&[_]UiNode{child}) } };
+    const spec = RenderSpec{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .target_options = .{ .anchor = .top_right }, .root = root, .keys = @constCast(&[_]KeyBinding{.{ .key = "ctrl+x", .action = "close" }}) };
     var cloned = try RenderSpec.clone(testing.allocator, spec);
     defer cloned.deinit(testing.allocator);
     try testing.expectEqualStrings("owner", cloned.state_owner_id);

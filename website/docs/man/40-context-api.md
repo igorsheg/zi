@@ -115,16 +115,15 @@ Text nodes render plain, ANSI, or Markdown text and may contain newlines. By def
 `selectable`
 : Optional boolean marking text as selectable for future selection-oriented UI behavior. Markdown-format text currently ignores this hint.
 
-Style colors accept names such as `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `black`, or hex strings like `#7aa2f7`. Tones include `neutral`, `info`, `success`, `warning`, `danger`, and `accent`.
+Style colors accept names such as `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `black`, or hex strings like `#7aa2f7`. Tones include `neutral`, `muted`, `info`, `success`, `warning`, `danger`, and `accent`. Visual frame chrome lives on the composing `view` via `style.chrome`; overlays only place/focus the tree.
 
 Dashboard text example:
 
 ```lua
 ctx.ui.render({
   id = "session-breakdown",
-  title = "Session breakdown",
   target = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center" },
-  root = { type = "box", style = { border = true, padding = 1, gap = 1 }, children = {
+  root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1, gap = 1 }, children = {
     { type = "text", wrap = "none", spans = {
       { text = "7d", style = { tone = "accent", bold = true } },
       { text = " · tokens · cost", style = { dim = true } },
@@ -146,10 +145,9 @@ ctx.ui.render({
 
 ctx.ui.render({
   id = "panel",
-  title = "Panel",
   target = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" },
   keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
-  root = { type = "box", style = { border = true, padding = 1 }, children = {
+  root = { type = "view", style = { chrome = { kind = "frame", title = "Panel", border = "rounded", tone = "muted" }, padding = 1 }, children = {
     { type = "text", text = "Press q or Esc to close." },
   } },
 })

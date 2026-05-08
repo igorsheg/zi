@@ -125,11 +125,14 @@ return function(zi)
     handler = function(args, ctx)
       ctx.ui.render({
         id = "hello-command",
-        title = "hello",
         target = { kind = "overlay", width = "60%", anchor = "center", backdrop = "dim" },
         focus = true,
         keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
-        root = { type = "text", text = "hello, " .. (args or "zi") },
+        root = {
+          type = "view",
+          style = { chrome = { kind = "frame", title = "hello", border = "rounded", tone = "muted" }, padding = 1 },
+          children = { { type = "text", text = "hello, " .. (args or "zi") } },
+        },
       })
     end,
   })
@@ -150,7 +153,7 @@ Built-ins stay TUI-local when they need immediate UI/session behavior. Extension
 
 `ctx.ui.render({ focus = true, target = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. Overlays without `focus = true`, including toasts and status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
 
-UI render trees support `box`, `text`, `chip`, `progress`, and `surface` nodes. The full text-node API, including wrapping, spans, ANSI/Markdown formats, links, and selection hints, is documented in [Context](context.html#ui-text-nodes). `surface` remains available for framebuffer graphs.
+UI render trees support `view`, `text`, `chip`, `progress`, `separator`, and `surface` nodes. Visual frame chrome is composed on `view.style.chrome`; top-level render specs describe placement/focus only. The full text-node API, including wrapping, spans, ANSI/Markdown formats, links, and selection hints, is documented in [Context](context.html#ui-text-nodes). `surface` remains available for framebuffer graphs.
 
 ## Providers
 

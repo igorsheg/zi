@@ -7,6 +7,7 @@ const text_mod = @import("text.zig");
 const panel_mod = @import("panel.zig");
 const theme_mod = @import("../theme.zig");
 const grapheme_mod = @import("../grapheme.zig");
+const chrome = @import("../primitives/chrome.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -116,10 +117,7 @@ pub const ScrollTextOverlay = struct {
         }
 
         if (inner.height > row) {
-            var col: u32 = 0;
-            while (col < inner.width) : (col += 1) {
-                inner.set(col, row, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.theme.fg(.border_muted) });
-            }
+            (chrome.Separator{}).render(inner.sub(0, row, inner.width, 1), self.theme);
             row += 1;
         }
 

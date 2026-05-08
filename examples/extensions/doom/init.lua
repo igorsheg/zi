@@ -30,7 +30,6 @@ end
 local function render_workbench(ctx)
   ctx.ui.render({
     id = view_id,
-    title = "DOOM in zi",
     target = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" },
     focus = true,
     keys = {
@@ -39,7 +38,7 @@ local function render_workbench(ctx)
       { key = "w", action = "key" }, { key = "a", action = "key" }, { key = "s", action = "key" }, { key = "d", action = "key" },
       { key = "space", action = "key" }, { key = "enter", action = "key" }, { key = "f", action = "key" },
     },
-    root = { type = "box", style = { border = true, padding = 1 }, children = {
+    root = { type = "view", style = { chrome = { kind = "frame", title = "DOOM in zi", border = "rounded", tone = "muted" }, padding = 1 }, children = {
       { type = "text", text = "Arrows/WASD move, F fires, Space uses, Q/Esc closes." },
       { type = "surface", id = node_id, style = { width = width, height = height } },
     } },

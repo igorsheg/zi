@@ -8,6 +8,7 @@ const themes_builtin = @import("../../themes/builtin.zig");
 const panel_mod = @import("panel.zig");
 const search_input_mod = @import("search_input.zig");
 const status_text_mod = @import("status_text.zig");
+const chrome = @import("../primitives/chrome.zig");
 const search = @import("../../search/root.zig");
 
 const Component = component_mod.Component;
@@ -290,10 +291,7 @@ pub const ListPicker = struct {
             self.syncSearchInput();
             self.search_input.render(inner.sub(0, 0, inner.width, 1));
             if (content_h > 1) {
-                var col: u32 = 0;
-                while (col < inner.width) : (col += 1) {
-                    inner.set(col, 1, .{ .grapheme = .{ .codepoint = 0x2500 }, .fg = self.theme.fg(.border_muted) });
-                }
+                (chrome.Separator{}).render(inner.sub(0, 1, inner.width, 1), self.theme);
             }
             body_row = 2;
             body_height = content_h -| 2;

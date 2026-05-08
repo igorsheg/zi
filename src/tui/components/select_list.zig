@@ -1,6 +1,7 @@
 const std = @import("std");
 const cell_mod = @import("../cell.zig");
 const buffer_mod = @import("../primitives/surface.zig");
+const list_rows = @import("../primitives/list_rows.zig");
 const keys_mod = @import("../terminal/keys.zig");
 const component_mod = @import("../primitives/view.zig");
 const theme_mod = @import("../theme.zig");
@@ -8,7 +9,6 @@ const themes_builtin = @import("../../themes/builtin.zig");
 const keybindings = @import("../keybindings.zig");
 
 const Color = cell_mod.Color;
-const Attributes = cell_mod.Attributes;
 const Region = buffer_mod.Region;
 const Key = keys_mod.Key;
 const Measurement = component_mod.Measurement;
@@ -116,8 +116,6 @@ pub const SelectList = struct {
 
     pub fn render(self: *const SelectList, region: Region) void {
         const muted = self.theme.fg(.muted);
-        const accent = self.theme.fg(.accent);
-        const text_color = self.theme.fg(.text);
 
         if (self.items.len == 0) {
             _ = region.writeStr(0, 0, "  ", muted, Color.default, .{});
@@ -145,19 +143,13 @@ pub const SelectList = struct {
             const item = &self.items[i];
             const is_selected = (i == self.selected_index);
 
-            const fg = if (is_selected) accent else text_color;
-            const prefix: []const u8 = if (is_selected) "\xe2\x86\x92 " else "  ";
-            var col = region.writeStr(0, row, prefix, fg, Color.default, .{});
-            col += region.writeStr(col, row, item.label, fg, Color.default, .{});
-
-            if (item.description) |desc| {
-                if (region.width > desc_threshold) {
-                    const current_label_w = region.textWidth(item.label);
-                    const pad = label_w - current_label_w + 2;
-                    col += pad;
-                    _ = region.writeStr(col, row, desc, muted, Color.default, .{ .dim = true });
-                }
-            }
+            list_rows.renderSelectableRow(.{
+                .label = item.label,
+                .description = item.description,
+                .selected = is_selected,
+                .label_width = label_w,
+                .description_min_width = desc_threshold,
+            }, region, row, self.theme);
             row += 1;
         }
 

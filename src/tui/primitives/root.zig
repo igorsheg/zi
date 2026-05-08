@@ -4,6 +4,8 @@ pub const view = @import("view.zig");
 pub const layout = @import("layout.zig");
 pub const focus = @import("focus.zig");
 pub const overlay = @import("overlay.zig");
+pub const chrome = @import("chrome.zig");
+pub const list_rows = @import("list_rows.zig");
 
 pub const Size = geometry.Size;
 pub const Point = geometry.Point;

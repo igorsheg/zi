@@ -273,6 +273,7 @@ fn publishRenderFromArgs(L: *c.lua_State) !void {
     defer arena.deinit();
     const aa = arena.allocator();
     const spec_idx = c.lua_absindex(L, 1);
+    if (hasField(L, spec_idx, "title")) return error.InvalidUiRenderTitle;
     const target = try readTargetField(L, spec_idx);
     const spec = extension_ui.RenderSpec{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
@@ -280,7 +281,6 @@ fn publishRenderFromArgs(L: *c.lua_State) !void {
         .id = try readStringFieldLimit(aa, L, spec_idx, "id", "root", ui_id_bytes),
         .target = target.kind,
         .target_options = target.options,
-        .title = try readOptionalStringFieldLimit(aa, L, spec_idx, "title", ui_text_bytes),
         .order = readIntField(L, spec_idx, "order", 0),
         .focus = readBoolField(L, spec_idx, "focus", false),
         .remove = readBoolField(L, spec_idx, "remove", false),
@@ -422,8 +422,8 @@ fn readOptionalNodeField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, 
 }
 
 fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui.UiNode {
-    const typ = try readStringFieldLimit(arena, L, idx, "type", "box", 32);
-    const style = try readStyleField(L, idx);
+    const typ = try readStringFieldLimit(arena, L, idx, "type", "view", 32);
+    const style = try readStyleField(arena, L, idx);
     const id = try readOptionalStringFieldLimit(arena, L, idx, "id", ui_id_bytes);
     if (std.mem.eql(u8, typ, "text")) {
         const spans = try readTextSpansField(arena, L, idx);
@@ -432,6 +432,7 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
     }
     if (std.mem.eql(u8, typ, "chip")) return .{ .chip = .{ .id = id, .label = try readStringFieldLimit(arena, L, idx, "label", "", ui_text_bytes), .style = style } };
     if (std.mem.eql(u8, typ, "progress")) return .{ .progress = .{ .id = id, .value = readOptionalFloatField(L, idx, "value"), .label = try readOptionalStringFieldLimit(arena, L, idx, "label", ui_text_bytes), .style = style } };
+    if (std.mem.eql(u8, typ, "separator")) return .{ .separator = .{ .id = id, .style = style } };
     if (std.mem.eql(u8, typ, "surface")) return .{ .surface = .{ .id = try readStringFieldLimit(arena, L, idx, "id", "surface", ui_id_bytes), .style = style } };
     var children: []extension_ui.UiNode = &.{};
     _ = c.lua_getfield(L, idx, "children");
@@ -446,7 +447,8 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
         }
     }
     c.lua_pop(L, 1);
-    return .{ .box = .{ .id = id, .style = style, .children = children } };
+    if (!std.mem.eql(u8, typ, "view")) return error.InvalidUiNodeType;
+    return .{ .view = .{ .id = id, .style = style, .children = children } };
 }
 
 fn readTextSpansField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[]extension_ui.TextSpan {
@@ -463,7 +465,7 @@ fn readTextSpansField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !?[
             const span_idx = c.lua_absindex(L, -1);
             spans[i] = .{
                 .text = try readStringFieldLimit(arena, L, span_idx, "text", "", ui_text_bytes),
-                .style = try readOptionalStyleField(L, span_idx, "style"),
+                .style = try readOptionalStyleField(arena, L, span_idx, "style"),
                 .link = try readOptionalStringFieldLimit(arena, L, span_idx, "link", ui_text_bytes),
             };
         } else {
@@ -529,22 +531,23 @@ fn readTextFormatField(L: *c.lua_State, idx: c_int) !extension_ui.TextFormat {
     return error.InvalidTextFormat;
 }
 
-fn readStyleField(L: *c.lua_State, idx: c_int) !extension_ui.Style {
-    return (try readOptionalStyleField(L, idx, "style")) orelse .{};
+fn readStyleField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui.Style {
+    return (try readOptionalStyleField(arena, L, idx, "style")) orelse .{};
 }
 
-fn readOptionalStyleField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.Style {
+fn readOptionalStyleField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.Style {
     _ = c.lua_getfield(L, idx, field.ptr);
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TTABLE) return null;
-    return try readStyleTable(L, c.lua_absindex(L, -1));
+    return try readStyleTable(arena, L, c.lua_absindex(L, -1));
 }
 
-fn readStyleTable(L: *c.lua_State, sidx: c_int) !extension_ui.Style {
+fn readStyleTable(arena: std.mem.Allocator, L: *c.lua_State, sidx: c_int) !extension_ui.Style {
     var style: extension_ui.Style = .{};
+    if (hasField(L, sidx, "border")) return error.InvalidUiStyleBorder;
     style.flex_grow = readFloatField(L, sidx, "flex_grow", style.flex_grow);
     style.gap = readFloatField(L, sidx, "gap", style.gap);
-    style.border = readBoolField(L, sidx, "border", style.border);
+    style.chrome = try readChromeField(arena, L, sidx);
     style.padding = .{ .top = readFloatField(L, sidx, "padding", 0), .right = readFloatField(L, sidx, "padding", 0), .bottom = readFloatField(L, sidx, "padding", 0), .left = readFloatField(L, sidx, "padding", 0) };
     style.width = readConstraintField(L, sidx, "width");
     style.height = readConstraintField(L, sidx, "height");
@@ -554,7 +557,7 @@ fn readStyleTable(L: *c.lua_State, sidx: c_int) !extension_ui.Style {
     }
     if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "tone", 16)) |tone| {
         defer std.heap.c_allocator.free(tone);
-        if (std.mem.eql(u8, tone, "info")) style.tone = .info else if (std.mem.eql(u8, tone, "success")) style.tone = .success else if (std.mem.eql(u8, tone, "warning")) style.tone = .warning else if (std.mem.eql(u8, tone, "danger")) style.tone = .danger else if (std.mem.eql(u8, tone, "accent")) style.tone = .accent;
+        if (std.mem.eql(u8, tone, "muted")) style.tone = .muted else if (std.mem.eql(u8, tone, "info")) style.tone = .info else if (std.mem.eql(u8, tone, "success")) style.tone = .success else if (std.mem.eql(u8, tone, "warning")) style.tone = .warning else if (std.mem.eql(u8, tone, "danger")) style.tone = .danger else if (std.mem.eql(u8, tone, "accent")) style.tone = .accent;
     }
     style.fg = try readColorField(L, sidx, "fg");
     style.bg = try readColorField(L, sidx, "bg");
@@ -564,6 +567,53 @@ fn readStyleTable(L: *c.lua_State, sidx: c_int) !extension_ui.Style {
     style.underline = readBoolField(L, sidx, "underline", style.underline);
     style.strikethrough = readBoolField(L, sidx, "strikethrough", style.strikethrough);
     return style;
+}
+
+fn readChromeField(arena: std.mem.Allocator, L: *c.lua_State, sidx: c_int) !extension_ui.Chrome {
+    _ = c.lua_getfield(L, sidx, "chrome");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) return .none;
+    const cidx = c.lua_absindex(L, -1);
+    const kind = try readStringFieldLimit(arena, L, cidx, "kind", "frame", 32);
+    if (std.mem.eql(u8, kind, "none")) return .none;
+    if (!std.mem.eql(u8, kind, "frame")) return error.InvalidUiChrome;
+    return .{ .frame = .{
+        .title = try readOptionalStringFieldLimit(arena, L, cidx, "title", ui_text_bytes),
+        .trailing = try readOptionalStringFieldLimit(arena, L, cidx, "trailing", ui_text_bytes),
+        .border = try readBorderStyleField(L, cidx),
+        .tone = try readToneField(L, cidx, .muted),
+    } };
+}
+
+fn readBorderStyleField(L: *c.lua_State, idx: c_int) !extension_ui.BorderStyle {
+    _ = c.lua_getfield(L, idx, "border");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .rounded;
+    const value = luaString(L, -1) orelse return .rounded;
+    if (std.mem.eql(u8, value, "rounded")) return .rounded;
+    if (std.mem.eql(u8, value, "square")) return .square;
+    return error.InvalidUiBorderStyle;
+}
+
+fn readToneField(L: *c.lua_State, idx: c_int, default: extension_ui.Tone) !extension_ui.Tone {
+    _ = c.lua_getfield(L, idx, "tone");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return default;
+    const value = luaString(L, -1) orelse return default;
+    if (std.mem.eql(u8, value, "neutral")) return .neutral;
+    if (std.mem.eql(u8, value, "muted")) return .muted;
+    if (std.mem.eql(u8, value, "info")) return .info;
+    if (std.mem.eql(u8, value, "success")) return .success;
+    if (std.mem.eql(u8, value, "warning")) return .warning;
+    if (std.mem.eql(u8, value, "danger")) return .danger;
+    if (std.mem.eql(u8, value, "accent")) return .accent;
+    return error.InvalidUiTone;
+}
+
+fn hasField(L: *c.lua_State, idx: c_int, field: [:0]const u8) bool {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    return c.lua_type(L, -1) != c.LUA_TNIL;
 }
 
 fn readColorField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.Color {

@@ -4,7 +4,7 @@ const buffer_mod = @import("../primitives/surface.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const cell_mod = @import("../cell.zig");
-const box_chrome = @import("../surfaces/box_chrome.zig");
+const chrome = @import("../primitives/chrome.zig");
 const keybindings = @import("../keybindings.zig");
 
 const Component = component_mod.Component;
@@ -29,17 +29,9 @@ pub const HotkeysOverlay = struct {
         if (w < 8 or h < 4) return;
 
         const theme = self.activeTheme();
-        const border_color = theme.fg(.border);
-        const style = box_chrome.Style{ .chrome = border_color, .fg = border_color, .dim = border_color };
-        const frame = box_chrome.closedFrame(region);
-        _ = frame.drawTop("Hotkeys", null, style);
-        _ = frame.drawBottom(style);
-
-        const inner = frame.inner;
-        var row: u32 = 0;
-        while (row < inner.height) : (row += 1) {
-            _ = frame.drawBodyRow(row, style);
-        }
+        const frame = chrome.Frame{ .title = "Hotkeys", .border = .rounded, .tone = .neutral, .color = theme.fg(.border) };
+        const layout = frame.render(region, theme) orelse return;
+        const inner = layout.body;
 
         if (inner.width == 0 or inner.height == 0) return;
         const key_width = maxKeyWidth(inner);

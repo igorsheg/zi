@@ -1,7 +1,7 @@
 const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const theme_mod = @import("../theme.zig");
-const box_chrome = @import("../surfaces/box_chrome.zig");
+const chrome = @import("../primitives/chrome.zig");
 
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
@@ -15,6 +15,7 @@ const Theme = theme_mod.Theme;
 pub const Panel = struct {
     title: ?[]const u8 = null,
     border: Color,
+    theme: *const Theme,
 
     pub const Layout = struct {
         body: Region,
@@ -24,20 +25,13 @@ pub const Panel = struct {
         return .{
             .title = title,
             .border = theme.fg(.border_muted),
+            .theme = theme,
         };
     }
 
     pub fn render(self: Panel, region: Region) ?Layout {
-        if (region.width < 2 or region.height < 2) return null;
-        const style = box_chrome.Style{ .chrome = self.border, .fg = self.border, .dim = self.border };
-        const frame = box_chrome.closedFrame(region);
-        _ = frame.drawTop(self.title, null, style);
-        _ = frame.drawBottom(style);
-
-        var row: u32 = 0;
-        while (row < frame.inner.height) : (row += 1) {
-            _ = frame.drawBodyRow(row, style);
-        }
-        return .{ .body = frame.inner };
+        const frame = chrome.Frame{ .title = self.title, .border = .rounded, .tone = .muted, .color = self.border };
+        const layout = frame.render(region, self.theme) orelse return null;
+        return .{ .body = layout.body };
     }
 };
