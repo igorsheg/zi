@@ -4,7 +4,8 @@ const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../zio/root.zig").abort;
 const agent_protocol = @import("../../agent/types.zig");
 const agent_message_memory = @import("../../agent/message_memory.zig");
-const agent_root = @import("../../agent/root.zig");
+const agent_session_core_mod = @import("../agent_session/core.zig");
+const lua_agent_serializers = @import("lua_agent_serializers.zig");
 const session_core = @import("../../session/root.zig");
 const ai = @import("../../ai/root.zig");
 const resource_types = @import("../resources/types.zig");
@@ -87,6 +88,7 @@ pub const AiCompleteStreamEvent = union(enum) {
     tool_execution_end: struct { tool_call_id: []const u8, tool_name: []const u8, result: agent_protocol.AgentToolResult, is_error: bool },
     err: []const u8,
     events_dropped: usize,
+    agent_event: agent_protocol.AgentEvent,
 
     pub fn clone(self: AiCompleteStreamEvent, allocator: std.mem.Allocator) !AiCompleteStreamEvent {
         return switch (self) {
@@ -102,6 +104,7 @@ pub const AiCompleteStreamEvent = union(enum) {
             .tool_execution_end => |v| .{ .tool_execution_end = .{ .tool_call_id = try allocator.dupe(u8, v.tool_call_id), .tool_name = try allocator.dupe(u8, v.tool_name), .result = try v.result.clone(allocator), .is_error = v.is_error } },
             .err => |msg| .{ .err = try allocator.dupe(u8, msg) },
             .events_dropped => |n| .{ .events_dropped = n },
+            .agent_event => |e| .{ .agent_event = e },
         };
     }
 
@@ -125,7 +128,7 @@ pub const AiCompleteStreamEvent = union(enum) {
                 v.result.free(allocator);
             },
             .err => |msg| allocator.free(msg),
-            .agent_start, .agent_end, .turn_start, .turn_end, .message_start, .events_dropped => {},
+            .agent_start, .agent_end, .turn_start, .turn_end, .message_start, .events_dropped, .agent_event => {},
         }
         self.* = undefined;
     }
@@ -210,13 +213,41 @@ pub const AiSessionEventSink = struct {
 };
 
 pub const AiCompleteResult = union(enum) {
-    completed: struct { text: []const u8 },
+    completed: Completed,
     err: []const u8,
     cancelled,
 
+    pub const Completed = struct {
+        text: []const u8,
+        message: ?agent_protocol.AgentMessage = null,
+        messages: []agent_protocol.AgentMessage = &.{},
+        tool_results: []agent_protocol.ToolResultMessage = &.{},
+        context_usage: ?session_core.context_usage.ContextUsage = null,
+    };
+
     pub fn clone(self: AiCompleteResult, allocator: std.mem.Allocator) !AiCompleteResult {
         return switch (self) {
-            .completed => |completed| .{ .completed = .{ .text = try allocator.dupe(u8, completed.text) } },
+            .completed => |completed| blk: {
+                var out = Completed{ .text = try allocator.dupe(u8, completed.text), .context_usage = completed.context_usage };
+                errdefer allocator.free(out.text);
+                if (completed.message) |message| out.message = try agent_message_memory.cloneMessage(allocator, message);
+                errdefer if (out.message) |*message| agent_message_memory.freeMessage(allocator, message);
+                out.messages = try agent_message_memory.cloneMessages(allocator, completed.messages);
+                errdefer agent_message_memory.freeMessages(allocator, out.messages);
+                if (completed.tool_results.len > 0) {
+                    out.tool_results = try allocator.alloc(agent_protocol.ToolResultMessage, completed.tool_results.len);
+                    var built: usize = 0;
+                    errdefer {
+                        for (out.tool_results[0..built]) |*tr| agent_message_memory.freeToolResultMessage(allocator, tr);
+                        allocator.free(out.tool_results);
+                    }
+                    for (completed.tool_results, 0..) |tr, i| {
+                        out.tool_results[i] = try agent_message_memory.cloneToolResultMessage(allocator, tr);
+                        built += 1;
+                    }
+                }
+                break :blk .{ .completed = out };
+            },
             .err => |msg| .{ .err = try allocator.dupe(u8, msg) },
             .cancelled => .cancelled,
         };
@@ -224,7 +255,15 @@ pub const AiCompleteResult = union(enum) {
 
     pub fn deinit(self: *AiCompleteResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .completed => |completed| allocator.free(completed.text),
+            .completed => |*completed| {
+                allocator.free(completed.text);
+                if (completed.message) |*message| agent_message_memory.freeMessage(allocator, message);
+                agent_message_memory.freeMessages(allocator, completed.messages);
+                if (completed.tool_results.len > 0) {
+                    for (completed.tool_results) |*tr| agent_message_memory.freeToolResultMessage(allocator, tr);
+                    allocator.free(completed.tool_results);
+                }
+            },
             .err => |msg| allocator.free(msg),
             .cancelled => {},
         }
@@ -476,7 +515,7 @@ pub const SideAiSession = struct {
     max_tokens: ?u64 = null,
     tool_allowlist: []const []const u8 = &.{},
     messages: std.ArrayListUnmanaged(agent_protocol.AgentMessage) = .empty,
-    agent: ?*agent_root.Agent = null,
+    core: ?*agent_session_core_mod.AgentSessionCore = null,
     agent_tools: []const agent_protocol.AgentTool = &.{},
     callbacks_ref: c_int = lua_runtime.c.LUA_NOREF,
     callbacks_L: ?*lua_runtime.c.lua_State = null,
@@ -491,10 +530,10 @@ pub const SideAiSession = struct {
         if (self.system_prompt) |value| allocator.free(value);
         for (self.tool_allowlist) |name| allocator.free(name);
         if (self.tool_allowlist.len > 0) allocator.free(self.tool_allowlist);
-        if (self.agent) |agent| {
-            agent.abort();
-            agent.deinit();
-            allocator.destroy(agent);
+        if (self.core) |core| {
+            core.abort();
+            core.deinit();
+            allocator.destroy(core);
         }
         if (self.agent_tools.len > 0) allocator.free(self.agent_tools);
         if (self.callbacks_ref != lua_runtime.c.LUA_NOREF) {
@@ -534,12 +573,12 @@ pub const SideAiSession = struct {
     pub fn clear(self: *SideAiSession, allocator: std.mem.Allocator) !void {
         for (self.messages.items) |*msg| agent_message_memory.freeMessage(allocator, msg);
         self.messages.clearRetainingCapacity();
-        if (self.agent) |agent| try agent.reset();
+        if (self.core) |core| try core.agent.reset();
     }
 
     pub fn isBusy(self: *const SideAiSession) bool {
         if (self.running) return true;
-        return if (self.agent) |agent| agent.isRunning() else false;
+        return if (self.core) |core| core.isBusy() else false;
     }
 
     pub fn replaceMessages(self: *SideAiSession, allocator: std.mem.Allocator, source: []const agent_protocol.AgentMessage) !void {
@@ -1482,7 +1521,7 @@ pub const ExtensionRunner = struct {
     pub fn disposeSideAiSession(self: *ExtensionRunner, id: u64) bool {
         if (self.side_ai_sessions.getPtr(id)) |session| {
             session.disposed = true;
-            if (session.agent) |agent| agent.abort();
+            if (session.core) |core| core.abort();
             if (session.isBusy()) return true;
         }
         if (self.side_ai_sessions.fetchRemove(id)) |kv| {
@@ -1594,10 +1633,15 @@ pub const ExtensionRunner = struct {
             .tool_execution_end => "tool_execution_end",
             .err => "error",
             .events_dropped => "events_dropped",
+            .agent_event => |e| @tagName(e),
         };
     }
 
     fn pushAiCompleteStreamEvent(L: *lua_runtime.c.lua_State, event: AiCompleteStreamEvent) void {
+        if (event == .agent_event) {
+            lua_agent_serializers.pushAgentEventToLua(L, event.agent_event) catch lua_runtime.c.lua_createtable(L, 0, 0);
+            return;
+        }
         lua_runtime.c.lua_createtable(L, 0, 3);
         const name = aiCompleteEventName(event);
         _ = lua_runtime.c.lua_pushlstring(L, name.ptr, name.len);
@@ -1643,6 +1687,7 @@ pub const ExtensionRunner = struct {
                 pushTextMessageTable(L, "assistant", "");
                 lua_runtime.c.lua_setfield(L, -2, "message");
             },
+            .agent_event => unreachable,
         }
     }
 

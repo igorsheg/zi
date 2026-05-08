@@ -34,6 +34,7 @@ const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
 const context_mod = @import("context.zig");
+const lua_agent_serializers = @import("lua_agent_serializers.zig");
 const dispatch = @import("dispatch.zig");
 const event_registry = @import("registries/event_registry.zig");
 
@@ -737,95 +738,43 @@ fn sessionLifecycleReasonString(reason: SessionLifecycleReason) []const u8 {
 }
 
 fn pushAgentStart(L: *c.lua_State) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 0);
+    try lua_agent_serializers.pushAgentEventToLua(L, .agent_start);
 }
 
 fn pushAgentEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 1);
-    c.lua_pushinteger(L, @intCast(payload.messages.len));
-    c.lua_setfield(L, -2, "messages_count");
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .agent_end = .{ .messages = payload.messages } });
 }
 
 fn pushTurnStart(L: *c.lua_State) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 0);
+    try lua_agent_serializers.pushAgentEventToLua(L, .turn_start);
 }
 
 fn pushTurnEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 2);
-    pushMessageRoleField(L, payload.message);
-    c.lua_pushinteger(L, @intCast(payload.tool_results.len));
-    c.lua_setfield(L, -2, "tool_results_count");
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .turn_end = .{ .message = payload.message, .tool_results = payload.tool_results } });
 }
 
 fn pushMessageStart(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 1);
-    pushMessageRoleField(L, payload.message);
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .message_start = .{ .message = payload.message } });
 }
 
 fn pushMessageUpdate(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 1);
-    pushMessageRoleField(L, payload.message);
-    _ = c.lua_pushstring(L, @tagName(payload.assistant_message_event));
-    c.lua_setfield(L, -2, "update_kind");
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .message_update = .{ .message = payload.message, .assistant_message_event = payload.assistant_message_event } });
 }
 
 fn pushMessageEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 1);
-    pushMessageRoleField(L, payload.message);
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .message_end = .{ .message = payload.message } });
 }
 
 fn pushToolExecStart(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 3);
-
-    _ = c.lua_pushlstring(L, payload.tool_call_id.ptr, payload.tool_call_id.len);
-    c.lua_setfield(L, -2, "tool_call_id");
-
-    _ = c.lua_pushlstring(L, payload.tool_name.ptr, payload.tool_name.len);
-    c.lua_setfield(L, -2, "tool_name");
-
-    try lua_runtime.pushJsonValue(L, payload.args);
-    c.lua_setfield(L, -2, "args");
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .tool_execution_start = .{ .tool_call_id = payload.tool_call_id, .tool_name = payload.tool_name, .args = payload.args } });
 }
 
 fn pushToolExecUpdate(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 4);
-
-    _ = c.lua_pushlstring(L, payload.tool_call_id.ptr, payload.tool_call_id.len);
-    c.lua_setfield(L, -2, "tool_call_id");
-
-    _ = c.lua_pushlstring(L, payload.tool_name.ptr, payload.tool_name.len);
-    c.lua_setfield(L, -2, "tool_name");
-
-    try lua_runtime.pushJsonValue(L, payload.args);
-    c.lua_setfield(L, -2, "args");
-
-    c.lua_pushboolean(L, if (payload.partial_result != null) 1 else 0);
-    c.lua_setfield(L, -2, "has_partial");
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .tool_execution_update = .{ .tool_call_id = payload.tool_call_id, .tool_name = payload.tool_name, .args = payload.args, .partial_result = payload.partial_result } });
 }
 
 fn pushToolExecEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 4);
-
-    _ = c.lua_pushlstring(L, payload.tool_call_id.ptr, payload.tool_call_id.len);
-    c.lua_setfield(L, -2, "tool_call_id");
-
-    _ = c.lua_pushlstring(L, payload.tool_name.ptr, payload.tool_name.len);
-    c.lua_setfield(L, -2, "tool_name");
-
-    c.lua_pushboolean(L, if (payload.is_error) 1 else 0);
-    c.lua_setfield(L, -2, "is_error");
-
-    c.lua_pushinteger(L, @intCast(payload.result.content.len));
-    c.lua_setfield(L, -2, "content_count");
-}
-
-/// Helper: extract the role tag from an AgentMessage and set it
-/// as the `role` field on the table currently at the top of the
-/// stack. Stack depth unchanged on return.
-fn pushMessageRoleField(L: *c.lua_State, message: agent_protocol.AgentMessage) void {
-    const role = @tagName(message);
-    _ = c.lua_pushlstring(L, role.ptr, role.len);
-    c.lua_setfield(L, -2, "role");
+    try lua_agent_serializers.pushAgentEventToLua(L, .{ .tool_execution_end = .{ .tool_call_id = payload.tool_call_id, .tool_name = payload.tool_name, .result = payload.result, .is_error = payload.is_error } });
 }
 
 /// Adapter matching `agent_protocol.BeforeToolCallHook.func`. Routes

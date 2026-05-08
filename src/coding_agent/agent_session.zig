@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const agent_impl = @import("../agent/agent.zig");
+const agent_message_memory = @import("../agent/message_memory.zig");
 const control_mod = @import("../agent/control.zig");
 const session_runtime = @import("session/root.zig");
 const session_core = @import("../session/root.zig");
@@ -24,6 +25,7 @@ const ai_complete_worker_mod = @import("extensions/ai_complete_worker.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const pending_extension_ui_mod = @import("agent_session/pending_extension_ui.zig");
+const agent_session_core_mod = @import("agent_session/core.zig");
 const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
 
@@ -40,7 +42,8 @@ const session_proto = session_core.protocol;
 
 /// Composition root: agent runtime + store + tools + extension seams.
 pub const AgentSession = struct {
-    agent: Agent,
+    core: *agent_session_core_mod.AgentSessionCore,
+    agent: *Agent,
     session_store: SessionStore,
     allocator: std.mem.Allocator,
     tools: []const protocol.AgentTool,
@@ -131,7 +134,8 @@ pub const AgentSession = struct {
             .ctx = @ptrCast(prepared.extension_runner_ref),
         };
 
-        const agent = Agent.init(allocator, .{
+        const core = allocator.create(agent_session_core_mod.AgentSessionCore) catch @panic("OOM");
+        core.* = agent_session_core_mod.AgentSessionCore.init(allocator, .{
             .system_prompt = prepared.system_prompt,
             .model = options.model,
             .tools = prepared.tools,
@@ -148,7 +152,8 @@ pub const AgentSession = struct {
         const context_usage_unknown_after_compaction = prepared.session_store.contextUsageUnknownAfterCompaction(allocator);
 
         return .{
-            .agent = agent,
+            .core = core,
+            .agent = &core.agent,
             .session_store = prepared.session_store,
             .allocator = allocator,
             .tools = prepared.tools,
@@ -350,7 +355,8 @@ pub const AgentSession = struct {
         self.allocator.destroy(self._extension_runner_ref);
         self.agent_event_listeners.deinit(self.allocator);
         self.session_event_listeners.deinit(self.allocator);
-        self.agent.deinit();
+        self.core.deinit();
+        self.allocator.destroy(self.core);
         self.allocator.free(self.tools);
         if (self._owned_system_prompt.len > 0) {
             self.allocator.free(self._owned_system_prompt);
@@ -569,7 +575,8 @@ pub const AgentSession = struct {
         defer prompts.deinit(self.allocator);
         try prompts.append(self.allocator, user_msg);
         try prompts.appendSlice(self.allocator, before.messages);
-        try self.agent.prompt(prompts.items);
+        var prompt_result = try self.core.prompt(prompts.items);
+        prompt_result.deinit(self.allocator);
     }
 
     fn dispatchBeforeAgentStart(self: *AgentSession) !event_bridge.BeforeAgentStartResult {
@@ -600,14 +607,16 @@ pub const AgentSession = struct {
         self.agent.replaceRuntimeInputs(before.system_prompt, self.tools);
         defer self.agent.replaceRuntimeInputs(previous_system_prompt, self.tools);
         if (before.messages.len > 0) {
-            try self.agent.prompt(before.messages);
+            var prompt_result = try self.core.prompt(before.messages);
+            prompt_result.deinit(self.allocator);
             return;
         }
 
-        self.agent.continueTurn() catch |err| switch (err) {
+        var continue_result = self.core.continueTurn() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
             else => return err,
         };
+        continue_result.deinit(self.allocator);
     }
 
     pub fn runAiCompletePrompt(
@@ -657,30 +666,6 @@ pub const AgentSession = struct {
         return ai_completion_runtime.buildWorkerRequest(self, allocator, id, request);
     }
 
-    pub fn buildAiSessionPromptWorkerRequest(
-        self: *AgentSession,
-        allocator: std.mem.Allocator,
-        id: extension_runner_mod.AsyncOpId,
-        request: extension_runner_mod.AiSessionPromptRequest,
-    ) !ai_complete_worker_mod.Request {
-        const runner = self.extensionRunner() orelse return error.MissingExtensionRunner;
-        const side = runner.getSideAiSession(request.session_id) orelse return error.MissingAiSession;
-        if (side.disposed) return error.MissingAiSession;
-        const seed_text = try assistantTextFromMessages(self.allocator, side.messages.items);
-        defer self.allocator.free(seed_text);
-        const prompt = try std.fmt.allocPrint(self.allocator, "{s}\nuser: {s}\nassistant:", .{ seed_text, request.prompt });
-        defer self.allocator.free(prompt);
-        const complete_request = extension_runner_mod.AiCompleteRequest{
-            .prompt = prompt,
-            .system_prompt = side.system_prompt,
-            .max_tokens = side.max_tokens,
-            .model = side.model,
-            .reasoning = side.reasoning,
-            .stream_events = request.callbacks_ref != lua_runtime.c.LUA_NOREF,
-        };
-        return ai_completion_runtime.buildWorkerRequest(self, allocator, id, complete_request);
-    }
-
     pub fn runAiSessionAgentPrompt(
         self: *AgentSession,
         allocator: std.mem.Allocator,
@@ -693,24 +678,43 @@ pub const AgentSession = struct {
 
         side.running = true;
         defer side.running = false;
-        const side_agent = try self.ensureSideAgent(side);
+        const side_core = try self.ensureSideCore(side);
         var event_ctx = SideAgentEventContext{ .sink = event_sink };
-        const token = if (event_sink != null) side_agent.subscribe(SideAgentEventContext.onEvent, @ptrCast(&event_ctx)) else SubscriptionToken{ .id = 0 };
-        defer side_agent.unsubscribe(token);
+        const token = if (event_sink != null) side_core.agent.subscribe(SideAgentEventContext.onEvent, @ptrCast(&event_ctx)) else SubscriptionToken{ .id = 0 };
+        defer side_core.agent.unsubscribe(token);
 
         const prompt = [_]protocol.AgentMessage{.{ .user = .{
             .content = .{ .text = request.prompt },
             .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
         } }};
         side.abort_requested = false;
-        try side_agent.prompt(&prompt);
-        if (side_agent.isAbortRequested()) return .cancelled;
-        if (side_agent.errorMessage()) |msg| return .{ .err = try allocator.dupe(u8, msg) };
-        const assistant = side_agent.latestAssistant() orelse return .{ .err = try allocator.dupe(u8, "side agent finished without an assistant response") };
-        const text = try assistantText(allocator, assistant);
-        errdefer allocator.free(text);
-        try side.replaceMessages(self.allocator, side_agent.messages());
-        return .{ .completed = .{ .text = text } };
+        var prompt_result = try side_core.prompt(&prompt);
+        defer prompt_result.deinit(allocator);
+        switch (prompt_result) {
+            .cancelled => return .cancelled,
+            .err => |err| return .{ .err = try allocator.dupe(u8, err.message) },
+            .completed => |completed| {
+                const assistant = completed.message.assistant;
+                const text = try assistantText(allocator, assistant);
+                errdefer allocator.free(text);
+                var owned_message = try agent_message_memory.cloneMessage(allocator, completed.message);
+                errdefer agent_message_memory.freeMessage(allocator, &owned_message);
+                const owned_messages = try agent_message_memory.cloneMessages(allocator, completed.messages);
+                errdefer agent_message_memory.freeMessages(allocator, owned_messages);
+                const owned_tool_results = try allocator.alloc(protocol.ToolResultMessage, completed.tool_results.len);
+                var built: usize = 0;
+                errdefer {
+                    for (owned_tool_results[0..built]) |*tr| agent_message_memory.freeToolResultMessage(allocator, tr);
+                    allocator.free(owned_tool_results);
+                }
+                for (completed.tool_results, 0..) |tr, i| {
+                    owned_tool_results[i] = try agent_message_memory.cloneToolResultMessage(allocator, tr);
+                    built += 1;
+                }
+                try side.replaceMessages(self.allocator, side_core.messages());
+                return .{ .completed = .{ .text = text, .message = owned_message, .messages = owned_messages, .tool_results = owned_tool_results, .context_usage = completed.context_usage } };
+            },
+        }
     }
 
     const SideAgentEventContext = struct {
@@ -719,30 +723,21 @@ pub const AgentSession = struct {
         fn onEvent(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             const sink = self.sink orelse return;
-            switch (event) {
-                .agent_start => sink.emit(sink.ptr, .agent_start),
-                .agent_end => sink.emit(sink.ptr, .agent_end),
-                .turn_start => sink.emit(sink.ptr, .turn_start),
-                .turn_end => sink.emit(sink.ptr, .turn_end),
-                .tool_execution_start => |e| sink.emit(sink.ptr, .{ .tool_execution_start = .{ .tool_call_id = e.tool_call_id, .tool_name = e.tool_name, .input = e.args } }),
-                .tool_execution_update => |e| sink.emit(sink.ptr, .{ .tool_execution_update = .{ .tool_call_id = e.tool_call_id, .tool_name = e.tool_name, .input = e.args } }),
-                .tool_execution_end => |e| sink.emit(sink.ptr, .{ .tool_execution_end = .{ .tool_call_id = e.tool_call_id, .tool_name = e.tool_name, .result = e.result, .is_error = e.is_error } }),
-                else => {},
-            }
+            sink.emit(sink.ptr, .{ .agent_event = event });
         }
     };
 
-    fn ensureSideAgent(self: *AgentSession, side: *extension_runner_mod.SideAiSession) !*Agent {
-        if (side.agent) |agent| return agent;
+    fn ensureSideCore(self: *AgentSession, side: *extension_runner_mod.SideAiSession) !*agent_session_core_mod.AgentSessionCore {
+        if (side.core) |core| return core;
         const model = if (side.model) |model_ref| self.resolveModelRef(model_ref) orelse return error.ModelUnavailable else self.agent.modelValue();
         side.agent_tools = try self.sideAgentTools(self.allocator, side.tool_allowlist);
         errdefer if (side.agent_tools.len > 0) {
             self.allocator.free(side.agent_tools);
             side.agent_tools = &.{};
         };
-        const agent = try self.allocator.create(Agent);
-        errdefer self.allocator.destroy(agent);
-        agent.* = try Agent.init(self.allocator, .{
+        const core = try self.allocator.create(agent_session_core_mod.AgentSessionCore);
+        errdefer self.allocator.destroy(core);
+        core.* = try agent_session_core_mod.AgentSessionCore.init(self.allocator, .{
             .system_prompt = side.system_prompt orelse self.agent.systemPrompt(),
             .model = model,
             .tools = side.agent_tools,
@@ -752,9 +747,11 @@ pub const AgentSession = struct {
             .convert_to_llm = .{ .func = &message_conversion.convertToLlm, .ctx = null },
             .stream_fn = .{ .func = &StreamClosure.streamFn, .ctx = @ptrCast(self._stream_closure) },
             .session_id = self.session_store.sessionId(),
+            .before_tool_call = .{ .func = &runtime_binding.beforeToolCall, .ctx = @ptrCast(self._extension_runner_ref) },
+            .after_tool_call = .{ .func = &runtime_binding.afterToolCall, .ctx = @ptrCast(self._extension_runner_ref) },
         });
-        side.agent = agent;
-        return agent;
+        side.core = core;
+        return core;
     }
 
     fn sideAgentTools(self: *AgentSession, allocator: std.mem.Allocator, allowlist: []const []const u8) ![]const protocol.AgentTool {
@@ -771,31 +768,6 @@ pub const AgentSession = struct {
             }
             if (!found) return error.UnknownSideAiSessionTool;
         }
-        return try out.toOwnedSlice(allocator);
-    }
-
-    fn assistantTextFromMessages(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage) ![]const u8 {
-        var out = std.ArrayList(u8).empty;
-        for (messages) |msg| switch (msg) {
-            .user => |user| switch (user.content) {
-                .text => |text| {
-                    if (out.items.len > 0) try out.append(allocator, '\n');
-                    try out.appendSlice(allocator, "user: ");
-                    try out.appendSlice(allocator, text);
-                },
-                .blocks => {},
-            },
-            .assistant => |assistant| {
-                const text = try assistantText(allocator, assistant);
-                defer allocator.free(text);
-                if (text.len > 0) {
-                    if (out.items.len > 0) try out.append(allocator, '\n');
-                    try out.appendSlice(allocator, "assistant: ");
-                    try out.appendSlice(allocator, text);
-                }
-            },
-            else => {},
-        };
         return try out.toOwnedSlice(allocator);
     }
 

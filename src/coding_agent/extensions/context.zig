@@ -1,6 +1,7 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const lua_agent_serializers = @import("lua_agent_serializers.zig");
 const resource_types = @import("../resources/types.zig");
 const json_util = @import("../../ai/json_util.zig");
 const agent_protocol = @import("../../agent/types.zig");
@@ -1685,7 +1686,7 @@ fn ctxAiSessionAbort(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const id = aiSessionIdFromUpvalue(L);
     if (runner.getSideAiSession(id)) |session| {
         session.abort_requested = true;
-        if (session.agent) |agent| agent.abort();
+        if (session.core) |core| core.abort();
     }
     c.lua_pushboolean(L, 1);
     return 1;
@@ -1753,34 +1754,11 @@ fn ctxAiSessionMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
     var out_index: c_int = 1;
     for (session.messages.items[start..]) |msg| {
         if (!include_tools and msg == .tool_result) continue;
-        c.lua_createtable(L, 0, 2);
-        switch (msg) {
-            .user => |user| {
-                _ = c.lua_pushliteral(L, "user");
-                c.lua_setfield(L, -2, "role");
-                if (user.content == .text) {
-                    _ = c.lua_pushlstring(L, user.content.text.ptr, user.content.text.len);
-                    c.lua_setfield(L, -2, "text");
-                }
-            },
-            .assistant => |assistant| {
-                _ = c.lua_pushliteral(L, "assistant");
-                c.lua_setfield(L, -2, "role");
-                for (assistant.content) |block| if (block == .text) {
-                    _ = c.lua_pushlstring(L, block.text.text.ptr, block.text.text.len);
-                    c.lua_setfield(L, -2, "text");
-                    break;
-                };
-            },
-            .tool_result => {
-                _ = c.lua_pushliteral(L, "tool");
-                c.lua_setfield(L, -2, "role");
-            },
-            else => {
-                _ = c.lua_pushliteral(L, "custom");
-                c.lua_setfield(L, -2, "role");
-            },
-        }
+        lua_agent_serializers.pushAgentMessageToLua(L, msg) catch {
+            c.lua_createtable(L, 0, 1);
+            _ = c.lua_pushlstring(L, @tagName(msg).ptr, @tagName(msg).len);
+            c.lua_setfield(L, -2, "role");
+        };
         c.lua_rawseti(L, -2, out_index);
         out_index += 1;
     }
@@ -1951,15 +1929,50 @@ fn pushLuaTextMessage(L: *c.lua_State, role: []const u8, text: []const u8) void 
 }
 
 fn pushAiCompleteResult(L: *c.lua_State, result: runner_mod.AiCompleteResult) void {
-    c.lua_createtable(L, 0, 2);
+    c.lua_createtable(L, 0, 10);
     switch (result) {
         .completed => |completed| {
             _ = c.lua_pushlstring(L, "completed", "completed".len);
             c.lua_setfield(L, -2, "status");
             _ = c.lua_pushlstring(L, completed.text.ptr, completed.text.len);
             c.lua_setfield(L, -2, "text");
-            pushLuaTextMessage(L, "assistant", completed.text);
+            if (completed.message) |message| {
+                lua_agent_serializers.pushAgentMessageToLua(L, message) catch pushLuaTextMessage(L, "assistant", completed.text);
+            } else {
+                pushLuaTextMessage(L, "assistant", completed.text);
+            }
             c.lua_setfield(L, -2, "message");
+            c.lua_createtable(L, @intCast(completed.messages.len), 0);
+            for (completed.messages, 0..) |message, i| {
+                lua_agent_serializers.pushAgentMessageToLua(L, message) catch pushLuaTextMessage(L, @tagName(message), "");
+                c.lua_rawseti(L, -2, @intCast(i + 1));
+            }
+            c.lua_setfield(L, -2, "messages");
+            c.lua_createtable(L, @intCast(completed.tool_results.len), 0);
+            for (completed.tool_results, 0..) |tr, i| {
+                lua_agent_serializers.pushToolResultMessageToLua(L, tr) catch c.lua_createtable(L, 0, 0);
+                c.lua_rawseti(L, -2, @intCast(i + 1));
+            }
+            c.lua_setfield(L, -2, "tool_results");
+            if (completed.message) |message| if (message == .assistant) {
+                lua_agent_serializers.pushUsageToLua(L, message.assistant.usage);
+                c.lua_setfield(L, -2, "usage");
+                _ = c.lua_pushlstring(L, message.assistant.model.ptr, message.assistant.model.len);
+                c.lua_setfield(L, -2, "model");
+                const stop = json_util.stopReasonToString(message.assistant.stop_reason);
+                _ = c.lua_pushlstring(L, stop.ptr, stop.len);
+                c.lua_setfield(L, -2, "stopReason");
+                _ = c.lua_pushlstring(L, stop.ptr, stop.len);
+                c.lua_setfield(L, -2, "stop_reason");
+                if (message.assistant.error_message) |err_msg| _ = c.lua_pushlstring(L, err_msg.ptr, err_msg.len) else c.lua_pushnil(L);
+                c.lua_setfield(L, -2, "errorMessage");
+                if (message.assistant.error_message) |err_msg| _ = c.lua_pushlstring(L, err_msg.ptr, err_msg.len) else c.lua_pushnil(L);
+                c.lua_setfield(L, -2, "error_message");
+            };
+            if (completed.context_usage) |usage| {
+                lua_agent_serializers.pushContextUsageToLua(L, usage);
+                c.lua_setfield(L, -2, "context_usage");
+            }
         },
         .err => |msg| {
             _ = c.lua_pushlstring(L, "error", "error".len);
