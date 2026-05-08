@@ -40,6 +40,7 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .session_tool_results_get = &runtimeSessionToolResultsGet,
         .session_messages_get = &runtimeSessionMessagesGet,
         .session_context_get = &runtimeSessionContextGet,
+        .tool_exists = &runtimeToolExists,
         .session_note_append = &runtimeSessionNoteAppend,
         .session_notes_get = &runtimeSessionNotesGet,
         .session_artifact_append = &runtimeSessionArtifactAppend,
@@ -55,6 +56,12 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .provider_projection_changed = &projection_runtime.providerProjectionChanged,
         .tool_projection_changed = &projection_runtime.toolProjectionChanged,
     }, self._stream_closure.registry) catch {};
+}
+
+fn runtimeToolExists(session_ptr: *anyopaque, name: []const u8) bool {
+    const self = session(session_ptr);
+    for (self.tools) |tool| if (std.mem.eql(u8, tool.name, name)) return true;
+    return false;
 }
 
 fn agentEventSinkFromRunnerRef(event: protocol.AgentEvent, ctx: ?*anyopaque) void {

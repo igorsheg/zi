@@ -345,8 +345,13 @@ local side = ctx.ai.session({
   model = "provider/model-id",        -- optional; defaults to current model
   system_prompt = "You are concise",  -- optional
   reasoning = "low",                  -- optional
-  tools = { "read", "edit" },         -- optional allowlist; enables side-agent tool use
+  tools = { "read", "edit" },         -- optional allowlist; absent means no tools
   context = ctx.session.context({ max_messages = 120 }), -- optional string or context object
+  on = {
+    message_delta = function(event) end,
+    tool_execution_start = function(event) end,
+    tool_execution_end = function(event) end,
+  },
   messages = {
     { role = "user", text = "initial question" },
     { role = "assistant", text = "initial answer" },
@@ -357,11 +362,14 @@ local result = side:prompt({
   prompt = "continue the side conversation",
   on = function(event) end, -- same streaming callback shape as ctx.ai.complete
 })
-side:abort()   -- marks the side session aborted; provider cancellation is TODO
+side:abort()   -- cancels the currently running side prompt when possible
+side:clear()   -- clears side transcript when idle
 side:dispose() -- releases in-memory state early
 ```
 
-`side:prompt(...)` returns the same result shape as `ctx.ai.complete` and appends successful user/assistant turns to that side session. Side sessions do not mutate the main transcript. Without `tools`, prompts use the lightweight completion path. With `tools`, zi creates a managed in-process side agent with an in-memory transcript and the requested tool allowlist; nested extension loading remains disabled, and callbacks are still delivered through the parent extension runner.
+`side:prompt(...)` returns the same result shape as `ctx.ai.complete` and commits successful turns to that side session's typed in-memory transcript. Side sessions do not mutate the main transcript. zi runs prompts through a managed in-process side agent; `tools = nil` or `{}` means no tools, while `tools = { ... }` is fail-fast validated against the parent session's available tools. Nested extension loading remains disabled. Session-wide `on` callbacks and per-prompt `on` callbacks are both delivered through the parent extension runner on the Lua thread.
+
+Side event tables include lifecycle events (`agent_start`, `agent_end`, `turn_start`, `turn_end`), message events (`message_start`, `message_delta`, `message_end`), tool events (`tool_execution_start`, `tool_execution_update`, `tool_execution_end`), `error`, and `events_dropped`. Message events include a JSON-compatible `message` table when available. Tool events include compatibility aliases such as `tool_name`/`toolName`, `tool_call_id`/`toolCallId`, `input`/`args`, and `is_error`/`isError`.
 
 Results:
 
@@ -370,6 +378,16 @@ Results:
 { status = "error", error = "..." }
 { status = "cancelled" }
 ```
+
+Inspection helpers:
+
+```lua
+side:info()      -- { id, busy, disposed, message_count, tools }
+side:messages({ limit = 100, include_tools = true }) -- typed, JSON-compatible side transcript summary
+side:is_busy()   -- true while the side agent is running a prompt
+```
+
+`ctx.ai.complete`, `ctx.ai.session`, and `zi.spawn` remain distinct: complete is one-shot, session is a multi-turn in-process side agent, and spawn delegates to an isolated child zi task.
 
 ## System commands
 

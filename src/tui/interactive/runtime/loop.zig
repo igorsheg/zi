@@ -136,6 +136,31 @@ pub fn extensionAsyncDispatcher(self: *@import("../../interactive.zig").Interact
     };
 }
 
+const SidePromptEventQueue = struct {
+    interactive: *Interactive,
+    id: extension_runner_mod.AsyncOpId,
+    dropped: usize = 0,
+
+    fn emit(ptr: *anyopaque, event: extension_runner_mod.AiCompleteStreamEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        enqueueAiSessionPromptEvent(self.interactive, self.id, event) catch {
+            self.dropped += 1;
+        };
+    }
+};
+
+fn enqueueAiSessionPromptEvent(self: *Interactive, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) !void {
+    const cloned = try event.clone(self.msg_allocator);
+    switch (self.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = cloned } })) {
+        .ok, .dropped => {},
+        .full, .closed, .oom => |rejected| {
+            var failed = rejected;
+            failed.deinit(self.msg_allocator);
+            return error.AiSessionPromptEventUnavailable;
+        },
+    }
+}
+
 fn dispatchAiCompleteEventFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) anyerror!void {
     const self: *Interactive = @ptrCast(@alignCast(ptr));
     var original = event;
@@ -169,28 +194,23 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
         },
         .ai_session_prompt => |request| {
             const session = self.runtime_host.currentSession();
-            const side = if (session.extensionRunner()) |r| r.getSideAiSession(request.session_id) else null;
-            if (side != null and side.?.tool_allowlist.len > 0) {
-                var result = try session.runAiSessionAgentPrompt(self.msg_allocator, request);
-                errdefer result.deinit(self.msg_allocator);
-                switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = owned_start.id, .result = .{ .ai_session_prompt = result } } })) {
-                    .ok, .dropped => {},
-                    .full, .closed, .oom => |rejected| {
-                        var failed = rejected;
-                        failed.deinit(self.msg_allocator);
-                        return error.AiSessionPromptUnavailable;
-                    },
-                }
-            } else {
-                const worker_request = try session.buildAiSessionPromptWorkerRequest(self.msg_allocator, owned_start.id, request);
-                var submitted = false;
-                errdefer if (!submitted) {
-                    var failed = worker_request;
+            try enqueueAiSessionPromptEvent(self, owned_start.id, .message_start);
+            var event_queue = SidePromptEventQueue{ .interactive = self, .id = owned_start.id };
+            var result = try session.runAiSessionAgentPrompt(self.msg_allocator, request, .{ .ptr = @ptrCast(&event_queue), .emit = SidePromptEventQueue.emit });
+            errdefer result.deinit(self.msg_allocator);
+            if (event_queue.dropped > 0) try enqueueAiSessionPromptEvent(self, owned_start.id, .{ .events_dropped = event_queue.dropped });
+            switch (result) {
+                .completed => |completed| try enqueueAiSessionPromptEvent(self, owned_start.id, .{ .message_end = .{ .text = completed.text } }),
+                .err => |msg| try enqueueAiSessionPromptEvent(self, owned_start.id, .{ .err = msg }),
+                .cancelled => {},
+            }
+            switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = owned_start.id, .result = .{ .ai_session_prompt = result } } })) {
+                .ok, .dropped => {},
+                .full, .closed, .oom => |rejected| {
+                    var failed = rejected;
                     failed.deinit(self.msg_allocator);
-                };
-                const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
-                try worker.submit(worker_request);
-                submitted = true;
+                    return error.AiSessionPromptUnavailable;
+                },
             }
         },
         .system => |request| {

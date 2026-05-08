@@ -1432,7 +1432,8 @@ fn ctxAiSessionCreate(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
     var session = runner_mod.SideAiSession{ .id = 0 };
-    errdefer session.deinit(runner.allocator);
+    var session_owned = false;
+    defer if (!session_owned) session.deinit(runner.allocator);
     if (c.lua_type(L, 1) == c.LUA_TTABLE) {
         const idx = c.lua_absindex(L, 1);
         if (readBorrowedStringField(L, idx, "model")) |model| session.model = runner.allocator.dupe(u8, model) catch {
@@ -1454,10 +1455,16 @@ fn ctxAiSessionCreate(L_opt: ?*c.lua_State) callconv(.c) c_int {
             c.lua_pushnil(L);
             return 1;
         };
+        validateAiSessionTools(runner, &session) catch {
+            c.lua_pushnil(L);
+            return 1;
+        };
         readAiSessionSeedMessages(runner.allocator, L, idx, &session) catch {
             c.lua_pushnil(L);
             return 1;
         };
+        session.callbacks_ref = readOptionalCallbacksRef(L, idx);
+        session.callbacks_L = if (session.callbacks_ref != c.LUA_NOREF) L else null;
     } else if (c.lua_type(L, 1) != c.LUA_TNONE and c.lua_type(L, 1) != c.LUA_TNIL) {
         c.lua_pushnil(L);
         return 1;
@@ -1466,8 +1473,20 @@ fn ctxAiSessionCreate(L_opt: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushnil(L);
         return 1;
     };
+    session_owned = true;
     pushAiSessionHandle(L, runner, id);
     return 1;
+}
+
+fn validateAiSessionTools(runner: *runner_mod.ExtensionRunner, session: *const runner_mod.SideAiSession) !void {
+    if (session.tool_allowlist.len == 0) return;
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const exists = bound.tool_exists orelse return;
+            for (session.tool_allowlist) |name| if (!exists(bound.session, name)) return error.UnknownTool;
+        },
+        .stub => return,
+    }
 }
 
 fn readAiSessionTools(allocator: std.mem.Allocator, L: *c.lua_State, idx: c_int, session: *runner_mod.SideAiSession) !void {
@@ -1557,7 +1576,7 @@ fn readBorrowedLuaString(L: *c.lua_State, idx: c_int) []const u8 {
 }
 
 fn pushAiSessionHandle(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, id: u64) void {
-    c.lua_createtable(L, 0, 5);
+    c.lua_createtable(L, 0, 9);
     c.lua_pushinteger(L, @intCast(id));
     c.lua_setfield(L, -2, "id");
     pushAiSessionMethod(L, runner, id, &ctxAiSessionPrompt);
@@ -1566,6 +1585,14 @@ fn pushAiSessionHandle(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, id:
     c.lua_setfield(L, -2, "abort");
     pushAiSessionMethod(L, runner, id, &ctxAiSessionDispose);
     c.lua_setfield(L, -2, "dispose");
+    pushAiSessionMethod(L, runner, id, &ctxAiSessionInfo);
+    c.lua_setfield(L, -2, "info");
+    pushAiSessionMethod(L, runner, id, &ctxAiSessionMessages);
+    c.lua_setfield(L, -2, "messages");
+    pushAiSessionMethod(L, runner, id, &ctxAiSessionIsBusy);
+    c.lua_setfield(L, -2, "is_busy");
+    pushAiSessionMethod(L, runner, id, &ctxAiSessionClear);
+    c.lua_setfield(L, -2, "clear");
 }
 
 fn pushAiSessionMethod(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, id: u64, func: *const fn (?*c.lua_State) callconv(.c) c_int) void {
@@ -1596,6 +1623,11 @@ fn ctxAiSessionPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
     if (session.disposed) {
         runner.allocator.free(prompt);
         pushAiCompleteError(L, "ctx.ai.session.prompt: disposed session");
+        return 1;
+    }
+    if (session.isBusy()) {
+        runner.allocator.free(prompt);
+        pushAiCompleteError(L, "ctx.ai.session.prompt: side session is busy");
         return 1;
     }
     var request = runner_mod.AiSessionPromptRequest{ .session_id = session_id, .prompt = prompt };
@@ -1651,7 +1683,10 @@ fn ctxAiSessionAbort(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
     const id = aiSessionIdFromUpvalue(L);
-    if (runner.getSideAiSession(id)) |session| session.abort_requested = true;
+    if (runner.getSideAiSession(id)) |session| {
+        session.abort_requested = true;
+        if (session.agent) |agent| agent.abort();
+    }
     c.lua_pushboolean(L, 1);
     return 1;
 }
@@ -1661,6 +1696,126 @@ fn ctxAiSessionDispose(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const runner = stateRunnerFromUpvalue(L);
     const id = aiSessionIdFromUpvalue(L);
     c.lua_pushboolean(L, if (runner.disposeSideAiSession(id)) 1 else 0);
+    return 1;
+}
+
+fn ctxAiSessionInfo(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id = aiSessionIdFromUpvalue(L);
+    const session = runner.getSideAiSession(id) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    c.lua_createtable(L, 0, 5);
+    c.lua_pushinteger(L, @intCast(id));
+    c.lua_setfield(L, -2, "id");
+    c.lua_pushboolean(L, if (session.disposed) 1 else 0);
+    c.lua_setfield(L, -2, "disposed");
+    c.lua_pushboolean(L, if (session.isBusy()) 1 else 0);
+    c.lua_setfield(L, -2, "busy");
+    c.lua_pushinteger(L, @intCast(session.messages.items.len));
+    c.lua_setfield(L, -2, "message_count");
+    c.lua_createtable(L, @intCast(session.tool_allowlist.len), 0);
+    for (session.tool_allowlist, 0..) |name, i| {
+        _ = c.lua_pushlstring(L, name.ptr, name.len);
+        c.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    c.lua_setfield(L, -2, "tools");
+    return 1;
+}
+
+fn ctxAiSessionMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id = aiSessionIdFromUpvalue(L);
+    const session = runner.getSideAiSession(id) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    var limit: usize = session.messages.items.len;
+    var include_tools = true;
+    const opts_arg: c_int = if (c.lua_type(L, 2) == c.LUA_TTABLE) 2 else 1;
+    if (c.lua_type(L, opts_arg) == c.LUA_TTABLE) {
+        const idx = c.lua_absindex(L, opts_arg);
+        _ = c.lua_getfield(L, idx, "limit");
+        if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+            const raw = c.lua_tointegerx(L, -1, null);
+            if (raw >= 0) limit = @min(limit, @as(usize, @intCast(raw)));
+        }
+        c.lua_pop(L, 1);
+        _ = c.lua_getfield(L, idx, "include_tools");
+        if (c.lua_type(L, -1) == c.LUA_TBOOLEAN) include_tools = c.lua_toboolean(L, -1) != 0;
+        c.lua_pop(L, 1);
+    }
+    const start = session.messages.items.len - limit;
+    c.lua_createtable(L, @intCast(session.messages.items.len - start), 0);
+    var out_index: c_int = 1;
+    for (session.messages.items[start..]) |msg| {
+        if (!include_tools and msg == .tool_result) continue;
+        c.lua_createtable(L, 0, 2);
+        switch (msg) {
+            .user => |user| {
+                _ = c.lua_pushliteral(L, "user");
+                c.lua_setfield(L, -2, "role");
+                if (user.content == .text) {
+                    _ = c.lua_pushlstring(L, user.content.text.ptr, user.content.text.len);
+                    c.lua_setfield(L, -2, "text");
+                }
+            },
+            .assistant => |assistant| {
+                _ = c.lua_pushliteral(L, "assistant");
+                c.lua_setfield(L, -2, "role");
+                for (assistant.content) |block| if (block == .text) {
+                    _ = c.lua_pushlstring(L, block.text.text.ptr, block.text.text.len);
+                    c.lua_setfield(L, -2, "text");
+                    break;
+                };
+            },
+            .tool_result => {
+                _ = c.lua_pushliteral(L, "tool");
+                c.lua_setfield(L, -2, "role");
+            },
+            else => {
+                _ = c.lua_pushliteral(L, "custom");
+                c.lua_setfield(L, -2, "role");
+            },
+        }
+        c.lua_rawseti(L, -2, out_index);
+        out_index += 1;
+    }
+    return 1;
+}
+
+fn ctxAiSessionIsBusy(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id = aiSessionIdFromUpvalue(L);
+    const session = runner.getSideAiSession(id) orelse {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    };
+    c.lua_pushboolean(L, if (session.isBusy()) 1 else 0);
+    return 1;
+}
+
+fn ctxAiSessionClear(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id = aiSessionIdFromUpvalue(L);
+    const session = runner.getSideAiSession(id) orelse {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    };
+    if (session.isBusy()) {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    }
+    session.clear(runner.allocator) catch {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    };
+    c.lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -1787,6 +1942,14 @@ fn readAiCompleteReasoning(L: *c.lua_State, table_idx: c_int) !?agent_protocol.T
     }
 }
 
+fn pushLuaTextMessage(L: *c.lua_State, role: []const u8, text: []const u8) void {
+    c.lua_createtable(L, 0, 2);
+    _ = c.lua_pushlstring(L, role.ptr, role.len);
+    c.lua_setfield(L, -2, "role");
+    _ = c.lua_pushlstring(L, text.ptr, text.len);
+    c.lua_setfield(L, -2, "text");
+}
+
 fn pushAiCompleteResult(L: *c.lua_State, result: runner_mod.AiCompleteResult) void {
     c.lua_createtable(L, 0, 2);
     switch (result) {
@@ -1795,6 +1958,8 @@ fn pushAiCompleteResult(L: *c.lua_State, result: runner_mod.AiCompleteResult) vo
             c.lua_setfield(L, -2, "status");
             _ = c.lua_pushlstring(L, completed.text.ptr, completed.text.len);
             c.lua_setfield(L, -2, "text");
+            pushLuaTextMessage(L, "assistant", completed.text);
+            c.lua_setfield(L, -2, "message");
         },
         .err => |msg| {
             _ = c.lua_pushlstring(L, "error", "error".len);

@@ -255,6 +255,10 @@ pub const Agent = struct {
         return self.abort_controller.isAborted();
     }
 
+    pub fn isRunning(self: *const Agent) bool {
+        return self.is_running.load(.acquire);
+    }
+
     pub fn abortSignal(self: *Agent) abort_signal_mod.AbortSignal {
         return self.abort_controller.signal();
     }
