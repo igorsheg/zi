@@ -517,8 +517,12 @@ fn runToolAiSessionPromptRequest(runner: *runner_mod.ExtensionRunner, request: r
     return switch (runner.runtime) {
         .bound => |bound| blk: {
             const prompt_fn = bound.ai_session_prompt orelse return error.AiSessionPromptUnavailable;
-            var sink_ctx = AiSessionPromptToolEventSink{ .runner = runner, .request = request };
-            const sink: ?runner_mod.AiSessionEventSink = if (request.callbacks_ref != c.LUA_NOREF)
+            var sink_ctx = AiSessionPromptToolEventSink{ .runner = runner, .request = request, .session_id = request.session_id };
+            const wants_events = request.callbacks_ref != c.LUA_NOREF or blk2: {
+                const session = runner.getSideAiSession(request.session_id) orelse break :blk2 false;
+                break :blk2 session.callbacks_ref != c.LUA_NOREF;
+            };
+            const sink: ?runner_mod.AiSessionEventSink = if (wants_events)
                 .{ .ptr = @ptrCast(&sink_ctx), .emit = AiSessionPromptToolEventSink.emit }
             else
                 null;
@@ -531,10 +535,11 @@ fn runToolAiSessionPromptRequest(runner: *runner_mod.ExtensionRunner, request: r
 const AiSessionPromptToolEventSink = struct {
     runner: *runner_mod.ExtensionRunner,
     request: runner_mod.AiSessionPromptRequest,
+    session_id: u64,
 
     fn emit(ptr: *anyopaque, event: runner_mod.AiCompleteStreamEvent) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.runner.dispatchAiSessionPromptRequestEvent(self.request, event);
+        self.runner.dispatchAiSessionPromptEvent(self.session_id, self.request, event);
     }
 };
 

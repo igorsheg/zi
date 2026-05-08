@@ -1532,6 +1532,17 @@ pub const ExtensionRunner = struct {
         callAiCompleteCallback(L, request.callbacks_ref, event);
     }
 
+    pub fn dispatchAiSessionPromptEvent(self: *ExtensionRunner, session_id: u64, request: AiSessionPromptRequest, event: AiCompleteStreamEvent) void {
+        self.assertOnLuaThread();
+        if (self.side_ai_sessions.getPtr(session_id)) |session| {
+            if (session.callbacks_ref != lua_runtime.c.LUA_NOREF) {
+                const L = session.callbacks_L orelse request.source_L orelse return;
+                callAiCompleteCallback(L, session.callbacks_ref, event);
+            }
+        }
+        self.dispatchAiSessionPromptRequestEvent(request, event);
+    }
+
     pub fn dispatchAiCompleteStreamEvent(self: *ExtensionRunner, id: AsyncOpId, event: AiCompleteStreamEvent) !void {
         self.assertOnLuaThread();
         var owned = event;
