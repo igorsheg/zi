@@ -11,6 +11,7 @@ const overlay_mod = @import("../primitives/overlay.zig");
 const keys_mod = @import("../terminal/keys.zig");
 const grapheme_mod = @import("../grapheme.zig");
 const chrome_mod = @import("../primitives/chrome.zig");
+const text_input_mod = @import("../primitives/text_input.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 
@@ -26,12 +27,13 @@ const TextRun = text_component_mod.TextRun;
 const MarkdownComponent = markdown_component_mod.Markdown;
 const WidthMethod = grapheme_mod.WidthMethod;
 const Theme = theme_mod.Theme;
+const TextInput = text_input_mod.TextInput;
 
 pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
     views: std.StringHashMap(ViewRecord),
     frames: std.StringHashMap(FrameRecord),
-    input_values: std.StringHashMap([]u8),
+    input_states: std.StringHashMap(TextInput),
     theme: *const Theme,
     status_component: TargetComponent,
     toast_component: TargetComponent,
@@ -44,7 +46,7 @@ pub const ExtensionUiState = struct {
             .allocator = allocator,
             .views = std.StringHashMap(ViewRecord).init(allocator),
             .frames = std.StringHashMap(FrameRecord).init(allocator),
-            .input_values = std.StringHashMap([]u8).init(allocator),
+            .input_states = std.StringHashMap(TextInput).init(allocator),
             .theme = themes_builtin.dark(),
             .status_component = .{ .target = .status },
             .toast_component = .{ .target = .toast },
@@ -69,12 +71,12 @@ pub const ExtensionUiState = struct {
         }
         self.frames.deinit();
 
-        var iit = self.input_values.iterator();
+        var iit = self.input_states.iterator();
         while (iit.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.deinit();
         }
-        self.input_values.deinit();
+        self.input_states.deinit();
     }
 
     pub fn setTheme(self: *ExtensionUiState, theme: *const Theme) void {
@@ -268,13 +270,14 @@ pub const ExtensionUiState = struct {
 const InputRef = struct {
     id: []const u8,
     value: []const u8,
+    on_input: ?[]const u8,
     on_change: ?[]const u8,
     on_submit: ?[]const u8,
 };
 
 fn firstInput(node: extension_ui.UiNode) ?InputRef {
     return switch (node) {
-        .input => |input| .{ .id = input.id, .value = input.value, .on_change = input.on_change, .on_submit = input.on_submit },
+        .input => |input| .{ .id = input.id, .value = input.value, .on_input = input.on_input, .on_change = input.on_change, .on_submit = input.on_submit },
         .view => |view| blk: {
             for (view.children) |child| if (firstInput(child)) |found| break :blk found;
             break :blk null;
@@ -289,7 +292,7 @@ fn syncInputValues(self: *ExtensionUiState, render: extension_ui.RenderSpec) voi
 
 fn syncInputValuesNode(self: *ExtensionUiState, owner: []const u8, view: []const u8, node: extension_ui.UiNode) void {
     switch (node) {
-        .input => |input| setInputValue(self, owner, view, input.id, input.value) catch {},
+        .input => |input| syncInputState(self, owner, view, input.id, input.value) catch {},
         .view => |v| for (v.children) |child| syncInputValuesNode(self, owner, view, child),
         else => {},
     }
@@ -300,67 +303,65 @@ fn clearInputValuesForView(self: *ExtensionUiState, owner: []const u8, view: []c
     defer self.allocator.free(prefix);
     var keys = std.ArrayList([]const u8).empty;
     defer keys.deinit(self.allocator);
-    var it = self.input_values.iterator();
+    var it = self.input_states.iterator();
     while (it.next()) |entry| {
         if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) keys.append(self.allocator, entry.key_ptr.*) catch break;
     }
     for (keys.items) |k| {
-        const old = self.input_values.fetchRemove(k) orelse continue;
+        var old = self.input_states.fetchRemove(k) orelse continue;
         self.allocator.free(old.key);
-        self.allocator.free(old.value);
+        old.value.deinit();
     }
 }
 
-fn setInputValue(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, value: []const u8) !void {
+fn syncInputState(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, value: []const u8) !void {
     const key = try makeInputKey(self.allocator, owner, view, id);
     errdefer self.allocator.free(key);
-    const owned = try self.allocator.dupe(u8, value);
-    errdefer self.allocator.free(owned);
-    if (self.input_values.getEntry(key)) |entry| {
-        self.allocator.free(entry.value_ptr.*);
-        entry.value_ptr.* = owned;
+    if (self.input_states.getEntry(key)) |entry| {
+        if (!std.mem.eql(u8, entry.value_ptr.text(), value)) {
+            try entry.value_ptr.setValue(value);
+        }
         self.allocator.free(key);
         return;
     }
-    try self.input_values.put(key, owned);
+    var input = TextInput.init(self.allocator, self.activeTheme());
+    errdefer input.deinit();
+    try input.setValue(value);
+    try self.input_states.put(key, input);
+}
+
+fn inputState(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, fallback: []const u8) !*TextInput {
+    const key = try makeInputKey(self.allocator, owner, view, id);
+    errdefer self.allocator.free(key);
+    if (self.input_states.getEntry(key)) |entry| {
+        self.allocator.free(key);
+        return entry.value_ptr;
+    }
+    var input = TextInput.init(self.allocator, self.activeTheme());
+    errdefer input.deinit();
+    try input.setValue(fallback);
+    try self.input_states.put(key, input);
+    return self.input_states.getPtr(key).?;
 }
 
 fn inputValue(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, fallback: []const u8) []const u8 {
-    const key = makeInputKey(self.allocator, owner, view, id) catch return fallback;
-    defer self.allocator.free(key);
-    return self.input_values.get(key) orelse fallback;
+    const input = inputState(self, owner, view, id, fallback) catch return fallback;
+    return input.text();
 }
 
 fn editInput(self: *ExtensionUiState, spec: extension_ui.RenderSpec, input: InputRef, key: keys_mod.Key) !?extension_ui.UiEvent {
-    const cur = inputValue(self, spec.state_owner_id, spec.id, input.id, input.value);
-    var next = std.ArrayList(u8).empty;
-    defer next.deinit(self.allocator);
-    try next.appendSlice(self.allocator, cur);
-    var event_type: extension_ui.UiEventType = .change;
-    var action = input.on_change;
-    switch (key.code) {
-        .char => if (!key.ctrl and !key.alt) {
-            if (key.char) |cp| {
-                var buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(cp, &buf) catch return null;
-                try next.appendSlice(self.allocator, buf[0..len]);
-            } else return null;
-        } else return null,
-        .backspace => {
-            if (next.items.len == 0) return null;
-            var end = next.items.len - 1;
-            while (end > 0 and (next.items[end] & 0xc0) == 0x80) end -= 1;
-            next.shrinkRetainingCapacity(end);
+    const editor = try inputState(self, spec.state_owner_id, spec.id, input.id, input.value);
+    const result = editor.handleKey(key);
+    switch (result) {
+        .none => return null,
+        .input => {
+            return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .node = input.id, .type = .input, .action = input.on_input orelse input.on_change, .value = editor.text(), .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
         },
-        .enter => {
-            event_type = .submit;
-            action = input.on_submit;
+        .consumed => return null,
+        .submit => {
+            return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .node = input.id, .type = .submit, .action = input.on_submit, .value = editor.text(), .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
         },
-        else => return null,
     }
-    if (event_type == .change) try setInputValue(self, spec.state_owner_id, spec.id, input.id, next.items);
-    const value = if (event_type == .change) inputValue(self, spec.state_owner_id, spec.id, input.id, next.items) else cur;
-    return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .node = input.id, .type = event_type, .action = action, .value = value, .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
 }
 
 const ViewRecord = struct {
@@ -1004,12 +1005,9 @@ fn renderChip(region: Region, label: []const u8) void {
 
 fn renderInput(state: *ExtensionUiState, view: extension_ui.RenderSpec, region: Region, input: extension_ui.UiNode.Input) void {
     if (region.width == 0) return;
-    const value = inputValue(state, view.state_owner_id, view.id, input.id, input.value);
-    const shown = if (value.len > 0) value else (input.placeholder orelse "");
-    const fg = if (value.len > 0) styleFg(state.activeTheme(), input.style) else state.activeTheme().fg(.muted);
-    const attrs = styleAttrs(input.style);
-    region.set(0, 0, charCell('›', fg, styleBg(input.style), attrs));
-    if (region.width > 2) _ = region.writeStr(2, 0, shown, fg, styleBg(input.style), attrs);
+    const primitive = inputState(state, view.state_owner_id, view.id, input.id, input.value) catch return;
+    primitive.placeholder = input.placeholder;
+    primitive.render(region);
 }
 
 fn renderSeparator(state: *ExtensionUiState, region: Region, sep: extension_ui.UiNode.Separator) void {
@@ -1113,13 +1111,13 @@ test "extension ui retains clone remove and generation gates" {
 test "extension ui edits focused overlay input and emits structured events" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    const root = extension_ui.UiNode{ .input = .{ .id = "filter", .value = "z", .placeholder = "Filter", .on_change = "changed", .on_submit = "submitted" } };
+    const root = extension_ui.UiNode{ .input = .{ .id = "filter", .value = "z", .placeholder = "Filter", .on_input = "input", .on_change = "changed", .on_submit = "submitted" } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .overlay, .focus = true, .root = root });
 
     const changed = state.handleOverlayInput(.{ .code = .char, .char = 'i' }).?;
-    try std.testing.expectEqual(extension_ui.UiEventType.change, changed.type);
+    try std.testing.expectEqual(extension_ui.UiEventType.input, changed.type);
     try std.testing.expectEqualStrings("filter", changed.node.?);
-    try std.testing.expectEqualStrings("changed", changed.action.?);
+    try std.testing.expectEqualStrings("input", changed.action.?);
     try std.testing.expectEqualStrings("zi", changed.value.?);
 
     const submitted = state.handleOverlayInput(.{ .code = .enter }).?;

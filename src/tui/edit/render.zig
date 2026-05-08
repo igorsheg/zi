@@ -5,7 +5,7 @@ const types = @import("types.zig");
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
-const PromptBuffer = buffer_state_mod.PromptBuffer;
+const EditBuffer = buffer_state_mod.EditBuffer;
 const VirtualLine = types.VirtualLine;
 
 pub const RenderConfig = struct {
@@ -16,7 +16,7 @@ pub const RenderConfig = struct {
     text_fg: Color,
 };
 
-pub fn renderVisibleLines(region: Region, buffer: *const PromptBuffer, visible_lines: []const VirtualLine, config: RenderConfig) void {
+pub fn renderVisibleLines(region: Region, buffer: *const EditBuffer, visible_lines: []const VirtualLine, config: RenderConfig) void {
     for (visible_lines, 0..) |line, row| {
         const prompt = switch (line.kind) {
             .prompt_first => config.prompt,

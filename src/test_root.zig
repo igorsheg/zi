@@ -33,7 +33,7 @@ test {
     _ = @import("tui/interactive/runtime/job_manager.zig");
     _ = @import("tui/interactive/session_index_worker.zig");
     _ = @import("themes/root.zig");
-    _ = @import("tui/editor/root.zig");
+    _ = @import("tui/edit/root.zig");
     _ = @import("coding_agent/slash_commands.zig");
     _ = @import("spawn/root.zig");
     _ = @import("coding_agent/extensions/system_command.zig");

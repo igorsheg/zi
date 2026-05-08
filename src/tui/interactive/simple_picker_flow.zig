@@ -16,6 +16,7 @@ pub const Theme = theme_mod.Theme;
 /// it owns picker presentation/lifecycle, not domain meaning.
 pub const SimplePickerFlow = struct {
     picker: ListPicker = undefined,
+    configured: bool = false,
     handle: ?OverlayHandle = null,
 
     pub fn configure(
@@ -29,7 +30,9 @@ pub const SimplePickerFlow = struct {
         on_select: ?*const fn (selection: Selection, ctx: ?*anyopaque) void,
         on_cancel: ?*const fn (ctx: ?*anyopaque) void,
     ) void {
+        if (self.configured) self.picker.deinit();
         self.picker = ListPicker.init(allocator, theme);
+        self.configured = true;
         self.picker.title = title;
         self.picker.list.max_visible = max_visible;
         self.picker.setItems(items);
@@ -42,6 +45,13 @@ pub const SimplePickerFlow = struct {
         if (self.handle) |h| {
             self.handle = null;
             h.hide();
+        }
+    }
+
+    pub fn deinit(self: *SimplePickerFlow) void {
+        if (self.configured) {
+            self.picker.deinit();
+            self.configured = false;
         }
     }
 };

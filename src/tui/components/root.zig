@@ -9,5 +9,4 @@ pub const hotkeys_overlay = @import("hotkeys_overlay.zig");
 pub const select_list = @import("select_list.zig");
 pub const list_picker = @import("list_picker.zig");
 pub const panel = @import("panel.zig");
-pub const search_input = @import("search_input.zig");
 pub const status_text = @import("status_text.zig");

@@ -1,13 +1,13 @@
 const buffer_mod = @import("buffer.zig");
 const types = @import("types.zig");
 
-const PromptBuffer = buffer_mod.PromptBuffer;
+const EditBuffer = buffer_mod.EditBuffer;
 const LogicalCursor = types.LogicalCursor;
 const VirtualLine = types.VirtualLine;
 const VisualCursor = types.VisualCursor;
 
 pub fn moveVisual(
-    buffer: *const PromptBuffer,
+    buffer: *const EditBuffer,
     virtual_lines: []const VirtualLine,
     current_row: u32,
     current_cursor: VisualCursor,

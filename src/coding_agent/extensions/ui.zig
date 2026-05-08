@@ -181,7 +181,7 @@ pub const UiNode = union(enum) {
     pub const Progress = struct { id: ?[]const u8 = null, value: ?f32 = null, label: ?[]const u8 = null, style: Style = .{} };
     pub const Separator = struct { id: ?[]const u8 = null, style: Style = .{} };
     pub const Surface = struct { id: []const u8, style: Style = .{} };
-    pub const Input = struct { id: []const u8, value: []const u8 = "", placeholder: ?[]const u8 = null, style: Style = .{}, on_change: ?[]const u8 = null, on_submit: ?[]const u8 = null };
+    pub const Input = struct { id: []const u8, value: []const u8 = "", placeholder: ?[]const u8 = null, style: Style = .{}, on_input: ?[]const u8 = null, on_change: ?[]const u8 = null, on_submit: ?[]const u8 = null };
 
     pub fn clone(allocator: std.mem.Allocator, node: UiNode) !UiNode {
         return switch (node) {
@@ -278,10 +278,12 @@ pub const UiNode = union(enum) {
                 errdefer allocator.free(value);
                 const placeholder = if (in.placeholder) |v| try allocator.dupe(u8, v) else null;
                 errdefer if (placeholder) |v| allocator.free(v);
+                const on_input = if (in.on_input) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (on_input) |v| allocator.free(v);
                 const on_change = if (in.on_change) |v| try allocator.dupe(u8, v) else null;
                 errdefer if (on_change) |v| allocator.free(v);
                 const on_submit = if (in.on_submit) |v| try allocator.dupe(u8, v) else null;
-                break :blk .{ .input = .{ .id = id, .value = value, .placeholder = placeholder, .style = style, .on_change = on_change, .on_submit = on_submit } };
+                break :blk .{ .input = .{ .id = id, .value = value, .placeholder = placeholder, .style = style, .on_input = on_input, .on_change = on_change, .on_submit = on_submit } };
             },
         };
     }
@@ -326,6 +328,7 @@ pub const UiNode = union(enum) {
                 allocator.free(in.id);
                 allocator.free(in.value);
                 if (in.placeholder) |v| allocator.free(v);
+                if (in.on_input) |v| allocator.free(v);
                 if (in.on_change) |v| allocator.free(v);
                 if (in.on_submit) |v| allocator.free(v);
                 in.style.deinit(allocator);
@@ -473,7 +476,7 @@ pub const EditorAction = struct {
     }
 };
 
-pub const UiEventType = enum { key, change, submit };
+pub const UiEventType = enum { key, input, change, submit };
 
 pub const UiEvent = struct {
     state_owner_id: []const u8,
@@ -606,11 +609,12 @@ test "ui v3 event clone owns payload" {
 
 test "ui v3 input clone owns strings" {
     const testing = std.testing;
-    var cloned = try UiNode.clone(testing.allocator, .{ .input = .{ .id = "name", .value = "zi", .placeholder = "filter", .style = .{ .tone = .accent }, .on_change = "rename", .on_submit = "accept" } });
+    var cloned = try UiNode.clone(testing.allocator, .{ .input = .{ .id = "name", .value = "zi", .placeholder = "filter", .style = .{ .tone = .accent }, .on_input = "typing", .on_change = "rename", .on_submit = "accept" } });
     defer cloned.deinit(testing.allocator);
     try testing.expectEqualStrings("name", cloned.input.id);
     try testing.expectEqualStrings("zi", cloned.input.value);
     try testing.expectEqualStrings("filter", cloned.input.placeholder.?);
+    try testing.expectEqualStrings("typing", cloned.input.on_input.?);
     try testing.expectEqualStrings("rename", cloned.input.on_change.?);
     try testing.expectEqualStrings("accept", cloned.input.on_submit.?);
 }

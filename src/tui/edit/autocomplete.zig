@@ -15,7 +15,7 @@ const SelectList = select_list_mod.SelectList;
 const Suggestions = autocomplete_mod.Suggestions;
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const RequestMode = autocomplete_mod.RequestMode;
-const PromptBuffer = buffer_mod.PromptBuffer;
+const EditBuffer = buffer_mod.EditBuffer;
 const Measurement = component_mod.Measurement;
 
 pub const InputOutcome = union(enum) {
@@ -73,7 +73,7 @@ pub const AutocompleteSession = struct {
         self.list.max_visible = self.max_visible;
     }
 
-    pub fn refresh(self: *AutocompleteSession, buffer: *const PromptBuffer) void {
+    pub fn refresh(self: *AutocompleteSession, buffer: *const EditBuffer) void {
         self.request(buffer, self.request_mode);
     }
 
@@ -94,7 +94,7 @@ pub const AutocompleteSession = struct {
         return provider.nextDeadline(now_ns);
     }
 
-    pub fn tickAnimation(self: *AutocompleteSession, buffer: *PromptBuffer, now_ns: i128) TickOutcome {
+    pub fn tickAnimation(self: *AutocompleteSession, buffer: *EditBuffer, now_ns: i128) TickOutcome {
         const provider = self.provider orelse return .{ .changed = false, .accepted = false };
         self.sink_ctx = .{ .session = self };
         const changed = provider.tick(now_ns, .{ .ptr = @ptrCast(&self.sink_ctx), .publish_fn = &sinkCallback });
@@ -124,7 +124,7 @@ pub const AutocompleteSession = struct {
         return self.active and self.list.items.len > 0;
     }
 
-    pub fn processInput(self: *AutocompleteSession, key: Key, buffer: *PromptBuffer) InputOutcome {
+    pub fn processInput(self: *AutocompleteSession, key: Key, buffer: *EditBuffer) InputOutcome {
         if (!self.isActive()) {
             if (keybindings.matches(.input_tab, key)) {
                 return self.trigger(buffer);
@@ -164,7 +164,7 @@ pub const AutocompleteSession = struct {
         }
     }
 
-    fn trigger(self: *AutocompleteSession, buffer: *PromptBuffer) InputOutcome {
+    fn trigger(self: *AutocompleteSession, buffer: *EditBuffer) InputOutcome {
         if (self.provider == null) return .unhandled;
         self.request(buffer, .force);
         if (self.isActive() and self.auto_accept_single_on_tab and self.list.items.len == 1) {
@@ -177,7 +177,7 @@ pub const AutocompleteSession = struct {
         return .consumed;
     }
 
-    fn request(self: *AutocompleteSession, buffer: *const PromptBuffer, mode: RequestMode) void {
+    fn request(self: *AutocompleteSession, buffer: *const EditBuffer, mode: RequestMode) void {
         const provider = self.provider orelse {
             self.cancel();
             return;
@@ -190,7 +190,7 @@ pub const AutocompleteSession = struct {
         );
     }
 
-    fn accept(self: *AutocompleteSession, buffer: *PromptBuffer) bool {
+    fn accept(self: *AutocompleteSession, buffer: *EditBuffer) bool {
         const provider = self.provider orelse return false;
         const item = self.list.getSelectedItem() orelse return false;
         const should_continue = shouldContinueAfterAccept(item);
@@ -332,8 +332,8 @@ fn testSession(provider: *TestProvider) AutocompleteSession {
     return session;
 }
 
-fn testPrompt(text: []const u8) PromptBuffer {
-    var buffer = PromptBuffer.init(testing.allocator, .wcwidth);
+fn testPrompt(text: []const u8) EditBuffer {
+    var buffer = EditBuffer.init(testing.allocator, .wcwidth);
     buffer.setText(text);
     return buffer;
 }

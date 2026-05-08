@@ -445,6 +445,7 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
         .value = try readStringFieldLimit(arena, L, idx, "value", "", ui_text_bytes),
         .placeholder = try readOptionalStringFieldLimit(arena, L, idx, "placeholder", ui_text_bytes),
         .style = style,
+        .on_input = try readOptionalStringFieldLimit(arena, L, idx, "on_input", ui_id_bytes),
         .on_change = try readOptionalStringFieldLimit(arena, L, idx, "on_change", ui_id_bytes),
         .on_submit = try readOptionalStringFieldLimit(arena, L, idx, "on_submit", ui_id_bytes),
     } };
@@ -2342,7 +2343,7 @@ test "extension ui parses text node spans" {
 test "extension ui parses input node" {
     var lua = try lua_runtime.LuaState.init(std.testing.allocator);
     defer lua.deinit();
-    try lua.doString("return { type = 'input', id = 'filter', value = 'zi', placeholder = 'Filter…', on_change = 'filter.changed', on_submit = 'filter.submit', style = { tone = 'accent' } }", "test_input_node");
+    try lua.doString("return { type = 'input', id = 'filter', value = 'zi', placeholder = 'Filter…', on_input = 'filter.input', on_change = 'filter.changed', on_submit = 'filter.submit', style = { tone = 'accent' } }", "test_input_node");
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2352,6 +2353,7 @@ test "extension ui parses input node" {
     try std.testing.expectEqualStrings("filter", node.input.id);
     try std.testing.expectEqualStrings("zi", node.input.value);
     try std.testing.expectEqualStrings("Filter…", node.input.placeholder.?);
+    try std.testing.expectEqualStrings("filter.input", node.input.on_input.?);
     try std.testing.expectEqualStrings("filter.changed", node.input.on_change.?);
     try std.testing.expectEqualStrings("filter.submit", node.input.on_submit.?);
     try std.testing.expectEqual(extension_ui.Tone.accent, node.input.style.tone);

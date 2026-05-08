@@ -7,10 +7,10 @@ const grapheme_mod = @import("../grapheme.zig");
 const box_chrome = @import("../surfaces/box_chrome.zig");
 const status_data_mod = @import("../status_data.zig");
 const autocomplete_mod = @import("../autocomplete/provider.zig");
-const editor_iface_mod = @import("../editor/interface.zig");
+const edit_iface_mod = @import("../edit/interface.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
-const editor_core = @import("../editor/root.zig");
+const edit_core = @import("../edit/root.zig");
 const keybindings = @import("../keybindings.zig");
 
 const Color = cell_mod.Color;
@@ -21,12 +21,12 @@ const CursorState = component_mod.CursorState;
 const Key = keys_mod.Key;
 const StatusData = status_data_mod.StatusData;
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
-const EditorInterface = editor_iface_mod.EditorInterface;
+const EditorInterface = edit_iface_mod.EditorInterface;
 const Theme = theme_mod.Theme;
-const PromptBuffer = editor_core.PromptBuffer;
-const PromptView = editor_core.PromptView;
-const AutocompleteSession = editor_core.AutocompleteSession;
-const RenderConfig = editor_core.RenderConfig;
+const EditBuffer = edit_core.EditBuffer;
+const TextAreaView = edit_core.TextAreaView;
+const AutocompleteSession = edit_core.AutocompleteSession;
+const RenderConfig = edit_core.RenderConfig;
 const BindingAction = keybindings.Action;
 
 const UndoSnapshot = struct {
@@ -46,8 +46,8 @@ const LastAction = enum {
 
 pub const Editor = struct {
     allocator: std.mem.Allocator,
-    buffer: *PromptBuffer,
-    view: PromptView,
+    buffer: *EditBuffer,
+    view: TextAreaView,
     autocomplete: AutocompleteSession,
     history: std.ArrayList([]u8) = .empty,
     undo_stack: std.ArrayList(UndoSnapshot) = .empty,
@@ -82,9 +82,9 @@ pub const Editor = struct {
 
     pub fn init(allocator: std.mem.Allocator, width_method: grapheme_mod.WidthMethod) Editor {
         const default_theme = themes_builtin.dark();
-        const buffer = allocator.create(PromptBuffer) catch @panic("OOM");
-        buffer.* = PromptBuffer.init(allocator, width_method);
-        var view = PromptView.init(allocator, buffer);
+        const buffer = allocator.create(EditBuffer) catch @panic("OOM");
+        buffer.* = EditBuffer.init(allocator, width_method);
+        var view = TextAreaView.init(allocator, buffer);
         view.setViewportHeight(10);
         return .{
             .allocator = allocator,
@@ -356,7 +356,7 @@ pub const Editor = struct {
             }
         }
 
-        editor_core.renderVisibleLines(inner, self.buffer, self.view.visibleLines(), RenderConfig{
+        edit_core.renderVisibleLines(inner, self.buffer, self.view.visibleLines(), RenderConfig{
             .prompt = self.prompt,
             .continuation_prompt = self.continuationPrompt(),
             .applied_padding_x = self.last_applied_padding_x,

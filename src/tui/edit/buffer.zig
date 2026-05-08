@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 
 pub const LogicalCursor = types.LogicalCursor;
 
-pub const PromptBuffer = struct {
+pub const EditBuffer = struct {
     allocator: Allocator,
     buf: std.ArrayList(u8) = .empty,
     cursor_byte: u32 = 0,
@@ -15,23 +15,23 @@ pub const PromptBuffer = struct {
     version_tag: u64 = 1,
     width_method: grapheme_mod.WidthMethod,
 
-    pub fn init(allocator: Allocator, width_method: grapheme_mod.WidthMethod) PromptBuffer {
+    pub fn init(allocator: Allocator, width_method: grapheme_mod.WidthMethod) EditBuffer {
         return .{ .allocator = allocator, .width_method = width_method };
     }
 
-    pub fn deinit(self: *PromptBuffer) void {
+    pub fn deinit(self: *EditBuffer) void {
         self.buf.deinit(self.allocator);
     }
 
-    pub fn text(self: *const PromptBuffer) []const u8 {
+    pub fn text(self: *const EditBuffer) []const u8 {
         return self.buf.items;
     }
 
-    pub fn version(self: *const PromptBuffer) u64 {
+    pub fn version(self: *const EditBuffer) u64 {
         return self.version_tag;
     }
 
-    pub fn cursor(self: *const PromptBuffer) LogicalCursor {
+    pub fn cursor(self: *const EditBuffer) LogicalCursor {
         return .{
             .byte = self.cursor_byte,
             .line = self.cursor_line,
@@ -39,15 +39,15 @@ pub const PromptBuffer = struct {
         };
     }
 
-    pub fn cursorByte(self: *const PromptBuffer) u32 {
+    pub fn cursorByte(self: *const EditBuffer) u32 {
         return self.cursor_byte;
     }
 
-    pub fn setText(self: *PromptBuffer, new_text: []const u8) void {
+    pub fn setText(self: *EditBuffer, new_text: []const u8) void {
         self.setTextAndCursor(new_text, @intCast(new_text.len));
     }
 
-    pub fn setTextAndCursor(self: *PromptBuffer, new_text: []const u8, cursor_byte: u32) void {
+    pub fn setTextAndCursor(self: *EditBuffer, new_text: []const u8, cursor_byte: u32) void {
         self.buf.items.len = 0;
         self.buf.appendSlice(self.allocator, new_text) catch {
             self.cursor_byte = 0;
@@ -61,22 +61,22 @@ pub const PromptBuffer = struct {
         self.bumpVersion();
     }
 
-    pub fn clear(self: *PromptBuffer) void {
+    pub fn clear(self: *EditBuffer) void {
         self.setTextAndCursor("", 0);
     }
 
-    pub fn insertAtCursor(self: *PromptBuffer, new_text: []const u8) void {
+    pub fn insertAtCursor(self: *EditBuffer, new_text: []const u8) void {
         self.buf.insertSlice(self.allocator, self.cursor_byte, new_text) catch return;
         self.cursor_byte += @intCast(new_text.len);
         self.recomputeCursorMetrics();
         self.bumpVersion();
     }
 
-    pub fn insertNewline(self: *PromptBuffer) void {
+    pub fn insertNewline(self: *EditBuffer) void {
         self.insertAtCursor("\n");
     }
 
-    pub fn replaceRange(self: *PromptBuffer, start_byte: u32, end_byte: u32, replacement_text: []const u8, cursor_in_replacement: u32) void {
+    pub fn replaceRange(self: *EditBuffer, start_byte: u32, end_byte: u32, replacement_text: []const u8, cursor_in_replacement: u32) void {
         const clamped_start = @min(start_byte, @as(u32, @intCast(self.buf.items.len)));
         const clamped_end = @max(clamped_start, @min(end_byte, @as(u32, @intCast(self.buf.items.len))));
 
@@ -94,7 +94,7 @@ pub const PromptBuffer = struct {
         self.bumpVersion();
     }
 
-    pub fn backspace(self: *PromptBuffer) void {
+    pub fn backspace(self: *EditBuffer) void {
         if (self.cursor_byte == 0) return;
         const prev: u32 = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         const items = self.buf.items;
@@ -105,7 +105,7 @@ pub const PromptBuffer = struct {
         self.bumpVersion();
     }
 
-    pub fn deleteForward(self: *PromptBuffer) void {
+    pub fn deleteForward(self: *EditBuffer) void {
         if (self.cursor_byte >= self.buf.items.len) return;
         const next: u32 = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         const items = self.buf.items;
@@ -115,34 +115,34 @@ pub const PromptBuffer = struct {
         self.bumpVersion();
     }
 
-    pub fn moveLeft(self: *PromptBuffer) void {
+    pub fn moveLeft(self: *EditBuffer) void {
         if (self.cursor_byte == 0) return;
         self.cursor_byte = @intCast(grapheme_mod.prevGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         self.recomputeCursorMetrics();
     }
 
-    pub fn moveRight(self: *PromptBuffer) void {
+    pub fn moveRight(self: *EditBuffer) void {
         if (self.cursor_byte >= self.buf.items.len) return;
         self.cursor_byte = @intCast(grapheme_mod.nextGraphemeBoundary(self.buf.items, self.cursor_byte, self.width_method));
         self.recomputeCursorMetrics();
     }
 
-    pub fn moveLogicalLineStart(self: *PromptBuffer) void {
+    pub fn moveLogicalLineStart(self: *EditBuffer) void {
         self.cursor_byte = self.currentLineStart();
         self.recomputeCursorMetrics();
     }
 
-    pub fn moveLogicalLineEnd(self: *PromptBuffer) void {
+    pub fn moveLogicalLineEnd(self: *EditBuffer) void {
         self.cursor_byte = self.currentLineEnd();
         self.recomputeCursorMetrics();
     }
 
-    pub fn setCursorByte(self: *PromptBuffer, byte: u32) void {
+    pub fn setCursorByte(self: *EditBuffer, byte: u32) void {
         self.cursor_byte = @min(byte, @as(u32, @intCast(self.buf.items.len)));
         self.recomputeCursorMetrics();
     }
 
-    pub fn currentLineStart(self: *const PromptBuffer) u32 {
+    pub fn currentLineStart(self: *const EditBuffer) u32 {
         if (self.cursor_byte == 0) return 0;
         var i = self.cursor_byte - 1;
         while (i > 0 and self.buf.items[i] != '\n') : (i -= 1) {}
@@ -150,17 +150,17 @@ pub const PromptBuffer = struct {
         return 0;
     }
 
-    pub fn currentLineEnd(self: *const PromptBuffer) u32 {
+    pub fn currentLineEnd(self: *const EditBuffer) u32 {
         var i = self.cursor_byte;
         while (i < self.buf.items.len and self.buf.items[i] != '\n') : (i += 1) {}
         return @intCast(i);
     }
 
-    pub fn cursorLine(self: *const PromptBuffer) u32 {
+    pub fn cursorLine(self: *const EditBuffer) u32 {
         return self.cursor_line;
     }
 
-    pub fn lineCount(self: *const PromptBuffer) u32 {
+    pub fn lineCount(self: *const EditBuffer) u32 {
         if (self.buf.items.len == 0) return 1;
         var count: u32 = 1;
         for (self.buf.items) |b| {
@@ -169,7 +169,7 @@ pub const PromptBuffer = struct {
         return count;
     }
 
-    pub fn lineStartByIndex(self: *const PromptBuffer, n: u32) u32 {
+    pub fn lineStartByIndex(self: *const EditBuffer, n: u32) u32 {
         if (n == 0) return 0;
         var count: u32 = 0;
         for (self.buf.items, 0..) |b, i| {
@@ -181,13 +181,13 @@ pub const PromptBuffer = struct {
         return @intCast(self.buf.items.len);
     }
 
-    pub fn lineEndByStart(self: *const PromptBuffer, start: u32) u32 {
+    pub fn lineEndByStart(self: *const EditBuffer, start: u32) u32 {
         var i = start;
         while (i < self.buf.items.len and self.buf.items[i] != '\n') : (i += 1) {}
         return i;
     }
 
-    pub fn displayColAtByte(self: *const PromptBuffer, byte: u32) u32 {
+    pub fn displayColAtByte(self: *const EditBuffer, byte: u32) u32 {
         const clamped = @min(byte, @as(u32, @intCast(self.buf.items.len)));
         var line_start: u32 = 0;
         if (clamped > 0) {
@@ -200,7 +200,7 @@ pub const PromptBuffer = struct {
         return @intCast(grapheme_mod.strWidth(self.buf.items[line_start..clamped], self.width_method));
     }
 
-    pub fn byteAtDisplayCol(self: *const PromptBuffer, line_start: u32, line_end: u32, target_col: u32) u32 {
+    pub fn byteAtDisplayCol(self: *const EditBuffer, line_start: u32, line_end: u32, target_col: u32) u32 {
         var col: u32 = 0;
         var i: u32 = line_start;
         while (i < line_end) {
@@ -216,7 +216,7 @@ pub const PromptBuffer = struct {
         return i;
     }
 
-    fn recomputeCursorMetrics(self: *PromptBuffer) void {
+    fn recomputeCursorMetrics(self: *EditBuffer) void {
         self.cursor_byte = @min(self.cursor_byte, @as(u32, @intCast(self.buf.items.len)));
 
         var line: u32 = 0;
@@ -233,7 +233,7 @@ pub const PromptBuffer = struct {
         self.cursor_col = @intCast(grapheme_mod.strWidth(self.buf.items[line_start..self.cursor_byte], self.width_method));
     }
 
-    fn bumpVersion(self: *PromptBuffer) void {
+    fn bumpVersion(self: *EditBuffer) void {
         self.version_tag +%= 1;
     }
 };

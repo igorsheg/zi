@@ -5,33 +5,33 @@ const buffer_mod = @import("buffer.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
-const PromptBuffer = buffer_mod.PromptBuffer;
+const EditBuffer = buffer_mod.EditBuffer;
 const LayoutConfig = types.LayoutConfig;
 const VirtualLine = types.VirtualLine;
 const VirtualLineKind = types.VirtualLineKind;
 
-pub const PromptLayoutCache = struct {
+pub const TextAreaLayoutCache = struct {
     arena: std.heap.ArenaAllocator,
     virtual_lines: []const VirtualLine = &.{},
     buffer_version: u64 = 0,
     config: ?LayoutConfig = null,
     generation: u64 = 0,
 
-    pub fn init(allocator: Allocator) PromptLayoutCache {
+    pub fn init(allocator: Allocator) TextAreaLayoutCache {
         return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
     }
 
-    pub fn deinit(self: *PromptLayoutCache) void {
+    pub fn deinit(self: *TextAreaLayoutCache) void {
         self.arena.deinit();
     }
 
-    pub fn invalidateAll(self: *PromptLayoutCache) void {
+    pub fn invalidateAll(self: *TextAreaLayoutCache) void {
         self.buffer_version = 0;
         self.config = null;
         self.virtual_lines = &.{};
     }
 
-    pub fn ensure(self: *PromptLayoutCache, buffer: *const PromptBuffer, config: LayoutConfig) void {
+    pub fn ensure(self: *TextAreaLayoutCache, buffer: *const EditBuffer, config: LayoutConfig) void {
         if (self.config) |current| {
             if (current.eql(config) and self.buffer_version == buffer.version()) return;
         }
@@ -44,12 +44,12 @@ pub const PromptLayoutCache = struct {
         self.generation +%= 1;
     }
 
-    pub fn lines(self: *const PromptLayoutCache) []const VirtualLine {
+    pub fn lines(self: *const TextAreaLayoutCache) []const VirtualLine {
         return self.virtual_lines;
     }
 };
 
-fn buildVirtualLines(buffer: *const PromptBuffer, config: LayoutConfig, allocator: Allocator) ![]const VirtualLine {
+fn buildVirtualLines(buffer: *const EditBuffer, config: LayoutConfig, allocator: Allocator) ![]const VirtualLine {
     var lines: std.ArrayList(VirtualLine) = .empty;
     errdefer lines.deinit(allocator);
 

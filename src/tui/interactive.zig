@@ -25,7 +25,7 @@ const theme_mod = @import("theme.zig");
 const themes_builtin = @import("../themes/builtin.zig");
 const app_meta = @import("../runtime/app.zig");
 const tui_mod = @import("tui.zig");
-const editor_iface_mod = @import("editor/interface.zig");
+const editor_iface_mod = @import("edit/interface.zig");
 const input_buffer_mod = @import("terminal/input_buffer.zig");
 const queues_mod = @import("interactive/runtime/queues.zig");
 const mailbox_mod = @import("../zio/root.zig").mailbox;
@@ -377,6 +377,9 @@ pub const Interactive = struct {
         self.drainUiEvents();
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
+        self.settings_picker.deinit();
+        self.thinking_picker.deinit();
+        self.login_picker.deinit();
         self.clearLoginPickerEntries();
         self.clearPendingImages();
         self.pending_images.deinit(self.allocator);

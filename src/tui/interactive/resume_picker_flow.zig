@@ -77,6 +77,7 @@ pub const ResumePickerFlow = struct {
     }
 
     pub fn deinit(self: *ResumePickerFlow) void {
+        self.picker.deinit();
         self.arena.deinit();
     }
 };

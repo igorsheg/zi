@@ -6,6 +6,7 @@ pub const focus = @import("focus.zig");
 pub const overlay = @import("overlay.zig");
 pub const chrome = @import("chrome.zig");
 pub const list_rows = @import("list_rows.zig");
+pub const text_input = @import("text_input.zig");
 
 pub const Size = geometry.Size;
 pub const Point = geometry.Point;
@@ -23,6 +24,7 @@ pub const Stack = layout.Stack;
 pub const ChildRect = layout.ChildRect;
 
 pub const FocusManager = focus.FocusManager;
+pub const TextInput = text_input.TextInput;
 
 pub const OverlayAnchor = overlay.OverlayAnchor;
 pub const OverlaySurface = overlay.OverlaySurface;

@@ -81,6 +81,7 @@ pub const ModelPickerFlow = struct {
     }
 
     pub fn deinit(self: *ModelPickerFlow) void {
+        self.picker.deinit();
         self.arena.deinit();
     }
 };

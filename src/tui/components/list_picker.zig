@@ -6,7 +6,7 @@ const select_list_mod = @import("select_list.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const panel_mod = @import("panel.zig");
-const search_input_mod = @import("search_input.zig");
+const text_input_mod = @import("../primitives/text_input.zig");
 const status_text_mod = @import("status_text.zig");
 const chrome = @import("../primitives/chrome.zig");
 const search = @import("../../search/root.zig");
@@ -19,14 +19,14 @@ const Key = keys_mod.Key;
 const SelectList = select_list_mod.SelectList;
 const SelectItem = select_list_mod.SelectItem;
 const InputResult = select_list_mod.InputResult;
-const SearchInput = search_input_mod.SearchInput;
+const TextInput = text_input_mod.TextInput;
 const StatusText = status_text_mod.StatusText;
 const Theme = theme_mod.Theme;
 
 const MAX_ITEMS = 512;
 const MAX_QUERY = 128;
 
-/// Modal picker surface composed from Panel, SearchInput, StatusText, and SelectList.
+/// Modal picker surface composed from Panel, TextInput, StatusText, and SelectList.
 ///
 /// Filtering/selection bookkeeping lives in PickerState; this view wires state to
 /// primitives and reports selection/cancellation via callbacks.
@@ -89,24 +89,11 @@ pub const PickerState = struct {
         return if (self.searchable) self.filtered_buf[0..self.filtered_count] else self.all_items;
     }
 
-    pub fn appendCodepoint(self: *PickerState, cp: u21) bool {
-        if (self.query_len >= MAX_QUERY) return false;
-        var utf8_buf: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch return false;
-        if (self.query_len + len > MAX_QUERY) return false;
-        @memcpy(self.query_buf[self.query_len..][0..len], utf8_buf[0..len]);
-        self.query_len += len;
+    pub fn setQuery(self: *PickerState, query_text: []const u8) void {
+        const len = @min(query_text.len, MAX_QUERY);
+        @memcpy(self.query_buf[0..len], query_text[0..len]);
+        self.query_len = len;
         self.applyFilter();
-        return true;
-    }
-
-    pub fn backspace(self: *PickerState) bool {
-        if (self.query_len == 0) return false;
-        var i = self.query_len - 1;
-        while (i > 0 and (self.query_buf[i] & 0b1100_0000) == 0b1000_0000) : (i -= 1) {}
-        self.query_len = i;
-        self.applyFilter();
-        return true;
     }
 
     pub fn setInitialSelectionByValue(self: *PickerState, value: []const u8) void {
@@ -209,7 +196,7 @@ pub const PickerState = struct {
 pub const ListPicker = struct {
     state: PickerState = .{},
     list: SelectList,
-    search_input: SearchInput,
+    search_input: TextInput,
     status_text: StatusText,
     title: []const u8 = "",
     theme: *const Theme,
@@ -223,7 +210,7 @@ pub const ListPicker = struct {
     pub fn init(allocator: std.mem.Allocator, theme: *const Theme) ListPicker {
         return .{
             .list = .{ .theme = theme },
-            .search_input = SearchInput.init(theme),
+            .search_input = TextInput.init(allocator, theme),
             .status_text = StatusText.init(allocator, theme, .wcwidth),
             .theme = theme,
         };
@@ -272,6 +259,10 @@ pub const ListPicker = struct {
         self.state.applyPreferredSelection(&self.list);
     }
 
+    pub fn deinit(self: *ListPicker) void {
+        self.search_input.deinit();
+    }
+
     pub fn render(self: *ListPicker, region: Region) void {
         const w = region.width;
         const h = region.height;
@@ -314,19 +305,16 @@ pub const ListPicker = struct {
 
     pub fn handleInput(self: *ListPicker, key: Key) bool {
         if (self.state.searchable) {
-            if (key.code == .char and !key.ctrl and !key.alt) {
-                if (key.char) |cp| {
-                    _ = self.state.appendCodepoint(cp);
+            const input_event = self.search_input.handleKey(key);
+            switch (input_event) {
+                .input => {
+                    self.state.setQuery(self.search_input.text());
                     self.list.setItems(self.state.visibleItems());
                     self.state.applyPreferredSelection(&self.list);
-                }
-                return true;
-            }
-            if (key.code == .backspace and !key.ctrl and !key.alt) {
-                _ = self.state.backspace();
-                self.list.setItems(self.state.visibleItems());
-                self.state.applyPreferredSelection(&self.list);
-                return true;
+                    return true;
+                },
+                .consumed => return true,
+                .submit, .none => {},
             }
         }
 
@@ -380,7 +368,7 @@ pub const ListPicker = struct {
 
     fn syncSearchInput(self: *ListPicker) void {
         self.search_input.placeholder = self.search_placeholder;
-        self.search_input.setText(self.state.query());
+        self.search_input.setValue(self.state.query()) catch {};
         self.search_input.setFocused(self.focused and self.state.searchable);
     }
 
@@ -433,6 +421,7 @@ test "plain picker navigates and reports visible source index" {
     var items = pickerItems();
 
     var picker = ListPicker.init(testing.allocator, &theme);
+    defer picker.deinit();
     var capture = SelectionCapture{};
     picker.setItems(&items);
     picker.on_select = &captureSelection;
@@ -455,6 +444,7 @@ test "searchable picker filters and reports original source index" {
     const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
 
     var picker = ListPicker.init(testing.allocator, &theme);
+    defer picker.deinit();
     var capture = SelectionCapture{};
     picker.setSearchableItems(&items, &search_texts);
     picker.on_select = &captureSelection;
@@ -474,6 +464,7 @@ test "searchable picker preserves selected value across filter changes" {
     const search_texts = [_][]const u8{ "resume alpha", "resume beta", "resume gamma" };
 
     var picker = ListPicker.init(testing.allocator, &theme);
+    defer picker.deinit();
     picker.setSearchableItems(&items, &search_texts);
     picker.setInitialSelectionByValue("beta");
 

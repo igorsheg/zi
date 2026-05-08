@@ -7,9 +7,9 @@ const render = @import("render.zig");
 const types = @import("types.zig");
 pub const interface = @import("interface.zig");
 
-pub const PromptBuffer = buffer.PromptBuffer;
-pub const PromptView = view.PromptView;
-pub const PromptLayoutCache = layout.PromptLayoutCache;
+pub const EditBuffer = buffer.EditBuffer;
+pub const TextAreaView = view.TextAreaView;
+pub const TextAreaLayoutCache = layout.TextAreaLayoutCache;
 pub const AutocompleteSession = autocomplete.AutocompleteSession;
 pub const AutocompleteInputOutcome = autocomplete.InputOutcome;
 pub const renderVisibleLines = render.renderVisibleLines;
