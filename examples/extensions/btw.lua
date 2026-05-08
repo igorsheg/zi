@@ -187,12 +187,16 @@ local function ask(ctx, question)
     return ensure_side(ctx):prompt({
       prompt = question,
       on = {
-        message_delta = function(event)
-          pending_answer = pending_answer .. tostring(event.text or "")
-          render(ctx)
+        message_update = function(event)
+          local ame = event and event.assistantMessageEvent or nil
+          if ame and ame.type == "text_delta" then
+            pending_answer = pending_answer .. tostring(ame.delta or "")
+            render(ctx)
+          end
         end,
         message_end = function(event)
-          if event.text and event.text ~= "" then pending_answer = event.text end
+          local msg = event and event.message or nil
+          if type(msg) == "table" and msg.role == "assistant" and msg.text and msg.text ~= "" then pending_answer = tostring(msg.text) end
           status = "Finalizing side response…"
           render(ctx)
         end,

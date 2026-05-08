@@ -143,22 +143,17 @@ const SidePromptEventQueue = struct {
 
     fn emit(ptr: *anyopaque, event: extension_runner_mod.AiCompleteStreamEvent) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        enqueueAiSessionPromptEvent(self.interactive, self.id, event) catch {
+        deliverAiSessionPromptEvent(self.interactive, self.id, event) catch {
             self.dropped += 1;
         };
     }
 };
 
-fn enqueueAiSessionPromptEvent(self: *Interactive, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) !void {
-    const cloned = try event.clone(self.msg_allocator);
-    switch (self.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = cloned } })) {
-        .ok, .dropped => {},
-        .full, .closed, .oom => |rejected| {
-            var failed = rejected;
-            failed.deinit(self.msg_allocator);
-            return error.AiSessionPromptEventUnavailable;
-        },
-    }
+fn deliverAiSessionPromptEvent(self: *Interactive, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) !void {
+    const runner = self.runtime_host.currentSession().extensionRunner() orelse return error.MissingExtensionRunner;
+    const owned = try event.clone(runner.allocator);
+    try runner.dispatchAiCompleteStreamEvent(id, owned);
+    self.publishPendingExtensionUi();
 }
 
 fn dispatchAiCompleteEventFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) anyerror!void {
@@ -194,14 +189,13 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
         },
         .ai_session_prompt => |request| {
             const session = self.runtime_host.currentSession();
-            try enqueueAiSessionPromptEvent(self, owned_start.id, .message_start);
             var event_queue = SidePromptEventQueue{ .interactive = self, .id = owned_start.id };
             var result = try session.runAiSessionAgentPrompt(self.msg_allocator, request, .{ .ptr = @ptrCast(&event_queue), .emit = SidePromptEventQueue.emit });
             errdefer result.deinit(self.msg_allocator);
-            if (event_queue.dropped > 0) try enqueueAiSessionPromptEvent(self, owned_start.id, .{ .events_dropped = event_queue.dropped });
+            if (event_queue.dropped > 0) try deliverAiSessionPromptEvent(self, owned_start.id, .{ .events_dropped = event_queue.dropped });
             switch (result) {
-                .completed => |completed| try enqueueAiSessionPromptEvent(self, owned_start.id, .{ .message_end = .{ .text = completed.text } }),
-                .err => |msg| try enqueueAiSessionPromptEvent(self, owned_start.id, .{ .err = msg }),
+                .completed => {},
+                .err => |msg| try deliverAiSessionPromptEvent(self, owned_start.id, .{ .err = msg }),
                 .cancelled => {},
             }
             switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = owned_start.id, .result = .{ .ai_session_prompt = result } } })) {

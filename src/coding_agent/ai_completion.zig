@@ -85,16 +85,19 @@ const CompletionCollector = struct {
     fn callback(event: ai.protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
         const self: *CompletionCollector = @ptrCast(@alignCast(ctx.?));
         switch (event) {
-            .start => {
-                self.emit(.message_start);
+            .start => |start| {
+                self.emit(.{ .agent_event = .{ .message_start = .{ .message = .{ .assistant = start.partial } } } });
             },
             .text_delta => |delta| {
-                if (delta.delta.len > 0) self.emit(.{ .message_delta = .{ .text = delta.delta } });
+                if (delta.delta.len > 0) self.emit(.{ .agent_event = .{ .message_update = .{
+                    .message = .{ .assistant = delta.partial },
+                    .assistant_message_event = event,
+                } } });
             },
             .done => |done| {
                 log.debug("provider done reason={s}", .{@tagName(done.reason)});
                 self.text = collectText(self.allocator, done.message) catch null;
-                self.emit(.{ .message_end = .{ .text = self.text orelse "" } });
+                self.emit(.{ .agent_event = .{ .message_end = .{ .message = .{ .assistant = done.message } } } });
             },
             .@"error" => |err| {
                 log.debug("provider error reason={s}", .{@tagName(err.reason)});
@@ -155,8 +158,11 @@ test "text completion emits stream callback events and final result" {
     try testing.expect(result == .completed);
     try testing.expectEqualStrings("hello", result.completed.text);
     try testing.expect(collector.events.items.len >= 3);
-    try testing.expect(collector.events.items[0] == .message_start);
-    try testing.expect(collector.events.items[1] == .message_delta);
-    try testing.expectEqualStrings("hello", collector.events.items[1].message_delta.text);
-    try testing.expect(collector.events.items[collector.events.items.len - 1] == .message_end);
+    try testing.expect(collector.events.items[0] == .agent_event);
+    try testing.expect(collector.events.items[0].agent_event == .message_start);
+    try testing.expect(collector.events.items[1] == .agent_event);
+    try testing.expect(collector.events.items[1].agent_event == .message_update);
+    try testing.expectEqualStrings("hello", collector.events.items[1].agent_event.message_update.assistant_message_event.text_delta.delta);
+    try testing.expect(collector.events.items[collector.events.items.len - 1] == .agent_event);
+    try testing.expect(collector.events.items[collector.events.items.len - 1].agent_event == .message_end);
 }

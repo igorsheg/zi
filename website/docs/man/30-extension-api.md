@@ -223,7 +223,7 @@ Event names:
 : Observe assistant turn boundaries.
 
 `message_start`, `message_update`, `message_end`, `message`
-: Observe transcript/message edges. `message` is the durable semantic observer and includes `event.message.entry_id`.
+: Observe transcript/message edges. `message_update` carries `event.message` plus `event.assistantMessageEvent` (`text_delta`, `thinking_delta`, `toolcall_delta`, etc.). `message` is the durable semantic observer and includes `event.message.entry_id`.
 
 `tool_execution_start`, `tool_execution_update`, `tool_execution_end`
 : Observe tool execution state.

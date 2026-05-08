@@ -80,9 +80,6 @@ pub const AiCompleteStreamEvent = union(enum) {
     agent_end,
     turn_start,
     turn_end,
-    message_start,
-    message_delta: struct { text: []const u8 },
-    message_end: struct { text: []const u8 },
     tool_execution_start: struct { tool_call_id: []const u8, tool_name: []const u8, input: std.json.Value },
     tool_execution_update: struct { tool_call_id: []const u8, tool_name: []const u8, input: std.json.Value },
     tool_execution_end: struct { tool_call_id: []const u8, tool_name: []const u8, result: agent_protocol.AgentToolResult, is_error: bool },
@@ -96,22 +93,17 @@ pub const AiCompleteStreamEvent = union(enum) {
             .agent_end => .agent_end,
             .turn_start => .turn_start,
             .turn_end => .turn_end,
-            .message_start => .message_start,
-            .message_delta => |v| .{ .message_delta = .{ .text = try allocator.dupe(u8, v.text) } },
-            .message_end => |v| .{ .message_end = .{ .text = try allocator.dupe(u8, v.text) } },
             .tool_execution_start => |v| .{ .tool_execution_start = .{ .tool_call_id = try allocator.dupe(u8, v.tool_call_id), .tool_name = try allocator.dupe(u8, v.tool_name), .input = try ai.json_util.cloneJsonValue(allocator, v.input) } },
             .tool_execution_update => |v| .{ .tool_execution_update = .{ .tool_call_id = try allocator.dupe(u8, v.tool_call_id), .tool_name = try allocator.dupe(u8, v.tool_name), .input = try ai.json_util.cloneJsonValue(allocator, v.input) } },
             .tool_execution_end => |v| .{ .tool_execution_end = .{ .tool_call_id = try allocator.dupe(u8, v.tool_call_id), .tool_name = try allocator.dupe(u8, v.tool_name), .result = try v.result.clone(allocator), .is_error = v.is_error } },
             .err => |msg| .{ .err = try allocator.dupe(u8, msg) },
             .events_dropped => |n| .{ .events_dropped = n },
-            .agent_event => |e| .{ .agent_event = e },
+            .agent_event => |e| .{ .agent_event = try cloneAgentEvent(allocator, e) },
         };
     }
 
     pub fn deinit(self: *AiCompleteStreamEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .message_delta => |v| allocator.free(v.text),
-            .message_end => |v| allocator.free(v.text),
             .tool_execution_start => |v| {
                 allocator.free(v.tool_call_id);
                 allocator.free(v.tool_name);
@@ -128,11 +120,129 @@ pub const AiCompleteStreamEvent = union(enum) {
                 v.result.free(allocator);
             },
             .err => |msg| allocator.free(msg),
-            .agent_start, .agent_end, .turn_start, .turn_end, .message_start, .events_dropped, .agent_event => {},
+            .agent_event => |*e| freeAgentEvent(allocator, e),
+            .agent_start, .agent_end, .turn_start, .turn_end, .events_dropped => {},
         }
         self.* = undefined;
     }
 };
+
+fn cloneAgentEvent(allocator: std.mem.Allocator, event: agent_protocol.AgentEvent) !agent_protocol.AgentEvent {
+    return switch (event) {
+        .agent_start => .{ .agent_start = {} },
+        .agent_end => |e| .{ .agent_end = .{ .messages = try agent_message_memory.cloneMessages(allocator, e.messages) } },
+        .turn_start => .{ .turn_start = {} },
+        .turn_end => |e| .{ .turn_end = .{ .message = try agent_message_memory.cloneMessage(allocator, e.message), .tool_results = try cloneToolResults(allocator, e.tool_results) } },
+        .message_start => |e| .{ .message_start = .{ .message = try agent_message_memory.cloneMessage(allocator, e.message) } },
+        .message_update => |e| .{ .message_update = .{ .message = try agent_message_memory.cloneMessage(allocator, e.message), .assistant_message_event = try cloneAssistantMessageEvent(allocator, e.assistant_message_event) } },
+        .message_end => |e| .{ .message_end = .{ .message = try agent_message_memory.cloneMessage(allocator, e.message) } },
+        .tool_execution_start => |e| .{ .tool_execution_start = .{ .tool_call_id = try allocator.dupe(u8, e.tool_call_id), .tool_name = try allocator.dupe(u8, e.tool_name), .args = try ai.json_util.cloneJsonValue(allocator, e.args) } },
+        .tool_execution_update => |e| .{ .tool_execution_update = .{ .tool_call_id = try allocator.dupe(u8, e.tool_call_id), .tool_name = try allocator.dupe(u8, e.tool_name), .args = try ai.json_util.cloneJsonValue(allocator, e.args), .partial_result = if (e.partial_result) |pr| try pr.clone(allocator) else null } },
+        .tool_execution_end => |e| .{ .tool_execution_end = .{ .tool_call_id = try allocator.dupe(u8, e.tool_call_id), .tool_name = try allocator.dupe(u8, e.tool_name), .result = try e.result.clone(allocator), .is_error = e.is_error } },
+    };
+}
+
+fn cloneToolResults(allocator: std.mem.Allocator, tool_results: []const agent_protocol.ToolResultMessage) ![]agent_protocol.ToolResultMessage {
+    const out = try allocator.alloc(agent_protocol.ToolResultMessage, tool_results.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*tr| agent_message_memory.freeToolResultMessage(allocator, tr);
+        allocator.free(out);
+    }
+    for (tool_results, 0..) |tr, i| {
+        out[i] = try agent_message_memory.cloneToolResultMessage(allocator, tr);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeAgentEvent(allocator: std.mem.Allocator, event: *agent_protocol.AgentEvent) void {
+    switch (event.*) {
+        .agent_start, .turn_start => {},
+        .agent_end => |e| agent_message_memory.freeMessages(allocator, @constCast(e.messages)),
+        .turn_end => |e| {
+            var message = e.message;
+            agent_message_memory.freeMessage(allocator, &message);
+            for (e.tool_results) |*tr| agent_message_memory.freeToolResultMessage(allocator, @constCast(tr));
+            allocator.free(e.tool_results);
+        },
+        .message_start => |e| {
+            var message = e.message;
+            agent_message_memory.freeMessage(allocator, &message);
+        },
+        .message_update => |e| {
+            var message = e.message;
+            agent_message_memory.freeMessage(allocator, &message);
+            var assistant_event = e.assistant_message_event;
+            freeAssistantMessageEvent(allocator, &assistant_event);
+        },
+        .message_end => |e| {
+            var message = e.message;
+            agent_message_memory.freeMessage(allocator, &message);
+        },
+        .tool_execution_start => |e| {
+            allocator.free(e.tool_call_id);
+            allocator.free(e.tool_name);
+            ai.json_util.freeJsonValue(allocator, e.args);
+        },
+        .tool_execution_update => |e| {
+            allocator.free(e.tool_call_id);
+            allocator.free(e.tool_name);
+            ai.json_util.freeJsonValue(allocator, e.args);
+            if (e.partial_result) |pr| pr.free(allocator);
+        },
+        .tool_execution_end => |e| {
+            allocator.free(e.tool_call_id);
+            allocator.free(e.tool_name);
+            e.result.free(allocator);
+        },
+    }
+}
+
+fn cloneAssistantMessageEvent(allocator: std.mem.Allocator, event: ai.protocol.AssistantMessageEvent) !ai.protocol.AssistantMessageEvent {
+    return switch (event) {
+        .start => |e| .{ .start = .{ .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .text_start => |e| .{ .text_start = .{ .content_index = e.content_index, .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .text_delta => |e| .{ .text_delta = .{ .content_index = e.content_index, .delta = try allocator.dupe(u8, e.delta), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .text_end => |e| .{ .text_end = .{ .content_index = e.content_index, .content = try allocator.dupe(u8, e.content), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .thinking_start => |e| .{ .thinking_start = .{ .content_index = e.content_index, .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .thinking_delta => |e| .{ .thinking_delta = .{ .content_index = e.content_index, .delta = try allocator.dupe(u8, e.delta), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .thinking_end => |e| .{ .thinking_end = .{ .content_index = e.content_index, .content = try allocator.dupe(u8, e.content), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .toolcall_start => |e| .{ .toolcall_start = .{ .content_index = e.content_index, .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .toolcall_delta => |e| .{ .toolcall_delta = .{ .content_index = e.content_index, .delta = try allocator.dupe(u8, e.delta), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .toolcall_end => |e| .{ .toolcall_end = .{ .content_index = e.content_index, .tool_call = try cloneToolCall(allocator, e.tool_call), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .done => |e| .{ .done = .{ .reason = e.reason, .message = try agent_message_memory.cloneAssistantMessage(allocator, e.message) } },
+        .@"error" => |e| .{ .@"error" = .{ .reason = e.reason, .@"error" = try agent_message_memory.cloneAssistantMessage(allocator, e.@"error") } },
+    };
+}
+
+fn freeAssistantMessageEvent(allocator: std.mem.Allocator, event: *ai.protocol.AssistantMessageEvent) void {
+    switch (event.*) {
+        .start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
+        .text_start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
+        .text_delta => |*e| { allocator.free(e.delta); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .text_end => |*e| { allocator.free(e.content); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .thinking_start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
+        .thinking_delta => |*e| { allocator.free(e.delta); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .thinking_end => |*e| { allocator.free(e.content); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .toolcall_start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
+        .toolcall_delta => |*e| { allocator.free(e.delta); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .toolcall_end => |*e| { freeToolCall(allocator, e.tool_call); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .done => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.message),
+        .@"error" => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.@"error"),
+    }
+}
+
+fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) !ai.protocol.ToolCall {
+    return .{ .id = try allocator.dupe(u8, tool_call.id), .name = try allocator.dupe(u8, tool_call.name), .arguments = try ai.json_util.cloneJsonValue(allocator, tool_call.arguments), .thought_signature = if (tool_call.thought_signature) |sig| try allocator.dupe(u8, sig) else null };
+}
+
+fn freeToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    ai.json_util.freeJsonValue(allocator, tool_call.arguments);
+    if (tool_call.thought_signature) |sig| allocator.free(sig);
+}
 
 pub const SystemEnvPair = struct {
     key: []const u8,
@@ -1625,9 +1735,6 @@ pub const ExtensionRunner = struct {
             .agent_end => "agent_end",
             .turn_start => "turn_start",
             .turn_end => "turn_end",
-            .message_start => "message_start",
-            .message_delta => "message_delta",
-            .message_end => "message_end",
             .tool_execution_start => "tool_execution_start",
             .tool_execution_update => "tool_execution_update",
             .tool_execution_end => "tool_execution_end",
@@ -1647,18 +1754,6 @@ pub const ExtensionRunner = struct {
         _ = lua_runtime.c.lua_pushlstring(L, name.ptr, name.len);
         lua_runtime.c.lua_setfield(L, -2, "type");
         switch (event) {
-            .message_delta => |v| {
-                _ = lua_runtime.c.lua_pushlstring(L, v.text.ptr, v.text.len);
-                lua_runtime.c.lua_setfield(L, -2, "text");
-                pushTextMessageTable(L, "assistant", v.text);
-                lua_runtime.c.lua_setfield(L, -2, "message");
-            },
-            .message_end => |v| {
-                _ = lua_runtime.c.lua_pushlstring(L, v.text.ptr, v.text.len);
-                lua_runtime.c.lua_setfield(L, -2, "text");
-                pushTextMessageTable(L, "assistant", v.text);
-                lua_runtime.c.lua_setfield(L, -2, "message");
-            },
             .tool_execution_start => |v| pushToolStreamEventFields(L, v.tool_call_id, v.tool_name, v.input),
             .tool_execution_update => |v| pushToolStreamEventFields(L, v.tool_call_id, v.tool_name, v.input),
             .tool_execution_end => |v| {
@@ -1680,10 +1775,6 @@ pub const ExtensionRunner = struct {
             },
             .agent_start, .agent_end, .turn_start => {},
             .turn_end => {
-                pushTextMessageTable(L, "assistant", "");
-                lua_runtime.c.lua_setfield(L, -2, "message");
-            },
-            .message_start => {
                 pushTextMessageTable(L, "assistant", "");
                 lua_runtime.c.lua_setfield(L, -2, "message");
             },
@@ -2455,7 +2546,7 @@ test "side ai tool stream events clone and free owned payloads" {
 
 test "side ai lifecycle stream events clone without allocation" {
     const allocator = std.testing.allocator;
-    const events = [_]AiCompleteStreamEvent{ .agent_start, .agent_end, .turn_start, .turn_end, .message_start };
+    const events = [_]AiCompleteStreamEvent{ .agent_start, .agent_end, .turn_start, .turn_end };
     for (events) |event| {
         var cloned = try event.clone(allocator);
         defer cloned.deinit(allocator);

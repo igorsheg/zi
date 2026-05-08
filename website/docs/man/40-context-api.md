@@ -328,13 +328,16 @@ local result = ctx.ai.complete({
   prompt = "draft release notes",
   on = {
     message_start = function(event) end,
-    message_delta = function(event) io.write(event.text or "") end,
+    message_update = function(event)
+      local update = event.assistantMessageEvent
+      if update and update.type == "text_delta" then io.write(update.delta or "") end
+    end,
     message_end = function(event) end,
   },
 })
 ```
 
-Stream event tables include `type = "message_start"`, `type = "message_delta", text = "..."`, and `type = "message_end", text = "..."`. Error and backpressure events may be delivered as `type = "error", error = "..."` or `type = "events_dropped", count = n`.
+Stream event tables use the normalized message lifecycle shape: `type = "message_start", message = {...}`, `type = "message_update", message = {...}, assistantMessageEvent = {...}`, and `type = "message_end", message = {...}`. For streamed text, read `event.assistantMessageEvent.delta` when `event.assistantMessageEvent.type == "text_delta"`. Error and backpressure events may be delivered as `type = "error", error = "..."` or `type = "events_dropped", count = n`.
 
 
 `ctx.ai.session(options)`
@@ -348,7 +351,7 @@ local side = ctx.ai.session({
   tools = { "read", "edit" },         -- optional allowlist; absent means no tools
   context = ctx.session.context({ max_messages = 120 }), -- optional string or context object
   on = {
-    message_delta = function(event) end,
+    message_update = function(event) end,
     tool_execution_start = function(event) end,
     tool_execution_end = function(event) end,
   },
@@ -369,7 +372,7 @@ side:dispose() -- releases in-memory state early
 
 `side:prompt(...)` returns the same result shape as `ctx.ai.complete` and commits successful turns to that side session's typed in-memory transcript. Side sessions do not mutate the main transcript. zi runs prompts through a managed in-process side agent; `tools = nil` or `{}` means no tools, while `tools = { ... }` is fail-fast validated against the parent session's available tools. Nested extension loading remains disabled. Session-wide `on` callbacks and per-prompt `on` callbacks are both delivered through the parent extension runner on the Lua thread.
 
-Side event tables include lifecycle events (`agent_start`, `agent_end`, `turn_start`, `turn_end`), message events (`message_start`, `message_delta`, `message_end`), tool events (`tool_execution_start`, `tool_execution_update`, `tool_execution_end`), `error`, and `events_dropped`. Message events include a JSON-compatible `message` table when available. Tool events include compatibility aliases such as `tool_name`/`toolName`, `tool_call_id`/`toolCallId`, `input`/`args`, and `is_error`/`isError`.
+Side event tables include lifecycle events (`agent_start`, `agent_end`, `turn_start`, `turn_end`), message events (`message_start`, `message_update`, `message_end`), tool events (`tool_execution_start`, `tool_execution_update`, `tool_execution_end`), `error`, and `events_dropped`. Message events include a JSON-compatible `message` table; `message_update` also includes `assistantMessageEvent` with normalized stream details (`text_delta`, `thinking_delta`, `toolcall_delta`, etc.). Tool events include compatibility aliases such as `tool_name`/`toolName`, `tool_call_id`/`toolCallId`, `input`/`args`, and `is_error`/`isError`.
 
 Results:
 

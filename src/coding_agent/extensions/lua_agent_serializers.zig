@@ -179,6 +179,35 @@ pub fn pushAgentMessageToLua(L: *c.lua_State, message: agent_protocol.AgentMessa
     }
 }
 
+fn pushToolCallToLua(L: *c.lua_State, tool_call: ai.protocol.ToolCall) lua_runtime.ConvertError!void {
+    c.lua_createtable(L, 0, 5);
+    pushStringField(L, "id", tool_call.id);
+    pushStringField(L, "name", tool_call.name);
+    pushStringField(L, "toolCallId", tool_call.id);
+    pushStringField(L, "toolName", tool_call.name);
+    try lua_runtime.pushJsonValue(L, tool_call.arguments);
+    c.lua_setfield(L, -2, "args");
+}
+
+fn pushAssistantMessageEventToLua(L: *c.lua_State, event: ai.protocol.AssistantMessageEvent) lua_runtime.ConvertError!void {
+    c.lua_createtable(L, 0, 5);
+    pushStringField(L, "type", @tagName(event));
+    switch (event) {
+        .start => |e| { try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .text_start => |e| { pushIntField(L, "contentIndex", e.content_index); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .text_delta => |e| { pushIntField(L, "contentIndex", e.content_index); pushStringField(L, "delta", e.delta); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .text_end => |e| { pushIntField(L, "contentIndex", e.content_index); pushStringField(L, "content", e.content); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .thinking_start => |e| { pushIntField(L, "contentIndex", e.content_index); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .thinking_delta => |e| { pushIntField(L, "contentIndex", e.content_index); pushStringField(L, "delta", e.delta); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .thinking_end => |e| { pushIntField(L, "contentIndex", e.content_index); pushStringField(L, "content", e.content); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .toolcall_start => |e| { pushIntField(L, "contentIndex", e.content_index); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .toolcall_delta => |e| { pushIntField(L, "contentIndex", e.content_index); pushStringField(L, "delta", e.delta); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .toolcall_end => |e| { pushIntField(L, "contentIndex", e.content_index); try pushToolCallToLua(L, e.tool_call); c.lua_setfield(L, -2, "toolCall"); try pushAssistantMessageToLua(L, e.partial); c.lua_setfield(L, -2, "partial"); },
+        .done => |e| { pushStringField(L, "reason", @tagName(e.reason)); try pushAssistantMessageToLua(L, e.message); c.lua_setfield(L, -2, "message"); },
+        .@"error" => |e| { pushStringField(L, "reason", @tagName(e.reason)); try pushAssistantMessageToLua(L, e.@"error"); c.lua_setfield(L, -2, "error"); },
+    }
+}
+
 pub fn pushAgentEventToLua(L: *c.lua_State, event: agent_protocol.AgentEvent) lua_runtime.ConvertError!void {
     c.lua_createtable(L, 0, 8);
     pushStringField(L, "type", @tagName(event));
@@ -187,7 +216,7 @@ pub fn pushAgentEventToLua(L: *c.lua_State, event: agent_protocol.AgentEvent) lu
         .agent_end => |e| { c.lua_createtable(L, @intCast(e.messages.len), 0); for (e.messages, 0..) |m, i| { try pushAgentMessageToLua(L, m); c.lua_rawseti(L, -2, @intCast(i + 1)); } c.lua_setfield(L, -2, "messages"); },
         .turn_end => |e| { try pushAgentMessageToLua(L, e.message); c.lua_setfield(L, -2, "message"); c.lua_createtable(L, @intCast(e.tool_results.len), 0); for (e.tool_results, 0..) |tr, i| { try pushToolResultMessageToLua(L, tr); c.lua_rawseti(L, -2, @intCast(i + 1)); } c.lua_setfield(L, -2, "toolResults"); },
         .message_start => |e| { try pushAgentMessageToLua(L, e.message); c.lua_setfield(L, -2, "message"); },
-        .message_update => |e| { try pushAgentMessageToLua(L, e.message); c.lua_setfield(L, -2, "message"); pushStringField(L, "update_kind", @tagName(e.assistant_message_event)); },
+        .message_update => |e| { try pushAgentMessageToLua(L, e.message); c.lua_setfield(L, -2, "message"); try pushAssistantMessageEventToLua(L, e.assistant_message_event); c.lua_setfield(L, -2, "assistantMessageEvent"); },
         .message_end => |e| { try pushAgentMessageToLua(L, e.message); c.lua_setfield(L, -2, "message"); },
         .tool_execution_start => |e| { pushStringField(L, "toolCallId", e.tool_call_id); pushStringField(L, "tool_call_id", e.tool_call_id); pushStringField(L, "toolName", e.tool_name); pushStringField(L, "tool_name", e.tool_name); try lua_runtime.pushJsonValue(L, e.args); c.lua_setfield(L, -2, "args"); },
         .tool_execution_update => |e| { pushStringField(L, "toolCallId", e.tool_call_id); pushStringField(L, "tool_call_id", e.tool_call_id); pushStringField(L, "toolName", e.tool_name); pushStringField(L, "tool_name", e.tool_name); try lua_runtime.pushJsonValue(L, e.args); c.lua_setfield(L, -2, "args"); if (e.partial_result) |pr| try pushAgentToolResultToLua(L, pr) else c.lua_pushnil(L); c.lua_setfield(L, -2, "partialResult"); },
