@@ -15,10 +15,14 @@ const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const display_wrap_mod = @import("../wrap/display.zig");
 const rendered_tool_result_view = @import("rendered_tool_result.zig");
+const selection_mod = @import("../selection/mod.zig");
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
+const Point = selection_mod.Point;
+const Rect = selection_mod.Rect;
+const GlobalSelection = selection_mod.GlobalSelection;
 
 /// Type-erased transcript row interface.
 ///
@@ -920,8 +924,10 @@ fn deinitUserMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 /// Items are owned transcript renderables plus optional metadata used for
 /// retained reconciliation (`retained_item_id`) and keyed tool-row lookup
 /// (`tool_call_id`). The transcript owns retained item order, layout, scroll,
-/// selection, and viewport rendering. Conversation semantics are projected into
-/// retained rows before they reach this container.
+/// and viewport rendering. Text selection is driven by the TUI selection
+/// controller through the selectable renderable protocol.
+/// Conversation semantics are projected into retained rows before they reach
+/// this container.
 pub const Transcript = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
     /// Fast lookup: tool_call_id → item index for retained tool-row updates.
@@ -1259,6 +1265,38 @@ pub const Transcript = struct {
             try events.append(allocator, .{ .tool_name = tool_name, .tool_call_id = tool_call_id });
         }
         return events.toOwnedSlice(allocator);
+    }
+
+    pub fn shouldStartSelection(self: *Transcript, bounds: Rect, point: Point) bool {
+        if (!bounds.contains(point)) return false;
+        if (bounds.width == 0 or bounds.height == 0) return false;
+        const local_x: u32 = @intCast(point.x - bounds.x);
+        const local_y: u32 = @intCast(point.y - bounds.y);
+        return self.selectionPointForLocal(bounds.width, bounds.height, local_x, local_y) != null;
+    }
+
+    pub fn onSelectionChanged(self: *Transcript, bounds: Rect, selection: ?GlobalSelection) bool {
+        const sel = selection orelse {
+            self.cancelSelection();
+            return false;
+        };
+        if (!sel.is_active or bounds.width == 0 or bounds.height == 0) {
+            self.cancelSelection();
+            return false;
+        }
+
+        const anchor_local = pointToTranscriptLocal(bounds, sel.anchor);
+        const focus = pointToTranscriptZone(bounds, sel.focus);
+        const needs_begin = sel.is_start or switch (self.selection) {
+            .inactive => true,
+            .active => false,
+        };
+        if (needs_begin) {
+            if (!self.beginSelection(bounds.width, bounds.height, anchor_local.x, anchor_local.y)) return false;
+        }
+        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        _ = self.updateSelection(bounds.width, bounds.height, focus.local_x, focus.local_y, focus.zone, now_ns);
+        return self.hasSelection(bounds.width);
     }
 
     pub fn beginSelection(self: *Transcript, width: u32, visible_height: u32, local_x: u32, local_y: u32) bool {
@@ -1630,6 +1668,36 @@ pub const Transcript = struct {
         }
     }
 };
+
+const LocalTranscriptPoint = struct { x: u32, y: u32 };
+const TranscriptZonePoint = struct { zone: DragZone, local_x: u32, local_y: u32 };
+
+fn pointToTranscriptLocal(bounds: Rect, point: Point) LocalTranscriptPoint {
+    const x = if (point.x < bounds.x)
+        0
+    else if (point.x >= bounds.x + @as(i32, @intCast(bounds.width)))
+        bounds.width - 1
+    else
+        @as(u32, @intCast(point.x - bounds.x));
+    const y = if (point.y < bounds.y)
+        0
+    else if (point.y >= bounds.y + @as(i32, @intCast(bounds.height)))
+        bounds.height - 1
+    else
+        @as(u32, @intCast(point.y - bounds.y));
+    return .{ .x = x, .y = y };
+}
+
+fn pointToTranscriptZone(bounds: Rect, point: Point) TranscriptZonePoint {
+    const local = pointToTranscriptLocal(bounds, point);
+    const zone: DragZone = if (point.y < bounds.y)
+        .above
+    else if (point.y >= bounds.y + @as(i32, @intCast(bounds.height)))
+        .below
+    else
+        .inside;
+    return .{ .zone = zone, .local_x = local.x, .local_y = local.y };
+}
 
 fn rowUsedColumns(region: Region, row: u32) u32 {
     if (row >= region.height) return 0;

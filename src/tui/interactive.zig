@@ -42,7 +42,7 @@ const runtime_process = @import("../zio/root.zig").process;
 const session_flow = @import("interactive/session_flow.zig");
 const conversation_publish = @import("interactive/conversation_publish.zig");
 const key_flow_mod = @import("interactive/key_flow.zig");
-const transcript_mouse = @import("interactive/transcript_mouse.zig");
+const selection_flow = @import("interactive/selection_flow.zig");
 const login_flow = @import("interactive/login_flow.zig");
 const composer_flow = @import("interactive/composer_flow.zig");
 const settings_flow_mod = @import("interactive/settings_flow.zig");
@@ -123,7 +123,8 @@ fn deinitTranscriptText(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(text);
 }
 
-const MouseCapture = transcript_mouse.MouseCapture;
+const MouseCapture = selection_flow.MouseCapture;
+const SelectionController = @import("selection/mod.zig").SelectionController;
 const AgentSession = coding_agent_mod.AgentSession;
 const SessionEvent = coding_agent_mod.session_event.SessionEvent;
 const RuntimeHost = coding_agent_mod.RuntimeHost;
@@ -276,6 +277,7 @@ pub const Interactive = struct {
     /// Kitty query deadline; null after negotiation settles.
     kitty_deadline_ns: ?i128 = null,
     mouse_capture: MouseCapture = .none,
+    selection: SelectionController = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -408,6 +410,7 @@ pub const Interactive = struct {
         self.lifecycle_event_queue.deinit();
         self.request_queue.deinit();
         self.conversation_projection.deinit();
+        self.selection.deinit(self.allocator);
         self.transcript.deinit();
         self.extension_ui_state.deinit();
         self.logs_overlay.deinit();
@@ -630,7 +633,7 @@ pub const Interactive = struct {
     }
 
     pub fn handleMouse(self: *Interactive, event: keys_mod.MouseEvent) void {
-        transcript_mouse.handle(self, event);
+        selection_flow.handle(self, event);
     }
 
     pub fn handleUiEvent(self: *Interactive, ev: *UiEvent) void {
@@ -674,7 +677,7 @@ pub const Interactive = struct {
     }
 
     pub fn cancelTranscriptSelection(self: *Interactive) void {
-        transcript_mouse.cancelSelection(self);
+        selection_flow.cancelSelection(self);
     }
 
     pub fn composerHasPendingInput(self: *Interactive) bool {
