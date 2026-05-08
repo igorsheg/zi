@@ -41,6 +41,8 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .session_messages_get = &runtimeSessionMessagesGet,
         .session_context_get = &runtimeSessionContextGet,
         .tool_exists = &runtimeToolExists,
+        .ai_complete = &runtimeAiComplete,
+        .ai_session_prompt = &runtimeAiSessionPrompt,
         .session_note_append = &runtimeSessionNoteAppend,
         .session_notes_get = &runtimeSessionNotesGet,
         .session_artifact_append = &runtimeSessionArtifactAppend,
@@ -56,6 +58,14 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .provider_projection_changed = &projection_runtime.providerProjectionChanged,
         .tool_projection_changed = &projection_runtime.toolProjectionChanged,
     }, self._stream_closure.registry) catch {};
+}
+
+fn runtimeAiComplete(session_ptr: *anyopaque, allocator: std.mem.Allocator, request: extension_runner_mod.AiCompleteRequest, event_sink: ?extension_runner_mod.AiSessionEventSink) anyerror!extension_runner_mod.AiCompleteResult {
+    return session(session_ptr).runAiCompletePrompt(allocator, request, event_sink);
+}
+
+fn runtimeAiSessionPrompt(session_ptr: *anyopaque, allocator: std.mem.Allocator, request: extension_runner_mod.AiSessionPromptRequest, event_sink: ?extension_runner_mod.AiSessionEventSink) anyerror!extension_runner_mod.AiCompleteResult {
+    return session(session_ptr).runAiSessionAgentPrompt(allocator, request, event_sink);
 }
 
 fn runtimeToolExists(session_ptr: *anyopaque, name: []const u8) bool {

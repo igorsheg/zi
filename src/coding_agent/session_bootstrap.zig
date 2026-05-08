@@ -456,11 +456,11 @@ pub fn buildAgentTools(
 ) ![]const agent_mod.protocol.AgentTool {
     const tools = try allocator.alloc(agent_mod.protocol.AgentTool, definitions.len);
     var count: usize = 0;
-    for (definitions) |definition| {
+    for (definitions) |*definition| {
         const tool = switch (definition.impl) {
             .builtin => tool_def.toAgentTool(definition),
             .lua => if (extension_runner) |runner|
-                lua_tool_mod.buildAgentTool(allocator, runner, definition) catch |err| {
+                lua_tool_mod.buildAgentTool(allocator, runner, definition.*) catch |err| {
                     std.log.scoped(.extensions).warn(
                         "failed to build agent tool for {s}: {s}",
                         .{ definition.name, @errorName(err) },

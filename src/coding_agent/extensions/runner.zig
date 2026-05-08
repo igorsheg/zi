@@ -204,6 +204,11 @@ pub const SystemRequest = struct {
 
 pub const SystemResult = system_command.Result;
 
+pub const AiSessionEventSink = struct {
+    ptr: *anyopaque,
+    emit: *const fn (ptr: *anyopaque, event: AiCompleteStreamEvent) void,
+};
+
 pub const AiCompleteResult = union(enum) {
     completed: struct { text: []const u8 },
     err: []const u8,
@@ -443,6 +448,8 @@ pub const ExtensionRuntime = union(enum) {
         session_messages_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, limit: usize, include_tools: bool) ?std.json.Value = null,
         session_context_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, max_messages: usize, include_tools: bool) ?std.json.Value = null,
         tool_exists: ?*const fn (session: *anyopaque, name: []const u8) bool = null,
+        ai_complete: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, request: AiCompleteRequest, event_sink: ?AiSessionEventSink) anyerror!AiCompleteResult = null,
+        ai_session_prompt: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, request: AiSessionPromptRequest, event_sink: ?AiSessionEventSink) anyerror!AiCompleteResult = null,
         session_note_append: ?*const fn (session: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8, source_entry_id: ?[]const u8) anyerror!void = null,
         session_notes_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, source_entry_id: ?[]const u8, limit: usize) ?std.json.Value = null,
         /// `data` is borrowed for the call; durable implementations must clone it.
@@ -1509,6 +1516,20 @@ pub const ExtensionRunner = struct {
         const owned = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned);
         try self.resumeAsync(id, .{ .@"test" = owned });
+    }
+
+    pub fn dispatchAiCompleteRequestEvent(self: *ExtensionRunner, request: AiCompleteRequest, event: AiCompleteStreamEvent) void {
+        self.assertOnLuaThread();
+        if (request.callbacks_ref == lua_runtime.c.LUA_NOREF) return;
+        const L = request.source_L orelse return;
+        callAiCompleteCallback(L, request.callbacks_ref, event);
+    }
+
+    pub fn dispatchAiSessionPromptRequestEvent(self: *ExtensionRunner, request: AiSessionPromptRequest, event: AiCompleteStreamEvent) void {
+        self.assertOnLuaThread();
+        if (request.callbacks_ref == lua_runtime.c.LUA_NOREF) return;
+        const L = request.source_L orelse return;
+        callAiCompleteCallback(L, request.callbacks_ref, event);
     }
 
     pub fn dispatchAiCompleteStreamEvent(self: *ExtensionRunner, id: AsyncOpId, event: AiCompleteStreamEvent) !void {

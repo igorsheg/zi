@@ -393,8 +393,7 @@ const WorkerExecution = struct {
     updates_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn run(self: *WorkerExecution, prepared: *const PreparedToolCall) void {
-        self.result = prepared.tool.execute(
-            prepared.tool.ctx,
+        const execution = prepared.tool.start(
             self.arena.allocator(),
             prepared.tool_call.id,
             prepared.effective_args,
@@ -402,10 +401,28 @@ const WorkerExecution = struct {
             &workerUpdateCallback,
             @ptrCast(self),
         );
+        self.result = resolveToolExecution(execution, self.arena.allocator(), self.signal, &workerUpdateCallback, @ptrCast(self));
         self.done.store(true, .release);
         self.queue.notify();
     }
 };
+
+fn resolveToolExecution(
+    execution: protocol.AgentToolExecution,
+    allocator: std.mem.Allocator,
+    signal: AbortSignal,
+    on_update: ?protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
+) protocol.AgentToolResult {
+    return switch (execution) {
+        .ready => |result| result,
+        .pending => |pending| blk: {
+            defer pending.free(allocator);
+            if (isAborted(signal)) pending.requestCancel();
+            break :blk pending.await(allocator, signal, on_update, update_ctx);
+        },
+    };
+}
 
 fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
     const worker: *WorkerExecution = @ptrCast(@alignCast(ctx.?));
@@ -591,8 +608,7 @@ fn executeToolCalls(
             .tool_name = prepared.tool_call.name,
             .args = prepared.tool_call.arguments,
         };
-        const result = prepared.tool.execute(
-            prepared.tool.ctx,
+        const execution = prepared.tool.start(
             turn_allocator,
             prepared.tool_call.id,
             prepared.effective_args,
@@ -600,6 +616,7 @@ fn executeToolCalls(
             &bridge_mod.UpdateBridge.callback,
             @ptrCast(&update_bridge),
         );
+        const result = resolveToolExecution(execution, turn_allocator, signal, &bridge_mod.UpdateBridge.callback, @ptrCast(&update_bridge));
         if (isAborted(signal)) {
             closeWorkerUpdates(prepared_calls.items[index..]);
             emitAbortedPreparedCalls(prepared_calls.items[index..], event_sink, event_ctx, turn_allocator);
@@ -1047,7 +1064,7 @@ test "parallel worker updates stream live before source-ordered finalization" {
             _: AbortSignal,
             on_update: ?protocol.AgentToolUpdateCallback,
             update_ctx: ?*anyopaque,
-        ) protocol.AgentToolResult {
+        ) protocol.AgentToolExecution {
             const ctx: *ToolCtx = @ptrCast(@alignCast(raw_ctx.?));
             switch (ctx.which) {
                 .first => std.Options.debug_io.sleep(.fromMilliseconds(30), .awake) catch {},
@@ -1061,10 +1078,10 @@ test "parallel worker updates stream live before source-ordered finalization" {
                     std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
                 },
             }
-            return makeAgentToolTextResult(allocator, switch (ctx.which) {
+            return .{ .ready = makeAgentToolTextResult(allocator, switch (ctx.which) {
                 .first => "first",
                 .second => "second",
-            }, false);
+            }, false) };
         }
     };
 
@@ -1150,7 +1167,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
             signal: AbortSignal,
             on_update: ?protocol.AgentToolUpdateCallback,
             update_ctx: ?*anyopaque,
-        ) protocol.AgentToolResult {
+        ) protocol.AgentToolExecution {
             _ = raw_ctx;
             if (on_update) |cb| {
                 cb(.{ .content = &.{.{ .text = .{ .text = "working" } }}, .is_error = false }, update_ctx);
@@ -1159,7 +1176,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
                 std.Options.debug_io.sleep(.fromNanoseconds(@intCast(std.time.ns_per_ms)), .awake) catch {};
             }
             std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
-            return makeAgentToolTextResult(allocator, "aborted", true);
+            return .{ .ready = makeAgentToolTextResult(allocator, "aborted", true) };
         }
     };
     const Aborter = struct {

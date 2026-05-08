@@ -25,6 +25,11 @@ pub fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return 0;
     } orelse return 0;
 
+    if (runner.current_signal != null) {
+        runner.current_spawn_request = req;
+        return c.lua_yieldk(L, 0, 0, ziSpawnContinue);
+    }
+
     var owned_req = req;
     defer {
         if (owned_req.callbacks_ref != c.LUA_NOREF) c.luaL_unref(owned_req.source_L, c.LUA_REGISTRYINDEX, owned_req.callbacks_ref);

@@ -32,10 +32,7 @@ const Agent = agent_mod.Agent;
 const SubscriptionToken = agent_impl.SubscriptionToken;
 pub const SessionStore = session_runtime.store.SessionStore;
 pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
-pub const SidePromptEventSink = struct {
-    ptr: *anyopaque,
-    emit: *const fn (ptr: *anyopaque, event: extension_runner_mod.AiCompleteStreamEvent) void,
-};
+pub const SidePromptEventSink = extension_runner_mod.AiSessionEventSink;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 pub const ContextUsage = session_core.context_usage.ContextUsage;
 const PendingExtensionUi = pending_extension_ui_mod.PendingExtensionUi;
@@ -612,6 +609,44 @@ pub const AgentSession = struct {
             else => return err,
         };
     }
+
+    pub fn runAiCompletePrompt(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+        request: extension_runner_mod.AiCompleteRequest,
+        event_sink: ?SidePromptEventSink,
+    ) !extension_runner_mod.AiCompleteResult {
+        const worker_request = try self.buildAiCompleteWorkerRequest(allocator, 0, request);
+        var owned = worker_request;
+        defer owned.deinit(allocator);
+        const ai_completion = @import("ai_completion.zig");
+        var forwarder = if (event_sink) |sink| AiCompleteEventForwarder{ .sink = sink } else null;
+        const result = ai_completion.runPreparedTextCompletion(allocator, .{
+            .provider = owned.provider,
+            .model = owned.model,
+            .prompt = owned.prompt,
+            .system_prompt = owned.system_prompt,
+            .api_key = owned.api_key,
+            .headers = owned.headers,
+            .max_tokens = owned.max_tokens,
+            .reasoning = owned.reasoning,
+            .on_event = if (forwarder != null and owned.stream_events) &AiCompleteEventForwarder.onEvent else null,
+            .on_event_ctx = if (forwarder != null) @ptrCast(&forwarder.?) else null,
+        });
+        return switch (result) {
+            .completed => |completed| .{ .completed = .{ .text = completed.text } },
+            .err => |msg| .{ .err = msg },
+            .cancelled => .cancelled,
+        };
+    }
+
+    const AiCompleteEventForwarder = struct {
+        sink: SidePromptEventSink,
+        fn onEvent(event: extension_runner_mod.AiCompleteStreamEvent, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.sink.emit(self.sink.ptr, event);
+        }
+    };
 
     pub fn buildAiCompleteWorkerRequest(
         self: *AgentSession,

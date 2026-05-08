@@ -233,6 +233,36 @@ pub const AgentToolResult = struct {
 /// Callback for streaming tool execution updates.
 pub const AgentToolUpdateCallback = *const fn (partial_result: AgentToolResult, ctx: ?*anyopaque) void;
 
+/// In-flight tool execution.
+///
+/// This is the Zig-native analogue of pi-mono's
+/// `Promise<AgentToolResult>` return from `AgentTool.execute`: a tool may
+/// complete immediately or hand the agent loop a continuation that can be
+/// waited/cancelled without encoding extension-specific state in the loop.
+pub const AgentToolExecution = union(enum) {
+    ready: AgentToolResult,
+    pending: Pending,
+
+    pub const Pending = struct {
+        ptr: *anyopaque,
+        wait: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, signal: AbortSignal, on_update: ?AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult,
+        cancel: ?*const fn (ptr: *anyopaque) void = null,
+        deinit: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void = null,
+
+        pub fn await(self: Pending, allocator: std.mem.Allocator, signal: AbortSignal, on_update: ?AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult {
+            return self.wait(self.ptr, allocator, signal, on_update, update_ctx);
+        }
+
+        pub fn requestCancel(self: Pending) void {
+            if (self.cancel) |f| f(self.ptr);
+        }
+
+        pub fn free(self: Pending, allocator: std.mem.Allocator) void {
+            if (self.deinit) |f| f(self.ptr, allocator);
+        }
+    };
+};
+
 /// Tool definition for the agent runtime.
 /// Extends ai.Tool with execution capability.
 /// pi-mono source: packages/agent/src/types.ts:292-307
@@ -255,7 +285,19 @@ pub const AgentTool = struct {
         signal: AbortSignal,
         on_update: ?AgentToolUpdateCallback,
         update_ctx: ?*anyopaque,
-    ) AgentToolResult,
+    ) AgentToolExecution,
+
+    pub fn start(
+        self: AgentTool,
+        allocator: std.mem.Allocator,
+        tool_call_id: []const u8,
+        args: std.json.Value,
+        signal: AbortSignal,
+        on_update: ?AgentToolUpdateCallback,
+        update_ctx: ?*anyopaque,
+    ) AgentToolExecution {
+        return self.execute(self.ctx, allocator, tool_call_id, args, signal, on_update, update_ctx);
+    }
 };
 
 /// Agent context snapshot passed to the loop.

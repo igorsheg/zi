@@ -37,6 +37,7 @@ const request_mod = @import("../request.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
 const spawn_types = @import("../../spawn/types.zig");
 const extension_limits = @import("limits.zig");
+const system_command = @import("system_command.zig");
 
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_tool);
@@ -125,13 +126,20 @@ fn execute(
     signal: abort_signal_mod.AbortSignal,
     on_update: ?agent_protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
-) AgentToolResult {
+) agent_protocol.AgentToolExecution {
     const tctx: *LuaToolCtx = @ptrCast(@alignCast(ctx.?));
     const state = tctx.runner.lua_state orelse {
-        return errorResult(allocator, "lua state not attached");
+        return .{ .ready = errorResult(allocator, "lua state not attached") };
     };
 
     tctx.runner.assertOnLuaThread();
+
+    var co = lua_runtime.Coroutine.init(state) catch |err| {
+        log.warn("lua tool coroutine allocation failed: {s}", .{@errorName(err)});
+        return .{ .ready = errorResult(allocator, @errorName(err)) };
+    };
+    var co_owned = true;
+    defer if (co_owned) co.deinit();
 
     tctx.runner.current_signal = signal;
     tctx.runner.current_update_callback = on_update;
@@ -142,27 +150,233 @@ fn execute(
         tctx.runner.current_update_ctx = null;
     }
 
-    const result = runHandler(allocator, state, tctx.runner, tctx.lua_ref, tctx.provenance, args) catch |err| {
+    prepareHandlerCoroutine(state, tctx.runner, &co, tctx.lua_ref, tctx.provenance, args) catch |err| {
         log.warn("lua tool execution failed: {s}", .{@errorName(err)});
-        return errorResult(allocator, @errorName(err));
+        return .{ .ready = errorResult(allocator, @errorName(err)) };
     };
 
-    _ = tool_call_id;
-    _ = tctx.name;
-    return result;
+    if (tctx.provenance) |prov| tctx.runner.beginExecutionContext(tctx.runner.sourceForProvenance(prov));
+    defer if (tctx.provenance != null) tctx.runner.endExecutionContext();
+
+    var nargs: c_int = 2;
+    while (true) {
+        const r = co.resumeWith(nargs) catch |err| {
+            log.warn("lua tool execution failed: {s}", .{@errorName(err)});
+            return .{ .ready = errorResult(allocator, @errorName(err)) };
+        };
+        nargs = 0;
+
+        switch (r.status) {
+            .yielded => {
+                if (tctx.runner.current_async_start) |start_value| {
+                    if (r.nresults > 0) c.lua_pop(co.L, r.nresults);
+                    var start = start_value;
+                    tctx.runner.current_async_start = null;
+                    errdefer start.deinit(tctx.runner.allocator);
+
+                    const pending = allocator.create(PendingLuaToolExecution) catch {
+                        start.deinit(tctx.runner.allocator);
+                        return .{ .ready = errorResult(allocator, "failed to allocate lua tool continuation") };
+                    };
+                    pending.* = .{
+                        .runner = tctx.runner,
+                        .state = state,
+                        .co = co,
+                        .start = start,
+                        .provenance = tctx.provenance,
+                        .tool_name = tctx.name,
+                        .tool_call_id = tool_call_id,
+                        .generation = tctx.runner.generation,
+                    };
+                    co_owned = false;
+                    return .{ .pending = .{
+                        .ptr = @ptrCast(pending),
+                        .wait = &PendingLuaToolExecution.wait,
+                        .cancel = &PendingLuaToolExecution.cancel,
+                        .deinit = &PendingLuaToolExecution.deinit,
+                    } };
+                }
+
+                if (tctx.runner.current_spawn_request) |spawn_req_value| {
+                    if (r.nresults > 0) c.lua_pop(co.L, r.nresults);
+                    var spawn_req = spawn_req_value;
+                    tctx.runner.current_spawn_request = null;
+                    errdefer {
+                        if (spawn_req.callbacks_ref != c.LUA_NOREF) c.luaL_unref(spawn_req.source_L, c.LUA_REGISTRYINDEX, spawn_req.callbacks_ref);
+                        spawn_req.deinit(tctx.runner.allocator);
+                    }
+                    const pending = allocator.create(PendingLuaToolExecution) catch {
+                        if (spawn_req.callbacks_ref != c.LUA_NOREF) c.luaL_unref(spawn_req.source_L, c.LUA_REGISTRYINDEX, spawn_req.callbacks_ref);
+                        spawn_req.deinit(tctx.runner.allocator);
+                        return .{ .ready = errorResult(allocator, "failed to allocate lua tool continuation") };
+                    };
+                    pending.* = .{
+                        .runner = tctx.runner,
+                        .state = state,
+                        .co = co,
+                        .spawn_request = spawn_req,
+                        .provenance = tctx.provenance,
+                        .tool_name = tctx.name,
+                        .tool_call_id = tool_call_id,
+                        .generation = tctx.runner.generation,
+                    };
+                    co_owned = false;
+                    return .{ .pending = .{
+                        .ptr = @ptrCast(pending),
+                        .wait = &PendingLuaToolExecution.wait,
+                        .cancel = &PendingLuaToolExecution.cancel,
+                        .deinit = &PendingLuaToolExecution.deinit,
+                    } };
+                }
+
+                serviceYieldedToolCoroutine(allocator, tctx.runner, state, &co, r.nresults) catch |err| {
+                    log.warn("lua tool yielded operation failed: {s}", .{@errorName(err)});
+                    return .{ .ready = errorResult(allocator, @errorName(err)) };
+                };
+                continue;
+            },
+            .ok, .finished => {
+                const top = c.lua_gettop(co.L);
+                defer if (r.nresults > 0) c.lua_settop(co.L, top - r.nresults);
+                const result = if (r.nresults == 0)
+                    emptyResult()
+                else
+                    parseReturn(allocator, co.L, top, default_tool_result_limits) catch |err| blk: {
+                        log.warn("lua tool result parsing failed: {s}", .{@errorName(err)});
+                        break :blk errorResult(allocator, @errorName(err));
+                    };
+                return .{ .ready = result };
+            },
+        }
+    }
 }
 
-fn runHandler(
-    allocator: std.mem.Allocator,
+const PendingLuaToolExecution = struct {
+    runner: *runner_mod.ExtensionRunner,
+    state: *lua_runtime.LuaState,
+    co: lua_runtime.Coroutine,
+    start: ?runner_mod.AsyncStart = null,
+    spawn_request: ?runner_mod.SpawnRequest = null,
+    provenance: ?resource_types.ExtensionProvenance,
+    tool_name: []const u8,
+    tool_call_id: []const u8,
+    generation: runner_mod.Generation,
+    cancelled: bool = false,
+
+    fn wait(ptr: *anyopaque, allocator: std.mem.Allocator, signal: abort_signal_mod.AbortSignal, on_update: ?agent_protocol.AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.cancelled or isAbortedToolSignal(signal)) return errorResult(allocator, "tool execution cancelled");
+        if (self.runner.generation != self.generation) return errorResult(allocator, "tool execution cancelled by extension reload");
+
+        self.runner.assertOnLuaThread();
+        self.runner.current_signal = signal;
+        self.runner.current_update_callback = on_update;
+        self.runner.current_update_ctx = update_ctx;
+        defer {
+            self.runner.current_signal = null;
+            self.runner.current_update_callback = null;
+            self.runner.current_update_ctx = null;
+        }
+
+        if (self.provenance) |prov| self.runner.beginExecutionContext(self.runner.sourceForProvenance(prov));
+        defer if (self.provenance != null) self.runner.endExecutionContext();
+
+        while (true) {
+            if (self.cancelled or isAbortedToolSignal(signal)) return errorResult(allocator, "tool execution cancelled");
+            if (self.runner.generation != self.generation) return errorResult(allocator, "tool execution cancelled by extension reload");
+            if (self.start) |start_value| {
+                self.start = null;
+                serviceYieldedAsyncToolCoroutine(self.runner, start_value) catch |err| {
+                    log.warn("lua tool async operation failed: {s}", .{@errorName(err)});
+                    return errorResult(allocator, @errorName(err));
+                };
+            }
+            if (self.spawn_request) |spawn_req_value| {
+                self.spawn_request = null;
+                serviceYieldedSpawnToolCoroutine(allocator, self.runner, &self.co, spawn_req_value) catch |err| {
+                    log.warn("lua tool spawn operation failed: {s}", .{@errorName(err)});
+                    return errorResult(allocator, @errorName(err));
+                };
+            }
+
+            const r = self.co.resumeWith(0) catch |err| {
+                log.warn("lua tool continuation failed: {s}", .{@errorName(err)});
+                return errorResult(allocator, @errorName(err));
+            };
+            switch (r.status) {
+                .yielded => {
+                    if (self.runner.current_async_start) |start_value| {
+                        if (r.nresults > 0) c.lua_pop(self.co.L, r.nresults);
+                        self.runner.current_async_start = null;
+                        self.start = start_value;
+                        continue;
+                    }
+                    if (self.runner.current_spawn_request) |spawn_req_value| {
+                        if (r.nresults > 0) c.lua_pop(self.co.L, r.nresults);
+                        self.runner.current_spawn_request = null;
+                        self.spawn_request = spawn_req_value;
+                        continue;
+                    }
+                    serviceYieldedToolCoroutine(allocator, self.runner, self.state, &self.co, r.nresults) catch |err| {
+                        log.warn("lua tool yielded operation failed: {s}", .{@errorName(err)});
+                        return errorResult(allocator, @errorName(err));
+                    };
+                    continue;
+                },
+                .ok, .finished => {
+                    const top = c.lua_gettop(self.co.L);
+                    defer if (r.nresults > 0) c.lua_settop(self.co.L, top - r.nresults);
+                    _ = self.tool_call_id;
+                    _ = self.tool_name;
+                    if (r.nresults == 0) return emptyResult();
+                    return parseReturn(allocator, self.co.L, top, default_tool_result_limits) catch |err| {
+                        log.warn("lua tool result parsing failed: {s}", .{@errorName(err)});
+                        return errorResult(allocator, @errorName(err));
+                    };
+                },
+            }
+        }
+    }
+
+    fn cancel(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.cancelled = true;
+    }
+
+    fn deinit(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.start) |*start| start.deinit(self.runner.allocator);
+        if (self.spawn_request) |*req| {
+            if (req.callbacks_ref != c.LUA_NOREF) c.luaL_unref(req.source_L, c.LUA_REGISTRYINDEX, req.callbacks_ref);
+            req.deinit(self.runner.allocator);
+        }
+        self.co.deinit();
+        allocator.destroy(self);
+    }
+};
+
+fn isAbortedToolSignal(signal: abort_signal_mod.AbortSignal) bool {
+    return signal.isAborted();
+}
+
+fn awaitToolExecutionForCompat(execution: agent_protocol.AgentToolExecution, allocator: std.mem.Allocator, signal: abort_signal_mod.AbortSignal) AgentToolResult {
+    return switch (execution) {
+        .ready => |result| result,
+        .pending => |pending| blk: {
+            defer pending.free(allocator);
+            break :blk pending.await(allocator, signal, null, null);
+        },
+    };
+}
+
+fn prepareHandlerCoroutine(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
+    co: *lua_runtime.Coroutine,
     handler_ref: c_int,
     provenance: ?resource_types.ExtensionProvenance,
     args: std.json.Value,
-) !AgentToolResult {
-    var co = try lua_runtime.Coroutine.init(state);
-    defer co.deinit();
-
+) !void {
     _ = c.lua_rawgeti(co.L, c.LUA_REGISTRYINDEX, handler_ref);
     if (c.lua_type(co.L, -1) != c.LUA_TFUNCTION) {
         c.lua_pop(co.L, 1);
@@ -177,27 +391,6 @@ fn runHandler(
     c.lua_setfield(co.L, -2, "update");
 
     runner.setModuleContext(state, provenance);
-    if (provenance) |prov| {
-        runner.beginExecutionContext(runner.sourceForProvenance(prov));
-        defer runner.endExecutionContext();
-    }
-
-    while (true) {
-        const r = try co.resumeWith(2);
-        switch (r.status) {
-            .yielded => {
-                try serviceYieldedToolCoroutine(allocator, runner, state, &co, r.nresults);
-                continue;
-            },
-            .ok, .finished => {
-                if (r.nresults == 0) return emptyResult();
-
-                const top = c.lua_gettop(co.L);
-                defer c.lua_settop(co.L, top - r.nresults);
-                return parseReturn(allocator, co.L, top, default_tool_result_limits);
-            },
-        }
-    }
 }
 
 fn serviceYieldedToolCoroutine(
@@ -210,11 +403,27 @@ fn serviceYieldedToolCoroutine(
     _ = state;
     if (nresults > 0) c.lua_pop(co.L, nresults);
 
-    var req = runner.current_spawn_request orelse return error.UnexpectedYield;
+    if (runner.current_async_start) |start| {
+        runner.current_async_start = null;
+        try serviceYieldedAsyncToolCoroutine(runner, start);
+        return;
+    }
+
+    const req = runner.current_spawn_request orelse return error.UnexpectedYield;
+    runner.current_spawn_request = null;
+    try serviceYieldedSpawnToolCoroutine(allocator, runner, co, req);
+}
+
+fn serviceYieldedSpawnToolCoroutine(
+    allocator: std.mem.Allocator,
+    runner: *runner_mod.ExtensionRunner,
+    co: *lua_runtime.Coroutine,
+    req_value: runner_mod.SpawnRequest,
+) !void {
+    var req = req_value;
     defer {
         if (req.callbacks_ref != c.LUA_NOREF) c.luaL_unref(req.source_L, c.LUA_REGISTRYINDEX, req.callbacks_ref);
         req.deinit(runner.allocator);
-        runner.current_spawn_request = null;
     }
 
     var trampoline_ctx = spawn_api.TrampolineCtx{
@@ -250,6 +459,106 @@ fn serviceYieldedToolCoroutine(
     try fanout.drain();
 
     runner.current_spawn_result = .{ .result = try spawnResultToToolResult(allocator, spawn_result) };
+}
+
+fn serviceYieldedAsyncToolCoroutine(
+    runner: *runner_mod.ExtensionRunner,
+    start_value: runner_mod.AsyncStart,
+) !void {
+    var start = start_value;
+    defer start.deinit(runner.allocator);
+
+    switch (start.request) {
+        .system => |request| {
+            var result: runner_mod.AsyncResult = .{ .system = try runToolSystemRequest(runner, request) };
+            errdefer result.deinit(runner.allocator);
+            try runner.completed_async.put(runner.allocator, start.id, result);
+        },
+        .ai_complete => |request| {
+            var result: runner_mod.AsyncResult = .{ .ai_complete = try runToolAiCompleteRequest(runner, request) };
+            errdefer result.deinit(runner.allocator);
+            try runner.completed_async.put(runner.allocator, start.id, result);
+        },
+        .ai_session_prompt => |request| {
+            var result: runner_mod.AsyncResult = .{ .ai_session_prompt = try runToolAiSessionPromptRequest(runner, request) };
+            errdefer result.deinit(runner.allocator);
+            try runner.completed_async.put(runner.allocator, start.id, result);
+        },
+        .@"test" => return error.UnsupportedToolAsyncOperation,
+    }
+}
+
+fn runToolAiCompleteRequest(runner: *runner_mod.ExtensionRunner, request: runner_mod.AiCompleteRequest) !runner_mod.AiCompleteResult {
+    return switch (runner.runtime) {
+        .bound => |bound| blk: {
+            const complete_fn = bound.ai_complete orelse return error.AiCompleteUnavailable;
+            var sink_ctx = AiCompleteToolEventSink{ .runner = runner, .request = request };
+            const sink: ?runner_mod.AiSessionEventSink = if (request.callbacks_ref != c.LUA_NOREF)
+                .{ .ptr = @ptrCast(&sink_ctx), .emit = AiCompleteToolEventSink.emit }
+            else
+                null;
+            break :blk try complete_fn(bound.session, runner.allocator, request, sink);
+        },
+        .stub => error.RuntimeNotBound,
+    };
+}
+
+const AiCompleteToolEventSink = struct {
+    runner: *runner_mod.ExtensionRunner,
+    request: runner_mod.AiCompleteRequest,
+
+    fn emit(ptr: *anyopaque, event: runner_mod.AiCompleteStreamEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.runner.dispatchAiCompleteRequestEvent(self.request, event);
+    }
+};
+
+fn runToolAiSessionPromptRequest(runner: *runner_mod.ExtensionRunner, request: runner_mod.AiSessionPromptRequest) !runner_mod.AiCompleteResult {
+    return switch (runner.runtime) {
+        .bound => |bound| blk: {
+            const prompt_fn = bound.ai_session_prompt orelse return error.AiSessionPromptUnavailable;
+            var sink_ctx = AiSessionPromptToolEventSink{ .runner = runner, .request = request };
+            const sink: ?runner_mod.AiSessionEventSink = if (request.callbacks_ref != c.LUA_NOREF)
+                .{ .ptr = @ptrCast(&sink_ctx), .emit = AiSessionPromptToolEventSink.emit }
+            else
+                null;
+            break :blk try prompt_fn(bound.session, runner.allocator, request, sink);
+        },
+        .stub => error.RuntimeNotBound,
+    };
+}
+
+const AiSessionPromptToolEventSink = struct {
+    runner: *runner_mod.ExtensionRunner,
+    request: runner_mod.AiSessionPromptRequest,
+
+    fn emit(ptr: *anyopaque, event: runner_mod.AiCompleteStreamEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.runner.dispatchAiSessionPromptRequestEvent(self.request, event);
+    }
+};
+
+fn runToolSystemRequest(runner: *runner_mod.ExtensionRunner, request: runner_mod.SystemRequest) !runner_mod.SystemResult {
+    var env: std.ArrayListUnmanaged(system_command.EnvPair) = .empty;
+    defer env.deinit(runner.allocator);
+    try env.ensureTotalCapacity(runner.allocator, request.env.len);
+    for (request.env) |pair| env.appendAssumeCapacity(.{ .key = pair.key, .value = pair.value });
+
+    return system_command.run(runner.allocator, runner.io, .{
+        .argv = request.argv,
+        .cwd = request.cwd,
+        .stdin = request.stdin,
+        .env = env.items,
+        .clear_env = request.clear_env,
+        .timeout_ms = request.timeout_ms,
+        .max_stdout_bytes = request.max_stdout_bytes,
+        .max_stderr_bytes = request.max_stderr_bytes,
+        .text = request.text,
+        .stdio = switch (request.stdio) {
+            .capture => .capture,
+            .terminal => .terminal,
+        },
+    });
 }
 
 const SpawnEventFanout = struct {
@@ -769,15 +1078,14 @@ test "lua tool ctx exposes binding from tool provenance" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    const result = tool.execute(
-        tool.ctx,
+    const result = awaitToolExecutionForCompat(tool.start(
         arena.allocator(),
         "id-binding",
         .{ .null = {} },
         abort_signal_mod.AbortSignal.none,
         null,
         null,
-    );
+    ), arena.allocator(), abort_signal_mod.AbortSignal.none);
 
     try testing.expect(!result.is_error);
     try testing.expect(result.details == .object);
@@ -1975,7 +2283,7 @@ test "todo command can call ctx.ui.render perimeter" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const add_args = try todoArgs(arena.allocator(), "add", "ship perimeter", null);
-    const add_result = tool.execute(tool.ctx, arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
+    const add_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
     try testing.expect(!add_result.is_error);
 
     try runner.dispatchCommand("todos", "");
@@ -2004,7 +2312,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const add_args = try todoArgs(arena.allocator(), "add", "persist me", null);
-        const add_result = tool.execute(tool.ctx, arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null);
+        const add_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
         try testing.expect(!add_result.is_error);
     }
 
@@ -2026,7 +2334,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const list_args = try todoArgs(arena.allocator(), "list", null, null);
-        const list_result = tool.execute(tool.ctx, arena.allocator(), "todo-2", list_args, abort_signal_mod.AbortSignal.none, null, null);
+        const list_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-2", list_args, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
         try testing.expect(!list_result.is_error);
         try testing.expectEqualStrings("No todos", list_result.content[0].text.text);
     }
@@ -2047,6 +2355,16 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
         \\  description = "echo",
         \\  parameters = { type = "object", properties = {} },
         \\  execute = function(args) return "hello " .. (args.who or "world") end,
+        \\})
+        \\zi.tool({
+        \\  name = "system_echo",
+        \\  description = "system echo",
+        \\  parameters = { type = "object", properties = {} },
+        \\  execute = function(args)
+        \\    local a = zi.system({ "/bin/sh", "-c", "printf tool" })
+        \\    local b = zi.system({ "/bin/sh", "-c", "printf -- -system" })
+        \\    return a.stdout .. b.stdout
+        \\  end,
         \\})
         \\zi.tool({
         \\  name = "fail",
@@ -2070,17 +2388,40 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
     try args_obj.put(testing.allocator, "who", .{ .string = "zi" });
 
     const echo_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("echo").?.*);
-    const echo = echo_tool.execute(echo_tool.ctx, arena.allocator(), "id-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
+    const echo_execution = echo_tool.start(arena.allocator(), "id-ready", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
+    switch (echo_execution) {
+        .ready => |echo_ready| {
+            try testing.expect(!echo_ready.is_error);
+            try testing.expectEqualStrings("hello zi", echo_ready.content[0].text.text);
+        },
+        .pending => return error.ExpectedReadyLuaToolExecution,
+    }
+    const echo = awaitToolExecutionForCompat(echo_tool.start(arena.allocator(), "id-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
     try testing.expect(!echo.is_error);
     try testing.expectEqualStrings("hello zi", echo.content[0].text.text);
 
+    const system_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("system_echo").?.*);
+    const system_execution = system_tool.start(arena.allocator(), "id-system-pending", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null);
+    const system_ready = switch (system_execution) {
+        .ready => return error.ExpectedPendingLuaToolExecution,
+        .pending => |pending| blk: {
+            defer pending.free(arena.allocator());
+            break :blk pending.await(arena.allocator(), abort_signal_mod.AbortSignal.none, null, null);
+        },
+    };
+    try testing.expect(!system_ready.is_error);
+    try testing.expectEqualStrings("tool-system", system_ready.content[0].text.text);
+    const system_echo = awaitToolExecutionForCompat(system_tool.start(arena.allocator(), "id-system", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+    try testing.expect(!system_echo.is_error);
+    try testing.expectEqualStrings("tool-system", system_echo.content[0].text.text);
+
     const fail_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("fail").?.*);
-    const fail = fail_tool.execute(fail_tool.ctx, arena.allocator(), "id-2", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null);
+    const fail = awaitToolExecutionForCompat(fail_tool.start(arena.allocator(), "id-2", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
     try testing.expect(fail.is_error);
     try testing.expectEqualStrings("boom", fail.content[0].text.text);
 
     const explode_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("explode").?.*);
-    const explode = explode_tool.execute(explode_tool.ctx, arena.allocator(), "id-3", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null);
+    const explode = awaitToolExecutionForCompat(explode_tool.start(arena.allocator(), "id-3", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
     try testing.expect(explode.is_error);
     try testing.expect(explode.content.len >= 1);
 }
