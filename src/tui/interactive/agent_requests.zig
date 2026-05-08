@@ -129,6 +129,7 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                         _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
                     };
                     req.* = .{ .refresh_status_snapshot = {} };
+                    self.publishPendingExtensionUi();
                 },
                 .extension_async_result => |async_result| {
                     idle_processed = true;
