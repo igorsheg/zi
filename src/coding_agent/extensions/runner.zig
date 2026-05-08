@@ -1414,7 +1414,7 @@ pub const ExtensionRunner = struct {
         const r = try co.resumeWith(2);
         switch (r.status) {
             .yielded => {
-                const start = try self.suspendYieldedCommand(&co, cmd.source.provenance);
+                const start = try self.suspendYieldedCoroutine(&co, cmd.source.provenance);
                 co_owned = false;
                 try self.submitAsyncStart(start);
                 return;
@@ -1428,7 +1428,7 @@ pub const ExtensionRunner = struct {
         }
     }
 
-    fn suspendYieldedCommand(self: *ExtensionRunner, co: *lua_runtime.Coroutine, provenance: ?resource_types.ExtensionProvenance) !AsyncStart {
+    pub fn suspendYieldedCoroutine(self: *ExtensionRunner, co: *lua_runtime.Coroutine, provenance: ?resource_types.ExtensionProvenance) !AsyncStart {
         var start = self.current_async_start orelse return error.UnexpectedYield;
         self.current_async_start = null;
         var callbacks_ref: c_int = lua_runtime.c.LUA_NOREF;
@@ -1463,7 +1463,7 @@ pub const ExtensionRunner = struct {
         return start;
     }
 
-    fn submitAsyncStart(self: *ExtensionRunner, start: AsyncStart) !void {
+    pub fn submitAsyncStart(self: *ExtensionRunner, start: AsyncStart) !void {
         if (self.async_dispatcher) |dispatcher| {
             dispatcher.submit(dispatcher.ptr, self, start) catch |err| {
                 if (self.pending_async.fetchRemove(start.id)) |kv| {
@@ -1777,7 +1777,7 @@ pub const ExtensionRunner = struct {
         const r = try pending.co.resumeWith(0);
         switch (r.status) {
             .yielded => {
-                const start = try self.suspendYieldedCommand(&pending.co, pending.provenance);
+                const start = try self.suspendYieldedCoroutine(&pending.co, pending.provenance);
                 pending_owned = false;
                 try self.submitAsyncStart(start);
             },

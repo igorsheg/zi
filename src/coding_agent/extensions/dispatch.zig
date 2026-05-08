@@ -278,7 +278,8 @@ fn runOneHandler(
     payload_idx: c_int,
 ) DispatchError!void {
     var co = try lua_runtime.Coroutine.init(state);
-    defer co.deinit();
+    var co_owned = true;
+    defer if (co_owned) co.deinit();
 
     try pushHandlerAndContext(state, runner, &co, h.lua_ref, h.provenance, payload_idx);
     if (h.provenance) |provenance| {
@@ -288,7 +289,12 @@ fn runOneHandler(
 
     const r = try co.resumeWith(2);
     switch (r.status) {
-        .yielded => return error.UnexpectedYield,
+        .yielded => {
+            const start = runner.suspendYieldedCoroutine(&co, h.provenance) catch return error.UnexpectedYield;
+            co_owned = false;
+            runner.submitAsyncStart(start) catch return error.UnexpectedYield;
+            return;
+        },
         .ok, .finished => {},
     }
     if (r.nresults > 0) c.lua_pop(co.L, r.nresults);
