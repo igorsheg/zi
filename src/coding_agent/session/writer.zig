@@ -353,6 +353,7 @@ fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, s
                     allocator.free(label.target_id);
                     if (label.label) |value| allocator.free(value);
                 },
+                .custom => |custom| if (custom.data) |value| ai.json_util.freeJsonValue(allocator, value),
                 else => {},
             }
         },
@@ -373,6 +374,7 @@ fn freeAppendedEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) vo
             allocator.free(label.target_id);
             if (label.label) |value| allocator.free(value);
         },
+        .custom => |custom| if (custom.data) |value| ai.json_util.freeJsonValue(allocator, value),
         else => {},
     }
 }

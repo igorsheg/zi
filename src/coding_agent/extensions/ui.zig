@@ -173,6 +173,7 @@ pub const UiNode = union(enum) {
     progress: Progress,
     separator: Separator,
     surface: Surface,
+    input: Input,
 
     pub const View = struct { id: ?[]const u8 = null, style: Style = .{}, children: []UiNode = &.{} };
     pub const Text = struct { id: ?[]const u8 = null, text: []const u8, spans: ?[]TextSpan = null, style: Style = .{}, wrap: TextWrap = .word, overflow: TextOverflow = .clip, format: TextFormat = .plain, @"align": TextAlign = .left, max_lines: ?u32 = null, scroll_y: u32 = 0, scroll_x: u32 = 0, link: ?[]const u8 = null, selectable: bool = false };
@@ -180,6 +181,7 @@ pub const UiNode = union(enum) {
     pub const Progress = struct { id: ?[]const u8 = null, value: ?f32 = null, label: ?[]const u8 = null, style: Style = .{} };
     pub const Separator = struct { id: ?[]const u8 = null, style: Style = .{} };
     pub const Surface = struct { id: []const u8, style: Style = .{} };
+    pub const Input = struct { id: []const u8, value: []const u8 = "", placeholder: ?[]const u8 = null, style: Style = .{}, on_change: ?[]const u8 = null, on_submit: ?[]const u8 = null };
 
     pub fn clone(allocator: std.mem.Allocator, node: UiNode) !UiNode {
         return switch (node) {
@@ -264,6 +266,23 @@ pub const UiNode = union(enum) {
                 const id = try allocator.dupe(u8, s.id);
                 break :blk .{ .surface = .{ .id = id, .style = style } };
             },
+            .input => |in| blk: {
+                const style = try Style.clone(allocator, in.style);
+                errdefer {
+                    var owned = style;
+                    owned.deinit(allocator);
+                }
+                const id = try allocator.dupe(u8, in.id);
+                errdefer allocator.free(id);
+                const value = try allocator.dupe(u8, in.value);
+                errdefer allocator.free(value);
+                const placeholder = if (in.placeholder) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (placeholder) |v| allocator.free(v);
+                const on_change = if (in.on_change) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (on_change) |v| allocator.free(v);
+                const on_submit = if (in.on_submit) |v| try allocator.dupe(u8, v) else null;
+                break :blk .{ .input = .{ .id = id, .value = value, .placeholder = placeholder, .style = style, .on_change = on_change, .on_submit = on_submit } };
+            },
         };
     }
 
@@ -302,6 +321,14 @@ pub const UiNode = union(enum) {
             .surface => |*s| {
                 allocator.free(s.id);
                 s.style.deinit(allocator);
+            },
+            .input => |*in| {
+                allocator.free(in.id);
+                allocator.free(in.value);
+                if (in.placeholder) |v| allocator.free(v);
+                if (in.on_change) |v| allocator.free(v);
+                if (in.on_submit) |v| allocator.free(v);
+                in.style.deinit(allocator);
             },
         }
         self.* = undefined;
@@ -446,7 +473,7 @@ pub const EditorAction = struct {
     }
 };
 
-pub const UiEventType = enum { key };
+pub const UiEventType = enum { key, change, submit };
 
 pub const UiEvent = struct {
     state_owner_id: []const u8,
@@ -456,6 +483,7 @@ pub const UiEvent = struct {
     type: UiEventType = .key,
     action: ?[]const u8 = null,
     key: ?[]const u8 = null,
+    value: ?[]const u8 = null,
     ctrl: bool = false,
     alt: bool = false,
     shift: bool = false,
@@ -471,7 +499,8 @@ pub const UiEvent = struct {
         errdefer if (action) |v| allocator.free(v);
         const key = if (event.key) |v| try allocator.dupe(u8, v) else null;
         errdefer if (key) |v| allocator.free(v);
-        return .{ .state_owner_id = state_owner_id, .generation = event.generation, .view = view, .node = node, .type = event.type, .action = action, .key = key, .ctrl = event.ctrl, .alt = event.alt, .shift = event.shift };
+        const value = if (event.value) |v| try allocator.dupe(u8, v) else null;
+        return .{ .state_owner_id = state_owner_id, .generation = event.generation, .view = view, .node = node, .type = event.type, .action = action, .key = key, .value = value, .ctrl = event.ctrl, .alt = event.alt, .shift = event.shift };
     }
 
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
@@ -480,6 +509,7 @@ pub const UiEvent = struct {
         if (self.node) |v| allocator.free(v);
         if (self.action) |v| allocator.free(v);
         if (self.key) |v| allocator.free(v);
+        if (self.value) |v| allocator.free(v);
         self.* = undefined;
     }
 };
@@ -571,6 +601,26 @@ test "ui v3 event clone owns payload" {
     try testing.expectEqualStrings("close", cloned.action.?);
     try testing.expectEqualStrings("escape", cloned.key.?);
     try testing.expect(cloned.ctrl);
+    try testing.expectEqual(@as(?[]const u8, null), cloned.value);
+}
+
+test "ui v3 input clone owns strings" {
+    const testing = std.testing;
+    var cloned = try UiNode.clone(testing.allocator, .{ .input = .{ .id = "name", .value = "zi", .placeholder = "filter", .style = .{ .tone = .accent }, .on_change = "rename", .on_submit = "accept" } });
+    defer cloned.deinit(testing.allocator);
+    try testing.expectEqualStrings("name", cloned.input.id);
+    try testing.expectEqualStrings("zi", cloned.input.value);
+    try testing.expectEqualStrings("filter", cloned.input.placeholder.?);
+    try testing.expectEqualStrings("rename", cloned.input.on_change.?);
+    try testing.expectEqualStrings("accept", cloned.input.on_submit.?);
+}
+
+test "ui v3 event clone owns input value" {
+    const testing = std.testing;
+    var cloned = try UiEvent.clone(testing.allocator, .{ .state_owner_id = "owner", .generation = 2, .view = "demo", .node = "name", .type = .change, .action = "rename", .value = "zi" });
+    defer cloned.deinit(testing.allocator);
+    try testing.expectEqual(UiEventType.change, cloned.type);
+    try testing.expectEqualStrings("zi", cloned.value.?);
 }
 
 test "ui v3 frame byte validation" {

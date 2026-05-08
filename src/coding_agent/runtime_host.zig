@@ -183,6 +183,14 @@ pub const RuntimeHost = struct {
         try runner.dispatchToolExpandedChanged(tool_name, tool_call_id, expanded);
     }
 
+    pub fn deliverExtensionAsyncEvent(self: *RuntimeHost, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) !void {
+        var original = event;
+        defer original.deinit(self.msg_allocator);
+        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
+        const owned = try event.clone(runner.allocator);
+        try runner.dispatchAiCompleteStreamEvent(id, owned);
+    }
+
     pub fn deliverExtensionAsyncResult(self: *RuntimeHost, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) !void {
         var original = result;
         defer original.deinit(self.msg_allocator);

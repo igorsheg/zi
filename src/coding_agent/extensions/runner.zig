@@ -32,6 +32,7 @@ pub const AsyncOpId = u64;
 pub const AsyncKind = enum {
     @"test",
     ai_complete,
+    ai_session_prompt,
     system,
 };
 
@@ -41,11 +42,60 @@ pub const AiCompleteRequest = struct {
     max_tokens: ?u64 = null,
     model: ?[]const u8 = null,
     reasoning: ?agent_protocol.ThinkingLevel = null,
+    stream_events: bool = false,
+    callbacks_ref: c_int = lua_runtime.c.LUA_NOREF,
+    source_L: ?*lua_runtime.c.lua_State = null,
 
     pub fn deinit(self: *AiCompleteRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
         if (self.system_prompt) |value| allocator.free(value);
         if (self.model) |value| allocator.free(value);
+        if (self.callbacks_ref != lua_runtime.c.LUA_NOREF) {
+            if (self.source_L) |L| lua_runtime.c.luaL_unref(L, lua_runtime.c.LUA_REGISTRYINDEX, self.callbacks_ref);
+        }
+        self.* = undefined;
+    }
+};
+
+pub const AiSessionPromptRequest = struct {
+    session_id: u64,
+    prompt: []const u8,
+    callbacks_ref: c_int = lua_runtime.c.LUA_NOREF,
+    source_L: ?*lua_runtime.c.lua_State = null,
+
+    pub fn deinit(self: *AiSessionPromptRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        if (self.callbacks_ref != lua_runtime.c.LUA_NOREF) {
+            if (self.source_L) |L| lua_runtime.c.luaL_unref(L, lua_runtime.c.LUA_REGISTRYINDEX, self.callbacks_ref);
+        }
+        self.* = undefined;
+    }
+};
+
+pub const AiCompleteStreamEvent = union(enum) {
+    message_start,
+    message_delta: struct { text: []const u8 },
+    message_end: struct { text: []const u8 },
+    err: []const u8,
+    events_dropped: usize,
+
+    pub fn clone(self: AiCompleteStreamEvent, allocator: std.mem.Allocator) !AiCompleteStreamEvent {
+        return switch (self) {
+            .message_start => .message_start,
+            .message_delta => |v| .{ .message_delta = .{ .text = try allocator.dupe(u8, v.text) } },
+            .message_end => |v| .{ .message_end = .{ .text = try allocator.dupe(u8, v.text) } },
+            .err => |msg| .{ .err = try allocator.dupe(u8, msg) },
+            .events_dropped => |n| .{ .events_dropped = n },
+        };
+    }
+
+    pub fn deinit(self: *AiCompleteStreamEvent, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .message_delta => |v| allocator.free(v.text),
+            .message_end => |v| allocator.free(v.text),
+            .err => |msg| allocator.free(msg),
+            .message_start, .events_dropped => {},
+        }
         self.* = undefined;
     }
 };
@@ -149,12 +199,14 @@ pub const AiCompleteResult = union(enum) {
 pub const AsyncRequest = union(AsyncKind) {
     @"test": void,
     ai_complete: AiCompleteRequest,
+    ai_session_prompt: AiSessionPromptRequest,
     system: SystemRequest,
 
     pub fn deinit(self: *AsyncRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .@"test" => {},
             .ai_complete => |*request| request.deinit(allocator),
+            .ai_session_prompt => |*request| request.deinit(allocator),
             .system => |*request| request.deinit(allocator),
         }
         self.* = undefined;
@@ -258,17 +310,20 @@ pub const AsyncDispatcher = struct {
     job_start: ?*const fn (ptr: *anyopaque, runner: *ExtensionRunner, id: u64, request: JobStartRequest) anyerror!void = null,
     job_write: ?*const fn (ptr: *anyopaque, runner: *ExtensionRunner, id: u64, data: []const u8) anyerror!void = null,
     job_stop: ?*const fn (ptr: *anyopaque, runner: *ExtensionRunner, id: u64) anyerror!void = null,
+    ai_complete_event: ?*const fn (ptr: *anyopaque, runner: *ExtensionRunner, id: AsyncOpId, event: AiCompleteStreamEvent) anyerror!void = null,
 };
 
 pub const AsyncResult = union(AsyncKind) {
     @"test": []const u8,
     ai_complete: AiCompleteResult,
+    ai_session_prompt: AiCompleteResult,
     system: SystemResult,
 
     pub fn clone(self: AsyncResult, allocator: std.mem.Allocator) !AsyncResult {
         return switch (self) {
             .@"test" => |value| .{ .@"test" = try allocator.dupe(u8, value) },
             .ai_complete => |result| .{ .ai_complete = try result.clone(allocator) },
+            .ai_session_prompt => |result| .{ .ai_session_prompt = try result.clone(allocator) },
             .system => |result| .{ .system = try result.clone(allocator) },
         };
     }
@@ -277,6 +332,7 @@ pub const AsyncResult = union(AsyncKind) {
         switch (self.*) {
             .@"test" => |value| allocator.free(value),
             .ai_complete => |*result| result.deinit(allocator),
+            .ai_session_prompt => |*result| result.deinit(allocator),
             .system => |*result| result.deinit(allocator),
         }
         self.* = undefined;
@@ -289,8 +345,17 @@ pub const PendingAsync = struct {
     co: lua_runtime.Coroutine,
     provenance: ?resource_types.ExtensionProvenance,
     generation: Generation,
+    ai_complete_callbacks_ref: c_int = lua_runtime.c.LUA_NOREF,
+    ai_complete_callbacks_L: ?*lua_runtime.c.lua_State = null,
+    ai_session_id: ?u64 = null,
+    ai_session_prompt: ?[]const u8 = null,
+    allocator: std.mem.Allocator,
 
     pub fn deinit(self: *PendingAsync) void {
+        if (self.ai_complete_callbacks_ref != lua_runtime.c.LUA_NOREF) {
+            if (self.ai_complete_callbacks_L) |L| lua_runtime.c.luaL_unref(L, lua_runtime.c.LUA_REGISTRYINDEX, self.ai_complete_callbacks_ref);
+        }
+        if (self.ai_session_prompt) |prompt| self.allocator.free(prompt);
         self.co.deinit();
         self.* = undefined;
     }
@@ -324,7 +389,7 @@ pub const ExtensionRuntime = union(enum) {
     pub const Bound = struct {
         session: *anyopaque,
         ui: ?*anyopaque = null,
-        command_actions: ?*anyopaque = null,
+        command_actions: ?*ExtensionCommandActions = null,
 
         /// Context action seams used by tool/event `ctx.*` helpers.
         /// Stored as function pointers here so extension modules can call
@@ -345,8 +410,12 @@ pub const ExtensionRuntime = union(enum) {
         session_name_set: ?*const fn (session: *anyopaque, name: ?[]const u8) anyerror!void = null,
         session_tool_results_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, tool_name: []const u8) ?std.json.Value = null,
         session_messages_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, limit: usize, include_tools: bool) ?std.json.Value = null,
+        session_context_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, max_messages: usize, include_tools: bool) ?std.json.Value = null,
         session_note_append: ?*const fn (session: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8, source_entry_id: ?[]const u8) anyerror!void = null,
         session_notes_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, source_entry_id: ?[]const u8, limit: usize) ?std.json.Value = null,
+        /// `data` is borrowed for the call; durable implementations must clone it.
+        session_artifact_append: ?*const fn (session: *anyopaque, owner_id: []const u8, kind: []const u8, key: ?[]const u8, title: ?[]const u8, data: std.json.Value) anyerror!void = null,
+        session_artifacts_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, owner_id: []const u8, kind: ?[]const u8, key: ?[]const u8, limit: usize) ?std.json.Value = null,
         session_label_set: ?*const fn (session: *anyopaque, target_entry_id: []const u8, label: ?[]const u8) anyerror!void = null,
         session_labels_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, target_entry_id: ?[]const u8, limit: usize) ?std.json.Value = null,
         session_entry_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, entry_id: []const u8) ?std.json.Value = null,
@@ -358,6 +427,38 @@ pub const ExtensionRuntime = union(enum) {
         provider_projection_changed: ?*const fn (session: *anyopaque) void = null,
         tool_projection_changed: ?*const fn (session: *anyopaque) void = null,
     };
+};
+
+pub const SideAiSession = struct {
+    id: u64,
+    model: ?[]const u8 = null,
+    system_prompt: ?[]const u8 = null,
+    reasoning: ?agent_protocol.ThinkingLevel = null,
+    max_tokens: ?u64 = null,
+    tool_allowlist: []const []const u8 = &.{},
+    messages: std.ArrayListUnmanaged(Message) = .empty,
+    disposed: bool = false,
+    abort_requested: bool = false,
+
+    pub const Role = enum { user, assistant, context };
+    pub const Message = struct {
+        role: Role,
+        text: []const u8,
+    };
+
+    pub fn deinit(self: *SideAiSession, allocator: std.mem.Allocator) void {
+        if (self.model) |value| allocator.free(value);
+        if (self.system_prompt) |value| allocator.free(value);
+        for (self.tool_allowlist) |name| allocator.free(name);
+        if (self.tool_allowlist.len > 0) allocator.free(self.tool_allowlist);
+        for (self.messages.items) |msg| allocator.free(msg.text);
+        self.messages.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn append(self: *SideAiSession, allocator: std.mem.Allocator, role: Role, text: []const u8) !void {
+        try self.messages.append(allocator, .{ .role = role, .text = try allocator.dupe(u8, text) });
+    }
 };
 
 /// ExtensionRunner — owned by AgentSession. One per generation.
@@ -402,6 +503,27 @@ pub const ExtensionRunnerRef = struct {
         self.current = next;
         return previous;
     }
+};
+
+pub const UserMessageTarget = enum {
+    auto,
+    prompt,
+    steering,
+    follow_up,
+};
+
+pub const SendUserMessageOptions = struct {
+    target: UserMessageTarget = .auto,
+};
+
+pub const SendUserMessageResult = enum {
+    submitted,
+    queued,
+};
+
+pub const ExtensionCommandActions = struct {
+    ctx: *anyopaque,
+    send_user_message: *const fn (ctx: *anyopaque, text: []const u8, opts: SendUserMessageOptions) anyerror!SendUserMessageResult,
 };
 
 pub const SpawnRequest = struct {
@@ -559,6 +681,8 @@ pub const ExtensionRunner = struct {
     completed_async: std.AutoHashMapUnmanaged(AsyncOpId, AsyncResult) = .empty,
     async_dispatcher: ?AsyncDispatcher = null,
     enable_test_async: bool = false,
+    next_side_ai_session_id: u64 = 1,
+    side_ai_sessions: std.AutoHashMapUnmanaged(u64, SideAiSession) = .empty,
 
     loaded_extensions: std.ArrayListUnmanaged(resource_types.ExtensionProvenance) = .empty,
     loaded_extension_infos: std.ArrayListUnmanaged(LoadedExtensionInfo) = .empty,
@@ -863,6 +987,13 @@ pub const ExtensionRunner = struct {
         if (projection_changed) self.notifyProviderProjectionChanged();
     }
 
+    pub fn setCommandActions(self: *ExtensionRunner, actions: ?*ExtensionCommandActions) void {
+        switch (self.runtime) {
+            .bound => |*bound| bound.command_actions = actions,
+            .stub => {},
+        }
+    }
+
     pub fn unbindRuntime(self: *ExtensionRunner) void {
         if (self.runtime == .bound) {
             const bound = self.runtime.bound;
@@ -1161,14 +1292,36 @@ pub const ExtensionRunner = struct {
     }
 
     fn suspendYieldedCommand(self: *ExtensionRunner, co: *lua_runtime.Coroutine, provenance: ?resource_types.ExtensionProvenance) !AsyncStart {
-        const start = self.current_async_start orelse return error.UnexpectedYield;
+        var start = self.current_async_start orelse return error.UnexpectedYield;
         self.current_async_start = null;
+        var callbacks_ref: c_int = lua_runtime.c.LUA_NOREF;
+        var callbacks_L: ?*lua_runtime.c.lua_State = null;
+        var ai_session_id: ?u64 = null;
+        var ai_session_prompt: ?[]const u8 = null;
+        if (start.request == .ai_complete) {
+            callbacks_ref = start.request.ai_complete.callbacks_ref;
+            callbacks_L = start.request.ai_complete.source_L;
+            start.request.ai_complete.callbacks_ref = lua_runtime.c.LUA_NOREF;
+            start.request.ai_complete.source_L = null;
+        } else if (start.request == .ai_session_prompt) {
+            callbacks_ref = start.request.ai_session_prompt.callbacks_ref;
+            callbacks_L = start.request.ai_session_prompt.source_L;
+            start.request.ai_session_prompt.callbacks_ref = lua_runtime.c.LUA_NOREF;
+            start.request.ai_session_prompt.source_L = null;
+            ai_session_id = start.request.ai_session_prompt.session_id;
+            ai_session_prompt = self.allocator.dupe(u8, start.request.ai_session_prompt.prompt) catch null;
+        }
         try self.pending_async.put(self.allocator, start.id, .{
             .id = start.id,
             .kind = start.kind(),
             .co = co.*,
             .provenance = provenance,
             .generation = self.generation,
+            .ai_complete_callbacks_ref = callbacks_ref,
+            .ai_complete_callbacks_L = callbacks_L,
+            .ai_session_id = ai_session_id,
+            .ai_session_prompt = ai_session_prompt,
+            .allocator = self.allocator,
         });
         return start;
     }
@@ -1202,11 +1355,43 @@ pub const ExtensionRunner = struct {
         return id;
     }
 
+    pub fn beginAiSessionPromptAsync(self: *ExtensionRunner, request: AiSessionPromptRequest) AsyncOpId {
+        const id = self.next_async_id;
+        self.next_async_id += 1;
+        self.current_async_start = .{ .id = id, .request = .{ .ai_session_prompt = request } };
+        return id;
+    }
+
     pub fn beginSystemAsync(self: *ExtensionRunner, request: SystemRequest) AsyncOpId {
         const id = self.next_async_id;
         self.next_async_id += 1;
         self.current_async_start = .{ .id = id, .request = .{ .system = request } };
         return id;
+    }
+
+    pub fn createSideAiSession(self: *ExtensionRunner, session: SideAiSession) !u64 {
+        var owned = session;
+        owned.id = self.next_side_ai_session_id;
+        self.next_side_ai_session_id += 1;
+        try self.side_ai_sessions.put(self.allocator, owned.id, owned);
+        return owned.id;
+    }
+
+    pub fn getSideAiSession(self: *ExtensionRunner, id: u64) ?*SideAiSession {
+        return self.side_ai_sessions.getPtr(id);
+    }
+
+    pub fn disposeSideAiSession(self: *ExtensionRunner, id: u64) bool {
+        if (self.side_ai_sessions.fetchRemove(id)) |kv| {
+            var value = kv.value;
+            value.deinit(self.allocator);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn hasPendingAsync(self: *const ExtensionRunner) bool {
+        return self.pending_async.count() != 0 or self.current_async_start != null;
     }
 
     pub fn takeCompletedAsync(self: *ExtensionRunner, id: AsyncOpId) ?AsyncResult {
@@ -1220,8 +1405,73 @@ pub const ExtensionRunner = struct {
         try self.resumeAsync(id, .{ .@"test" = owned });
     }
 
-    pub fn resumeAsync(self: *ExtensionRunner, id: AsyncOpId, result: AsyncResult) !void {
+    pub fn dispatchAiCompleteStreamEvent(self: *ExtensionRunner, id: AsyncOpId, event: AiCompleteStreamEvent) !void {
         self.assertOnLuaThread();
+        var owned = event;
+        defer owned.deinit(self.allocator);
+        const pending = self.pending_async.getPtr(id) orelse return;
+        if (pending.generation != self.generation) return;
+        if (pending.ai_complete_callbacks_ref == lua_runtime.c.LUA_NOREF) return;
+        const L = pending.ai_complete_callbacks_L orelse pending.co.L;
+        callAiCompleteCallback(L, pending.ai_complete_callbacks_ref, owned);
+    }
+
+    fn callAiCompleteCallback(L: *lua_runtime.c.lua_State, callbacks_ref: c_int, event: AiCompleteStreamEvent) void {
+        const top = lua_runtime.c.lua_gettop(L);
+        defer lua_runtime.c.lua_settop(L, top);
+        _ = lua_runtime.c.lua_rawgeti(L, lua_runtime.c.LUA_REGISTRYINDEX, callbacks_ref);
+        const ref_type = lua_runtime.c.lua_type(L, -1);
+        if (ref_type == lua_runtime.c.LUA_TTABLE) {
+            const name = aiCompleteEventName(event);
+            _ = lua_runtime.c.lua_getfield(L, -1, name.ptr);
+            if (lua_runtime.c.lua_type(L, -1) != lua_runtime.c.LUA_TFUNCTION) return;
+            pushAiCompleteStreamEvent(L, event);
+            if (lua_runtime.c.lua_pcallk(L, 1, 0, 0, 0, null) != lua_runtime.c.LUA_OK) log.warn("ctx.ai.complete stream callback failed", .{});
+        } else if (ref_type == lua_runtime.c.LUA_TFUNCTION) {
+            pushAiCompleteStreamEvent(L, event);
+            if (lua_runtime.c.lua_pcallk(L, 1, 0, 0, 0, null) != lua_runtime.c.LUA_OK) log.warn("ctx.ai.complete stream callback failed", .{});
+        }
+    }
+
+    fn aiCompleteEventName(event: AiCompleteStreamEvent) [:0]const u8 {
+        return switch (event) {
+            .message_start => "message_start",
+            .message_delta => "message_delta",
+            .message_end => "message_end",
+            .err => "error",
+            .events_dropped => "events_dropped",
+        };
+    }
+
+    fn pushAiCompleteStreamEvent(L: *lua_runtime.c.lua_State, event: AiCompleteStreamEvent) void {
+        lua_runtime.c.lua_createtable(L, 0, 3);
+        const name = aiCompleteEventName(event);
+        _ = lua_runtime.c.lua_pushlstring(L, name.ptr, name.len);
+        lua_runtime.c.lua_setfield(L, -2, "type");
+        switch (event) {
+            .message_delta => |v| {
+                _ = lua_runtime.c.lua_pushlstring(L, v.text.ptr, v.text.len);
+                lua_runtime.c.lua_setfield(L, -2, "text");
+            },
+            .message_end => |v| {
+                _ = lua_runtime.c.lua_pushlstring(L, v.text.ptr, v.text.len);
+                lua_runtime.c.lua_setfield(L, -2, "text");
+            },
+            .err => |msg| {
+                _ = lua_runtime.c.lua_pushlstring(L, msg.ptr, msg.len);
+                lua_runtime.c.lua_setfield(L, -2, "error");
+            },
+            .events_dropped => |n| {
+                lua_runtime.c.lua_pushinteger(L, @intCast(n));
+                lua_runtime.c.lua_setfield(L, -2, "count");
+            },
+            .message_start => {},
+        }
+    }
+
+    pub fn resumeAsync(self: *ExtensionRunner, id: AsyncOpId, incoming_result: AsyncResult) !void {
+        self.assertOnLuaThread();
+        var result = incoming_result;
         const pending_kv = self.pending_async.fetchRemove(id) orelse {
             var dropped = result;
             dropped.deinit(self.allocator);
@@ -1235,6 +1485,25 @@ pub const ExtensionRunner = struct {
             var dropped = result;
             dropped.deinit(self.allocator);
             return;
+        }
+
+        if (pending.kind == .ai_session_prompt and result == .ai_complete) {
+            result = .{ .ai_session_prompt = result.ai_complete };
+        }
+
+        if (pending.ai_session_id) |session_id| {
+            if (self.side_ai_sessions.getPtr(session_id)) |session| {
+                if (!session.disposed) {
+                    if (pending.ai_session_prompt) |prompt_text| session.append(self.allocator, .user, prompt_text) catch {};
+                    switch (result) {
+                        .ai_session_prompt => |res| switch (res) {
+                            .completed => |completed| session.append(self.allocator, .assistant, completed.text) catch {},
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
+            }
         }
 
         try self.completed_async.put(self.allocator, id, result);
@@ -1265,6 +1534,9 @@ pub const ExtensionRunner = struct {
         var completed_it = self.completed_async.iterator();
         while (completed_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.completed_async.deinit(self.allocator);
+        var side_it = self.side_ai_sessions.iterator();
+        while (side_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.side_ai_sessions.deinit(self.allocator);
     }
 
     pub fn dispatchOAuthLogin(
@@ -1401,14 +1673,14 @@ pub const ExtensionRunner = struct {
 
     fn pushOAuthLoginCallbacks(L: *lua_runtime.c.lua_State, invoke_ctx: *OAuthLoginInvokeCtx) void {
         const c = lua_runtime.c;
-        c.lua_createtable(L, 0, 2);
+        lua_runtime.c.lua_createtable(L, 0, 2);
         c.lua_pushlightuserdata(L, invoke_ctx);
         c.lua_pushcclosure(L, oauthLoginOnAuth, 1);
-        c.lua_setfield(L, -2, "onAuth");
+        lua_runtime.c.lua_setfield(L, -2, "onAuth");
         if (invoke_ctx.callbacks.on_progress != null) {
             c.lua_pushlightuserdata(L, invoke_ctx);
             c.lua_pushcclosure(L, oauthLoginOnProgress, 1);
-            c.lua_setfield(L, -2, "onProgress");
+            lua_runtime.c.lua_setfield(L, -2, "onProgress");
         }
     }
 
@@ -1417,10 +1689,10 @@ pub const ExtensionRunner = struct {
         const L = L_opt.?;
         const ctx_ptr = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse return c.luaL_error(L, "oauth.onAuth: missing context");
         const invoke_ctx: *OAuthLoginInvokeCtx = @ptrCast(@alignCast(ctx_ptr));
-        if (c.lua_type(L, 1) != c.LUA_TTABLE) return c.luaL_error(L, "oauth.onAuth: expected table");
-        _ = c.lua_getfield(L, 1, "url");
+        if (lua_runtime.c.lua_type(L, 1) != lua_runtime.c.LUA_TTABLE) return c.luaL_error(L, "oauth.onAuth: expected table");
+        _ = lua_runtime.c.lua_getfield(L, 1, "url");
         defer c.lua_pop(L, 1);
-        if (c.lua_type(L, -1) != c.LUA_TSTRING) return c.luaL_error(L, "oauth.onAuth: expected string field 'url'");
+        if (lua_runtime.c.lua_type(L, -1) != c.LUA_TSTRING) return c.luaL_error(L, "oauth.onAuth: expected string field 'url'");
         invoke_ctx.callbacks.on_auth(lstring(L, -1), invoke_ctx.callbacks.ctx);
         return 0;
     }
@@ -1431,24 +1703,24 @@ pub const ExtensionRunner = struct {
         const ctx_ptr = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse return c.luaL_error(L, "oauth.onProgress: missing context");
         const invoke_ctx: *OAuthLoginInvokeCtx = @ptrCast(@alignCast(ctx_ptr));
         const progress = invoke_ctx.callbacks.on_progress orelse return 0;
-        if (c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "oauth.onProgress: expected string");
+        if (lua_runtime.c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "oauth.onProgress: expected string");
         progress(lstring(L, 1), invoke_ctx.callbacks.ctx);
         return 0;
     }
 
     fn pushOAuthCredentialTable(L: *lua_runtime.c.lua_State, credential: auth_types.OAuthCredential) void {
         const c = lua_runtime.c;
-        c.lua_createtable(L, 0, 3 + @as(c_int, @intCast(credential.extras.count())));
-        _ = c.lua_pushlstring(L, credential.refresh.ptr, credential.refresh.len);
-        c.lua_setfield(L, -2, "refresh");
-        _ = c.lua_pushlstring(L, credential.access.ptr, credential.access.len);
-        c.lua_setfield(L, -2, "access");
-        c.lua_pushinteger(L, @intCast(credential.expires));
-        c.lua_setfield(L, -2, "expires");
+        lua_runtime.c.lua_createtable(L, 0, 3 + @as(c_int, @intCast(credential.extras.count())));
+        _ = lua_runtime.c.lua_pushlstring(L, credential.refresh.ptr, credential.refresh.len);
+        lua_runtime.c.lua_setfield(L, -2, "refresh");
+        _ = lua_runtime.c.lua_pushlstring(L, credential.access.ptr, credential.access.len);
+        lua_runtime.c.lua_setfield(L, -2, "access");
+        lua_runtime.c.lua_pushinteger(L, @intCast(credential.expires));
+        lua_runtime.c.lua_setfield(L, -2, "expires");
 
         var it = credential.extras.iterator();
         while (it.next()) |entry| {
-            _ = c.lua_pushlstring(L, entry.key_ptr.*.ptr, entry.key_ptr.*.len);
+            _ = lua_runtime.c.lua_pushlstring(L, entry.key_ptr.*.ptr, entry.key_ptr.*.len);
             lua_runtime.pushJsonValue(L, entry.value_ptr.*) catch unreachable;
             c.lua_settable(L, -3);
         }
@@ -1460,7 +1732,7 @@ pub const ExtensionRunner = struct {
         allocator: std.mem.Allocator,
     ) !?[]const u8 {
         const c = lua_runtime.c;
-        return switch (c.lua_type(L, idx)) {
+        return switch (lua_runtime.c.lua_type(L, idx)) {
             c.LUA_TNIL => null,
             c.LUA_TSTRING => try allocator.dupe(u8, lstring(L, idx)),
             else => error.InvalidOAuthApiKey,
@@ -1473,24 +1745,24 @@ pub const ExtensionRunner = struct {
         allocator: std.mem.Allocator,
     ) !auth_types.OAuthCredential {
         const c = lua_runtime.c;
-        if (c.lua_type(L, idx) != c.LUA_TTABLE) return error.InvalidOAuthCredential;
+        if (lua_runtime.c.lua_type(L, idx) != lua_runtime.c.LUA_TTABLE) return error.InvalidOAuthCredential;
         const abs_idx = c.lua_absindex(L, idx);
 
-        _ = c.lua_getfield(L, abs_idx, "refresh");
+        _ = lua_runtime.c.lua_getfield(L, abs_idx, "refresh");
         defer c.lua_pop(L, 1);
-        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOAuthCredential;
+        if (lua_runtime.c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOAuthCredential;
         const refresh = try allocator.dupe(u8, lstring(L, -1));
         errdefer allocator.free(refresh);
 
-        _ = c.lua_getfield(L, abs_idx, "access");
+        _ = lua_runtime.c.lua_getfield(L, abs_idx, "access");
         defer c.lua_pop(L, 1);
-        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOAuthCredential;
+        if (lua_runtime.c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidOAuthCredential;
         const access = try allocator.dupe(u8, lstring(L, -1));
         errdefer allocator.free(access);
 
-        _ = c.lua_getfield(L, abs_idx, "expires");
+        _ = lua_runtime.c.lua_getfield(L, abs_idx, "expires");
         defer c.lua_pop(L, 1);
-        const expires: i64 = switch (c.lua_type(L, -1)) {
+        const expires: i64 = switch (lua_runtime.c.lua_type(L, -1)) {
             c.LUA_TNUMBER => if (c.lua_isinteger(L, -1) != 0)
                 @intCast(c.lua_tointegerx(L, -1, null))
             else
@@ -1511,7 +1783,7 @@ pub const ExtensionRunner = struct {
         c.lua_pushnil(L);
         while (c.lua_next(L, abs_idx) != 0) {
             defer c.lua_pop(L, 1);
-            if (c.lua_type(L, -2) != c.LUA_TSTRING) continue;
+            if (lua_runtime.c.lua_type(L, -2) != c.LUA_TSTRING) continue;
             const key = lstring(L, -2);
             if (std.mem.eql(u8, key, "refresh") or std.mem.eql(u8, key, "access") or std.mem.eql(u8, key, "expires")) continue;
             const duped_key = try allocator.dupe(u8, key);
@@ -1598,47 +1870,47 @@ fn moduleRootFromExtensionPath(allocator: std.mem.Allocator, path: []const u8) !
 
 fn pushUiEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.UiEvent) void {
     const c = lua_runtime.c;
-    c.lua_createtable(L, 0, 10);
+    lua_runtime.c.lua_createtable(L, 0, 10);
     pushStringField(L, "type", @tagName(event.type));
     pushStringField(L, "view", event.view);
     pushStringField(L, "state_owner_id", event.state_owner_id);
-    c.lua_pushinteger(L, @intCast(event.generation));
-    c.lua_setfield(L, -2, "generation");
+    lua_runtime.c.lua_pushinteger(L, @intCast(event.generation));
+    lua_runtime.c.lua_setfield(L, -2, "generation");
     if (event.node) |node| pushStringField(L, "node", node);
     if (event.action) |action| pushStringField(L, "action", action);
     if (event.key) |key| pushStringField(L, "key", key);
+    if (event.value) |value| pushStringField(L, "value", value);
     c.lua_pushboolean(L, if (event.ctrl) 1 else 0);
-    c.lua_setfield(L, -2, "ctrl");
+    lua_runtime.c.lua_setfield(L, -2, "ctrl");
     c.lua_pushboolean(L, if (event.alt) 1 else 0);
-    c.lua_setfield(L, -2, "alt");
+    lua_runtime.c.lua_setfield(L, -2, "alt");
     c.lua_pushboolean(L, if (event.shift) 1 else 0);
-    c.lua_setfield(L, -2, "shift");
+    lua_runtime.c.lua_setfield(L, -2, "shift");
 }
 
 fn pushJobEventPayload(L: *lua_runtime.c.lua_State, event: extension_ui.JobEvent) void {
     const c = lua_runtime.c;
-    c.lua_createtable(L, 0, 8);
-    c.lua_pushinteger(L, @intCast(event.id));
-    c.lua_setfield(L, -2, "id");
+    lua_runtime.c.lua_createtable(L, 0, 8);
+    lua_runtime.c.lua_pushinteger(L, @intCast(event.id));
+    lua_runtime.c.lua_setfield(L, -2, "id");
     pushStringField(L, "kind", @tagName(event.kind));
     if (event.data) |data| pushStringField(L, "data", data);
     if (event.code) |code| {
-        c.lua_pushinteger(L, @intCast(code));
-        c.lua_setfield(L, -2, "code");
+        lua_runtime.c.lua_pushinteger(L, @intCast(code));
+        lua_runtime.c.lua_setfield(L, -2, "code");
     }
     if (event.value) |value| {
         lua_runtime.pushJsonValue(L, value) catch c.lua_pushnil(L);
-        c.lua_setfield(L, -2, "value");
+        lua_runtime.c.lua_setfield(L, -2, "value");
     }
     c.lua_pushboolean(L, if (event.is_error) 1 else 0);
-    c.lua_setfield(L, -2, "is_error");
+    lua_runtime.c.lua_setfield(L, -2, "is_error");
     if (event.error_message) |msg| pushStringField(L, "error", msg);
 }
 
 fn pushStringField(L: *lua_runtime.c.lua_State, comptime field: [:0]const u8, value: []const u8) void {
-    const c = lua_runtime.c;
-    _ = c.lua_pushlstring(L, value.ptr, value.len);
-    c.lua_setfield(L, -2, field.ptr);
+    _ = lua_runtime.c.lua_pushlstring(L, value.ptr, value.len);
+    lua_runtime.c.lua_setfield(L, -2, field.ptr);
 }
 
 test "ExtensionRunner lifecycle binds once and unbinds to stub" {
@@ -1677,6 +1949,42 @@ fn testBound(session: *anyopaque) ExtensionRuntime.Bound {
         .system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
     };
+}
+
+fn testSendUserMessage(
+    ctx: *anyopaque,
+    text: []const u8,
+    opts: SendUserMessageOptions,
+) anyerror!SendUserMessageResult {
+    _ = ctx;
+    _ = text;
+    return switch (opts.target) {
+        .follow_up => .queued,
+        else => .submitted,
+    };
+}
+
+test "ExtensionRunner stores command actions on bound runtime" {
+    const allocator = std.testing.allocator;
+    var runner = ExtensionRunner.init(allocator, 11);
+    defer runner.deinit();
+    var provider_registry = ai.provider.Registry.init(allocator);
+    defer provider_registry.deinit();
+
+    var session: u8 = 0;
+    try runner.bindRuntime(testBound(@ptrCast(&session)), &provider_registry);
+    var action_ctx: u8 = 0;
+    var actions = ExtensionCommandActions{
+        .ctx = @ptrCast(&action_ctx),
+        .send_user_message = &testSendUserMessage,
+    };
+
+    runner.setCommandActions(&actions);
+    try std.testing.expect(runner.runtime.bound.command_actions.? == &actions);
+    try std.testing.expectEqual(SendUserMessageResult.queued, try actions.send_user_message(actions.ctx, "hello", .{ .target = .follow_up }));
+
+    runner.setCommandActions(null);
+    try std.testing.expect(runner.runtime.bound.command_actions == null);
 }
 
 fn testGetModel(_: *anyopaque) agent_protocol.Model {
@@ -1863,4 +2171,23 @@ test "ExtensionRunner owns populated registries until deinit" {
     try std.testing.expectEqual(@as(usize, 1), runner.tool_registry.count());
     try std.testing.expectEqual(@as(usize, 1), runner.event_registry.count());
     try std.testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
+}
+
+test "side ai sessions persist messages until disposed" {
+    const testing = std.testing;
+    var runner = ExtensionRunner.init(testing.allocator, 1);
+    defer runner.deinit();
+
+    var session = SideAiSession{ .id = 0 };
+    try session.append(testing.allocator, .context, "seed context");
+    const id = try runner.createSideAiSession(session);
+
+    const stored = runner.getSideAiSession(id) orelse return error.MissingSideAiSession;
+    try testing.expectEqual(@as(usize, 1), stored.messages.items.len);
+    try testing.expectEqualStrings("seed context", stored.messages.items[0].text);
+
+    try stored.append(testing.allocator, .user, "hello");
+    try testing.expectEqual(@as(usize, 2), stored.messages.items.len);
+    try testing.expect(runner.disposeSideAiSession(id));
+    try testing.expect(runner.getSideAiSession(id) == null);
 }

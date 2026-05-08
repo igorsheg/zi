@@ -29,6 +29,7 @@ pub fn buildWorkerRequest(
         .headers = null,
         .max_tokens = request.max_tokens,
         .reasoning = resolveReasoning(current_model, request.reasoning),
+        .stream_events = request.stream_events,
     };
     errdefer built.deinit(allocator);
     if (request.system_prompt) |value| built.system_prompt = try allocator.dupe(u8, value);

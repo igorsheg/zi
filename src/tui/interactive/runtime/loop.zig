@@ -13,6 +13,7 @@ const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 
 pub const agentThread = agentThreadFn;
 pub const submitExtensionAsyncResult = submitExtensionAsyncResultFn;
+pub const submitExtensionAiCompleteEvent = submitExtensionAiCompleteEventFn;
 pub const submitExtensionAsyncFromRunner = extensionAsyncDispatcher;
 pub const dispatchExtensionOAuthRefresh = dispatchExtensionOAuthRefreshViaRequestQueue;
 
@@ -112,6 +113,17 @@ fn submitExtensionAsyncResultFn(ptr: *anyopaque, id: extension_runner_mod.AsyncO
         },
     }
 }
+fn submitExtensionAiCompleteEventFn(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) bool {
+    const self: *Interactive = @ptrCast(@alignCast(ptr));
+    switch (self.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = event } })) {
+        .ok, .dropped => return true,
+        .full, .closed, .oom => |rejected| {
+            var failed = rejected;
+            failed.deinit(self.msg_allocator);
+            return false;
+        },
+    }
+}
 
 pub fn extensionAsyncDispatcher(self: *@import("../../interactive.zig").Interactive) extension_runner_mod.AsyncDispatcher {
     return .{
@@ -120,7 +132,23 @@ pub fn extensionAsyncDispatcher(self: *@import("../../interactive.zig").Interact
         .job_start = &startExtensionJobFromRunnerFn,
         .job_write = &writeExtensionJobFromRunnerFn,
         .job_stop = &stopExtensionJobFromRunnerFn,
+        .ai_complete_event = &dispatchAiCompleteEventFromRunnerFn,
     };
+}
+
+fn dispatchAiCompleteEventFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) anyerror!void {
+    const self: *Interactive = @ptrCast(@alignCast(ptr));
+    var original = event;
+    defer original.deinit(runner.allocator);
+    const cloned = try event.clone(self.msg_allocator);
+    switch (self.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = cloned } })) {
+        .ok, .dropped => {},
+        .full, .closed, .oom => |rejected| {
+            var failed = rejected;
+            failed.deinit(self.msg_allocator);
+            return error.AiCompleteEventUnavailable;
+        },
+    }
 }
 
 fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, start: extension_runner_mod.AsyncStart) anyerror!void {
@@ -138,6 +166,32 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
             const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
             try worker.submit(worker_request);
             submitted = true;
+        },
+        .ai_session_prompt => |request| {
+            const session = self.runtime_host.currentSession();
+            const side = if (session.extensionRunner()) |r| r.getSideAiSession(request.session_id) else null;
+            if (side != null and side.?.tool_allowlist.len > 0) {
+                var result = try session.runAiSessionAgentPrompt(self.msg_allocator, request);
+                errdefer result.deinit(self.msg_allocator);
+                switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = owned_start.id, .result = .{ .ai_session_prompt = result } } })) {
+                    .ok, .dropped => {},
+                    .full, .closed, .oom => |rejected| {
+                        var failed = rejected;
+                        failed.deinit(self.msg_allocator);
+                        return error.AiSessionPromptUnavailable;
+                    },
+                }
+            } else {
+                const worker_request = try session.buildAiSessionPromptWorkerRequest(self.msg_allocator, owned_start.id, request);
+                var submitted = false;
+                errdefer if (!submitted) {
+                    var failed = worker_request;
+                    failed.deinit(self.msg_allocator);
+                };
+                const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
+                try worker.submit(worker_request);
+                submitted = true;
+            }
         },
         .system => |request| {
             switch (request.stdio) {

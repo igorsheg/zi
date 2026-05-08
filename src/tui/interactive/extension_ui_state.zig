@@ -31,6 +31,7 @@ pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
     views: std.StringHashMap(ViewRecord),
     frames: std.StringHashMap(FrameRecord),
+    input_values: std.StringHashMap([]u8),
     theme: *const Theme,
     status_component: TargetComponent,
     toast_component: TargetComponent,
@@ -43,6 +44,7 @@ pub const ExtensionUiState = struct {
             .allocator = allocator,
             .views = std.StringHashMap(ViewRecord).init(allocator),
             .frames = std.StringHashMap(FrameRecord).init(allocator),
+            .input_values = std.StringHashMap([]u8).init(allocator),
             .theme = themes_builtin.dark(),
             .status_component = .{ .target = .status },
             .toast_component = .{ .target = .toast },
@@ -66,6 +68,13 @@ pub const ExtensionUiState = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.frames.deinit();
+
+        var iit = self.input_values.iterator();
+        while (iit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.input_values.deinit();
     }
 
     pub fn setTheme(self: *ExtensionUiState, theme: *const Theme) void {
@@ -116,6 +125,20 @@ pub const ExtensionUiState = struct {
         return ordered[ordered.len - 1].spec.focus;
     }
 
+    pub fn handleOverlayInput(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
+        const ordered = self.orderedTargetViews(.overlay) catch return null;
+        defer self.allocator.free(ordered);
+        var i = ordered.len;
+        while (i > 0) {
+            i -= 1;
+            const spec = ordered[i].spec;
+            if (!spec.focus) continue;
+            const input = firstInput(spec.root orelse continue) orelse continue;
+            return editInput(self, spec, input, key) catch null;
+        }
+        return null;
+    }
+
     pub fn matchOverlayKey(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
         const ordered = self.orderedTargetViews(.overlay) catch return null;
         defer self.allocator.free(ordered);
@@ -150,6 +173,7 @@ pub const ExtensionUiState = struct {
             }
             if (render.remove) {
                 var old = self.views.fetchRemove(entry.key_ptr.*).?;
+                clearInputValuesForView(self, render.state_owner_id, render.id);
                 self.allocator.free(old.key);
                 old.value.deinit(self.allocator);
                 self.allocator.free(key);
@@ -161,6 +185,7 @@ pub const ExtensionUiState = struct {
             };
             entry.value_ptr.deinit(self.allocator);
             entry.value_ptr.* = .{ .spec = cloned };
+            syncInputValues(self, render);
             self.allocator.free(key);
             return;
         }
@@ -178,6 +203,7 @@ pub const ExtensionUiState = struct {
             owned.deinit(self.allocator);
             self.allocator.free(key);
         };
+        syncInputValues(self, render);
     }
 
     pub fn applyFrame(self: *ExtensionUiState, frame: extension_ui.UiFrame) void {
@@ -238,6 +264,104 @@ pub const ExtensionUiState = struct {
         return list.toOwnedSlice(self.allocator);
     }
 };
+
+const InputRef = struct {
+    id: []const u8,
+    value: []const u8,
+    on_change: ?[]const u8,
+    on_submit: ?[]const u8,
+};
+
+fn firstInput(node: extension_ui.UiNode) ?InputRef {
+    return switch (node) {
+        .input => |input| .{ .id = input.id, .value = input.value, .on_change = input.on_change, .on_submit = input.on_submit },
+        .view => |view| blk: {
+            for (view.children) |child| if (firstInput(child)) |found| break :blk found;
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn syncInputValues(self: *ExtensionUiState, render: extension_ui.RenderSpec) void {
+    if (render.root) |root| syncInputValuesNode(self, render.state_owner_id, render.id, root);
+}
+
+fn syncInputValuesNode(self: *ExtensionUiState, owner: []const u8, view: []const u8, node: extension_ui.UiNode) void {
+    switch (node) {
+        .input => |input| setInputValue(self, owner, view, input.id, input.value) catch {},
+        .view => |v| for (v.children) |child| syncInputValuesNode(self, owner, view, child),
+        else => {},
+    }
+}
+
+fn clearInputValuesForView(self: *ExtensionUiState, owner: []const u8, view: []const u8) void {
+    const prefix = std.fmt.allocPrint(self.allocator, "{s}\x1f{s}\x1f", .{ owner, view }) catch return;
+    defer self.allocator.free(prefix);
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(self.allocator);
+    var it = self.input_values.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) keys.append(self.allocator, entry.key_ptr.*) catch break;
+    }
+    for (keys.items) |k| {
+        const old = self.input_values.fetchRemove(k) orelse continue;
+        self.allocator.free(old.key);
+        self.allocator.free(old.value);
+    }
+}
+
+fn setInputValue(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, value: []const u8) !void {
+    const key = try makeInputKey(self.allocator, owner, view, id);
+    errdefer self.allocator.free(key);
+    const owned = try self.allocator.dupe(u8, value);
+    errdefer self.allocator.free(owned);
+    if (self.input_values.getEntry(key)) |entry| {
+        self.allocator.free(entry.value_ptr.*);
+        entry.value_ptr.* = owned;
+        self.allocator.free(key);
+        return;
+    }
+    try self.input_values.put(key, owned);
+}
+
+fn inputValue(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, fallback: []const u8) []const u8 {
+    const key = makeInputKey(self.allocator, owner, view, id) catch return fallback;
+    defer self.allocator.free(key);
+    return self.input_values.get(key) orelse fallback;
+}
+
+fn editInput(self: *ExtensionUiState, spec: extension_ui.RenderSpec, input: InputRef, key: keys_mod.Key) !?extension_ui.UiEvent {
+    const cur = inputValue(self, spec.state_owner_id, spec.id, input.id, input.value);
+    var next = std.ArrayList(u8).empty;
+    defer next.deinit(self.allocator);
+    try next.appendSlice(self.allocator, cur);
+    var event_type: extension_ui.UiEventType = .change;
+    var action = input.on_change;
+    switch (key.code) {
+        .char => if (!key.ctrl and !key.alt) {
+            if (key.char) |cp| {
+                var buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(cp, &buf) catch return null;
+                try next.appendSlice(self.allocator, buf[0..len]);
+            } else return null;
+        } else return null,
+        .backspace => {
+            if (next.items.len == 0) return null;
+            var end = next.items.len - 1;
+            while (end > 0 and (next.items[end] & 0xc0) == 0x80) end -= 1;
+            next.shrinkRetainingCapacity(end);
+        },
+        .enter => {
+            event_type = .submit;
+            action = input.on_submit;
+        },
+        else => return null,
+    }
+    if (event_type == .change) try setInputValue(self, spec.state_owner_id, spec.id, input.id, next.items);
+    const value = if (event_type == .change) inputValue(self, spec.state_owner_id, spec.id, input.id, next.items) else cur;
+    return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .node = input.id, .type = event_type, .action = action, .value = value, .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
+}
 
 const ViewRecord = struct {
     spec: extension_ui.RenderSpec,
@@ -380,6 +504,7 @@ fn measureNode(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, 
         .progress => 1,
         .separator => 1,
         .surface => |s| constraintHeight(s.style.height) orelse 1,
+        .input => 1,
         .view => |b| measureView(state, b, width, width_method),
     };
 }
@@ -733,6 +858,7 @@ fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: ext
         .surface => |s| if (state.findFrame(view.state_owner_id, view.id, s.id)) |frame| {
             if (frame.generation >= view.generation) framebuffer_surface_mod.renderFrame(region, frame, 0);
         },
+        .input => |input| renderInput(state, view, region, input),
         .view => |b| renderView(state, view, b, region),
     }
 }
@@ -791,6 +917,7 @@ fn resolveHeight(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32
         .progress => |p| p.style.height,
         .separator => |s| s.style.height,
         .surface => |s| s.style.height,
+        .input => |input| input.style.height,
     };
     if (c) |v| return resolveConstraint(v, avail);
     return measureNode(state, node, width, width_method);
@@ -804,6 +931,7 @@ fn widthConstraint(node: extension_ui.UiNode) ?extension_ui.Constraint {
         .progress => |p| p.style.width,
         .separator => |s| s.style.width,
         .surface => |s| s.style.width,
+        .input => |input| input.style.width,
     };
 }
 
@@ -874,6 +1002,16 @@ fn renderChip(region: Region, label: []const u8) void {
     if (close_x + 1 < region.width) _ = region.writeStr(close_x, 0, " ]", Color.default, Color.default, Attributes.none);
 }
 
+fn renderInput(state: *ExtensionUiState, view: extension_ui.RenderSpec, region: Region, input: extension_ui.UiNode.Input) void {
+    if (region.width == 0) return;
+    const value = inputValue(state, view.state_owner_id, view.id, input.id, input.value);
+    const shown = if (value.len > 0) value else (input.placeholder orelse "");
+    const fg = if (value.len > 0) styleFg(state.activeTheme(), input.style) else state.activeTheme().fg(.muted);
+    const attrs = styleAttrs(input.style);
+    region.set(0, 0, charCell('›', fg, styleBg(input.style), attrs));
+    if (region.width > 2) _ = region.writeStr(2, 0, shown, fg, styleBg(input.style), attrs);
+}
+
 fn renderSeparator(state: *ExtensionUiState, region: Region, sep: extension_ui.UiNode.Separator) void {
     const color = if (sep.style.fg) |fg| uiColor(fg) else null;
     (chrome_mod.Separator{ .color = color }).render(region, state.activeTheme());
@@ -912,6 +1050,10 @@ fn makeViewKey(allocator: std.mem.Allocator, owner: []const u8, id: []const u8) 
 }
 
 fn makeFrameKey(allocator: std.mem.Allocator, owner: []const u8, view: []const u8, node: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ owner, view, node });
+}
+
+fn makeInputKey(allocator: std.mem.Allocator, owner: []const u8, view: []const u8, node: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ owner, view, node });
 }
 
@@ -966,6 +1108,40 @@ test "extension ui retains clone remove and generation gates" {
     try std.testing.expectEqual(@as(usize, 1), state.views.count());
     state.applyRender(.{ .state_owner_id = "owner", .generation = 3, .id = "view", .remove = true });
     try std.testing.expectEqual(@as(usize, 0), state.views.count());
+}
+
+test "extension ui edits focused overlay input and emits structured events" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const root = extension_ui.UiNode{ .input = .{ .id = "filter", .value = "z", .placeholder = "Filter", .on_change = "changed", .on_submit = "submitted" } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .overlay, .focus = true, .root = root });
+
+    const changed = state.handleOverlayInput(.{ .code = .char, .char = 'i' }).?;
+    try std.testing.expectEqual(extension_ui.UiEventType.change, changed.type);
+    try std.testing.expectEqualStrings("filter", changed.node.?);
+    try std.testing.expectEqualStrings("changed", changed.action.?);
+    try std.testing.expectEqualStrings("zi", changed.value.?);
+
+    const submitted = state.handleOverlayInput(.{ .code = .enter }).?;
+    try std.testing.expectEqual(extension_ui.UiEventType.submit, submitted.type);
+    try std.testing.expectEqualStrings("submitted", submitted.action.?);
+    try std.testing.expectEqualStrings("zi", submitted.value.?);
+
+    var buf = try Buffer.init(std.testing.allocator, 8, 1, .wcwidth);
+    defer buf.deinit();
+    var comp = state.overlayComponent();
+    comp.render(buf.region());
+    try std.testing.expect(try bufferContainsText(&buf, "zi"));
+}
+
+test "extension ui render resyncs input state" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .overlay, .focus = true, .root = .{ .input = .{ .id = "filter", .value = "a" } } });
+    _ = state.handleOverlayInput(.{ .code = .char, .char = 'b' }).?;
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .target = .overlay, .focus = true, .root = .{ .input = .{ .id = "filter", .value = "server" } } });
+    const submitted = state.handleOverlayInput(.{ .code = .enter }).?;
+    try std.testing.expectEqualStrings("server", submitted.value.?);
 }
 
 test "extension ui renders text" {

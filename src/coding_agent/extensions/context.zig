@@ -24,7 +24,7 @@ pub fn pushExtensionContext(
     runner: *runner_mod.ExtensionRunner,
     provenance: ?resource_types.ExtensionProvenance,
 ) !void {
-    c.lua_createtable(L, 0, 12);
+    c.lua_createtable(L, 0, 14);
 
     _ = c.lua_pushlstring(L, runner.cwd.ptr, runner.cwd.len);
     c.lua_setfield(L, -2, "cwd");
@@ -45,7 +45,7 @@ pub fn pushExtensionContext(
     c.lua_pushnil(L);
     c.lua_setfield(L, -2, "signal");
 
-    pushSessionApi(L, runner);
+    pushSessionApi(L, runner, provenance);
     c.lua_setfield(L, -2, "session");
 
     pushAiApi(L, runner);
@@ -73,6 +73,9 @@ pub fn pushExtensionContext(
             pushMethod(L, runner, &ctxAbort);
             c.lua_setfield(L, -2, "abort");
 
+            pushMethod(L, runner, &ctxSendUserMessage);
+            c.lua_setfield(L, -2, "send_user_message");
+
             pushMethod(L, runner, &ctxHasPendingMessages);
             c.lua_setfield(L, -2, "has_pending_messages");
 
@@ -96,6 +99,8 @@ pub fn pushExtensionContext(
             c.lua_setfield(L, -2, "is_idle");
             c.lua_pushnil(L);
             c.lua_setfield(L, -2, "abort");
+            c.lua_pushnil(L);
+            c.lua_setfield(L, -2, "send_user_message");
             c.lua_pushnil(L);
             c.lua_setfield(L, -2, "has_pending_messages");
             c.lua_pushnil(L);
@@ -434,6 +439,14 @@ fn readNode(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui
     if (std.mem.eql(u8, typ, "progress")) return .{ .progress = .{ .id = id, .value = readOptionalFloatField(L, idx, "value"), .label = try readOptionalStringFieldLimit(arena, L, idx, "label", ui_text_bytes), .style = style } };
     if (std.mem.eql(u8, typ, "separator")) return .{ .separator = .{ .id = id, .style = style } };
     if (std.mem.eql(u8, typ, "surface")) return .{ .surface = .{ .id = try readStringFieldLimit(arena, L, idx, "id", "surface", ui_id_bytes), .style = style } };
+    if (std.mem.eql(u8, typ, "input")) return .{ .input = .{
+        .id = try readStringFieldLimit(arena, L, idx, "id", "input", ui_id_bytes),
+        .value = try readStringFieldLimit(arena, L, idx, "value", "", ui_text_bytes),
+        .placeholder = try readOptionalStringFieldLimit(arena, L, idx, "placeholder", ui_text_bytes),
+        .style = style,
+        .on_change = try readOptionalStringFieldLimit(arena, L, idx, "on_change", ui_id_bytes),
+        .on_submit = try readOptionalStringFieldLimit(arena, L, idx, "on_submit", ui_id_bytes),
+    } };
     var children: []extension_ui.UiNode = &.{};
     _ = c.lua_getfield(L, idx, "children");
     if (c.lua_type(L, -1) == c.LUA_TTABLE) {
@@ -778,9 +791,11 @@ fn utf8SafePrefixLen(value: []const u8, limit: usize) usize {
 }
 
 fn pushAiApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
-    c.lua_createtable(L, 0, 1);
+    c.lua_createtable(L, 0, 2);
     pushMethod(L, runner, &ctxAiComplete);
     c.lua_setfield(L, -2, "complete");
+    pushMethod(L, runner, &ctxAiSessionCreate);
+    c.lua_setfield(L, -2, "session");
 }
 
 fn pushModelsApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
@@ -793,9 +808,9 @@ fn pushModelsApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_setfield(L, -2, "get");
 }
 
-fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
+fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, provenance: ?resource_types.ExtensionProvenance) void {
     const has_session = switch (runner.runtime) {
-        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null or bound.session_note_append != null or bound.session_notes_get != null or bound.session_label_set != null or bound.session_labels_get != null or bound.session_entry_get != null or bound.session_entries_get != null,
+        .bound => |bound| bound.session_info_get != null or bound.session_name_get != null or bound.session_name_set != null or bound.session_tool_results_get != null or bound.session_messages_get != null or bound.session_context_get != null or bound.session_note_append != null or bound.session_notes_get != null or bound.session_artifact_append != null or bound.session_artifacts_get != null or bound.session_label_set != null or bound.session_labels_get != null or bound.session_entry_get != null or bound.session_entries_get != null,
         .stub => false,
     };
     if (!has_session) {
@@ -803,7 +818,7 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
         return;
     }
 
-    c.lua_createtable(L, 0, 11);
+    c.lua_createtable(L, 0, 15);
     pushMethod(L, runner, &ctxSessionInfo);
     c.lua_setfield(L, -2, "info");
     pushMethod(L, runner, &ctxSessionName);
@@ -814,10 +829,18 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_setfield(L, -2, "tool_results");
     pushMethod(L, runner, &ctxSessionMessages);
     c.lua_setfield(L, -2, "messages");
+    pushMethod(L, runner, &ctxSessionContext);
+    c.lua_setfield(L, -2, "context");
     pushMethod(L, runner, &ctxSessionAppendNote);
     c.lua_setfield(L, -2, "append_note");
     pushMethod(L, runner, &ctxSessionNotes);
     c.lua_setfield(L, -2, "notes");
+    if (provenance) |prov| {
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxSessionAppendArtifact);
+        c.lua_setfield(L, -2, "append_artifact");
+        pushUiMethod(L, runner, prov.state_owner_id, &ctxSessionArtifacts);
+        c.lua_setfield(L, -2, "artifacts");
+    }
     pushMethod(L, runner, &ctxSessionLabel);
     c.lua_setfield(L, -2, "label");
     pushMethod(L, runner, &ctxSessionLabels);
@@ -1043,6 +1066,43 @@ fn ctxSessionMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
     }
 }
 
+fn ctxSessionContext(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    var max_messages: usize = 500;
+    var include_tools = true;
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        _ = c.lua_getfield(L, 1, "max_messages");
+        if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+            const raw = c.lua_tointegerx(L, -1, null);
+            if (raw > 0) max_messages = @intCast(@min(raw, 500));
+        }
+        c.lua_pop(L, 1);
+        _ = c.lua_getfield(L, 1, "include_tools");
+        if (c.lua_type(L, -1) == c.LUA_TBOOLEAN) include_tools = c.lua_toboolean(L, -1) != 0;
+        c.lua_pop(L, 1);
+    }
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_context_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator, max_messages, include_tools) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
+}
+
 fn ctxSessionAppendNote(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
@@ -1102,6 +1162,98 @@ fn ctxSessionNotes(L_opt: ?*c.lua_State) callconv(.c) c_int {
                 return 1;
             };
             const value = getter(bound.session, runner.allocator, kind, source_entry_id, limit) orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            defer json_util.freeJsonValue(runner.allocator, value);
+            lua_runtime.pushJsonValue(L, value) catch c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+        .stub => {
+            c.lua_createtable(L, 0, 0);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionAppendArtifact(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const owner_id = stateOwnerFromUpvalue(L);
+    if (owner_id.len == 0 or c.lua_type(L, 1) != c.LUA_TTABLE) {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    }
+    const idx = c.lua_absindex(L, 1);
+    const kind = readBorrowedStringField(L, idx, "kind") orelse "artifact";
+    const key = readBorrowedStringField(L, idx, "key");
+    const title = readBorrowedStringField(L, idx, "title");
+
+    _ = c.lua_getfield(L, idx, "data");
+    if (c.lua_type(L, -1) == c.LUA_TNONE or c.lua_type(L, -1) == c.LUA_TNIL) {
+        c.lua_pop(L, 1);
+        c.lua_pushboolean(L, 0);
+        return 1;
+    }
+    const allocator = runner.allocator;
+    var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+    const data = lua_runtime.luaValueToJsonLimited(L, -1, allocator, &budget) catch {
+        c.lua_pop(L, 1);
+        c.lua_pushboolean(L, 0);
+        return 1;
+    };
+    c.lua_pop(L, 1);
+    errdefer json_util.freeJsonValue(allocator, data);
+
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const append = bound.session_artifact_append orelse {
+                json_util.freeJsonValue(allocator, data);
+                c.lua_pushboolean(L, 0);
+                return 1;
+            };
+            append(bound.session, owner_id, kind, key, title, data) catch {
+                json_util.freeJsonValue(allocator, data);
+                c.lua_pushboolean(L, 0);
+                return 1;
+            };
+            json_util.freeJsonValue(allocator, data);
+            c.lua_pushboolean(L, 1);
+            return 1;
+        },
+        .stub => {
+            json_util.freeJsonValue(allocator, data);
+            c.lua_pushboolean(L, 0);
+            return 1;
+        },
+    }
+}
+
+fn ctxSessionArtifacts(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const owner_id = stateOwnerFromUpvalue(L);
+    var limit: usize = 50;
+    var kind: ?[]const u8 = null;
+    var key: ?[]const u8 = null;
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        const idx = c.lua_absindex(L, 1);
+        kind = readBorrowedStringField(L, idx, "kind");
+        key = readBorrowedStringField(L, idx, "key");
+        _ = c.lua_getfield(L, idx, "limit");
+        if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+            const raw = c.lua_tointegerx(L, -1, null);
+            if (raw > 0) limit = @intCast(@min(raw, 500));
+        }
+        c.lua_pop(L, 1);
+    }
+    switch (runner.runtime) {
+        .bound => |bound| {
+            const getter = bound.session_artifacts_get orelse {
+                c.lua_createtable(L, 0, 0);
+                return 1;
+            };
+            const value = getter(bound.session, runner.allocator, owner_id, kind, key, limit) orelse {
                 c.lua_createtable(L, 0, 0);
                 return 1;
             };
@@ -1276,6 +1428,242 @@ fn readBorrowedStringField(L: *c.lua_State, table_idx: c_int, field: [:0]const u
     return ptr[0..len];
 }
 
+fn ctxAiSessionCreate(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    var session = runner_mod.SideAiSession{ .id = 0 };
+    errdefer session.deinit(runner.allocator);
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        const idx = c.lua_absindex(L, 1);
+        if (readBorrowedStringField(L, idx, "model")) |model| session.model = runner.allocator.dupe(u8, model) catch {
+            c.lua_pushnil(L);
+            return 1;
+        };
+        if (readBorrowedStringField(L, idx, "system_prompt")) |prompt| session.system_prompt = runner.allocator.dupe(u8, prompt) catch {
+            c.lua_pushnil(L);
+            return 1;
+        };
+        session.reasoning = readAiCompleteReasoning(L, idx) catch null;
+        _ = c.lua_getfield(L, idx, "max_tokens");
+        if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
+            const raw = c.lua_tointegerx(L, -1, null);
+            if (raw > 0) session.max_tokens = @intCast(raw);
+        }
+        c.lua_pop(L, 1);
+        readAiSessionTools(runner.allocator, L, idx, &session) catch {
+            c.lua_pushnil(L);
+            return 1;
+        };
+        readAiSessionSeedMessages(runner.allocator, L, idx, &session) catch {
+            c.lua_pushnil(L);
+            return 1;
+        };
+    } else if (c.lua_type(L, 1) != c.LUA_TNONE and c.lua_type(L, 1) != c.LUA_TNIL) {
+        c.lua_pushnil(L);
+        return 1;
+    }
+    const id = runner.createSideAiSession(session) catch {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    pushAiSessionHandle(L, runner, id);
+    return 1;
+}
+
+fn readAiSessionTools(allocator: std.mem.Allocator, L: *c.lua_State, idx: c_int, session: *runner_mod.SideAiSession) !void {
+    _ = c.lua_getfield(L, idx, "tools");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) == c.LUA_TNIL) return;
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) return error.InvalidTools;
+    const n: usize = @intCast(c.lua_rawlen(L, -1));
+    const items = try allocator.alloc([]const u8, n);
+    var built: usize = 0;
+    errdefer {
+        for (items[0..built]) |item| allocator.free(item);
+        allocator.free(items);
+    }
+    for (0..n) |i| {
+        _ = c.lua_rawgeti(L, -1, @intCast(i + 1));
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidTools;
+        items[i] = try dupeLuaString(allocator, L, -1);
+        built += 1;
+    }
+    session.tool_allowlist = items;
+}
+
+fn readAiSessionSeedMessages(allocator: std.mem.Allocator, L: *c.lua_State, idx: c_int, session: *runner_mod.SideAiSession) !void {
+    _ = c.lua_getfield(L, idx, "context");
+    if (c.lua_type(L, -1) == c.LUA_TSTRING) {
+        try session.append(allocator, .context, readBorrowedLuaString(L, -1));
+    } else if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+        const cidx = c.lua_absindex(L, -1);
+        if (readBorrowedStringField(L, cidx, "system_prompt")) |system_prompt| try session.append(allocator, .context, system_prompt);
+        _ = c.lua_getfield(L, cidx, "messages");
+        if (c.lua_type(L, -1) == c.LUA_TTABLE) try appendAiSessionSeedMessageArray(allocator, L, c.lua_absindex(L, -1), session);
+        c.lua_pop(L, 1);
+    }
+    c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, idx, "messages");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) == c.LUA_TTABLE) try appendAiSessionSeedMessageArray(allocator, L, c.lua_absindex(L, -1), session);
+}
+
+fn appendAiSessionSeedMessageArray(allocator: std.mem.Allocator, L: *c.lua_State, idx: c_int, session: *runner_mod.SideAiSession) !void {
+    const n: usize = @intCast(c.lua_rawlen(L, idx));
+    for (0..n) |i| {
+        _ = c.lua_rawgeti(L, idx, @intCast(i + 1));
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) == c.LUA_TSTRING) {
+            try session.append(allocator, .user, readBorrowedLuaString(L, -1));
+        } else if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+            try appendAiSessionSeedMessage(allocator, L, c.lua_absindex(L, -1), session);
+        }
+    }
+}
+
+fn appendAiSessionSeedMessage(allocator: std.mem.Allocator, L: *c.lua_State, idx: c_int, session: *runner_mod.SideAiSession) !void {
+    const role_s = readBorrowedStringField(L, idx, "role") orelse "user";
+    const role: runner_mod.SideAiSession.Role = if (std.mem.eql(u8, role_s, "assistant")) .assistant else if (std.mem.eql(u8, role_s, "context") or std.mem.eql(u8, role_s, "system")) .context else .user;
+    if (readBorrowedStringField(L, idx, "text") orelse readBorrowedStringField(L, idx, "content")) |text| {
+        try session.append(allocator, role, text);
+        return;
+    }
+    _ = c.lua_getfield(L, idx, "content");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(allocator);
+        const n: usize = @intCast(c.lua_rawlen(L, -1));
+        for (0..n) |i| {
+            _ = c.lua_rawgeti(L, -1, @intCast(i + 1));
+            defer c.lua_pop(L, 1);
+            if (c.lua_type(L, -1) != c.LUA_TTABLE) continue;
+            const bidx = c.lua_absindex(L, -1);
+            const typ = readBorrowedStringField(L, bidx, "type") orelse "text";
+            if (!std.mem.eql(u8, typ, "text")) continue;
+            const block_text = readBorrowedStringField(L, bidx, "text") orelse continue;
+            if (text.items.len > 0) try text.append(allocator, '\n');
+            try text.appendSlice(allocator, block_text);
+        }
+        if (text.items.len > 0) try session.append(allocator, role, text.items);
+    }
+}
+
+fn readBorrowedLuaString(L: *c.lua_State, idx: c_int) []const u8 {
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, idx, &len) orelse return &.{};
+    return ptr[0..len];
+}
+
+fn pushAiSessionHandle(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, id: u64) void {
+    c.lua_createtable(L, 0, 5);
+    c.lua_pushinteger(L, @intCast(id));
+    c.lua_setfield(L, -2, "id");
+    pushAiSessionMethod(L, runner, id, &ctxAiSessionPrompt);
+    c.lua_setfield(L, -2, "prompt");
+    pushAiSessionMethod(L, runner, id, &ctxAiSessionAbort);
+    c.lua_setfield(L, -2, "abort");
+    pushAiSessionMethod(L, runner, id, &ctxAiSessionDispose);
+    c.lua_setfield(L, -2, "dispose");
+}
+
+fn pushAiSessionMethod(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, id: u64, func: *const fn (?*c.lua_State) callconv(.c) c_int) void {
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_pushinteger(L, @intCast(id));
+    c.lua_pushcclosure(L, func, 2);
+}
+
+fn aiSessionIdFromUpvalue(L: *c.lua_State) u64 {
+    return @intCast(c.lua_tointegerx(L, c.lua_upvalueindex(2), null));
+}
+
+fn ctxAiSessionPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const session_id = aiSessionIdFromUpvalue(L);
+    const prompt_arg = aiSessionPromptArgIndex(L);
+    const prompt = parseAiSessionPromptText(runner.allocator, L, prompt_arg) catch {
+        pushAiCompleteError(L, "ctx.ai.session.prompt: invalid prompt");
+        return 1;
+    };
+    errdefer runner.allocator.free(prompt);
+    const session = runner.getSideAiSession(session_id) orelse {
+        runner.allocator.free(prompt);
+        pushAiCompleteError(L, "ctx.ai.session.prompt: disposed session");
+        return 1;
+    };
+    if (session.disposed) {
+        runner.allocator.free(prompt);
+        pushAiCompleteError(L, "ctx.ai.session.prompt: disposed session");
+        return 1;
+    }
+    var request = runner_mod.AiSessionPromptRequest{ .session_id = session_id, .prompt = prompt };
+    request.callbacks_ref = readOptionalCallbacksRef(L, prompt_arg);
+    request.source_L = if (request.callbacks_ref != c.LUA_NOREF) L else null;
+    const id = runner.beginAiSessionPromptAsync(request);
+    return c.lua_yieldk(L, 0, @intCast(id), ctxAiSessionPromptContinue);
+}
+
+fn aiSessionPromptArgIndex(L: *c.lua_State) c_int {
+    if (c.lua_type(L, 1) == c.LUA_TTABLE and readBorrowedStringField(L, c.lua_absindex(L, 1), "prompt") == null and c.lua_type(L, 2) != c.LUA_TNONE) return 2;
+    return 1;
+}
+
+fn parseAiSessionPromptText(allocator: std.mem.Allocator, L: *c.lua_State, arg_idx: c_int) ![]const u8 {
+    if (c.lua_type(L, arg_idx) == c.LUA_TSTRING) return try dupeLuaString(allocator, L, arg_idx);
+    if (c.lua_type(L, arg_idx) != c.LUA_TTABLE) return error.InvalidPrompt;
+    const idx = c.lua_absindex(L, arg_idx);
+    _ = c.lua_getfield(L, idx, "prompt");
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return error.InvalidPrompt;
+    return try dupeLuaString(allocator, L, -1);
+}
+
+fn readOptionalCallbacksRef(L: *c.lua_State, arg_idx: c_int) c_int {
+    if (c.lua_type(L, arg_idx) != c.LUA_TTABLE) return c.LUA_NOREF;
+    const idx = c.lua_absindex(L, arg_idx);
+    _ = c.lua_getfield(L, idx, "on");
+    const t = c.lua_type(L, -1);
+    if (t == c.LUA_TFUNCTION or t == c.LUA_TTABLE) return c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+    c.lua_pop(L, 1);
+    return c.LUA_NOREF;
+}
+
+fn ctxAiSessionPromptContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) callconv(.c) c_int {
+    _ = status;
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id: runner_mod.AsyncOpId = @intCast(ctx);
+    var result = runner.takeCompletedAsync(id) orelse {
+        pushAiCompleteError(L, "ctx.ai.session.prompt: missing async result");
+        return 1;
+    };
+    defer result.deinit(runner.allocator);
+    switch (result) {
+        .ai_session_prompt => |value| pushAiCompleteResult(L, value),
+        else => pushAiCompleteError(L, "ctx.ai.session.prompt: unexpected async result"),
+    }
+    return 1;
+}
+
+fn ctxAiSessionAbort(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id = aiSessionIdFromUpvalue(L);
+    if (runner.getSideAiSession(id)) |session| session.abort_requested = true;
+    c.lua_pushboolean(L, 1);
+    return 1;
+}
+
+fn ctxAiSessionDispose(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = stateRunnerFromUpvalue(L);
+    const id = aiSessionIdFromUpvalue(L);
+    c.lua_pushboolean(L, if (runner.disposeSideAiSession(id)) 1 else 0);
+    return 1;
+}
+
 fn ctxAiComplete(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
@@ -1355,6 +1743,17 @@ fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner
 
     const reasoning = try readAiCompleteReasoning(L, idx);
 
+    var callbacks_ref: c_int = c.LUA_NOREF;
+    _ = c.lua_getfield(L, idx, "on");
+    const on_type = c.lua_type(L, -1);
+    if (on_type == c.LUA_TFUNCTION or on_type == c.LUA_TTABLE) {
+        callbacks_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+    } else {
+        c.lua_pop(L, 1);
+        if (on_type != c.LUA_TNIL) return error.InvalidRequest;
+    }
+    errdefer if (callbacks_ref != c.LUA_NOREF) c.luaL_unref(L, c.LUA_REGISTRYINDEX, callbacks_ref);
+
     var max_tokens: ?u64 = null;
     _ = c.lua_getfield(L, idx, "max_tokens");
     if (c.lua_type(L, -1) == c.LUA_TNUMBER) {
@@ -1363,7 +1762,7 @@ fn parseAiCompleteRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner
     }
     c.lua_pop(L, 1);
 
-    return .{ .prompt = prompt, .system_prompt = system_prompt, .max_tokens = max_tokens, .model = model, .reasoning = reasoning };
+    return .{ .prompt = prompt, .system_prompt = system_prompt, .max_tokens = max_tokens, .model = model, .reasoning = reasoning, .stream_events = callbacks_ref != c.LUA_NOREF, .callbacks_ref = callbacks_ref, .source_L = L };
 }
 
 fn readAiCompleteReasoning(L: *c.lua_State, table_idx: c_int) !?agent_protocol.ThinkingLevel {
@@ -1581,6 +1980,55 @@ fn ctxAbort(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn ctxSendUserMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    const runner = runnerFromUpvalue(L);
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "ctx.send_user_message: expected text string");
+
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, 1, &len) orelse return c.luaL_error(L, "ctx.send_user_message: expected text string");
+    const text = ptr[0..len];
+
+    var opts: runner_mod.SendUserMessageOptions = .{};
+    if (c.lua_type(L, 2) == c.LUA_TTABLE) {
+        _ = c.lua_getfield(L, 2, "target");
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) == c.LUA_TSTRING) {
+            var target_len: usize = 0;
+            const target_ptr = c.lua_tolstring(L, -1, &target_len) orelse return c.luaL_error(L, "ctx.send_user_message: expected target string");
+            const target = target_ptr[0..target_len];
+            opts.target = if (std.mem.eql(u8, target, "auto"))
+                .auto
+            else if (std.mem.eql(u8, target, "prompt"))
+                .prompt
+            else if (std.mem.eql(u8, target, "steering"))
+                .steering
+            else if (std.mem.eql(u8, target, "follow_up") or std.mem.eql(u8, target, "follow-up"))
+                .follow_up
+            else
+                return c.luaL_error(L, "ctx.send_user_message: unknown target");
+        }
+    }
+
+    const actions = switch (runner.runtime) {
+        .bound => |bound| bound.command_actions orelse return c.luaL_error(L, "ctx.send_user_message: unavailable in this host"),
+        .stub => return c.luaL_error(L, "ctx.send_user_message: unavailable before runtime bind"),
+    };
+
+    const result = actions.send_user_message(actions.ctx, text, opts) catch {
+        return c.luaL_error(L, "ctx.send_user_message: failed to enqueue message");
+    };
+
+    c.lua_createtable(L, 0, 1);
+    const status = switch (result) {
+        .submitted => "submitted",
+        .queued => "queued",
+    };
+    _ = c.lua_pushlstring(L, status.ptr, status.len);
+    c.lua_setfield(L, -2, "status");
+    return 1;
+}
+
 fn ctxHasPendingMessages(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
@@ -1711,6 +2159,24 @@ test "extension ui parses text node spans" {
     try std.testing.expectEqual(extension_ui.Tone.accent, node.text.spans.?[0].style.?.tone);
     try std.testing.expectEqualStrings("https://span.test", node.text.spans.?[0].link.?);
     try std.testing.expectEqual(extension_ui.Tone.success, node.text.spans.?[1].style.?.tone);
+}
+
+test "extension ui parses input node" {
+    var lua = try lua_runtime.LuaState.init(std.testing.allocator);
+    defer lua.deinit();
+    try lua.doString("return { type = 'input', id = 'filter', value = 'zi', placeholder = 'Filter…', on_change = 'filter.changed', on_submit = 'filter.submit', style = { tone = 'accent' } }", "test_input_node");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const node = try readNode(arena.allocator(), lua.L, -1);
+
+    try std.testing.expect(node == .input);
+    try std.testing.expectEqualStrings("filter", node.input.id);
+    try std.testing.expectEqualStrings("zi", node.input.value);
+    try std.testing.expectEqualStrings("Filter…", node.input.placeholder.?);
+    try std.testing.expectEqualStrings("filter.changed", node.input.on_change.?);
+    try std.testing.expectEqualStrings("filter.submit", node.input.on_submit.?);
+    try std.testing.expectEqual(extension_ui.Tone.accent, node.input.style.tone);
 }
 
 test "extension ui parses style colors and attributes" {

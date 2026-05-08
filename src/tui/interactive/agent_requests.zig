@@ -1,5 +1,6 @@
 const request_mod = @import("../../coding_agent/request.zig");
 const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
+const extension_runner_mod = @import("../../coding_agent/extensions/runner.zig");
 
 pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExtensionAsyncFromRunner: anytype) bool {
     var buf: [16]AgentRequest = undefined;
@@ -12,6 +13,7 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
         var i: usize = 0;
         while (i < n) : (i += 1) {
             var req = &buf[i];
+            bindExtensionCommandActions(self);
             switch (req.*) {
                 .prompt => |p| {
                     prompt_processed = true;
@@ -120,6 +122,14 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                     };
                     oauth.response.finish(result);
                 },
+                .extension_async_event => |async_event| {
+                    idle_processed = true;
+                    self.runtime_host.deliverExtensionAsyncEvent(async_event.id, async_event.event) catch |err| {
+                        const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
+                        _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
+                    };
+                    req.* = .{ .refresh_status_snapshot = {} };
+                },
                 .extension_async_result => |async_result| {
                     idle_processed = true;
                     self.runtime_host.deliverExtensionAsyncResult(async_result.id, async_result.result) catch |err| {
@@ -150,11 +160,86 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
             req.deinit(self.msg_allocator);
         }
 
+        var flushed_deferred_prompt = false;
         if (idle_processed) {
+            flushed_deferred_prompt = flushDeferredUserPrompts(self);
             self.publishPendingExtensionUi();
         }
-        if (idle_processed and !prompt_processed) {
+        if (idle_processed and !prompt_processed and !flushed_deferred_prompt) {
             _ = self.publishLifecycleUiEvent(.{ .request_worker_finished = {} });
         }
+    }
+}
+
+fn bindExtensionCommandActions(self: anytype) void {
+    const runner = self.runtime_host.currentSession().extensionRunner() orelse return;
+    self.extension_command_actions = .{
+        .ctx = @ptrCast(self),
+        .send_user_message = &sendUserMessageFromExtension,
+    };
+    runner.setCommandActions(&self.extension_command_actions);
+}
+
+fn flushDeferredUserPrompts(self: anytype) bool {
+    if (self.extension_deferred_user_prompts.items.len == 0) return false;
+    if (self.runtime_host.currentSession().extensionRunner()) |runner| {
+        if (runner.hasPendingAsync()) return false;
+    }
+
+    var sent_any = false;
+    while (self.extension_deferred_user_prompts.items.len > 0) {
+        const text = self.extension_deferred_user_prompts.items[0];
+        switch (self.request_queue.trySend(.{ .prompt = .{ .content = .{ .text = text } } })) {
+            .ok => {
+                sent_any = true;
+                _ = self.extension_deferred_user_prompts.orderedRemove(0);
+                continue;
+            },
+            .dropped => unreachable,
+            .full => return sent_any,
+            .closed => {
+                self.msg_allocator.free(text);
+                _ = self.extension_deferred_user_prompts.orderedRemove(0);
+                continue;
+            },
+            .oom => return sent_any,
+        }
+    }
+    return sent_any;
+}
+
+fn sendUserMessageFromExtension(
+    ctx: *anyopaque,
+    text: []const u8,
+    opts: extension_runner_mod.SendUserMessageOptions,
+) anyerror!extension_runner_mod.SendUserMessageResult {
+    const self: *@import("../interactive.zig").Interactive = @ptrCast(@alignCast(ctx));
+    const streaming = self.runtime_host.currentSession().agent.isStreaming();
+    const target = switch (opts.target) {
+        .auto => if (streaming) extension_runner_mod.UserMessageTarget.steering else .prompt,
+        else => opts.target,
+    };
+
+    switch (target) {
+        .auto => unreachable,
+        .steering, .follow_up => {
+            const queue_kind: @import("../../coding_agent/runtime_host.zig").QueueKind = switch (target) {
+                .steering => .steering,
+                .follow_up => .follow_up,
+                else => unreachable,
+            };
+            return switch (self.runtime_host.enqueueQueuedText(queue_kind, text)) {
+                .ok => .queued,
+                .closed => error.AgentUnavailable,
+                .oom => error.OutOfMemory,
+            };
+        },
+        .prompt => {
+            if (streaming) return error.AgentBusy;
+            const text_copy = try self.msg_allocator.dupe(u8, text);
+            errdefer self.msg_allocator.free(text_copy);
+            try self.extension_deferred_user_prompts.append(self.msg_allocator, text_copy);
+            return .submitted;
+        },
     }
 }

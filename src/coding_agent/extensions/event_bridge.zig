@@ -29,6 +29,7 @@ const std = @import("std");
 const agent_protocol = @import("../../agent/types.zig");
 const ai_protocol = @import("../../ai/protocol.zig");
 const abort_signal_mod = @import("../../zio/root.zig").abort;
+const json_util = @import("../../ai/json_util.zig");
 const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
@@ -51,6 +52,20 @@ pub const BeforeAgentStartOptions = struct {
     selected_tools: []const []const u8,
     skills: []const resource_types.Skill,
     append_system_prompt: []const []const u8,
+};
+
+pub const BeforeAgentStartResult = struct {
+    system_prompt: []const u8,
+    messages: []agent_protocol.AgentMessage = &.{},
+
+    pub fn deinit(self: *BeforeAgentStartResult, allocator: std.mem.Allocator) void {
+        if (self.system_prompt.len > 0) allocator.free(self.system_prompt);
+        if (self.messages.len > 0) {
+            const message_memory = @import("../../agent/message_memory.zig");
+            message_memory.freeMessages(allocator, self.messages);
+        }
+        self.* = .{ .system_prompt = "" };
+    }
 };
 
 /// Adapter matching `agent_protocol.AgentEventSink`. Pass this and
@@ -450,12 +465,19 @@ pub fn dispatchBeforeAgentStart(
     system_prompt: []const u8,
     options: BeforeAgentStartOptions,
     allocator: std.mem.Allocator,
-) ![]const u8 {
+) !BeforeAgentStartResult {
     const state = runner.lua_state orelse return error.NoState;
     runner.assertOnLuaThread();
 
     const handlers = runner.event_registry.handlers(.before_agent_start);
-    if (handlers.len == 0) return try allocator.dupe(u8, system_prompt);
+    if (handlers.len == 0) return .{ .system_prompt = try allocator.dupe(u8, system_prompt) };
+
+    var messages = std.ArrayList(agent_protocol.AgentMessage).empty;
+    errdefer {
+        const message_memory = @import("../../agent/message_memory.zig");
+        for (messages.items) |*message| message_memory.freeMessage(allocator, message);
+        messages.deinit(allocator);
+    }
 
     try pushBeforeAgentStartPayload(state.L, system_prompt, options);
     defer c.lua_pop(state.L, 1);
@@ -479,6 +501,7 @@ pub fn dispatchBeforeAgentStart(
                     defer allocator.free(prompt);
                     setPayloadSystemPrompt(state.L, -1, prompt);
                 }
+                try appendBeforeAgentStartMessages(co.L, top_idx, allocator, &messages);
             }
         }
 
@@ -488,7 +511,10 @@ pub fn dispatchBeforeAgentStart(
         }
     }
 
-    return try readPayloadSystemPrompt(state.L, -1, allocator) orelse try allocator.dupe(u8, system_prompt);
+    return .{
+        .system_prompt = try readPayloadSystemPrompt(state.L, -1, allocator) orelse try allocator.dupe(u8, system_prompt),
+        .messages = try messages.toOwnedSlice(allocator),
+    };
 }
 
 pub fn dispatchInput(
@@ -848,7 +874,7 @@ fn beforeToolCallImpl(
         return .{ .block = true, .reason = cancel.reason, .args = null };
     }
 
-    _ = c.lua_getfield(state.L, -1, "args");
+    _ = c.lua_getfield(state.L, -1, "input");
     defer c.lua_pop(state.L, 1);
     var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
     const new_args = lua_runtime.luaValueToJsonLimited(state.L, -1, hook_alloc, &budget) catch |err| {
@@ -893,7 +919,7 @@ fn afterToolCallImpl(
 
     runner.assertOnLuaThread();
 
-    try pushToolResultPayload(state.L, ctx_arg.tool_call, ctx_arg.result);
+    try pushToolResultPayload(state.L, ctx_arg.tool_call, ctx_arg.args, ctx_arg.result);
     defer c.lua_pop(state.L, 1);
 
     const hook_alloc = runner.hookAllocator();
@@ -904,7 +930,7 @@ fn afterToolCallImpl(
 
     var result: agent_protocol.AfterToolCallResult = .{};
 
-    if (obj.get("is_error")) |v| switch (v) {
+    if (obj.get("isError")) |v| switch (v) {
         .bool => |b| result.is_error = b,
         else => {},
     };
@@ -915,6 +941,10 @@ fn afterToolCallImpl(
         } else |err| {
             log.warn("afterToolCall: invalid content array: {s}", .{@errorName(err)});
         }
+    }
+
+    if (obj.get("details")) |v| {
+        if (v != .null) result.details = json_util.cloneJsonValue(hook_alloc, v) catch null;
     }
 
     return result;
@@ -951,6 +981,65 @@ fn readOptionalStringFieldOwned(L: *c.lua_State, idx: c_int, field: [:0]const u8
     var len: usize = 0;
     const ptr = c.lua_tolstring(L, -1, &len) orelse return null;
     return try allocator.dupe(u8, ptr[0..len]);
+}
+
+fn appendBeforeAgentStartMessages(
+    L: *c.lua_State,
+    idx: c_int,
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(agent_protocol.AgentMessage),
+) !void {
+    const abs_idx = c.lua_absindex(L, idx);
+
+    _ = c.lua_getfield(L, abs_idx, "message");
+    if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+        try messages.append(allocator, try readCustomAgentMessage(L, -1, allocator));
+    }
+    c.lua_pop(L, 1);
+
+    _ = c.lua_getfield(L, abs_idx, "messages");
+    if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+        const messages_idx = c.lua_absindex(L, -1);
+        const len = c.lua_rawlen(L, messages_idx);
+        var i: usize = 1;
+        while (i <= len) : (i += 1) {
+            _ = c.lua_rawgeti(L, messages_idx, @intCast(i));
+            if (c.lua_type(L, -1) == c.LUA_TTABLE) {
+                try messages.append(allocator, try readCustomAgentMessage(L, -1, allocator));
+            }
+            c.lua_pop(L, 1);
+        }
+    }
+    c.lua_pop(L, 1);
+}
+
+fn readCustomAgentMessage(L: *c.lua_State, idx: c_int, allocator: std.mem.Allocator) !agent_protocol.AgentMessage {
+    const abs_idx = c.lua_absindex(L, idx);
+    const custom_type = try readOptionalStringFieldOwned(L, abs_idx, "customType", allocator) orelse return error.InvalidUtf8;
+    errdefer allocator.free(custom_type);
+    const content = try readOptionalStringFieldOwned(L, abs_idx, "content", allocator) orelse return error.InvalidUtf8;
+    errdefer allocator.free(content);
+
+    _ = c.lua_getfield(L, abs_idx, "display");
+    const display = c.lua_toboolean(L, -1) != 0;
+    c.lua_pop(L, 1);
+
+    var details: ?std.json.Value = null;
+    _ = c.lua_getfield(L, abs_idx, "details");
+    if (c.lua_type(L, -1) != c.LUA_TNIL) {
+        var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
+        details = try lua_runtime.luaValueToJsonLimited(L, -1, allocator, &budget);
+    }
+    c.lua_pop(L, 1);
+    errdefer if (details) |value| json_util.freeJsonValue(allocator, value);
+
+    return .{ .custom = .{
+        .custom_type = custom_type,
+        .content = .{ .text = content },
+        .display = display,
+        .details = details,
+        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+    } };
 }
 
 fn readPayloadSystemPrompt(L: *c.lua_State, idx: c_int, allocator: std.mem.Allocator) !?[]const u8 {
@@ -1024,7 +1113,7 @@ fn pushInputPayload(L: *c.lua_State, text: []const u8, queued_kind: ?[]const u8)
     c.lua_setfield(L, -2, "queue_kind");
 }
 
-/// Push `{ tool_call = {id, name}, tool_name, args }` onto the stack.
+/// Push pi-mono-shaped `{ toolCall = {id, name}, toolName, input }` onto the stack.
 fn pushToolCallPayload(
     L: *c.lua_State,
     tool_call: ai_protocol.ToolCall,
@@ -1037,32 +1126,36 @@ fn pushToolCallPayload(
     c.lua_setfield(L, -2, "id");
     _ = c.lua_pushlstring(L, tool_call.name.ptr, tool_call.name.len);
     c.lua_setfield(L, -2, "name");
-    c.lua_setfield(L, -2, "tool_call");
+    c.lua_setfield(L, -2, "toolCall");
 
     _ = c.lua_pushlstring(L, tool_call.name.ptr, tool_call.name.len);
-    c.lua_setfield(L, -2, "tool_name");
+    c.lua_setfield(L, -2, "toolName");
 
     try lua_runtime.pushJsonValue(L, args);
-    c.lua_setfield(L, -2, "args");
+    c.lua_setfield(L, -2, "input");
 }
 
-/// Push `{ tool_call = {id, name}, tool_name, content = [...], is_error }`.
+/// Push pi-mono-shaped `{ toolCall = {id, name}, toolName, input, content = [...], details, isError }`.
 fn pushToolResultPayload(
     L: *c.lua_State,
     tool_call: ai_protocol.ToolCall,
+    args: std.json.Value,
     result: agent_protocol.AgentToolResult,
 ) lua_runtime.ConvertError!void {
-    c.lua_createtable(L, 0, 4);
+    c.lua_createtable(L, 0, 6);
 
     c.lua_createtable(L, 0, 2);
     _ = c.lua_pushlstring(L, tool_call.id.ptr, tool_call.id.len);
     c.lua_setfield(L, -2, "id");
     _ = c.lua_pushlstring(L, tool_call.name.ptr, tool_call.name.len);
     c.lua_setfield(L, -2, "name");
-    c.lua_setfield(L, -2, "tool_call");
+    c.lua_setfield(L, -2, "toolCall");
 
     _ = c.lua_pushlstring(L, tool_call.name.ptr, tool_call.name.len);
-    c.lua_setfield(L, -2, "tool_name");
+    c.lua_setfield(L, -2, "toolName");
+
+    try lua_runtime.pushJsonValue(L, args);
+    c.lua_setfield(L, -2, "input");
 
     c.lua_createtable(L, @intCast(result.content.len), 0);
     for (result.content, 0..) |block, i| {
@@ -1088,8 +1181,15 @@ fn pushToolResultPayload(
     }
     c.lua_setfield(L, -2, "content");
 
+    if (result.details != .null) {
+        try lua_runtime.pushJsonValue(L, result.details);
+    } else {
+        c.lua_pushnil(L);
+    }
+    c.lua_setfield(L, -2, "details");
+
     c.lua_pushboolean(L, if (result.is_error) 1 else 0);
-    c.lua_setfield(L, -2, "is_error");
+    c.lua_setfield(L, -2, "isError");
 }
 
 /// Parse a JSON array of `{type, text}` (text only in v1) into
@@ -1222,9 +1322,9 @@ test "before_agent_start transforms system prompt and exposes options" {
 
     const tool_names = [_][]const u8{"bash"};
     const skill_list = [_]resource_types.Skill{.{ .name = "zig", .description = "zig skill", .file_path = "zig.md", .base_dir = ".", .source_info = .{ .path = "zig.md", .source = "test" } }};
-    const result = try dispatchBeforeAgentStart(runner, "base", .{ .cwd = ".", .selected_tools = &tool_names, .skills = &skill_list, .append_system_prompt = &.{} }, testing.allocator);
-    defer testing.allocator.free(result);
-    try testing.expectEqualStrings("base bash zig marker", result);
+    var result = try dispatchBeforeAgentStart(runner, "base", .{ .cwd = ".", .selected_tools = &tool_names, .skills = &skill_list, .append_system_prompt = &.{} }, testing.allocator);
+    defer result.deinit(testing.allocator);
+    try testing.expectEqualStrings("base bash zig marker", result.system_prompt);
 }
 
 test "input middleware transforms text before agent submission" {
@@ -1274,7 +1374,7 @@ test "beforeToolCall blocks tool execution when handler returns block=true" {
 
     try state.doString(
         \\zi.on("tool_call", function(event, ctx)
-        \\  if event.tool_name == "Bash" and event.args.command == "rm -rf /" then
+        \\  if event.toolName == "Bash" and event.input.command == "rm -rf /" then
         \\    return { block = true, reason = "nope" }
         \\  end
         \\end)
@@ -1308,7 +1408,7 @@ test "beforeToolCall returns mutated args when handler rewrites them" {
 
     try state.doString(
         \\zi.on("tool_call", function(event, ctx)
-        \\  event.args.command = "echo safe"
+        \\  event.input.command = "echo safe"
         \\end)
     , "subscribe");
 

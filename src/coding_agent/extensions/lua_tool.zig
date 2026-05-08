@@ -913,6 +913,11 @@ const TestStateStore = struct {
     note_title: ?[]const u8 = null,
     note_body: ?[]const u8 = null,
     note_source_entry_id: ?[]const u8 = null,
+    artifact_owner_id: ?[]const u8 = null,
+    artifact_kind: ?[]const u8 = null,
+    artifact_key: ?[]const u8 = null,
+    artifact_title: ?[]const u8 = null,
+    artifact_data: ?std.json.Value = null,
     label_target_entry_id: ?[]const u8 = null,
     label_value: ?[]const u8 = null,
     label_history: std.ArrayListUnmanaged(TestLabelEntry) = .empty,
@@ -930,6 +935,11 @@ const TestStateStore = struct {
         if (self.note_title) |value| self.allocator.free(value);
         if (self.note_body) |value| self.allocator.free(value);
         if (self.note_source_entry_id) |value| self.allocator.free(value);
+        if (self.artifact_owner_id) |value| self.allocator.free(value);
+        if (self.artifact_kind) |value| self.allocator.free(value);
+        if (self.artifact_key) |value| self.allocator.free(value);
+        if (self.artifact_title) |value| self.allocator.free(value);
+        if (self.artifact_data) |value| ai.json_util.freeJsonValue(self.allocator, value);
         if (self.label_target_entry_id) |value| self.allocator.free(value);
         if (self.label_value) |value| self.allocator.free(value);
         for (self.label_history.items) |label_item| {
@@ -941,6 +951,11 @@ const TestStateStore = struct {
         self.note_title = null;
         self.note_body = null;
         self.note_source_entry_id = null;
+        self.artifact_owner_id = null;
+        self.artifact_kind = null;
+        self.artifact_key = null;
+        self.artifact_title = null;
+        self.artifact_data = null;
         self.label_target_entry_id = null;
         self.label_value = null;
     }
@@ -1010,6 +1025,43 @@ const TestStateStore = struct {
         if (self.note_title) |title| obj.put(allocator, allocator.dupe(u8, "title") catch return null, .{ .string = allocator.dupe(u8, title) catch return null }) catch return null;
         if (self.note_source_entry_id) |source| obj.put(allocator, allocator.dupe(u8, "source_entry_id") catch return null, .{ .string = allocator.dupe(u8, source) catch return null }) catch return null;
         obj.put(allocator, allocator.dupe(u8, "body") catch return null, .{ .string = allocator.dupe(u8, self.note_body orelse "") catch return null }) catch return null;
+        arr.append(.{ .object = obj }) catch return null;
+        return .{ .array = arr };
+    }
+
+    fn appendArtifact(session: *anyopaque, owner_id: []const u8, kind: []const u8, key: ?[]const u8, title: ?[]const u8, data: std.json.Value) !void {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        if (self.artifact_owner_id) |value| self.allocator.free(value);
+        if (self.artifact_kind) |value| self.allocator.free(value);
+        if (self.artifact_key) |value| self.allocator.free(value);
+        if (self.artifact_title) |value| self.allocator.free(value);
+        if (self.artifact_data) |value| ai.json_util.freeJsonValue(self.allocator, value);
+        self.artifact_owner_id = try self.allocator.dupe(u8, owner_id);
+        self.artifact_kind = try self.allocator.dupe(u8, kind);
+        self.artifact_key = if (key) |value| try self.allocator.dupe(u8, value) else null;
+        self.artifact_title = if (title) |value| try self.allocator.dupe(u8, value) else null;
+        self.artifact_data = try ai.json_util.cloneJsonValue(self.allocator, data);
+    }
+
+    fn artifacts(session: *anyopaque, allocator: std.mem.Allocator, owner_id: []const u8, kind: ?[]const u8, key: ?[]const u8, limit: usize) ?std.json.Value {
+        const self: *TestStateStore = @ptrCast(@alignCast(session));
+        _ = limit;
+        var arr = std.json.Array.init(allocator);
+        const artifact_owner = self.artifact_owner_id orelse return .{ .array = arr };
+        if (!std.mem.eql(u8, owner_id, artifact_owner)) return .{ .array = arr };
+        const artifact_kind = self.artifact_kind orelse return .{ .array = arr };
+        if (kind) |wanted| if (!std.mem.eql(u8, wanted, artifact_kind)) return .{ .array = arr };
+        if (key) |wanted| {
+            const artifact_key = self.artifact_key orelse return .{ .array = arr };
+            if (!std.mem.eql(u8, wanted, artifact_key)) return .{ .array = arr };
+        }
+        var obj: std.json.ObjectMap = .{};
+        obj.put(allocator, allocator.dupe(u8, "entry_id") catch return null, .{ .string = allocator.dupe(u8, "artifact-1") catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "owner_id") catch return null, .{ .string = allocator.dupe(u8, artifact_owner) catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "kind") catch return null, .{ .string = allocator.dupe(u8, artifact_kind) catch return null }) catch return null;
+        if (self.artifact_key) |value| obj.put(allocator, allocator.dupe(u8, "key") catch return null, .{ .string = allocator.dupe(u8, value) catch return null }) catch return null;
+        if (self.artifact_title) |value| obj.put(allocator, allocator.dupe(u8, "title") catch return null, .{ .string = allocator.dupe(u8, value) catch return null }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "data") catch return null, if (self.artifact_data) |value| ai.json_util.cloneJsonValue(allocator, value) catch return null else .null) catch return null;
         arr.append(.{ .object = obj }) catch return null;
         return .{ .array = arr };
     }
@@ -1123,6 +1175,43 @@ const TestStateStore = struct {
         return .{ .array = arr };
     }
 
+    fn sessionContext(session: *anyopaque, allocator: std.mem.Allocator, max_messages: usize, include_tools: bool) ?std.json.Value {
+        _ = session;
+        var obj: std.json.ObjectMap = .{};
+        obj.put(allocator, allocator.dupe(u8, "system_prompt") catch return null, .{ .string = allocator.dupe(u8, "test system") catch return null }) catch return null;
+        var messages = std.json.Array.init(allocator);
+        if (max_messages != 1) {
+            var user_obj: std.json.ObjectMap = .{};
+            user_obj.put(allocator, allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "user") catch return null }) catch return null;
+            user_obj.put(allocator, allocator.dupe(u8, "content") catch return null, .{ .string = allocator.dupe(u8, "hello") catch return null }) catch return null;
+            messages.append(.{ .object = user_obj }) catch return null;
+        }
+        var assistant_obj: std.json.ObjectMap = .{};
+        assistant_obj.put(allocator, allocator.dupe(u8, "role") catch return null, .{ .string = allocator.dupe(u8, "assistant") catch return null }) catch return null;
+        var content = std.json.Array.init(allocator);
+        var text_obj: std.json.ObjectMap = .{};
+        text_obj.put(allocator, allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "text") catch return null }) catch return null;
+        text_obj.put(allocator, allocator.dupe(u8, "text") catch return null, .{ .string = allocator.dupe(u8, "hi") catch return null }) catch return null;
+        content.append(.{ .object = text_obj }) catch return null;
+        if (include_tools) {
+            var call_obj: std.json.ObjectMap = .{};
+            call_obj.put(allocator, allocator.dupe(u8, "type") catch return null, .{ .string = allocator.dupe(u8, "tool_call") catch return null }) catch return null;
+            call_obj.put(allocator, allocator.dupe(u8, "name") catch return null, .{ .string = allocator.dupe(u8, "todo") catch return null }) catch return null;
+            content.append(.{ .object = call_obj }) catch return null;
+        }
+        assistant_obj.put(allocator, allocator.dupe(u8, "content") catch return null, .{ .array = content }) catch return null;
+        messages.append(.{ .object = assistant_obj }) catch return null;
+        obj.put(allocator, allocator.dupe(u8, "messages") catch return null, .{ .array = messages }) catch return null;
+        if (include_tools) {
+            var tools = std.json.Array.init(allocator);
+            var tool: std.json.ObjectMap = .{};
+            tool.put(allocator, allocator.dupe(u8, "name") catch return null, .{ .string = allocator.dupe(u8, "todo") catch return null }) catch return null;
+            tools.append(.{ .object = tool }) catch return null;
+            obj.put(allocator, allocator.dupe(u8, "tools") catch return null, .{ .array = tools }) catch return null;
+        }
+        return .{ .object = obj };
+    }
+
     fn publishRender(session: *anyopaque, spec: extension_ui.RenderSpec) !void {
         const self: *TestStateStore = @ptrCast(@alignCast(session));
         var cloned = try extension_ui.RenderSpec.clone(self.allocator, spec);
@@ -1182,8 +1271,11 @@ fn bindRuntimeFields(store: *TestStateStore) runner_mod.ExtensionRuntime.Bound {
         .session_name_set = &TestStateStore.setSessionName,
         .session_tool_results_get = &TestStateStore.sessionToolResults,
         .session_messages_get = &TestStateStore.sessionMessages,
+        .session_context_get = &TestStateStore.sessionContext,
         .session_note_append = &TestStateStore.appendNote,
         .session_notes_get = &TestStateStore.notes,
+        .session_artifact_append = &TestStateStore.appendArtifact,
+        .session_artifacts_get = &TestStateStore.artifacts,
         .session_label_set = &TestStateStore.setLabel,
         .session_labels_get = &TestStateStore.labels,
         .session_entry_get = &TestStateStore.entry,
@@ -1251,6 +1343,17 @@ test "extension command context exposes read-only session ui_publication" {
         \\    assert(notes[1].body == "remember")
         \\    assert(notes[1].source_entry_id == "entry-2")
         \\    assert(#ctx.session.notes({ source_entry_id = "missing" }) == 0)
+        \\    assert(ctx.session.append_artifact({ kind = "todo_state", key = "main", title = "Todo state", data = { next_id = 3, items = { "a", "b" } } }) == true)
+        \\    local artifacts = ctx.session.artifacts({ kind = "todo_state", key = "main" })
+        \\    assert(#artifacts == 1)
+        \\    assert(artifacts[1].entry_id == "artifact-1")
+        \\    assert(artifacts[1].owner_id == "state-123")
+        \\    assert(artifacts[1].kind == "todo_state")
+        \\    assert(artifacts[1].key == "main")
+        \\    assert(artifacts[1].title == "Todo state")
+        \\    assert(artifacts[1].data.next_id == 3)
+        \\    assert(artifacts[1].data.items[2] == "b")
+        \\    assert(#ctx.session.artifacts({ key = "missing" }) == 0)
         \\    assert(ctx.session.label("entry-2", "important") == true)
         \\    local labels = ctx.session.labels({ target_entry_id = "entry-2" })
         \\    assert(#labels == 1)

@@ -221,6 +221,8 @@ pub const Interactive = struct {
     hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
     logs_overlay: ScrollTextOverlay,
     extension_keybindings: std.ArrayListUnmanaged(ui_event_mod.ExtensionKeybindingEntry) = .empty,
+    extension_command_actions: extension_runner_mod.ExtensionCommandActions = undefined,
+    extension_deferred_user_prompts: std.ArrayListUnmanaged([]u8) = .empty,
 
     resume_picker_flow: ?ResumePickerFlow = null,
     resume_picker_generation: u64 = 0,
@@ -379,6 +381,8 @@ pub const Interactive = struct {
         if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
         self.clearExtensionKeybindings();
         self.extension_keybindings.deinit(self.allocator);
+        for (self.extension_deferred_user_prompts.items) |prompt| self.msg_allocator.free(prompt);
+        self.extension_deferred_user_prompts.deinit(self.msg_allocator);
         self.command_registry.deinit();
         self.runtime_host.deinit();
         if (self.last_published_status_snapshot) |*snapshot| {
@@ -439,7 +443,7 @@ pub const Interactive = struct {
         try self.startAgentThread();
         try self.startSessionIndexWorker();
         if (self.ai_complete_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &runtime_loop.submitExtensionAsyncResult });
+            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &runtime_loop.submitExtensionAsyncResult, .submit_event = &runtime_loop.submitExtensionAiCompleteEvent });
             try worker.start();
         }
         if (self.system_worker) |*worker| {

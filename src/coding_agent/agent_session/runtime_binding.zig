@@ -39,8 +39,11 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .session_name_set = &runtimeSessionNameSet,
         .session_tool_results_get = &runtimeSessionToolResultsGet,
         .session_messages_get = &runtimeSessionMessagesGet,
+        .session_context_get = &runtimeSessionContextGet,
         .session_note_append = &runtimeSessionNoteAppend,
         .session_notes_get = &runtimeSessionNotesGet,
+        .session_artifact_append = &runtimeSessionArtifactAppend,
+        .session_artifacts_get = &runtimeSessionArtifactsGet,
         .session_label_set = &runtimeSessionLabelSet,
         .session_labels_get = &runtimeSessionLabelsGet,
         .session_entry_get = &runtimeSessionEntryGet,
@@ -142,12 +145,24 @@ fn runtimeSessionMessagesGet(session_ptr: *anyopaque, allocator: std.mem.Allocat
     return runtime_session.messagesGet(session(session_ptr), allocator, limit, include_tools);
 }
 
+fn runtimeSessionContextGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, max_messages: usize, include_tools: bool) ?std.json.Value {
+    return runtime_session.contextGet(session(session_ptr), allocator, max_messages, include_tools);
+}
+
 fn runtimeSessionNoteAppend(session_ptr: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8, source_entry_id: ?[]const u8) !void {
     try runtime_session.noteAppend(session(session_ptr), kind, title, body, source_entry_id);
 }
 
 fn runtimeSessionNotesGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, source_entry_id: ?[]const u8, limit: usize) ?std.json.Value {
     return runtime_session.notesGet(session(session_ptr), allocator, kind, source_entry_id, limit);
+}
+
+fn runtimeSessionArtifactAppend(session_ptr: *anyopaque, owner_id: []const u8, kind: []const u8, key: ?[]const u8, title: ?[]const u8, data: std.json.Value) !void {
+    try runtime_session.artifactAppend(session(session_ptr), owner_id, kind, key, title, data);
+}
+
+fn runtimeSessionArtifactsGet(session_ptr: *anyopaque, allocator: std.mem.Allocator, owner_id: []const u8, kind: ?[]const u8, key: ?[]const u8, limit: usize) ?std.json.Value {
+    return runtime_session.artifactsGet(session(session_ptr), allocator, owner_id, kind, key, limit);
 }
 
 fn runtimeSessionLabelSet(session_ptr: *anyopaque, target_entry_id: []const u8, label: ?[]const u8) !void {

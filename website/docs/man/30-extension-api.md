@@ -151,9 +151,9 @@ Built-ins stay TUI-local when they need immediate UI/session behavior. Extension
 
 ### UI focus
 
-`ctx.ui.render({ focus = true, target = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. Overlays without `focus = true`, including toasts and status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
+`ctx.ui.render({ focus = true, target = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. `input` nodes inside a focused overlay are edited by the TUI itself; each edit emits a structured `ui` event with `type = "change"`, `node`, `value`, and optional `action`, and Enter emits `type = "submit"`. Extensions should update their own state from those events and re-render the input value. Overlays without `focus = true`, including toasts and status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
 
-UI render trees support `view`, `text`, `chip`, `progress`, `separator`, and `surface` nodes. Visual frame chrome is composed on `view.style.chrome`; top-level render specs describe placement/focus only. The full text-node API, including wrapping, spans, ANSI/Markdown formats, links, and selection hints, is documented in [Context](context.html#ui-text-nodes). `surface` remains available for framebuffer graphs.
+UI render trees support `view`, `text`, `input`, `chip`, `progress`, `separator`, and `surface` nodes. Visual frame chrome is composed on `view.style.chrome`; top-level render specs describe placement/focus only. The full text-node API, including wrapping, spans, ANSI/Markdown formats, links, and selection hints, is documented in [Context](context.html#ui-text-nodes). `surface` remains available for framebuffer graphs.
 
 ## Providers
 

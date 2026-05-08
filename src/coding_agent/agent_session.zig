@@ -558,8 +558,31 @@ pub const AgentSession = struct {
                 .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             },
         };
-        const prompts = [_]protocol.AgentMessage{user_msg};
-        try self.agent.prompt(&prompts);
+        var before = try self.dispatchBeforeAgentStart();
+        defer before.deinit(self.allocator);
+        const previous_system_prompt = self.agent.systemPrompt();
+        self.agent.replaceRuntimeInputs(before.system_prompt, self.tools);
+        defer self.agent.replaceRuntimeInputs(previous_system_prompt, self.tools);
+
+        var prompts = std.ArrayList(protocol.AgentMessage).empty;
+        defer prompts.deinit(self.allocator);
+        try prompts.append(self.allocator, user_msg);
+        try prompts.appendSlice(self.allocator, before.messages);
+        try self.agent.prompt(prompts.items);
+    }
+
+    fn dispatchBeforeAgentStart(self: *AgentSession) !event_bridge.BeforeAgentStartResult {
+        const runner = self._extension_runner orelse return .{ .system_prompt = try self.allocator.dupe(u8, self._owned_system_prompt) };
+        var tool_names = std.ArrayList([]const u8).empty;
+        defer tool_names.deinit(self.allocator);
+        for (self.tools) |tool| try tool_names.append(self.allocator, tool.name);
+        const prompt_inputs = self.resource_loader.getPromptInputs();
+        return try event_bridge.dispatchBeforeAgentStart(runner, self._owned_system_prompt, .{
+            .cwd = self.resource_loader.cwd,
+            .selected_tools = tool_names.items,
+            .skills = self.resource_loader.getSkills().skills,
+            .append_system_prompt = prompt_inputs.append_system_prompt,
+        }, self.allocator);
     }
 
     /// Continue from loaded session context.
@@ -569,6 +592,17 @@ pub const AgentSession = struct {
     pub fn continueSession(self: *AgentSession) !void {
         self.flushPendingToolProjectionRefresh();
         self.wireSubscription();
+
+        var before = try self.dispatchBeforeAgentStart();
+        defer before.deinit(self.allocator);
+        const previous_system_prompt = self.agent.systemPrompt();
+        self.agent.replaceRuntimeInputs(before.system_prompt, self.tools);
+        defer self.agent.replaceRuntimeInputs(previous_system_prompt, self.tools);
+        if (before.messages.len > 0) {
+            try self.agent.prompt(before.messages);
+            return;
+        }
+
         self.agent.continueTurn() catch |err| switch (err) {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
             else => return err,
@@ -582,6 +616,136 @@ pub const AgentSession = struct {
         request: extension_runner_mod.AiCompleteRequest,
     ) !ai_complete_worker_mod.Request {
         return ai_completion_runtime.buildWorkerRequest(self, allocator, id, request);
+    }
+
+    pub fn buildAiSessionPromptWorkerRequest(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+        id: extension_runner_mod.AsyncOpId,
+        request: extension_runner_mod.AiSessionPromptRequest,
+    ) !ai_complete_worker_mod.Request {
+        const runner = self.extensionRunner() orelse return error.MissingExtensionRunner;
+        const side = runner.getSideAiSession(request.session_id) orelse return error.MissingAiSession;
+        if (side.disposed) return error.MissingAiSession;
+        var prompt_buf = std.ArrayList(u8).empty;
+        defer prompt_buf.deinit(self.allocator);
+        for (side.messages.items) |msg| {
+            const line = try std.fmt.allocPrint(self.allocator, "{s}: {s}\n", .{ @tagName(msg.role), msg.text });
+            defer self.allocator.free(line);
+            try prompt_buf.appendSlice(self.allocator, line);
+        }
+        const tail = try std.fmt.allocPrint(self.allocator, "user: {s}\nassistant:", .{request.prompt});
+        defer self.allocator.free(tail);
+        try prompt_buf.appendSlice(self.allocator, tail);
+        const prompt = try prompt_buf.toOwnedSlice(self.allocator);
+        defer self.allocator.free(prompt);
+        const complete_request = extension_runner_mod.AiCompleteRequest{
+            .prompt = prompt,
+            .system_prompt = side.system_prompt,
+            .max_tokens = side.max_tokens,
+            .model = side.model,
+            .reasoning = side.reasoning,
+            .stream_events = request.callbacks_ref != lua_runtime.c.LUA_NOREF,
+        };
+        return ai_completion_runtime.buildWorkerRequest(self, allocator, id, complete_request);
+    }
+
+    pub fn runAiSessionAgentPrompt(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+        request: extension_runner_mod.AiSessionPromptRequest,
+    ) !extension_runner_mod.AiCompleteResult {
+        const runner = self.extensionRunner() orelse return error.MissingExtensionRunner;
+        const side = runner.getSideAiSession(request.session_id) orelse return error.MissingAiSession;
+        if (side.disposed) return error.MissingAiSession;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const model = if (side.model) |model_ref| self.resolveModelRef(model_ref) orelse return error.ModelUnavailable else self.agent.modelValue();
+        const tools = try self.sideAgentTools(aa, side.tool_allowlist);
+        const messages = try self.sideAgentMessages(aa, side);
+        var side_agent = try Agent.init(allocator, .{
+            .system_prompt = side.system_prompt orelse self.agent.systemPrompt(),
+            .model = model,
+            .tools = tools,
+            .messages = messages,
+            .thinking_level = side.reasoning orelse .off,
+            .io = self._stream_closure.io,
+            .convert_to_llm = .{ .func = &message_conversion.convertToLlm, .ctx = null },
+            .stream_fn = .{ .func = &StreamClosure.streamFn, .ctx = @ptrCast(self._stream_closure) },
+            .session_id = self.session_store.sessionId(),
+        });
+        defer side_agent.deinit();
+
+        const prompt = [_]protocol.AgentMessage{.{ .user = .{
+            .content = .{ .text = request.prompt },
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        } }};
+        try side_agent.prompt(&prompt);
+        if (side_agent.errorMessage()) |msg| return .{ .err = try allocator.dupe(u8, msg) };
+        const assistant = side_agent.latestAssistant() orelse return .{ .err = try allocator.dupe(u8, "side agent finished without an assistant response") };
+        return .{ .completed = .{ .text = try assistantText(allocator, assistant) } };
+    }
+
+    fn sideAgentTools(self: *AgentSession, allocator: std.mem.Allocator, allowlist: []const []const u8) ![]const protocol.AgentTool {
+        if (allowlist.len == 0) return &.{};
+        var out = std.ArrayList(protocol.AgentTool).empty;
+        for (self.tools) |tool| {
+            for (allowlist) |name| {
+                if (std.mem.eql(u8, tool.name, name)) {
+                    try out.append(allocator, tool);
+                    break;
+                }
+            }
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    fn sideAgentMessages(_: *AgentSession, allocator: std.mem.Allocator, side: *const extension_runner_mod.SideAiSession) ![]const protocol.AgentMessage {
+        var out = std.ArrayList(protocol.AgentMessage).empty;
+        for (side.messages.items) |msg| {
+            const timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds();
+            switch (msg.role) {
+                .user, .context => try out.append(allocator, .{ .user = .{ .content = .{ .text = msg.text }, .timestamp = timestamp } }),
+                .assistant => try out.append(allocator, try sideAssistantMessage(allocator, msg.text, timestamp)),
+            }
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    fn sideAssistantMessage(allocator: std.mem.Allocator, text: []const u8, timestamp: i64) !protocol.AgentMessage {
+        const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, 1);
+        content[0] = .{ .text = .{ .text = text } };
+        return .{ .assistant = .{
+            .content = content,
+            .api = .openai_responses,
+            .provider = .{ .custom = "side-session" },
+            .model = "side-session",
+            .usage = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total_tokens = 0,
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+            },
+            .stop_reason = .stop,
+            .timestamp = timestamp,
+        } };
+    }
+
+    fn assistantText(allocator: std.mem.Allocator, assistant: protocol.AssistantMessage) ![]const u8 {
+        var out = std.ArrayList(u8).empty;
+        for (assistant.content) |block| switch (block) {
+            .text => |text| {
+                if (out.items.len > 0) try out.append(allocator, '\n');
+                try out.appendSlice(allocator, text.text);
+            },
+            else => {},
+        };
+        return try out.toOwnedSlice(allocator);
     }
 
     pub fn completeUserText(

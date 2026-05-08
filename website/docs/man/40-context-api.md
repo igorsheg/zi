@@ -54,6 +54,9 @@ Most tools, commands, and events receive `ctx`.
 `ctx.abort()`
 : Request abort on the active run.
 
+`ctx.send_user_message(text, opts?)`
+: Inject a user message into the main chat through the same host paths as typed input. When the session is idle, the default target submits a new prompt after the current extension handler returns. When the session is streaming, the default target queues steering text for the active run. `opts.target` may be `"prompt"`, `"steering"`, `"follow_up"`, or `"auto"` (default). The call returns `{ status = "submitted" }` for an idle prompt enqueue or `{ status = "queued" }` for a run-control queue. This API is intentionally not a session-control shortcut: it does not reload, fork, or replace the live runner.
+
 `ctx.update(partial_result)`
 : Update the current in-flight tool preview. The final tool return remains authoritative.
 
@@ -74,10 +77,56 @@ Most tools, commands, and events receive `ctx`.
 `ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v3 exposes two methods:
 
 `ctx.ui.render(spec)`
-: Publish, update, or remove a retained UI view. `spec.id` is required. `spec.target` is one of `status`, `toast`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`box`, `text`, `chip`, `progress`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
+: Publish, update, or remove a retained UI view. `spec.id` is required. `spec.target` is one of `status`, `toast`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`view`, `text`, `input`, `chip`, `progress`, `separator`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
 
 `ctx.ui.frame(spec)`
 : Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`. `surface` remains the node type for framebuffer graphs and other pixel/cell-frame visuals.
+
+### UI input nodes
+
+Input nodes are first-class fields for focused overlays. Zi owns editing mechanics so extensions do not need to implement terminal cursor/delete behavior; extensions own durable state and should re-render after events.
+
+`{ type = "input", ... }` supports:
+
+`id`
+: Required string. Used as the event `node` id and local input-state key.
+
+`value`
+: Current extension-owned value. Defaults to `""`. Re-render with the updated value after handling a change/submit event.
+
+`placeholder`
+: Optional string shown when `value` is empty.
+
+`on_change`
+: Optional action string delivered on edit events as `{ type = "change", node = id, action = on_change, value = "..." }`.
+
+`on_submit`
+: Optional action string delivered when Enter is pressed as `{ type = "submit", node = id, action = on_submit, value = "..." }`.
+
+`style`
+: Standard node style fields (`tone`, `fg`, `bg`, attributes, sizing).
+
+Example:
+
+```lua
+ctx.ui.render({
+  id = "rename-session",
+  target = { kind = "overlay", width = "50%", anchor = "center", backdrop = "dim" },
+  focus = true,
+  root = { type = "view", style = { chrome = { kind = "frame", title = "Rename" }, padding = 1 }, children = {
+    { type = "input", id = "name", value = state.name or "", placeholder = "Session name", on_change = "rename.change", on_submit = "rename.submit" },
+  } },
+})
+
+zi.on("ui", function(event, ctx)
+  if event.action == "rename.change" then
+    state.name = event.value or ""
+    -- re-render with state.name
+  elseif event.action == "rename.submit" then
+    -- commit state.name and close the overlay
+  end
+end)
+```
 
 ### UI text nodes
 
@@ -176,7 +225,7 @@ There is no synchronous editor text getter.
 
 ## State
 
-Extension-scoped state maps are not part of API v3. Use Lua locals for extension-ephemeral state. Durable extension state should be represented explicitly as session artifacts such as notes or labels.
+Extension-scoped state maps are not part of API v3. Use Lua locals for extension-ephemeral state. Durable extension state should be represented explicitly as session artifacts. Use `ctx.session.append_artifact` for extension-owned JSON state, or notes/labels for human-readable annotations and entry bookmarks.
 
 ## Session
 
@@ -190,7 +239,10 @@ Extension-scoped state maps are not part of API v3. Use Lua locals for extension
 : Set or clear the session name.
 
 `ctx.session.messages({ limit?, include_tools? })`
-: Return recent semantic messages. Default limit is 50, max is 500. Returned messages include durable `entry_id` values.
+: Return recent durable transcript messages. Default limit is 50, max is 500. Returned messages include durable `entry_id` values and are shaped for transcript inspection.
+
+`ctx.session.context({ include_tools?, max_messages? })`
+: Return the active assembled model context as semantic data: `{ system_prompt, messages, tools? }`. Messages are normalized from the current branch with compaction/branch summaries converted the same way zi prepares provider context. `max_messages` limits the returned tail after optional tool filtering (default/max 500). `include_tools = false` omits tool schemas, tool calls, and tool results. The result intentionally avoids provider transport payloads and session-manager internals; use `before_provider_request` when you need to observe the exact transport request.
 
 `ctx.session.tool_results(tool_name)`
 : Return recorded tool results.
@@ -200,6 +252,12 @@ Extension-scoped state maps are not part of API v3. Use Lua locals for extension
 
 `ctx.session.notes({ kind?, source_entry_id?, limit? })`
 : Return notes. Default limit is 50, max is 500.
+
+`ctx.session.append_artifact({ kind?, key?, title?, data })`
+: Append a durable extension-owned artifact on the current branch. `data` must be JSON-compatible and is bounded by the extension JSON conversion limits. Artifacts are stored as inspectable session entries, are not added to model context, advance the session tree like other durable entries, and are scoped to the calling extension owner. Default `kind` is `"artifact"`.
+
+`ctx.session.artifacts({ kind?, key?, limit? })`
+: Return artifacts for the calling extension owner from the current branch, newest limited to the requested tail. Default limit is 50, max is 500. Each item includes `entry_id`, `owner_id`, `kind`, optional `key`/`title`, and `data`.
 
 `ctx.session.label(entry_id, label)`
 : Append a durable label for an entry. Nil or empty label clears it.
@@ -263,6 +321,48 @@ ctx.ai.complete({
 
 `reasoning` may be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or a boolean.
 
+Optional streaming callbacks may be passed as `on = function(event)` or as a table keyed by event type. Callbacks run on the extension Lua thread while `ctx.ai.complete` is waiting for the final result. They must be non-yielding (do not call yieldable APIs such as `ctx.ai.complete`, `zi.system`, or coroutine yield from them).
+
+```lua
+local result = ctx.ai.complete({
+  prompt = "draft release notes",
+  on = {
+    message_start = function(event) end,
+    message_delta = function(event) io.write(event.text or "") end,
+    message_end = function(event) end,
+  },
+})
+```
+
+Stream event tables include `type = "message_start"`, `type = "message_delta", text = "..."`, and `type = "message_end", text = "..."`. Error and backpressure events may be delivered as `type = "error", error = "..."` or `type = "events_dropped", count = n`.
+
+
+`ctx.ai.session(options)`
+: Create an extension-owned side AI session. The session is in-memory, belongs to the current extension runner generation, and is disposed automatically when the extension generation/session shuts down. Use this for persistent side-channel conversations; use `ctx.ai.complete` for one-off completions.
+
+```lua
+local side = ctx.ai.session({
+  model = "provider/model-id",        -- optional; defaults to current model
+  system_prompt = "You are concise",  -- optional
+  reasoning = "low",                  -- optional
+  tools = { "read", "edit" },         -- optional allowlist; enables side-agent tool use
+  context = ctx.session.context({ max_messages = 120 }), -- optional string or context object
+  messages = {
+    { role = "user", text = "initial question" },
+    { role = "assistant", text = "initial answer" },
+  },
+})
+
+local result = side:prompt({
+  prompt = "continue the side conversation",
+  on = function(event) end, -- same streaming callback shape as ctx.ai.complete
+})
+side:abort()   -- marks the side session aborted; provider cancellation is TODO
+side:dispose() -- releases in-memory state early
+```
+
+`side:prompt(...)` returns the same result shape as `ctx.ai.complete` and appends successful user/assistant turns to that side session. Side sessions do not mutate the main transcript. Without `tools`, prompts use the lightweight completion path. With `tools`, zi creates a managed in-process side agent with an in-memory transcript and the requested tool allowlist; nested extension loading remains disabled, and callbacks are still delivered through the parent extension runner.
+
 Results:
 
 ```lua
@@ -314,6 +414,7 @@ Options:
 `stdio`
 : `"capture"` or `"terminal"`. Terminal mode is TUI-only and attaches the child to the user's terminal. Use it for `$EDITOR`, `$PAGER`, `fzf`, `lazygit`, and login flows. Capture-only options are invalid with terminal mode.
 
+
 Results:
 
 ```lua
@@ -321,6 +422,7 @@ Results:
 { status = "error", error = "...", stdout = "", stderr = "" }
 { status = "timeout", error = "timed out after ...ms", stdout = "...partial...", stderr = "...partial..." }
 ```
+
 
 Non-zero exits are `status = "completed"`; inspect `code`.
 

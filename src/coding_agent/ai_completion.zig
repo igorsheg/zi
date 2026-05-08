@@ -3,6 +3,8 @@ const ai = @import("../ai/root.zig");
 
 const log = std.log.scoped(.ai_completion);
 
+pub const StreamEventCallback = *const fn (event: @import("extensions/runner.zig").AiCompleteStreamEvent, ctx: ?*anyopaque) void;
+
 pub const PreparedTextCompletionRequest = struct {
     provider: ai.provider.Provider,
     model: ai.protocol.Model,
@@ -12,6 +14,8 @@ pub const PreparedTextCompletionRequest = struct {
     headers: ?[]const ai.protocol.Header = null,
     max_tokens: ?u64 = null,
     reasoning: ?ai.protocol.ThinkingLevel = null,
+    on_event: ?StreamEventCallback = null,
+    on_event_ctx: ?*anyopaque = null,
 };
 
 pub const TextCompletionResult = union(enum) {
@@ -46,7 +50,7 @@ pub fn runPreparedTextCompletion(
         .messages = &messages,
     };
 
-    var collector = CompletionCollector{ .allocator = result_allocator };
+    var collector = CompletionCollector{ .allocator = result_allocator, .on_event = request.on_event, .on_event_ctx = request.on_event_ctx };
     request.provider.streamSimple(
         stream_allocator,
         request.model,
@@ -71,18 +75,32 @@ const CompletionCollector = struct {
     allocator: std.mem.Allocator,
     text: ?[]u8 = null,
     error_message: ?[]u8 = null,
+    on_event: ?StreamEventCallback = null,
+    on_event_ctx: ?*anyopaque = null,
+
+    fn emit(self: *CompletionCollector, event: @import("extensions/runner.zig").AiCompleteStreamEvent) void {
+        if (self.on_event) |cb| cb(event, self.on_event_ctx);
+    }
 
     fn callback(event: ai.protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
         const self: *CompletionCollector = @ptrCast(@alignCast(ctx.?));
         switch (event) {
+            .start => {
+                self.emit(.message_start);
+            },
+            .text_delta => |delta| {
+                if (delta.delta.len > 0) self.emit(.{ .message_delta = .{ .text = delta.delta } });
+            },
             .done => |done| {
                 log.debug("provider done reason={s}", .{@tagName(done.reason)});
                 self.text = collectText(self.allocator, done.message) catch null;
+                self.emit(.{ .message_end = .{ .text = self.text orelse "" } });
             },
             .@"error" => |err| {
                 log.debug("provider error reason={s}", .{@tagName(err.reason)});
                 const msg = err.@"error".error_message orelse "provider error";
                 self.error_message = self.allocator.dupe(u8, msg) catch null;
+                self.emit(.{ .err = msg });
             },
             else => {},
         }
@@ -98,3 +116,47 @@ const CompletionCollector = struct {
         return out.toOwnedSlice(allocator);
     }
 };
+
+test "text completion emits stream callback events and final result" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var faux_provider = ai.faux.FauxProvider.init(allocator);
+    defer faux_provider.deinit();
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{ai.faux.fauxText("hello")};
+    const response = ai.faux.fauxAssistantMessage(allocator, &content, .stop);
+    defer allocator.free(response.content);
+    faux_provider.setResponses(&.{response});
+
+    const Collector = struct {
+        events: std.ArrayList(@import("extensions/runner.zig").AiCompleteStreamEvent) = .empty,
+
+        fn callback(event: @import("extensions/runner.zig").AiCompleteStreamEvent, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.events.append(testing.allocator, event.clone(testing.allocator) catch return) catch return;
+        }
+    };
+
+    var collector = Collector{};
+    defer {
+        for (collector.events.items) |*event| event.deinit(allocator);
+        collector.events.deinit(allocator);
+    }
+
+    var result = runPreparedTextCompletion(allocator, .{
+        .provider = faux_provider.provider(),
+        .model = ai.faux.fauxModel(),
+        .prompt = "prompt",
+        .on_event = &Collector.callback,
+        .on_event_ctx = @ptrCast(&collector),
+    });
+    defer result.deinit(allocator);
+
+    try testing.expect(result == .completed);
+    try testing.expectEqualStrings("hello", result.completed.text);
+    try testing.expect(collector.events.items.len >= 3);
+    try testing.expect(collector.events.items[0] == .message_start);
+    try testing.expect(collector.events.items[1] == .message_delta);
+    try testing.expectEqualStrings("hello", collector.events.items[1].message_delta.text);
+    try testing.expect(collector.events.items[collector.events.items.len - 1] == .message_end);
+}

@@ -487,12 +487,16 @@ fn customizeSystemPrompt(
     const tool_names = try toolNameSlice(allocator, definitions);
     defer allocator.free(tool_names);
     const prompt_inputs = resource_loader.getPromptInputs();
-    return try event_bridge.dispatchBeforeAgentStart(extension_runner, base_system_prompt, .{
+    var result = try event_bridge.dispatchBeforeAgentStart(extension_runner, base_system_prompt, .{
         .cwd = resource_loader.cwd,
         .selected_tools = tool_names,
         .skills = resource_loader.getSkills().skills,
         .append_system_prompt = prompt_inputs.append_system_prompt,
     }, allocator);
+    const prompt = result.system_prompt;
+    result.system_prompt = "";
+    result.deinit(allocator);
+    return prompt;
 }
 
 pub fn buildSystemPrompt(

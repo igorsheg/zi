@@ -11,6 +11,7 @@ const log = std.log.scoped(.ai_complete_worker);
 pub const ResultSink = struct {
     ptr: *anyopaque,
     submit: *const fn (ptr: *anyopaque, id: extension_runner.AsyncOpId, result: extension_runner.AsyncResult) bool,
+    submit_event: ?*const fn (ptr: *anyopaque, id: extension_runner.AsyncOpId, event: extension_runner.AiCompleteStreamEvent) bool = null,
 };
 
 pub const Request = struct {
@@ -23,6 +24,7 @@ pub const Request = struct {
     headers: ?[]const ai.protocol.Header = null,
     max_tokens: ?u64 = null,
     reasoning: ?ai.protocol.ThinkingLevel = null,
+    stream_events: bool = false,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
@@ -58,7 +60,21 @@ const Handler = struct {
         }
     }
 
+    const EventFanout = struct {
+        handler: *Handler,
+        request: *Request,
+
+        fn callback(event: extension_runner.AiCompleteStreamEvent, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const sink = self.handler.result_sink orelse return;
+            const submit = sink.submit_event orelse return;
+            var owned = event.clone(self.handler.allocator) catch return;
+            if (!submit(sink.ptr, self.request.id, owned)) owned.deinit(self.handler.allocator);
+        }
+    };
+
     fn complete(self: *Handler, request: *Request) extension_runner.AiCompleteResult {
+        var fanout = EventFanout{ .handler = self, .request = request };
         const result = ai_completion.runPreparedTextCompletion(self.allocator, .{
             .provider = request.provider,
             .model = request.model,
@@ -68,6 +84,8 @@ const Handler = struct {
             .headers = request.headers,
             .max_tokens = request.max_tokens,
             .reasoning = request.reasoning,
+            .on_event = if (request.stream_events) &EventFanout.callback else null,
+            .on_event_ctx = if (request.stream_events) @ptrCast(&fanout) else null,
         });
         return switch (result) {
             .completed => |completed| .{ .completed = .{ .text = completed.text } },

@@ -10,15 +10,13 @@ pub fn handle(self: anytype, key: Key) void {
             self.tui.dirty = true;
             return;
         }
+        if (self.extension_ui_state.handleOverlayInput(key)) |event| {
+            dispatchExtensionUiEvent(self, event);
+            self.tui.dirty = true;
+            return;
+        }
         if (self.extension_ui_state.matchOverlayKey(key)) |event| {
-            const owned = @import("../../coding_agent/extensions/ui.zig").UiEvent.clone(self.msg_allocator, event) catch return;
-            switch (self.request_queue.trySend(.{ .extension_ui_event = owned })) {
-                .ok, .dropped => {},
-                .full, .closed, .oom => |rejected| {
-                    var failed = rejected;
-                    failed.deinit(self.msg_allocator);
-                },
-            }
+            dispatchExtensionUiEvent(self, event);
             self.tui.dirty = true;
             return;
         }
@@ -154,6 +152,17 @@ pub fn handle(self: anytype, key: Key) void {
     if (self.tui.handleInput(key)) {
         self.refreshHeaderVisibility();
         self.tui.dirty = true;
+    }
+}
+
+fn dispatchExtensionUiEvent(self: anytype, event: @import("../../coding_agent/extensions/ui.zig").UiEvent) void {
+    const owned = @import("../../coding_agent/extensions/ui.zig").UiEvent.clone(self.msg_allocator, event) catch return;
+    switch (self.request_queue.trySend(.{ .extension_ui_event = owned })) {
+        .ok, .dropped => {},
+        .full, .closed, .oom => |rejected| {
+            var failed = rejected;
+            failed.deinit(self.msg_allocator);
+        },
     }
 }
 
