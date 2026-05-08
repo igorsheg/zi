@@ -3,6 +3,7 @@ const keybindings = @import("../keybindings.zig");
 const keys_mod = @import("../terminal/keys.zig");
 
 const Key = keys_mod.Key;
+const log = std.log.scoped(.extension_ui_input);
 
 pub fn handle(self: anytype, key: Key) void {
     if (self.tui.hasCapturingOverlay()) {
@@ -11,6 +12,7 @@ pub fn handle(self: anytype, key: Key) void {
             return;
         }
         if (self.extension_ui_state.handleOverlayInput(key)) |event| {
+            log.debug("overlay input event type={s} node={s} action={s} value_len={d}", .{ @tagName(event.type), event.node orelse "", event.action orelse "", if (event.value) |value| value.len else 0 });
             dispatchExtensionUiEvent(self, event);
             self.tui.dirty = true;
             return;

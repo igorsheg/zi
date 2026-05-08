@@ -433,6 +433,17 @@ fn reconcileDesiredItems(
     editor: EditorInterface,
     desired_items: *std.ArrayList(DesiredItem),
 ) void {
+    const was_following_bottom = transcript.isFollowingBottom();
+    const scroll_before = transcript.scrollOffset();
+    const width_before = transcript.last_render_width;
+    const height_before = transcript.last_visible_height;
+
+    defer {
+        if (!was_following_bottom) {
+            transcript.restoreScrollOffset(scroll_before, false, width_before, height_before);
+        }
+    }
+
     var desired_index: usize = 0;
     while (desired_index < desired_items.items.len) : (desired_index += 1) {
         const desired = desired_items.items[desired_index];
@@ -2171,6 +2182,39 @@ test "reconcileFromSnapshots reorders rows and preserves scroll offset when not 
     reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
 
     try testing.expectEqual(scroll_before, transcript.scrollOffset());
+}
+
+test "reconcileFromSnapshots replaces rows and preserves detached scroll offset" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    var mock_editor = editor_iface_mod.MockEditor{};
+    const editor = mock_editor.editorInterface();
+
+    var state_a = try ownedViewSnapshotFromMessages(testing.allocator, &.{
+        makeUserMessage("alpha beta gamma delta epsilon zeta eta theta"),
+        makeUserMessage("one two three four five six seven eight"),
+        makeUserMessage("nine ten eleven twelve thirteen fourteen"),
+        makeUserMessage("fifteen sixteen seventeen eighteen nineteen"),
+    });
+    defer state_a.deinit(testing.allocator);
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_a, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
+    _ = transcript.totalHeight(16);
+    transcript.scrollBy(16, 4, -2);
+    const scroll_before = transcript.scrollOffset();
+    try testing.expect(!transcript.isFollowingBottom());
+
+    var state_b = try ownedViewSnapshotFromMessages(testing.allocator, &.{
+        makeUserMessage("alpha beta gamma delta epsilon zeta eta theta"),
+        makeUserMessage("changed row with enough wrapped text to keep the viewport scrollable"),
+        makeUserMessage("nine ten eleven twelve thirteen fourteen"),
+        makeUserMessage("fifteen sixteen seventeen eighteen nineteen"),
+    });
+    defer state_b.deinit(testing.allocator);
+    reconcileFromSnapshots(&transcript, editor, tool_display_mod.empty_resolver, state_b, null, .{ .theme = themes_builtin.dark(), .width_method = .wcwidth });
+
+    try testing.expectEqual(scroll_before, transcript.scrollOffset());
+    try testing.expect(!transcript.isFollowingBottom());
 }
 
 test "replaceAllOwnedState clears and reseeds editor history when committed user history changes" {

@@ -28,6 +28,7 @@ const MarkdownComponent = markdown_component_mod.Markdown;
 const WidthMethod = grapheme_mod.WidthMethod;
 const Theme = theme_mod.Theme;
 const TextInput = text_input_mod.TextInput;
+const log = std.log.scoped(.extension_ui_input);
 
 pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
@@ -355,6 +356,7 @@ fn editInput(self: *ExtensionUiState, spec: extension_ui.RenderSpec, input: Inpu
     switch (result) {
         .none => return null,
         .input => {
+            log.debug("edited input owner={s} view={s} node={s} value_len={d}", .{ spec.state_owner_id, spec.id, input.id, editor.text().len });
             return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .node = input.id, .type = .input, .action = input.on_input orelse input.on_change, .value = editor.text(), .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
         },
         .consumed => return null,
@@ -1006,6 +1008,7 @@ fn renderChip(region: Region, label: []const u8) void {
 fn renderInput(state: *ExtensionUiState, view: extension_ui.RenderSpec, region: Region, input: extension_ui.UiNode.Input) void {
     if (region.width == 0) return;
     const primitive = inputState(state, view.state_owner_id, view.id, input.id, input.value) catch return;
+    log.debug("render input owner={s} view={s} node={s} value_len={d} width={d}", .{ view.state_owner_id, view.id, input.id, primitive.text().len, region.width });
     primitive.placeholder = input.placeholder;
     primitive.render(region);
 }
