@@ -32,6 +32,7 @@ const diff_unified = @import("../../diff/unified.zig");
 const tool_result_details = @import("result_details.zig");
 const lock_registry = @import("lock_registry.zig");
 const json_value = @import("../../json/value.zig");
+const zio_fs = @import("../../zio/root.zig").fs;
 
 const SCHEMA =
     \\{"type":"object","properties":{
@@ -231,27 +232,21 @@ fn executeSync(
         allocator.dupe(u8, resolved) catch return util.errorResult(allocator, "alloc failed");
     defer allocator.free(io_path);
 
-    const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, io_path, .{}) catch |err| {
+    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, io_path, .{}) catch |err| {
         if (err == error.FileNotFound)
             return util.errorf(allocator, "file not found: {s}", .{resolved});
-        return util.errorf(allocator, "edit tool: open failed: {s}", .{@errorName(err)});
-    };
-    const stat = file.stat(std.Options.debug_io) catch {
-        file.close(std.Options.debug_io);
         return util.errorResult(allocator, "edit tool: stat failed");
     };
-    if (stat.kind == .directory) {
-        file.close(std.Options.debug_io);
-        return util.errorf(allocator, "{s} is a directory, not a file.", .{resolved});
-    }
-    var read_buf: [4096]u8 = undefined;
-    var file_reader = file.reader(std.Options.debug_io, &read_buf);
-    const raw = file_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024)) catch {
-        file.close(std.Options.debug_io);
-        return util.errorResult(allocator, "edit tool: read failed");
+
+    var input = zio_fs.readOnlyBytes(std.Options.debug_io, allocator, io_path, .{ .max_bytes = 16 * 1024 * 1024 }) catch |err| {
+        if (err == error.FileNotFound)
+            return util.errorf(allocator, "file not found: {s}", .{resolved});
+        if (err == error.IsDir)
+            return util.errorf(allocator, "{s} is a directory, not a file.", .{resolved});
+        return util.errorf(allocator, "edit tool: read failed: {s}", .{@errorName(err)});
     };
-    file.close(std.Options.debug_io);
-    defer allocator.free(raw);
+    defer input.deinit(allocator);
+    const raw = input.bytes();
 
     const ending = detectLineEnding(raw);
     const normalized = normalizeToLfDup(allocator, raw) catch

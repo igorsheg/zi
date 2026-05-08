@@ -3,6 +3,7 @@ const ai = @import("../../ai/root.zig");
 const agent = @import("../../agent/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
+const zio_fs = @import("../../zio/root.zig").fs;
 
 pub const TelemetrySnapshot = struct {
     read_count: u64 = 0,
@@ -97,12 +98,9 @@ fn parseLine(
 /// Read and parse a session file from disk.
 pub fn readSessionFile(allocator: std.mem.Allocator, path: []const u8) !SessionData {
     const total_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
-    const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{});
-    defer file.close(std.Options.debug_io);
-    var read_buf: [4096]u8 = undefined;
-    var file_reader = file.reader(std.Options.debug_io, &read_buf);
-    const content = try file_reader.interface.allocRemaining(allocator, .limited(100 * 1024 * 1024));
-    defer allocator.free(content);
+    var input = try zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 100 * 1024 * 1024 });
+    defer input.deinit(allocator);
+    const content = input.bytes();
 
     const parse_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
     const data = try parseSessionContent(allocator, content);

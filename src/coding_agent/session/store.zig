@@ -6,6 +6,7 @@ const context_mod = @import("../../session/context.zig");
 const context_usage = @import("../../session/context_usage.zig");
 const storage = @import("../../storage.zig");
 const agent_mod = @import("../../agent/root.zig");
+const zio_fs = @import("../../zio/root.zig").fs;
 
 /// Metadata about a session file, for listing.
 pub const SessionInfo = struct {
@@ -566,8 +567,9 @@ pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) 
 /// Read a session file and extract listing metadata.
 /// Reads the full file but only JSON-parses the header and first user message.
 fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo {
-    const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, allocator, .limited(10 * 1024 * 1024)) catch return null;
-    defer allocator.free(content);
+    var input = zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 10 * 1024 * 1024 }) catch return null;
+    defer input.deinit(allocator);
+    const content = input.bytes();
 
     var session_id: ?[]const u8 = null;
     var cwd_str: ?[]const u8 = null;

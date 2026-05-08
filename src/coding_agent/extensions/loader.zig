@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio_fs = @import("../../zio/root.zig").fs;
 const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
@@ -339,12 +340,9 @@ fn loadOne(
     runner: *runner_mod.ExtensionRunner,
     ext: LoadedExtension,
 ) !void {
-    const file = try std.Io.Dir.openFileAbsolute(std.Options.debug_io, ext.path, .{});
-    defer file.close(std.Options.debug_io);
-    var read_buf: [4096]u8 = undefined;
-    var file_reader = file.reader(std.Options.debug_io, &read_buf);
-    const src = try file_reader.interface.allocRemaining(allocator, .limited(MAX_EXTENSION_SIZE));
-    defer allocator.free(src);
+    var input = try zio_fs.readOnlyBytes(std.Options.debug_io, allocator, ext.path, .{ .max_bytes = MAX_EXTENSION_SIZE });
+    defer input.deinit(allocator);
+    const src = input.bytes();
 
     const chunk_name_buf = try std.fmt.allocPrint(allocator, "@{s}", .{ext.path});
     defer allocator.free(chunk_name_buf);

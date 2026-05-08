@@ -16,6 +16,7 @@ const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("output_buffer.zig");
 const image = @import("../../image/root.zig");
+const zio_fs = @import("../../zio/root.zig").fs;
 
 const MAX_LINES: usize = 500;
 const MAX_FILE_BYTES: usize = util.Limits.text_result_bytes;
@@ -225,14 +226,10 @@ fn readTextFile(
     path: []const u8,
     range: ?[2]i64,
 ) protocol.AgentToolResult {
-    const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{}) catch |err|
+    var input = zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 4 * 1024 * 1024 }) catch |err|
         return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
-    defer file.close(std.Options.debug_io);
-    var text_read_buf: [4096]u8 = undefined;
-    var text_reader = file.reader(std.Options.debug_io, &text_read_buf);
-    const raw = text_reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch |err|
-        return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
-    defer allocator.free(raw);
+    defer input.deinit(allocator);
+    const raw = input.bytes();
 
     var total_lines: usize = 1;
     for (raw) |byte| {
