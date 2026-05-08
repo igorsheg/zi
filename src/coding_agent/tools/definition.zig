@@ -20,7 +20,7 @@ pub const BuiltinImpl = struct {
         signal: protocol.AbortSignal,
         on_update: ?protocol.AgentToolUpdateCallback,
         update_ctx: ?*anyopaque,
-    ) protocol.AgentToolResult,
+    ) protocol.AgentToolExecution,
 };
 
 pub const ToolImpl = union(enum) {
@@ -113,28 +113,11 @@ pub fn toAgentTool(def: *const ToolDefinition) protocol.AgentTool {
             .description = def.description,
             .label = def.label,
             .parameters = def.parameters,
-            .ctx = @constCast(def),
+            .ctx = impl.ctx,
             .affinity = .worker_thread,
             .prepare_arguments = impl.prepare_arguments,
-            .execute = builtinExecute,
+            .execute = impl.execute,
         },
         .lua => unreachable,
     };
-}
-
-fn builtinExecute(
-    raw_ctx: ?*anyopaque,
-    allocator: std.mem.Allocator,
-    tool_call_id: []const u8,
-    args: std.json.Value,
-    signal: protocol.AbortSignal,
-    on_update: ?protocol.AgentToolUpdateCallback,
-    update_ctx: ?*anyopaque,
-) protocol.AgentToolExecution {
-    const def: *const ToolDefinition = @ptrCast(@alignCast(raw_ctx.?));
-    const impl = switch (def.impl) {
-        .builtin => |impl| impl,
-        .lua => unreachable,
-    };
-    return .{ .ready = impl.execute(impl.ctx, allocator, tool_call_id, args, signal, on_update, update_ctx) };
 }

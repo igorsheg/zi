@@ -33,6 +33,18 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
 fn execute(
     raw_ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    args: std.json.Value,
+    signal: protocol.AbortSignal,
+    on_update: ?protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
+) protocol.AgentToolExecution {
+    return .{ .ready = executeSync(raw_ctx, allocator, tool_call_id, args, signal, on_update, update_ctx) };
+}
+
+fn executeSync(
+    raw_ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
     _: protocol.AbortSignal,
